@@ -1,11 +1,7 @@
-# ---------------------------------------------------------------------------
-# trainer_ntp.py   – plain-PyTorch, class-based but SRP-oriented
-# ---------------------------------------------------------------------------
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
-import sys
-sys.path.insert(0, '/mnt/4tb/nemo_lm/')
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -19,50 +15,30 @@ from nemo_lm.automodel.base_recipe import BaseRecipe
 #  Stateless helper functions
 # ---------------------------
 
-def build_model(cfg_model, device) -> nn.Module:
+def build_model(device, cfg_model) -> nn.Module:
     model = cfg_model.instantiate()
     for m in model.modules():
         if isinstance(m, nn.Embedding):
             m.weight.requires_grad_(False)
     return model.to(device)
 
-def build_optimizer(cfg_opt, model) -> Optimizer:
+def build_optimizer(device, cfg_opt, model) -> Optimizer:
     return cfg_opt.instantiate(params=model.parameters())
 
-def build_loss_fn(cfg_loss, device):
+def build_loss_fn(device, cfg_loss):
     if callable(cfg_loss):
         return cfg_loss
     else:
         return cfg_loss.instantiate().to(device)
 
-def build_dataloader(cfg_ds, cfg_dl) -> DataLoader:
+def build_dataloader(device, cfg_ds, cfg_dl) -> DataLoader:
     ds = cfg_ds.instantiate()
     return cfg_dl.instantiate(dataset=ds)
 
-
-# ----------------
-#  Utility classes
-# ----------------
-
-@dataclass
-class DistInfo:
-    backend: str
-    rank: int
-    world: int
-    device: torch.device
-    is_main: bool
-
-def init_distributed(cfg_dist: Dict[str, Any]) -> DistInfo:
+def build_distributed(cfg_dist: Dict[str, Any]) -> DistInfo:
     backend = cfg_dist.get("backend", "nccl")
     timeout = cfg_dist.get("timeout_minutes", 1)
-    initialize_distributed(backend=backend, timeout_minutes=timeout)
-
-    rank  = torch.distributed.get_rank()
-    world = torch.distributed.get_world_size()
-    device = torch.device("cuda", rank % torch.cuda.device_count())
-    torch.cuda.set_device(device)
-    return DistInfo(backend, rank, world, device, rank == 0)
-
+    return initialize_distributed(backend=backend, timeout_minutes=timeout)
 
 class StepScheduler:
     """
@@ -74,13 +50,15 @@ class StepScheduler:
                  ckpt_every_steps: int,
                  epoch_len: Optional[int],
                  start_step: int = 0,
-                 start_epoch: int = 0):
+                 start_epoch: int = 0,
+                 num_epochs: int = 0):
 
         self.grad_acc_steps   = grad_acc_steps
         self.ckpt_every_steps = ckpt_every_steps
         self.epoch_len        = epoch_len
         self.step   = start_step
         self.epoch  = start_epoch
+        self.num_epochs = num_epochs
 
     def update(self, batch_idx: int) -> Tuple[bool, bool]:
         """Return (is_grad_step, is_ckpt_step) after incrementing step counter."""
@@ -101,31 +79,35 @@ class StepScheduler:
 #  Trainer class – orchestration only
 # ---------------------------------------------------------------------------
 
-class Recipe(BaseRecipe):
+class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
     """
     Orchestrates the full training life-cycle.
     wiring + loop; no low-level domain logic.
     """
     def __init__(self, cfg):
         self.cfg = cfg
-        self.dist:        DistInfo = None
-        self.scheduler:   StepScheduler = None
-        self.dataloader:  DataLoader = None
-        self.loss_fn = None
 
     # ------------------ build phase ------------------
     def setup(self):
-        self.dist = init_distributed(self.cfg.get("training", {}).get("distributed", {}))
+        """ Builds all components needed for training/validation/logging/checkpointing/etc.
+
+        This is the last place where self.cfg should be referenced.
+
+        Raises:
+            NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
+        """
+        self.dist = build_distributed(self.cfg.get("distributed", {}))
         torch.manual_seed(self.cfg.get("seed", 42) + self.dist.rank)
 
         # Build components
-        self.model = build_model(self.cfg.model, self.dist.device)
-        self.optimizer = build_optimizer(self.cfg.optimizer, self.model)
-        self.loss_fn   = build_loss_fn(self.cfg.loss_fn, self.dist.device)
-        self.dataloader = build_dataloader(self.cfg.dataset, self.cfg.dataloader)
+        self.model = build_model(self.dist.device, self.cfg.model)
+        self.optimizer = build_optimizer(self.dist.device, self.cfg.optimizer, self.model)
+        self.loss_fn   = build_loss_fn(self.dist.device, self.cfg.loss_fn)
+        self.dataloader = build_dataloader(self.dist.device, self.cfg.dataset, self.cfg.dataloader)
 
         # Scheduler
         self.scheduler = StepScheduler(
+            num_epochs = self.cfg.get("epochs", 10),
             grad_acc_steps   = self.cfg.get("grad_acc_steps", 10),
             ckpt_every_steps = self.cfg.get("ckpt_every_steps", 100),
             epoch_len        = len(self.dataloader),
@@ -138,7 +120,7 @@ class Recipe(BaseRecipe):
     # ------------------ main loop ------------------
     def run_train_validation_loop(self):
         self.model.train()
-        for self.scheduler.epoch in range(self.scheduler.epoch, self.cfg.get("epochs", 10)):
+        for self.scheduler.epoch in range(self.scheduler.epoch, self.scheduler.num_epochs):
             for batch_idx, batch in enumerate(self.dataloader):
                 is_grad, is_ckpt = self.scheduler.update(batch_idx)
                 loss = self._run_train_step(batch, is_grad)
@@ -179,7 +161,7 @@ class Recipe(BaseRecipe):
 
 def main():
     cfg = load_yaml_config("llama_3_2_1b_hellaswag.yaml")
-    trainer = Recipe(cfg)
+    trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
 

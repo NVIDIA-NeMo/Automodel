@@ -25,6 +25,15 @@ from nemo_lm.automodel.utils.dist_utils import (
     get_world_size_safe
 )
 
+
+@dataclass
+class DistInfo:
+    backend: str
+    rank: int
+    world: int
+    device: torch.device
+    is_main: bool
+
 def initialize_distributed(
     backend, timeout_minutes=1,
 ):
@@ -70,6 +79,11 @@ def initialize_distributed(
         torch.distributed.init_process_group(**init_process_group_kwargs)
         atexit.register(destroy_global_state)
         torch.distributed.barrier(device_ids=[get_local_rank_preinit()])
+
+    rank  = torch.distributed.get_rank()
+    world = torch.distributed.get_world_size()
+    device = torch.device("cuda", rank % torch.cuda.device_count())
+    return DistInfo(backend, rank, world, device, rank == 0)
 
 
 def destroy_global_state():

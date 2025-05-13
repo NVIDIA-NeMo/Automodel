@@ -46,7 +46,6 @@ class ConfigNode:
                 continue
             if k.endswith('_fn'):
                 config_kwargs[k] = v
-                # config_kwargs[k] = self._resolve_target(v)
             else:
                 config_kwargs[k] = self._instantiate_value(v)
 

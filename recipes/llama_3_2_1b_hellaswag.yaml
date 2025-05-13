@@ -3,12 +3,11 @@ training:
   train_iters: 250
   eval_interval: 1000
   eval_iters: 4
-  global_batch_size: 256
-  micro_batch_size: 4
   exit_signal_handler: true
-  distributed:
-    backend: gloo
-    timeout_minutes: 1
+
+distributed:
+  backend: nccl
+  timeout_minutes: 1
 
 rng:
   _target_: nemo_lm.automodel.training.rng.StatefulRNG
@@ -18,33 +17,32 @@ rng:
 model:
   _target_: transformers.AutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
-  # load_pretrained_weights: true
 
 loss_fn: nemo_lm.automodel.loss.masked_ce.masked_cross_entropy
 
 dataset:
   _target_: nemo_lm.automodel.datasets.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
-  # trust_remote_code: True
   split: train
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_lm.automodel.datasets.utils.default_collater
+  batch_size: 1
 
 validation_dataset:
   _target_: nemo_lm.automodel.datasets.hellaswag.hellaswag
   path_or_dataset: rowan/hellaswag
-  # trust_remote_code: True
   split: train
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  # collate_fn: nemo_lm.automodel.datasets.hellaswag.collater
 
 optimizer:
   _target_: torch.optim.Adam
