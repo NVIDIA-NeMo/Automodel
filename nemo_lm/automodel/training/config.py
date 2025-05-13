@@ -34,9 +34,9 @@ from nemo_lm.config.common import (
     RNGConfig,
     TrainingConfig,
 )
-from nemo_lm.utils.common_utils import get_rank_safe, get_world_size_safe
-from nemo_lm.utils.config_utils import ConfigContainer as Container
-from nemo_lm.utils.import_utils import safe_import
+from nemo_lm.automodel.utils.common_utils import get_rank_safe, get_world_size_safe
+from nemo_lm.automodel.utils.config_utils import ConfigContainer as Container
+from nemo_lm.automodel.utils.import_utils import safe_import
 
 logger = logging.getLogger(__name__)
 

@@ -20,7 +20,7 @@ import torch
 
 from nemo_lm.automodel.components.state import GlobalState
 from nemo_lm.automodel.config import ConfigContainer
-from nemo_lm.utils.common_utils import (
+from nemo_lm.automodel.utils.common_utils import (
     get_world_size_safe,
     is_last_rank,
     print_rank_last,

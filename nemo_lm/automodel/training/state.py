@@ -24,8 +24,8 @@ from torch.utils.tensorboard.writer import SummaryWriter
 
 from nemo_lm.automodel.components.timers import Timers
 from nemo_lm.automodel.config import ConfigContainer
-from nemo_lm.utils.common_utils import dump_dataclass_to_yaml, get_rank_safe, get_world_size_safe
-from nemo_lm.utils.sig_utils import DistributedSignalHandler
+from nemo_lm.automodel.utils.common_utils import dump_dataclass_to_yaml, get_rank_safe, get_world_size_safe
+from nemo_lm.automodel.utils.sig_utils import DistributedSignalHandler
 
 
 @dataclass

@@ -19,58 +19,14 @@ import signal
 import torch
 import torch.distributed
 
-from nemo_lm.config.common import DistributedInitConfig
-from nemo_lm.utils.common_utils import get_local_rank_preinit, get_rank_safe, get_world_size_safe
+from nemo_lm.automodel.utils.dist_utils import (
+    get_local_rank_preinit,
+    get_rank_safe,
+    get_world_size_safe
+)
 
-
-def initialize_automodel(
-    dist_config: DistributedInitConfig,
-    seed: int,
-    allow_no_cuda: bool = False,
-    skip_dist_initialization: bool = False,
-):
-    """Initialize global vars, logging, and distributed state."""
-
-    if not allow_no_cuda:
-        # Make sure cuda is available.
-        assert torch.cuda.is_available(), "NemoLM requires CUDA."
-
-    # torch.distributed initialization
-    return torch_dist_init(
-        dist_config=dist_config,
-        seed=seed,
-        skip_dist_initialization=skip_dist_initialization,
-    )
-
-
-def torch_dist_init(
-    dist_config: DistributedInitConfig,
-    seed: int,
-    skip_dist_initialization: bool,
-):
-    def finish_dist_init():
-        # Pytorch distributed.
-        _initialize_distributed(dist_config=dist_config)
-
-        # Random seeds for reproducibility.
-        if get_rank_safe() == 0:
-            print("> setting random seeds to {} ...".format(seed))
-        _set_random_seed(seed=seed)
-
-    if skip_dist_initialization:
-        return None
-
-    if dist_config.lazy_init:
-        return finish_dist_init
-    else:
-        # Complete initialization right away.
-        finish_dist_init()
-        # No continuation function
-        return None
-
-
-def _initialize_distributed(
-    dist_config: DistributedInitConfig,
+def initialize_distributed(
+    backend, timeout_minutes=1,
 ):
     """Initialize torch.distributed and core model parallel."""
 
@@ -84,7 +40,7 @@ def _initialize_distributed(
 
     else:
         if get_rank_safe() == 0:
-            print("> initializing torch distributed ...", flush=True)
+            print("> initializing torch distributed with {} workers...".format(get_world_size_safe()), flush=True)
 
         # Manually set the device ids.
         if device_count > 0:
@@ -92,10 +48,10 @@ def _initialize_distributed(
 
         # Call the init process
         init_process_group_kwargs = {
-            "backend": dist_config.distributed_backend,
+            "backend": backend,
             "world_size": get_world_size_safe(),
             "rank": get_rank_safe(),
-            "timeout": datetime.timedelta(minutes=dist_config.distributed_timeout_minutes),
+            "timeout": datetime.timedelta(minutes=timeout_minutes),
         }
 
         if get_world_size_safe() == 1:
@@ -114,20 +70,6 @@ def _initialize_distributed(
         torch.distributed.init_process_group(**init_process_group_kwargs)
         atexit.register(destroy_global_state)
         torch.distributed.barrier(device_ids=[get_local_rank_preinit()])
-
-
-def _set_random_seed(seed: int):
-    """Set random seed for reproducability."""
-    assert seed is not None and seed > 0, f"Seed ({seed}) should be a positive integer."
-
-    import random
-
-    import numpy as np
-
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    # TODO: add cuda seed
 
 
 def destroy_global_state():

@@ -38,14 +38,14 @@ from nemo_lm.automodel.utils.train_utils import (
     training_log,
 )
 from nemo_lm.config.common import ProfilingConfig
-from nemo_lm.utils.common_utils import (
+from nemo_lm.automodel.utils.common_utils import (
     append_to_progress_log,
     barrier_and_log,
     get_rank_safe,
     get_world_size_safe,
     print_rank_0,
 )
-from nemo_lm.utils.log_utils import setup_logging
+from nemo_lm.automodel.utils.log_utils import setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -276,7 +276,7 @@ def train_step(
         grad_norm,
     )
 
-
+@torch.no_grad
 def evaluate_and_print_results(
     global_state: GlobalState,
     prefix: str,
@@ -300,41 +300,40 @@ def evaluate_and_print_results(
         eval_batch_size = train_config.global_batch_size
         eval_num_microbatches = eval_batch_size // (train_config.micro_batch_size * config.data_parallel_size)
 
-        with torch.no_grad():
-            iteration = 0
+        iteration = 0
+        if verbose:
+            print_rank_0(f"Evaluating on {train_config.eval_iters * eval_batch_size} samples")
+        while iteration < train_config.eval_iters:
+            iteration += 1
             if verbose:
-                print_rank_0(f"Evaluating on {train_config.eval_iters * eval_batch_size} samples")
-            while iteration < train_config.eval_iters:
-                iteration += 1
-                if verbose:
-                    print_rank_0(f"Evaluating iter {iteration}/{train_config.eval_iters}")
+                print_rank_0(f"Evaluating iter {iteration}/{train_config.eval_iters}")
 
-                loss_store = []
-                total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
-                for _ in range(eval_num_microbatches):
-                    loss, num_tokens = forward_with_loss(
-                        state=global_state, data_iterator=data_iterator, model=model, loss_fn=model_config.loss_fn
-                    )
-                    num_tokens = num_tokens.clone().detach().to(torch.int)
-                    total_num_tokens += num_tokens.item()
-                    loss_store.append(loss.clone())
-
-                # Empty unused memory
-                if train_config.empty_unused_memory_level >= 1:
-                    torch.cuda.empty_cache()
-
-                # Reduce across processes.
-                loss, total_num_tokens = reduce_loss(loss_store, total_num_tokens)
-
-                if "lm loss" not in total_loss_dict:
-                    total_loss_dict["lm loss"] = (0.0, 0)
-
-                total_loss_dict["lm loss"] = (
-                    total_loss_dict["lm loss"][0] + loss.item(),
-                    total_loss_dict["lm loss"][1] + total_num_tokens.item(),
+            loss_store = []
+            total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
+            for _ in range(eval_num_microbatches):
+                loss, num_tokens = forward_with_loss(
+                    state=global_state, data_iterator=data_iterator, model=model, loss_fn=model_config.loss_fn
                 )
+                num_tokens = num_tokens.clone().detach().to(torch.int)
+                total_num_tokens += num_tokens.item()
+                loss_store.append(loss.clone())
 
-                global_state.train_state.consumed_valid_samples += eval_batch_size
+            # Empty unused memory
+            if train_config.empty_unused_memory_level >= 1:
+                torch.cuda.empty_cache()
+
+            # Reduce across processes.
+            loss, total_num_tokens = reduce_loss(loss_store, total_num_tokens)
+
+            if "lm loss" not in total_loss_dict:
+                total_loss_dict["lm loss"] = (0.0, 0)
+
+            total_loss_dict["lm loss"] = (
+                total_loss_dict["lm loss"][0] + loss.item(),
+                total_loss_dict["lm loss"][1] + total_num_tokens.item(),
+            )
+
+            global_state.train_state.consumed_valid_samples += eval_batch_size
 
         # Move model back to the train mode.
         model.train()

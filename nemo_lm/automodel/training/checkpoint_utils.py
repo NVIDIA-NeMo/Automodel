@@ -7,7 +7,11 @@ from typing import Any, Optional, Type, TypeVar
 import torch
 import yaml
 
-from nemo_lm.utils.common_utils import get_rank_safe, get_world_size_safe, log_single_rank, print_rank_0
+from nemo_lm.automodel.utils.dist_utils import (
+    get_local_rank_preinit,
+    get_rank_safe,
+    get_world_size_safe
+)
 
 TRAIN_STATE_FILE = "train_state.pt"
 TRACKER_PREFIX = "latest"

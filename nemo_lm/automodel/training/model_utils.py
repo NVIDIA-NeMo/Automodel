@@ -20,7 +20,7 @@ from types import MethodType
 import torch
 from torch.nn.parallel import DistributedDataParallel
 
-from nemo_lm.utils.import_utils import safe_import_from
+from nemo_lm.automodel.utils.import_utils import safe_import_from
 
 te, HAVE_TE = safe_import_from("transformer_engine", "pytorch")
 

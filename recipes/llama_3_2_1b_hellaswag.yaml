@@ -1,0 +1,90 @@
+training:
+  _target_: nemo_lm.config.common.TrainingConfig
+  train_iters: 250
+  eval_interval: 1000
+  eval_iters: 4
+  global_batch_size: 256
+  micro_batch_size: 4
+  exit_signal_handler: true
+  distributed:
+    backend: gloo
+    timeout_minutes: 1
+
+rng:
+  _target_: nemo_lm.automodel.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  _target_: transformers.AutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+  # load_pretrained_weights: true
+
+loss_fn: nemo_lm.automodel.loss.masked_ce.masked_cross_entropy
+
+dataset:
+  _target_: nemo_lm.automodel.datasets.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  # trust_remote_code: True
+  split: train
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_lm.automodel.datasets.utils.default_collater
+
+validation_dataset:
+  _target_: nemo_lm.automodel.datasets.hellaswag.hellaswag
+  path_or_dataset: rowan/hellaswag
+  # trust_remote_code: True
+  split: train
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  # collate_fn: nemo_lm.automodel.datasets.hellaswag.collater
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0
+  # min_lr: 1.0e-5
+
+scheduler:
+  _target_: nemo_lm.automodel.config.SchedulerConfig
+  start_weight_decay: 0
+  end_weight_decay: 0
+  weight_decay_incr_style: constant
+  lr_decay_style: cosine
+  lr_decay_iters: 250
+  lr_warmup_iters: 0
+  lr_warmup_init: 1.0e-5
+  override_opt_param_scheduler: true
+
+logger:
+  _target_: nemo_lm.config.common.LoggerConfig
+  wandb_project: nemo_automodel_sft_loop
+  wandb_entity: nvidia
+  wandb_exp_name: nemolm_automodel_Rowan_hellaswag_meta-llama_Llama-3.2-1B_gbs_256_seq_len_1024_lr_1.0e-5
+  wandb_save_dir: /tmp/nemo_run/wandb
+  tensorboard_dir: /tmp/nemo_run/tensorboard
+  log_timers_to_tensorboard: true
+  log_validation_ppl_to_tensorboard: true
+  tensorboard_log_interval: 1
+  timing_log_level: 2
+  log_progress: true
+  log_interval: 1
+  logging_level: INFO
+  modules_to_filter:
+    - nemo.collections.llm.gpt.data.utils
+
+checkpointer:
+  _target_: nemo_lm.automodel.training.checkpoint.TorchCheckpointer
+  # save_interval: 10000
+  # save: /tmp/nemo_run/checkpoints/automodel/Rowan_hellaswag_meta-llama_Llama-3.2-1B_gbs_256_seq_len_1024
+  # load: /tmp/nemo_run/checkpoints/automodel/Rowan_hellaswag_meta-llama_Llama-3.2-1B_gbs_256_seq_len_1024
+

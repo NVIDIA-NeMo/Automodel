@@ -9,7 +9,7 @@ from datasets import Dataset, DatasetDict, load_dataset
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from nemo_lm.utils.common_utils import log_single_rank
+from nemo_lm.automodel.utils.common_utils import log_single_rank
 
 logger = logging.getLogger(__name__)
 
@@ -127,67 +127,6 @@ def make_dataset_splits(dataset, split, split_aliases):
 def has_dist_env_init_or_rank_env_var():
     """returns whether it runs on a dist-environment"""
     return dist.is_initialized() or int(os.environ.get("WORLD_SIZE", "0")) > 1
-
-
-def batchify(tensor):
-    """Ensures that the input tensor has at least two dimensions by adding an extra batch dimension if necessary.
-
-    Parameters
-    ----------
-    tensor : torch.Tensor
-        The input tensor to be batchified.
-
-    Returns
-    -------
-    torch.Tensor
-        The tensor with an extra dimension added if it was originally 1-dimensional.
-        Otherwise, the tensor is returned as-is.
-    """
-    if tensor.ndim == 1:
-        return tensor.unsqueeze_(0)
-    return tensor
-
-
-def extract_key_from_dicts(batch, key):
-    """Extracts the value of the given key from each dictionary in a list of dictionaries.
-
-    Parameters
-    ----------
-    batch : List[dict]
-        A list of dictionaries.
-    key : str
-        The key whose values are to be extracted from each dictionary.
-
-    Returns
-    -------
-    List
-        A list of values associated with the specified key, in the same order as
-        the dictionaries in the input batch.
-    """
-    return list(map(lambda x: x[key], batch))
-
-
-def pad_within_micro(batch, pad_token_id, pad_seq_len_divisible=None):
-    """Pads each list in a batch of lists to the same length with a specified token.
-
-    Parameters
-    ----------
-    batch : List[List[int]]
-        A batch of sequences (e.g., token IDs), where each sequence is a list of integers.
-    pad_token_id : int
-        The token ID to use for padding shorter sequences.
-    pad_seq_len_divisible : int
-        The value to use for padding sequence length so that it is divisible by pad_seq_len_divisible.
-    Returns
-    -------
-    List[List[int]]
-        A batch of sequences where each inner list has been padded with the pad token
-        to match the length of the longest sequence in the batch.
-    """
-    max_len = max(map(len, batch))
-    if pad_seq_len_divisible:
-        max_len = (pad_seq_len_divisible - max_len % pad_seq_len_divisible) + max_len
-    return [item + [pad_token_id] * (max_len - len(item)) for item in batch]
 
 
 @dataclass(kw_only=True)
