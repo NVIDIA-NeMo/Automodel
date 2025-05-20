@@ -25,6 +25,18 @@ CPUOffloadPolicy, HAS_CPU_OFFLOAD_POLICY = safe_import_from(
     "torch.distributed.fsdp", "CPUOffloadPolicy", fallback_module="torch.distributed._composable.fsdp"
 )
 
+    # tp_plan: Optional[Dict[str, Any]] = field(
+    #     default=None,
+    #     metadata={"help": "Custom TP shard plan dict; keys are module‐name regexps."}
+    # )
+    # use_hf_tp: bool = field(
+    #     default=True,
+    #     metadata={"help": "If True and no custom tp_plan, uses HuggingFace default plan."}
+    # )
+    # parallelize_fn: Callable = field(
+    #     default=None,
+    #     metadata={"help": "fn(model, device_mesh, mp_policy, use_hf_tp_plan, tp_plan, offload_policy)"}
+    # )
 
 
 # Taken and modified from torchtitan
