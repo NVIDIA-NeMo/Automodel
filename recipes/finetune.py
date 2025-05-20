@@ -1,7 +1,11 @@
 from __future__ import annotations
+import sys
+sys.path.insert(0, '/mnt/4tb/nemo_lm/')
+
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
+import os
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -15,11 +19,15 @@ from automodel.base_recipe import BaseRecipe
 #  Stateless helper functions
 # ---------------------------
 
-def build_model(device, cfg_model) -> nn.Module:
+def build_model(device, model_wrapper, cfg_model) -> nn.Module:
     model = cfg_model.instantiate()
     for m in model.modules():
         if isinstance(m, nn.Embedding):
             m.weight.requires_grad_(False)
+    if model_wrapper is not None:
+        model = model_wrapper.parallelize(model)
+    # print(model)
+    # quit()
     return model.to(device)
 
 def build_optimizer(device, cfg_opt, model) -> Optimizer:
@@ -96,14 +104,19 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         Raises:
             NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
         """
-        self.dist = build_distributed(self.cfg.get("distributed", {}))
-        torch.manual_seed(self.cfg.get("seed", 42) + self.dist.rank)
+        self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
+        model_wrapper = None
+        if 'distributed' in self.cfg:
+            model_wrapper = self.cfg.distributed.instantiate(world_size=self.dist_env.world_size)
+            print(model_wrapper)
+        torch.manual_seed(self.cfg.get("seed", 42) + self.dist_env.rank)
 
         # Build components
-        self.model = build_model(self.dist.device, self.cfg.model)
-        self.optimizer = build_optimizer(self.dist.device, self.cfg.optimizer, self.model)
-        self.loss_fn   = build_loss_fn(self.dist.device, self.cfg.loss_fn)
-        self.dataloader = build_dataloader(self.dist.device, self.cfg.dataset, self.cfg.dataloader)
+        self.model = build_model(self.dist_env.device, model_wrapper, self.cfg.model)
+        # quit()
+        self.optimizer = build_optimizer(self.dist_env.device, self.cfg.optimizer, self.model)
+        self.loss_fn   = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
+        self.dataloader = build_dataloader(self.dist_env.device, self.cfg.dataset, self.cfg.dataloader)
 
         # Scheduler
         self.scheduler = StepScheduler(
@@ -124,15 +137,15 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             for batch_idx, batch in enumerate(self.dataloader):
                 is_grad, is_ckpt = self.scheduler.update(batch_idx)
                 loss = self._run_train_step(batch, is_grad)
-                # if self.dist.is_main and is_ckpt:
+                # if self.dist_env.is_main and is_ckpt:
                 #     self._save_checkpoint()
-                if self.dist.is_main and is_grad:
+                if self.dist_env.is_main and is_grad:
                     print(f"step {self.scheduler.step} | loss {loss.item():.4f}", flush=True)
 
 
     # ------------------ helpers ------------------
     def _run_train_step(self, batch, is_grad):
-        batch = {k: v.to(self.dist.device) for k, v in batch.items()}
+        batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
         labels = batch.pop("labels")
         mask   = batch.pop("loss_mask", None)
 
