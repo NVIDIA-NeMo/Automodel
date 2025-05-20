@@ -5,7 +5,7 @@ training:
   eval_iters: 4
   exit_signal_handler: true
 
-distributed:
+dist_env:
   backend: nccl
   timeout_minutes: 1
 
@@ -17,6 +17,10 @@ rng:
 model:
   _target_: transformers.AutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+
+distributed:
+  _target_: automodel.distributed.fsdp2.FSDP2Manager
+
 
 loss_fn: automodel.loss.masked_ce.masked_cross_entropy
 
