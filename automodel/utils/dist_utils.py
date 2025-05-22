@@ -109,7 +109,7 @@ import torch
 import torch.distributed
 import yaml
 
-from nemo_lm.automodel.utils.yaml_utils import safe_yaml_representers
+from automodel.utils.yaml_utils import safe_yaml_representers
 
 
 def get_rank_safe() -> int:

@@ -4,7 +4,7 @@ from functools import partial
 
 import datasets
 from datasets import load_dataset
-from nemo_lm.automodel.datasets.utils import SFTSingleTurnPreprocessor
+from automodel.datasets.utils import SFTSingleTurnPreprocessor
 
 class HellaSwag:
     def __init__(self, path_or_dataset, tokenizer, split):

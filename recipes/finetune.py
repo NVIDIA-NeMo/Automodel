@@ -6,9 +6,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from nemo_lm.automodel.config.loader import load_yaml_config
-from nemo_lm.automodel.training.init_utils import initialize_distributed
-from nemo_lm.automodel.base_recipe import BaseRecipe
+from automodel.config.loader import load_yaml_config
+from automodel.training.init_utils import initialize_distributed
+from automodel.base_recipe import BaseRecipe
 
 
 # ---------------------------

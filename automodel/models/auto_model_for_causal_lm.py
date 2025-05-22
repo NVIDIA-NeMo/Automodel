@@ -20,11 +20,11 @@ import torch.nn as nn
 import torch.distributed as dist
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 
-from nemo_lm.automodel.utils.dist_utils import FirstRankPerNode
-from nemo_lm.automodel.loss import masked_cross_entropy
-from nemo_lm.automodel.loss.linear_ce import HAVE_LINEAR_LOSS_CE, fused_linear_cross_entropy
+from automodel.utils.dist_utils import FirstRankPerNode
+from automodel.loss import masked_cross_entropy
+from automodel.loss.linear_ce import HAVE_LINEAR_LOSS_CE, fused_linear_cross_entropy
 # from nemo.utils import logging
-from nemo_lm.automodel.utils.import_utils import safe_import
+from automodel.utils.import_utils import safe_import
 
 
 @torch.no_grad()

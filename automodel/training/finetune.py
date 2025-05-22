@@ -23,29 +23,29 @@ import torch
 from torch.nn.parallel import DistributedDataParallel
 from transformers import AutoTokenizer
 
-from nemo_lm.automodel.checkpointing import (
+from automodel.checkpointing import (
     checkpoint_and_decide_exit,
     checkpoint_exists,
     load_checkpoint,
     save_checkpoint_and_time,
 )
-from nemo_lm.automodel.components.state import GlobalState
-from nemo_lm.automodel.config import ConfigContainer
-from nemo_lm.automodel.utils.distributed_utils import initialize_automodel
-from nemo_lm.automodel.utils.train_utils import (
+from automodel.components.state import GlobalState
+from automodel.config import ConfigContainer
+from automodel.utils.distributed_utils import initialize_automodel
+from automodel.utils.train_utils import (
     eval_log,
     reduce_loss,
     training_log,
 )
 from nemo_lm.config.common import ProfilingConfig
-from nemo_lm.automodel.utils.common_utils import (
+from automodel.utils.common_utils import (
     append_to_progress_log,
     barrier_and_log,
     get_rank_safe,
     get_world_size_safe,
     print_rank_0,
 )
-from nemo_lm.automodel.utils.log_utils import setup_logging
+from automodel.utils.log_utils import setup_logging
 
 logger = logging.getLogger(__name__)
 

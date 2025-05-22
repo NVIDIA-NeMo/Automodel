@@ -24,11 +24,11 @@ import numpy as np
 import torch
 from torch.nn import Module
 
-# from nemo_lm.automodel.components.state import GlobalState, TrainState
-# from nemo_lm.automodel.config import ConfigContainer
-# from nemo_lm.automodel.utils.model_utils import unwrap_model
-# from nemo_lm.automodel.utils import wandb_utils
-from nemo_lm.automodel.training.checkpoint_utils import (
+# from automodel.components.state import GlobalState, TrainState
+# from automodel.config import ConfigContainer
+# from automodel.utils.model_utils import unwrap_model
+# from automodel.utils import wandb_utils
+from automodel.training.checkpoint_utils import (
     TRACKER_PREFIX,
     checkpoint_exists,
     get_checkpoint_run_config_filename,
@@ -36,8 +36,8 @@ from nemo_lm.automodel.training.checkpoint_utils import (
     read_run_config,
     read_train_state,
 )
-# from nemo_lm.automodel.utils.checkpoint_utils import TRAIN_STATE_FILE
-from nemo_lm.automodel.utils.dist_utils import (
+# from automodel.utils.checkpoint_utils import TRAIN_STATE_FILE
+from automodel.utils.dist_utils import (
     get_local_rank_preinit,
     get_rank_safe,
     get_world_size_safe
