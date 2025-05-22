@@ -219,5 +219,4 @@ setuptools.setup(
     # Custom commands.
     cmdclass={'style': StyleCommand},
     dependency_links=['https://pypi.nvidia.com/'],
-    setup_requires=['setuptools>=45', 'wheel', 'torch==2.6.0', 'wheel_stub', 'pybind11', 'Cython>=3.0.0'],
 )
