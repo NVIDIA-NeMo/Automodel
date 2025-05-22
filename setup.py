@@ -25,7 +25,7 @@ from itertools import chain
 
 import setuptools
 
-spec = importlib.util.spec_from_file_location('package_info', './package_info.py')
+spec = importlib.util.spec_from_file_location('package_info', 'automodel/package_info.py')
 if spec is None:
     raise ImportError("Failed to import package_info")
 
