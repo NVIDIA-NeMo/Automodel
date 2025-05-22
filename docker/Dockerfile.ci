@@ -34,7 +34,7 @@ RUN --mount=type=bind,source=setup.py,target=/workspace/setup.py \
     --mount=type=bind,source=package_info.py,target=/workspace/package_info.py \
     --mount=type=bind,source=README.md,target=/workspace/README.md \
     --mount=type=bind,source=requirements,target=/workspace/requirements \
-    pip install --no-build-isolation --no-cache-dir '.[all]'
+    pip install --no-build-isolation --no-cache-dir .
 
 # Install development versions
 RUN pip install --no-cache-dir --upgrade \
