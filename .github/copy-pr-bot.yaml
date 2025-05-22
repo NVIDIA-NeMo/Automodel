@@ -1,0 +1,17 @@
+enabled: true
+additional_trustees:
+  - ericharper
+  - ko3n1g
+  - chtruong814
+  - thomasdhc
+  - pablo-garay
+  - akoumpa
+additional_vetters:
+  - ericharper
+  - ko3n1g
+  - chtruong814
+  - thomasdhc
+  - pablo-garay
+  - akoumpa
+auto_sync_draft: false
+auto_sync_ready: true
