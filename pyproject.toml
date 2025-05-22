@@ -1,0 +1,25 @@
+[project]
+name = "nemo-lm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Hemil Desai", email = "hemild@nvidia.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.6.0",
+    "datasets>=3.5.1",
+    "numpy>=2.2.5",
+    "omegaconf>=2.3.0",
+    "packaging>=25.0",
+    "tensorboard>=2.19.0",
+    "torch>=2.7.0",
+    "transformers>=4.51.3",
+    "wandb>=0.19.10",
+]
+
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
