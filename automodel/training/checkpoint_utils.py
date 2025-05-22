@@ -7,7 +7,7 @@ from typing import Any, Optional, Type, TypeVar
 import torch
 import yaml
 
-from nemo_lm.automodel.utils.dist_utils import (
+from automodel.utils.dist_utils import (
     get_local_rank_preinit,
     get_rank_safe,
     get_world_size_safe
