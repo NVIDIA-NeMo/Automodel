@@ -51,7 +51,7 @@ jobs:
         run: |
           LAST_PRS=$(gh api graphql -f query='
             query {
-              repository(owner: "NVIDIA", name: "NeMo-Export-Deploy") {
+              repository(owner: "NVIDIA", name: "NeMo-Automodel") {
                 pullRequests(states: MERGED, first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
                   nodes {
                     number
