@@ -1,0 +1,138 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+name: CICD NeMo
+on:
+  schedule:
+    - cron: 0 0 * * *
+  push:
+    branches:
+      - main
+      - "pull-request/[0-9]+"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'main' }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  pre-flight:
+    runs-on: ubuntu-latest
+    outputs:
+      is_ci_workload: ${{ steps.is_ci_workload.outputs.main }}
+      no_fail_fast: ${{ steps.no_fail_fast.outputs.main }}
+    env:
+      TESTS_TO_RUN: ${{ inputs.test_to_run }}
+      EVENT_NAME: ${{ github.event_name }}
+      HAS_LABEL: ${{ github.event.label.name == 'Run CICD' }}
+    steps:
+      - name: Check if this is a CI workload
+        shell: bash
+        id: is_ci_workload
+        run: |
+          branch_name=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}
+
+          if [[ "$branch_name" =~ ^bump-ci-container || "$EVENT_NAME" == "schedule" ]]; then
+            is_ci_workload=true
+            echo "main=true" | tee -a "$GITHUB_OUTPUT"
+          else
+            is_ci_workload=false
+          fi
+
+          echo "main=$is_ci_workload" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Check if no-fail-fast is set
+        shell: bash
+        id: no_fail_fast
+        env:
+          HAS_FAIL_FAST_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'no-fail-fast') }}
+        run: |
+          if [[ "$HAS_FAIL_FAST_LABEL" == "true" || "$EVENT_NAME" == "schedule" ]]; then
+            no_fail_fast=true
+          else
+            no_fail_fast=false
+          fi
+
+          echo "main=$no_fail_fast" | tee -a "$GITHUB_OUTPUT"
+
+  cicd-wait-in-queue:
+    needs: [pre-flight]
+    runs-on: ubuntu-latest
+    environment: test
+    if: |
+      needs.pre-flight.outputs.test_to_run != '[]' 
+      && needs.pre-flight.outputs.components_to_run != '[]'
+      && needs.pre-flight.outputs.is_ci_workload == 'false'
+    steps:
+      - name: Running CI tests
+        run: |
+          echo "Running CI tests"
+
+  cicd-container-build:
+    uses: ./.github/workflows/_build_container.yml
+    needs: [pre-flight, cicd-wait-in-queue]
+    if: |
+      needs.pre-flight.outputs.test_to_run != '[]' 
+      && needs.pre-flight.outputs.components_to_run != '[]'
+      && (
+        success() 
+        || (
+          needs.cicd-wait-in-queue.result == 'skipped'
+          && needs.pre-flight.outputs.is_ci_workload == 'true'
+        )
+      )
+      && !cancelled()
+    with:
+      image-name: nemo_container
+      dockerfile: docker/Dockerfile.ci
+    secrets:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+#   cicd-unit-tests:
+#     strategy:
+#       fail-fast: false
+#       matrix:
+#         include:
+#           - script: L0_Unit_Tests_GPU_Export_Deploy
+#             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+#             timeout: 30
+#           - script: L0_Unit_Tests_CPU_Export_Deploy
+#             runner: linux-amd64-cpu16
+#             cpu-only: true
+#     needs: [cicd-container-build]
+#     runs-on: ${{ matrix.runner }}
+#     name: ${{ matrix.script }}
+#     environment: nemo-ci
+#     steps:
+#       - name: Checkout
+#         uses: actions/checkout@v4
+#         with:
+#           path: ${{ github.run_id }}
+#       - name: main
+#         uses: NVIDIA/NeMo-Export-Deploy/.github/actions/test-template@main
+#         with:
+#           runner: ${{ runner.name }}
+#           script: ${{ matrix.script }}
+#           timeout: ${{ matrix.timeout || 10 }}
+#           is_unit_test: "true"
+#           image: nemo_container
+#           cpu-only: ${{ matrix.cpu-only || false }}
+#           has-azure-credentials: "true"
+#           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+#           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+#           azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
