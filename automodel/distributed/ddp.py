@@ -1,9 +1,8 @@
-# ddp_utils.py
 import os
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-
+from dataclasses import dataclass, field
 
 @dataclass
 class DDPManager:
