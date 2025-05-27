@@ -152,7 +152,7 @@ class FSDP2Manager:
             self.device_mesh[("data_parallel", "context_parallel")]._flatten(mesh_dim_name="dp_cp")
         return self
 
-    def parallelize(self, model):
+    def parallelize(self, model, use_hf_tp_plan=False):
         """
         Parallelizes the given model using FSDP2 and TP sharding strategies.
 
