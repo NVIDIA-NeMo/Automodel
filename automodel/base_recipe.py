@@ -2,6 +2,17 @@ import torch.nn as nn
 from torch.optim import Optimizer
 
 def has_load_restore_state(object):
+    """ Checks whether object has load_state_dict and state_dict functions, ie whether the object
+    follows the nn.Module API.
+
+    TODO: also need to check function signatures.
+
+    Args:
+        object (any): the object to check.
+
+    Returns:
+        bool: returns True if has callable load_state_dict and state_dict
+    """
     return all(
         callable(getattr(object, attr, None))
         for attr in ('load_state_dict', 'state_dict')
