@@ -206,7 +206,6 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Build components
         self.model = build_model(self.dist_env.device, model_wrapper, self.cfg.model)
-        # quit()
         self.optimizer = build_optimizer(self.dist_env.device, self.cfg.optimizer, self.model)
         self.loss_fn   = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
         self.dataloader = build_dataloader(self.dist_env.device, self.cfg.dataset, self.cfg.dataloader)
