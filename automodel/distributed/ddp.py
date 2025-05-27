@@ -80,7 +80,7 @@ class DDPManager:
         """
         return DDP(
             model.to(self.device),
-            device_ids=[device] if device.type == "cuda" else None
+            device_ids=[self.device] if self.device.type == "cuda" else None
         )
 
     # @contextmanager
