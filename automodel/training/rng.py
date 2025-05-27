@@ -19,8 +19,28 @@ import torch
 from automodel.utils.dist_utils import get_rank_safe
 
 class StatefulRNG:
+    """
+    A class to handle random number generator (RNG) states for reproducibility
+    across Python's random module, NumPy, and PyTorch, including CUDA.
+
+    The RNG state can be captured and restored, making it useful in settings
+    where reproducible experiments are essential.
+    """
+
     def __init__(self, seed: int, ranked: bool = False):
-        """Set random seed for reproducability."""
+        """
+        Initialize the RNG states using a provided seed and optionally
+        modify the seed based on the rank of the process.
+
+        Parameters:
+            seed (int): A positive integer used as the base seed for all RNGs.
+            ranked (bool): Flag indicating whether to adjust the seed based on
+                           the process rank. Default is False.
+
+        Raises:
+            AssertionError: If `seed` is not an integer or is not positive,
+                            or if `ranked` is not a boolean.
+        """
         assert isinstance(seed, int), "Expected seed to be of type int"
         assert seed > 0, "Expected seed ({}) to be a positive integer.".format(seed)
         assert isinstance(ranked, bool), "Expected ranked to a bool"
@@ -34,8 +54,17 @@ class StatefulRNG:
         torch.cuda.manual_seed(seed)
 
     def state_dict(self):
-        """Capture Python / NumPy / Torch RNG states for reproducibility."""
+        """
+        Capture the current random number generator states for Python,
+        NumPy, and PyTorch (including CUDA).
 
+        Returns:
+            dict: A dictionary containing the RNG states with the keys:
+                - "random_rng_state": The state of Python's random module.
+                - "np_rng_state": The state of NumPy's random module.
+                - "torch_rng_state": The state of PyTorch's CPU random generator.
+                - "cuda_rng_state": The state of PyTorch's CUDA random generators.
+        """
         return {
             "random_rng_state": random.getstate(),
             "np_rng_state": np.random.get_state(),
@@ -44,8 +73,14 @@ class StatefulRNG:
         }
 
     def load_state_dict(self, state):  # pragma: no cover
-        """Restore RNG state collected by :func:`_collect_rng_state`."""
+        """
+        Restore the random number generator states for Python, NumPy, and PyTorch
+        (including CUDA) from a previously captured state dictionary.
 
+        Parameters:
+            state (dict): A dictionary containing the RNG states as returned
+                          by the `state_dict()` method.
+        """
         random.setstate(state["random_rng_state"])
         np.random.set_state(state["np_rng_state"])
         torch.set_rng_state(state["torch_rng_state"])
