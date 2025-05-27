@@ -6,6 +6,12 @@ additional_trustees:
   - thomasdhc
   - pablo-garay
   - akoumpa
+  - adil-a
+  - ananthsub
+  - athitten
+  - hemildesai
+  - maanug-nv
+  - mckimm
 additional_vetters:
   - ericharper
   - ko3n1g
@@ -13,5 +19,11 @@ additional_vetters:
   - thomasdhc
   - pablo-garay
   - akoumpa
+  - adil-a
+  - ananthsub
+  - athitten
+  - hemildesai
+  - maanug-nv
+  - mckimm
 auto_sync_draft: false
 auto_sync_ready: true
