@@ -196,7 +196,8 @@ class ConfigNode:
 
         Returns:
             The configuration value or the default value.
-        """        parts = key.split(".")
+        """
+        parts = key.split(".")
         current = self
         # TODO(@akoumparouli): reduce?
         for p in parts:
