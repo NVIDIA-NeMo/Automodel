@@ -35,7 +35,7 @@ def build_model(device, model_wrapper, cfg_model) -> nn.Module:
         model = model_wrapper.parallelize(model)
     return model.to(device)
 
-def build_optimizer(device, cfg_opt, model) -> Optimizer:
+def build_optimizer(device, cfg_opt, model) -> 'Optimizer':
     """
     Build an optimizer for the model.
 
@@ -81,7 +81,7 @@ def build_dataloader(device, cfg_ds, cfg_dl) -> DataLoader:
     sampler = torch.utils.data.distributed.DistributedSampler(ds)
     return cfg_dl.instantiate(dataset=ds, sampler=sampler)
 
-def build_distributed(cfg_dist: Dict[str, Any]) -> DistInfo:
+def build_distributed(cfg_dist: Dict[str, Any]) -> 'DistInfo':
     """
     Build and initialize distributed training resources.
 
