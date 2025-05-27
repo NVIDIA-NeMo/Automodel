@@ -219,8 +219,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
 
         # Optionally resume
-        if path := self.cfg.get("restore_from"):
-            raise NotImplemented("TODO")
+        if (path := self.cfg.get("restore_from")) is not None:
+            raise NotImplemented("TODO resume from {}".format(path))
 
     # ------------------ main loop ------------------
     def run_train_validation_loop(self):
@@ -258,8 +258,6 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         mask   = batch.pop("loss_mask", None)
 
         out  = self.model(**batch)
-        # print(batch)
-        # quit()
         loss = self.loss_fn(out.logits.view(-1, out.logits.size(-1)),
                             labels.view(-1), mask=mask)
         loss.backward()
