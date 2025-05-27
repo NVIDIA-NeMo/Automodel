@@ -405,6 +405,11 @@ def gpu_only_import_from(module, symbol, *, alt=None):
 
 
 def get_torch_version():
+    """return pytorch version with fallback if unavailable
+
+    Returns:
+        PkgVersion: Pytorch's version
+    """
     try:
         _torch_version = PkgVersion(torch.__version__)
     except Exception:
