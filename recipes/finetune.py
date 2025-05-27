@@ -16,40 +16,96 @@ from automodel.base_recipe import BaseRecipe
 # ---------------------------
 
 def build_model(device, model_wrapper, cfg_model) -> nn.Module:
+    """
+    Build and initialize a model.
+
+    Args:
+        device: The target device.
+        model_wrapper: A potential wrapper providing parallelism.
+        cfg_model: Configuration for model instantiation.
+
+    Returns:
+        The instantiated model on the specified device.
+    """
     model = cfg_model.instantiate()
     for m in model.modules():
         if isinstance(m, nn.Embedding):
             m.weight.requires_grad_(False)
-    if model_wrapper is not None:
+    if model_wrapper is not None and callable(getattr(model_wrapper, 'parallelize', None)):
         model = model_wrapper.parallelize(model)
-    # print(model)
-    # quit()
     return model.to(device)
 
 def build_optimizer(device, cfg_opt, model) -> Optimizer:
+    """
+    Build an optimizer for the model.
+
+    Args:
+        device: The target device.
+        cfg_opt: Configuration for optimizer instantiation.
+        model: The model whose parameters will be optimized.
+
+    Returns:
+        The instantiated optimizer.
+    """
     return cfg_opt.instantiate(params=model.parameters())
 
 def build_loss_fn(device, cfg_loss):
+    """
+    Build a loss function.
+
+    Args:
+        device: The target device.
+        cfg_loss: Loss function configuration or a callable loss function.
+
+    Returns:
+        The instantiated loss function on the specified device.
+    """
     if callable(cfg_loss):
         return cfg_loss
     else:
         return cfg_loss.instantiate().to(device)
 
 def build_dataloader(device, cfg_ds, cfg_dl) -> DataLoader:
+    """
+    Build a DataLoader for the dataset.
+
+    Args:
+        device: The target device.
+        cfg_ds: Dataset configuration.
+        cfg_dl: DataLoader configuration.
+
+    Returns:
+        The instantiated DataLoader.
+    """
     ds = cfg_ds.instantiate()
     sampler = torch.utils.data.distributed.DistributedSampler(ds)
-    # , num_replicas=None, rank=None, shuffle=True, seed=0, drop_last=False)
     return cfg_dl.instantiate(dataset=ds, sampler=sampler)
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> DistInfo:
+    """
+    Build and initialize distributed training resources.
+
+    Args:
+        cfg_dist: Configuration dictionary for distributed training.
+
+    Returns:
+        Distributed training information from initialize_distributed.
+    """
     backend = cfg_dist.get("backend", "nccl")
     timeout = cfg_dist.get("timeout_minutes", 1)
     return initialize_distributed(backend=backend, timeout_minutes=timeout)
 
 class StepScheduler:
     """
-    Maintains counters and tells the trainer when to step/ckpt.
-    SRP: *time-base policy* ONLY.
+    Scheduler for managing gradient accumulation and checkpointing steps.
+
+    Attributes:
+        grad_acc_steps (int): Steps to accumulate gradients.
+        ckpt_every_steps (int): Interval steps for checkpointing.
+        epoch_len (Optional[int]): Length of an epoch (number of batches).
+        step (int): Global step counter.
+        epoch (int): Current epoch counter.
+        num_epochs (int): Total number of epochs.
     """
     def __init__(self,
                  grad_acc_steps: int,
@@ -58,18 +114,35 @@ class StepScheduler:
                  start_step: int = 0,
                  start_epoch: int = 0,
                  num_epochs: int = 0):
+        """
+        Initialize the StepScheduler.
 
+        Args:
+            grad_acc_steps (int): Number of steps for gradient accumulation.
+            ckpt_every_steps (int): Frequency of checkpoint steps.
+            epoch_len (Optional[int]): Number of batches per epoch.
+            start_step (int): Initial global step.
+            start_epoch (int): Initial epoch.
+            num_epochs (int): Total number of epochs.
+        """
         self.grad_acc_steps   = grad_acc_steps
         self.ckpt_every_steps = ckpt_every_steps
         self.epoch_len        = epoch_len
         self.step   = start_step
         self.epoch  = start_epoch
         self.num_epochs = num_epochs
-        # print('self.grad_acc_steps= '  +str(self.grad_acc_steps))
-        # quit()
 
     def update(self, batch_idx: int) -> Tuple[bool, bool]:
-        """Return (is_grad_step, is_ckpt_step) after incrementing step counter."""
+        """
+        Update the scheduler for the next batch.
+
+        Args:
+            batch_idx (int): Index of the current batch.
+
+        Returns:
+            Tuple[bool, bool]: A tuple of (is_grad_step, is_ckpt_step) indicating if a gradient
+            step and/or checkpoint step should be performed.
+        """
         self.step += 1
         is_grad = (self.step % self.grad_acc_steps) == 0
         last_batch = self.epoch_len is not None and batch_idx == self.epoch_len - 1
@@ -78,8 +151,21 @@ class StepScheduler:
 
     # (optional) persistence
     def state_dict(self):
+        """
+        Get the current state of the scheduler.
+
+        Returns:
+            dict: Current state with 'step' and 'epoch' keys.
+        """
         return {"step": self.step, "epoch": self.epoch}
+
     def load_state_dict(self, s):
+        """
+        Load the scheduler state from a dictionary.
+
+        Args:
+            s (dict): Dictionary containing 'step' and 'epoch'.
+        """
         self.step, self.epoch = s["step"], s["epoch"]
 
 
@@ -89,10 +175,17 @@ class StepScheduler:
 
 class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
     """
-    Orchestrates the full training life-cycle.
-    wiring + loop; no low-level domain logic.
+    Recipe for fine-tuning a model for next-token prediction.
+
+    This class orchestrates training, from setup to main training loop.
     """
     def __init__(self, cfg):
+        """
+        Initialize the recipe with configuration.
+
+        Args:
+            cfg: Configuration dictionary/object for training.
+        """
         self.cfg = cfg
 
     # ------------------ build phase ------------------
@@ -132,6 +225,12 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
     # ------------------ main loop ------------------
     def run_train_validation_loop(self):
+        """
+        Run the training loop over all epochs and batches.
+
+        For each batch, perform a forward pass, compute loss, backpropagate,
+        and update model parameters when necessary. Also prints loss every gradient step.
+        """
         self.model.train()
         for self.scheduler.epoch in range(self.scheduler.epoch, self.scheduler.num_epochs):
             for batch_idx, batch in enumerate(self.dataloader):
@@ -145,6 +244,16 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
     # ------------------ helpers ------------------
     def _run_train_step(self, batch, is_grad):
+        """
+        Execute a single training step.
+
+        Args:
+            batch: Batch of training data.
+            is_grad: Flag indicating if a gradient step should be applied.
+
+        Returns:
+            Detached loss from the training step.
+        """
         batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
         labels = batch.pop("labels")
         mask   = batch.pop("loss_mask", None)
@@ -173,6 +282,11 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         return loss.detach()
 
     def _save_checkpoint(self):
+        """
+        Save the current training state as a checkpoint.
+
+        Currently iterates over state-tracked attributes and saves their state_dict.
+        """
         path = self.cfg.get("ckpt_path", "latest.pt")
         for key in self.__dict__['__state_tracked']:
             torch.save(getattr(self, key).state_dict(),
@@ -185,6 +299,11 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 # ---------------------------------------------------------------------------
 
 def main():
+    """
+    Main entry point for the fine-tuning recipe.
+
+    Loads the configuration, sets up the trainer, and initiates the training loop.
+    """
     cfg = load_yaml_config("llama_3_2_1b_hellaswag.yaml")
     trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
