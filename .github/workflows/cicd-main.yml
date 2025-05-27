@@ -96,7 +96,7 @@ jobs:
       )
       && !cancelled()
     with:
-      image-name: nemo_container
+      image-name: nemo_automodel
       dockerfile: docker/Dockerfile.ci
     secrets:
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
