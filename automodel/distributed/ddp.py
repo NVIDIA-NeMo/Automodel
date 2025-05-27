@@ -3,30 +3,20 @@ import os
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DistributedSampler, DataLoader
-from contextlib import contextmanager
-from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Union
-
-@dataclass
-class CheckpointIO:
-    """Simple disk-based checkpoint I/O."""
-
-    def save(self, state: Dict[str, Any], path: Union[str, Path]):
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(state, path)
-
-    def load(self, path: Union[str, Path]) -> Dict[str, Any]:
-        return torch.load(path, map_location="cpu")
+from typing import Any, Dict, Union
 
 
 @dataclass
 class DDPManager:
-    checkpoint_io: CheckpointIO = field(
-        default_factory=CheckpointIO,
-        metadata={"help": "Helper for checkpoint save/load (disk, S3, etc.)."}
-    )
+    """
+    Manages setting up distributed training using PyTorch's distributed package and wraps a model
+    with DistributedDataParallel (DDP).
+
+    Attributes:
+        backend (str): The distributed backend to use (e.g. "nccl" or "gloo"). Defaults to "nccl".
+        rank (int): Global rank of this process. This is set during distributed setup.
+        world_size (int): Total number of processes in the distributed group. Set at distributed setup.
+    """
     backend: str = field(
         default="nccl",
         default_factory=str,
@@ -47,8 +37,16 @@ class DDPManager:
 
     def setup_distributed(self):
         """
-        Initialize torch.distributed process group and wrap raw_model in DDP.
-        Requires env vars: RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT.
+        Initialize the torch.distributed process group and set up device configuration.
+
+        This method requires the following environment variables to be set:
+            - RANK: Global rank of the process.
+            - WORLD_SIZE: Total number of processes.
+            - MASTER_ADDR: Address of the master node.
+            - MASTER_PORT: Port on which the master node is listening.
+
+        The method sets the `rank` and `world_size` of the DDPManager,
+        configures the device (GPU for 'nccl' backend, CPU otherwise), and initializes the process group.
         """
         if not dist.is_initialized():
             rank = int(os.environ["RANK"])
@@ -64,44 +62,41 @@ class DDPManager:
         if self.backend == "nccl":
             local_gpu = self.rank % torch.cuda.device_count()
             torch.cuda.set_device(local_gpu)
-            device = torch.device("cuda", index=local_gpu)
+            self.device = torch.device("cuda", index=local_gpu)
         else:
-            device = torch.device("cpu")
+            self.device = torch.device("cpu")
 
     def wrap_model(self, model):
-        model.to(device)
-        # wrap in DDP
-        return DDP(model, device_ids=[device] if device.type == "cuda" else None)
+        """
+        Wraps the given model with DistributedDataParallel (DDP).
+
+        Moves the model to the initialized device before wrapping. For CUDA devices,
+        the device id is passed to DDP as device_ids; for CPU, no device ids are provided.
+
+        Args:
+            model (torch.nn.Module): The PyTorch model to be wrapped.
+
+        Returns:
+            torch.nn.parallel.DistributedDataParallel: The DDP-wrapped model.
+        """
+        return DDP(
+            model.to(self.device),
+            device_ids=[device] if device.type == "cuda" else None
+        )
 
     # @contextmanager
     # def no_sync(self):
     #     """
-    #     Context manager to skip gradient all‐reduce (for gradient accumulation):
+    #     Context manager to temporarily disable gradient synchronization during backpropagation.
+    #
+    #     This can be used for gradient accumulation:
     #         with manager.no_sync():
-    #             ...
+    #             loss.backward()
+    #
+    #     When used within a DDP-wrapped model, it skips the gradient all‐reduce.
     #     """
     #     if isinstance(self.model, DDP):
     #         with self.model.no_sync():
     #             yield
     #     else:
     #         yield
-
-    def save_checkpoint(self, state: Dict[str, Any], path: Union[str, Path]):
-        """
-        Barrier + save on rank 0.
-        state: dict of tensors (e.g. {"model": model_state, "opt": opt_state})
-        """
-        dist.barrier()
-        if self.rank == 0:
-            self.checkpoint_io.save(state, path)
-
-    def load_checkpoint(self, path: Union[str, Path]) -> Dict[str, Any]:
-        """
-        Load on rank 0 and broadcast any tensor entries to all ranks.
-        Returns the state dict.
-        """
-        state = self.checkpoint_io.load(path)
-        for k, v in state.items():
-            if torch.is_tensor(v):
-                dist.broadcast(v, src=0)
-        return state
