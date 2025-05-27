@@ -1,15 +1,11 @@
 import contextlib
-import io
 import signal
-from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path
-from typing import Any, Dict, Generator, Iterable, List, Optional, Set, Tuple, Union, cast
+from typing import Dict, Generator, List, Optional, Set, Union
 
 import torch
 from torch import Tensor, nn
-from torch.distributed._sharded_tensor import ShardedTensor as TorchShardedTensor
-from torch.distributed._tensor import DTensor, Replicate, Shard
+from torch.distributed._tensor import DTensor, Replicate
 from torch.distributed.device_mesh import DeviceMesh, _mesh_resources
 from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, SequenceParallel, parallelize_module
 

@@ -29,6 +29,16 @@ from automodel.utils.dist_utils import (
 
 @dataclass
 class DistInfo:
+    """
+    Holds information about the distributed training environment.
+
+    Attributes:
+        backend (str): The backend used for torch.distributed (e.g., 'nccl').
+        rank (int): The rank of the current process.
+        world_size (int): The total number of processes.
+        device (torch.device): The device assigned to the current process.
+        is_main (bool): True if the process is the main process (rank 0).
+    """
     backend: str
     rank: int
     world_size: int
@@ -38,8 +48,20 @@ class DistInfo:
 def initialize_distributed(
     backend, timeout_minutes=1,
 ):
-    """Initialize torch.distributed and core model parallel."""
+    """
+    Initialize the torch.distributed environment and core model parallel infrastructure.
 
+    This function sets the device based on the local rank, configures the process group,
+    and calls torch.distributed.init_process_group with the appropriate parameters.
+    It also registers a cleanup function to properly destroy the process group at exit.
+
+    Args:
+        backend (str): The backend to use for torch.distributed (e.g., 'nccl').
+        timeout_minutes (int, optional): Timeout (in minutes) for distributed initialization. Defaults to 1.
+
+    Returns:
+        DistInfo: An instance containing the distributed environment configuration.
+    """
     device_count = torch.cuda.device_count()
     if torch.distributed.is_initialized():
         if get_rank_safe() == 0:
@@ -88,6 +110,12 @@ def initialize_distributed(
 
 
 def destroy_global_state():
+    """
+    Destroy the torch.distributed process group during cleanup.
+
+    This function is registered to execute at exit to ensure the process group is properly destroyed.
+    It temporarily ignores SIGINT to avoid interruption during cleanup.
+    """
     # Don't allow Ctrl+C to interrupt this handler
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     if torch.distributed.is_available() and torch.distributed.is_initialized():
