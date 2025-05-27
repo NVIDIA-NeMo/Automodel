@@ -55,7 +55,7 @@ class ConfigNode:
                 return v
 
     def instantiate(self, *args, **kwargs):
-       """
+        """
         Instantiate the target object specified in the configuration.
 
         This method looks for the "_target_" attribute in the configuration and resolves
