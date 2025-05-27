@@ -31,7 +31,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 WORKDIR /workspace
 RUN --mount=type=bind,source=setup.py,target=/workspace/setup.py \
     --mount=type=bind,source=automodel/__init__.py,target=/workspace/automodel/__init__.py \
-    --mount=type=bind,source=automodel/package_info.py,target=/workspace/package_info.py \
+    --mount=type=bind,source=automodel/package_info.py,target=/workspace/automodel/package_info.py \
     --mount=type=bind,source=README.md,target=/workspace/README.md \
     --mount=type=bind,source=requirements,target=/workspace/requirements \
     pip install --no-build-isolation --no-cache-dir .
