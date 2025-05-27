@@ -38,7 +38,7 @@ dataloader:
   batch_size: 1
 
 validation_dataset:
-  _target_: automodel.datasets.hellaswag.hellaswag
+  _target_: automodel.datasets.llm.hellaswag.hellaswag
   path_or_dataset: rowan/hellaswag
   split: train
   tokenizer:
