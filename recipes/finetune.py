@@ -1,6 +1,4 @@
 from __future__ import annotations
-import sys
-sys.path.insert(0, '/mnt/4tb/nemo_lm/')
 
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
@@ -41,7 +39,9 @@ def build_loss_fn(device, cfg_loss):
 
 def build_dataloader(device, cfg_ds, cfg_dl) -> DataLoader:
     ds = cfg_ds.instantiate()
-    return cfg_dl.instantiate(dataset=ds)
+    sampler = torch.utils.data.distributed.DistributedSampler(ds)
+    # , num_replicas=None, rank=None, shuffle=True, seed=0, drop_last=False)
+    return cfg_dl.instantiate(dataset=ds, sampler=sampler)
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> DistInfo:
     backend = cfg_dist.get("backend", "nccl")
@@ -67,6 +67,8 @@ class StepScheduler:
         self.step   = start_step
         self.epoch  = start_epoch
         self.num_epochs = num_epochs
+        # print('self.grad_acc_steps= '  +str(self.grad_acc_steps))
+        # quit()
 
     def update(self, batch_idx: int) -> Tuple[bool, bool]:
         """Return (is_grad_step, is_ckpt_step) after incrementing step counter."""
@@ -140,7 +142,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # if self.dist_env.is_main and is_ckpt:
                 #     self._save_checkpoint()
                 if self.dist_env.is_main and is_grad:
-                    print(f"step {self.scheduler.step} | loss {loss.item():.4f}", flush=True)
+                    print(f"step {self.scheduler.step} | loss {loss.item():.6f}", flush=True)
 
 
     # ------------------ helpers ------------------
@@ -150,12 +152,24 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         mask   = batch.pop("loss_mask", None)
 
         out  = self.model(**batch)
+        # print(batch)
+        # quit()
         loss = self.loss_fn(out.logits.view(-1, out.logits.size(-1)),
                             labels.view(-1), mask=mask)
         loss.backward()
 
         if is_grad:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            #         if self.cfg.training.get("calculate_per_token_loss", False):
+            # world_size = get_world_size_safe()
+            # num_tokens_for_grad_scaling = self.total_num_tokens.clone().detach()
+            # dist.all_reduce(num_tokens_for_grad_scaling)
+                # DDP reduces across ranks, so we need to scale by the world size to inverse it
+            scaling_factor = 109 #world_size / num_tokens_for_grad_scaling
+            # print('scaling_factor= ' + str(scaling_factor))
+            for param in self.model.parameters():
+                if param.grad is not None:
+                    param.grad.data.mul_(scaling_factor)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0, foreach=True)
             self.optimizer.step()
             self.optimizer.zero_grad()
         return loss.detach()

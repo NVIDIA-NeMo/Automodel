@@ -11,7 +11,7 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor._api import distribute_tensor
 from torch.distributed.tensor.placement_types import Replicate, Shard
-from nemo_lm.automodel.utils.import_utils import safe_import_from
+from automodel.utils.import_utils import safe_import_from
 from dataclasses import dataclass, field
 
 MixedPrecisionPolicy, HAS_MIXED_PRECISION_POLICY = safe_import_from(
@@ -23,20 +23,7 @@ fully_shard, HAS_FULLY_SHARD = safe_import_from(
 CPUOffloadPolicy, HAS_CPU_OFFLOAD_POLICY = safe_import_from(
     "torch.distributed.fsdp", "CPUOffloadPolicy", fallback_module="torch.distributed._composable.fsdp"
 )
-from nemo_lm.automodel.distributed.parallelizer import fsdp2_strategy_parallelize
-
-
-
-@dataclass
-class CheckpointIO:
-    """Simple disk-based checkpoint I/O."""
-    def save(self, state: Dict[str, Any], path: Union[str, Path]):
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(state, p)
-
-    def load(self, path: Union[str, Path]) -> Dict[str, Any]:
-        return torch.load(path, map_location="cpu")
+from automodel.distributed.parallelizer import fsdp2_strategy_parallelize, get_hf_tp_shard_plan
 
 
 @dataclass
@@ -46,11 +33,11 @@ class FSDP2Manager:
         metadata={"help": "Data‐parallel group size; if None, infer from WORLD_SIZE."}
     )
     tp_size: Optional[int] = field(
-        default=None,
+        default=0,
         metadata={"help": "Tensor‐parallel group size; if None, defaults to 1."}
     )
     cp_size: int = field(
-        default=1,
+        default=0,
         metadata={"help": "Context‐parallel group size (for pipeline‐like sharding)."}
     )
     sequence_parallel: bool = field(
@@ -123,11 +110,6 @@ class FSDP2Manager:
         # flatten dp+cp if cp>1
         if self.cp_size > 1:
             self.device_mesh[("data_parallel", "context_parallel")]._flatten(mesh_dim_name="dp_cp")
-
-        # move base model to the right device before wrapping
-        # dev = torch.device("cuda" if self.backend=="nccl" else "cpu")
-        # self.raw_model.to(dev)
-        # self.model = self.raw_model  # will be replaced on parallelize()
         return self
 
     def parallelize(self, model):
@@ -135,12 +117,16 @@ class FSDP2Manager:
         Apply FSDP2 + TP sharding via the provided parallelize_fn.
         Must be called after setup_distributed().
         """
+        if use_hf_tp_plan:
+            tp_shard_plan = get_hf_tp_shard_plan(model)
+        else:
+            raise NotImplemented("todo")
+
         fsdp2_strategy_parallelize(
             model,
             device_mesh=self.device_mesh,
             mp_policy=self.mp_policy,
-            use_hf_tp_plan=False, #self.use_hf_tp,
-            tp_shard_plan=None, #self.tp_plan,
+            tp_shard_plan=tp_shard_plan,
             offload_policy=self.offload_policy,
         )
         return model

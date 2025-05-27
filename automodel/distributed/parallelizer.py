@@ -13,7 +13,7 @@ from torch.distributed._tensor import DTensor, Replicate, Shard
 from torch.distributed.device_mesh import DeviceMesh, _mesh_resources
 from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, SequenceParallel, parallelize_module
 
-from nemo_lm.automodel.utils.import_utils import safe_import_from
+from automodel.utils.import_utils import safe_import_from
 
 MixedPrecisionPolicy, HAS_MIXED_PRECISION_POLICY = safe_import_from(
     "torch.distributed.fsdp", "MixedPrecisionPolicy", fallback_module="torch.distributed._composable.fsdp"
@@ -25,19 +25,6 @@ CPUOffloadPolicy, HAS_CPU_OFFLOAD_POLICY = safe_import_from(
     "torch.distributed.fsdp", "CPUOffloadPolicy", fallback_module="torch.distributed._composable.fsdp"
 )
 
-    # tp_plan: Optional[Dict[str, Any]] = field(
-    #     default=None,
-    #     metadata={"help": "Custom TP shard plan dict; keys are module‐name regexps."}
-    # )
-    # use_hf_tp: bool = field(
-    #     default=True,
-    #     metadata={"help": "If True and no custom tp_plan, uses HuggingFace default plan."}
-    # )
-    # parallelize_fn: Callable = field(
-    #     default=None,
-    #     metadata={"help": "fn(model, device_mesh, mp_policy, use_hf_tp_plan, tp_plan, offload_policy)"}
-    # )
-
 
 # Taken and modified from torchtitan
 # https://github.com/pytorch/torchtitan/blob/main/torchtitan/parallelisms/parallelize_llama.py
@@ -45,7 +32,6 @@ def fsdp2_strategy_parallelize(
     model,
     device_mesh: DeviceMesh = None,
     mp_policy: MixedPrecisionPolicy = None,
-    use_hf_tp_plan: bool = False,
     tp_shard_plan: Optional[Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]] = None,
     offload_policy: 'CPUOffloadPolicy' = None,
 ):
@@ -95,16 +81,18 @@ def fsdp2_strategy_parallelize(
     dp_mesh = device_mesh[
         ("dp_cp" if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(device_mesh, {}) else "data_parallel")
     ]
-    tp_mesh = device_mesh["tensor_parallel"]
-
+    # print(dir(device_mesh))
+    # print(device_mesh.mesh_dim_names)
+    # quit()
     if dp_mesh.size() > 1:
         assert dp_mesh.ndim == 1, "Hybrid-sharding not supported"
 
-    # TP sharding
-    if tp_mesh.size() > 1:
-        if tp_shard_plan is None and use_hf_tp_plan:
-            tp_shard_plan = get_hf_tp_shard_plan(model)
-        parallelize_module(model, tp_mesh, tp_shard_plan)
+    if 'tensor_parallel' in device_mesh.mesh_dim_names:
+        tp_mesh = device_mesh["tensor_parallel"]
+        # TP sharding
+        if tp_mesh.size() > 1:
+            assert tp_shard_plan is not None
+            parallelize_module(model, tp_mesh, tp_shard_plan)
 
     # FSDP sharding
     assert dp_mesh.ndim == 1, "Hybrid-sharding not supported"
