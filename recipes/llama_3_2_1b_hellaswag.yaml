@@ -17,6 +17,9 @@ model:
 
 distributed:
   _target_: automodel.distributed.fsdp2.FSDP2Manager
+  dp_size: 1
+  tp_size: 1
+  cp_size: 1
 
 loss_fn: automodel.loss.masked_ce.masked_cross_entropy
 
