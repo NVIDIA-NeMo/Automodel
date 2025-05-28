@@ -20,6 +20,17 @@ from typing import Callable, Optional, Union
 
 logger = logging.getLogger(__name__)
 
+class RankFilter(logging.Filter):
+    def __init__(self, rank):
+        super().__init__()
+        self.rank = rank
+
+    def filter(self, record):
+        # If the log record explicitly requests to bypass the rank check, allow it.
+        if getattr(record, 'all_ranks', False):
+            return True
+        # Otherwise, only allow logs from rank 0.
+        return self.rank == 0
 
 def warning_filter(record: LogRecord) -> bool:
     """Logging filter to exclude WARNING level messages.
