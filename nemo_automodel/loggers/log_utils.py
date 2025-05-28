@@ -21,11 +21,42 @@ from typing import Callable, Optional, Union
 logger = logging.getLogger(__name__)
 
 class RankFilter(logging.Filter):
+    """
+    A logging filter that controls log output based on the process rank.
+
+    This filter allows log messages only for rank 0 by default.
+    If a log record has an attribute 'all_ranks' set to True,
+    the log message will always be output regardless of the process rank.
+    """
     def __init__(self, rank):
+        """
+        Decide whether to log the provided record.
+
+        If the log record has an attribute 'bypass_rank_filter' set to True,
+        the record is allowed. Otherwise, only messages from rank 0 are allowed.
+
+        Args:
+            record (logging.LogRecord): The log record to be evaluated.
+
+        Returns:
+            bool: True if the log record should be logged, False otherwise.
+        """
         super().__init__()
         self.rank = rank
 
     def filter(self, record):
+        """
+        Decide whether to log the provided record.
+
+        If the log record has an attribute 'bypass_rank_filter' set to True,
+        the record is allowed. Otherwise, only messages from rank 0 are allowed.
+
+        Args:
+            record (logging.LogRecord): The log record to be evaluated.
+
+        Returns:
+            bool: True if the log record should be logged, False otherwise.
+        """
         # If the log record explicitly requests to bypass the rank check, allow it.
         if getattr(record, 'all_ranks', False):
             return True
