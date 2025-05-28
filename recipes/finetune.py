@@ -89,7 +89,7 @@ def build_distributed(cfg_dist: Dict[str, Any]) -> 'DistInfo':  # noqa: F821
     Build and initialize distributed training resources.
 
     Args:
-        cfg_dist: Configuration dictionary for distributed training.
+        cfg_dist: Configuration for distributed training.
 
     Returns:
         Distributed training information from initialize_distributed.
@@ -99,6 +99,16 @@ def build_distributed(cfg_dist: Dict[str, Any]) -> 'DistInfo':  # noqa: F821
     return initialize_distributed(backend=backend, timeout_minutes=timeout)
 
 def build_step_scheduler(cfg, dataloader):
+    """
+    Build the step scheduler.
+
+    Args:
+        cfg: configuration for the StepScheduler class.
+        dataloader: the training dataloader, used for extracting the epoch_len (in batches).
+
+    Returns:
+        StepScheduler: the configured StepScheduler.
+    """
     assert not '_target_' in cfg, "_target_ not permitted in step scheduler"
     default_kwargs = dict(
         num_epochs = 10,
