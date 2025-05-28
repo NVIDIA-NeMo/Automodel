@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from torch.distributed.checkpoint.stateful import Stateful
+from typing import Any, Dict, Optional, Tuple
 
 class StepScheduler(Stateful):
     """
@@ -59,14 +60,20 @@ class StepScheduler(Stateful):
             batch_idx (int): Index of the current batch.
 
         Returns:
-            Tuple[bool, bool]: A tuple of (is_optim_step_step, is_ckpt_step) indicating if a gradient
+            Tuple[bool, bool]: A tuple of (is_optim_step, is_ckpt_step) indicating if a gradient
             step and/or checkpoint step should be performed.
         """
         self.step += 1
-        is_optim_step = (self.step % self.grad_acc_steps) == 0
+        return self.is_optim_step, self.is_ckpt_step(batch_idx)
+
+    @property
+    def is_optim_step(self):
+        return (self.step % self.grad_acc_steps) == 0
+
+    def is_ckpt_step(self, batch_idx):
         last_batch = self.epoch_len is not None and batch_idx == self.epoch_len - 1
-        is_ckpt = (self.step % self.ckpt_every_steps) == 0 or last_batch
-        return is_optim_step, is_ckpt
+        return (self.step % self.ckpt_every_steps) == 0 or last_batch
+
 
     # (optional) persistence
     def state_dict(self):
