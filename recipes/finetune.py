@@ -99,6 +99,7 @@ def build_distributed(cfg_dist: Dict[str, Any]) -> 'DistInfo':  # noqa: F821
     return initialize_distributed(backend=backend, timeout_minutes=timeout)
 
 def build_step_scheduler(cfg, dataloader):
+    assert not '_target_' in cfg, "_target_ not permitted in step scheduler"
     default_kwargs = dict(
         num_epochs = 10,
         grad_acc_steps = 10,
