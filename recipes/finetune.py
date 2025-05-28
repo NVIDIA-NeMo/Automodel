@@ -7,7 +7,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from automodel.config.loader import load_yaml_config
-from automodel.training.init_utils import initialize_distributed
+from automodel.distributed.init_utils import initialize_distributed
 from automodel.base_recipe import BaseRecipe
 
 
@@ -140,14 +140,14 @@ class StepScheduler:
             batch_idx (int): Index of the current batch.
 
         Returns:
-            Tuple[bool, bool]: A tuple of (is_grad_step, is_ckpt_step) indicating if a gradient
+            Tuple[bool, bool]: A tuple of (is_optim_step_step, is_ckpt_step) indicating if a gradient
             step and/or checkpoint step should be performed.
         """
         self.step += 1
-        is_grad = (self.step % self.grad_acc_steps) == 0
+        is_optim_step = (self.step % self.grad_acc_steps) == 0
         last_batch = self.epoch_len is not None and batch_idx == self.epoch_len - 1
         is_ckpt = (self.step % self.ckpt_every_steps) == 0 or last_batch
-        return is_grad, is_ckpt
+        return is_optim_step, is_ckpt
 
     # (optional) persistence
     def state_dict(self):
@@ -233,22 +233,23 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.model.train()
         for self.scheduler.epoch in range(self.scheduler.epoch, self.scheduler.num_epochs):
             for batch_idx, batch in enumerate(self.dataloader):
-                is_grad, is_ckpt = self.scheduler.update(batch_idx)
-                loss = self._run_train_step(batch, is_grad)
+                is_optim_step, is_ckpt = self.scheduler.update(batch_idx)
+                loss = self._run_train_step(batch, is_optim_step, 1.0,
+                    num_grad_acc_steps=self.scheduler.grad_acc_steps)
                 # if self.dist_env.is_main and is_ckpt:
                 #     self._save_checkpoint()
-                if self.dist_env.is_main and is_grad:
+                if self.dist_env.is_main and is_optim_step:
                     print(f"step {self.scheduler.step} | loss {loss.item():.6f}", flush=True)
 
 
     # ------------------ helpers ------------------
-    def _run_train_step(self, batch, is_grad):
+    def _run_train_step(self, batch, is_optim_step, clip_norm=1.0, num_grad_acc_steps=10):
         """
         Execute a single training step.
 
         Args:
             batch: Batch of training data.
-            is_grad: Flag indicating if a gradient step should be applied.
+            is_optim_step: Flag indicating if a gradient step should be applied.
 
         Returns:
             Detached loss from the training step.
@@ -262,18 +263,14 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                             labels.view(-1), mask=mask)
         loss.backward()
 
-        if is_grad:
-            #         if self.cfg.training.get("calculate_per_token_loss", False):
-            # world_size = get_world_size_safe()
-            # num_tokens_for_grad_scaling = self.total_num_tokens.clone().detach()
-            # dist.all_reduce(num_tokens_for_grad_scaling)
-                # DDP reduces across ranks, so we need to scale by the world size to inverse it
-            scaling_factor = 109 #world_size / num_tokens_for_grad_scaling
-            # print('scaling_factor= ' + str(scaling_factor))
+        if is_optim_step:
+            grad_params = []
             for param in self.model.parameters():
                 if param.grad is not None:
-                    param.grad.data.mul_(scaling_factor)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0, foreach=True)
+                    param.grad.data.mul_(1/num_grad_acc_steps)
+                    grad_params.append(param)
+            if isinstance(clip_norm, float):
+                torch.nn.utils.clip_grad_norm_(grad_params, clip_norm, foreach=True)
             self.optimizer.step()
             self.optimizer.zero_grad()
         return loss.detach()
