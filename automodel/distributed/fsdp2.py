@@ -139,9 +139,13 @@ class FSDP2Manager:
             self.dp_size = self.world_size
         self.tp_size = self.tp_size or 1
 
-        # build mesh [dp, cp, tp]
         mesh_shape = (self.dp_size, self.cp_size, self.tp_size)
         mesh_names = ("data_parallel", "context_parallel", "tensor_parallel")
+        for shape, name in zip(mesh_shape, mesh_names):
+            assert isinstance(shape, int), "Expected {} to be an int, but got {}".format(name, type(shape))
+            assert shape > 0, "Expected {} > 0, {}".format(name, shape)
+
+        # build mesh [dp, cp, tp]
         self.device_mesh = init_device_mesh(
             device_type="cuda" if self.backend == "nccl" else "cpu",
             mesh_shape=mesh_shape,
