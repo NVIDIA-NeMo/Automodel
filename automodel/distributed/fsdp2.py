@@ -59,11 +59,11 @@ class FSDP2Manager:
         metadata={"help": "Data‐parallel group size; if None, infer from WORLD_SIZE."}
     )
     tp_size: Optional[int] = field(
-        default=0,
+        default=1,
         metadata={"help": "Tensor‐parallel group size; if None, defaults to 1."}
     )
     cp_size: int = field(
-        default=0,
+        default=1,
         metadata={"help": "Context‐parallel group size (for pipeline‐like sharding)."}
     )
     sequence_parallel: bool = field(
@@ -172,7 +172,8 @@ class FSDP2Manager:
         if use_hf_tp_plan:
             tp_shard_plan = get_hf_tp_shard_plan(model)
         else:
-            raise NotImplemented("todo")
+            # TODO (tp-plan)
+            tp_shard_plan = None
 
         fsdp2_strategy_parallelize(
             model,
