@@ -1,5 +1,5 @@
 step_scheduler:
-  _target_: automodel.base_recipe.StepScheduler
+  _target_: automodel.training.step_scheduler.StepScheduler
   grad_acc_steps: 10
   ckpt_every_steps: 1000
 
@@ -18,7 +18,6 @@ model:
 
 distributed:
   _target_: automodel.distributed.fsdp2.FSDP2Manager
-
 
 loss_fn: automodel.loss.masked_ce.masked_cross_entropy
 
