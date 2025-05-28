@@ -86,6 +86,11 @@ class StepScheduler(Stateful):
 
     @property
     def epochs(self):
+        """Epoch iterator
+
+        Yields:
+            iterator: over epochs
+        """
         yield from range(self.epoch, self.num_epochs)
 
     # (optional) persistence
