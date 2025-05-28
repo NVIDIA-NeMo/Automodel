@@ -68,12 +68,21 @@ class StepScheduler(Stateful):
 
     @property
     def is_optim_step(self):
+        """whether this step needs to call the optimizer step
+
+        Returns:
+            bool: if true, the optimizer should run.
+        """
         return (self.step % self.grad_acc_steps) == 0
 
     def is_ckpt_step(self, batch_idx):
+        """whether this step needs to call the checkpoint saving.
+
+        Returns:
+            bool: if true, the checkpoint should run.
+        """
         last_batch = self.epoch_len is not None and batch_idx == self.epoch_len - 1
         return (self.step % self.ckpt_every_steps) == 0 or last_batch
-
 
     # (optional) persistence
     def state_dict(self):
