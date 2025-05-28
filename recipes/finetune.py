@@ -163,7 +163,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.dataloader = build_dataloader(self.dist_env.device, self.cfg.dataset, self.cfg.dataloader)
 
         # Scheduler
-        self.scheduler = build_step_scheduler(self.cfg.get('step_scheduler', None), self.dataloader)
+        self.step_scheduler = build_step_scheduler(self.cfg.get('step_scheduler', None), self.dataloader)
 
         # Optionally resume
         if (path := self.cfg.get("restore_from")) is not None:
@@ -178,15 +178,17 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         and update model parameters when necessary. Also prints loss every gradient step.
         """
         self.model.train()
-        for self.scheduler.epoch in range(self.scheduler.epoch, self.scheduler.num_epochs):
+        for epoch in self.step_scheduler.epochs:
             for batch_idx, batch in enumerate(self.dataloader):
-                is_optim_step, is_ckpt = self.scheduler.update(batch_idx)
+                is_optim_step, is_ckpt_step = self.step_scheduler.update(batch_idx)
                 loss = self._run_train_step(batch, is_optim_step, 1.0,
-                    num_grad_acc_steps=self.scheduler.grad_acc_steps)
-                # if self.dist_env.is_main and is_ckpt:
-                #     self._save_checkpoint()
+                    num_grad_acc_steps=self.step_scheduler.grad_acc_steps)
+
+                if self.dist_env.is_main and is_ckpt_step:
+                    self._save_checkpoint()
+
                 if self.dist_env.is_main and is_optim_step:
-                    print(f"step {self.scheduler.step} | loss {loss.item():.6f}", flush=True)
+                    print(f"step {self.step_scheduler.step} | loss {loss.item():.6f}", flush=True)
 
 
     # ------------------ helpers ------------------
