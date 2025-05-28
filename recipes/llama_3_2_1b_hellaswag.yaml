@@ -25,7 +25,7 @@ distributed:
 loss_fn: automodel.loss.masked_ce.masked_cross_entropy
 
 dataset:
-  _target_: automodel.datasets.hellaswag.HellaSwag
+  _target_: automodel.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
   tokenizer:
@@ -38,7 +38,7 @@ dataloader:
   batch_size: 1
 
 validation_dataset:
-  _target_: automodel.datasets.llm.hellaswag.hellaswag
+  _target_: automodel.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
   tokenizer:
