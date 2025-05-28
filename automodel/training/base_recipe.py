@@ -14,7 +14,6 @@
 
 import torch.nn as nn
 from torch.optim import Optimizer
-from typing import Any, Dict, Optional, Tuple
 from torch.distributed.checkpoint.stateful import Stateful
 
 def has_load_restore_state(object):
@@ -34,7 +33,7 @@ def has_load_restore_state(object):
         for attr in ('load_state_dict', 'state_dict')
     )
 
-class BaseRecipe:
+class BaseRecipe(Stateful):
     """
     Checkpoint registry
     """
