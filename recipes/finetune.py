@@ -99,15 +99,16 @@ def build_distributed(cfg_dist: Dict[str, Any]) -> 'DistInfo':  # noqa: F821
     return initialize_distributed(backend=backend, timeout_minutes=timeout)
 
 def build_step_scheduler(cfg, dataloader):
-    if cfg is None:
-        return StepScheduler(
-            num_epochs = 10,
-            grad_acc_steps   = 10,
-            ckpt_every_steps = 100,
-            epoch_len        = len(dataloader),
-        )
-    else:
-        return cfg.instantiate(epoch_len = len(dataloader))
+    default_kwargs = dict(
+        num_epochs = 10,
+        grad_acc_steps = 10,
+        ckpt_every_steps = 100,
+        epoch_len = len(dataloader),
+    )
+    if cfg is not None:
+        default_kwargs |= cfg.to_dict()
+    return StepScheduler(**default_kwargs)
+
 
 # ---------------------------------------------------------------------------
 #  Trainer class – orchestration only

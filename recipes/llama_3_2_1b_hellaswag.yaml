@@ -1,5 +1,4 @@
 step_scheduler:
-  _target_: automodel.training.step_scheduler.StepScheduler
   grad_acc_steps: 10
   ckpt_every_steps: 1000
 
