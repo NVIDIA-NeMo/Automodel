@@ -17,20 +17,19 @@ class DDPManager:
     """
     backend: str = field(
         default="nccl",
-        default_factory=str,
         metadata={"help": "Distributed backend, e.g. 'nccl' or 'gloo'."}
     )
 
-    # These are populated in setup_distributed(), not by user:
+    world_size: int = field(
+        default_factory=lambda: int,
+        metadata={"help": "Total number of distributed processes."}
+    )
+
+    # This is populated in setup_distributed(), not by user:
     rank: int = field(
         init=False,
-        default_factory=int,
+        default_factory=lambda: int,
         metadata={"help": "Global rank of this process."}
-    )
-    world_size: int = field(
-        init=False,
-        default_factory=int,
-        metadata={"help": "Total number of distributed processes."}
     )
 
     def setup_distributed(self):
