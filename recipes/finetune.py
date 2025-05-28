@@ -8,7 +8,8 @@ from torch.utils.data import DataLoader
 
 from automodel.config.loader import load_yaml_config
 from automodel.distributed.init_utils import initialize_distributed
-from automodel.base_recipe import BaseRecipe, StepScheduler
+from automodel.training.base_recipe import BaseRecipe
+from automodel.training.step_scheduler import StepScheduler
 
 
 # ---------------------------
