@@ -84,6 +84,10 @@ class StepScheduler(Stateful):
         last_batch = self.epoch_len is not None and batch_idx == self.epoch_len - 1
         return (self.step % self.ckpt_every_steps) == 0 or last_batch
 
+    @property
+    def epochs(self):
+        yield from range(self.epoch, self.num_epochs)
+
     # (optional) persistence
     def state_dict(self):
         """
