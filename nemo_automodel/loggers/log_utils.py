@@ -30,10 +30,7 @@ def warning_filter(record: LogRecord) -> bool:
     Returns:
         False if the record level is WARNING, True otherwise.
     """
-    if record.levelno == logging.WARNING:
-        return False
-
-    return True
+    return record.levelno != logging.WARNING
 
 
 def module_filter(record: LogRecord, modules_to_filter: list[str]) -> bool:
