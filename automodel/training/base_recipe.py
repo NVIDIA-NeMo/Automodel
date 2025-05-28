@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 from torch.optim import Optimizer
 from torch.distributed.checkpoint.stateful import Stateful
+import os
 
 def has_load_restore_state(object):
     """ Checks whether object has load_state_dict and state_dict functions, ie whether the object
@@ -66,9 +67,9 @@ class BaseRecipe(Stateful):
 
         Currently iterates over state-tracked attributes and saves their state_dict.
         """
-        path = self.cfg.get("ckpt_path", "latest.pt")
+        path = self.cfg.get("ckpt_path", "latest/")
         for key in self.__dict__['__state_tracked']:
             torch.save(getattr(self, key).state_dict(),
-                path + "_key"
+                os.path.join(path, key),
             )
         print(f"[ckpt] saved to {path}", flush=True)
