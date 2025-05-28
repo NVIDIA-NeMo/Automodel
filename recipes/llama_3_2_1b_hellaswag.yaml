@@ -1,0 +1,42 @@
+step_scheduler:
+  grad_acc_steps: 10
+  ckpt_every_steps: 1000
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 1
+
+rng:
+  _target_: automodel.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  _target_: transformers.AutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+
+distributed:
+  _target_: automodel.distributed.fsdp2.FSDP2Manager
+
+loss_fn: automodel.loss.masked_ce.masked_cross_entropy
+
+dataset:
+  _target_: automodel.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: automodel.datasets.utils.default_collater
+  batch_size: 1
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0
+  # min_lr: 1.0e-5
