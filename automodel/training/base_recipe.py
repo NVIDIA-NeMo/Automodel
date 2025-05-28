@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import torch
 import torch.nn as nn
 from torch.optim import Optimizer
 from torch.distributed.checkpoint.stateful import Stateful
