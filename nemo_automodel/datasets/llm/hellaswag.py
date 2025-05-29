@@ -1,5 +1,5 @@
 from datasets import load_dataset
-from automodel.datasets.utils import SFTSingleTurnPreprocessor
+from nemo_automodel.datasets.utils import SFTSingleTurnPreprocessor
 
 class HellaSwag:
     """

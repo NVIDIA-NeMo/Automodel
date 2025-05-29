@@ -8,7 +8,7 @@ from typing import List
 
 import torch
 
-from automodel.utils.import_utils import is_torch_min_version
+from nemo_automodel.utils.import_utils import is_torch_min_version
 
 if is_torch_min_version("1.13.0"):
     dist_all_gather_func = torch.distributed.all_gather_into_tensor

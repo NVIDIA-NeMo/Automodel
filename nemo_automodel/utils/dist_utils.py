@@ -25,7 +25,7 @@ from contextlib import ContextDecorator
 import torch.distributed as dist
 import yaml
 
-from automodel.utils.yaml_utils import safe_yaml_representers
+from nemo_automodel.utils.yaml_utils import safe_yaml_representers
 
 
 
