@@ -68,7 +68,8 @@ def build_loss_fn(device, cfg_loss):
     else:
         return cfg_loss.instantiate().to(device)
 
-def build_dataloader(device, cfg_ds, cfg_dl) -> DataLoader:
+
+def build_dataloader(device, cfg_ds, cfg_dl, distributed_sampler_kwargs) -> DataLoader:
     """
     Build a DataLoader for the dataset.
 
@@ -81,8 +82,13 @@ def build_dataloader(device, cfg_ds, cfg_dl) -> DataLoader:
         The instantiated DataLoader.
     """
     ds = cfg_ds.instantiate()
-    sampler = torch.utils.data.distributed.DistributedSampler(ds)
+    sampler = torch.utils.data.distributed.DistributedSampler(
+        ds,
+        num_replicas=distributed_sampler_kwargs["num_replicas"],
+        rank=distributed_sampler_kwargs["rank"],
+    )
     return cfg_dl.instantiate(dataset=ds, sampler=sampler)
+
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> 'DistInfo':  # noqa: F821
     """
@@ -150,17 +156,30 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
         """
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
+
         model_wrapper = None
-        if 'distributed' in self.cfg:
-            model_wrapper = self.cfg.distributed.instantiate(world_size=self.dist_env.world_size)
-            print(model_wrapper)
+        distributed_sampler_kwargs = {}
+        if "distributed" in self.cfg:
+            model_wrapper = self.cfg.distributed.instantiate(
+                world_size=self.dist_env.world_size
+            )
+            distributed_sampler_kwargs = {
+                "num_replicas": model_wrapper.device_mesh["data_parallel"].size(),
+                "rank": model_wrapper.device_mesh["data_parallel"].get_local_rank(),
+            }
+
         torch.manual_seed(self.cfg.get("seed", 42) + self.dist_env.rank)
 
         # Build components
         self.model = build_model(self.dist_env.device, model_wrapper, self.cfg.model)
         self.optimizer = build_optimizer(self.dist_env.device, self.cfg.optimizer, self.model)
         self.loss_fn   = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
-        self.dataloader = build_dataloader(self.dist_env.device, self.cfg.dataset, self.cfg.dataloader)
+        self.dataloader = build_dataloader(
+            self.dist_env.device,
+            self.cfg.dataset,
+            self.cfg.dataloader,
+            distributed_sampler_kwargs,
+        )
 
         # Scheduler
         self.step_scheduler = build_step_scheduler(self.cfg.get('step_scheduler', None), self.dataloader)
@@ -218,7 +237,11 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 if param.grad is not None:
                     param.grad.data.mul_(1/num_grad_acc_steps)
                     grad_params.append(param)
-            if isinstance(clip_norm, float):
+            # TP does not support grad_clip yet
+            if (
+                isinstance(clip_norm, float)
+                and self.cfg.get("distributed.tp_size", 1) == 1
+            ):
                 torch.nn.utils.clip_grad_norm_(grad_params, clip_norm, foreach=True)
             self.optimizer.step()
             self.optimizer.zero_grad()
