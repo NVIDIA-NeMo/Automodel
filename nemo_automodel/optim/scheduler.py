@@ -8,7 +8,7 @@ from typing import Optional
 
 from torch.optim.optimizer import Optimizer
 
-from automodel.utils.common_utils import log_single_rank
+from nemo_automodel.utils.common_utils import log_single_rank
 
 logger = logging.getLogger(__name__)
 

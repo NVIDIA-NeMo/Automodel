@@ -8,7 +8,7 @@ from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, SequenceParallel
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
-from automodel.distributed.parallelizer import fsdp2_strategy_parallelize, get_hf_tp_shard_plan
+from nemo_automodel.distributed.parallelizer import fsdp2_strategy_parallelize, get_hf_tp_shard_plan
 
 
 @dataclass

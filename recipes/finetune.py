@@ -6,10 +6,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from automodel.config.loader import load_yaml_config
-from automodel.distributed.init_utils import initialize_distributed
-from automodel.training.base_recipe import BaseRecipe
-from automodel.training.step_scheduler import StepScheduler
+from nemo_automodel.config.loader import load_yaml_config
+from nemo_automodel.distributed.init_utils import initialize_distributed
+from nemo_automodel.training.base_recipe import BaseRecipe
+from nemo_automodel.training.step_scheduler import StepScheduler
 
 
 # ---------------------------

@@ -7,7 +7,7 @@ dist_env:
   timeout_minutes: 1
 
 rng:
-  _target_: automodel.training.rng.StatefulRNG
+  _target_: nemo_automodel.training.rng.StatefulRNG
   seed: 1111
   ranked: true
 
@@ -16,16 +16,16 @@ model:
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
 
 distributed:
-  _target_: automodel.distributed.fsdp2.FSDP2Manager
+  _target_: nemo_automodel.distributed.fsdp2.FSDP2Manager
   dp_size: 1
   tp_size: 1
   cp_size: 1
   sequence_parallel: false
 
-loss_fn: automodel.loss.masked_ce.masked_cross_entropy
+loss_fn: nemo_automodel.loss.masked_ce.masked_cross_entropy
 
 dataset:
-  _target_: automodel.datasets.llm.hellaswag.HellaSwag
+  _target_: nemo_automodel.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
   tokenizer:
@@ -35,7 +35,7 @@ dataset:
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: automodel.datasets.utils.default_collater
+  collate_fn: nemo_automodel.datasets.utils.default_collater
   batch_size: 1
 
 optimizer:

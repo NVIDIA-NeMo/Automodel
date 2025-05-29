@@ -16,7 +16,7 @@ import random
 import numpy as np
 import torch
 
-from automodel.utils.dist_utils import get_rank_safe
+from nemo_automodel.utils.dist_utils import get_rank_safe
 
 class StatefulRNG:
     """
