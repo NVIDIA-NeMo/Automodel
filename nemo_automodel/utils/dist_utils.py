@@ -245,3 +245,22 @@ def dump_dataclass_to_yaml(obj: Any, filename: Optional[str] = None) -> Optional
                 yaml.safe_dump(obj, f)
         else:
             return yaml.safe_dump(obj)
+
+
+def reduce_loss(
+    loss_store: list[torch.Tensor],
+    total_num_tokens: torch.Tensor,
+    per_token_loss: bool = True,
+    dp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce loss across all ranks."""
+    loss = torch.sum(torch.stack(loss_store).float()).view(1).clone().detach()
+
+    torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+
+    if per_token_loss:
+        denominator = total_num_tokens.clone().detach().to(torch.int)
+    else:
+        denominator = torch.tensor([len(loss_store)], dtype=torch.int, device="cuda")
+    torch.distributed.all_reduce(denominator, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+    return loss, denominator
