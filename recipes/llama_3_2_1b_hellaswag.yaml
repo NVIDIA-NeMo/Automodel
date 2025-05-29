@@ -17,6 +17,10 @@ model:
 
 distributed:
   _target_: automodel.distributed.fsdp2.FSDP2Manager
+  dp_size: 1
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
 
 loss_fn: automodel.loss.masked_ce.masked_cross_entropy
 
@@ -27,6 +31,7 @@ dataset:
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+  num_samples_limit: 10000
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -39,4 +44,5 @@ optimizer:
   eps: 1e-8
   lr: 1.0e-5
   weight_decay: 0
+  foreach: true # foreach is not compatible with TP
   # min_lr: 1.0e-5
