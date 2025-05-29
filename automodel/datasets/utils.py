@@ -92,7 +92,7 @@ class SFTSingleTurnPreprocessor:
 
     Parameters
     ----------
-    args           : argparse.Namespace or similar – must expose the fields
+    args           : argparse.Namespace or similar - must expose the fields
                      `dataset_name`, `model_name_or_path`, `preprocessing_num_workers`,
                      `overwrite_cache`.
     tokenizer      : Pre-trained tokenizer (HF).
@@ -138,7 +138,7 @@ class SFTSingleTurnPreprocessor:
             c_m + t_m for c_m, t_m in zip(ctx_tok["attention_mask"],
                                           tgt_tok["attention_mask"])
         ]
-        # label: –100 for ctx, true ids for tgt
+        # label: -100 for ctx, true ids for tgt
         out["labels"] = [
             [-100] * (len(c_ids)-1) + t_ids + [-100]
             for c_ids, t_ids in zip(ctx_tok["input_ids"], tgt_tok["input_ids"])
@@ -191,7 +191,7 @@ class SFTSingleTurnPreprocessor:
 
         Returns
         -------
-        datasets.DatasetDict  – tokenized + padded datasets (all splits preserved).
+        datasets.DatasetDict  - tokenized + padded datasets (all splits preserved).
         """
 
         if not hasattr(self.tokenizer, 'pad_token') and hasattr(self.tokenizer, 'bos_token'):

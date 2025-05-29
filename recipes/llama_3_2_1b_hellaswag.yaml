@@ -17,9 +17,10 @@ model:
 
 distributed:
   _target_: automodel.distributed.fsdp2.FSDP2Manager
-  dp_size: 8
+  dp_size: 1
   tp_size: 1
   cp_size: 1
+  sequence_parallel: false
 
 loss_fn: automodel.loss.masked_ce.masked_cross_entropy
 
@@ -43,4 +44,5 @@ optimizer:
   eps: 1e-8
   lr: 1.0e-5
   weight_decay: 0
+  foreach: true # foreach is not compatible with TP
   # min_lr: 1.0e-5

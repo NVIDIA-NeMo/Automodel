@@ -1,19 +1,13 @@
+from dataclasses import dataclass, field
 from typing import Any, Optional
+
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
-from automodel.utils.import_utils import safe_import_from
-from dataclasses import dataclass, field
+from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
+from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, SequenceParallel
+from torch.distributed.tensor.placement_types import Replicate, Shard
 
-MixedPrecisionPolicy, HAS_MIXED_PRECISION_POLICY = safe_import_from(
-    "torch.distributed.fsdp", "MixedPrecisionPolicy", fallback_module="torch.distributed._composable.fsdp"
-)
-fully_shard, HAS_FULLY_SHARD = safe_import_from(
-    "torch.distributed.fsdp", "fully_shard", fallback_module="torch.distributed._composable.fsdp"
-)
-CPUOffloadPolicy, HAS_CPU_OFFLOAD_POLICY = safe_import_from(
-    "torch.distributed.fsdp", "CPUOffloadPolicy", fallback_module="torch.distributed._composable.fsdp"
-)
 from automodel.distributed.parallelizer import fsdp2_strategy_parallelize, get_hf_tp_shard_plan
 
 
@@ -176,8 +170,36 @@ class FSDP2Manager:
         if use_hf_tp_plan:
             tp_shard_plan = get_hf_tp_shard_plan(model)
         else:
-            # TODO (tp-plan)
-            tp_shard_plan = None
+            # Parallelize the first embedding and the last linear out projection
+            base_tp_shard_plan = {
+                "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
+                "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+                "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+                "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+                "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+                "model.layers.*.mlp.up_proj": ColwiseParallel(),
+                "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+                "model.layers.*.mlp.down_proj": RowwiseParallel(),
+                "lm_head": ColwiseParallel(output_layouts=Replicate()),
+            }
+
+            base_sp_shard_plan = {
+                "model.embed_tokens": RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1)),
+                "model.norm": SequenceParallel(),
+                "model.layers.*.input_layernorm": SequenceParallel(),
+                "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
+                "model.layers.*.post_attention_layernorm": SequenceParallel(),
+                "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
+                "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate()),
+            }
+
+            if self.sequence_parallel:
+                # Enable sequence parallelism only if TP size > 1
+                base_tp_shard_plan.update(base_sp_shard_plan)
+
+            tp_shard_plan = base_tp_shard_plan
+
+            # TODO: add log "Using default TP plan for parallelization. It is compatible with huggingface llama3-style models."
 
         fsdp2_strategy_parallelize(
             model,

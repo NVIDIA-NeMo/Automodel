@@ -7,19 +7,8 @@ import torch
 from torch import Tensor, nn
 from torch.distributed._tensor import DTensor, Replicate
 from torch.distributed.device_mesh import DeviceMesh, _mesh_resources
+from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, SequenceParallel, parallelize_module
-
-from automodel.utils.import_utils import safe_import_from
-
-MixedPrecisionPolicy, HAS_MIXED_PRECISION_POLICY = safe_import_from(
-    "torch.distributed.fsdp", "MixedPrecisionPolicy", fallback_module="torch.distributed._composable.fsdp"
-)
-fully_shard, HAS_FULLY_SHARD = safe_import_from(
-    "torch.distributed.fsdp", "fully_shard", fallback_module="torch.distributed._composable.fsdp"
-)
-CPUOffloadPolicy, HAS_CPU_OFFLOAD_POLICY = safe_import_from(
-    "torch.distributed.fsdp", "CPUOffloadPolicy", fallback_module="torch.distributed._composable.fsdp"
-)
 
 
 # Taken and modified from torchtitan
@@ -50,7 +39,6 @@ def fsdp2_strategy_parallelize(
     """
 
     if not mp_policy:
-        assert HAS_MIXED_PRECISION_POLICY is not None, "Expected to have MixedPrecisionPolicy"
         mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
 
     def parallelize_helper(module, mesh, mp_policy):
@@ -92,7 +80,6 @@ def fsdp2_strategy_parallelize(
 
     # FSDP sharding
     assert dp_mesh.ndim == 1, "Hybrid-sharding not supported"
-    assert HAS_FULLY_SHARD is not None, "Expected to have fully_shard"
 
     # Find transformer layers and apply parallelisms
     parallelize_helper(model, dp_mesh, mp_policy)
