@@ -199,7 +199,8 @@ class FSDP2Manager:
 
             tp_shard_plan = base_tp_shard_plan
 
-            # TODO: add log "Using default TP plan for parallelization. It is compatible with huggingface llama3-style models."
+            # TODO: add log "Using default TP plan for parallelization.
+            # It is compatible with huggingface llama3-style models."
 
         fsdp2_strategy_parallelize(
             model,
