@@ -27,7 +27,6 @@ RUN apt-get update && apt-get install -y \
 
 # Set venv as default
 ENV PATH="/opt/venv/bin:$PATH"
-    && rm -rf /var/lib/apt/lists/*
 
 # Install all
 WORKDIR /workspace
