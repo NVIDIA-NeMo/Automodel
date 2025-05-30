@@ -170,7 +170,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 "rank": model_wrapper.device_mesh["data_parallel"].get_local_rank(),
                 "shuffle": self.cfg.dataloader.get("shuffle", True),
             }
-            del self.cfg.dataloader.shuffle
+            if "shuffle" in self.cfg.dataloader:
+                del self.cfg.dataloader.shuffle
 
         torch.manual_seed(self.cfg.get("seed", 42) + self.dist_env.rank)
 
