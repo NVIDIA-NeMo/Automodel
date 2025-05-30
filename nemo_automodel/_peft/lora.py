@@ -246,26 +246,3 @@ def _parent_and_attr(root: nn.Module, fqname: str):
     for p in parts[:-1]:
         parent = getattr(parent, p)
     return parent, parts[-1]
-
-
-
-if __name__ == "__main__":
-    class ToyModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.linear1 = nn.Linear(16, 16)
-            self.linear2 = nn.Linear(16, 16)
-
-        def forward(self, x):
-            x = self.linear1(x).relu()
-            x = self.linear2(x)
-            return x
-
-    model = ToyModel()
-    apply_lora_to_linear_modules(model, target_modules=["linear1"], dim=4, alpha=16)
-    dummy = torch.randn(2, 16)
-    out = model(dummy)
-    out.sum().backward()
-    print("Forward/backward worked with LoRA.")
-    print(out)
-    print(model)
