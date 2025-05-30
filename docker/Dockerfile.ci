@@ -36,3 +36,6 @@ RUN --mount=type=bind,source=setup.py,target=/workspace/setup.py \
     --mount=type=bind,source=README.md,target=/workspace/README.md \
     --mount=type=bind,source=requirements,target=/workspace/requirements \
     pip install --no-cache-dir .
+
+# Test install
+RUN pip install coverage pytest
