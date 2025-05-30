@@ -10,38 +10,13 @@ import torch.distributed as dist
 
 from nemo_automodel.config.loader import load_yaml_config
 from nemo_automodel.distributed.init_utils import initialize_distributed, get_world_size_safe
-from nemo_automodel.utils.dist_utils import reduce_loss
+from nemo_automodel.utils.dist_utils import reduce_loss, get_sync_ctx
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.step_scheduler import StepScheduler
-import contextlib
-
 
 # ---------------------------
 #  Stateless helper functions
 # ---------------------------
-
-def get_sync_ctx(model, is_optim_step):
-    """
-    Get the synchronization context for the model.
-
-    Args:
-        model: The model to synchronize.
-        is_optim_step: Whether the current step is an optimizer step.
-
-    Returns:
-        A context manager that synchronizes the model.
-    """
-    # Use `no_sync` on DDP models when we are *not* on the final micro-batch for
-    # this gradient update (i.e., when `is_grad` is False). This avoids an
-    # all-reduce for every micro-batch and greatly improves throughput.
-    if isinstance(model, dist.fsdp._fully_shard._fully_shard.FSDPModule):
-        model.set_requires_gradient_sync(is_optim_step)
-        sync_ctx = contextlib.nullcontext()
-    elif isinstance(model, torch.nn.parallel.DistributedDataParallel) and not is_optim_step:
-        sync_ctx = model.no_sync()
-    else:
-        sync_ctx = contextlib.nullcontext()
-    return sync_ctx
 
 def build_model(device, model_wrapper, cfg_model) -> nn.Module:
     """
@@ -251,16 +226,27 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 #     self._save_checkpoint()
                 if self.dist_env.is_main and is_optim_step:
                     print(
-                        f"step {self.step_scheduler.step} | epoch {self.step_scheduler.epoch} | loss {reporting_loss:.6f} | grad_norm {grad_norm:.6f}"
+                        f"step {self.step_scheduler.step} | "
+                        f"epoch {self.step_scheduler.epoch} | "
+                        f"loss {reporting_loss:.6f} | "
+                        f"grad_norm {grad_norm:.6f}"
                     )
                 
                 if is_val_step and self.val_dataloader is not None:
                     val_loss = self._run_validation_epoch()
                     if self.dist_env.is_main:
                         if wandb.run is not None:
-                            wandb.log({"val_loss": val_loss, "step": self.step_scheduler.step, "epoch": self.step_scheduler.epoch})
+                            wandb.log(
+                                {
+                                    "val_loss": val_loss,
+                                    "step": self.step_scheduler.step,
+                                    "epoch": self.step_scheduler.epoch
+                                }
+                            )
                         print(
-                            f"[val] step {self.step_scheduler.step} | epoch {self.step_scheduler.epoch} | loss {val_loss:.4f}",
+                            f"step {self.step_scheduler.step} | "
+                            f"epoch {self.step_scheduler.epoch} | "
+                            f"loss {val_loss:.4f}",
                         )
 
 
@@ -276,6 +262,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         Returns:
             Grad norm from the training step.
         """
+        self.model.train()
+
         batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
         labels = batch.pop("labels")
         mask   = batch.pop("loss_mask", None)
@@ -315,6 +303,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.optimizer.zero_grad()
         return grad_norm
     
+    @torch.no_grad()
     def _run_validation_epoch(self) -> float:
         """Run one pass over `self.val_dataloader` and return average loss per token."""
         self.model.eval()
@@ -322,23 +311,22 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         total_loss = 0.0
         total_tokens = 0
 
-        with torch.no_grad():
-            for batch in self.val_dataloader:
-                batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
-                labels = batch.pop("labels")
-                mask = batch.pop("loss_mask", None)
-                if mask is None:
-                    mask = (labels.detach() != -100).to(torch.int)
+        for batch in self.val_dataloader:
+            batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
+            labels = batch.pop("labels")
+            mask = batch.pop("loss_mask", None)
+            if mask is None:
+                mask = (labels.detach() != -100).to(torch.int)
 
-                out = self.model(**batch)
-                local_loss = self.loss_fn(
-                    out.logits.view(-1, out.logits.size(-1)),
-                    labels.view(-1),
-                    mask=mask,
-                    reduction="sum"
-                )
-                total_loss += local_loss.item()
-                total_tokens += mask.sum().item()
+            out = self.model(**batch)
+            local_loss = self.loss_fn(
+                out.logits.view(-1, out.logits.size(-1)),
+                labels.view(-1),
+                mask=mask,
+                reduction="sum"
+            )
+            total_loss += local_loss.item()
+            total_tokens += mask.sum().item()
 
         # Aggregate across ranks if distributed is initialized
         if dist.is_initialized():
@@ -346,7 +334,6 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
             total_loss, total_tokens = tensor.tolist()
 
-        self.model.train()
         return total_loss / max(total_tokens, 1e-8)
     
     def log_train_metrics(self, grad_norm):

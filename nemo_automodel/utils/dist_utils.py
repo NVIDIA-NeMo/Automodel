@@ -21,7 +21,7 @@ from typing import Any, Optional
 
 import torch
 import torch.distributed
-from contextlib import ContextDecorator
+from contextlib import ContextDecorator, nullcontext
 import torch.distributed as dist
 import yaml
 
@@ -253,7 +253,17 @@ def reduce_loss(
     per_token_loss: bool = True,
     dp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reduce loss across all ranks."""
+    """Reduce loss across all ranks.
+
+    Args:
+        loss_store: List of loss tensors to reduce.
+        total_num_tokens: Total number of tokens to divide the loss by.
+        per_token_loss: Whether to divide the loss by the number of tokens.
+        dp_group: Process group to reduce the loss across.
+
+    Returns:
+        Tuple of reduced loss and denominator.
+    """
     loss = torch.sum(torch.stack(loss_store).float()).view(1).clone().detach()
 
     torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.SUM, group=dp_group)
@@ -264,3 +274,27 @@ def reduce_loss(
         denominator = torch.tensor([len(loss_store)], dtype=torch.int, device="cuda")
     torch.distributed.all_reduce(denominator, op=torch.distributed.ReduceOp.SUM, group=dp_group)
     return loss, denominator
+
+
+def get_sync_ctx(model, is_optim_step):
+    """
+    Get the synchronization context for the model.
+
+    Args:
+        model: The model to synchronize.
+        is_optim_step: Whether the current step is an optimizer step.
+
+    Returns:
+        A context manager that synchronizes the model.
+    """
+    # Use `no_sync` on DDP models when we are *not* on the final micro-batch for
+    # this gradient update (i.e., when `is_grad` is False). This avoids an
+    # all-reduce for every micro-batch and greatly improves throughput.
+    if isinstance(model, dist.fsdp._fully_shard._fully_shard.FSDPModule):
+        model.set_requires_gradient_sync(is_optim_step)
+        sync_ctx = nullcontext()
+    elif isinstance(model, torch.nn.parallel.DistributedDataParallel) and not is_optim_step:
+        sync_ctx = model.no_sync()
+    else:
+        sync_ctx = nullcontext()
+    return sync_ctx

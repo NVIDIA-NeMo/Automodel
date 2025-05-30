@@ -17,12 +17,12 @@ model:
   _target_: transformers.AutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
 
-# distributed:
-#   _target_: nemo_automodel.distributed.fsdp2.FSDP2Manager
-#   dp_size: 1
-#   tp_size: 1
-#   cp_size: 1
-#   sequence_parallel: false
+distributed:
+  _target_: nemo_automodel.distributed.fsdp2.FSDP2Manager
+  dp_size: 1
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
 
 loss_fn: nemo_automodel.loss.masked_ce.masked_cross_entropy
 
@@ -72,18 +72,7 @@ optimizer:
   # min_lr: 1.0e-5
 
 logger:
-  _target_: nemo_automodel.utils.common_utils.LoggerConfig
   wandb_project: nemo_automodel_sft_loop
   wandb_entity: nvidia
   wandb_exp_name: automodel-hellaswag-single-gpu-llama_Llama-3.2-1B
   wandb_save_dir: /tmp/nemo_automodel/wandb
-  tensorboard_dir: /tmp/nemo_automodel/tensorboard
-  log_timers_to_tensorboard: true
-  log_validation_ppl_to_tensorboard: true
-  tensorboard_log_interval: 1
-  timing_log_level: 2
-  log_progress: true
-  log_interval: 1
-  logging_level: INFO
-  # modules_to_filter:
-  #   - nemo.collections.llm.gpt.data.utils
