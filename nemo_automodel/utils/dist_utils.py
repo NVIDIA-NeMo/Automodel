@@ -298,3 +298,34 @@ def get_sync_ctx(model, is_optim_step):
     else:
         sync_ctx = nullcontext()
     return sync_ctx
+
+def rescale_gradients(model, num_tokens_for_grad_scaling, dp_group, dp_size):
+    """
+    Rescale gradients across the DP group.
+
+    Args:
+        model: The model to rescale.
+        num_tokens_for_grad_scaling: The number of tokens to divide the gradients by.
+        dp_group: The process group to rescale the gradients across.
+    """
+    num_tokens_for_grad_scaling = num_tokens_for_grad_scaling.clone().detach()
+    dist.all_reduce(num_tokens_for_grad_scaling, group=dp_group)
+    # DDP/FSDP reduces gradients across ranks, so we need to scale by the world size to inverse it
+    scaling_factor = dp_size / num_tokens_for_grad_scaling
+    for param in model.parameters():
+        if param.grad is not None:
+            param.grad.data.mul_(scaling_factor)
+
+@torch.no_grad()
+def clip_gradients(model, clip_norm):
+    """
+    Clip gradients across the DP group.
+    """
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    grad_norm = torch.nn.utils.get_total_norm(grads)
+    if isinstance(grad_norm, torch.distributed.tensor.DTensor):
+        grad_norm = grad_norm.full_tensor()
+    # Need to test if TP supports grad_clip w/ DTensor
+    # if tp_size == 1:
+    torch.nn.utils.clip_grads_with_norm_([p for p in model.parameters()], clip_norm, grad_norm)
+    return grad_norm

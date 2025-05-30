@@ -10,7 +10,7 @@ import torch.distributed as dist
 
 from nemo_automodel.config.loader import load_yaml_config
 from nemo_automodel.distributed.init_utils import initialize_distributed, get_world_size_safe
-from nemo_automodel.utils.dist_utils import reduce_loss, get_sync_ctx
+from nemo_automodel.utils.dist_utils import reduce_loss, get_sync_ctx, rescale_gradients, clip_gradients
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.step_scheduler import StepScheduler
 
@@ -159,15 +159,15 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
 
-        model_wrapper = None
+        self.model_wrapper = None
         distributed_sampler_kwargs = {}
         if "distributed" in self.cfg:
-            model_wrapper = self.cfg.distributed.instantiate(
+            self.model_wrapper = self.cfg.distributed.instantiate(
                 world_size=self.dist_env.world_size
             )
             distributed_sampler_kwargs = {
-                "num_replicas": model_wrapper.device_mesh["data_parallel"].size(),
-                "rank": model_wrapper.device_mesh["data_parallel"].get_local_rank(),
+                "num_replicas": self.model_wrapper.device_mesh["data_parallel"].size(),
+                "rank": self.model_wrapper.device_mesh["data_parallel"].get_local_rank(),
                 "shuffle": self.cfg.dataloader.get("shuffle", True),
             }
             if "shuffle" in self.cfg.dataloader:
@@ -185,7 +185,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
 
         # Build components
-        self.model = build_model(self.dist_env.device, model_wrapper, self.cfg.model)
+        self.model = build_model(self.dist_env.device, self.model_wrapper, self.cfg.model)
         self.optimizer = build_optimizer(self.cfg.optimizer, self.model)
         self.loss_fn   = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
         self.dataloader = build_dataloader(
@@ -294,24 +294,16 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         grad_norm = None
         if is_optim_step:
-            world_size = get_world_size_safe()
-            num_tokens_for_grad_scaling = self.total_num_tokens.clone().detach()
-            dist.all_reduce(num_tokens_for_grad_scaling)
-            # DDP/FSDP reduces gradients across ranks, so we need to scale by the world size to inverse it
-            scaling_factor = world_size / num_tokens_for_grad_scaling
-            for param in self.model.parameters():
-                if param.grad is not None:
-                    param.grad.data.mul_(scaling_factor)
+            rescale_gradients(
+                self.model,
+                self.total_num_tokens,
+                self.model_wrapper.device_mesh["data_parallel"].get_group(),
+                self.model_wrapper.device_mesh["data_parallel"].size()
+            )
             
-            # Clip gradients **after** any optional rescaling.
-            with torch.no_grad():
-                grads = [p.grad for p in self.model.parameters() if p.grad is not None]
-                grad_norm = torch.nn.utils.get_total_norm(grads)
-                if isinstance(grad_norm, torch.distributed.tensor.DTensor):
-                    grad_norm = grad_norm.full_tensor()
-                # Need to test if TP supports grad_clip w/ DTensor
-                if self.cfg.get("distributed.tp_size", 1) == 1:
-                    torch.nn.utils.clip_grads_with_norm_([p for p in self.model.parameters()], clip_norm, grad_norm)
+            # Clip gradients **after** any rescaling.
+            if self.model_wrapper.device_mesh["tensor_parallel"].size() == 1:
+                grad_norm = clip_gradients(self.model, clip_norm)
 
             self.optimizer.step()
             self.optimizer.zero_grad()
