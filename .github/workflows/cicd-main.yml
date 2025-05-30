@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 name: CICD NeMo
 on:
   schedule:
@@ -34,11 +35,34 @@ jobs:
     outputs:
       is_ci_workload: ${{ steps.is_ci_workload.outputs.main }}
       no_fail_fast: ${{ steps.no_fail_fast.outputs.main }}
+      docs_only: ${{ steps.docs_only.outputs.main == 'true' }}
     env:
       TESTS_TO_RUN: ${{ inputs.test_to_run }}
       EVENT_NAME: ${{ github.event_name }}
-      HAS_LABEL: ${{ github.event.label.name == 'Run CICD' }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get changed files
+        id: changed-files
+        uses: step-security/changed-files@v45.0.1
+        with:
+          files_yaml: |
+            doc:
+              - '**.md'
+              - docs/**
+            src:
+              - '!**.md'
+              - '!docs/**'
+
+      - name: Check if docs only
+        shell: bash
+        id: docs_only
+        env:
+          DOCS_ONLY: ${{ steps.changed-files.outputs.doc_any_changed == 'true' && steps.changed-files.outputs.src_any_changed == 'false' }}
+        run: |
+          echo "main=$DOCS_ONLY" | tee -a "$GITHUB_OUTPUT"
+
       - name: Check if this is a CI workload
         shell: bash
         id: is_ci_workload
@@ -68,6 +92,7 @@ jobs:
 
           echo "main=$no_fail_fast" | tee -a "$GITHUB_OUTPUT"
 
+
   cicd-wait-in-queue:
     needs: [pre-flight]
     runs-on: ubuntu-latest
@@ -76,6 +101,7 @@ jobs:
       needs.pre-flight.outputs.test_to_run != '[]' 
       && needs.pre-flight.outputs.components_to_run != '[]'
       && needs.pre-flight.outputs.is_ci_workload == 'false'
+      && needs.pre-flight.outputs.docs_only == 'false'
     steps:
       - name: Running CI tests
         run: |
