@@ -38,12 +38,11 @@ def build_model(device, model_wrapper, cfg_model) -> nn.Module:
         model = model_wrapper.parallelize(model)
     return model.to(device)
 
-def build_optimizer(device, cfg_opt, model) -> 'Optimizer':  # noqa: F821
+def build_optimizer(cfg_opt, model) -> 'Optimizer':  # noqa: F821
     """
     Build an optimizer for the model.
 
     Args:
-        device: The target device.
         cfg_opt: Configuration for optimizer instantiation.
         model: The model whose parameters will be optimized.
 
@@ -70,7 +69,8 @@ def build_loss_fn(device, cfg_loss):
     else:
         return cfg_loss.instantiate().to(device)
 
-def build_dataloader(cfg_ds, cfg_dl) -> DataLoader:
+
+def build_dataloader(cfg_ds, cfg_dl, distributed_sampler_kwargs) -> DataLoader:
     """
     Build a DataLoader for the dataset.
 
@@ -83,20 +83,14 @@ def build_dataloader(cfg_ds, cfg_dl) -> DataLoader:
         The instantiated DataLoader.
     """
     ds = cfg_ds.instantiate()
-    # Handle optional sampler
-    sampler_cfg = None
-    sampler_obj = None
-    if hasattr(cfg_dl, "sampler"):
-        sampler_cfg = cfg_dl.sampler
-        # Remove it from kwargs so that ``instantiate`` doesn't try to build it
-        # on its own (which fails because ``dataset`` would be missing).
-        del cfg_dl.__dict__["sampler"]
+    sampler = torch.utils.data.distributed.DistributedSampler(
+        ds,
+        num_replicas=distributed_sampler_kwargs["num_replicas"],
+        rank=distributed_sampler_kwargs["rank"],
+        shuffle=distributed_sampler_kwargs["shuffle"],
+    )
+    return cfg_dl.instantiate(dataset=ds, sampler=sampler)
 
-        # Instantiate the sampler with the actual dataset.
-        if sampler_cfg is not None:
-            sampler_obj = sampler_cfg.instantiate(dataset=ds)
-
-    return cfg_dl.instantiate(dataset=ds, sampler=sampler_obj)
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> 'DistInfo':  # noqa: F821
     """
@@ -164,11 +158,20 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
         """
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
+
         model_wrapper = None
-        if 'distributed' in self.cfg:
-            model_wrapper = self.cfg.distributed.instantiate(world_size=self.dist_env.world_size)
-            if self.dist_env.is_main:
-                print(model_wrapper)
+        distributed_sampler_kwargs = {}
+        if "distributed" in self.cfg:
+            model_wrapper = self.cfg.distributed.instantiate(
+                world_size=self.dist_env.world_size
+            )
+            distributed_sampler_kwargs = {
+                "num_replicas": model_wrapper.device_mesh["data_parallel"].size(),
+                "rank": model_wrapper.device_mesh["data_parallel"].get_local_rank(),
+                "shuffle": self.cfg.dataloader.get("shuffle", True),
+            }
+            del self.cfg.dataloader.shuffle
+
         torch.manual_seed(self.cfg.get("seed", 42) + self.dist_env.rank)
 
         if self.dist_env.is_main and hasattr(self.cfg, 'logger'):
@@ -182,16 +185,24 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Build components
         self.model = build_model(self.dist_env.device, model_wrapper, self.cfg.model)
-        self.optimizer = build_optimizer(self.dist_env.device, self.cfg.optimizer, self.model)
+        self.optimizer = build_optimizer(self.cfg.optimizer, self.model)
         self.loss_fn   = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
-        self.dataloader = build_dataloader(self.cfg.dataset, self.cfg.dataloader)
+        self.dataloader = build_dataloader(
+            self.cfg.dataset,
+            self.cfg.dataloader,
+            distributed_sampler_kwargs,
+        )
 
         # Build validation dataloader if the config provides it
         self.val_dataloader = None
         val_ds_cfg = self.cfg.get("validation_dataset")
         val_dl_cfg = self.cfg.get("validation_dataloader")
         if val_ds_cfg is not None and val_dl_cfg is not None:
-            self.val_dataloader = build_dataloader(val_ds_cfg, val_dl_cfg)
+            self.val_dataloader = build_dataloader(
+                val_ds_cfg,
+                val_dl_cfg,
+                distributed_sampler_kwargs,
+            )
         
         # Initialize metrics required for calculating loss
         self.total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
@@ -244,7 +255,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                                 }
                             )
                         print(
-                            f"step {self.step_scheduler.step} | "
+                            f"[val] step {self.step_scheduler.step} | "
                             f"epoch {self.step_scheduler.epoch} | "
                             f"loss {val_loss:.4f}",
                         )
@@ -297,7 +308,9 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 grad_norm = torch.nn.utils.get_total_norm(grads)
                 if isinstance(grad_norm, torch.distributed.tensor.DTensor):
                     grad_norm = grad_norm.full_tensor()
-                torch.nn.utils.clip_grads_with_norm_([p for p in self.model.parameters()], clip_norm, grad_norm)
+                # Need to test if TP supports grad_clip w/ DTensor
+                if self.cfg.get("distributed.tp_size", 1) == 1:
+                    torch.nn.utils.clip_grads_with_norm_([p for p in self.model.parameters()], clip_norm, grad_norm)
 
             self.optimizer.step()
             self.optimizer.zero_grad()
