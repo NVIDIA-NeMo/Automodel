@@ -38,4 +38,4 @@ RUN --mount=type=bind,source=setup.py,target=/workspace/setup.py \
     pip install --no-cache-dir .
 
 # Test install
-RUN pip install coverage
+RUN pip install coverage pytest
