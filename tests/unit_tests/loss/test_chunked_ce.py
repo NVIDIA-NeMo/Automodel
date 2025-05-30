@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import pytest
 import torch
 import torch.nn.functional as F
 
@@ -62,7 +61,6 @@ def test_chunked_cross_entropy_matches_compute_cross_entropy():
     when the entire sequence is processed in one chunk.
     """
     # Create random test data
-    batch_size = 4
     seq_len = 16
     num_classes = 8
 
@@ -73,8 +71,6 @@ def test_chunked_cross_entropy_matches_compute_cross_entropy():
     loss_ref = compute_cross_entropy(logits, targets) / (targets != -100).sum().detach()
 
     # Loss from chunked_cross_entropy when chunk_len = seq_len (effectively one chunk)
-    from math import ceil
-
     chunk_len = seq_len  # so there's only one chunk
     loss_chunked = chunked_cross_entropy(logits, targets, chunk_len=chunk_len)
 
