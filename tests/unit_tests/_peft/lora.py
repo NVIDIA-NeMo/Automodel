@@ -17,17 +17,18 @@ import torch.nn as nn
 import pytest
 from torch.nn.utils import parameters_to_vector
 
-from your_module import LinearLoRA, apply_lora_to_linear_modules  # Replace `your_module` with actual module name
+from nemo_automodel._peft.lora import LinearLoRA, apply_lora_to_linear_modules
 
 
-# Dummy model to test patching
 class DummyModel(nn.Module):
+    """A dummy neural network model with two linear layers used for testing LoRA injection."""
     def __init__(self):
         super().__init__()
         self.linear1 = nn.Linear(16, 16)
         self.linear2 = nn.Linear(16, 16)
 
     def forward(self, x):
+        """Forward pass through two linear layers with ReLU activation in between."""
         x = self.linear1(x).relu()
         x = self.linear2(x)
         return x
@@ -35,21 +36,27 @@ class DummyModel(nn.Module):
 
 @pytest.fixture
 def dummy_input():
+    """Provides a dummy input tensor for model testing."""
     return torch.randn(2, 16, requires_grad=True)
 
 
 @pytest.fixture
 def model():
+    """Instantiates and returns a DummyModel instance."""
     return DummyModel()
 
 
 def test_lora_patch_applies_to_selected_module(model):
+    """Tests that LoRA is only applied to specified target modules."""
     apply_lora_to_linear_modules(model, target_modules=["linear1"], dim=4, alpha=8)
     assert isinstance(model.linear1, LinearLoRA)
     assert not isinstance(model.linear2, LinearLoRA)
 
 
 def test_forward_output_consistency(dummy_input):
+    """Verifies that model output shape remains the same after LoRA patching,
+    but values change due to the added LoRA components.
+    """
     base = DummyModel()
     model = DummyModel()
     apply_lora_to_linear_modules(model, target_modules=["linear1"], dim=4, alpha=8)
@@ -66,6 +73,9 @@ def test_forward_output_consistency(dummy_input):
 
 
 def test_backward_pass(dummy_input):
+    """Checks that backpropagation works and gradients are correctly computed
+    when LoRA is applied.
+    """
     model = DummyModel()
     apply_lora_to_linear_modules(model, target_modules=["linear1"], dim=4, alpha=8)
     output = model(dummy_input)
@@ -78,6 +88,7 @@ def test_backward_pass(dummy_input):
 
 
 def test_lora_layers_are_trainable():
+    """Ensures that LoRA layers are trainable while base weights remain frozen."""
     base = nn.Linear(16, 16)
     lora = LinearLoRA(base, dim=4, alpha=8)
 
@@ -89,6 +100,7 @@ def test_lora_layers_are_trainable():
 
 
 def test_dropout_pre_post_effects(dummy_input):
+    """Tests that different dropout positions ('pre' vs 'post') lead to different outputs."""
     base = nn.Linear(16, 16)
     lora_pre = LinearLoRA(base, dim=4, alpha=8, dropout=0.5, dropout_position='pre')
     lora_post = LinearLoRA(base, dim=4, alpha=8, dropout=0.5, dropout_position='post')
@@ -104,12 +116,14 @@ def test_dropout_pre_post_effects(dummy_input):
 
 
 def test_apply_lora_respects_wildcard(model):
+    """Validates that wildcard matching correctly applies LoRA to all matching modules."""
     apply_lora_to_linear_modules(model, target_modules=[".*"], dim=4, alpha=8)
     assert isinstance(model.linear1, LinearLoRA)
     assert isinstance(model.linear2, LinearLoRA)
 
 
 def test_no_patch_on_non_matching_module(model):
+    """Confirms that no modules are patched if target pattern doesn't match any names."""
     apply_lora_to_linear_modules(model, target_modules=["nonexistent_module"], dim=4, alpha=8)
     assert not isinstance(model.linear1, LinearLoRA)
     assert not isinstance(model.linear2, LinearLoRA)
