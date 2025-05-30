@@ -205,6 +205,7 @@ def patch_linear_module(
 def apply_lora_to_linear_modules(
     model: nn.Module,
     target_modules: List[str],
+    match_all_linear: bool = False,
     dim: int = 8,
     alpha: int = 32,
     dropout: float = 0.0,
@@ -222,7 +223,9 @@ def apply_lora_to_linear_modules(
     patterns = [re.compile(t) for t in target_modules]
 
     for name, module in list(model.named_modules()):
-        if isinstance(module, nn.Linear) and any(p.fullmatch(name) or p.search(name) for p in patterns):
+        if isinstance(module, nn.Linear) and (
+            match_all_linear or any(p.fullmatch(name) or p.search(name) for p in patterns)
+        ):
             parent, attr = _parent_and_attr(model, name)
             setattr(
                 parent,
