@@ -18,9 +18,8 @@ model:
 distributed:
   _target_: nemo_automodel.distributed.fsdp2.FSDP2Manager
   dp_size: 4
-  tp_size: 1
-  cp_size: 2
-  sequence_parallel: false # SP is not supported for nvFSDP
+  tp_size: 2
+  cp_size: 1
   nvfsdp: true
   nvfsdp_unit_modules: [transformers.models.llama.modeling_llama.LlamaDecoderLayer]
   
@@ -47,5 +46,4 @@ optimizer:
   eps: 1e-8
   lr: 1.0e-5
   weight_decay: 0
-  foreach: true # foreach is not compatible with TP
   # min_lr: 1.0e-5

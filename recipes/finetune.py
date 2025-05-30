@@ -44,7 +44,7 @@ def build_model(device, model_wrapper, cfg_model) -> nn.Module:
     else:
         return model.to(device)
 
-def build_optimizer(device, cfg_opt, model) -> 'Optimizer':  # noqa: F821
+def build_optimizer(device, cfg_opt, model, tp_size) -> 'Optimizer':  # noqa: F821
     """
     Build an optimizer for the model.
 
@@ -58,6 +58,9 @@ def build_optimizer(device, cfg_opt, model) -> 'Optimizer':  # noqa: F821
     """
     trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
     assert len(trainable_params) > 0, "trainable_params cannot be empty"
+    if tp_size > 1:
+        # TP does not support foreach
+        cfg_opt.foreach = False
     return cfg_opt.instantiate(params=trainable_params)
 
 def build_loss_fn(device, cfg_loss):
@@ -180,7 +183,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Build components
         self.model = build_model(self.dist_env.device, self.model_wrapper, self.cfg.model)
-        self.optimizer = build_optimizer(self.dist_env.device, self.cfg.optimizer, self.model)
+        self.optimizer = build_optimizer(self.dist_env.device, self.cfg.optimizer, self.model, self.cfg.get("distributed.tp_size", 1))
         self.loss_fn   = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
         self.dataloader = build_dataloader(
             self.dist_env.device,
