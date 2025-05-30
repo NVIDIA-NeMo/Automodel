@@ -1,5 +1,8 @@
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, List, Dict
+
+# from megatron.core.distributed.custom_fsdp import FSDP
+from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 
 import torch
 import torch.distributed as dist
@@ -8,7 +11,7 @@ from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, SequenceParallel
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
-from nemo_automodel.distributed.parallelizer import fsdp2_strategy_parallelize, get_hf_tp_shard_plan
+from nemo_automodel.distributed.parallelizer import fsdp2_strategy_parallelize, get_hf_tp_shard_plan, nvfsdp_strategy_parallelize
 
 
 @dataclass
@@ -34,10 +37,6 @@ class FSDP2Manager:
             to CPU, if specified.
         backend (str): Distributed backend to use (e.g., 'nccl' for GPUs or 'gloo' for CPUs).
         world_size (int): Total number of processes.
-
-    Private Attributes:
-        _device_mesh (Any): The Torch distributed DeviceMesh built for managing device assignments.
-        _rank (int): Global rank of the current process.
 
     Methods:
         __post_init__():
@@ -81,21 +80,27 @@ class FSDP2Manager:
         default="nccl",
         metadata={"help": "Distributed backend, e.g. 'nccl' or 'gloo'."}
     )
-
-    _device_mesh: Optional[Any] = field(
-        default=None,
-        init=False,
-        metadata={"help": "Torch distributed DeviceMesh."}
-    )
-    _rank: Optional[int] = field(
-        default=None,
-        init=False,
-        metadata={"help": "Global rank of this process."}
-    )
     world_size: Optional[int] = field(
         default=None,
         # init=False,
         metadata={"help": "Total number of processes."}
+    )
+    nvfsdp: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Use nvFSDP instead of torch.distributed.fsdp if True."}
+    )
+    nvfsdp_unit_modules: Optional[List[str]] = field(
+        default=None,
+        metadata={"help": "List of unit modules to be wrapped with nvFSDP."}
+    )
+    init_nvfsdp_with_meta_device: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Initialize nvFSDP with meta device if True."}
+    )
+    # TODO(boxiangw): rename this after nvFSDP is published
+    nvfsdp_config: Optional[Dict[str, Any]] = field(
+        default=None,
+        metadata={"help": "nvFSDP ddp_config used in Megatron Core."}
     )
 
     def __post_init__(self):
@@ -171,7 +176,7 @@ class FSDP2Manager:
             tp_shard_plan = get_hf_tp_shard_plan(model)
         else:
             # Parallelize the first embedding and the last linear out projection
-            base_tp_shard_plan = {
+            base_model_tp_plan = {
                 "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
                 "model.layers.*.self_attn.q_proj": ColwiseParallel(),
                 "model.layers.*.self_attn.k_proj": ColwiseParallel(),
@@ -180,10 +185,15 @@ class FSDP2Manager:
                 "model.layers.*.mlp.up_proj": ColwiseParallel(),
                 "model.layers.*.mlp.gate_proj": ColwiseParallel(),
                 "model.layers.*.mlp.down_proj": RowwiseParallel(),
+            }
+
+            # TODO(boxiangw): add this support for nvFSDP
+            fsdp2_model_tp_plan = {
+                "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
                 "lm_head": ColwiseParallel(output_layouts=Replicate()),
             }
 
-            base_sp_shard_plan = {
+            base_model_sp_plan = {
                 "model.embed_tokens": RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1)),
                 "model.norm": SequenceParallel(),
                 "model.layers.*.input_layernorm": SequenceParallel(),
@@ -193,20 +203,46 @@ class FSDP2Manager:
                 "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate()),
             }
 
-            if self.sequence_parallel:
-                # Enable sequence parallelism only if TP size > 1
-                base_tp_shard_plan.update(base_sp_shard_plan)
+            if not self.nvfsdp:
+                base_model_tp_plan.update(fsdp2_model_tp_plan)
+                if self.sequence_parallel:
+                    # Enable sequence parallelism only if TP size > 1
+                    base_model_tp_plan.update(base_model_sp_plan)
+            elif self.sequence_parallel:
+                #TODO(boxiangw): add log "Sequence parallelism is disabled. It is not compatible with nvFSDP. "
+                pass
 
-            tp_shard_plan = base_tp_shard_plan
+            tp_shard_plan = base_model_tp_plan
 
             # TODO: add log "Using default TP plan for parallelization.
             # It is compatible with huggingface llama3-style models."
+        if self.nvfsdp:
+            # Use nvFSDP instead of torch.distributed.fsdp.
+            if self.nvfsdp_config is None:
+                self.nvfsdp_config = DistributedDataParallelConfig(
+                    check_for_nan_in_grad= True,
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    grad_reduce_in_fp32=False,
+                    preserve_fp32_weights=False,
+                    overlap_grad_reduce=True,
+                    overlap_param_gather=True,
+                    average_in_collective=False
+                )
 
-        fsdp2_strategy_parallelize(
-            model,
-            device_mesh=self.device_mesh,
-            mp_policy=self.mp_policy,
-            tp_shard_plan=tp_shard_plan,
-            offload_policy=self.offload_policy,
-        )
+            model = nvfsdp_strategy_parallelize(
+                model,
+                device_mesh=self.device_mesh,
+                nvfsdp_config=self.nvfsdp_config,
+                nvfsdp_unit_modules=self.nvfsdp_unit_modules,
+                init_nvfsdp_with_meta_device=self.init_nvfsdp_with_meta_device,
+                tp_shard_plan=tp_shard_plan,
+                )
+        else:
+            fsdp2_strategy_parallelize(
+                model,
+                device_mesh=self.device_mesh,
+                mp_policy=self.mp_policy,
+                tp_shard_plan=tp_shard_plan,
+                offload_policy=self.offload_policy,
+            )
         return model
