@@ -147,8 +147,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          path: ${{ github.run_id }}
       - name: main
         uses: ./.github/actions/test-template
         with:
