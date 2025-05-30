@@ -9,7 +9,7 @@ import wandb
 import torch.distributed as dist
 
 from nemo_automodel.config.loader import load_yaml_config
-from nemo_automodel.distributed.init_utils import initialize_distributed, get_world_size_safe
+from nemo_automodel.distributed.init_utils import initialize_distributed
 from nemo_automodel.utils.dist_utils import reduce_loss, get_sync_ctx, rescale_gradients, clip_gradients
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.step_scheduler import StepScheduler
