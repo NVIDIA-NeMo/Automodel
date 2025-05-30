@@ -20,12 +20,7 @@ RUN apt-get update && apt-get install -y \
     git \
     libopenmpi-dev \
     vim \
-    && rm -rf /var/lib/apt/lists/* && \
-    python3 -m venv /opt/venv && \
-    /opt/venv/bin/pip install --no-cache-dir -U pip setuptools
-
-# Set venv as default
-ENV PATH="/opt/venv/bin:$PATH"
+    && rm -rf /var/lib/apt/lists/*
 
 # Install all
 WORKDIR /workspace
@@ -35,7 +30,3 @@ RUN --mount=type=bind,source=setup.py,target=/workspace/setup.py \
     --mount=type=bind,source=README.md,target=/workspace/README.md \
     --mount=type=bind,source=requirements,target=/workspace/requirements \
     pip install --no-build-isolation --no-cache-dir .
-
-# Install development versions
-RUN pip install --no-cache-dir --upgrade \
-    git+https://github.com/NVIDIA/NeMo-Run.git
