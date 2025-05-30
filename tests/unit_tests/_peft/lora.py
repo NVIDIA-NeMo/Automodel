@@ -15,7 +15,6 @@
 import torch
 import torch.nn as nn
 import pytest
-from torch.nn.utils import parameters_to_vector
 
 from nemo_automodel._peft.lora import LinearLoRA, apply_lora_to_linear_modules
 

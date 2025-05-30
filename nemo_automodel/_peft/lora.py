@@ -19,6 +19,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from nemo_automodel.shared.import_utils import safe_import
+HAS_BNB, bitsandbytes = safe_import("bitsandbytes")
+
 
 
 
@@ -192,7 +195,7 @@ def patch_linear_module(
         (nn.Module): the monkey-patched (nn.Linear + LoRA) nn.Module
     """
 
-    assert isinstance(orig_linear, nn.Linear) or orig_linear.__class__ == te.Linear
+    assert isinstance(orig_linear, nn.Linear)
     assert not hasattr(orig_linear, 'super_fwd'), orig_linear.super_fwd
 
     if isinstance(orig_linear, nn.Linear):
@@ -200,7 +203,7 @@ def patch_linear_module(
         cls = orig_linear.__class__
         new_cls = type('PatchedLinearLoRA', (LinearLoRA, cls), {})
     else:
-        raise NotImplementedError("Expected isinstance(orig_linear, (nn.Linear, te.Linear))")
+        raise NotImplementedError("Expected isinstance(orig_linear, nn.Linear)")
 
     # If the model uses quantized weights, we want to use orig_linear's forward
     if (
