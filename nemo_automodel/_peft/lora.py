@@ -30,16 +30,6 @@ class LinearLoRA(nn.Linear):
     The _init_wrapper and _forward methods provide the LoRA functionality. We want to be able to
     use those inside LinearLoRA but also for monkey-patching modules, without repeating the
     same code -> therefore those are decorated with @staticmethod.
-
-    Args:
-        orig_linear (nn.Module): the linear module to augment.
-        dim (int): lora's dim in_features -> dim -> out_features.
-        alpha (int): lora's scaling alpha.
-        dropout (float): dropout prob (default: 0.0).
-        dropout_position (str): where to apply dropout rel. to lora (choices= ['pre', 'post'], default=post)
-        lora_A_init_method (str): init method for lora_A (choices= ['xavier', 'uniform'])
-        lora_dtype (torch.dtype): weight's dtype, by default will use orig_linear's but if they
-        are quantized weights (e.g. 4bit) needs to be specified explicitly.
     """
 
     def __init__(
@@ -52,6 +42,18 @@ class LinearLoRA(nn.Linear):
         lora_A_init_method='xavier',
         lora_dtype=None,
     ):
+        """LinearLora constructor
+
+        Args:
+            orig_linear (nn.Module): the linear module to augment.
+            dim (int): lora's dim in_features -> dim -> out_features.
+            alpha (int): lora's scaling alpha.
+            dropout (float): dropout prob (default: 0.0).
+            dropout_position (str): where to apply dropout rel. to lora (choices= ['pre', 'post'], default=post)
+            lora_A_init_method (str): init method for lora_A (choices= ['xavier', 'uniform'])
+            lora_dtype (torch.dtype): weight's dtype, by default will use orig_linear's but if they
+            are quantized weights (e.g. 4bit) needs to be specified explicitly.
+        """
         assert isinstance(orig_linear, nn.Linear)
         super(LinearLoRA, self).__init__(
             in_features=orig_linear.in_features,
@@ -124,6 +126,18 @@ class LinearLoRA(nn.Linear):
         obj.dropout_position = dropout_position
 
     def forward(self, x):
+        """
+        Forward pass through the original linear layer augmented with the LoRA pathway.
+
+        Applies LoRA either before or after the dropout, depending on the configuration.
+        The result of the original linear transformation is combined with the LoRA output.
+
+        Args:
+            x (Tensor): Input tensor of shape (batch_size, in_features).
+
+        Returns:
+            Tensor: Output tensor of shape (batch_size, out_features).
+        """
         # pylint: disable=C0115,C0116
         # If LinearLoRA is used to monkey-patch a nn.Linear module, we want to use nn.Linear's
         # forward in the case where it uses quantized weights. We store a reference to nn.Linear's
