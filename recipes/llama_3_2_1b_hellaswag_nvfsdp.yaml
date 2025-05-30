@@ -17,10 +17,13 @@ model:
 
 distributed:
   _target_: nemo_automodel.distributed.fsdp2.FSDP2Manager
-  dp_size: 8
+  dp_size: 4
   tp_size: 1
-  cp_size: 1
-  sequence_parallel: false
+  cp_size: 2
+  sequence_parallel: false # SP is not supported for nvFSDP
+  nvfsdp: true
+  nvfsdp_unit_modules: [transformers.models.llama.modeling_llama.LlamaDecoderLayer]
+  
 
 loss_fn: nemo_automodel.loss.masked_ce.masked_cross_entropy
 

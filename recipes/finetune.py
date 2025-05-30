@@ -6,6 +6,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+from megatron.core.distributed.custom_fsdp import FSDP
+
+
 from nemo_automodel.config.loader import load_yaml_config
 from nemo_automodel.distributed.init_utils import initialize_distributed
 from nemo_automodel.training.base_recipe import BaseRecipe
@@ -32,9 +35,14 @@ def build_model(device, model_wrapper, cfg_model) -> nn.Module:
     for m in model.modules():
         if isinstance(m, nn.Embedding):
             m.weight.requires_grad_(False)
+
     if model_wrapper is not None and callable(getattr(model_wrapper, 'parallelize', None)):
         model = model_wrapper.parallelize(model)
-    return model.to(device)
+
+        # FSDP2 and nvFSDP should already be on the correct device
+        return model
+    else:
+        return model.to(device)
 
 def build_optimizer(device, cfg_opt, model) -> 'Optimizer':  # noqa: F821
     """
@@ -157,21 +165,21 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
 
-        model_wrapper = None
+        self.model_wrapper = None
         distributed_sampler_kwargs = {}
         if "distributed" in self.cfg:
-            model_wrapper = self.cfg.distributed.instantiate(
+            self.model_wrapper = self.cfg.distributed.instantiate(
                 world_size=self.dist_env.world_size
             )
             distributed_sampler_kwargs = {
-                "num_replicas": model_wrapper.device_mesh["data_parallel"].size(),
-                "rank": model_wrapper.device_mesh["data_parallel"].get_local_rank(),
+                "num_replicas": self.model_wrapper.device_mesh["data_parallel"].size(),
+                "rank": self.model_wrapper.device_mesh["data_parallel"].get_local_rank(),
             }
 
         torch.manual_seed(self.cfg.get("seed", 42) + self.dist_env.rank)
 
         # Build components
-        self.model = build_model(self.dist_env.device, model_wrapper, self.cfg.model)
+        self.model = build_model(self.dist_env.device, self.model_wrapper, self.cfg.model)
         self.optimizer = build_optimizer(self.dist_env.device, self.cfg.optimizer, self.model)
         self.loss_fn   = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
         self.dataloader = build_dataloader(
@@ -243,8 +251,22 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 and self.cfg.get("distributed.tp_size", 1) == 1
             ):
                 torch.nn.utils.clip_grad_norm_(grad_params, clip_norm, foreach=True)
+
+            if isinstance(self.model, FSDP):
+                # If the model uses nvFSDP, wait for all sharded gradients to be reduced and unsharded.
+                # Necessary because the post-backward reduce-scatter is asynchronous, so gradients and backward
+                # computations are concurrent, but the gradients of the final layer may not be available yet.
+                self.model.finish_grad_sync()
+
             self.optimizer.step()
             self.optimizer.zero_grad()
+
+            if isinstance(self.model, FSDP) and self.model.ddp_config.preserve_fp32_weights:
+                # If custom FSDP2 is configured with "optim" (optimizer state / high-precision model weight sharding),
+                # then the optimizer step will be applied to the main high-precision model weights. Update the model
+                # weights after the optimizer step.
+                self.model.param_and_grad_buffer.copy_main_weights_to_model_weights()
+
         return loss.detach()
 
 # ---------------------------------------------------------------------------
@@ -257,7 +279,7 @@ def main():
 
     Loads the configuration, sets up the trainer, and initiates the training loop.
     """
-    cfg = load_yaml_config("llama_3_2_1b_hellaswag.yaml")
+    cfg = load_yaml_config("llama_3_2_1b_hellaswag_nvfsdp.yaml")
     trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
