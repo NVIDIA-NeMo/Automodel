@@ -21,75 +21,183 @@ import torch.nn.functional as F
 from torch import nn
 
 
-# -----------------------------------------------------------------------------#
-# 1.  Lightweight LoRA-enabled Linear layer                                    #
-# -----------------------------------------------------------------------------#
+
+
 class LinearLoRA(nn.Linear):
     """
-    nn.Linear with an additive low-rank adapter (LoRA).
+    Linear + LoRA, maintains ckpts structrue (i.e. Linear's weight/bias remain at the same FQN)
+
+    The _init_wrapper and _forward methods provide the LoRA functionality. We want to be able to
+    use those inside LinearLoRA but also for monkey-patching modules, without repeating the
+    same code -> therefore those are decorated with @staticmethod.
+
+    Args:
+        orig_linear (nn.Module): the linear module to augment.
+        dim (int): lora's dim in_features -> dim -> out_features.
+        alpha (int): lora's scaling alpha.
+        dropout (float): dropout prob (default: 0.0).
+        dropout_position (str): where to apply dropout rel. to lora (choices= ['pre', 'post'], default=post)
+        lora_A_init_method (str): init method for lora_A (choices= ['xavier', 'uniform'])
+        lora_dtype (torch.dtype): weight's dtype, by default will use orig_linear's but if they
+        are quantized weights (e.g. 4bit) needs to be specified explicitly.
     """
 
     def __init__(
         self,
-        orig_linear: nn.Linear,
-        dim: int = 8,
-        alpha: int = 32,
-        dropout: float = 0.0,
-        dropout_position: Literal["pre", "post"] = "post",
-        lora_A_init: str = "xavier",
-        lora_dtype: Optional[torch.dtype] = None,
+        orig_linear,
+        dim=8,
+        alpha=32,
+        dropout=0.0,
+        dropout_position='post',
+        lora_A_init_method='xavier',
+        lora_dtype=None,
     ):
-        # Copy original Linear parameters
-        super().__init__(
+        assert isinstance(orig_linear, nn.Linear)
+        super(LinearLoRA, self).__init__(
             in_features=orig_linear.in_features,
             out_features=orig_linear.out_features,
             bias=orig_linear.bias is not None,
             device=orig_linear.weight.device,
             dtype=orig_linear.weight.dtype,
         )
+        # copy weights
         self.weight.data.copy_(orig_linear.weight.data)
         if orig_linear.bias is not None:
             self.bias.data.copy_(orig_linear.bias.data)
+        # initialize the adapte
+        LinearLoRA._init_adapter(
+            self,
+            dim=dim,
+            alpha=alpha,
+            dropout=dropout,
+            dropout_position=dropout_position,
+            lora_A_init_method=lora_A_init_method,
+            lora_dtype=lora_dtype,
+        )
 
-        # ------------------------------------------------------------------ #
-        # LoRA specific weights                                               #
-        # ------------------------------------------------------------------ #
-        self.rank = dim
-        self.scale = alpha / dim
-        dtype = lora_dtype or self.weight.dtype
-        device = self.weight.device
+    @torch.no_grad
+    @staticmethod
+    def _init_adapter(
+        obj,
+        dim=8,
+        alpha=32,
+        dropout=0.0,
+        dropout_position='post',
+        lora_A_init_method='xavier',
+        lora_dtype=None,
+    ):
+        """Adds LoRA weights to obj. The obj is either a LinearLoRA or an nn.Module (when
+        monkey-patching).
 
-        self.lora_A = nn.Linear(self.in_features, dim, bias=False, device=device, dtype=dtype)
-        self.lora_B = nn.Linear(dim, self.out_features, bias=False, device=device, dtype=dtype)
+        Args:
+            obj (LinearLoRA | nn.Module): input module to adapt.
+            dim (int): lora's dim in_features -> dim -> out_features.
+            alpha (int): lora's scaling alpha.
+            dropout (float): dropout prob (default: 0.0).
+            dropout_position (str): where to apply dropout rel. to lora (choices= ['pre', 'post'], default=post)
+            lora_A_init_method (str): init method for lora_A (choices= ['xavier', 'uniform'])
+            lora_dtype (torch.dtype): weight's dtype, by default will use orig_linear's but if they
+            are quantized weights (e.g. 4bit) needs to be specified explicitly.
+        """
+        obj.dim = dim
+        obj.scale = alpha / dim
 
-        if lora_A_init == "xavier":
-            nn.init.xavier_uniform_(self.lora_A.weight)
+        # Freezer
+        device = obj.weight.device
+        obj.weight.requires_grad = False
+        if obj.bias is not None:
+            obj.bias.requires_grad = False
+
+        in_features = obj.in_features
+        out_features = obj.out_features
+        dtype = lora_dtype or obj.weight.dtype
+
+        obj.lora_a = nn.Linear(in_features, dim, bias=False, dtype=dtype, device=device)
+        obj.lora_b = nn.Linear(dim, out_features, bias=False, dtype=dtype, device=device)
+        if lora_A_init_method == 'xavier':
+            torch.nn.init.uniform_(obj.lora_a.weight.data)
         else:
-            nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B.weight)
-
-        self.dropout = nn.Dropout(dropout)
-        assert dropout_position in ("pre", "post")
-        self.dropout_position = dropout_position
-
-        # Freeze base weights
-        self.weight.requires_grad = False
-        if self.bias is not None:
-            self.bias.requires_grad = False
+            nn.init.kaiming_uniform_(obj.lora_a.weight.data, a=math.sqrt(5))
+        obj.lora_b.weight.data.fill_(0)
+        obj.dropout = nn.Dropout(p=dropout)
+        assert dropout_position in ['pre', 'post'], dropout_position
+        obj.dropout_position = dropout_position
 
     def forward(self, x):
-        # Base linear (weight frozen)
-        base = F.linear(x, self.weight, self.bias)
+        # pylint: disable=C0115,C0116
+        # If LinearLoRA is used to monkey-patch a nn.Linear module, we want to use nn.Linear's
+        # forward in the case where it uses quantized weights. We store a reference to nn.Linear's
+        # forward in `super_fwd` attribute. If the attribute does not exist we do the usual linear.
+        if (fwd := getattr(self, 'super_fwd', None)) is not None:
+            assert fwd != self.forward
+            res = fwd(x)
+        else:
+            res = F.linear(x, self.weight, self.bias)
 
-        # LoRA path
-        if self.dropout_position == "pre":
+        if self.dropout_position == 'pre':
             x = self.dropout(x)
-        lora = self.lora_B(self.lora_A(x)) * self.scale
-        if self.dropout_position == "post":
-            lora = self.dropout(lora)
+        lora_res = self.lora_b(self.lora_a(x))
+        lora_res = lora_res * self.scale
+        if self.dropout_position == 'post':
+            lora_res = self.dropout(lora_res)
+        return res + lora_res
 
-        return base + lora
 
+def patch_linear_module(
+    orig_linear,
+    dim=8,
+    alpha=32,
+    dropout=0.0,
+    dropout_position='post',
+    lora_A_init_method='xavier',
+    lora_dtype=None,
+):
+    """Monkey-patches a nn.Linear (orig_linear param) to be a LinearLoRA, for all purposes
+    think of this function as replacing a nn.Linear with a LinearLoRA defined above.
+
+    The orig_linear might not contain valid weights, for example, the given orig_linear was
+    initialized within a context-manager that uses a "meta" device. Therefore, we cannot copy
+    the weight/bias from the orig_linear to the LinearLoRA, since those have not been allocated,
+
+    To circumvent this scenario, LinearLoRA's additional functionality (_init_adapter, _forward)
+    is based on static functions, so that we can use them for patching or when allocating a
+    new LinearLoRA object.
+
+    Args:
+        orig_linear (nn.Linear): the module we add adapter to.
+        dim (int, optional): Lora dim. Defaults to 8.
+        alpha (int, optional): Lora alpha scale. Defaults to 32.
+        dropout (float, optional): dropout prob. Defaults to 0.0.
+        dropout_position (str, optional): location to apply dropout wrt lora.
+            Defaults to 'post' (choices: 'pre', 'post').
+        lora_A_init_method (str, optional): lora_a init method. Defaults to 'xavier'.
+        lora_dtype (_type_, optional): Lora weights' dtype. By default will use orig_linear's dtype
+        but orig_linear might use non-trainable dtype (e.g., 4bit), in which case the user must
+        specify the dtype manually. Defaults to None.
+
+    Returns:
+        (nn.Module): the monkey-patched (nn.Linear + LoRA) nn.Module
+    """
+
+    assert isinstance(orig_linear, nn.Linear) or orig_linear.__class__ == te.Linear
+    assert not hasattr(orig_linear, 'super_fwd'), orig_linear.super_fwd
+
+    if isinstance(orig_linear, nn.Linear):
+        LinearLoRA._init_adapter(orig_linear, dim, alpha, dropout, dropout_position, lora_A_init_method, lora_dtype)
+        cls = orig_linear.__class__
+        new_cls = type('PatchedLinearLoRA', (LinearLoRA, cls), {})
+    else:
+        raise NotImplementedError("Expected isinstance(orig_linear, (nn.Linear, te.Linear))")
+
+    # If the model uses quantized weights, we want to use orig_linear's forward
+    if (
+        getattr(orig_linear, 'quant_state', None) is not None
+        and orig_linear.quant_state.__class__ == bitsandbytes.functional.QuantState
+    ):
+        orig_linear.super_fwd = orig_linear.forward
+
+    orig_linear.__class__ = new_cls
+    return orig_linear
 
 # -----------------------------------------------------------------------------#
 # 2.  Convenience: patch a model in-place                                      #
@@ -125,7 +233,7 @@ def apply_lora_to_linear_modules(
                     alpha=alpha,
                     dropout=dropout,
                     dropout_position=dropout_position,
-                    lora_A_init=lora_A_init,
+                    lora_A_init_method=lora_A_init,
                     lora_dtype=lora_dtype,
                 ),
             )
@@ -139,27 +247,6 @@ def _parent_and_attr(root: nn.Module, fqname: str):
         parent = getattr(parent, p)
     return parent, parts[-1]
 
-
-# -----------------------------------------------------------------------------#
-# 3.  Merge utility                                                            #
-# -----------------------------------------------------------------------------#
-@torch.no_grad()
-def merge_lora_weights(model: nn.Module):
-    """
-    Permanently adds the LoRA contribution into the base weights and
-    deletes the LoRA parameters. Call after training if you want to
-    discard adapters for inference.
-    """
-    for m in model.modules():
-        if isinstance(m, LinearLoRA):
-            # W ← W + (α/r) * B @ A
-            delta_w = (m.scale * (m.lora_B.weight @ m.lora_A.weight)).to(m.weight.dtype)
-            m.weight.data += delta_w
-
-            # Remove LoRA parameters (turn layer into frozen plain Linear)
-            del m.lora_A, m.lora_B, m.dropout
-            m.__class__ = nn.Linear  # type: ignore
-    return model
 
 
 if __name__ == "__main__":
@@ -180,8 +267,5 @@ if __name__ == "__main__":
     out = model(dummy)
     out.sum().backward()
     print("Forward/backward worked with LoRA.")
-
-    # Merge & test
-    merge_lora_weights(model)
-    out2 = model(dummy)
-    print("Forward after merge worked:", out2.shape)
+    print(out)
+    print(model)
