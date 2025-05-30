@@ -177,7 +177,6 @@ class FSDP2Manager:
         else:
             # Parallelize the first embedding and the last linear out projection
             base_model_tp_plan = {
-                "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
                 "model.layers.*.self_attn.q_proj": ColwiseParallel(),
                 "model.layers.*.self_attn.k_proj": ColwiseParallel(),
                 "model.layers.*.self_attn.v_proj": ColwiseParallel(),
