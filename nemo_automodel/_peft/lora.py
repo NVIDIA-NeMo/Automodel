@@ -258,7 +258,7 @@ def apply_lora_to_linear_modules(
                     lora_dtype=lora_dtype,
                 ),
             )
-    return model, num_modules_matched
+    return num_modules_matched
 
 def _parent_and_attr(root: nn.Module, fqname: str):
     """Return (parent_module, attribute_name) for fully-qualified module name."""
