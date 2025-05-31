@@ -18,13 +18,13 @@ from nemo_automodel.training.step_scheduler import StepScheduler
 #  Stateless helper functions
 # ---------------------------
 
-def build_model(device, model_wrapper, cfg_model) -> nn.Module:
+def build_model(device, cfg_model, cfg_peft, model_wrapper) -> nn.Module:
     """
     Build and initialize a model.
 
     Args:
         device: The target device.
-        model_wrapper: A potential wrapper providing parallelism.
+        model_wrapper: Optional parallelism wrapper.
         cfg_model: Configuration for model instantiation.
 
     Returns:
@@ -34,7 +34,13 @@ def build_model(device, model_wrapper, cfg_model) -> nn.Module:
     for m in model.modules():
         if isinstance(m, nn.Embedding):
             m.weight.requires_grad_(False)
-    if model_wrapper is not None and callable(getattr(model_wrapper, 'parallelize', None)):
+    # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
+    if cfg_peft is not None:
+        opts = cfg_peft.to_dict()
+        peft_fn = opts.pop('peft_fn')
+        model = peft_fn(model, **opts)
+
+    if callable(getattr(model_wrapper, 'parallelize', None)):
         model = model_wrapper.parallelize(model)
     return model.to(device)
 
@@ -188,7 +194,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
 
         # Build components
-        self.model = build_model(self.dist_env.device, model_wrapper, self.cfg.model)
+        self.model = build_model(self.dist_env.device, self.cfg.model, self.cfg.get('peft', None), model_wrapper)
         self.optimizer = build_optimizer(self.cfg.optimizer, self.model)
         self.loss_fn   = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
         self.dataloader = build_dataloader(
