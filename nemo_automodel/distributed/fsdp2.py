@@ -206,10 +206,12 @@ class FSDP2Manager:
                 base_model_tp_plan.update(base_model_sp_plan)
 
             tp_shard_plan = base_model_tp_plan
+
             # TODO(boxiangw): Change this to a log
-            print(
-                "Using default TP plan for parallelization. It is compatible with huggingface llama3-style models."
-            )
+            if self.device_mesh.get_rank() == 0:
+                print(
+                    "Using default TP plan for parallelization. It is compatible with huggingface llama3-style models."
+                )
 
         fsdp2_strategy_parallelize(
             model,

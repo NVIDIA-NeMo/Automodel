@@ -114,7 +114,8 @@ class NVFSDPManager:
         default=True, metadata={"help": "Check for NaN in gradients if True."}
     )
     data_parallel_sharding_strategy: Optional[str] = field(
-        default="optim_grads_params", metadata={"help": "Data parallel sharding strategy."}
+        default="optim_grads_params",
+        metadata={"help": "Data parallel sharding strategy."},
     )
     grad_reduce_in_fp32: Optional[bool] = field(
         default=False, metadata={"help": "Reduce gradients in fp32 if True."}
