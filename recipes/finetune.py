@@ -38,7 +38,7 @@ def build_model(device, cfg_model, cfg_peft, model_wrapper) -> nn.Module:
     if cfg_peft is not None:
         opts = cfg_peft.to_dict()
         peft_fn = opts.pop('peft_fn')
-        num_modules_matched = peft_fn(model, **opts)
+        peft_fn(model, **opts)
 
     if callable(getattr(model_wrapper, 'parallelize', None)):
         model = model_wrapper.parallelize(model)
