@@ -19,11 +19,7 @@ model:
 
 distributed:
   _target_: nemo_automodel.distributed.fsdp2.FSDP2Manager
-<<<<<<< HEAD
   dp_size: None
-=======
-  dp_size: 8
->>>>>>> main
   tp_size: 1
   cp_size: 1
   sequence_parallel: false
