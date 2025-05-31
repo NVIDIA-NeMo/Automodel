@@ -2,16 +2,26 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, List, Dict
 
 # from megatron.core.distributed.custom_fsdp import FSDP
-from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from megatron.core.distributed.distributed_data_parallel_config import (
+    DistributedDataParallelConfig,
+)
 
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
-from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, SequenceParallel
+from torch.distributed.tensor.parallel import (
+    ColwiseParallel,
+    RowwiseParallel,
+    SequenceParallel,
+)
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
-from nemo_automodel.distributed.parallelizer import fsdp2_strategy_parallelize, get_hf_tp_shard_plan, nvfsdp_strategy_parallelize
+from nemo_automodel.distributed.parallelizer import (
+    fsdp2_strategy_parallelize,
+    get_hf_tp_shard_plan,
+    nvfsdp_strategy_parallelize,
+)
 
 
 @dataclass
@@ -47,60 +57,62 @@ class FSDP2Manager:
         parallelize(model):
             Applies FSDP2 and Tensor-Parallel sharding strategies to the given model.
     """
+
     dp_size: Optional[int] = field(
         default=None,
-        metadata={"help": "Data-parallel group size; if None, infer from WORLD_SIZE."}
+        metadata={"help": "Data-parallel group size; if None, infer from WORLD_SIZE."},
     )
     tp_size: Optional[int] = field(
         default=1,
-        metadata={"help": "Tensor-parallel group size; if None, defaults to 1."}
+        metadata={"help": "Tensor-parallel group size; if None, defaults to 1."},
     )
     cp_size: Optional[int] = field(
         default=1,
-        metadata={"help": "Context-parallel group size (for pipeline-like sharding)."}
+        metadata={"help": "Context-parallel group size (for pipeline-like sharding)."},
     )
     sequence_parallel: Optional[bool] = field(
         default=False,
-        metadata={"help": "Enable sequence parallelism in TP plan if True."}
+        metadata={"help": "Enable sequence parallelism in TP plan if True."},
     )
     mp_policy: Optional[MixedPrecisionPolicy] = field(
         default=MixedPrecisionPolicy(
-                param_dtype=torch.bfloat16,
-                reduce_dtype=torch.bfloat16,
-                output_dtype=torch.bfloat16,
-                cast_forward_inputs=True,
-            ),
-        metadata={"help": "MixedPrecisionPolicy for FSDP2 (param/reduce/output dtypes)."}
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.bfloat16,
+            output_dtype=torch.bfloat16,
+            cast_forward_inputs=True,
+        ),
+        metadata={
+            "help": "MixedPrecisionPolicy for FSDP2 (param/reduce/output dtypes)."
+        },
     )
     offload_policy: Optional[CPUOffloadPolicy] = field(
         default=None,
-        metadata={"help": "CPUOffloadPolicy to offload parameters/optim states to CPU."}
+        metadata={
+            "help": "CPUOffloadPolicy to offload parameters/optim states to CPU."
+        },
     )
     backend: Optional[str] = field(
-        default="nccl",
-        metadata={"help": "Distributed backend, e.g. 'nccl' or 'gloo'."}
+        default="nccl", metadata={"help": "Distributed backend, e.g. 'nccl' or 'gloo'."}
     )
     world_size: Optional[int] = field(
         default=None,
         # init=False,
-        metadata={"help": "Total number of processes."}
+        metadata={"help": "Total number of processes."},
     )
     nvfsdp: Optional[bool] = field(
         default=False,
-        metadata={"help": "Use nvFSDP instead of torch.distributed.fsdp if True."}
+        metadata={"help": "Use nvFSDP instead of torch.distributed.fsdp if True."},
     )
     nvfsdp_unit_modules: Optional[List[str]] = field(
         default=None,
-        metadata={"help": "List of unit modules to be wrapped with nvFSDP."}
+        metadata={"help": "List of unit modules to be wrapped with nvFSDP."},
     )
     init_nvfsdp_with_meta_device: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Initialize nvFSDP with meta device if True."}
+        default=False, metadata={"help": "Initialize nvFSDP with meta device if True."}
     )
     # TODO(boxiangw): rename this after nvFSDP is published
     nvfsdp_config: Optional[Dict[str, Any]] = field(
-        default=None,
-        metadata={"help": "nvFSDP ddp_config used in Megatron Core."}
+        default=None, metadata={"help": "nvFSDP ddp_config used in Megatron Core."}
     )
 
     def __post_init__(self):
@@ -141,7 +153,9 @@ class FSDP2Manager:
         mesh_shape = (self.dp_size, self.cp_size, self.tp_size)
         mesh_names = ("data_parallel", "context_parallel", "tensor_parallel")
         for shape, name in zip(mesh_shape, mesh_names):
-            assert isinstance(shape, int), "Expected {} to be an int, but got {}".format(name, type(shape))
+            assert isinstance(
+                shape, int
+            ), "Expected {} to be an int, but got {}".format(name, type(shape))
             assert shape > 0, "Expected {} > 0, {}".format(name, shape)
 
         # build mesh [dp, cp, tp]
@@ -152,7 +166,9 @@ class FSDP2Manager:
         )
         # flatten dp+cp if cp>1
         if self.cp_size > 1:
-            self.device_mesh[("data_parallel", "context_parallel")]._flatten(mesh_dim_name="dp_cp")
+            self.device_mesh[("data_parallel", "context_parallel")]._flatten(
+                mesh_dim_name="dp_cp"
+            )
         return self
 
     def parallelize(self, model, use_hf_tp_plan=False):
@@ -193,13 +209,21 @@ class FSDP2Manager:
             }
 
             base_model_sp_plan = {
-                "model.embed_tokens": RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1)),
+                "model.embed_tokens": RowwiseParallel(
+                    input_layouts=Replicate(), output_layouts=Shard(1)
+                ),
                 "model.norm": SequenceParallel(),
                 "model.layers.*.input_layernorm": SequenceParallel(),
-                "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
+                "model.layers.*.self_attn.o_proj": RowwiseParallel(
+                    output_layouts=Shard(1)
+                ),
                 "model.layers.*.post_attention_layernorm": SequenceParallel(),
-                "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
-                "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate()),
+                "model.layers.*.mlp.down_proj": RowwiseParallel(
+                    output_layouts=Shard(1)
+                ),
+                "lm_head": ColwiseParallel(
+                    input_layouts=Shard(1), output_layouts=Replicate()
+                ),
             }
 
             if not self.nvfsdp:
@@ -208,24 +232,28 @@ class FSDP2Manager:
                     # Enable sequence parallelism only if TP size > 1
                     base_model_tp_plan.update(base_model_sp_plan)
             elif self.sequence_parallel:
-                #TODO(boxiangw): Change this to a log
-                print("Sequence parallelism is disabled. It is not compatible with nvFSDP.")
+                # TODO(boxiangw): Change this to a log
+                print(
+                    "Sequence parallelism is disabled. It is not compatible with nvFSDP."
+                )
 
             tp_shard_plan = base_model_tp_plan
-            #TODO(boxiangw): Change this to a log
-            print("Using default TP plan for parallelization. It is compatible with huggingface llama3-style models.")
+            # TODO(boxiangw): Change this to a log
+            print(
+                "Using default TP plan for parallelization. It is compatible with huggingface llama3-style models."
+            )
 
         if self.nvfsdp:
             # Use nvFSDP instead of torch.distributed.fsdp.
             if self.nvfsdp_config is None:
                 self.nvfsdp_config = DistributedDataParallelConfig(
-                    check_for_nan_in_grad= True,
+                    check_for_nan_in_grad=True,
                     data_parallel_sharding_strategy="optim_grads_params",
                     grad_reduce_in_fp32=False,
                     preserve_fp32_weights=False,
                     overlap_grad_reduce=True,
                     overlap_param_gather=True,
-                    average_in_collective=False
+                    average_in_collective=False,
                 )
 
             model = nvfsdp_strategy_parallelize(
@@ -235,7 +263,7 @@ class FSDP2Manager:
                 nvfsdp_unit_modules=self.nvfsdp_unit_modules,
                 init_nvfsdp_with_meta_device=self.init_nvfsdp_with_meta_device,
                 tp_shard_plan=tp_shard_plan,
-                )
+            )
         else:
             fsdp2_strategy_parallelize(
                 model,
