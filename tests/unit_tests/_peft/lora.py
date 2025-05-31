@@ -92,8 +92,8 @@ def test_lora_layers_are_trainable():
     lora = LinearLoRA(base, dim=4, alpha=8)
 
     assert lora.weight.requires_grad is False
-    assert lora.lora_a.weight.requires_grad
-    assert lora.lora_b.weight.requires_grad
+    assert lora.lora_A.weight.requires_grad
+    assert lora.lora_B.weight.requires_grad
     if lora.bias is not None:
         assert lora.bias.requires_grad is False
 
@@ -105,11 +105,11 @@ def test_dropout_pre_post_effects(dummy_input):
     lora_post = LinearLoRA(base, dim=4, alpha=8, dropout=0.5, dropout_position='post')
 
     with torch.no_grad():
-        lora_pre.lora_a.weight.uniform_()
-        lora_pre.lora_b.weight.uniform_()
+        lora_pre.lora_A.weight.uniform_()
+        lora_pre.lora_B.weight.uniform_()
 
-        lora_post.lora_a.weight.copy_(lora_pre.lora_a.weight)
-        lora_post.lora_b.weight.copy_(lora_pre.lora_b.weight)
+        lora_post.lora_A.weight.copy_(lora_pre.lora_A.weight)
+        lora_post.lora_B.weight.copy_(lora_pre.lora_B.weight)
 
     lora_pre.train()
     lora_post.train()

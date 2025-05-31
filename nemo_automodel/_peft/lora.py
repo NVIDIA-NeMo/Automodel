@@ -116,13 +116,13 @@ class LinearLoRA(nn.Linear):
         out_features = obj.out_features
         dtype = lora_dtype or obj.weight.dtype
 
-        obj.lora_a = nn.Linear(in_features, dim, bias=False, dtype=dtype, device=device)
-        obj.lora_b = nn.Linear(dim, out_features, bias=False, dtype=dtype, device=device)
+        obj.lora_A = nn.Linear(in_features, dim, bias=False, dtype=dtype, device=device)
+        obj.lora_B = nn.Linear(dim, out_features, bias=False, dtype=dtype, device=device)
         if lora_A_init_method == 'xavier':
-            torch.nn.init.uniform_(obj.lora_a.weight.data)
+            torch.nn.init.uniform_(obj.lora_A.weight.data)
         else:
-            nn.init.kaiming_uniform_(obj.lora_a.weight.data, a=math.sqrt(5))
-        obj.lora_b.weight.data.fill_(0)
+            nn.init.kaiming_uniform_(obj.lora_A.weight.data, a=math.sqrt(5))
+        obj.lora_B.weight.data.fill_(0)
         obj.dropout = nn.Dropout(p=dropout)
         assert dropout_position in ['pre', 'post'], ('dropout position can only be pre/post', dropout_position)
         obj.dropout_position = dropout_position
@@ -152,7 +152,7 @@ class LinearLoRA(nn.Linear):
 
         if self.dropout_position == 'pre':
             x = self.dropout(x)
-        lora_res = self.lora_b(self.lora_a(x))
+        lora_res = self.lora_B(self.lora_A(x))
         lora_res = lora_res * self.scale
         if self.dropout_position == 'post':
             lora_res = self.dropout(lora_res)
