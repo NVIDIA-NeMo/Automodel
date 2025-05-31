@@ -61,9 +61,9 @@ class ModuleMatcher:
     def __post_init__(self):
         """ input validation """
         if self.match_all_linear is False and (
-            not isinstance(target_modules, list) or len(target_modules) == 0
+            not isinstance(self.target_modules, list) or len(self.target_modules) == 0
         ) and (
-            not isinstance(exclude_modules, list) or len(exclude_modules) == 0
+            not isinstance(self.exclude_modules, list) or len(self.exclude_modules) == 0
         ):
             raise ValueError("Expected match_all_linear to be true or "\
                 "target_modules/exclude_modules to be non-empty")

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import math
-from typing import List, Literal, Optional
+from typing import Literal, Optional
 import re
 import torch
 import torch.nn.functional as F
@@ -237,8 +237,6 @@ def apply_lora_to_linear_modules(
     target_modules accepts wildcard fragments, e.g. ["q_proj", "k_proj", ".*fc.*"].
     """
     matcher = ModuleMatcher(target_modules, exclude_modules, match_all_linear)
-
-    patterns = [re.compile(t) for t in target_modules]
 
     num_modules_matched = 0
     for name, module in list(model.named_modules()):
