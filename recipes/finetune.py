@@ -183,7 +183,12 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Build components
         self.model = build_model(self.dist_env.device, self.model_wrapper, self.cfg.model)
-        self.optimizer = build_optimizer(self.dist_env.device, self.cfg.optimizer, self.model, self.cfg.get("distributed.tp_size", 1))
+        self.optimizer = build_optimizer(
+            self.dist_env.device, 
+            self.cfg.optimizer, 
+            self.model, 
+            self.cfg.get("distributed.tp_size", 1),
+        )
         self.loss_fn   = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
         self.dataloader = build_dataloader(
             self.dist_env.device,
