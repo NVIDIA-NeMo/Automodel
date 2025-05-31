@@ -106,7 +106,6 @@ def import_classes_from_paths(class_paths: List[str]):
         class_paths (List[str]): The list of string paths to the classes.
     """
     classes = []
-    print(f"Importing classes from paths: {class_paths}")
     for path in class_paths:
         module_path, class_name = path.rsplit('.', 1)
         module = importlib.import_module(module_path)
