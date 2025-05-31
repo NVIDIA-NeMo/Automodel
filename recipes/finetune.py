@@ -91,9 +91,9 @@ def build_dataloader(cfg_ds, cfg_dl, distributed_sampler_kwargs) -> DataLoader:
     ds = cfg_ds.instantiate()
     sampler = torch.utils.data.distributed.DistributedSampler(
         ds,
-        num_replicas=distributed_sampler_kwargs["num_replicas"],
-        rank=distributed_sampler_kwargs["rank"],
-        shuffle=distributed_sampler_kwargs["shuffle"],
+        num_replicas=distributed_sampler_kwargs.get("num_replicas", 1),
+        rank=distributed_sampler_kwargs.get("rank", 0),
+        shuffle=distributed_sampler_kwargs.get("shuffle", False),
     )
     return cfg_dl.instantiate(dataset=ds, sampler=sampler)
 
