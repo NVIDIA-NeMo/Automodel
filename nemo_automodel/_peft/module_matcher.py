@@ -57,7 +57,17 @@ class ModuleMatcher:
         default_factory=lambda: ['linear_qkv', 'linear_proj', 'linear_fc1', 'linear_fc2']
     )
     exclude_modules: List[str] = field(default_factory=list)
-    canonical_mapping: Dict[str, Set] = field(default_factory=lambda: defaultdict(set))
+    match_all_linear: bool = field(default=False)
+
+    def __post_init__(self):
+        """ input validation """
+        if self.match_all_linear is False and (
+            not isinstance(target_modules, list) or len(target_modules) == 0
+        ) and (
+            not isinstance(exclude_modules, list) or len(exclude_modules) == 0
+        ):
+            raise ValueError("Expected match_all_linear to be true or "\
+                "target_modules/exclude_modules to be non-empty")
 
     # --------------------------------------------------------------------- #
     # Public API                                                            #
@@ -68,14 +78,9 @@ class ModuleMatcher:
         """
         full_name = f"{prefix}.{name}" if prefix else name
 
-        # 1. canonical_mapping takes absolute precedence
-        if self.canonical_mapping:
-            assert not self.exclude_modules, (
-                "`exclude_modules` must be empty when `canonical_mapping` is used."
-            )
-            for pattern in self.canonical_mapping:
-                if name == pattern or wildcard_match(pattern, full_name):
-                    return (pattern, full_name)
+        # 1. matching by layer type takes absolute precedence
+        if self.match_all_linear and isinstance(m, nn.Linear):
+            return True
 
         # 2. target_modules is the next most-specific rule set
         elif self.target_modules:
@@ -84,17 +89,12 @@ class ModuleMatcher:
             )
             for pattern in self.target_modules:
                 if name == pattern or wildcard_match(pattern, full_name):
-                    return (pattern, full_name)
+                    return True
 
         # 3. Fallback: “all linear layers except those explicitly excluded”
         else:
-            linear_types = (nn.Linear,)
-
-            if (
+            return (
                 name not in self.exclude_modules
                 and not any(wildcard_match(pattern, full_name) for pattern in self.exclude_modules)
-                and isinstance(m, linear_types)
-            ):
-                return (name, full_name)
-
-        return None
+                and isinstance(m, nn.Linear)
+            )

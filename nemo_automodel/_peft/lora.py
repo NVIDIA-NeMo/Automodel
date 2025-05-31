@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from nemo_automodel.shared.import_utils import safe_import
+from nemo_automodel._peft.module_matcher import ModuleMatcher
 HAS_BNB, bitsandbytes = safe_import("bitsandbytes")
 
 
@@ -220,8 +221,9 @@ def patch_linear_module(
 # -----------------------------------------------------------------------------#
 def apply_lora_to_linear_modules(
     model: nn.Module,
-    target_modules: List[str] = [],
-    match_all_linear: bool = False,
+    target_modules = [],
+    exclude_modules = [],
+    match_all_linear = True,
     dim: int = 8,
     alpha: int = 32,
     dropout: float = 0.0,
@@ -234,17 +236,14 @@ def apply_lora_to_linear_modules(
 
     target_modules accepts wildcard fragments, e.g. ["q_proj", "k_proj", ".*fc.*"].
     """
-    if match_all_linear is False and (
-        not isinstance(target_modules, list) or len(target_modules) == 0
-    ):
-        raise ValueError("Expected match_all_linear to be true or target_modules to be non-empty")
+    matcher = ModuleMatcher(target_modules, exclude_modules, match_all_linear)
 
     patterns = [re.compile(t) for t in target_modules]
 
+    num_modules_matched = 0
     for name, module in list(model.named_modules()):
-        if isinstance(module, nn.Linear) and (
-            match_all_linear or any(p.fullmatch(name) or p.search(name) for p in patterns)
-        ):
+        if matcher.match(module, name):
+            num_modules_matched += 1
             parent, attr = _parent_and_attr(model, name)
             setattr(
                 parent,
@@ -259,7 +258,7 @@ def apply_lora_to_linear_modules(
                     lora_dtype=lora_dtype,
                 ),
             )
-    return model
+    return model, num_modules_matched
 
 def _parent_and_attr(root: nn.Module, fqname: str):
     """Return (parent_module, attribute_name) for fully-qualified module name."""
