@@ -1,4 +1,5 @@
 import torch
+import math
 
 def batchify(tensor):
     """Ensures that the input tensor has at least two dimensions by adding an extra batch dimension if necessary.
@@ -77,7 +78,11 @@ def default_collater(batch, pad_token_id=0, pad_seq_len_divisible=None):
             torch.LongTensor(
                 pad_within_micro(
                     extract_key_from_dicts(batch, key),
-                    pad_token_id if key != "loss_mask" else 0,
+                    (
+                        0 if key == "attention_mask" or key == "loss_mask" else (
+                            -100 if key == "labels" else pad_token_id
+                        )
+                    ),
                     pad_seq_len_divisible,
                 )
             )
@@ -143,6 +148,10 @@ class SFTSingleTurnPreprocessor:
             [-100] * (len(c_ids)-1) + t_ids + [-100]
             for c_ids, t_ids in zip(ctx_tok["input_ids"], tgt_tok["input_ids"])
         ]
+
+        out["loss_mask"] = [
+            [1 if t != -100 else 0 for t in lbl] for lbl in out["labels"]
+        ]
         return out
 
     # --------------------------------------------------------------------- #
@@ -151,7 +160,7 @@ class SFTSingleTurnPreprocessor:
     def _compute_dataset_max_len(self, tokenized_ds):
         max_len = max(map(lambda x: len(x['input_ids']), tokenized_ds))
         # make multiple of 8
-        max_len = (max_len // 8 + 1) * 8
+        max_len = math.ceil(max_len / 8) * 8
         # respect model block size
         if self.block_size is not None:
             max_len = min(max_len, self.block_size)
@@ -163,17 +172,23 @@ class SFTSingleTurnPreprocessor:
         def _pad(examples):
             pad_id = tk.pad_token_id or 0
             examples["input_ids"] = [
-                ids + [pad_id] * (max_len - len(ids)) for ids in examples["input_ids"]
+                (ids[:max_len] + [pad_id] * max(0, max_len - len(ids)))
+                for ids in examples["input_ids"]
             ]
             examples["attention_mask"] = [
-                [1] * len(ids) + [0] * (max_len - len(ids))
+                ([1] * min(len(ids), max_len) + [0] * max(0, max_len - len(ids)))
                 for ids in examples["attention_mask"]
             ]
             examples["labels"] = [
-                lbl + [-100] * (max_len - len(lbl)) for lbl in examples["labels"]
+                (lbl[:max_len] + [-100] * max(0, max_len - len(lbl)))
+                for lbl in examples["labels"]
             ]
-            # truncate (safety)
-            return {k: v[:max_len] for k, v in examples.items()}
+            examples["loss_mask"] = [
+                (lm[:max_len] + [0] * max(0, max_len - len(lm)))
+                for lm in examples["loss_mask"]
+            ]
+            # return dictionary with sequences all exactly `max_len` long
+            return examples
 
         return _pad
 

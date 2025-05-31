@@ -21,7 +21,7 @@ from typing import Any, Optional
 
 import torch
 import torch.distributed
-from contextlib import ContextDecorator
+from contextlib import ContextDecorator, nullcontext
 import torch.distributed as dist
 import yaml
 
@@ -245,3 +245,89 @@ def dump_dataclass_to_yaml(obj: Any, filename: Optional[str] = None) -> Optional
                 yaml.safe_dump(obj, f)
         else:
             return yaml.safe_dump(obj)
+
+
+def reduce_loss(
+    loss_store: list[torch.Tensor],
+    total_num_tokens: torch.Tensor,
+    per_token_loss: bool = True,
+    dp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce loss across all ranks.
+
+    Args:
+        loss_store: List of loss tensors to reduce.
+        total_num_tokens: Total number of tokens to divide the loss by.
+        per_token_loss: Whether to divide the loss by the number of tokens.
+        dp_group: Process group to reduce the loss across.
+
+    Returns:
+        Tuple of reduced loss and denominator.
+    """
+    loss = torch.sum(torch.stack(loss_store).float()).view(1).clone().detach()
+
+    torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+
+    if per_token_loss:
+        denominator = total_num_tokens.clone().detach().to(torch.int)
+    else:
+        denominator = torch.tensor([len(loss_store)], dtype=torch.int, device="cuda")
+    torch.distributed.all_reduce(denominator, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+    return loss, denominator
+
+
+def get_sync_ctx(model, is_optim_step):
+    """
+    Get the synchronization context for the model.
+
+    Args:
+        model: The model to synchronize.
+        is_optim_step: Whether the current step is an optimizer step.
+
+    Returns:
+        A context manager that synchronizes the model.
+    """
+    # Use `no_sync` on DDP models when we are *not* on the final micro-batch for
+    # this gradient update (i.e., when `is_grad` is False). This avoids an
+    # all-reduce for every micro-batch and greatly improves throughput.
+    if isinstance(model, dist.fsdp._fully_shard._fully_shard.FSDPModule):
+        model.set_requires_gradient_sync(is_optim_step)
+        sync_ctx = nullcontext()
+    elif isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        if is_optim_step:
+            sync_ctx = nullcontext()
+        else:
+            sync_ctx = model.no_sync()
+    else:
+        sync_ctx = nullcontext()
+    return sync_ctx
+
+def rescale_gradients(model, num_tokens_for_grad_scaling, dp_group, dp_size):
+    """
+    Rescale gradients across the DP group.
+
+    Args:
+        model: The model to rescale.
+        num_tokens_for_grad_scaling: The number of tokens to divide the gradients by.
+        dp_group: The process group to rescale the gradients across.
+    """
+    num_tokens_for_grad_scaling = num_tokens_for_grad_scaling.clone().detach()
+    dist.all_reduce(num_tokens_for_grad_scaling, group=dp_group)
+    # DDP/FSDP reduces gradients across ranks, so we need to scale by the world size to inverse it
+    scaling_factor = dp_size / num_tokens_for_grad_scaling
+    for param in model.parameters():
+        if param.grad is not None:
+            param.grad.data.mul_(scaling_factor)
+
+# based on: https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/utils.py#L278
+@torch.no_grad()
+def clip_gradients(model, clip_norm):
+    """
+    Clip gradients across the DP group.
+    """
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    grad_norm = torch.nn.utils.get_total_norm(grads)
+    if isinstance(grad_norm, torch.distributed.tensor.DTensor):
+        grad_norm = grad_norm.full_tensor()
+    torch.nn.utils.clip_grads_with_norm_([p for p in model.parameters()], clip_norm, grad_norm)
+    return grad_norm

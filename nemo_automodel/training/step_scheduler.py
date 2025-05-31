@@ -31,6 +31,7 @@ class StepScheduler(Stateful):
                  grad_acc_steps: int,
                  ckpt_every_steps: int,
                  epoch_len: Optional[int],
+                 val_every_steps: Optional[int] = None,
                  start_step: int = 0,
                  start_epoch: int = 0,
                  num_epochs: int = 10):
@@ -51,8 +52,11 @@ class StepScheduler(Stateful):
         self.step   = start_step
         self.epoch  = start_epoch
         self.num_epochs = num_epochs
+        self.grad_step = 0        # number of optimizer steps taken
+        self.val_every_steps = val_every_steps
 
-    def update(self, batch_idx: int) -> Tuple[bool, bool]:
+
+    def update(self, batch_idx: int) -> Tuple[bool, bool, bool]:
         """
         Update the scheduler for the next batch.
 
@@ -60,11 +64,15 @@ class StepScheduler(Stateful):
             batch_idx (int): Index of the current batch.
 
         Returns:
-            Tuple[bool, bool]: A tuple of (is_optim_step, is_ckpt_step) indicating if a gradient
-            step and/or checkpoint step should be performed.
+            Tuple[bool, bool, bool]: A tuple of (is_optim_step, is_ckpt_step, is_val_step) indicating if a gradient
+            step, checkpoint step and validation step should be performed.
         """
         self.step += 1
-        return self.is_optim_step, self.is_ckpt_step(batch_idx)
+        is_grad = self.is_optim_step
+        is_val = self.is_val_step(is_grad)
+        is_ckpt = self.is_ckpt_step(batch_idx)
+        return is_grad, is_ckpt, is_val
+
 
     @property
     def is_optim_step(self):
@@ -73,9 +81,20 @@ class StepScheduler(Stateful):
         Returns:
             bool: if true, the optimizer should run.
         """
-        return (self.step % self.grad_acc_steps) == 0
+        is_grad = (self.step % self.grad_acc_steps) == 0
+        if is_grad:
+            self.grad_step += 1
+        return is_grad
 
-    def is_ckpt_step(self, batch_idx):
+    def is_val_step(self, is_grad: bool):
+        """whether this step needs to call the validation
+        """
+        is_val = False
+        if self.val_every_steps and self.val_every_steps > 0 and is_grad:
+            is_val = (self.grad_step % self.val_every_steps) == 0
+        return is_val
+
+    def is_ckpt_step(self, batch_idx: int):
         """whether this step needs to call the checkpoint saving.
 
         Returns:

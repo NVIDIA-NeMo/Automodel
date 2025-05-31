@@ -5,12 +5,14 @@ from typing import Any, Dict
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+import wandb
+import torch.distributed as dist
 
 from nemo_automodel.config.loader import load_yaml_config
 from nemo_automodel.distributed.init_utils import initialize_distributed
+from nemo_automodel.utils.dist_utils import reduce_loss, get_sync_ctx, rescale_gradients, clip_gradients
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.step_scheduler import StepScheduler
-
 
 # ---------------------------
 #  Stateless helper functions
@@ -36,12 +38,11 @@ def build_model(device, model_wrapper, cfg_model) -> nn.Module:
         model = model_wrapper.parallelize(model)
     return model.to(device)
 
-def build_optimizer(device, cfg_opt, model) -> 'Optimizer':  # noqa: F821
+def build_optimizer(cfg_opt, model) -> 'Optimizer':  # noqa: F821
     """
     Build an optimizer for the model.
 
     Args:
-        device: The target device.
         cfg_opt: Configuration for optimizer instantiation.
         model: The model whose parameters will be optimized.
 
@@ -69,7 +70,7 @@ def build_loss_fn(device, cfg_loss):
         return cfg_loss.instantiate().to(device)
 
 
-def build_dataloader(device, cfg_ds, cfg_dl, distributed_sampler_kwargs) -> DataLoader:
+def build_dataloader(cfg_ds, cfg_dl, distributed_sampler_kwargs) -> DataLoader:
     """
     Build a DataLoader for the dataset.
 
@@ -86,6 +87,7 @@ def build_dataloader(device, cfg_ds, cfg_dl, distributed_sampler_kwargs) -> Data
         ds,
         num_replicas=distributed_sampler_kwargs["num_replicas"],
         rank=distributed_sampler_kwargs["rank"],
+        shuffle=distributed_sampler_kwargs["shuffle"],
     )
     return cfg_dl.instantiate(dataset=ds, sampler=sampler)
 
@@ -157,8 +159,9 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
 
-        model_wrapper = None
+        self.device_mesh = None
         distributed_sampler_kwargs = {}
+        model_wrapper = None
         if "distributed" in self.cfg:
             model_wrapper = self.cfg.distributed.instantiate(
                 world_size=self.dist_env.world_size
@@ -166,20 +169,48 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             distributed_sampler_kwargs = {
                 "num_replicas": model_wrapper.device_mesh["data_parallel"].size(),
                 "rank": model_wrapper.device_mesh["data_parallel"].get_local_rank(),
+                "shuffle": self.cfg.dataloader.get("shuffle", True),
             }
+            if "shuffle" in self.cfg.dataloader:
+                del self.cfg.dataloader.shuffle
+            if hasattr(model_wrapper, 'device_mesh'):
+                self.device_mesh = model_wrapper.device_mesh
 
         torch.manual_seed(self.cfg.get("seed", 42) + self.dist_env.rank)
 
+        if self.dist_env.is_main and hasattr(self.cfg, 'logger'):
+            wandb.init(
+                project=self.cfg.logger.get("wandb_project", "default_project"),
+                entity=self.cfg.logger.get("wandb_entity"),
+                name=self.cfg.logger.get("wandb_exp_name"),
+                dir=self.cfg.logger.get("wandb_save_dir"),
+                config=self.cfg,
+            )
+
         # Build components
         self.model = build_model(self.dist_env.device, model_wrapper, self.cfg.model)
-        self.optimizer = build_optimizer(self.dist_env.device, self.cfg.optimizer, self.model)
+        self.optimizer = build_optimizer(self.cfg.optimizer, self.model)
         self.loss_fn   = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
         self.dataloader = build_dataloader(
-            self.dist_env.device,
             self.cfg.dataset,
             self.cfg.dataloader,
             distributed_sampler_kwargs,
         )
+
+        # Build validation dataloader if the config provides it
+        self.val_dataloader = None
+        val_ds_cfg = self.cfg.get("validation_dataset")
+        val_dl_cfg = self.cfg.get("validation_dataloader")
+        if val_ds_cfg is not None and val_dl_cfg is not None:
+            self.val_dataloader = build_dataloader(
+                val_ds_cfg,
+                val_dl_cfg,
+                distributed_sampler_kwargs,
+            )
+        
+        # Initialize metrics required for calculating loss
+        self.total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
+        self.forward_data_store = []
 
         # Scheduler
         self.step_scheduler = build_step_scheduler(self.cfg.get('step_scheduler', None), self.dataloader)
@@ -199,19 +230,41 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.model.train()
         for epoch in self.step_scheduler.epochs:
             for batch_idx, batch in enumerate(self.dataloader):
-                is_optim_step, is_ckpt_step = self.step_scheduler.update(batch_idx)
-                loss = self._run_train_step(batch, is_optim_step, 1.0,
-                    num_grad_acc_steps=self.step_scheduler.grad_acc_steps)
+                is_optim_step, is_ckpt_step, is_val_step = self.step_scheduler.update(batch_idx)
+                grad_norm = self._run_train_step(batch, is_optim_step, self.device_mesh, 1.0)
+                if is_optim_step:
+                    reporting_loss = self.log_train_metrics(grad_norm)
 
-                if self.dist_env.is_main and is_ckpt_step:
-                    self._save_checkpoint()
-
+                # if self.dist_env.is_main and is_ckpt_step:
+                #     self._save_checkpoint()
                 if self.dist_env.is_main and is_optim_step:
-                    print(f"step {self.step_scheduler.step} | loss {loss.item():.6f}", flush=True)
+                    print(
+                        f"step {self.step_scheduler.step} | "
+                        f"epoch {self.step_scheduler.epoch} | "
+                        f"loss {reporting_loss:.6f} | "
+                        f"grad_norm {grad_norm:.6f}"
+                    )
+                
+                if is_val_step and self.val_dataloader is not None:
+                    val_loss = self._run_validation_epoch()
+                    if self.dist_env.is_main:
+                        if wandb.run is not None:
+                            wandb.log(
+                                {
+                                    "val_loss": val_loss,
+                                    "step": self.step_scheduler.step,
+                                    "epoch": self.step_scheduler.epoch
+                                }
+                            )
+                        print(
+                            f"[val] step {self.step_scheduler.step} | "
+                            f"epoch {self.step_scheduler.epoch} | "
+                            f"loss {val_loss:.4f}",
+                        )
 
 
     # ------------------ helpers ------------------
-    def _run_train_step(self, batch, is_optim_step, clip_norm=1.0, num_grad_acc_steps=10):
+    def _run_train_step(self, batch, is_optim_step, device_mesh, clip_norm=1.0):
         """
         Execute a single training step.
 
@@ -220,32 +273,107 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             is_optim_step: Flag indicating if a gradient step should be applied.
 
         Returns:
-            Detached loss from the training step.
+            Grad norm from the training step.
         """
+        self.model.train()
+
         batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
         labels = batch.pop("labels")
         mask   = batch.pop("loss_mask", None)
+        if mask is None:
+            mask = (labels.detach() != -100).to(torch.int)
 
         out  = self.model(**batch)
-        loss = self.loss_fn(out.logits.view(-1, out.logits.size(-1)),
-                            labels.view(-1), mask=mask)
-        loss.backward()
+        local_loss = self.loss_fn(out.logits.view(-1, out.logits.size(-1)),
+                            labels.view(-1), mask=mask, reduction="sum")
+        local_num_tokens = mask.sum().detach().to(torch.int)
+        self.total_num_tokens += local_num_tokens
+        self.forward_data_store.append(local_loss.detach())
 
+        with get_sync_ctx(self.model, is_optim_step):
+            local_loss.backward()
+
+        grad_norm = None
         if is_optim_step:
-            grad_params = []
-            for param in self.model.parameters():
-                if param.grad is not None:
-                    param.grad.data.mul_(1/num_grad_acc_steps)
-                    grad_params.append(param)
-            # TP does not support grad_clip yet
-            if (
-                isinstance(clip_norm, float)
-                and self.cfg.get("distributed.tp_size", 1) == 1
-            ):
-                torch.nn.utils.clip_grad_norm_(grad_params, clip_norm, foreach=True)
+            rescale_gradients(
+                self.model,
+                self.total_num_tokens,
+                device_mesh["data_parallel"].get_group(),
+                device_mesh["data_parallel"].size()
+            )
+            
+            # Clip gradients **after** any rescaling.
+            if device_mesh["tensor_parallel"].size() == 1:
+                grad_norm = clip_gradients(self.model, clip_norm)
+
             self.optimizer.step()
             self.optimizer.zero_grad()
-        return loss.detach()
+        return grad_norm
+    
+    @torch.no_grad()
+    def _run_validation_epoch(self) -> float:
+        """Run one pass over `self.val_dataloader` and return average loss per token."""
+        self.model.eval()
+
+        total_loss = 0.0
+        total_tokens = 0
+
+        for batch in self.val_dataloader:
+            batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
+            labels = batch.pop("labels")
+            mask = batch.pop("loss_mask", None)
+            if mask is None:
+                mask = (labels.detach() != -100).to(torch.int)
+
+            out = self.model(**batch)
+            local_loss = self.loss_fn(
+                out.logits.view(-1, out.logits.size(-1)),
+                labels.view(-1),
+                mask=mask,
+                reduction="sum"
+            )
+            total_loss += local_loss.item()
+            total_tokens += mask.sum().item()
+
+        # Aggregate across ranks if distributed is initialized
+        if dist.is_initialized():
+            tensor = torch.tensor([total_loss, total_tokens], device=self.dist_env.device)
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            total_loss, total_tokens = tensor.tolist()
+
+        return total_loss / max(total_tokens, 1e-8)
+    
+    def log_train_metrics(self, grad_norm):
+        """
+        Log metrics to wandb.
+
+        Args:
+            grad_norm: Grad norm from the training step.
+
+        Returns:
+            Reporting loss.
+        """
+        total_loss, total_num_tokens = reduce_loss(
+            self.forward_data_store, self.total_num_tokens, per_token_loss=True
+        )
+        reporting_loss = (total_loss / total_num_tokens).item()
+        grad_norm = grad_norm.item()
+        self.total_num_tokens.zero_()
+        self.forward_data_store = []
+        log_data = {
+            "train_loss": reporting_loss,
+            "loss_sum": total_loss,
+            "step": self.step_scheduler.step,
+            "epoch": self.step_scheduler.epoch,
+            "grad_norm": grad_norm,
+            "num_tokens_per_step": total_num_tokens,
+        }
+        if self.optimizer.param_groups:
+            log_data["learning_rate"] = self.optimizer.param_groups[0]['lr']
+
+        if wandb.run is not None:
+            wandb.log(log_data)
+        return reporting_loss
 
 # ---------------------------------------------------------------------------
 # Entry point

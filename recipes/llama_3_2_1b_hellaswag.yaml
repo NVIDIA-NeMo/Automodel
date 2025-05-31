@@ -1,6 +1,8 @@
 step_scheduler:
-  grad_acc_steps: 10
+  grad_acc_steps: 4
   ckpt_every_steps: 1000
+  val_every_steps: 10  # will run every x number of gradient steps
+  num_epochs: 1
 
 dist_env:
   backend: nccl
@@ -17,7 +19,7 @@ model:
 
 distributed:
   _target_: nemo_automodel.distributed.fsdp2.FSDP2Manager
-  dp_size: 1
+  dp_size: 8
   tp_size: 1
   cp_size: 1
   sequence_parallel: false
@@ -31,13 +33,27 @@ dataset:
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
-  num_samples_limit: 10000
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.datasets.utils.default_collater
-  batch_size: 1
+  batch_size: 8
+  shuffle: false
 
+validation_dataset:
+  _target_: nemo_automodel.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: validation
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+  num_samples_limit: 64
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.datasets.utils.default_collater
+  batch_size: 8
+  
 optimizer:
   _target_: torch.optim.Adam
   betas: [0.9, 0.999]
@@ -46,3 +62,9 @@ optimizer:
   weight_decay: 0
   foreach: true # foreach is not compatible with TP
   # min_lr: 1.0e-5
+
+logger:
+  wandb_project: nemo_automodel_sft_loop
+  wandb_entity: nvidia
+  wandb_exp_name: automodel-hellaswag-single-fsdp-local-tensor-llama_Llama-3.2-1B
+  wandb_save_dir: /tmp/nemo_automodel/wandb
