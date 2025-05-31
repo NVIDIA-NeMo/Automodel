@@ -14,7 +14,7 @@
 
 import math
 from typing import List, Literal, Optional
-
+import re
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -220,7 +220,7 @@ def patch_linear_module(
 # -----------------------------------------------------------------------------#
 def apply_lora_to_linear_modules(
     model: nn.Module,
-    target_modules: List[str],
+    target_modules: List[str] = [],
     match_all_linear: bool = False,
     dim: int = 8,
     alpha: int = 32,
@@ -234,7 +234,10 @@ def apply_lora_to_linear_modules(
 
     target_modules accepts wildcard fragments, e.g. ["q_proj", "k_proj", ".*fc.*"].
     """
-    import re
+    if match_all_linear is False and (
+        not isinstance(target_modules, list) or len(target_modules) == 0
+    ):
+        raise ValueError("Expected match_all_linear to be true or target_modules to be non-empty")
 
     patterns = [re.compile(t) for t in target_modules]
 
@@ -256,7 +259,7 @@ def apply_lora_to_linear_modules(
                     lora_dtype=lora_dtype,
                 ),
             )
-
+    return model
 
 def _parent_and_attr(root: nn.Module, fqname: str):
     """Return (parent_module, attribute_name) for fully-qualified module name."""
