@@ -159,19 +159,22 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
 
-        self.model_wrapper = None
+        self.device_mesh = None
         distributed_sampler_kwargs = {}
+        model_wrapper = None
         if "distributed" in self.cfg:
-            self.model_wrapper = self.cfg.distributed.instantiate(
+            model_wrapper = self.cfg.distributed.instantiate(
                 world_size=self.dist_env.world_size
             )
             distributed_sampler_kwargs = {
-                "num_replicas": self.model_wrapper.device_mesh["data_parallel"].size(),
-                "rank": self.model_wrapper.device_mesh["data_parallel"].get_local_rank(),
+                "num_replicas": model_wrapper.device_mesh["data_parallel"].size(),
+                "rank": model_wrapper.device_mesh["data_parallel"].get_local_rank(),
                 "shuffle": self.cfg.dataloader.get("shuffle", True),
             }
             if "shuffle" in self.cfg.dataloader:
                 del self.cfg.dataloader.shuffle
+            if hasattr(model_wrapper, 'device_mesh'):
+                self.device_mesh = model_wrapper.device_mesh
 
         torch.manual_seed(self.cfg.get("seed", 42) + self.dist_env.rank)
 
@@ -185,7 +188,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
 
         # Build components
-        self.model = build_model(self.dist_env.device, self.model_wrapper, self.cfg.model)
+        self.model = build_model(self.dist_env.device, model_wrapper, self.cfg.model)
         self.optimizer = build_optimizer(self.cfg.optimizer, self.model)
         self.loss_fn   = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
         self.dataloader = build_dataloader(
@@ -225,12 +228,10 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         and update model parameters when necessary. Also prints loss every gradient step.
         """
         self.model.train()
-        starting_epoch = self.step_scheduler.epoch
-        num_epochs = self.step_scheduler.num_epochs
-        for self.step_scheduler.epoch in range(starting_epoch, num_epochs):
+        for epoch in self.step_scheduler.epochs:
             for batch_idx, batch in enumerate(self.dataloader):
                 is_optim_step, is_ckpt_step, is_val_step = self.step_scheduler.update(batch_idx)
-                grad_norm = self._run_train_step(batch, is_optim_step, 1.0)
+                grad_norm = self._run_train_step(batch, is_optim_step, self.device_mesh, 1.0)
                 if is_optim_step:
                     reporting_loss = self.log_train_metrics(grad_norm)
 
@@ -263,7 +264,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
 
     # ------------------ helpers ------------------
-    def _run_train_step(self, batch, is_optim_step, clip_norm=1.0):
+    def _run_train_step(self, batch, is_optim_step, device_mesh, clip_norm=1.0):
         """
         Execute a single training step.
 
@@ -297,12 +298,12 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             rescale_gradients(
                 self.model,
                 self.total_num_tokens,
-                self.model_wrapper.device_mesh["data_parallel"].get_group(),
-                self.model_wrapper.device_mesh["data_parallel"].size()
+                device_mesh["data_parallel"].get_group(),
+                device_mesh["data_parallel"].size()
             )
             
             # Clip gradients **after** any rescaling.
-            if self.model_wrapper.device_mesh["tensor_parallel"].size() == 1:
+            if device_mesh["tensor_parallel"].size() == 1:
                 grad_norm = clip_gradients(self.model, clip_norm)
 
             self.optimizer.step()
