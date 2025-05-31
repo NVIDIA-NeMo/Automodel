@@ -104,6 +104,13 @@ def test_dropout_pre_post_effects(dummy_input):
     lora_pre = LinearLoRA(base, dim=4, alpha=8, dropout=0.5, dropout_position='pre')
     lora_post = LinearLoRA(base, dim=4, alpha=8, dropout=0.5, dropout_position='post')
 
+    with torch.no_grad():
+        lora_pre.lora_a.weight.uniform_()
+        lora_pre.lora_b.weight.uniform_()
+
+        lora_post.lora_a.weight.copy_(lora_pre.lora_a.weight)
+        lora_post.lora_b.weight.copy_(lora_pre.lora_b.weight)
+
     lora_pre.train()
     lora_post.train()
 
