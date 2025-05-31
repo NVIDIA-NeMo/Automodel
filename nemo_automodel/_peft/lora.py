@@ -124,7 +124,7 @@ class LinearLoRA(nn.Linear):
             nn.init.kaiming_uniform_(obj.lora_a.weight.data, a=math.sqrt(5))
         obj.lora_b.weight.data.fill_(0)
         obj.dropout = nn.Dropout(p=dropout)
-        assert dropout_position in ['pre', 'post'], dropout_position
+        assert dropout_position in ['pre', 'post'], ('dropout position can only be pre/post', dropout_position)
         obj.dropout_position = dropout_position
 
     def forward(self, x):
