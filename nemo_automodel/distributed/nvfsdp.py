@@ -1,11 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Any, Optional, List, Dict
 
-# from megatron.core.distributed.custom_fsdp import FSDP
-from megatron.core.distributed.distributed_data_parallel_config import (
-    DistributedDataParallelConfig,
-)
-
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
@@ -15,6 +10,9 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
 )
 
+from nemo_automodel.distributed.nvfsdp.distributed_data_parallel_config import (
+    DistributedDataParallelConfig,
+)
 from nemo_automodel.distributed.parallelizer import (
     get_hf_tp_shard_plan,
     nvfsdp_strategy_parallelize,
