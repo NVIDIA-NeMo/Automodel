@@ -56,7 +56,7 @@ class TrainingState(Enum):
     IDLE = auto()
 
 
-class FSDP(torch.nn.Module):
+class nvFSDP(torch.nn.Module):
     """Fully Sharded Data Parallel training for MCore models.
 
     A distributed training wrapper that shards model parameters, gradients and optimizer

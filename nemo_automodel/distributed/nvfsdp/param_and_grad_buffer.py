@@ -3055,7 +3055,6 @@ def _get_fsdp_tensor_spec(param, dp_mesh):
                 "The data parallel mesh and the tensor parallel mesh are not the same."
                 f"DP's global mesh: {dp_global_mesh}\nTP's global mesh: {tp_global_mesh}"
             )
-        name_dims_error = "FSDP requires named DeviceMesh dims for ND parallelism"
         # submesh_names = dp_mesh.mesh_dim_names + tp_mesh.mesh_dim_names
         # FIXME: hacking, need to fix it
         dp_tp_mesh = dp_global_mesh[("data_parallel", "tensor_parallel")]
