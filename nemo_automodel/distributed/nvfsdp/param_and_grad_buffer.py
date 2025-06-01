@@ -312,7 +312,7 @@ def build_data_parallel_buffer_index(
             bucket_id=bucket_id,
             global_data_index=global_data_index,  # Location of the buffer shard in the global bucket.
             local_data_index=0,  # When the buffer is sharded, the local index of the data in this shard starts at 0.
-            bucket_data_index=bucket_data_index,  # Location of the buffer shard relative to the global starting index of the bucket.
+            bucket_data_index=bucket_data_index,  # Location of the buffer shard relative to the global starting index of the bucket. # pylint: disable=line-too-long
             size=shard_size,  # Size of the bucket shard.
         )
     else:
@@ -936,7 +936,8 @@ class DataParallelBuffer:
         Compute the offset that maps the coordinates of the slice of the item in this shard to the local coordinates
         of the slice of this shard that contains the item, for retrieval of the item's data stored in this shard.
             - If distributed, then evaluates to item_start - shard_start (because shard_local_data_index = 0).
-            - If not distributed, then evaluates to item_start (because shard_local_data_index = shard_global_data_index).
+            - If not distributed, then evaluates to item_start (because 
+              shard_local_data_index = shard_global_data_index).
               This maps the coordinates of the slice of the item in this shard to the global coordinates of the
               slice of the item in the bucket because the unsharded buffer entirely backs the global bucket.
         """
