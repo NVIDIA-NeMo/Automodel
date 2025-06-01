@@ -25,13 +25,21 @@ try:
     # Default to Megatron-LM FW.
     logger.info("Detected Megatron Core, using nvFSDP with Megatron.")
     from megatron.core.parallel_state import get_global_memory_buffer
-    from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
-    from megatron.core.fp8_utils import is_float8tensor, modify_underlying_storage, quantize_param_shard
+    from megatron.core.distributed.distributed_data_parallel_config import (
+        DistributedDataParallelConfig,
+    )
+    from megatron.core.fp8_utils import (
+        is_float8tensor,
+        modify_underlying_storage,
+        quantize_param_shard,
+    )
     from megatron.core.tensor_parallel import get_cuda_rng_tracker
     from megatron.core.utils import is_submodule, is_te_min_version
 except ImportError:
     # Megatron-LM is not installed, use nvFSDP as a standalone module.
-    logger.info("Megatron Core is not installed, nvFSDP will run without Megatron Core.")
+    logger.info(
+        "Megatron Core is not installed, nvFSDP will run without Megatron Core."
+    )
     from .distributed_data_parallel_config import DistributedDataParallelConfig
     from .utils import (
         get_global_memory_buffer,
@@ -112,12 +120,14 @@ def _free_storage(tensor: torch.Tensor):
 
 
 TensorItemIndex = namedtuple(
-    'TensorItemIndex', ['global_data_index', 'size', 'item_id', 'bucket_id', 'shape']
+    "TensorItemIndex", ["global_data_index", "size", "item_id", "bucket_id", "shape"]
 )
-BucketIndex = namedtuple('BucketIndex', ['bucket_id', 'global_data_index', 'size', 'items'])
+BucketIndex = namedtuple(
+    "BucketIndex", ["bucket_id", "global_data_index", "size", "items"]
+)
 ShardBucketIndex = namedtuple(
-    'ShardBucketIndex',
-    ['bucket_id', 'global_data_index', 'local_data_index', 'bucket_data_index', 'size'],
+    "ShardBucketIndex",
+    ["bucket_id", "global_data_index", "local_data_index", "bucket_data_index", "size"],
 )
 
 
@@ -201,7 +211,7 @@ class BucketingPolicy:
 
     suggested_bucket_size: Optional[int] = 40_000_000
     fsdp_unit_modules: List[torch.nn.Module] = dataclasses.field(default_factory=list)
-    data_parallel_sharding_strategy: str = 'no_shard'
+    data_parallel_sharding_strategy: str = "no_shard"
 
 
 def _pad(number_to_be_padded: int, divisor: int) -> int:
@@ -236,7 +246,7 @@ def build_data_parallel_buffer_index(
     """
 
     def _pad_if_needed(data_index: int) -> int:
-        if ddp_config.data_parallel_sharding_strategy != 'no_shard':
+        if ddp_config.data_parallel_sharding_strategy != "no_shard":
             return _pad(data_index, data_parallel_world_size * chunk_size_factor)
         return data_index
 
@@ -394,7 +404,9 @@ class TemporaryBucketAllocator:
         allocate a temporary bucket.
         """
         if bucket_id not in self.buckets:
-            self.buckets[bucket_id] = Bucket(data=torch.empty(size, dtype=dtype, device=device))
+            self.buckets[bucket_id] = Bucket(
+                data=torch.empty(size, dtype=dtype, device=device)
+            )
         return self.buckets[bucket_id]
 
     def free(self, bucket_id: int):
@@ -427,7 +439,9 @@ class StorageResizeBasedBucketAllocator(TemporaryBucketAllocator):
         allocate a temporary bucket.
         """
         if bucket_id not in self.buckets:
-            self.buckets[bucket_id] = Bucket(data=torch.empty(size, dtype=dtype, device=device))
+            self.buckets[bucket_id] = Bucket(
+                data=torch.empty(size, dtype=dtype, device=device)
+            )
         bucket = self.buckets[bucket_id]
         _alloc_storage(bucket.data, torch.Size([size]))
         return bucket
@@ -534,10 +548,14 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
     deallocation of temporary buffers during FSDP operations.
     """
 
-    def __init__(self, name: str, fsdp_param_groups: List["ParameterGroup"], size: int = 2):
+    def __init__(
+        self, name: str, fsdp_param_groups: List["ParameterGroup"], size: int = 2
+    ):
         self.name = name
         self.fsdp_param_groups = fsdp_param_groups
-        self.size = size  # Number of buffers in the pool (default is 2 for double buffering)
+        self.size = (
+            size  # Number of buffers in the pool (default is 2 for double buffering)
+        )
         self.allocation_tracker = {}  # tracking the global buffer allocation status
 
         # Build a mapping from FSDP unit id to its associated bucket ids.
@@ -573,7 +591,9 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         self.using_buffer = {}  # Map from bucket_id to (buf_group_id, offset) in use.
 
         # Populate the idle buffer pool with all buffer group and bucket offset combinations.
-        for buf_group_id in range(self.size):  # Iterate over each buffer group in the pool.
+        for buf_group_id in range(
+            self.size
+        ):  # Iterate over each buffer group in the pool.
             num_bucket = len(self.fsdp_unit_buckets[self.fsdp_double_buffer_units[0]])
             for bucket_offset in range(num_bucket):
                 self.idle_buffer.append((buf_group_id, bucket_offset))
@@ -643,7 +663,10 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                     torch.cuda.synchronize()
             return Bucket(
                 data=get_global_memory_buffer().get_tensor(
-                    [size], dtype=dtype, name=buffer_name, mem_alloc_context=mem_alloc_context
+                    [size],
+                    dtype=dtype,
+                    name=buffer_name,
+                    mem_alloc_context=mem_alloc_context,
                 )
             )
 
@@ -672,7 +695,9 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             del self.using_buffer[bucket_id]
             return
         # If not managed by fixed pool allocator, delegate to the backup allocator.
-        logging.debug(f"[FSDP] Free from the backup allocator for {bucket_id} {fsdp_unit_id}")
+        logging.debug(
+            f"[FSDP] Free from the backup allocator for {bucket_id} {fsdp_unit_id}"
+        )
         self.backup_allocator.free(bucket_id)
 
 
@@ -710,16 +735,20 @@ class DataParallelBuffer:
         self.params = params
         _param_dtype = {p.dtype for p in self.params}
 
-        assert len(_param_dtype) == 1, f'params have different dtypes: {_param_dtype}'
+        assert len(_param_dtype) == 1, f"params have different dtypes: {_param_dtype}"
         self.is_data_distributed = is_data_distributed
         self.bucket_id = bucket_id
         self.dtype = dtype if dtype else next(iter(_param_dtype))
         self.device = device
         self.data_parallel_group = data_parallel_group
         self.dp_rank = torch.distributed.get_rank(group=self.data_parallel_group)
-        self.dp_world_size = torch.distributed.get_world_size(group=self.data_parallel_group)
+        self.dp_world_size = torch.distributed.get_world_size(
+            group=self.data_parallel_group
+        )
         self.temporary_bucket_allocator = (
-            temporary_bucket_allocator if temporary_bucket_allocator else TemporaryBucketAllocator()
+            temporary_bucket_allocator
+            if temporary_bucket_allocator
+            else TemporaryBucketAllocator()
         )
         self.is_dtype_float8 = is_dtype_float8
         self.gradient_scaling_factor = gradient_scaling_factor
@@ -740,7 +769,9 @@ class DataParallelBuffer:
         )
 
         self.data_size = (
-            self.bucket_index.size if not is_data_distributed else self.shard_bucket_index.size
+            self.bucket_index.size
+            if not is_data_distributed
+            else self.shard_bucket_index.size
         )
 
         # Count all parameters in this buffer and store their enumerated index.
@@ -748,7 +779,9 @@ class DataParallelBuffer:
 
     def init_data(self, data: torch.Tensor):
         """Allocate a buffer Tensor to persistently store the data for this (shard of) the buffer."""
-        assert data.dtype == self.dtype, f"Data type mismatch: {data.dtype} != {self.dtype}"
+        assert (
+            data.dtype == self.dtype
+        ), f"Data type mismatch: {data.dtype} != {self.dtype}"
         assert (
             data.numel() == self.data_size
         ), f"Data size mismatch: {data.numel()} != {self.data_size}"
@@ -830,7 +863,9 @@ class DataParallelBuffer:
         item_global_start = item_index.global_data_index
         item_global_end = item_index.global_data_index + item_index.size
         shard_bucket_start = shard_bucket_index.global_data_index
-        shard_bucket_end = shard_bucket_index.global_data_index + shard_bucket_index.size
+        shard_bucket_end = (
+            shard_bucket_index.global_data_index + shard_bucket_index.size
+        )
 
         # If the item is not in the shard, return 0, 0.
         if item_global_start > shard_bucket_end or item_global_end < shard_bucket_start:
@@ -926,7 +961,10 @@ class DataParallelBuffer:
             # calculating the intersection of the item and the shard.
             item_index = self.item_index_map[item_id]
             # Note: Buffer coordinates = bucket coordinates when the buffer is not sharded.
-            return (item_index.global_data_index, item_index.global_data_index + item_index.size)
+            return (
+                item_index.global_data_index,
+                item_index.global_data_index + item_index.size,
+            )
         # Otherwise, return the local coordinates of the slice of this
         # buffer's shard that intersects the specified item tensor.
         return self._get_item_local_shard_index(item_id)
@@ -1091,7 +1129,7 @@ def _get_parameter_groups(
             and policy.data_parallel_sharding_strategy != "no_shard"
         )
 
-    is_expert_parameter = lambda p: not getattr(p, 'allreduce', True)
+    is_expert_parameter = lambda p: not getattr(p, "allreduce", True)
 
     # Step 1: Group the parameters according to their execution order and attributes.
     # FSDP unit module parameters are split into multiple parameter sub-groups.
@@ -1103,7 +1141,8 @@ def _get_parameter_groups(
         param_attrs = dict(
             dtype=(
                 "float8"
-                if is_float8tensor(param) or meta_device_init_fp8_params.get(name, False)
+                if is_float8tensor(param)
+                or meta_device_init_fp8_params.get(name, False)
                 else param.dtype
             ),
             is_expert_param=is_expert_parameter(param),
@@ -1122,7 +1161,9 @@ def _get_parameter_groups(
         # Check if the parameter already belongs to a group.
         for param_group in parameter_groups:
             group_attrs = {
-                key: value for key, value in param_group.__dict__.items() if key in param_attrs
+                key: value
+                for key, value in param_group.__dict__.items()
+                if key in param_attrs
             }
             # Parameters are grouped by their attributes and FSDP unit module ID.
             if group_attrs == param_attrs:
@@ -1145,7 +1186,7 @@ def _get_parameter_groups(
         basic_attrs = {
             key: value
             for key, value in group.__dict__.items()
-            if key in ['dtype', 'is_expert_param', 'requires_grad', 'fsdp_unit_id']
+            if key in ["dtype", "is_expert_param", "requires_grad", "fsdp_unit_id"]
         }
         for param in group.params:
             if _does_param_require_new_bucket(param):
@@ -1187,7 +1228,9 @@ def _get_parameter_groups(
     new_bucket_groups = []
     for group in bucket_groups:
         params = sorted(
-            group.params, key=lambda p: to_local_if_dtensor(p).shape[1:].numel(), reverse=True
+            group.params,
+            key=lambda p: to_local_if_dtensor(p).shape[1:].numel(),
+            reverse=True,
         )
         while len(params) > 0:
             chunk_size_factor = to_local_if_dtensor(params[0]).shape[1:].numel()
@@ -1322,7 +1365,7 @@ class ParamAndGradBuffer:
         grad_reduce_in_fp32: bool = True,
         gradient_scaling_factor: Optional[float] = None,
         expert_gradient_scaling_factor: Optional[float] = None,
-        device: torch.device = torch.device('cuda'),
+        device: torch.device = torch.device("cuda"),
         only_create_grad_buffer_and_main_weight_buffer_for_param_requires_grad: bool = True,
         reset_parameters_for_meta_device_init_module: bool = False,
     ):
@@ -1365,7 +1408,8 @@ class ParamAndGradBuffer:
         # Buffer is registered to data_parallel_group and expert_data_parallel_group if it exists
         # In the case of not using nccl_ub, it returns a nullcontext
         self.mem_alloc_context = self.get_mem_alloc_context(
-            group=self.data_parallel_group, additional_group=self.expert_data_parallel_group
+            group=self.data_parallel_group,
+            additional_group=self.expert_data_parallel_group,
         )
 
         # Mark fp8 param.
@@ -1383,9 +1427,11 @@ class ParamAndGradBuffer:
                         meta_device_init_fp8_params[self.param_to_name[param]] = True
 
         # Get the parameter groups.
-        (self.parameter_groups, self.param_to_param_group, self.bucket_group_of_bucket) = (
-            _get_parameter_groups(module, bucketing_policy, meta_device_init_fp8_params)
-        )
+        (
+            self.parameter_groups,
+            self.param_to_param_group,
+            self.bucket_group_of_bucket,
+        ) = _get_parameter_groups(module, bucketing_policy, meta_device_init_fp8_params)
         self._init_each_parameter_group_buffers(meta_device_init_fp8_params)
         self._init_distributed_params()
 
@@ -1414,7 +1460,9 @@ class ParamAndGradBuffer:
                 # Custom DualUBRAllocator class is used to register buffers to both groups.
                 # Register buffers to the data_parallel_group using apex memory allocator
                 # and register buffers to the expert_data_parallel_group.
-                assert group != additional_group, "Group and additional group must be different."
+                assert (
+                    group != additional_group
+                ), "Group and additional group must be different."
                 mem_alloc_context = functools.partial(
                     DualUBRAllocator,
                     NCCL_MEMORY_POOL,
@@ -1435,7 +1483,7 @@ class ParamAndGradBuffer:
         total_padded_bytes = 0
         total_comm_bytes = 0
         log_strs = []
-        log_strs.append(f'Number of parameter groups for FSDP: {len(bucket_groups)}')
+        log_strs.append(f"Number of parameter groups for FSDP: {len(bucket_groups)}")
         for index, group in enumerate(bucket_groups):
             numel = sum([to_local_if_dtensor(p).shape.numel() for p in group.params])
             wbuf = group.model_weight_buffer
@@ -1443,13 +1491,19 @@ class ParamAndGradBuffer:
             gbuf = group.main_grad_buffer
             padded_size = 0
             if wbuf:
-                padded_size += (wbuf.bucket_index.size - numel) * _dtype_size(wbuf.dtype)
+                padded_size += (wbuf.bucket_index.size - numel) * _dtype_size(
+                    wbuf.dtype
+                )
                 total_comm_bytes += wbuf.bucket_index.size * _dtype_size(wbuf.dtype)
             if mbuf:
-                padded_size += (mbuf.bucket_index.size - numel) * _dtype_size(mbuf.dtype)
+                padded_size += (mbuf.bucket_index.size - numel) * _dtype_size(
+                    mbuf.dtype
+                )
                 total_comm_bytes += mbuf.bucket_index.size * _dtype_size(mbuf.dtype)
             if gbuf:
-                padded_size += (gbuf.bucket_index.size - numel) * _dtype_size(gbuf.dtype)
+                padded_size += (gbuf.bucket_index.size - numel) * _dtype_size(
+                    gbuf.dtype
+                )
                 total_comm_bytes += gbuf.bucket_index.size * _dtype_size(gbuf.dtype)
             total_padded_bytes += padded_size
             log_strs.append(
@@ -1461,39 +1515,41 @@ class ParamAndGradBuffer:
                 f"padded_size: {padded_size / 1_000_000:.2f} MB): "
             )
             for param in group.params:
-                log_strs.append(f'\t{param_to_name[param]}')
+                log_strs.append(f"\t{param_to_name[param]}")
         log_strs.append(
             f"Total communication size: {total_comm_bytes / 1_000_000:.2f} MB | "
             f"Total padded size: {total_padded_bytes / 1_000_000:.2f} MB"
         )
         if torch.distributed.get_rank() == 0:
-            logger.info('\n'.join(log_strs))
+            logger.info("\n".join(log_strs))
 
     def _init_each_parameter_group_buffers(self, meta_device_init_fp8_params):
         """
         Initialize the buffers for each parameter group.
         """
         # ZeRO-DP Strategy: no-shard, optim, optim_grads, optim_grads_params
-        data_parallel_sharding_strategy = self.ddp_config.data_parallel_sharding_strategy
-        if data_parallel_sharding_strategy == 'no_shard':
+        data_parallel_sharding_strategy = (
+            self.ddp_config.data_parallel_sharding_strategy
+        )
+        if data_parallel_sharding_strategy == "no_shard":
             is_model_weight_buffer_distributed = False
             is_main_weight_buffer_distributed = False
             is_grad_buffer_distributed = False
-        elif data_parallel_sharding_strategy == 'optim':
+        elif data_parallel_sharding_strategy == "optim":
             is_model_weight_buffer_distributed = False
             is_main_weight_buffer_distributed = True
             is_grad_buffer_distributed = False
-        elif data_parallel_sharding_strategy == 'optim_grads':
+        elif data_parallel_sharding_strategy == "optim_grads":
             is_model_weight_buffer_distributed = False
             is_main_weight_buffer_distributed = True
             is_grad_buffer_distributed = True
-        elif data_parallel_sharding_strategy == 'optim_grads_params':
+        elif data_parallel_sharding_strategy == "optim_grads_params":
             is_model_weight_buffer_distributed = True
             is_main_weight_buffer_distributed = True
             is_grad_buffer_distributed = True
         else:
             raise ValueError(
-                f'Invalid data_parallel_sharding_strategy: {data_parallel_sharding_strategy}'
+                f"Invalid data_parallel_sharding_strategy: {data_parallel_sharding_strategy}"
             )
         if self.ddp_config.nccl_ub:
             assert self.ddp_config.fsdp_double_buffer, (
@@ -1503,10 +1559,14 @@ class ParamAndGradBuffer:
         if self.ddp_config.fsdp_double_buffer:
             UB_BUFFER_NUM = 2
             self.weight_alloc = FixedPoolAllocator(
-                name="fsdp_params", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM
+                name="fsdp_params",
+                fsdp_param_groups=self.parameter_groups,
+                size=UB_BUFFER_NUM,
             )
             self.main_grad_alloc = FixedPoolAllocator(
-                name="fsdp_grads", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM
+                name="fsdp_grads",
+                fsdp_param_groups=self.parameter_groups,
+                size=UB_BUFFER_NUM,
             )
             self.double_buf_units = self.weight_alloc.fsdp_double_buffer_units
         else:
@@ -1517,7 +1577,12 @@ class ParamAndGradBuffer:
 
         preserve_fp32_weights = self.preserve_fp32_weights
         grad_reduce_in_fp32 = self.grad_reduce_in_fp32
-        buffer_size = {torch.float32: 0, torch.float16: 0, torch.bfloat16: 0, "float8": 0}
+        buffer_size = {
+            torch.float32: 0,
+            torch.float16: 0,
+            torch.bfloat16: 0,
+            "float8": 0,
+        }
 
         # For all bucket groups (partitioned parameter groups)...
         for group_id, group in enumerate(self.parameter_groups):
@@ -1526,7 +1591,9 @@ class ParamAndGradBuffer:
                 if not group.is_expert_param
                 else self.expert_data_parallel_group
             )
-            group.data_parallel_world_size = torch.distributed.get_world_size(group=dp_group)
+            group.data_parallel_world_size = torch.distributed.get_world_size(
+                group=dp_group
+            )
             gradient_scaling_factor = (
                 self.gradient_scaling_factor
                 if not group.is_expert_param
@@ -1534,9 +1601,9 @@ class ParamAndGradBuffer:
             )
             # Check if the parameter group is FP8.
             one_param = group.params[0]
-            is_dtype_float8 = is_float8tensor(one_param) or meta_device_init_fp8_params.get(
-                self.param_to_name[one_param], False
-            )
+            is_dtype_float8 = is_float8tensor(
+                one_param
+            ) or meta_device_init_fp8_params.get(self.param_to_name[one_param], False)
             if is_dtype_float8:
                 param_dtype = torch.uint8
                 grad_dtype = torch.bfloat16
@@ -1551,7 +1618,7 @@ class ParamAndGradBuffer:
             )
 
             # Initialize the model weight buffer from bucket parameters.
-            if data_parallel_sharding_strategy != 'no_shard':
+            if data_parallel_sharding_strategy != "no_shard":
                 group.model_weight_buffer = DataParallelBuffer(
                     self.ddp_config,
                     group.params,
@@ -1568,7 +1635,10 @@ class ParamAndGradBuffer:
                 )
 
             # Initialize the main weight buffer.
-            if should_create_grad_buffer_or_main_weight_buffer and preserve_fp32_weights:
+            if (
+                should_create_grad_buffer_or_main_weight_buffer
+                and preserve_fp32_weights
+            ):
                 group.main_weight_buffer = DataParallelBuffer(
                     self.ddp_config,
                     group.params,
@@ -1594,7 +1664,8 @@ class ParamAndGradBuffer:
                     dtype=torch.float32 if grad_reduce_in_fp32 else grad_dtype,
                     device=self.device,
                     data_parallel_group=dp_group,
-                    is_dtype_float8=not grad_reduce_in_fp32 and grad_dtype is torch.uint8,
+                    is_dtype_float8=not grad_reduce_in_fp32
+                    and grad_dtype is torch.uint8,
                     temporary_bucket_allocator=self.main_grad_alloc,
                     gradient_scaling_factor=gradient_scaling_factor,
                     bucket_id=group_id,
@@ -1608,7 +1679,9 @@ class ParamAndGradBuffer:
                 elif group.main_grad_buffer.is_dtype_float8:
                     buffer_size["float8"] += group.main_grad_buffer.data_size
                 else:
-                    buffer_size[group.main_grad_buffer.dtype] += group.main_grad_buffer.data_size
+                    buffer_size[
+                        group.main_grad_buffer.dtype
+                    ] += group.main_grad_buffer.data_size
 
         reset_context_args = {"init_param_with_fp8": self.ddp_config.fp8_param_gather}
         module_reset_flag = {}
@@ -1626,7 +1699,7 @@ class ParamAndGradBuffer:
                     p_numel = to_local_if_dtensor(p).shape.numel()
                     if p.is_meta:
                         meta_params_numel += p_numel
-                    elif p.device.type == 'cuda':
+                    elif p.device.type == "cuda":
                         cuda_params_numel += p_numel
                     else:
                         cpu_params_numel += p_numel
@@ -1647,13 +1720,17 @@ class ParamAndGradBuffer:
             if wbuf:
                 with self.mem_alloc_context():
                     wbuf.init_data(
-                        torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device)
+                        torch.empty(
+                            wbuf.data_size, dtype=wbuf.dtype, device=self.device
+                        )
                     )
                 bucket = wbuf.fetch_bucket()
             mbuf = group.main_weight_buffer
             if mbuf:
                 # Manually instantiate an empty tensor into the main weight buffer.
-                mbuf.init_data(torch.empty(mbuf.data_size, dtype=mbuf.dtype, device=self.device))
+                mbuf.init_data(
+                    torch.empty(mbuf.data_size, dtype=mbuf.dtype, device=self.device)
+                )
             for item_id, p in enumerate(group.params):
                 # Model Weight (Low-Precision) Buffer Initialization
                 if wbuf:
@@ -1688,7 +1765,9 @@ class ParamAndGradBuffer:
 
                             # After resetting parameters, delete fp8 transpose cache
                             # if we do not need keep cache.
-                            if not self.ddp_config.keep_fp8_transpose_cache_when_using_custom_fsdp:
+                            if (
+                                not self.ddp_config.keep_fp8_transpose_cache_when_using_custom_fsdp
+                            ):
                                 for _param in m.parameters(recurse=False):
                                     if is_float8tensor(_param):
                                         _param._transpose_invalid = True
@@ -1730,7 +1809,7 @@ class ParamAndGradBuffer:
 
                 # Main Weight (High-Precision) Buffer Initialization
                 if mbuf:
-                    if hasattr(p, 'get_high_precision_init_val'):
+                    if hasattr(p, "get_high_precision_init_val"):
                         assert not isinstance(p, DTensor), (
                             self.param_to_name[p],
                             "not support fp8 DTensor.",
@@ -1769,7 +1848,9 @@ class ParamAndGradBuffer:
                     p.fully_shard_param_local_shard = local_shard
                     # Get the index of the parameter relative to the global start of the shard
                     # if distributed, or the global start of the item in the bucket if not.
-                    p.fully_shard_param_local_index = wbuf.locate_item_in_global_item(item_id)
+                    p.fully_shard_param_local_index = wbuf.locate_item_in_global_item(
+                        item_id
+                    )
 
             if wbuf and wbuf.is_data_distributed:
                 # Free the memory backing the temporarily-allocated bucket associated with this buffer.
@@ -1785,19 +1866,30 @@ class ParamAndGradBuffer:
             with self.mem_alloc_context():
                 self.buffer = {
                     torch.float32: torch.empty(
-                        buffer_size[torch.float32], dtype=torch.float32, device=self.device
+                        buffer_size[torch.float32],
+                        dtype=torch.float32,
+                        device=self.device,
                     ),
                     torch.float16: torch.empty(
-                        buffer_size[torch.float16], dtype=torch.float16, device=self.device
+                        buffer_size[torch.float16],
+                        dtype=torch.float16,
+                        device=self.device,
                     ),
                     torch.bfloat16: torch.empty(
-                        buffer_size[torch.bfloat16], dtype=torch.bfloat16, device=self.device
+                        buffer_size[torch.bfloat16],
+                        dtype=torch.bfloat16,
+                        device=self.device,
                     ),
                     "float8": torch.empty(
                         buffer_size["float8"], dtype=torch.uint8, device=self.device
                     ),
                 }
-            offset = {torch.float32: 0, torch.float16: 0, torch.bfloat16: 0, "float8": 0}
+            offset = {
+                torch.float32: 0,
+                torch.float16: 0,
+                torch.bfloat16: 0,
+                "float8": 0,
+            }
 
         def _alloc(dtype, size):
             """
@@ -1844,7 +1936,7 @@ class ParamAndGradBuffer:
                 # Patch the parameter class to include a main_grad property.
                 # Utilized in the gradient reduction pipeline to save computed
                 # data-parallel gradients on every rank and reduce-scatter them.
-                setattr(p.__class__, 'main_grad', property(main_grad_getter))
+                setattr(p.__class__, "main_grad", property(main_grad_getter))
 
         # Clean up deallocated memory.
         gc.collect()
@@ -1861,7 +1953,9 @@ class ParamAndGradBuffer:
             self.param_to_param_group[new_param] = self.param_to_param_group[old_param]
             del self.param_to_param_group[old_param]
 
-            self.param_to_direct_module[new_param] = self.param_to_direct_module[old_param]
+            self.param_to_direct_module[new_param] = self.param_to_direct_module[
+                old_param
+            ]
             del self.param_to_direct_module[old_param]
 
         for item_id, p in enumerate(self.params):
@@ -1900,7 +1994,7 @@ class ParamAndGradBuffer:
         """
         for _, param in self.optimizer_named_parameters:
             param.grad = None
-            if hasattr(param, 'decoupled_grad'):
+            if hasattr(param, "decoupled_grad"):
                 param.decoupled_grad = None
 
         for group in self.parameter_groups:
@@ -1918,17 +2012,25 @@ class ParamAndGradBuffer:
                 param_name = self.param_to_name[orig_param]
                 if wbuf:
                     dist_param = _fsdp_tensor(
-                        data=wbuf.get_item(item_id, only_shard=wbuf.is_data_distributed),
+                        data=wbuf.get_item(
+                            item_id, only_shard=wbuf.is_data_distributed
+                        ),
                         param=orig_param,
-                        dp_mesh=DeviceMesh.from_group(wbuf.data_parallel_group, device_type="cuda"),
+                        dp_mesh=DeviceMesh.from_group(
+                            wbuf.data_parallel_group, device_type="cuda"
+                        ),
                         run_check=True,
                     )
                     dist_model_weight[param_name] = dist_param
                 if mbuf:
                     dist_param = _fsdp_tensor(
-                        data=mbuf.get_item(item_id, only_shard=mbuf.is_data_distributed),
+                        data=mbuf.get_item(
+                            item_id, only_shard=mbuf.is_data_distributed
+                        ),
                         param=orig_param,
-                        dp_mesh=DeviceMesh.from_group(wbuf.data_parallel_group, device_type="cuda"),
+                        dp_mesh=DeviceMesh.from_group(
+                            wbuf.data_parallel_group, device_type="cuda"
+                        ),
                         run_check=True,
                     )
                     dist_main_weight[param_name] = dist_param
@@ -1955,25 +2057,27 @@ class ParamAndGradBuffer:
                 def set_param_attribute_closure(param, orig_param):
                     def set_param_attribute():
                         for attr_name in [
-                            'requires_grad',
-                            'sequence_parallel',
-                            'shared',
-                            'tensor_model_parallel',
-                            'partition_dim',
-                            'partition_stride',
-                            'is_embedding_or_output_parameter',
+                            "requires_grad",
+                            "sequence_parallel",
+                            "shared",
+                            "tensor_model_parallel",
+                            "partition_dim",
+                            "partition_stride",
+                            "is_embedding_or_output_parameter",
                         ]:
                             if hasattr(orig_param, attr_name):
-                                setattr(param, attr_name, getattr(orig_param, attr_name))
+                                setattr(
+                                    param, attr_name, getattr(orig_param, attr_name)
+                                )
 
                     return set_param_attribute
 
                 setattr(
                     dist_param,
-                    'reset_attribute',
+                    "reset_attribute",
                     set_param_attribute_closure(dist_param, orig_param),
                 )
-                setattr(dist_param, 'orig_param', orig_param)
+                setattr(dist_param, "orig_param", orig_param)
                 dist_param.reset_attribute()
                 named_parameters.append((param_name, dist_param))
 
@@ -2029,9 +2133,9 @@ class ParamAndGradBuffer:
             # The presence of main_grad_buffer but no main_weight_buffer means
             # that a precision-aware optimizer is used.
             if self.ddp_config.use_precision_aware_optimizer:
-                setattr(param, 'decoupled_grad', grad)
+                setattr(param, "decoupled_grad", grad)
             else:
-                setattr(param, 'grad', grad)
+                setattr(param, "grad", grad)
 
     @property
     def num_buckets(self):
@@ -2074,7 +2178,9 @@ class ParamAndGradBuffer:
                         shard_model_params.append(None)
                     else:
                         shard_fp32_from_fp8.append(main_weight)
-                        shard_offsets_in_fp8.append(wbuf.locate_item_in_global_item(item_id)[0])
+                        shard_offsets_in_fp8.append(
+                            wbuf.locate_item_in_global_item(item_id)[0]
+                        )
                         shard_model_params.append(model_param)
                     continue
 
@@ -2114,8 +2220,11 @@ class ParamAndGradBuffer:
                 asynchronously. Defaults to False.
         """
         assert all(
-            [not g.model_weight_buffer.is_data_distributed for g in self.parameter_groups]
-        ), 'all_gather_parameters() should only be called when parameters are not sharded.'
+            [
+                not g.model_weight_buffer.is_data_distributed
+                for g in self.parameter_groups
+            ]
+        ), "all_gather_parameters() should only be called when parameters are not sharded."
 
         all_gather_ops = []
         for g in self.parameter_groups:
@@ -2140,7 +2249,7 @@ class ParamAndGradBuffer:
         """
         assert all(
             [not g.main_grad_buffer.is_data_distributed for g in self.parameter_groups]
-        ), 'reduce_scatter_gradients() should only be called when gradients are not sharded.'
+        ), "reduce_scatter_gradients() should only be called when gradients are not sharded."
 
         reduce_scatter_ops = []
         for g in self.parameter_groups:
@@ -2148,7 +2257,9 @@ class ParamAndGradBuffer:
             if gbuf is not None:
                 continue
             scaling_factor = gbuf.gradient_scaling_factor
-            reduce_op = gradient_reduce_preprocessing(gbuf.data, scaling_factor, self.ddp_config)
+            reduce_op = gradient_reduce_preprocessing(
+                gbuf.data, scaling_factor, self.ddp_config
+            )
             reduce_scatter_handler = torch.distributed.reduce_scatter_tensor(
                 output=gbuf.get_shard_from_local_buffer(),
                 input=gbuf.data,
@@ -2175,7 +2286,7 @@ class ParamAndGradBuffer:
                 for g in self.parameter_groups
                 if g.main_grad_buffer
             ]
-        ), 'all_reduce_gradients() should only be called when gradients are not sharded.'
+        ), "all_reduce_gradients() should only be called when gradients are not sharded."
 
         all_reduce_ops = []
         for g in self.parameter_groups:
@@ -2183,9 +2294,14 @@ class ParamAndGradBuffer:
             if gbuf is not None:
                 continue
             scaling_factor = gbuf.gradient_scaling_factor
-            reduce_op = gradient_reduce_preprocessing(gbuf.data, scaling_factor, self.ddp_config)
+            reduce_op = gradient_reduce_preprocessing(
+                gbuf.data, scaling_factor, self.ddp_config
+            )
             all_reduce_handler = torch.distributed.all_reduce(
-                gbuf.data, op=reduce_op, group=gbuf.data_parallel_group, async_op=async_op
+                gbuf.data,
+                op=reduce_op,
+                group=gbuf.data_parallel_group,
+                async_op=async_op,
             )
             if async_op:
                 all_reduce_ops.append(all_reduce_handler)
@@ -2290,7 +2406,9 @@ class GradReducePipeline:
                 self._mark_bucket_ready(bucket_id, async_rs=True)
 
     def wait_for_previous_grad_reduce(
-        self, suggested_queue_size: int = 1, suggested_queue_capacity: Optional[int] = None
+        self,
+        suggested_queue_size: int = 1,
+        suggested_queue_capacity: Optional[int] = None,
     ):
         """
         Wait for the previous reduce-scatter/all-reduce to finish.
@@ -2302,21 +2420,29 @@ class GradReducePipeline:
         if suggested_queue_capacity is not None:
             queue_space = sum(
                 [
-                    self.buffer.parameter_groups[bucket_id].main_grad_buffer.bucket_index.size
+                    self.buffer.parameter_groups[
+                        bucket_id
+                    ].main_grad_buffer.bucket_index.size
                     for _, _, bucket_id in self.grad_reduce_queue
                 ]
             )
             while queue_space > suggested_queue_capacity:
-                grad_reduce_event, free_up_grad_bucket, bucket_id = self.grad_reduce_queue.pop(0)
+                grad_reduce_event, free_up_grad_bucket, bucket_id = (
+                    self.grad_reduce_queue.pop(0)
+                )
                 grad_reduce_event.wait()
                 free_up_grad_bucket()
                 queue_space -= self.buffer.parameter_groups[
                     bucket_id
                 ].main_grad_buffer.bucket_index.size
         else:
-            suggested_queue_size = max(0, min(suggested_queue_size, self.buffer.num_buckets - 1))
+            suggested_queue_size = max(
+                0, min(suggested_queue_size, self.buffer.num_buckets - 1)
+            )
             while len(self.grad_reduce_queue) > suggested_queue_size:
-                grad_reduce_event, free_up_grad_bucket, _ = self.grad_reduce_queue.pop(0)
+                grad_reduce_event, free_up_grad_bucket, _ = self.grad_reduce_queue.pop(
+                    0
+                )
                 grad_reduce_event.wait()
                 free_up_grad_bucket()
 
@@ -2331,7 +2457,8 @@ class GradReducePipeline:
             if fsdp_unit_id in self.buffer.double_buf_units:
                 double_buf_units.add(fsdp_unit_id)
         assert len(double_buf_units) <= 2, (
-            f"Double buffer limit exceeded. " f"Current double_buf_units: {double_buf_units}."
+            f"Double buffer limit exceeded. "
+            f"Current double_buf_units: {double_buf_units}."
         )
 
         keep_n = len(self.grad_reduce_queue)
@@ -2356,7 +2483,9 @@ class GradReducePipeline:
         # some bucket parameters do not require grad, so we need to
         # remove them from the bucket group.
         bucket_group = self.buffer.bucket_group_of_bucket[bucket_id]
-        bucket_group = [i for i in bucket_group if self.buffer.parameter_groups[i].main_grad_buffer]
+        bucket_group = [
+            i for i in bucket_group if self.buffer.parameter_groups[i].main_grad_buffer
+        ]
         # If any bucket in the bucket group is not ready, skip the gradient reduce
         # waiting for the bucket group to be all ready before executing.
         for bucket_id in bucket_group:
@@ -2371,11 +2500,15 @@ class GradReducePipeline:
 
         current_stream = torch.cuda.current_stream()
         reduce_scatter_stream = (
-            self.cuda_stream if self.cuda_stream is not None else torch.cuda.current_stream()
+            self.cuda_stream
+            if self.cuda_stream is not None
+            else torch.cuda.current_stream()
         )
         reduce_scatter_stream.wait_stream(current_stream)
 
-        dp_group = self.buffer.parameter_groups[bucket_id].main_grad_buffer.data_parallel_group
+        dp_group = self.buffer.parameter_groups[
+            bucket_id
+        ].main_grad_buffer.data_parallel_group
         with torch.cuda.stream(reduce_scatter_stream):
             with _coalescing_manager(dp_group):
                 grad_buffer = []
@@ -2473,7 +2606,9 @@ class AllGatherPipeline:
         # Track the status of all-gather operations for each bucket.
         self.param_gather_event_map = {}
         # All buckets are initially deallocated / empty after initialization of ParamAndGradBuffer.
-        self.bucket_status = {i: BucketStatus.EMPTY for i in range(self.buffer.num_buckets)}
+        self.bucket_status = {
+            i: BucketStatus.EMPTY for i in range(self.buffer.num_buckets)
+        }
         # Track whether each bucket can be deallocated.
         self.bucket_can_be_released = {i: False for i in range(self.buffer.num_buckets)}
 
@@ -2512,12 +2647,17 @@ class AllGatherPipeline:
             self.bucket_can_be_released[bucket_id] = True
         self.recycle_unused_buckets()
 
-        assert all([status is BucketStatus.EMPTY for status in self.bucket_status.values()]), (
+        assert all(
+            [status is BucketStatus.EMPTY for status in self.bucket_status.values()]
+        ), (
             f"There are still working buckets, it is not safe to reset. "
             f"bucket_status: {self.bucket_status}."
         )
         assert all(
-            [not can_be_released for can_be_released in self.bucket_can_be_released.values()]
+            [
+                not can_be_released
+                for can_be_released in self.bucket_can_be_released.values()
+            ]
         ), (
             f"The bucket can be released table is in an abnormal state, not safe to reset. "
             f"bucket_can_be_released: {self.bucket_can_be_released}."
@@ -2629,7 +2769,9 @@ class AllGatherPipeline:
                     ag_buckets = list(sorted(set(ag_buckets)))
 
         # Only all-gather on buckets that have not been allocated yet.
-        ag_buckets = [i for i in ag_buckets if self.bucket_status[i] == BucketStatus.EMPTY]
+        ag_buckets = [
+            i for i in ag_buckets if self.bucket_status[i] == BucketStatus.EMPTY
+        ]
         if len(ag_buckets) == 0:
             return
 
@@ -2673,7 +2815,9 @@ class AllGatherPipeline:
             raise ValueError(f"Bucket {bucket_id} is empty.")
 
         # Wait for asynchronous / overlapped NCCL operations to complete.
-        param_gather_event, mark_bucket_ready_to_use = self.param_gather_event_map.pop(bucket_id)
+        param_gather_event, mark_bucket_ready_to_use = self.param_gather_event_map.pop(
+            bucket_id
+        )
         param_gather_event.wait()
         mark_bucket_ready_to_use()
 
@@ -2698,7 +2842,9 @@ class AllGatherPipeline:
                 self.bucket_can_be_released[bucket_id] = False
 
     @torch.no_grad()
-    def all_gather_bucket_and_set_items(self, bucket_id: int, async_op: bool = False) -> None:
+    def all_gather_bucket_and_set_items(
+        self, bucket_id: int, async_op: bool = False
+    ) -> None:
         """All-gather the bucket and set the items."""
         self.bucket_can_be_released[bucket_id] = False
         if self.bucket_status[bucket_id] != BucketStatus.EMPTY:
@@ -2732,7 +2878,10 @@ class AllGatherPipeline:
 
         if async_op:
             # Track the async all-gather operation for the bucket.
-            self.param_gather_event_map[bucket_id] = (param_gather_event, mark_bucket_ready_to_use)
+            self.param_gather_event_map[bucket_id] = (
+                param_gather_event,
+                mark_bucket_ready_to_use,
+            )
             return
         mark_bucket_ready_to_use()
 
@@ -2778,7 +2927,9 @@ def check_gpu_memory(threshold=0.9):
     near_full = allocated_ratio >= threshold or reserved_ratio >= threshold
 
     if near_full and torch.distributed.get_rank() == 0:
-        logger.info(f"GPU Memory: Allocated: {allocated_ratio:.2%}, Reserved: {reserved_ratio:.2%}")
+        logger.info(
+            f"GPU Memory: Allocated: {allocated_ratio:.2%}, Reserved: {reserved_ratio:.2%}"
+        )
     return near_full
 
 
@@ -2796,7 +2947,10 @@ class ResetParametersContext:
         if self.init_param_with_fp8:
             assert HAVE_TE
             args = {"enabled": True}
-            if "preserve_high_precision_init_val" in inspect.signature(fp8_model_init).parameters:
+            if (
+                "preserve_high_precision_init_val"
+                in inspect.signature(fp8_model_init).parameters
+            ):
                 args["preserve_high_precision_init_val"] = True
             self.stack.enter_context(fp8_model_init(**args))
 
@@ -2834,7 +2988,7 @@ def override_sharded_param_methods_with_safety_checks(params, all_gather_pipelin
 
             return override_sharded_param_to_function
 
-        setattr(p, 'to', override_sharded_param_to_function_closure(p, to_function))
+        setattr(p, "to", override_sharded_param_to_function_closure(p, to_function))
 
         def override_sharded_param_cpu_function_closure(p, cpu_function):
             def override_sharded_param_cpu_function(*args, **kwargs):
@@ -2846,11 +3000,11 @@ def override_sharded_param_methods_with_safety_checks(params, all_gather_pipelin
                     "The parameters are sharded by MCore FSDP, and no actual "
                     "cpu operation is performed."
                 )
-                return torch.empty([], device='cpu')
+                return torch.empty([], device="cpu")
 
             return override_sharded_param_cpu_function
 
-        setattr(p, 'cpu', override_sharded_param_cpu_function_closure(p, cpu_function))
+        setattr(p, "cpu", override_sharded_param_cpu_function_closure(p, cpu_function))
 
 
 def _dtype_size(dtype: torch.dtype) -> int:
@@ -2894,7 +3048,9 @@ def _get_fsdp_tensor_spec(param, dp_mesh):
         tp_mesh = tp_spec.device_mesh
         dp_global_mesh = _mesh_resources.get_root_mesh(tp_mesh)
         tp_global_mesh = _mesh_resources.get_root_mesh(tp_mesh)
-        if dp_global_mesh != tp_global_mesh or (dp_global_mesh is None or tp_global_mesh is None):
+        if dp_global_mesh != tp_global_mesh or (
+            dp_global_mesh is None or tp_global_mesh is None
+        ):
             raise ValueError(
                 "The data parallel mesh and the tensor parallel mesh are not the same."
                 f"DP's global mesh: {dp_global_mesh}\nTP's global mesh: {tp_global_mesh}"
@@ -2902,11 +3058,17 @@ def _get_fsdp_tensor_spec(param, dp_mesh):
         name_dims_error = "FSDP requires named DeviceMesh dims for ND parallelism"
         # submesh_names = dp_mesh.mesh_dim_names + tp_mesh.mesh_dim_names
         # FIXME: hacking, need to fix it
-        dp_tp_mesh = dp_global_mesh[('data_parallel', 'tensor_parallel')]
+        dp_tp_mesh = dp_global_mesh[("data_parallel", "tensor_parallel")]
         split_factor = tp_spec.num_shards_map[0]
-        assert 2 <= dp_tp_mesh.ndim <= 3, f"dp_tp_mesh can only be 2 or 3 but got {dp_tp_mesh}."
+        assert (
+            2 <= dp_tp_mesh.ndim <= 3
+        ), f"dp_tp_mesh can only be 2 or 3 but got {dp_tp_mesh}."
         dp_shard_tp_placement = (
-            (_StridedShard(0, split_factor=split_factor) if split_factor > 1 else Shard(0)),
+            (
+                _StridedShard(0, split_factor=split_factor)
+                if split_factor > 1
+                else Shard(0)
+            ),
             tp_spec.placements[0],
         )
 

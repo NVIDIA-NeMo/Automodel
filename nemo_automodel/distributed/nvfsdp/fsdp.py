@@ -17,12 +17,16 @@ logger = logging.getLogger(__name__)
 try:
     # Default to Megatron-LM FW.
     logger.info("Detected Megatron Core, using nvFSDP with Megatron.")
-    from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+    from megatron.core.distributed.distributed_data_parallel_config import (
+        DistributedDataParallelConfig,
+    )
     from megatron.core.fp8_utils import is_float8tensor
     from megatron.core.utils import is_submodule
 except ImportError:
     # Megatron-LM is not installed, use nvFSDP as a standalone module.
-    logger.info("Megatron Core is not installed, nvFSDP will run without Megatron Core.")
+    logger.info(
+        "Megatron Core is not installed, nvFSDP will run without Megatron Core."
+    )
     from .distributed_data_parallel_config import DistributedDataParallelConfig
     from .utils import is_float8tensor, is_submodule
 
@@ -118,11 +122,15 @@ class FSDP(torch.nn.Module):
         init_model_with_meta_device: bool = False,
     ):
         super().__init__()
-        self.device = device if device else torch.device(f'cuda:{torch.cuda.current_device()}')
+        self.device = (
+            device if device else torch.device(f"cuda:{torch.cuda.current_device()}")
+        )
         # FIXME(@jianbinc, @cspades): Conflicts with init_model_with_meta_device,
         # which avoids initializing large models on every rank. Temporary guard here.
         # Utilized to align all parameters in the model to the same device.
-        self.module = module.to(self.device) if not init_model_with_meta_device else module
+        self.module = (
+            module.to(self.device) if not init_model_with_meta_device else module
+        )
         self.ddp_config = ddp_config
         self.device_mesh = device_mesh
         self.calculate_per_token_loss = calculate_per_token_loss
@@ -130,16 +138,16 @@ class FSDP(torch.nn.Module):
 
         have_expert_parameters = False
         for _, param in module.named_parameters():
-            if not getattr(param, 'allreduce', True):
+            if not getattr(param, "allreduce", True):
                 have_expert_parameters = True
                 break
 
         if isinstance(self.device_mesh, DeviceMesh):
             cp_size = context_parallel_size
-            if 'dp_cp' in self.device_mesh.mesh_dim_names:
-                self.dp_cp_group = self.device_mesh['dp_cp'].get_group()
-            elif 'dp' in self.device_mesh.mesh_dim_names and cp_size == 1:
-                self.dp_cp_group = self.device_mesh['dp'].get_group()
+            if "dp_cp" in self.device_mesh.mesh_dim_names:
+                self.dp_cp_group = self.device_mesh["dp_cp"].get_group()
+            elif "dp" in self.device_mesh.mesh_dim_names and cp_size == 1:
+                self.dp_cp_group = self.device_mesh["dp"].get_group()
             else:
                 raise ValueError(
                     "Required process group missing in device mesh: 'dp_cp' "
@@ -147,9 +155,9 @@ class FSDP(torch.nn.Module):
                 )
             if have_expert_parameters:
                 assert (
-                    'expt_dp' in self.device_mesh.mesh_dim_names
-                ), 'Expert process group (expt_dp) is required when using expert parameters.'
-                self.expt_dp_group = self.device_mesh['expt_dp'].get_group()
+                    "expt_dp" in self.device_mesh.mesh_dim_names
+                ), "Expert process group (expt_dp) is required when using expert parameters."
+                self.expt_dp_group = self.device_mesh["expt_dp"].get_group()
             else:
                 self.expt_dp_group = None
         else:
@@ -172,7 +180,11 @@ class FSDP(torch.nn.Module):
         # Parse FSDP unit modules. If given a list of strings, import the classes.
         self.fsdp_unit_modules = (
             [
-                self._import_classes_from_paths(cls_path) if isinstance(cls_path, str) else cls_path
+                (
+                    self._import_classes_from_paths(cls_path)
+                    if isinstance(cls_path, str)
+                    else cls_path
+                )
                 for cls_path in fsdp_unit_modules
             ]
             if fsdp_unit_modules is not None
@@ -211,7 +223,9 @@ class FSDP(torch.nn.Module):
                 expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
 
         # Initialize the param and grad buffer.
-        self.data_parallel_sharding_strategy = self.ddp_config.data_parallel_sharding_strategy
+        self.data_parallel_sharding_strategy = (
+            self.ddp_config.data_parallel_sharding_strategy
+        )
         self.param_and_grad_buffer = ParamAndGradBuffer(
             self.ddp_config,
             self.module,
@@ -237,14 +251,17 @@ class FSDP(torch.nn.Module):
 
         # Initialize the reduce-scatter pipeline.
         self.grad_reduce_pipeline = GradReducePipeline(
-            self.param_and_grad_buffer, cuda_stream=self.side_stream_for_buffer_copy_and_grad_accum
+            self.param_and_grad_buffer,
+            cuda_stream=self.side_stream_for_buffer_copy_and_grad_accum,
         )
 
         # Initialize the all-gather pipeline.
         self.all_gather_pipeline = AllGatherPipeline(self.param_and_grad_buffer)
 
         # Set the suggested communication unit size for reduce-scatter and all-gather pipelines.
-        suggested_communication_unit_size = self.ddp_config.suggested_communication_unit_size
+        suggested_communication_unit_size = (
+            self.ddp_config.suggested_communication_unit_size
+        )
         if suggested_communication_unit_size is None:
             if self.data_parallel_sharding_strategy == "optim_grads_params":
                 total_param_elements = 0
@@ -252,11 +269,15 @@ class FSDP(torch.nn.Module):
                 for module in self.module.modules():
                     if isinstance(module, tuple(self.fsdp_unit_modules)):
                         total_fsdp_module += 1
-                        total_param_elements += sum(p.numel() for p in module.parameters())
+                        total_param_elements += sum(
+                            p.numel() for p in module.parameters()
+                        )
                 # The suggested size is twice the number of elements in the FSDP modules.
                 # This ensures we process the current FSDP module and attempt to prefetch
                 # the next FSDP module, making the flow of communication better.
-                suggested_communication_unit_size = total_param_elements // total_fsdp_module * 2
+                suggested_communication_unit_size = (
+                    total_param_elements // total_fsdp_module * 2
+                )
             elif self.bucket_size is not None:
                 suggested_communication_unit_size = self.bucket_size * 2
 
@@ -272,7 +293,7 @@ class FSDP(torch.nn.Module):
         """Helper function to import classes from string paths."""
         classes = []
         for path in class_paths:
-            module_path, class_name = path.rsplit('.', 1)
+            module_path, class_name = path.rsplit(".", 1)
             module = importlib.import_module(module_path)
             cls = getattr(module, class_name)
             classes.append(cls)
@@ -378,7 +399,9 @@ class FSDP(torch.nn.Module):
                     # used main_grad buffer does not exceed the scope of two FSDP Unit
                     # Modules, i.e., the buffer limit imposed by double-buffer allocator.
                     if self.ddp_config.fsdp_double_buffer:
-                        self.grad_reduce_pipeline._enforce_double_buffer_limit([group_id])
+                        self.grad_reduce_pipeline._enforce_double_buffer_limit(
+                            [group_id]
+                        )
 
                     if param.grad is not None:
                         # Copy the gradient into the allocated main gradient bucket.
@@ -404,7 +427,10 @@ class FSDP(torch.nn.Module):
             and reduce-scatter the gradients before the optimizer step.
             """
             if isinstance(module, tuple(fsdp_unit_modules)):
-                if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
+                if (
+                    self.ddp_config.data_parallel_sharding_strategy
+                    == "optim_grads_params"
+                ):
                     # Deallocate the module parameters after the backward pass,
                     # because we have our data-parallel gradients computed.
                     release_module_parameters(module)
@@ -416,22 +442,26 @@ class FSDP(torch.nn.Module):
             # If the parameter is shared, we do not accumulate gradients
             # here, as the gradients will be accumulated in the
             # root post-backward hook.
-            param_list = [p for p in param_list if not getattr(p, '_is_shared', False)]
+            param_list = [p for p in param_list if not getattr(p, "_is_shared", False)]
 
             # Write computed gradients into the allocated main gradient bucket for reduce-scatter.
             for param in param_list:
                 _grad_acc(param)
                 self._params_require_handle_grad.discard(param)
 
-            grad_reduce_every_bprop = self.ddp_config.data_parallel_sharding_strategy in [
-                "optim_grads",
-                "optim_grads_params",
-            ]
-            if grad_reduce_every_bprop or getattr(self, 'is_last_microbatch', False):
+            grad_reduce_every_bprop = (
+                self.ddp_config.data_parallel_sharding_strategy
+                in [
+                    "optim_grads",
+                    "optim_grads_params",
+                ]
+            )
+            if grad_reduce_every_bprop or getattr(self, "is_last_microbatch", False):
                 # Reduce-scatter the gradients asynchronously before the optimizer step.
                 # Requires calling finish_grad_sync() to wait for the reduce-scatter to complete.
                 self.grad_reduce_pipeline.reduce_gradients(
-                    param_list, suggested_queue_capacity=self.suggested_RS_queue_capacity
+                    param_list,
+                    suggested_queue_capacity=self.suggested_RS_queue_capacity,
                 )
 
         def _pre_forward_param_unshard(
@@ -527,11 +557,14 @@ class FSDP(torch.nn.Module):
                 _grad_acc(param)
 
             # Reduce the remaining gradients.
-            grad_reduce_every_bprop = self.ddp_config.data_parallel_sharding_strategy in [
-                "optim_grads",
-                "optim_grads_params",
-            ]
-            if grad_reduce_every_bprop or getattr(self, 'is_last_microbatch', False):
+            grad_reduce_every_bprop = (
+                self.ddp_config.data_parallel_sharding_strategy
+                in [
+                    "optim_grads",
+                    "optim_grads_params",
+                ]
+            )
+            if grad_reduce_every_bprop or getattr(self, "is_last_microbatch", False):
                 self.grad_reduce_pipeline.reduce_gradients(
                     list(self._params_require_handle_grad),
                     suggested_queue_capacity=self.suggested_RS_queue_capacity,
@@ -579,8 +612,12 @@ class FSDP(torch.nn.Module):
                         # Deallocate all model parameter buckets before the backwards pass
                         # to avoid memory spikes due to concurrently allocated buckets.
                         for param in module.parameters():
-                            bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
-                            self.all_gather_pipeline.wait_bucket_ready(bucket_id, empty_ok=True)
+                            bucket_id = self.param_and_grad_buffer.param_to_param_group[
+                                param
+                            ]
+                            self.all_gather_pipeline.wait_bucket_ready(
+                                bucket_id, empty_ok=True
+                            )
                             self.all_gather_pipeline.release_bucket(bucket_id)
             # Track parameters that require gradient reduction and optimization.
             self._params_require_handle_grad = set()
@@ -591,7 +628,9 @@ class FSDP(torch.nn.Module):
                 for param in param_group.params:
                     param.grad_added_to_main_grad = False
             # Queue the root post-backward hook to reduce leftover gradients after the backward pass.
-            torch.autograd.Variable._execution_engine.queue_callback(_root_post_backward)
+            torch.autograd.Variable._execution_engine.queue_callback(
+                _root_post_backward
+            )
 
         def _post_forward(module: nn.Module, input: Any, output: Any):
             # When composed with module-hook-based activation recomputation, the
@@ -630,7 +669,9 @@ class FSDP(torch.nn.Module):
                 # will trigger immediately after the gradients of the output
                 # tensor(s) have been computed.
                 torch.autograd.graph.register_multi_grad_hook(
-                    output_list, lambda grads: custom_backward_handler(_module, grads), mode='any'
+                    output_list,
+                    lambda grads: custom_backward_handler(_module, grads),
+                    mode="any",
                 )
                 return output
 
@@ -645,7 +686,7 @@ class FSDP(torch.nn.Module):
                 continue
 
             # Register the forward pre-hook to unshard parameters before the forward pass.
-            self.forward_pre_hooks[f'module {name} parameter unshard'] = (
+            self.forward_pre_hooks[f"module {name} parameter unshard"] = (
                 module.register_forward_pre_hook(
                     _pre_forward_param_unshard, prepend=True, with_kwargs=True
                 )
@@ -668,14 +709,17 @@ class FSDP(torch.nn.Module):
                 )
             elif (
                 not self.ddp_config.keep_fp8_transpose_cache_when_using_custom_fsdp
-                and self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+                and self.ddp_config.data_parallel_sharding_strategy
+                == "optim_grads_params"
             ):
                 # Register the forward post-hook to release FP8 transpose cache
                 # after the forward pass for non-FSDP unit modules.
                 # NOTE: We only need to remove the transpose cache in parameter
                 # sharding strategy.
                 self.forward_hooks[f"remove module {name} fp8 transpose cache"] = (
-                    module.register_forward_hook(_release_module_fp8_transpose_cache, prepend=False)
+                    module.register_forward_hook(
+                        _release_module_fp8_transpose_cache, prepend=False
+                    )
                 )
 
             # Register the post-backward hook to deallocate model parameters and
@@ -697,8 +741,8 @@ class FSDP(torch.nn.Module):
                 continue
             # Add a pre-backward hook to reshard / deallocate model parameters prior to the backward pass.
             # Furthermore, add a gradient-triggered post-backward hook to reduce-scatter leftover gradients.
-            self.backward_pre_hooks[f"{name} _root_pre_backward"] = create_custom_backward_hook(
-                module, _root_pre_backward
+            self.backward_pre_hooks[f"{name} _root_pre_backward"] = (
+                create_custom_backward_hook(module, _root_pre_backward)
             )
         self._root_pre_backward_hook_handle = create_custom_backward_hook(
             module, _root_pre_backward
@@ -718,7 +762,9 @@ class FSDP(torch.nn.Module):
         finally:
             self.is_last_microbatch = True
 
-    def start_param_sync(self, *unused, force_sync: bool = False, force_dispatch: bool = False):
+    def start_param_sync(
+        self, *unused, force_sync: bool = False, force_dispatch: bool = False
+    ):
         """
         Initiates param sync (all-gather) communication operations for all model parameters.
 
@@ -737,7 +783,9 @@ class FSDP(torch.nn.Module):
         if not force_sync and self.ddp_config.overlap_param_gather:
             # All-gather the first bucket before the forward pass.
             first_param = list(self.module.parameters())[0]
-            self.all_gather_pipeline.all_gather_params(params=[first_param], prefetch=False)
+            self.all_gather_pipeline.all_gather_params(
+                params=[first_param], prefetch=False
+            )
         else:
             self.all_gather_pipeline.reset()
             for bucket_id in range(self.all_gather_pipeline.num_buckets):
@@ -809,7 +857,9 @@ class FSDP(torch.nn.Module):
         pg_buffer = self.param_and_grad_buffer
         fsdp_params = dict(pg_buffer.optimizer_named_parameters)
         for name, _ in self.module.named_parameters():
-            assert name in fsdp_params, f"Parameter {name} not found in FSDP parameters."
+            assert (
+                name in fsdp_params
+            ), f"Parameter {name} not found in FSDP parameters."
             dist_param = fsdp_params[name]
             _replace_module_parameter(self.module, name, dist_param)
 
@@ -887,7 +937,7 @@ class FSDP(torch.nn.Module):
         Syncs parameters across all DP ranks.
         """
         for param in self.module.parameters():
-            is_expert_parallel = not getattr(param, 'allreduce', True)
+            is_expert_parallel = not getattr(param, "allreduce", True)
 
             if is_expert_parallel:
                 data_parallel_group = self.expt_dp_group
@@ -938,7 +988,7 @@ def _replace_module_parameter(module, name, new_param):
     """
     Replace a module's parameter with a new parameter, preserving the hierarchy.
     """
-    parts = name.split('.')
+    parts = name.split(".")
     parent = module
     for part in parts[:-1]:  # Navigate to parent module
         parent = getattr(parent, part)

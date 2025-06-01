@@ -60,7 +60,7 @@ class DistributedDataParallelConfig:
     use_custom_fsdp: bool = False
     """If true, use the FSDP code path for DDP."""
 
-    data_parallel_sharding_strategy: str = 'no_shard'
+    data_parallel_sharding_strategy: str = "no_shard"
     """Sharding strategy for FSDP. Valid values are 'no_shard', 'optim',
         'optim_grads', 'optim_grads_params'."""
 

@@ -28,7 +28,7 @@ def get_te_version():
     def get_te_version_str():
         import transformer_engine as te
 
-        if hasattr(te, '__version__'):
+        if hasattr(te, "__version__"):
             return str(te.__version__)
         else:
             return version("transformer-engine")
@@ -47,14 +47,19 @@ def is_te_min_version(vers, check_equality=True):
         return te_version >= PkgVersion(vers)
     return te_version > PkgVersion(vers)
 
+
 # Check if Transformer Engine has class for fp8 tensors.
 try:
     if is_te_min_version("2.0"):
         # In TE2.x, QuantizedTensor is the base class for all different type of fp8 tensors,
         # including fp8 tensor for delayed scaling, current scaling and mxfp8, etc.
-        from transformer_engine.pytorch.tensor import QuantizedTensor as FP8_TENSOR_CLASS
+        from transformer_engine.pytorch.tensor import (
+            QuantizedTensor as FP8_TENSOR_CLASS,
+        )
     else:
-        from transformer_engine.pytorch.float8_tensor import Float8Tensor as FP8_TENSOR_CLASS
+        from transformer_engine.pytorch.float8_tensor import (
+            Float8Tensor as FP8_TENSOR_CLASS,
+        )
 
     HAVE_TE_FP8_TENSOR_CLASS = True
 except (ImportError, ModuleNotFoundError):
@@ -62,7 +67,10 @@ except (ImportError, ModuleNotFoundError):
     HAVE_TE_FP8_TENSOR_CLASS = False
 
 try:
-    from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_scale
+    from transformer_engine.pytorch.optimizers import (
+        multi_tensor_applier,
+        multi_tensor_scale,
+    )
 
     multi_tensor_scale_impl = multi_tensor_scale
 except ImportError:
@@ -75,9 +83,9 @@ except ImportError:
         import warnings
 
         warnings.warn(
-            'Transformer Engine and Apex are not installed. '
-            'Falling back to local implementations of '
-            'multi_tensor_applier and multi_tensor_scale'
+            "Transformer Engine and Apex are not installed. "
+            "Falling back to local implementations of "
+            "multi_tensor_applier and multi_tensor_scale"
         )
 
         def local_multi_tensor_applier(op, noop_flag_buffer, tensor_lists, *args):
@@ -119,7 +127,9 @@ def is_float8tensor(tensor: torch.Tensor) -> bool:
 
 
 def _multi_tensor_copy_this_to_that(
-    this: List[torch.Tensor], that: List[torch.Tensor], overflow_buf: Optional[torch.Tensor] = None
+    this: List[torch.Tensor],
+    that: List[torch.Tensor],
+    overflow_buf: Optional[torch.Tensor] = None,
 ):
     """
     Use multi-tensor-applier to copy values from one list to another.
@@ -186,7 +196,9 @@ if HAVE_TE and is_te_min_version("2.2"):
 
         args = [model_params, main_params, start_offsets, data_parallel_group]
         if fsdp_shard_model_params is not None:
-            if get_te_version() == PkgVersion("2.3.0.dev0+5fdd7bb") or is_te_min_version("2.3.0"):
+            if get_te_version() == PkgVersion(
+                "2.3.0.dev0+5fdd7bb"
+            ) or is_te_min_version("2.3.0"):
                 args.append(fsdp_shard_model_params)
             else:
                 raise NotImplementedError(
@@ -262,18 +274,24 @@ elif HAVE_TE and is_te_min_version("2.0"):
             scale_invs.append(model_param._scale_inv.view(1))
             model_param._reset_caches()
 
-        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device="cuda")
 
         # Update scaling factors.
-        packed_scales = torch.empty(len(scales), dtype=torch.float32, device=scales[0].device)
+        packed_scales = torch.empty(
+            len(scales), dtype=torch.float32, device=scales[0].device
+        )
         packed_scale_views = [packed_scales[i].view(1) for i in range(len(scales))]
         _multi_tensor_copy_this_to_that(scales, packed_scale_views, dummy_overflow_buf)
         torch.reciprocal(packed_scales, out=packed_scales)
-        _multi_tensor_copy_this_to_that(packed_scale_views, scale_invs, dummy_overflow_buf)
+        _multi_tensor_copy_this_to_that(
+            packed_scale_views, scale_invs, dummy_overflow_buf
+        )
 
         # Reduce amaxes.
         # Note: Assume each param has a separate amax.
-        packed_amaxes = torch.empty(len(amaxes), dtype=torch.float32, device=amaxes[0].device)
+        packed_amaxes = torch.empty(
+            len(amaxes), dtype=torch.float32, device=amaxes[0].device
+        )
         packed_amax_views = [packed_amaxes[i].view(1) for i in range(len(amaxes))]
         _multi_tensor_copy_this_to_that(amaxes, packed_amax_views, dummy_overflow_buf)
         torch.distributed.all_reduce(
@@ -286,7 +304,9 @@ elif HAVE_TE and is_te_min_version("1.0"):
     from transformer_engine.pytorch.cpp_extensions import cast_to_fp8
     from transformer_engine.pytorch.float8_tensor import Float8Tensor
 
-    def _modify_underlying_storage_impl(tensor: Float8Tensor, new_raw_data: torch.Tensor) -> None:
+    def _modify_underlying_storage_impl(
+        tensor: Float8Tensor, new_raw_data: torch.Tensor
+    ) -> None:
         old_raw_data = tensor._data
         assert old_raw_data.dtype == new_raw_data.dtype
         new_raw_data.detach().copy_(old_raw_data)
@@ -344,18 +364,24 @@ elif HAVE_TE and is_te_min_version("1.0"):
             scale_invs.append(model_param._scale_inv.view(1))
             model_param._reset_caches()
 
-        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device="cuda")
 
         # Update scaling factors.
-        packed_scales = torch.empty(len(scales), dtype=torch.float32, device=scales[0].device)
+        packed_scales = torch.empty(
+            len(scales), dtype=torch.float32, device=scales[0].device
+        )
         packed_scale_views = [packed_scales[i].view(1) for i in range(len(scales))]
         _multi_tensor_copy_this_to_that(scales, packed_scale_views, dummy_overflow_buf)
         torch.reciprocal(packed_scales, out=packed_scales)
-        _multi_tensor_copy_this_to_that(packed_scale_views, scale_invs, dummy_overflow_buf)
+        _multi_tensor_copy_this_to_that(
+            packed_scale_views, scale_invs, dummy_overflow_buf
+        )
 
         # Reduce amaxes.
         # Note: Assume each param has a separate amax.
-        packed_amaxes = torch.empty(len(amaxes), dtype=torch.float32, device=amaxes[0].device)
+        packed_amaxes = torch.empty(
+            len(amaxes), dtype=torch.float32, device=amaxes[0].device
+        )
         packed_amax_views = [packed_amaxes[i].view(1) for i in range(len(amaxes))]
         _multi_tensor_copy_this_to_that(amaxes, packed_amax_views, dummy_overflow_buf)
         torch.distributed.all_reduce(
@@ -366,10 +392,14 @@ elif HAVE_TE and is_te_min_version("1.0"):
 else:
     # Fallback impl if TE version is invalid or TE is not installed.
     def _modify_underlying_storage_impl(*args, **kwargs):
-        raise RuntimeError("Invalid Transformer Engine version for FP8 distributed optimizer")
+        raise RuntimeError(
+            "Invalid Transformer Engine version for FP8 distributed optimizer"
+        )
 
     def _quantize_param_shard_impl(*args, **kwargs):
-        raise RuntimeError("Invalid Transformer Engine version for FP8 distributed optimizer")
+        raise RuntimeError(
+            "Invalid Transformer Engine version for FP8 distributed optimizer"
+        )
 
 
 def modify_underlying_storage(tensor: torch.Tensor, new_raw_data: torch.Tensor):
@@ -378,16 +408,26 @@ def modify_underlying_storage(tensor: torch.Tensor, new_raw_data: torch.Tensor):
 
 
 def quantize_param_shard(
-    model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params=None
+    model_params,
+    main_params,
+    start_offsets,
+    data_parallel_group,
+    fsdp_shard_model_params=None,
 ):
     """Cast shard fp32 main params to fp8 model params."""
     _quantize_param_shard_impl(
-        model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params
+        model_params,
+        main_params,
+        start_offsets,
+        data_parallel_group,
+        fsdp_shard_model_params,
     )
 
 
 def _get_cuda_rng_state(
-    device: Union[int, str, torch.device] = "cuda", clone: bool = False, graph_safe: bool = False
+    device: Union[int, str, torch.device] = "cuda",
+    clone: bool = False,
+    graph_safe: bool = False,
 ) -> torch.Tensor:
     """Return the random number generator state of the specified GPU.
 
@@ -417,7 +457,9 @@ def _get_cuda_rng_state(
     return default_generator.graphsafe_get_state()
 
 
-def _set_cuda_rng_state(new_state: torch.Tensor, device: int = -1, graph_safe: bool = False):
+def _set_cuda_rng_state(
+    new_state: torch.Tensor, device: int = -1, graph_safe: bool = False
+):
     """Sets the random number generator state of the current GPU.
 
     Arguments:
@@ -429,7 +471,7 @@ def _set_cuda_rng_state(new_state: torch.Tensor, device: int = -1, graph_safe: b
     with a single change: the input state is not cloned. Cloning caused
     major performance issues for +4 GPU cases.
     """
-    if hasattr(_C, '_cuda_setRNGState') and callable(_C._cuda_setRNGState):
+    if hasattr(_C, "_cuda_setRNGState") and callable(_C._cuda_setRNGState):
         # older PyTorch
         def cb():
             with device_ctx_manager(device):
@@ -438,11 +480,11 @@ def _set_cuda_rng_state(new_state: torch.Tensor, device: int = -1, graph_safe: b
     else:
         # newer PyTorch
         if device == -1:
-            device = torch.device('cuda')
+            device = torch.device("cuda")
         elif isinstance(device, str):
             device = torch.device(device)
         elif isinstance(device, int):
-            device = torch.device('cuda', device)
+            device = torch.device("cuda", device)
 
         def cb():
             idx = device.index
@@ -475,18 +517,25 @@ def initialize_rng_tracker(
         _CUDA_RNG_STATE_TRACKER = None
         _CUDA_RNG_STATE_TRACKER_INITIALIZED = False
 
-    if "_CUDA_RNG_STATE_TRACKER_INITIALIZED" in globals() and _CUDA_RNG_STATE_TRACKER_INITIALIZED:
+    if (
+        "_CUDA_RNG_STATE_TRACKER_INITIALIZED" in globals()
+        and _CUDA_RNG_STATE_TRACKER_INITIALIZED
+    ):
         return
-    
-    _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
+
+    _MODEL_PARALLEL_RNG_TRACKER_NAME = "model-parallel-rng"
 
     # Get the base tracker class
     base_tracker = None
     if HAVE_TE and use_te_rng_tracker:
         if not is_te_min_version("1.5.0"):
-            raise RuntimeError("use_te_rng_tracker requires TransformerEngine version >= 1.5")
+            raise RuntimeError(
+                "use_te_rng_tracker requires TransformerEngine version >= 1.5"
+            )
 
-        class TECudaRNGStatesTracker(transformer_engine.pytorch.distributed.CudaRNGStatesTracker):
+        class TECudaRNGStatesTracker(
+            transformer_engine.pytorch.distributed.CudaRNGStatesTracker
+        ):
             """Wraps TransformerEngine's CudaRNGStatesTracker so that it is
             interchangeable with Megatron's RNG tracker"""
 
@@ -527,7 +576,9 @@ def initialize_rng_tracker(
             cuda state.
             """
 
-            def __init__(self, use_cudagraphable_rng=False, is_inference_rng_tracker=False):
+            def __init__(
+                self, use_cudagraphable_rng=False, is_inference_rng_tracker=False
+            ):
                 self.reset()
                 self.use_cudagraphable_rng = use_cudagraphable_rng
                 self.is_inference_rng_tracker = is_inference_rng_tracker
@@ -575,11 +626,11 @@ def initialize_rng_tracker(
                 self._is_initialized = True
                 # Check seed is not already used.
                 if seed in self.seeds_:
-                    raise Exception('seed {} already exists'.format(seed))
+                    raise Exception("seed {} already exists".format(seed))
                 self.seeds_.add(seed)
                 # Check that state is not already defined.
                 if name in self.states_:
-                    raise Exception('cuda rng state {} already exists'.format(name))
+                    raise Exception("cuda rng state {} already exists".format(name))
 
                 # If available, create the state in a graph safe manner
                 if self.use_cudagraphable_rng:
@@ -601,11 +652,15 @@ def initialize_rng_tracker(
                 the original state."""
                 # Check if we have added the state
                 if name not in self.states_:
-                    raise Exception('cuda rng state {} is not added'.format(name))
+                    raise Exception("cuda rng state {} is not added".format(name))
                 # Store current rng state.
-                orig_cuda_rng_state = _get_cuda_rng_state(graph_safe=self.use_cudagraphable_rng)
+                orig_cuda_rng_state = _get_cuda_rng_state(
+                    graph_safe=self.use_cudagraphable_rng
+                )
                 # Set rng state to the desired one
-                _set_cuda_rng_state(self.states_[name], graph_safe=self.use_cudagraphable_rng)
+                _set_cuda_rng_state(
+                    self.states_[name], graph_safe=self.use_cudagraphable_rng
+                )
                 # Record cpu RNG state
                 cpu_rng_state = torch.get_rng_state()
                 # Do the stuff we wanted to do.
@@ -614,11 +669,17 @@ def initialize_rng_tracker(
                 finally:
                     # Throw a warning if cpu RNG state changed
                     if not torch.all(cpu_rng_state == torch.get_rng_state()).item():
-                        logging.getLogger(__name__).warning('CPU RNG state changed within GPU RNG context')
+                        logging.getLogger(__name__).warning(
+                            "CPU RNG state changed within GPU RNG context"
+                        )
                     # Update the current rng state for later use.
-                    self.states_[name] = _get_cuda_rng_state(graph_safe=self.use_cudagraphable_rng)
+                    self.states_[name] = _get_cuda_rng_state(
+                        graph_safe=self.use_cudagraphable_rng
+                    )
                     # And set the state to the original state we started with.
-                    _set_cuda_rng_state(orig_cuda_rng_state, graph_safe=self.use_cudagraphable_rng)
+                    _set_cuda_rng_state(
+                        orig_cuda_rng_state, graph_safe=self.use_cudagraphable_rng
+                    )
 
         base_tracker = CudaRNGStatesTracker
         tracker_kwargs = {
@@ -657,7 +718,9 @@ def get_cuda_rng_tracker(
     use_cudagraphable_rng: bool = False,
 ):
     """Get cuda rng tracker."""
-    initialize_rng_tracker(use_te_rng_tracker, inference_rng_tracker, use_cudagraphable_rng)
+    initialize_rng_tracker(
+        use_te_rng_tracker, inference_rng_tracker, use_cudagraphable_rng
+    )
     return _CUDA_RNG_STATE_TRACKER
 
 
@@ -679,7 +742,10 @@ class GlobalMemoryBuffer:
             or self.buffer[(name, dtype)].numel() < required_len
         ):
             self.buffer[(name, dtype)] = torch.empty(
-                required_len, dtype=dtype, device=torch.cuda.current_device(), requires_grad=False
+                required_len,
+                dtype=dtype,
+                device=torch.cuda.current_device(),
+                requires_grad=False,
             )
 
         return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)
