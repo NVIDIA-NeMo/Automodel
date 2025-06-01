@@ -4,12 +4,6 @@ import signal
 from functools import lru_cache
 from typing import Dict, Generator, List, Optional, Set, Union
 
-# TODO(boxiangw): Change to nvFSDP once it got published
-from megatron.core.distributed.custom_fsdp import FSDP
-from megatron.core.distributed.distributed_data_parallel_config import (
-    DistributedDataParallelConfig,
-)
-
 import torch
 from torch import Tensor, nn
 from torch.distributed._tensor import DTensor, Replicate
@@ -20,6 +14,12 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
     SequenceParallel,
     parallelize_module,
+)
+
+# TODO(boxiangw): Change to nvFSDP once it got published
+from nemo_automodel.distributed.nvfsdp.fsdp import FSDP
+from nemo_automodel.distributed.nvfsdp.distributed_data_parallel_config import (
+    DistributedDataParallelConfig,
 )
 
 
