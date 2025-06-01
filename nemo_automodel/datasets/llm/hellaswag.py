@@ -69,7 +69,9 @@ class HellaSwag:
         Returns:
             dict: A tokenized and preprocessed example.
         """
-        return self.dataset[index]
+        ans = self.dataset[index]
+        ans.pop('attention_mask', None)
+        return ans
 
     def __len__(self):
         """
