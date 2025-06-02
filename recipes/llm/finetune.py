@@ -376,7 +376,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             # Clip gradients **after** any rescaling.
             # TODO(@boxiangw): Fix TP gradient clipping
-            grad_norm = clip_gradients(self.model, clip_norm)
+            if self.device_mesh["tensor_parallel"].size() == 1:
+                grad_norm = clip_gradients(self.model, clip_norm)
 
             if isinstance(self.model, FSDP):
                 # If the model uses nvFSDP, wait for all sharded gradients to be reduced and unsharded.
@@ -476,7 +477,7 @@ def main():
 
     Loads the configuration, sets up the trainer, and initiates the training loop.
     """
-    cfg = load_yaml_config("llama_3_2_1b_hellaswag_nvfsdp.yaml")
+    cfg = load_yaml_config("llama_3_2_1b_hellaswag.yaml")
     trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
