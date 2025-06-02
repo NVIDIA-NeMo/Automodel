@@ -50,7 +50,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
     """
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-       """
+        """
         Load a pretrained causal-language-model and (optionally) patch it with
         Liger fused-attention kernels.
 
