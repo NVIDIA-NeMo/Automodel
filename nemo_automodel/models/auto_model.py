@@ -23,22 +23,22 @@ HAS_LIGER_KERNEL, liger_kernel_trf = safe_import('liger_kernel.transformers')
 logger = logging.getLogger(__name__)
 
 
-def patch_attention(obj, sdap_method=None):
+def patch_attention(obj, sdpa_method=None):
     """
     Wrap the `forward` method of `obj` in an `sdap_kernel` context to
     enable a sequence of SDP attention backends.
 
     Args:
         obj: Any object with a `.forward(*args, **kwargs)` method.
-        sdap_method (list[SDPBackend], optional): Ordered list of SDPBackend
+        sdpa_method (list[SDPBackend], optional): Ordered list of SDPBackend
             implementations to attempt. If None, defaults to
             [CUDNN_ATTENTION, FLASH_ATTENTION, EFFICIENT_ATTENTION, MATH].
 
     Returns:
         The same `obj` with its `.forward` method patched.
     """
-    if sdap_method is None:
-        sdap_method = [
+    if sdpa_method is None:
+        sdpa_method = [
                 SDPBackend.CUDNN_ATTENTION,
                 SDPBackend.FLASH_ATTENTION,
                 SDPBackend.EFFICIENT_ATTENTION,
@@ -46,7 +46,7 @@ def patch_attention(obj, sdap_method=None):
             ]
     orig_forward = obj.forward
     def patched_forward(self, *args, **kwargs):
-        with sdap_kernel(sdap_method):
+        with sdpa_kernel(sdpa_method):
             return orig_forward(*args, **kwargs)
     obj.forward = patched_forward
     return obj
@@ -115,7 +115,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
         ``use_liger_kernel=False``.
         """
         use_liger_kernel = kwargs.pop('use_liger_kernel', True)
-        sdap_method = kwargs.pop('sdap_method', None)
+        sdpa_method = kwargs.pop('sdpa_method', None)
         model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
         if use_liger_kernel:
             if not HAS_LIGER_KERNEL:
@@ -128,7 +128,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
                 # If patching failed, retry
                 return cls.from_pretrained(
                     pretrained_model_name_or_path, *model_args, **kwargs, use_liger_kernel=False)
-        model = patch_attention(model, sdap_method)
+        model = patch_attention(model, sdpa_method)
         model.config.update({"nemo_version" : __version__})
         return model
 
@@ -160,7 +160,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
         loading.
         """
         use_liger_kernel = kwargs.pop('use_liger_kernel', True)
-        sdap_method = kwargs.pop('sdap_method', None)
+        sdpa_method = kwargs.pop('sdpa_method', None)
         model = super().from_config(config, **kwargs)
         if use_liger_kernel:
             if not HAS_LIGER_KERNEL:
@@ -172,6 +172,6 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
                 del model
                 # If patching failed, retry
                 return cls.from_config(config, **kwargs, use_liger_kernel=False)
-        model = patch_attention(model, sdap_method)
+        model = patch_attention(model, sdpa_method)
         model.config.update({"nemo_version" : __version__})
         return model
