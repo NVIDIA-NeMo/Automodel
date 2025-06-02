@@ -14,24 +14,27 @@
 # limitations under the License.
 
 from datasets import Dataset, Features, Sequence, Value
-import random, math, itertools, torch
+import random
 
-# 1.  Build a trivial vocab; index 0=<pad>, 1=<eos>, rest = word_i
 def make_vocab(vocab_size:int=100):
+    """
+    Build a trivial vocab; index 0=<pad>, 1=<eos>, rest = word_i
+    """
     vocab = {"<pad>": 0, "<eos>": 1}
     for i in range(2, vocab_size):
         vocab[f"tok_{i}"] = i
     return vocab
 
-# 2.  Sentence generator with Gaussian length control
 def gen_sentence_ids(vocab, mean_len:float, std_len:float, max_len:int):
+    """ Sentence generator with Gaussian length control """
+
     words = list(vocab.values())[2:]     # exclude <pad>, <eos>
     # truncated Gaussian
     L = max(1, min(max_len, int(random.gauss(mean_len, std_len))))
     return random.choices(words, k=L) + [vocab["<eos>"]]
 
-# 3.  Flush helper (build position_ids that reset after <eos>)
 def flush_block(block, block_size):
+    """ Flush helper (build position_ids that reset after <eos>) """
     pos, pos_ids = 0, []
     for tid in block:
         pos_ids.append(pos)
@@ -43,7 +46,6 @@ def flush_block(block, block_size):
         "position_ids": pos_ids,
     }
 
-# 4.  Main utility ------------------------------------------------------
 def build_packed_dataset(
         *,
         num_blocks:int          = 10,
@@ -54,6 +56,7 @@ def build_packed_dataset(
         max_sentence_len:int    = 64,
         seed:int                = 0,
 ):
+    """ dataset builder """
     random.seed(seed)
     vocab = make_vocab(vocab_size)
     current, examples = [], []
