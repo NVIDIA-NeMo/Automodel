@@ -85,9 +85,7 @@ def fsdp2_strategy_parallelize(
             else "data_parallel"
         )
     ]
-    # print(dir(device_mesh))
-    # print(device_mesh.mesh_dim_names)
-    # quit()
+
     if dp_mesh.size() > 1:
         assert dp_mesh.ndim == 1, "Hybrid-sharding not supported"
 

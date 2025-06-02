@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import wandb
+import torch.distributed as dist
 from typing import Any, Dict
 
 import torch
@@ -54,9 +56,9 @@ def build_optimizer(cfg_opt, model, tp_size) -> 'Optimizer':  # noqa: F821
     Build an optimizer for the model.
 
     Args:
-        device: The target device.
         cfg_opt: Configuration for optimizer instantiation.
         model: The model whose parameters will be optimized.
+        tp_size: The size of the tensor parallel group.
 
     Returns:
         The instantiated optimizer.
@@ -85,15 +87,14 @@ def build_loss_fn(device, cfg_loss):
         return cfg_loss.instantiate().to(device)
 
 
-def build_dataloader(device, cfg_ds, cfg_dl, distributed_sampler_kwargs) -> DataLoader:
+def build_dataloader(cfg_ds, cfg_dl, distributed_sampler_kwargs) -> DataLoader:
     """
     Build a DataLoader for the dataset.
 
     Args:
-        device: The target device.
         cfg_ds: Dataset configuration.
         cfg_dl: DataLoader configuration.
-
+        distributed_sampler_kwargs: Additional arguments for the DistributedSampler.
     Returns:
         The instantiated DataLoader.
     """
@@ -174,6 +175,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
 
+        self.device_mesh = None
         self.model_wrapper = None
         distributed_sampler_kwargs = {}
         if "distributed" in self.cfg:
@@ -184,8 +186,21 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 "num_replicas": self.model_wrapper.device_mesh["data_parallel"].size(),
                 "rank": self.model_wrapper.device_mesh["data_parallel"].get_local_rank(),
             }
+            if "shuffle" in self.cfg.dataloader:
+                del self.cfg.dataloader.shuffle
+            if hasattr(self.model_wrapper, 'device_mesh'):
+                self.device_mesh = self.model_wrapper.device_mesh
 
         torch.manual_seed(self.cfg.get("seed", 42) + self.dist_env.rank)
+
+        if self.dist_env.is_main and hasattr(self.cfg, 'logger'):
+            wandb.init(
+                project=self.cfg.logger.get("wandb_project", "default_project"),
+                entity=self.cfg.logger.get("wandb_entity"),
+                name=self.cfg.logger.get("wandb_exp_name"),
+                dir=self.cfg.logger.get("wandb_save_dir"),
+                config=self.cfg,
+            )
 
         # Build components
         self.model = build_model(self.dist_env.device, self.cfg.model, self.cfg.get('peft', None), self.model_wrapper)
@@ -196,11 +211,25 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
         self.loss_fn   = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
         self.dataloader = build_dataloader(
-            self.dist_env.device,
             self.cfg.dataset,
             self.cfg.dataloader,
             distributed_sampler_kwargs,
         )
+
+        # Build validation dataloader if the config provides it
+        self.val_dataloader = None
+        val_ds_cfg = self.cfg.get("validation_dataset")
+        val_dl_cfg = self.cfg.get("validation_dataloader")
+        if val_ds_cfg is not None and val_dl_cfg is not None:
+            self.val_dataloader = build_dataloader(
+                val_ds_cfg,
+                val_dl_cfg,
+                distributed_sampler_kwargs,
+            )
+
+        # Initialize metrics required for calculating loss
+        self.total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
+        self.forward_data_store = []
 
         # Scheduler
         self.step_scheduler = build_step_scheduler(self.cfg.get('step_scheduler', None), self.dataloader)
@@ -220,15 +249,51 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.model.train()
         for epoch in self.step_scheduler.epochs:
             for batch_idx, batch in enumerate(self.dataloader):
-                is_optim_step, is_ckpt_step = self.step_scheduler.update(batch_idx)
-                loss = self._run_train_step(batch, is_optim_step, 1.0,
-                    num_grad_acc_steps=self.step_scheduler.grad_acc_steps)
+                # is_optim_step, is_ckpt_step = self.step_scheduler.update(batch_idx)
+                # loss = self._run_train_step(batch, is_optim_step, 1.0,
+                #     num_grad_acc_steps=self.step_scheduler.grad_acc_steps)
 
-                if self.dist_env.is_main and is_ckpt_step:
-                    self._save_checkpoint()
+                # if self.dist_env.is_main and is_ckpt_step:
+                #     self._save_checkpoint()
+                # is_optim_step, is_ckpt_step, is_val_step = self.step_scheduler.update(batch_idx)
+                # grad_norm = self._run_train_step(batch, is_optim_step, self.device_mesh, 1.0)
+                # if is_optim_step:
+                #     reporting_loss = self.log_train_metrics(grad_norm)
+
+                # if self.dist_env.is_main and is_optim_step:
+                #     print(f"step {self.step_scheduler.step} | loss {loss.item():.6f}", flush=True)
+                is_optim_step, is_ckpt_step, is_val_step = self.step_scheduler.update(batch_idx)
+                grad_norm = self._run_train_step(batch, is_optim_step, self.device_mesh, 1.0)
+                if is_optim_step:
+                    reporting_loss = self.log_train_metrics(grad_norm)
+
+                # if self.dist_env.is_main and is_ckpt_step:
+                #     self._save_checkpoint()
 
                 if self.dist_env.is_main and is_optim_step:
-                    print(f"step {self.step_scheduler.step} | loss {loss.item():.6f}", flush=True)
+                    print(
+                        f"step {self.step_scheduler.step} | "
+                        f"epoch {self.step_scheduler.epoch} | "
+                        f"loss {reporting_loss:.6f} | "
+                        f"grad_norm {grad_norm:.6f}"
+                    )
+
+                if is_val_step and self.val_dataloader is not None:
+                    val_loss = self._run_validation_epoch()
+                    if self.dist_env.is_main:
+                        if wandb.run is not None:
+                            wandb.log(
+                                {
+                                    "val_loss": val_loss,
+                                    "step": self.step_scheduler.step,
+                                    "epoch": self.step_scheduler.epoch
+                                }
+                            )
+                        print(
+                            f"[val] step {self.step_scheduler.step} | "
+                            f"epoch {self.step_scheduler.epoch} | "
+                            f"loss {val_loss:.4f}",
+                        )
 
 
     # ------------------ helpers ------------------
