@@ -167,51 +167,55 @@ class FSDP2Manager:
         Raises:
             NotImplemented: If the required TP sharding plan is not supported.
         """
-        if use_hf_tp_plan:
-            tp_shard_plan = get_hf_tp_shard_plan(model)
+        if self.device_mesh["tensor_parallel"].size() > 1:
+            if use_hf_tp_plan:
+                tp_shard_plan = get_hf_tp_shard_plan(model)
+            else:
+                # Parallelize the first embedding and the last linear out projection
+                base_model_tp_plan = {
+                    "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
+                    "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+                    "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+                    "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+                    "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+                    "model.layers.*.mlp.up_proj": ColwiseParallel(),
+                    "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+                    "model.layers.*.mlp.down_proj": RowwiseParallel(),
+                    "lm_head": ColwiseParallel(output_layouts=Replicate()),
+                }
+
+                base_model_sp_plan = {
+                    "model.embed_tokens": RowwiseParallel(
+                        input_layouts=Replicate(), output_layouts=Shard(1)
+                    ),
+                    "model.norm": SequenceParallel(),
+                    "model.layers.*.input_layernorm": SequenceParallel(),
+                    "model.layers.*.self_attn.o_proj": RowwiseParallel(
+                        output_layouts=Shard(1)
+                    ),
+                    "model.layers.*.post_attention_layernorm": SequenceParallel(),
+                    "model.layers.*.mlp.down_proj": RowwiseParallel(
+                        output_layouts=Shard(1)
+                    ),
+                    "lm_head": ColwiseParallel(
+                        input_layouts=Shard(1), output_layouts=Replicate()
+                    ),
+                }
+
+                if self.sequence_parallel:
+                    # Enable sequence parallelism only if TP size > 1
+                    base_model_tp_plan.update(base_model_sp_plan)
+
+                tp_shard_plan = base_model_tp_plan
+
+                # TODO(boxiangw): Change this to a log
+                if self.device_mesh.get_rank() == 0:
+                    print(
+                        "Using default TP plan for parallelization. "
+                        "It is compatible with huggingface llama3-style models."
+                    )
         else:
-            # Parallelize the first embedding and the last linear out projection
-            base_model_tp_plan = {
-                "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
-                "model.layers.*.self_attn.q_proj": ColwiseParallel(),
-                "model.layers.*.self_attn.k_proj": ColwiseParallel(),
-                "model.layers.*.self_attn.v_proj": ColwiseParallel(),
-                "model.layers.*.self_attn.o_proj": RowwiseParallel(),
-                "model.layers.*.mlp.up_proj": ColwiseParallel(),
-                "model.layers.*.mlp.gate_proj": ColwiseParallel(),
-                "model.layers.*.mlp.down_proj": RowwiseParallel(),
-                "lm_head": ColwiseParallel(output_layouts=Replicate()),
-            }
-
-            base_model_sp_plan = {
-                "model.embed_tokens": RowwiseParallel(
-                    input_layouts=Replicate(), output_layouts=Shard(1)
-                ),
-                "model.norm": SequenceParallel(),
-                "model.layers.*.input_layernorm": SequenceParallel(),
-                "model.layers.*.self_attn.o_proj": RowwiseParallel(
-                    output_layouts=Shard(1)
-                ),
-                "model.layers.*.post_attention_layernorm": SequenceParallel(),
-                "model.layers.*.mlp.down_proj": RowwiseParallel(
-                    output_layouts=Shard(1)
-                ),
-                "lm_head": ColwiseParallel(
-                    input_layouts=Shard(1), output_layouts=Replicate()
-                ),
-            }
-
-            if self.sequence_parallel:
-                # Enable sequence parallelism only if TP size > 1
-                base_model_tp_plan.update(base_model_sp_plan)
-
-            tp_shard_plan = base_model_tp_plan
-
-            # TODO(boxiangw): Change this to a log
-            if self.device_mesh.get_rank() == 0:
-                print(
-                    "Using default TP plan for parallelization. It is compatible with huggingface llama3-style models."
-                )
+            tp_shard_plan = None
 
         fsdp2_strategy_parallelize(
             model,
