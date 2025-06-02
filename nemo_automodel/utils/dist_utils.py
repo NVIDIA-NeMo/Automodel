@@ -321,13 +321,16 @@ def rescale_gradients(model, num_tokens_for_grad_scaling, dp_group, dp_size):
 
 # based on: https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/utils.py#L278
 @torch.no_grad()
-def clip_gradients(model, clip_norm):
+def clip_gradients(model, clip_norm, foreach=True):
     """
     Clip gradients across the DP group.
+    Args:
+        model: The model to clip the gradients of.
+        clip_norm: The maximum norm of the gradients.
     """
     grads = [p.grad for p in model.parameters() if p.grad is not None]
-    grad_norm = torch.nn.utils.get_total_norm(grads)
+    grad_norm = torch.nn.utils.get_total_norm(grads, foreach=foreach)
     if isinstance(grad_norm, torch.distributed.tensor.DTensor):
         grad_norm = grad_norm.full_tensor()
-    torch.nn.utils.clip_grads_with_norm_([p for p in model.parameters()], clip_norm, grad_norm)
+    torch.nn.utils.clip_grads_with_norm_([p for p in model.parameters()], clip_norm, grad_norm, foreach=foreach)
     return grad_norm
