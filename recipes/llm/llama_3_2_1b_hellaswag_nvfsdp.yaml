@@ -61,8 +61,8 @@ optimizer:
   weight_decay: 0
   # min_lr: 1.0e-5
 
-logger:
-  wandb_project: nemo_automodel_sft_loop
-  wandb_entity: nvidia
-  wandb_exp_name: automodel-hellaswag-single-fsdp-local-tensor-llama_Llama-3.2-1B
-  wandb_save_dir: /tmp/nemo_automodel/wandb
+# logger:
+#   wandb_project: <your_wandb_project>
+#   wandb_entity: <your_wandb_entity>
+#   wandb_exp_name: <your_wandb_exp_name>
+#   wandb_save_dir: <your_wandb_save_dir>

@@ -251,33 +251,22 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.model.train()
         for epoch in self.step_scheduler.epochs:
             for batch_idx, batch in enumerate(self.dataloader):
-                # is_optim_step, is_ckpt_step = self.step_scheduler.update(batch_idx)
-                # loss = self._run_train_step(batch, is_optim_step, 1.0,
-                #     num_grad_acc_steps=self.step_scheduler.grad_acc_steps)
-
-                # if self.dist_env.is_main and is_ckpt_step:
-                #     self._save_checkpoint()
-                # is_optim_step, is_ckpt_step, is_val_step = self.step_scheduler.update(batch_idx)
-                # grad_norm = self._run_train_step(batch, is_optim_step, self.device_mesh, 1.0)
-                # if is_optim_step:
-                #     reporting_loss = self.log_train_metrics(grad_norm)
-
-                # if self.dist_env.is_main and is_optim_step:
-                #     print(f"step {self.step_scheduler.step} | loss {loss.item():.6f}", flush=True)
                 is_optim_step, is_ckpt_step, is_val_step = self.step_scheduler.update(batch_idx)
-                grad_norm = self._run_train_step(batch, is_optim_step, self.device_mesh, 1.0)
+                grad_norm = self._run_train_step(batch, is_optim_step, 1.0)
                 if is_optim_step:
                     reporting_loss = self.log_train_metrics(grad_norm)
 
-                # if self.dist_env.is_main and is_ckpt_step:
+                    if self.dist_env.is_main:
+                        print(
+                            f"step {self.step_scheduler.step} | "
+                            f"epoch {self.step_scheduler.epoch} | "
+                            f"loss {reporting_loss:.6f} | "
+                            f"grad_norm {grad_norm:.6f}"
+                        )
+
+                if is_ckpt_step and self.dist_env.is_main:
                 #     self._save_checkpoint()
-                if self.dist_env.is_main and is_optim_step:
-                    print(
-                        f"step {self.step_scheduler.step} | "
-                        f"epoch {self.step_scheduler.epoch} | "
-                        f"loss {reporting_loss:.6f} | "
-                        f"grad_norm {grad_norm:.6f}"
-                    )
+                    pass
 
                 if is_val_step and self.val_dataloader is not None:
                     val_loss = self._run_validation_epoch()
@@ -298,7 +287,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
 
     # ------------------ helpers ------------------
-    def _run_train_step(self, batch, is_optim_step, device_mesh, clip_norm=1.0):
+    def _run_train_step(self, batch, is_optim_step, clip_norm=1.0):
         """
         Execute a single training step.
 
@@ -320,17 +309,15 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # TODO(@boxiangw): Refractor. Needed for SP support
         # If 'position_ids' does not exist in batch already then override it. batch in case of Packed sequence
         # contains 'position_ids' and we don't want to override it.
-        if 'position_ids' not in batch and (self.model_wrapper.device_mesh["context_parallel"].size() > 1 or self.model_wrapper.device_mesh["tensor_parallel"].size() > 1):
+        if 'position_ids' not in batch and (self.device_mesh["context_parallel"].size() > 1 or self.device_mesh["tensor_parallel"].size() > 1):
             batch["position_ids"] = torch.arange(0, batch['input_ids'].shape[1]).unsqueeze(0).to(self.model.device)
-            batch["attention_mask"] = None
 
         # based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/train.py#L336
-        if self.model_wrapper.device_mesh["context_parallel"].size() > 1:
+        if self.device_mesh["context_parallel"].size() > 1:
 
             input_ids = batch["input_ids"].to(self.model.device)
             position_ids = batch["position_ids"].to(self.model.device)
 
-            
             if loss_mask is not None:
                 cp_buffers = [input_ids, labels, position_ids, loss_mask]
                 cp_seq_dims = [1, 1, 1, 1]
@@ -360,19 +347,20 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 logits = logits.view(-1, n_cls)
                 labels = labels.view(-1)
                 assert logits.shape[-2] == labels.shape[-1], "Expected logits & labels to have the same length"
-                loss = self.loss_fn(logits, labels, loss_mask)
+                local_loss = self.loss_fn(logits, labels, loss_mask)
 
             # In the case where all labels are masked, the loss should be 0.
             if loss_mask is not None and loss_mask.bool().sum() == 0:
-                loss.detach().copy_(torch.zeros_like(loss))
+                local_loss.detach().copy_(torch.zeros_like(local_loss))
 
         else:
             out  = self.model(**batch)
             local_loss = self.loss_fn(out.logits.view(-1, out.logits.size(-1)),
-                                labels.view(-1), mask=mask, reduction="sum")
-            local_num_tokens = mask.sum().detach().to(torch.int)
-            self.total_num_tokens += local_num_tokens
-            self.forward_data_store.append(local_loss.detach())
+                                labels.view(-1), mask=loss_mask, reduction="sum")
+
+        local_num_tokens = loss_mask.sum().detach().to(torch.int)
+        self.total_num_tokens += local_num_tokens
+        self.forward_data_store.append(local_loss.detach())
 
         with get_sync_ctx(self.model, is_optim_step):
             local_loss.backward()
@@ -382,48 +370,31 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             rescale_gradients(
                 self.model,
                 self.total_num_tokens,
-                device_mesh["data_parallel"].get_group(),
-                device_mesh["data_parallel"].size()
+                self.device_mesh["data_parallel"].get_group(),
+                self.device_mesh["data_parallel"].size()
             )
 
             # Clip gradients **after** any rescaling.
-            if device_mesh["tensor_parallel"].size() == 1:
-                grad_norm = clip_gradients(self.model, clip_norm)
+            # TODO(@boxiangw): Fix TP gradient clipping
+            grad_norm = clip_gradients(self.model, clip_norm)
+
+            if isinstance(self.model, FSDP):
+                # If the model uses nvFSDP, wait for all sharded gradients to be reduced and unsharded.
+                # Necessary because the post-backward reduce-scatter is asynchronous, so gradients and backward
+                # computations are concurrent, but the gradients of the final layer may not be available yet.
+                self.model.finish_grad_sync()
+
             self.optimizer.step()
             self.optimizer.zero_grad()
 
+            if isinstance(self.model, FSDP):
+                # If custom FSDP2 is configured with "optim" (optimizer state / high-precision model weight sharding),
+                # then the optimizer step will be applied to the main high-precision model weights. Update the model
+                # weights after the optimizer step.
+                self.model.param_and_grad_buffer.copy_main_weights_to_model_weights()
+
         return grad_norm
 
-
-        # if is_optim_step:
-        #     grad_params = []
-        #     for param in self.model.parameters():
-        #         if param.grad is not None:
-        #             param.grad.data.mul_(1/num_grad_acc_steps)
-        #             grad_params.append(param)
-        #     # TP does not support grad_clip yet
-        #     if (
-        #         isinstance(clip_norm, float)
-        #         and self.cfg.get("distributed.tp_size", 1) == 1
-        #     ):
-        #         torch.nn.utils.clip_grad_norm_(grad_params, clip_norm, foreach=True)
-
-        #     if isinstance(self.model, FSDP):
-        #         # If the model uses nvFSDP, wait for all sharded gradients to be reduced and unsharded.
-        #         # Necessary because the post-backward reduce-scatter is asynchronous, so gradients and backward
-        #         # computations are concurrent, but the gradients of the final layer may not be available yet.
-        #         self.model.finish_grad_sync()
-
-        #     self.optimizer.step()
-        #     self.optimizer.zero_grad()
-
-        #     if isinstance(self.model, FSDP) and self.model.ddp_config.preserve_fp32_weights:
-        #         # If custom FSDP2 is configured with "optim" (optimizer state / high-precision model weight sharding),
-        #         # then the optimizer step will be applied to the main high-precision model weights. Update the model
-        #         # weights after the optimizer step.
-        #         self.model.param_and_grad_buffer.copy_main_weights_to_model_weights()
-
-        # return loss.detach()
 
     @torch.no_grad()
     def _run_validation_epoch(self) -> float:
@@ -468,8 +439,13 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         Returns:
             Reporting loss.
         """
+        if self.device_mesh["context_parallel"].size() > 1:
+            dp_group = self.device_mesh["dp_cp"].get_group()
+        else:
+            dp_group = self.device_mesh["data_parallel"].get_group()
+
         total_loss, total_num_tokens = reduce_loss(
-            self.forward_data_store, self.total_num_tokens, per_token_loss=True
+            self.forward_data_store, self.total_num_tokens, per_token_loss=True, dp_group=dp_group
         )
         reporting_loss = (total_loss / total_num_tokens).item()
         grad_norm = grad_norm.item()
@@ -500,7 +476,7 @@ def main():
 
     Loads the configuration, sets up the trainer, and initiates the training loop.
     """
-    cfg = load_yaml_config("llama_3_2_1b_hellaswag.yaml")
+    cfg = load_yaml_config("llama_3_2_1b_hellaswag_nvfsdp.yaml")
     trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
