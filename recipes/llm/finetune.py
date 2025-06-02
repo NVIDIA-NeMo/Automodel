@@ -95,6 +95,7 @@ def build_dataloader(cfg_ds, cfg_dl, distributed_sampler_kwargs) -> DataLoader:
         cfg_ds: Dataset configuration.
         cfg_dl: DataLoader configuration.
         distributed_sampler_kwargs: Additional arguments for the DistributedSampler.
+
     Returns:
         The instantiated DataLoader.
     """
@@ -185,6 +186,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             distributed_sampler_kwargs = {
                 "num_replicas": self.model_wrapper.device_mesh["data_parallel"].size(),
                 "rank": self.model_wrapper.device_mesh["data_parallel"].get_local_rank(),
+                "shuffle": self.cfg.dataloader.get("shuffle", True),
             }
             if "shuffle" in self.cfg.dataloader:
                 del self.cfg.dataloader.shuffle
@@ -269,7 +271,6 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
                 # if self.dist_env.is_main and is_ckpt_step:
                 #     self._save_checkpoint()
-
                 if self.dist_env.is_main and is_optim_step:
                     print(
                         f"step {self.step_scheduler.step} | "
@@ -297,7 +298,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
 
     # ------------------ helpers ------------------
-    def _run_train_step(self, batch, is_optim_step, clip_norm=1.0, num_grad_acc_steps=10):
+    def _run_train_step(self, batch, is_optim_step, device_mesh, clip_norm=1.0):
         """
         Execute a single training step.
 
@@ -306,11 +307,15 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             is_optim_step: Flag indicating if a gradient step should be applied.
 
         Returns:
-            Detached loss from the training step.
+            Grad norm from the training step.
         """
+        self.model.train()
+
         batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
         labels = batch.pop("labels")
         loss_mask = batch.pop("loss_mask", None)
+        if loss_mask is None:
+            loss_mask = (labels.detach() != -100).to(torch.int)
 
         # TODO(@boxiangw): Refractor. Needed for SP support
         # If 'position_ids' does not exist in batch already then override it. batch in case of Packed sequence
@@ -363,39 +368,62 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         else:
             out  = self.model(**batch)
-            loss = self.loss_fn(out.logits.view(-1, out.logits.size(-1)),
-                                labels.view(-1), mask=loss_mask)
-        loss.backward()
+            local_loss = self.loss_fn(out.logits.view(-1, out.logits.size(-1)),
+                                labels.view(-1), mask=mask, reduction="sum")
+            local_num_tokens = mask.sum().detach().to(torch.int)
+            self.total_num_tokens += local_num_tokens
+            self.forward_data_store.append(local_loss.detach())
 
+        with get_sync_ctx(self.model, is_optim_step):
+            local_loss.backward()
+
+        grad_norm = None
         if is_optim_step:
-            grad_params = []
-            for param in self.model.parameters():
-                if param.grad is not None:
-                    param.grad.data.mul_(1/num_grad_acc_steps)
-                    grad_params.append(param)
-            # TP does not support grad_clip yet
-            if (
-                isinstance(clip_norm, float)
-                and self.cfg.get("distributed.tp_size", 1) == 1
-            ):
-                torch.nn.utils.clip_grad_norm_(grad_params, clip_norm, foreach=True)
+            rescale_gradients(
+                self.model,
+                self.total_num_tokens,
+                device_mesh["data_parallel"].get_group(),
+                device_mesh["data_parallel"].size()
+            )
 
-            if isinstance(self.model, FSDP):
-                # If the model uses nvFSDP, wait for all sharded gradients to be reduced and unsharded.
-                # Necessary because the post-backward reduce-scatter is asynchronous, so gradients and backward
-                # computations are concurrent, but the gradients of the final layer may not be available yet.
-                self.model.finish_grad_sync()
-
+            # Clip gradients **after** any rescaling.
+            if device_mesh["tensor_parallel"].size() == 1:
+                grad_norm = clip_gradients(self.model, clip_norm)
             self.optimizer.step()
             self.optimizer.zero_grad()
 
-            if isinstance(self.model, FSDP) and self.model.ddp_config.preserve_fp32_weights:
-                # If custom FSDP2 is configured with "optim" (optimizer state / high-precision model weight sharding),
-                # then the optimizer step will be applied to the main high-precision model weights. Update the model
-                # weights after the optimizer step.
-                self.model.param_and_grad_buffer.copy_main_weights_to_model_weights()
+        return grad_norm
 
-        return loss.detach()
+
+        # if is_optim_step:
+        #     grad_params = []
+        #     for param in self.model.parameters():
+        #         if param.grad is not None:
+        #             param.grad.data.mul_(1/num_grad_acc_steps)
+        #             grad_params.append(param)
+        #     # TP does not support grad_clip yet
+        #     if (
+        #         isinstance(clip_norm, float)
+        #         and self.cfg.get("distributed.tp_size", 1) == 1
+        #     ):
+        #         torch.nn.utils.clip_grad_norm_(grad_params, clip_norm, foreach=True)
+
+        #     if isinstance(self.model, FSDP):
+        #         # If the model uses nvFSDP, wait for all sharded gradients to be reduced and unsharded.
+        #         # Necessary because the post-backward reduce-scatter is asynchronous, so gradients and backward
+        #         # computations are concurrent, but the gradients of the final layer may not be available yet.
+        #         self.model.finish_grad_sync()
+
+        #     self.optimizer.step()
+        #     self.optimizer.zero_grad()
+
+        #     if isinstance(self.model, FSDP) and self.model.ddp_config.preserve_fp32_weights:
+        #         # If custom FSDP2 is configured with "optim" (optimizer state / high-precision model weight sharding),
+        #         # then the optimizer step will be applied to the main high-precision model weights. Update the model
+        #         # weights after the optimizer step.
+        #         self.model.param_and_grad_buffer.copy_main_weights_to_model_weights()
+
+        # return loss.detach()
 
     @torch.no_grad()
     def _run_validation_epoch(self) -> float:
