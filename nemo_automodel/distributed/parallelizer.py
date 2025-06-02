@@ -89,12 +89,11 @@ def fsdp2_strategy_parallelize(
     if dp_mesh.size() > 1:
         assert dp_mesh.ndim == 1, "Hybrid-sharding not supported"
 
-    if "tensor_parallel" in device_mesh.mesh_dim_names:
-        tp_mesh = device_mesh["tensor_parallel"]
-        # TP sharding
-        if tp_mesh.size() > 1:
-            assert tp_shard_plan is not None
-            parallelize_module(model, tp_mesh, tp_shard_plan)
+    tp_mesh = device_mesh["tensor_parallel"]
+    # TP sharding
+    if tp_mesh.size() > 1:
+        assert tp_shard_plan is not None
+        parallelize_module(model, tp_mesh, tp_shard_plan)
 
     # FSDP sharding
     assert dp_mesh.ndim == 1, "Hybrid-sharding not supported"

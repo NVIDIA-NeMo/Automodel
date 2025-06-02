@@ -384,6 +384,9 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # TODO(@boxiangw): Fix TP gradient clipping
             if self.device_mesh["tensor_parallel"].size() == 1:
                 grad_norm = clip_gradients(self.model, clip_norm)
+            else:
+                # TODO: TP WAR
+                grad_norm = 0.
 
             if isinstance(self.model, FSDP):
                 # If the model uses nvFSDP, wait for all sharded gradients to be reduced and unsharded.
@@ -414,19 +417,28 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         for batch in self.val_dataloader:
             batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
             labels = batch.pop("labels")
-            mask = batch.pop("loss_mask", None)
-            if mask is None:
-                mask = (labels.detach() != -100).to(torch.int)
+            loss_mask = batch.pop("loss_mask", None)
+            if loss_mask is None:
+                loss_mask = (labels.detach() != -100).to(torch.int)
+            
+            if (
+                'position_ids' not in batch and
+                (
+                    self.device_mesh["context_parallel"].size() > 1 or
+                    self.device_mesh["tensor_parallel"].size() > 1
+                )
+            ):
+                batch["position_ids"] = torch.arange(0, batch['input_ids'].shape[1]).unsqueeze(0).to(self.model.device)
 
             out = self.model(**batch)
             local_loss = self.loss_fn(
                 out.logits.view(-1, out.logits.size(-1)),
                 labels.view(-1),
-                mask=mask,
+                mask=loss_mask,
                 reduction="sum"
             )
             total_loss += local_loss.item()
-            total_tokens += mask.sum().item()
+            total_tokens += loss_mask.sum().item()
 
         # Aggregate across ranks if distributed is initialized
         if dist.is_initialized():
@@ -455,7 +467,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.forward_data_store, self.total_num_tokens, per_token_loss=True, dp_group=dp_group
         )
         reporting_loss = (total_loss / total_num_tokens).item()
-        grad_norm = grad_norm.item()
+        grad_norm = grad_norm.item() if not isinstance(grad_norm, float) else grad_norm # TP WAR
         self.total_num_tokens.zero_()
         self.forward_data_store = []
         log_data = {
