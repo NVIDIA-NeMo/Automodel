@@ -21,6 +21,22 @@ from nemo_automodel.shared.import_utils import safe_import
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import('liger_kernel.transformers')
 logger = logging.getLogger(__name__)
 
+
+def patch_attention(obj, sdap_method=None):
+    if sdap_method is None:
+        sdap_method = [
+                SDPBackend.CUDNN_ATTENTION,
+                SDPBackend.FLASH_ATTENTION,
+                SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.MATH,
+            ]
+    orig_forward = obj.forward
+    def patched_forward(self, *args, **kwargs):
+        with sdap_kernel(sdap_method):
+            return orig_forward(*args, **kwargs)
+    obj.forward = patched_forward
+    return obj
+
 class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
     """
     Drop-in replacement for ``transformers.AutoModelForCausalLM`` that can
@@ -85,6 +101,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
         ``use_liger_kernel=False``.
         """
         use_liger_kernel = kwargs.pop('use_liger_kernel', True)
+        sdap_method = kwargs.pop('sdap_method', None)
         ans = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
         if use_liger_kernel:
             if not HAS_LIGER_KERNEL:
@@ -97,6 +114,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
                 # If patching failed, retry
                 return cls.from_pretrained(
                     pretrained_model_name_or_path, *model_args, **kwargs, use_liger_kernel=False)
+        ans = patch_attention(ans, sdap_method)
         return ans
 
 
@@ -127,6 +145,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
         loading.
         """
         use_liger_kernel = kwargs.pop('use_liger_kernel', True)
+        sdap_method = kwargs.pop('sdap_method', None)
         ans = super().from_config(config, **kwargs)
         if use_liger_kernel:
             if not HAS_LIGER_KERNEL:
@@ -138,4 +157,5 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
                 del ans
                 # If patching failed, retry
                 return cls.from_config(config, **kwargs, use_liger_kernel=False)
+        ans = patch_attention(ans, sdap_method)
         return ans
