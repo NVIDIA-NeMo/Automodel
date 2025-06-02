@@ -18,6 +18,7 @@ from transformers import AutoModelForCausalLM
 from nemo_automodel.package_info import __version__
 
 from nemo_automodel.shared.import_utils import safe_import
+from torch.nn.attention import sdpa_kernel, SDPBackend
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import('liger_kernel.transformers')
 logger = logging.getLogger(__name__)
 
