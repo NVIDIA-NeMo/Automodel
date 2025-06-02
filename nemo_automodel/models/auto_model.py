@@ -13,11 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+
 from transformers import AutoModelForCausalLM
 
 from nemo_automodel.shared.import_utils import safe_import
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import('liger_kernel.transformers')
-
+logger = logging.getLogger(__name__)
 
 class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
     """
@@ -90,7 +92,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
                 return ans
             try:
                 liger_kernel_trf._apply_liger_kernel_to_instance(model=ans)
-            except Exception as e:
+            except Exception:
                 del ans
                 # If patching failed, retry
                 return cls.from_pretrained(
@@ -132,7 +134,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
                 return ans
             try:
                 liger_kernel_trf._apply_liger_kernel_to_instance(model=ans)
-            except Exception as e:
+            except Exception:
                 del ans
                 # If patching failed, retry
                 return cls.from_config(config, **kwargs, use_liger_kernel=False)
