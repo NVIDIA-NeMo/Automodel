@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import types
 
 from transformers import AutoModelForCausalLM
 from nemo_automodel.package_info import __version__
@@ -39,16 +40,16 @@ def patch_attention(obj, sdpa_method=None):
     """
     if sdpa_method is None:
         sdpa_method = [
-                SDPBackend.CUDNN_ATTENTION,
-                SDPBackend.FLASH_ATTENTION,
-                SDPBackend.EFFICIENT_ATTENTION,
-                SDPBackend.MATH,
-            ]
+            SDPBackend.CUDNN_ATTENTION,
+            SDPBackend.FLASH_ATTENTION,
+            SDPBackend.EFFICIENT_ATTENTION,
+            SDPBackend.MATH,
+        ]
     orig_forward = obj.forward
     def patched_forward(self, *args, **kwargs):
         with sdpa_kernel(sdpa_method):
             return orig_forward(*args, **kwargs)
-    obj.forward = patched_forward
+    obj.forward = types.MethodType(patched_forward, obj)
     return obj
 
 class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
