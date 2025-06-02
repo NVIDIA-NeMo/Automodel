@@ -309,7 +309,13 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # TODO(@boxiangw): Refractor. Needed for SP support
         # If 'position_ids' does not exist in batch already then override it. batch in case of Packed sequence
         # contains 'position_ids' and we don't want to override it.
-        if 'position_ids' not in batch and (self.device_mesh["context_parallel"].size() > 1 or self.device_mesh["tensor_parallel"].size() > 1):
+        if (
+            'position_ids' not in batch and
+            (
+                self.device_mesh["context_parallel"].size() > 1 or
+                self.device_mesh["tensor_parallel"].size() > 1
+            )
+        ):
             batch["position_ids"] = torch.arange(0, batch['input_ids'].shape[1]).unsqueeze(0).to(self.model.device)
 
         # based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/train.py#L336
