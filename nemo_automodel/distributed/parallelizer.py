@@ -17,7 +17,7 @@ from torch.distributed.tensor.parallel import (
 )
 
 # TODO(boxiangw): Change to nvFSDP once it got published
-from nemo_automodel.distributed.nvfsdp.fsdp import FSDP
+from nemo_automodel.distributed.nvfsdp.nvfsdp import nvFSDP
 from nemo_automodel.distributed.nvfsdp.distributed_data_parallel_config import (
     DistributedDataParallelConfig,
 )
@@ -193,7 +193,7 @@ def nvfsdp_strategy_parallelize(
     nvfsdp_unit_modules = import_classes_from_paths(nvfsdp_unit_modules)
 
     # Wrap model with nvFSDP.
-    model = FSDP(
+    model = nvFSDP(
         ddp_config=nvfsdp_config,
         module=model,
         fsdp_unit_modules=nvfsdp_unit_modules,
