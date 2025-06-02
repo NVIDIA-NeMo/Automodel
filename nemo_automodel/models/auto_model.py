@@ -23,6 +23,19 @@ logger = logging.getLogger(__name__)
 
 
 def patch_attention(obj, sdap_method=None):
+    """
+    Wrap the `forward` method of `obj` in an `sdap_kernel` context to
+    enable a sequence of SDP attention backends.
+
+    Args:
+        obj: Any object with a `.forward(*args, **kwargs)` method.
+        sdap_method (list[SDPBackend], optional): Ordered list of SDPBackend
+            implementations to attempt. If None, defaults to
+            [CUDNN_ATTENTION, FLASH_ATTENTION, EFFICIENT_ATTENTION, MATH].
+
+    Returns:
+        The same `obj` with its `.forward` method patched.
+    """
     if sdap_method is None:
         sdap_method = [
                 SDPBackend.CUDNN_ATTENTION,
