@@ -1,4 +1,3 @@
-
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +15,7 @@
 import logging
 
 from transformers import AutoModelForCausalLM
+from nemo_automodel.package_info import __version__
 
 from nemo_automodel.shared.import_utils import safe_import
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import('liger_kernel.transformers')
@@ -102,20 +102,21 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
         """
         use_liger_kernel = kwargs.pop('use_liger_kernel', True)
         sdap_method = kwargs.pop('sdap_method', None)
-        ans = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
         if use_liger_kernel:
             if not HAS_LIGER_KERNEL:
                 logging.warning("Asked to use Liger Kernel, but could not import")
-                return ans
+                return model
             try:
-                liger_kernel_trf._apply_liger_kernel_to_instance(model=ans)
+                liger_kernel_trf._apply_liger_kernel_to_instance(model=model)
             except Exception:
-                del ans
+                del model
                 # If patching failed, retry
                 return cls.from_pretrained(
                     pretrained_model_name_or_path, *model_args, **kwargs, use_liger_kernel=False)
-        ans = patch_attention(ans, sdap_method)
-        return ans
+        model = patch_attention(model, sdap_method)
+        model.config.update({"nemo_version" : __version__})
+        return model
 
 
     @classmethod
@@ -146,16 +147,17 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
         """
         use_liger_kernel = kwargs.pop('use_liger_kernel', True)
         sdap_method = kwargs.pop('sdap_method', None)
-        ans = super().from_config(config, **kwargs)
+        model = super().from_config(config, **kwargs)
         if use_liger_kernel:
             if not HAS_LIGER_KERNEL:
                 logging.warning("Asked to use Liger Kernel, but could not import")
-                return ans
+                return model
             try:
-                liger_kernel_trf._apply_liger_kernel_to_instance(model=ans)
+                liger_kernel_trf._apply_liger_kernel_to_instance(model=model)
             except Exception:
-                del ans
+                del model
                 # If patching failed, retry
                 return cls.from_config(config, **kwargs, use_liger_kernel=False)
-        ans = patch_attention(ans, sdap_method)
-        return ans
+        model = patch_attention(model, sdap_method)
+        model.config.update({"nemo_version" : __version__})
+        return model
