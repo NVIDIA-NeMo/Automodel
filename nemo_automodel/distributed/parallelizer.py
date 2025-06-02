@@ -1,4 +1,5 @@
 import contextlib
+import importlib
 import signal
 from functools import lru_cache
 from typing import Dict, Generator, List, Optional, Set, Union
@@ -8,17 +9,30 @@ from torch import Tensor, nn
 from torch.distributed._tensor import DTensor, Replicate
 from torch.distributed.device_mesh import DeviceMesh, _mesh_resources
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully_shard
-from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, SequenceParallel, parallelize_module
+from torch.distributed.tensor.parallel import (
+    ColwiseParallel,
+    RowwiseParallel,
+    SequenceParallel,
+    parallelize_module,
+)
+
+# TODO(boxiangw): Change to nvFSDP once it got published
+from nemo_automodel.distributed.nvfsdp.nvfsdp import nvFSDP
+from nemo_automodel.distributed.nvfsdp.distributed_data_parallel_config import (
+    DistributedDataParallelConfig,
+)
 
 
 # Taken and modified from torchtitan
 # https://github.com/pytorch/torchtitan/blob/main/torchtitan/parallelisms/parallelize_llama.py
 def fsdp2_strategy_parallelize(
     model,
-    device_mesh: DeviceMesh = None,
+    device_mesh: DeviceMesh,
     mp_policy: MixedPrecisionPolicy = None,
-    tp_shard_plan: Optional[Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]] = None,
-    offload_policy: 'CPUOffloadPolicy' = None,
+    tp_shard_plan: Optional[
+        Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]
+    ] = None,
+    offload_policy: "CPUOffloadPolicy" = None,
 ):
     """Apply parallelisms and activation checkpointing to the model.
 
@@ -39,7 +53,9 @@ def fsdp2_strategy_parallelize(
     """
 
     if not mp_policy:
-        mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+        )
 
     def parallelize_helper(module, mesh, mp_policy):
         if isinstance(module, nn.ModuleList):
@@ -63,15 +79,17 @@ def fsdp2_strategy_parallelize(
 
     # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
     dp_mesh = device_mesh[
-        ("dp_cp" if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(device_mesh, {}) else "data_parallel")
+        (
+            "dp_cp"
+            if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(device_mesh, {})
+            else "data_parallel"
+        )
     ]
-    # print(dir(device_mesh))
-    # print(device_mesh.mesh_dim_names)
-    # quit()
+
     if dp_mesh.size() > 1:
         assert dp_mesh.ndim == 1, "Hybrid-sharding not supported"
 
-    if 'tensor_parallel' in device_mesh.mesh_dim_names:
+    if "tensor_parallel" in device_mesh.mesh_dim_names:
         tp_mesh = device_mesh["tensor_parallel"]
         # TP sharding
         if tp_mesh.size() > 1:
@@ -87,7 +105,99 @@ def fsdp2_strategy_parallelize(
     # reshard_after_forward=True based on
     # https://github.com/pytorch/torchtitan/blob/main/torchtitan/parallelisms/parallelize_llama.py#L359
     model = fully_shard(
-        model, mesh=dp_mesh, mp_policy=mp_policy, reshard_after_forward=True, offload_policy=offload_policy
+        model,
+        mesh=dp_mesh,
+        mp_policy=mp_policy,
+        reshard_after_forward=True,
+        offload_policy=offload_policy,
+    )
+
+    return model
+
+
+def import_classes_from_paths(class_paths: List[str]):
+    """
+    Helper function to import classes from string paths.
+
+    Args:
+        class_paths (List[str]): The list of string paths to the classes.
+    """
+    classes = []
+    for path in class_paths:
+        module_path, class_name = path.rsplit(".", 1)
+        module = importlib.import_module(module_path)
+        cls = getattr(module, class_name)
+        classes.append(cls)
+    return classes
+
+
+def nvfsdp_strategy_parallelize(
+    model,
+    device_mesh: DeviceMesh,
+    nvfsdp_config: Optional[DistributedDataParallelConfig] = None,
+    nvfsdp_unit_modules: Optional[List[str]] = None,
+    init_nvfsdp_with_meta_device: bool = False,
+    tp_shard_plan: Optional[
+        Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]
+    ] = None,
+):
+    """Apply parallelisms and activation checkpointing to the model.
+
+    Args:
+        model: The model to be parallelized.
+        device_mesh (DeviceMesh): The device mesh for distributed training.
+        nvfsdp_config (DistributedDataParallelConfig): The distributed data parallel config.
+        nvfsdp_unit_modules (Optional[List[str]]): The nvFSDP unit modules.
+        init_nvfsdp_with_meta_device (bool): Whether to initialize the model with meta device.
+        tp_shard_plan (Optional[Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]]):
+            A tensor parallel sharding plan. The keys should be the module names and the values should be the
+            corresponding parallel styles (e.g., RowwiseParallel, ColwiseParallel, SequenceParallel).
+    NOTE: The passed-in model preferably should be on meta device. Otherwise,
+    the model must fit on GPU or CPU memory.
+    NOTE: Currently, the user should make sure that custom_tp_plan is compatible with the model architecture.
+    """
+
+    # DP_CP ranks are sharded by FSDP.
+    dp_mesh = device_mesh[
+        (
+            "dp_cp"
+            if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(device_mesh, {})
+            else "data_parallel"
+        )
+    ]
+    tp_mesh = device_mesh["tensor_parallel"]
+
+    if dp_mesh.size() > 1:
+        # TODO(boxiangw): remove this once HSDP is supported.
+        assert dp_mesh.ndim == 1, "Hybrid-sharding not supported"
+
+    # TP sharding.
+    if tp_mesh.size() > 1:
+        parallelize_module(model, tp_mesh, tp_shard_plan)
+
+    if nvfsdp_config is None:
+        # Default DDP config for nvFSDP.
+        # data_parallel_sharding_strategy="optim_grads_params" is required to shard the parameters. (ZeRO-3)
+        nvfsdp_config = DistributedDataParallelConfig(
+            check_for_nan_in_grad=True,
+            data_parallel_sharding_strategy="optim_grads_params",
+            grad_reduce_in_fp32=True,
+            overlap_grad_reduce=True,
+            overlap_param_gather=True,
+            average_in_collective=False,
+        )
+
+    # Import nvFSDP unit modules specified by the user.
+    nvfsdp_unit_modules = import_classes_from_paths(nvfsdp_unit_modules)
+
+    # Wrap model with nvFSDP.
+    model = nvFSDP(
+        ddp_config=nvfsdp_config,
+        module=model,
+        fsdp_unit_modules=nvfsdp_unit_modules,
+        dp_cp_group=dp_mesh.get_group(),
+        calculate_per_token_loss=False,
+        init_model_with_meta_device=init_nvfsdp_with_meta_device,
     )
 
     return model
@@ -98,12 +208,16 @@ def get_hf_tp_shard_plan(model):
     Get the tensor parallel sharding plan from the model.
     """
     hf_tp_shard_plan = {}
-    if hasattr(model, '_tp_plan') and model._tp_plan is not None:
+    if hasattr(model, "_tp_plan") and model._tp_plan is not None:
         hf_tp_shard_plan.update(model._tp_plan)
-    if hasattr(model.model, '_tp_plan') and model.model._tp_plan is not None:
-        hf_tp_shard_plan.update({f"model.{k}": v for k, v in model.model._tp_plan.items()})
+    if hasattr(model.model, "_tp_plan") and model.model._tp_plan is not None:
+        hf_tp_shard_plan.update(
+            {f"model.{k}": v for k, v in model.model._tp_plan.items()}
+        )
 
-    hf_tp_shard_plan = {k: translate_to_torch_parallel_style(v) for k, v in hf_tp_shard_plan.items()}
+    hf_tp_shard_plan = {
+        k: translate_to_torch_parallel_style(v) for k, v in hf_tp_shard_plan.items()
+    }
     return hf_tp_shard_plan
 
 
@@ -229,14 +343,20 @@ def get_train_context(enable_loss_parallel: bool, enable_compiled_autograd: bool
                 stack.enter_context(torch.distributed.tensor.parallel.loss_parallel())
 
             if enable_compiled_autograd:
-                stack.enter_context(torch._dynamo.utils.maybe_enable_compiled_autograd(True))
+                stack.enter_context(
+                    torch._dynamo.utils.maybe_enable_compiled_autograd(True)
+                )
 
             if cp_context is not None:
                 from torch.nn.attention import SDPBackend, sdpa_kernel
 
                 # currently we only support these two SDP backends.
                 # TODO (xilunwu): support cuDNN backend
-                stack.enter_context(sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]))
+                stack.enter_context(
+                    sdpa_kernel(
+                        [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+                    )
+                )
                 stack.enter_context(cp_context)
 
             yield

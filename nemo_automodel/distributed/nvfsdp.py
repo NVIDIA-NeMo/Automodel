@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List
 
 import torch
 import torch.distributed as dist
@@ -8,20 +8,21 @@ from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     RowwiseParallel,
-    SequenceParallel,
 )
-from torch.distributed.tensor.placement_types import Replicate, Shard
 
+from nemo_automodel.distributed.nvfsdp.distributed_data_parallel_config import (
+    DistributedDataParallelConfig,
+)
 from nemo_automodel.distributed.parallelizer import (
-    fsdp2_strategy_parallelize,
     get_hf_tp_shard_plan,
+    nvfsdp_strategy_parallelize,
 )
 
 
 @dataclass
-class FSDP2Manager:
+class NVFSDPManager:
     """
-    Manager for setting up and parallelizing models using FSDP2 with Tensor-Parallel,
+    Manager for setting up and parallelizing models using nvFSDP with Tensor-Parallel,
     Data-Parallel, and Context-Parallel sharding strategies.
 
     This manager initializes the torch.distributed process group, infers the group sizes
@@ -66,7 +67,9 @@ class FSDP2Manager:
     )
     sequence_parallel: Optional[bool] = field(
         default=False,
-        metadata={"help": "Enable sequence parallelism in TP plan if True."},
+        metadata={
+            "help": "Enable sequence parallelism in TP plan if True. Not supported with nvFSDP right now."
+        },
     )
     mp_policy: Optional[MixedPrecisionPolicy] = field(
         default=MixedPrecisionPolicy(
@@ -92,6 +95,40 @@ class FSDP2Manager:
         default=None,
         # init=False,
         metadata={"help": "Total number of processes."},
+    )
+    nvfsdp_unit_modules: Optional[List[str]] = field(
+        default_factory=lambda: [
+            "transformers.models.llama.modeling_llama.LlamaDecoderLayer",
+        ],
+        metadata={"help": "List of unit modules to be wrapped with nvFSDP."},
+    )
+    init_nvfsdp_with_meta_device: Optional[bool] = field(
+        default=False, metadata={"help": "Initialize nvFSDP with meta device if True."}
+    )
+    # TODO(boxiangw): rename this after nvFSDP is published
+
+    # nvfsdp_config configs
+    check_for_nan_in_grad: Optional[bool] = field(
+        default=True, metadata={"help": "Check for NaN in gradients if True."}
+    )
+    data_parallel_sharding_strategy: Optional[str] = field(
+        default="optim_grads_params",
+        metadata={"help": "Data parallel sharding strategy."},
+    )
+    grad_reduce_in_fp32: Optional[bool] = field(
+        default=False, metadata={"help": "Reduce gradients in fp32 if True."}
+    )
+    preserve_fp32_weights: Optional[bool] = field(
+        default=False, metadata={"help": "Preserve fp32 weights if True."}
+    )
+    overlap_grad_reduce: Optional[bool] = field(
+        default=True, metadata={"help": "Overlap gradient reduction if True."}
+    )
+    overlap_param_gather: Optional[bool] = field(
+        default=True, metadata={"help": "Overlap parameter gathering if True."}
+    )
+    average_in_collective: Optional[bool] = field(
+        default=False, metadata={"help": "Average in collective if True."}
     )
 
     def __post_init__(self):
@@ -167,12 +204,29 @@ class FSDP2Manager:
         Raises:
             NotImplemented: If the required TP sharding plan is not supported.
         """
+        if self.data_parallel_sharding_strategy != "optim_grads_params":
+            if self.device_mesh.get_rank() == 0:
+                print(
+                    "Warning: nvFSDP data_parallel_sharding_strategy is not optim_grads_params. "
+                    "Parameters will not be sharded."
+                )
+
+        # TODO(boxiangw): any other configs necessary?
+        nvfsdp_config = DistributedDataParallelConfig(
+            check_for_nan_in_grad=self.check_for_nan_in_grad,
+            data_parallel_sharding_strategy=self.data_parallel_sharding_strategy,
+            grad_reduce_in_fp32=self.grad_reduce_in_fp32,
+            preserve_fp32_weights=self.preserve_fp32_weights,
+            overlap_grad_reduce=self.overlap_grad_reduce,
+            overlap_param_gather=self.overlap_param_gather,
+            average_in_collective=self.average_in_collective,
+        )
+
         if use_hf_tp_plan:
             tp_shard_plan = get_hf_tp_shard_plan(model)
         else:
             # Parallelize the first embedding and the last linear out projection
             base_model_tp_plan = {
-                "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
                 "model.layers.*.self_attn.q_proj": ColwiseParallel(),
                 "model.layers.*.self_attn.k_proj": ColwiseParallel(),
                 "model.layers.*.self_attn.v_proj": ColwiseParallel(),
@@ -180,44 +234,29 @@ class FSDP2Manager:
                 "model.layers.*.mlp.up_proj": ColwiseParallel(),
                 "model.layers.*.mlp.gate_proj": ColwiseParallel(),
                 "model.layers.*.mlp.down_proj": RowwiseParallel(),
-                "lm_head": ColwiseParallel(output_layouts=Replicate()),
             }
 
-            base_model_sp_plan = {
-                "model.embed_tokens": RowwiseParallel(
-                    input_layouts=Replicate(), output_layouts=Shard(1)
-                ),
-                "model.norm": SequenceParallel(),
-                "model.layers.*.input_layernorm": SequenceParallel(),
-                "model.layers.*.self_attn.o_proj": RowwiseParallel(
-                    output_layouts=Shard(1)
-                ),
-                "model.layers.*.post_attention_layernorm": SequenceParallel(),
-                "model.layers.*.mlp.down_proj": RowwiseParallel(
-                    output_layouts=Shard(1)
-                ),
-                "lm_head": ColwiseParallel(
-                    input_layouts=Shard(1), output_layouts=Replicate()
-                ),
-            }
-
-            if self.sequence_parallel:
-                # Enable sequence parallelism only if TP size > 1
-                base_model_tp_plan.update(base_model_sp_plan)
+            # TODO(boxiangw): investigate SP
+            if self.sequence_parallel and self.device_mesh.get_rank() == 0:
+                # TODO(boxiangw): Change this to a log
+                print(
+                    "Sequence parallelism is disabled. It is not compatible with nvFSDP."
+                )
 
             tp_shard_plan = base_model_tp_plan
-
             # TODO(boxiangw): Change this to a log
             if self.device_mesh.get_rank() == 0:
                 print(
                     "Using default TP plan for parallelization. It is compatible with huggingface llama3-style models."
                 )
 
-        fsdp2_strategy_parallelize(
+        model = nvfsdp_strategy_parallelize(
             model,
             device_mesh=self.device_mesh,
-            mp_policy=self.mp_policy,
+            nvfsdp_config=nvfsdp_config,
+            nvfsdp_unit_modules=self.nvfsdp_unit_modules,
+            init_nvfsdp_with_meta_device=self.init_nvfsdp_with_meta_device,
             tp_shard_plan=tp_shard_plan,
-            offload_policy=self.offload_policy,
         )
+
         return model

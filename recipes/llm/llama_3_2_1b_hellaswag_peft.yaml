@@ -17,11 +17,19 @@ model:
   _target_: transformers.AutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
 
+peft:
+  peft_fn: nemo_automodel._peft.lora.apply_lora_to_linear_modules
+  match_all_linear: True
+  dim: 8
+  alpha: 32
+  # dtype needs a fix to resolve to type instead of string
+  # lora_dtype: torch.bfloat16
+
 distributed:
   _target_: nemo_automodel.distributed.fsdp2.FSDP2Manager
-  dp_size: 8
-  tp_size: 1
-  cp_size: 1
+  dp_size: 2
+  tp_size: 2
+  cp_size: 2
   sequence_parallel: false
 
 loss_fn: nemo_automodel.loss.masked_ce.masked_cross_entropy
