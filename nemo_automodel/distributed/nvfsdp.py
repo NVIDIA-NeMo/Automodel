@@ -207,7 +207,8 @@ class NVFSDPManager:
         if self.data_parallel_sharding_strategy != "optim_grads_params":
             if self.device_mesh.get_rank() == 0:
                 print(
-                    "Warning: nvFSDP data_parallel_sharding_strategy is not optim_grads_params. Parameters will not be sharded."
+                    "Warning: nvFSDP data_parallel_sharding_strategy is not optim_grads_params. "
+                    "Parameters will not be sharded."
                 )
 
         # TODO(boxiangw): any other configs necessary?
