@@ -27,7 +27,7 @@ peft:
 
 distributed:
   _target_: nemo_automodel.distributed.fsdp2.FSDP2Manager
-  dp_size: 1
+  dp_size: 8
   tp_size: 1
   cp_size: 1
   sequence_parallel: false
