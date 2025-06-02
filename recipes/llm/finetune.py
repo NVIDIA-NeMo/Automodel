@@ -8,12 +8,12 @@ from torch.utils.data import DataLoader
 
 from megatron.core.distributed.custom_fsdp import FSDP
 
-
 from nemo_automodel.config.loader import load_yaml_config
 from nemo_automodel.distributed.init_utils import initialize_distributed
 from nemo_automodel.distributed.parallelizer import create_context_parallel_ctx, get_train_context
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.step_scheduler import StepScheduler
+from nemo_automodel.utils.dist_utils import reduce_loss, get_sync_ctx, rescale_gradients, clip_gradients
 
 # ---------------------------
 #  Stateless helper functions
@@ -49,7 +49,7 @@ def build_model(device, cfg_model, cfg_peft, model_wrapper) -> nn.Module:
     else:
         return model.to(device)
 
-def build_optimizer(device, cfg_opt, model, tp_size) -> 'Optimizer':  # noqa: F821
+def build_optimizer(cfg_opt, model, tp_size) -> 'Optimizer':  # noqa: F821
     """
     Build an optimizer for the model.
 
@@ -331,6 +331,71 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 self.model.param_and_grad_buffer.copy_main_weights_to_model_weights()
 
         return loss.detach()
+
+    @torch.no_grad()
+    def _run_validation_epoch(self) -> float:
+        """Run one pass over `self.val_dataloader` and return average loss per token."""
+        self.model.eval()
+
+        total_loss = 0.0
+        total_tokens = 0
+
+        for batch in self.val_dataloader:
+            batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
+            labels = batch.pop("labels")
+            mask = batch.pop("loss_mask", None)
+            if mask is None:
+                mask = (labels.detach() != -100).to(torch.int)
+
+            out = self.model(**batch)
+            local_loss = self.loss_fn(
+                out.logits.view(-1, out.logits.size(-1)),
+                labels.view(-1),
+                mask=mask,
+                reduction="sum"
+            )
+            total_loss += local_loss.item()
+            total_tokens += mask.sum().item()
+
+        # Aggregate across ranks if distributed is initialized
+        if dist.is_initialized():
+            tensor = torch.tensor([total_loss, total_tokens], device=self.dist_env.device)
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            total_loss, total_tokens = tensor.tolist()
+
+        return total_loss / max(total_tokens, 1e-8)
+
+    def log_train_metrics(self, grad_norm):
+        """
+        Log metrics to wandb.
+
+        Args:
+            grad_norm: Grad norm from the training step.
+
+        Returns:
+            Reporting loss.
+        """
+        total_loss, total_num_tokens = reduce_loss(
+            self.forward_data_store, self.total_num_tokens, per_token_loss=True
+        )
+        reporting_loss = (total_loss / total_num_tokens).item()
+        grad_norm = grad_norm.item()
+        self.total_num_tokens.zero_()
+        self.forward_data_store = []
+        log_data = {
+            "train_loss": reporting_loss,
+            "loss_sum": total_loss,
+            "step": self.step_scheduler.step,
+            "epoch": self.step_scheduler.epoch,
+            "grad_norm": grad_norm,
+            "num_tokens_per_step": total_num_tokens,
+        }
+        if self.optimizer.param_groups:
+            log_data["learning_rate"] = self.optimizer.param_groups[0]['lr']
+
+        if wandb.run is not None:
+            wandb.log(log_data)
+        return reporting_loss
 
 # ---------------------------------------------------------------------------
 # Entry point
