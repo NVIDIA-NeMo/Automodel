@@ -23,6 +23,9 @@
 import os
 import sys
 
+# flake8: noqa
+# pylint: skip-file
+
 project = "NeMo-AutoModel"
 copyright = "2025, NVIDIA Corporation"
 author = "NVIDIA Corporation"

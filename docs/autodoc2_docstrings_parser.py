@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# flake8: noqa
+# pylint: skip-file
 from docutils import nodes
 from myst_parser.parsers.sphinx_ import MystParser
 from sphinx.ext.napoleon.docstring import GoogleDocstring
