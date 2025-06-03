@@ -109,7 +109,15 @@ class ConfigNode:
         elif isinstance(v, list):
             return [self._instantiate_value(i) for i in v]
         else:
-            return v
+            special_values = {
+                'none': None,
+                'None': None,
+                'true': True,
+                'True': True,
+                'false': False,
+                'False': False,
+            }
+            return special_values.get(v, v)
 
     def _resolve_target(self, dotted_path):
         """
