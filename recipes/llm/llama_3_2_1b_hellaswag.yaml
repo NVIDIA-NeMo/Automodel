@@ -14,12 +14,12 @@ rng:
   ranked: true
 
 model:
-  _target_: transformers.AutoModelForCausalLM.from_pretrained
+  _target_: nemo_automodel.transformers.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
 
 distributed:
   _target_: nemo_automodel.distributed.fsdp2.FSDP2Manager
-  dp_size: 8
+  dp_size: none
   tp_size: 1
   cp_size: 1
   sequence_parallel: false
