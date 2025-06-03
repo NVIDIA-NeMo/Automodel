@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import wandb
+from wandb import Settings
+from nemo_automodel.loggers.wandb_utils import suppress_wandb_log_messages
+
 import torch.distributed as dist
 from typing import Any, Dict
 
@@ -196,13 +199,16 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         torch.manual_seed(self.cfg.get("seed", 42) + self.dist_env.rank)
 
         if self.dist_env.is_main and hasattr(self.cfg, 'logger'):
-            wandb.init(
+            suppress_wandb_log_messages()
+            run = wandb.init(
                 project=self.cfg.logger.get("wandb_project", "default_project"),
                 entity=self.cfg.logger.get("wandb_entity"),
                 name=self.cfg.logger.get("wandb_exp_name"),
                 dir=self.cfg.logger.get("wandb_save_dir"),
                 config=self.cfg,
+                settings=Settings(silent=True),
             )
+            print("🚀 View run at {}".format(run.url))
 
         # Build components
         self.model = build_model(self.dist_env.device, self.cfg.model, self.cfg.get('peft', None), self.model_wrapper)
