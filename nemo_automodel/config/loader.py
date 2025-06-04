@@ -1,6 +1,4 @@
-# config_loader.py
 import yaml
-import importlib
 from functools import reduce
 import os
 import importlib
@@ -42,16 +40,16 @@ class ConfigNode:
             return ConfigNode(v)
         elif isinstance(v, list):
             return [self._wrap('', i) for i in v]
-        elif k.endswith('_fn'):
-            return self._resolve_target(v)
         elif isinstance(v, (int, float)):
             return v
-        elif v.isdigit():
+        elif isinstance(v, str) and v.isdigit():
             return int(v)
         else:
             try:
+                # try float conversion
                 return float(v)
-            except ValueError:
+            except Exception:
+                # leave strings alone (including _fn and _target_)
                 return v
 
     def instantiate(self, *args, **kwargs):
@@ -73,24 +71,21 @@ class ConfigNode:
         """
         if not hasattr(self, "_target_"):
             raise AttributeError("No _target_ found to instantiate")
-
-        target = self._target_
-        func = self._resolve_target(target)
-
-        # Prepare kwargs from config
-        config_kwargs = {}
+        # resolve the class/function now
+        func = self._resolve_target(self._target_)
+        # build kwargs
+        cfg = {}
         for k, v in self.__dict__.items():
-            if k == '_target_':
+            if k == "_target_":
                 continue
-            if k.endswith('_fn'):
-                config_kwargs[k] = v
+            if k.endswith("_fn"):
+                # resolve function pointers now
+                cfg[k] = self._resolve_target(v)
             else:
-                config_kwargs[k] = self._instantiate_value(v)
-
-        # Override/add with passed kwargs
-        config_kwargs.update(kwargs)
-
-        return func(*args, **config_kwargs)
+                cfg[k] = self._instantiate_value(v)
+        # allow user overrides
+        cfg.update(kwargs)
+        return func(*args, **cfg)
 
     def _instantiate_value(self, v):
         """
@@ -137,22 +132,22 @@ class ConfigNode:
         """
         parts = dotted_path.split(".")
 
-        # Try standard import first
-        # e.g.: torchdata.stateful_dataloader.StatefulDataLoader
-        # TODO(@akoumparouli): make this more robust
-        if len(parts) > 2:
+        # try direct import of module and attribute
+        if len(parts) > 1:
             try:
-                module = importlib.import_module('.'.join(parts[:-1]))
+                module = importlib.import_module(".".join(parts[:-1]))
                 return getattr(module, parts[-1])
             except (ModuleNotFoundError, AttributeError):
                 pass
+
+        # try importing first part then attribute chain
         try:
             module = importlib.import_module(parts[0])
             return reduce(getattr, parts[1:], module)
         except (ModuleNotFoundError, AttributeError):
             pass
 
-        # Try to resolve it as a local module by searching sys.path
+        # try loading as a local .py file
         for path in sys.path:
             try_path = os.path.join(path, *parts[:-1]) + ".py"
             if os.path.isfile(try_path):
@@ -162,6 +157,7 @@ class ConfigNode:
                 sys.modules[module_name] = mod
                 spec.loader.exec_module(mod)
                 return getattr(mod, parts[-1])
+
         raise ImportError(f"Cannot resolve target: {dotted_path}. Searched paths for: {'.'.join(parts[:-1])}.py")
 
     def to_dict(self):
@@ -209,20 +205,16 @@ class ConfigNode:
         current = self
         # TODO(@akoumparouli): reduce?
         for p in parts:
-            # Traverse dictionaries (ConfigNode)
             if isinstance(current, ConfigNode):
-                if p in current.__dict__:
-                    current = current.__dict__[p]
-                else:
-                    return default
-            # Traverse lists by numeric index
+                current = current.__dict__.get(p, default)
             elif isinstance(current, list):
                 try:
-                    idx = int(p)
-                    current = current[idx]
-                except (ValueError, IndexError):
+                    current = current[int(p)]
+                except:
                     return default
             else:  # Reached a leaf but path still has components
+                return default
+            if current is default:
                 return default
         return current
 
