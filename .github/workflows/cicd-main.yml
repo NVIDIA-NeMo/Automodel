@@ -173,7 +173,7 @@ jobs:
     environment: nemo-ci
     steps:
       - name: main
-        uses: ./.github/actions/test-template@main
+        uses: ./.github/actions/test-template
         with:
           runner: ${{ runner.name }}
           script: ${{ matrix.script }}
