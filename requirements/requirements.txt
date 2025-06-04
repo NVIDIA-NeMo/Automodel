@@ -6,3 +6,4 @@ pyyaml
 torch
 torchdata
 transformers
+wandb
