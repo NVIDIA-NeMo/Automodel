@@ -69,12 +69,13 @@ class StepScheduler(Stateful):
         """
         self.step += 1
 
+        if self.epoch_len is not None and (batch_idx + 1) == self.epoch_len:
+            self.epoch += 1
+
         is_grad = self.is_optim_step
         is_val = self.is_val_step(is_grad)
         is_ckpt = self.is_ckpt_step(batch_idx)
 
-        if self.epoch_len is not None and (batch_idx + 1) == self.epoch_len:
-            self.epoch += 1
         return is_grad, is_ckpt, is_val
 
 
