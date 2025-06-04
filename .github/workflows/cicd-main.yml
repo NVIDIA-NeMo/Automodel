@@ -172,17 +172,19 @@ jobs:
     name: ${{ matrix.script }}
     environment: nemo-ci
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
       - name: main
         uses: ./.github/actions/test-template
         with:
           runner: ${{ runner.name }}
           script: ${{ matrix.script }}
+          is_unit_test: "false"
           image: nemo_automodel
           has-azure-credentials: "true"
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          is_unit_test: "false"
 
   Nemo_CICD_Test:
     needs:
