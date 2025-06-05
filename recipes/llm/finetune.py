@@ -20,6 +20,7 @@ from nemo_automodel.distributed.parallelizer import create_context_parallel_ctx,
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.step_scheduler import StepScheduler
 from nemo_automodel.utils.dist_utils import reduce_loss, get_sync_ctx, rescale_gradients, clip_gradients
+# from nemo_automodel.datasets.llm.hf_dataset import HFDatasetBuilder
 
 # ---------------------------
 #  Stateless helper functions
@@ -368,8 +369,12 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         else:
             out  = self.model(**batch)
-            local_loss = self.loss_fn(out.logits.view(-1, out.logits.size(-1)),
-                                labels.view(-1), mask=loss_mask, reduction="sum")
+            local_loss = self.loss_fn(
+                out.logits.view(-1, out.logits.size(-1)),
+                labels.view(-1),
+                mask=loss_mask,
+                reduction="sum"
+            )
 
         local_num_tokens = loss_mask.sum().detach().to(torch.int)
         self.total_num_tokens += local_num_tokens
@@ -502,7 +507,7 @@ def main():
 
     Loads the configuration, sets up the trainer, and initiates the training loop.
     """
-    cfg = load_yaml_config("llama_3_2_1b_hellaswag.yaml")
+    cfg = load_yaml_config("llama_3_2_1b_squad.yaml")
     trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
