@@ -24,7 +24,7 @@ def make_squad_dataset(
     split='train',
     dataset_name="rajpurkar/squad",
 ):
-   """
+    """
     Load and preprocess a SQuAD-style QA dataset for model fine-tuning.
 
     This function retrieves the specified split of the SQuAD dataset, applies
@@ -52,7 +52,7 @@ def make_squad_dataset(
             (default "rajpurkar/squad").
 
     Returns:
-        A Hugging Face Dataset where each example is a dict with keys:
+        A Hugginggth Face Dataset where each example is a dict with keys:
         - `input_ids`: List of token IDs for the prompt + answer.
         - `labels`: List of token IDs shifted for language modeling.
         - `loss_mask`: List of 0/1 flags indicating which tokens contribute
