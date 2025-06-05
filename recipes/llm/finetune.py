@@ -215,8 +215,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Build components
         self.model = build_model(self.dist_env.device, self.cfg.model, self.cfg.get('peft', None), self.model_wrapper)
         self.optimizer = build_optimizer(
-            self.cfg.optimizer, 
-            self.model, 
+            self.cfg.optimizer,
+            self.model,
             self.cfg.get("distributed.tp_size", 1),
         )
         self.loss_fn   = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
@@ -228,8 +228,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Build validation dataloader if the config provides it
         self.val_dataloader = None
-        val_ds_cfg = self.cfg.get("validation_dataset")
-        val_dl_cfg = self.cfg.get("validation_dataloader")
+        val_ds_cfg = self.cfg.get("validation_dataset", None)
+        val_dl_cfg = self.cfg.get("validation_dataloader", None)
         if val_ds_cfg is not None and val_dl_cfg is not None:
             self.val_dataloader = build_dataloader(
                 val_ds_cfg,
