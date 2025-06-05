@@ -24,6 +24,23 @@ from functools import reduce
 import ast
 
 def translate_value(v):
+    """
+    Convert a string token into the corresponding Python object.
+
+    This function first checks for a handful of special symbols (None/true/false),
+    then falls back to `ast.literal_eval`, and finally to returning the original
+    string if parsing fails.
+
+    Args:
+        v (str):
+            The raw string value to translate.
+
+    Returns:
+        The translated Python value, which may be:
+          - None, True, or False for the special symbols
+          - an int, float, tuple, list, dict, etc. if `ast.literal_eval` succeeds
+          - the original string `v` if all parsing attempts fail
+    """
     special_symbols = {
         'none': None,
         'None': None,
