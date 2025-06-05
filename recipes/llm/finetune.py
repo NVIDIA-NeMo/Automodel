@@ -261,37 +261,12 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             for batch_idx, batch in enumerate(self.dataloader):
                 is_optim_step, is_ckpt_step, is_val_step = self.step_scheduler.update(batch_idx)
                 grad_norm = self._run_train_step(batch, is_optim_step, 1.0)
-                if is_optim_step:
-                    reporting_loss = self.log_train_metrics(grad_norm)
-
-                    if self.dist_env.is_main:
-                        print(
-                            f"step {self.step_scheduler.step} | "
-                            f"epoch {self.step_scheduler.epoch} | "
-                            f"loss {reporting_loss:.6f} | "
-                            f"grad_norm {grad_norm:.6f}"
-                        )
-
                 if is_ckpt_step and self.dist_env.is_main:
                 #     self._save_checkpoint()
                     pass
 
                 if is_val_step and self.val_dataloader is not None:
                     val_loss = self._run_validation_epoch()
-                    if self.dist_env.is_main:
-                        if wandb.run is not None:
-                            wandb.log(
-                                {
-                                    "val_loss": val_loss,
-                                    "step": self.step_scheduler.step,
-                                    "epoch": self.step_scheduler.epoch
-                                }
-                            )
-                        print(
-                            f"[val] step {self.step_scheduler.step} | "
-                            f"epoch {self.step_scheduler.epoch} | "
-                            f"loss {val_loss:.4f}",
-                        )
 
 
     # ------------------ helpers ------------------
@@ -415,6 +390,16 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # weights after the optimizer step.
                 self.model.param_and_grad_buffer.copy_main_weights_to_model_weights()
 
+            # log
+            reporting_loss = self.log_train_metrics(grad_norm)
+            if self.dist_env.is_main:
+                print(
+                    f"step {self.step_scheduler.step} | "
+                    f"epoch {self.step_scheduler.epoch} | "
+                    f"loss {reporting_loss:.6f} | "
+                    f"grad_norm {grad_norm:.6f}"
+                )
+
         return grad_norm
 
 
@@ -458,7 +443,22 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
             total_loss, total_tokens = tensor.tolist()
 
-        return total_loss / max(total_tokens, 1e-8)
+        val_loss = total_loss / max(total_tokens, 1e-8)
+        if self.dist_env.is_main:
+            if wandb.run is not None:
+                wandb.log(
+                    {
+                        "val_loss": val_loss,
+                        "step": self.step_scheduler.step,
+                        "epoch": self.step_scheduler.epoch
+                    }
+                )
+            print(
+                f"[val] step {self.step_scheduler.step} | "
+                f"epoch {self.step_scheduler.epoch} | "
+                f"loss {val_loss:.4f}",
+            )
+        return val_loss
 
     def log_train_metrics(self, grad_norm):
         """
