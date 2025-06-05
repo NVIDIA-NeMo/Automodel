@@ -14,26 +14,52 @@
 # from nemo_automodel.datasets.llm.hf_dataset import HFDatasetBuilder
 from datasets import Dataset, DatasetDict, load_dataset
 
-def get_eos_token_id(tokenizer):
-    return getattr(tokenizer, 'eos_token_id', None) or getattr(tokenizer, 'eos_id', None)
-
-def get_chat_template(tokenizer):
-    # attempt to unwrap NeMo's tokenizer wrapper and check if wrapped tokenizer has chat_template
-    return getattr(tokenizer, 'chat_template', None)
-
 
 def make_squad_dataset(
     tokenizer,
     seq_length=None,
-    packed_sequence_size=None,
     limit_dataset_samples=None,
     start_of_turn_token=None,
     fp8=False,
     split='train',
     dataset_name="rajpurkar/squad",
 ):
-    eos_token_id = get_eos_token_id(tokenizer)
-    chat_template = get_chat_template(tokenizer)
+   """
+    Load and preprocess a SQuAD-style QA dataset for model fine-tuning.
+
+    This function retrieves the specified split of the SQuAD dataset, applies
+    either a simple prompt–completion format or a chat‐template format
+    (if `tokenizer.chat_template` is set), tokenizes each example,
+    constructs `input_ids`, `labels`, and `loss_mask`, and optionally pads
+    all sequences to a fixed length.
+
+    Args:
+        tokenizer: A Hugging Face tokenizer with attributes
+            `eos_token_id`, optional `bos_id`, optional `eos_id`, and
+            optionally `chat_template`/`apply_chat_template`.
+        seq_length (int, optional): If set, pad/truncate each example to this
+            length.
+        limit_dataset_samples (int, optional): If set, limit the number of
+            examples loaded from the split.
+        start_of_turn_token (str or None): If using a chat template, the
+            token that marks the start of each turn. Used to compute the
+            response offset for `loss_mask`.
+        fp8 (bool): Flag for future use (e.g., mixed precision). Currently
+            unused.
+        split (str): Which split of the dataset to load (e.g. 'train',
+            'validation').
+        dataset_name (str): Identifier for the Hugging Face dataset
+            (default "rajpurkar/squad").
+
+    Returns:
+        A Hugging Face Dataset where each example is a dict with keys:
+        - `input_ids`: List of token IDs for the prompt + answer.
+        - `labels`: List of token IDs shifted for language modeling.
+        - `loss_mask`: List of 0/1 flags indicating which tokens contribute
+          to the loss (answers only).
+    """
+    eos_token_id = getattr(tokenizer, 'eos_token_id', 0)
+    chat_template = getattr(tokenizer, 'chat_template', None)
 
     def pad_to_seq_length(sample):
         seq_pad_len_ar = max(0, seq_length - len(next(iter(sample.values()))))
@@ -87,6 +113,7 @@ def make_squad_dataset(
     fmt_fn = formatting_prompts_func
     if chat_template is not None:
         fmt_fn = lambda x: formatting_prompts_func_with_chat_template(x, start_of_turn_token)
+
     if isinstance(seq_length, int):
         fmt_fn_ = fmt_fn
         fmt_fn = lambda x: pad_to_seq_length(fmt_fn_(x))
