@@ -112,9 +112,6 @@ class SFTSingleTurnPreprocessor:
         self.preprocessing_num_workers = 1
         self.overwrite_cache = False
 
-    # --------------------------------------------------------------------- #
-    # tokenisation --------------------------------------------------------- #
-    # --------------------------------------------------------------------- #
     def _tokenize_function(self, examples, dataset):
         ctx = dataset.get_context(examples)
         tgt = dataset.get_target(examples)
@@ -154,9 +151,6 @@ class SFTSingleTurnPreprocessor:
         ]
         return out
 
-    # --------------------------------------------------------------------- #
-    # padding -------------------------------------------------------------- #
-    # --------------------------------------------------------------------- #
     def _compute_dataset_max_len(self, tokenized_ds):
         max_len = max(map(lambda x: len(x['input_ids']), tokenized_ds))
         # make multiple of 8
@@ -192,9 +186,6 @@ class SFTSingleTurnPreprocessor:
 
         return _pad
 
-    # --------------------------------------------------------------------- #
-    # public API ----------------------------------------------------------- #
-    # --------------------------------------------------------------------- #
     def process(self, raw_dataset, ds):
         """
         Main entry.

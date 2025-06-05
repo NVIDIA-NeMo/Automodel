@@ -214,8 +214,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Build components
         self.model = build_model(self.dist_env.device, self.cfg.model, self.cfg.get('peft', None), self.model_wrapper)
         self.optimizer = build_optimizer(
-            self.cfg.optimizer, 
-            self.model, 
+            self.cfg.optimizer,
+            self.model,
             self.cfg.get("distributed.tp_size", 1),
         )
         self.loss_fn   = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
@@ -227,8 +227,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Build validation dataloader if the config provides it
         self.val_dataloader = None
-        val_ds_cfg = self.cfg.get("validation_dataset")
-        val_dl_cfg = self.cfg.get("validation_dataloader")
+        val_ds_cfg = self.cfg.get("validation_dataset", None)
+        val_dl_cfg = self.cfg.get("validation_dataloader", None)
         if val_ds_cfg is not None and val_dl_cfg is not None:
             self.val_dataloader = build_dataloader(
                 val_ds_cfg,
@@ -259,38 +259,13 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         for epoch in self.step_scheduler.epochs:
             for batch_idx, batch in enumerate(self.dataloader):
                 is_optim_step, is_ckpt_step, is_val_step = self.step_scheduler.update(batch_idx)
-                grad_norm = self._run_train_step(batch, is_optim_step, 1.0)
-                if is_optim_step:
-                    reporting_loss = self.log_train_metrics(grad_norm)
-
-                    if self.dist_env.is_main:
-                        print(
-                            f"step {self.step_scheduler.step} | "
-                            f"epoch {self.step_scheduler.epoch} | "
-                            f"loss {reporting_loss:.6f} | "
-                            f"grad_norm {grad_norm:.6f}"
-                        )
-
+                self._run_train_step(batch, is_optim_step, 1.0)
                 if is_ckpt_step and self.dist_env.is_main:
                 #     self._save_checkpoint()
                     pass
 
                 if is_val_step and self.val_dataloader is not None:
-                    val_loss = self._run_validation_epoch()
-                    if self.dist_env.is_main:
-                        if wandb.run is not None:
-                            wandb.log(
-                                {
-                                    "val_loss": val_loss,
-                                    "step": self.step_scheduler.step,
-                                    "epoch": self.step_scheduler.epoch
-                                }
-                            )
-                        print(
-                            f"[val] step {self.step_scheduler.step} | "
-                            f"epoch {self.step_scheduler.epoch} | "
-                            f"loss {val_loss:.4f}",
-                        )
+                    self._run_validation_epoch()
 
 
     # ------------------ helpers ------------------
@@ -368,8 +343,12 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         else:
             out  = self.model(**batch)
-            local_loss = self.loss_fn(out.logits.view(-1, out.logits.size(-1)),
-                                labels.view(-1), mask=loss_mask, reduction="sum")
+            local_loss = self.loss_fn(
+                out.logits.view(-1, out.logits.size(-1)),
+                labels.view(-1),
+                mask=loss_mask,
+                reduction="sum"
+            )
 
         local_num_tokens = loss_mask.sum().detach().to(torch.int)
         self.total_num_tokens += local_num_tokens
@@ -410,7 +389,15 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # weights after the optimizer step.
                 self.model.param_and_grad_buffer.copy_main_weights_to_model_weights()
 
-        return grad_norm
+            # log
+            reporting_loss = self.log_train_metrics(grad_norm)
+            if self.dist_env.is_main:
+                print(
+                    f"step {self.step_scheduler.step} | "
+                    f"epoch {self.step_scheduler.epoch} | "
+                    f"loss {reporting_loss:.6f} | "
+                    f"grad_norm {grad_norm:.6f}"
+                )
 
 
     @torch.no_grad()
@@ -427,7 +414,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             loss_mask = batch.pop("loss_mask", None)
             if loss_mask is None:
                 loss_mask = (labels.detach() != -100).to(torch.int)
-            
+
             if (
                 'position_ids' not in batch and
                 (
@@ -453,7 +440,21 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
             total_loss, total_tokens = tensor.tolist()
 
-        return total_loss / max(total_tokens, 1e-8)
+        val_loss = total_loss / max(total_tokens, 1e-8)
+        if self.dist_env.is_main:
+            if wandb.run is not None:
+                wandb.log(
+                    {
+                        "val_loss": val_loss,
+                        "step": self.step_scheduler.step,
+                        "epoch": self.step_scheduler.epoch
+                    }
+                )
+            print(
+                f"[val] step {self.step_scheduler.step} | "
+                f"epoch {self.step_scheduler.epoch} | "
+                f"loss {val_loss:.4f}",
+            )
 
     def log_train_metrics(self, grad_norm):
         """
@@ -502,7 +503,7 @@ def main():
 
     Loads the configuration, sets up the trainer, and initiates the training loop.
     """
-    cfg = load_yaml_config("llama_3_2_1b_hellaswag.yaml")
+    cfg = load_yaml_config("llama_3_2_1b_squad.yaml")
     trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
