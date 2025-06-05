@@ -20,7 +20,6 @@ from nemo_automodel.distributed.parallelizer import create_context_parallel_ctx,
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.step_scheduler import StepScheduler
 from nemo_automodel.utils.dist_utils import reduce_loss, get_sync_ctx, rescale_gradients, clip_gradients
-# from nemo_automodel.datasets.llm.hf_dataset import HFDatasetBuilder
 
 # ---------------------------
 #  Stateless helper functions
