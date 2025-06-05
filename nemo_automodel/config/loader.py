@@ -9,6 +9,25 @@ import os
 import sys
 from functools import reduce
 
+def translate_value(v):
+    special_symbols = {
+        'none': None,
+        'None': None,
+        'true': True,
+        'True': True,
+        'false': False,
+        'False': False,
+    }
+    if v in special_symbols:
+        return special_symbols[v]
+    elif v.isdigit():
+        return v
+    else:
+        try:
+            return float(v)
+        except ValueError:
+            return v
+
 class ConfigNode:
     """
     A configuration node that wraps a dictionary (or parts of it) from a YAML file.
@@ -44,15 +63,8 @@ class ConfigNode:
             return [self._wrap('', i) for i in v]
         elif k.endswith('_fn'):
             return self._resolve_target(v)
-        elif isinstance(v, (int, float)):
-            return v
-        elif v.isdigit():
-            return int(v)
         else:
-            try:
-                return float(v)
-            except ValueError:
-                return v
+            return translate_value(v)
 
     def instantiate(self, *args, **kwargs):
         """
@@ -109,15 +121,7 @@ class ConfigNode:
         elif isinstance(v, list):
             return [self._instantiate_value(i) for i in v]
         else:
-            special_values = {
-                'none': None,
-                'None': None,
-                'true': True,
-                'True': True,
-                'false': False,
-                'False': False,
-            }
-            return special_values.get(v, v)
+            return translate_value(v)
 
     def _resolve_target(self, dotted_path):
         """
