@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import sys
-import ast
 from nemo_automodel.config.loader import translate_value, load_yaml_config
 
 def parse_cli_argv(cfg_path=None):
