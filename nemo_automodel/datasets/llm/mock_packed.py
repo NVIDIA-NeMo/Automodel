@@ -82,10 +82,10 @@ def build_packed_dataset(
         "labels":        Sequence(Value("int64")),
         "position_ids":  Sequence(Value("int64")),
     })
-    return Dataset.from_list(examples[:num_blocks], features=features), vocab
+    return Dataset.from_list(examples[:num_blocks], features=features)
 
 if __name__ == "__main__":
-    ds, vocab = build_packed_dataset(
+    ds = build_packed_dataset(
         num_blocks=3,
         block_size=32,
         mean_len=10,
