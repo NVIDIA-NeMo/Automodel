@@ -260,13 +260,13 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         for epoch in self.step_scheduler.epochs:
             for batch_idx, batch in enumerate(self.dataloader):
                 is_optim_step, is_ckpt_step, is_val_step = self.step_scheduler.update(batch_idx)
-                grad_norm = self._run_train_step(batch, is_optim_step, 1.0)
+                self._run_train_step(batch, is_optim_step, 1.0)
                 if is_ckpt_step and self.dist_env.is_main:
                 #     self._save_checkpoint()
                     pass
 
                 if is_val_step and self.val_dataloader is not None:
-                    val_loss = self._run_validation_epoch()
+                    self._run_validation_epoch()
 
 
     # ------------------ helpers ------------------
@@ -400,8 +400,6 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     f"grad_norm {grad_norm:.6f}"
                 )
 
-        return grad_norm
-
 
     @torch.no_grad()
     def _run_validation_epoch(self) -> float:
@@ -417,7 +415,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             loss_mask = batch.pop("loss_mask", None)
             if loss_mask is None:
                 loss_mask = (labels.detach() != -100).to(torch.int)
-            
+
             if (
                 'position_ids' not in batch and
                 (
@@ -458,7 +456,6 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 f"epoch {self.step_scheduler.epoch} | "
                 f"loss {val_loss:.4f}",
             )
-        return val_loss
 
     def log_train_metrics(self, grad_norm):
         """
