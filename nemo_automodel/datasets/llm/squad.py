@@ -82,18 +82,7 @@ def make_squad_dataset(
         assert isinstance(limit_dataset_samples, int), "Expected limit_dataset_samples to be an int"
         split = f'{split}[:{limit_dataset_samples}]'
 
-    if isinstance(packed_sequence_size, int) and packed_sequence_size > 0:
-        raise NotImplemented("packed is WIP")
-        # datamodule = llm.HFDatasetDataModulePacked(
-        #     "rajpurkar/squad",
-        #     packed_sequence_size=packed_sequence_size,
-        #     split=splits,
-        #     micro_batch_size=micro_batch_size,
-        #     pad_token_id=tokenizer.eos_id if tokenizer.eos_id is not None else 0,
-        #     pad_seq_len_divisible=16 if fp8 else None,  # FP8 training requires seq length to be divisible by 16.
-        # )
-    else:
-        dataset = load_dataset(dataset_name, split=split)
+    dataset = load_dataset(dataset_name, split=split)
 
     fmt_fn = formatting_prompts_func
     if chat_template is not None:
@@ -107,4 +96,3 @@ def make_squad_dataset(
         batched=False,
         remove_columns=["id", "title", "context", "question", 'answers'],
     )
-
