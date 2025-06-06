@@ -181,7 +181,7 @@ def barrier_and_log(string: str) -> None:
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
     time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    logger.info(f"[{}] datetime: {} ".format(string, time_str))
+    logger.info("[{}] datetime: {} ".format(string, time_str))
 
 
 def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs: Any):
