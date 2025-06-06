@@ -10,6 +10,7 @@ from typing import Any, Dict
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+import pathlib
 
 from nemo_automodel.shared.import_utils import safe_import_from
 HAS_FSDP, FSDP = safe_import_from("megatron.core.distributed.custom_fsdp", "FSDP")
@@ -502,7 +503,8 @@ def main():
 
     Loads the configuration, sets up the trainer, and initiates the training loop.
     """
-    cfg = parse_args_and_load_config("llama_3_2_1b_hellaswag.yaml")
+    script_path = pathlib.Path(__file__).parent.resolve()
+    cfg = parse_args_and_load_config(script_path / "llama_3_2_1b_hellaswag.yaml")
     trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
