@@ -13,5 +13,8 @@
 # limitations under the License.
 
 TRANSFORMERS_OFFLINE=1 coverage run -a --data-file=/workspace/.coverage --source=/workspace/nemo recipes/llm/finetune.py \
-  --model /home/TestData/akoumparouli/hf_mixtral_2l/ \
-  --max-steps 3 --ckpt-folder /tmp/hf_peft_ckpt
+  --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
+  --step_scheduler.max_steps 3 \
+  --step_scheduler.grad_acc_steps 1 \
+  --dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
+  --validation_dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/
