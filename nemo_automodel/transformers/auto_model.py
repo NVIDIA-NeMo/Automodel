@@ -60,7 +60,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
 
     The class only overrides ``from_pretrained`` and ``from_config`` to add the
     optional ``use_liger_kernel`` flag.  If the flag is ``True`` (default) and
-    the Liger kernel is available, the model’s attention layers are
+    the Liger kernel is available, the model's attention layers are
     monkey-patched in place.  If patching fails for any reason, the call is
     retried once with ``use_liger_kernel=False`` so that users still obtain a
     functional model.
@@ -70,7 +70,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
 
     Notes
     -----
-    - No changes are made to the model’s public API; forward signatures,
+    - No changes are made to the model's public API; forward signatures,
       generation utilities, and weight shapes remain identical.
     - Only decoder-style (causal) architectures are currently supported by the
       Liger patch.  Unsupported models will silently fall back.

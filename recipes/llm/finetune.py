@@ -10,9 +10,12 @@ from typing import Any, Dict
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.distributed.device_mesh import _mesh_resources
 
-from nemo_automodel.shared.import_utils import safe_import_from
-HAS_FSDP, FSDP = safe_import_from("megatron.core.distributed.custom_fsdp", "FSDP")
+try:
+    from nvfsdp import nvFSDP
+except ImportError:
+    from nemo_automodel.distributed.nvfsdp.nvfsdp import nvFSDP
 
 from nemo_automodel.config.cli import parse_args_and_load_config
 from nemo_automodel.distributed.init_utils import initialize_distributed
@@ -330,6 +333,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 False,
                 False,
             )
+
             with train_context(context_parallel_ctx):
                 out  = self.model(**batch)
 
@@ -366,8 +370,16 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             rescale_gradients(
                 self.model,
                 self.total_num_tokens,
-                self.device_mesh["data_parallel"].get_group(),
-                self.device_mesh["data_parallel"].size()
+                self.device_mesh[(
+                    "dp_cp"
+                    if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(self.device_mesh, {})
+                    else "data_parallel"
+                )].get_group(),
+                self.device_mesh[(
+                    "dp_cp"
+                    if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(self.device_mesh, {})
+                    else "data_parallel"
+                )].size()
             )
 
             # Clip gradients **after** any rescaling.
@@ -378,7 +390,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # TODO: TP WAR
                 grad_norm = 0.
 
-            if isinstance(self.model, FSDP):
+            if isinstance(self.model, nvFSDP):
                 # If the model uses nvFSDP, wait for all sharded gradients to be reduced and unsharded.
                 # Necessary because the post-backward reduce-scatter is asynchronous, so gradients and backward
                 # computations are concurrent, but the gradients of the final layer may not be available yet.
@@ -387,11 +399,12 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.optimizer.step()
             self.optimizer.zero_grad()
 
-            if isinstance(self.model, FSDP):
+            if isinstance(self.model, nvFSDP):
                 # If custom FSDP2 is configured with "optim" (optimizer state / high-precision model weight sharding),
                 # then the optimizer step will be applied to the main high-precision model weights. Update the model
                 # weights after the optimizer step.
-                self.model.param_and_grad_buffer.copy_main_weights_to_model_weights()
+                self.model.install_optimized_model_weights()
+                self.model.zero_grad_buffer()
 
             # log
             reporting_loss = self.log_train_metrics(grad_norm)
@@ -427,14 +440,54 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
             ):
                 batch["position_ids"] = torch.arange(0, batch['input_ids'].shape[1]).unsqueeze(0).to(self.model.device)
+            
+            if self.device_mesh["context_parallel"].size() > 1:
 
-            out = self.model(**batch)
-            local_loss = self.loss_fn(
-                out.logits.view(-1, out.logits.size(-1)),
-                labels.view(-1),
-                mask=loss_mask,
-                reduction="sum"
-            )
+                input_ids = batch["input_ids"].to(self.model.device)
+                position_ids = batch["position_ids"].to(self.model.device)
+
+                if loss_mask is not None:
+                    cp_buffers = [input_ids, labels, position_ids, loss_mask]
+                    cp_seq_dims = [1, 1, 1, 1]
+                    cp_no_restore_buffers = {input_ids, labels, loss_mask}
+                else:
+                    cp_buffers = [input_ids, labels, position_ids]
+                    cp_seq_dims = [1, 1, 1]
+                    cp_no_restore_buffers = {input_ids, labels}
+
+                context_parallel_ctx = create_context_parallel_ctx(
+                    cp_mesh=self.model_wrapper.device_mesh["context_parallel"],
+                    cp_buffers=cp_buffers,
+                    cp_seq_dims=cp_seq_dims,
+                    cp_no_restore_buffers=cp_no_restore_buffers,
+                    cp_rotate_method="allgather",  # TODO add "alltoall" option
+                )
+                train_context = get_train_context(
+                    False,
+                    False,
+                )
+                with train_context(context_parallel_ctx):
+                    out  = self.model(**batch)
+                    # Prepare for loss calculation
+                    logits = out.logits.float()
+                    n_cls = logits.shape[-1]
+                    logits = logits.view(-1, n_cls)
+                    labels = labels.view(-1)
+                    assert logits.shape[-2] == labels.shape[-1], "Expected logits & labels to have the same length"
+                    local_loss = self.loss_fn(logits, labels, loss_mask)
+
+                # In the case where all labels are masked, the loss should be 0.
+                if loss_mask is not None and loss_mask.bool().sum() == 0:
+                    local_loss.detach().copy_(torch.zeros_like(local_loss))
+            else:
+                out = self.model(**batch)
+                local_loss = self.loss_fn(
+                    out.logits.view(-1, out.logits.size(-1)),
+                    labels.view(-1),
+                    mask=loss_mask,
+                    reduction="sum"
+                )
+
             total_loss += local_loss.item()
             total_tokens += loss_mask.sum().item()
 
