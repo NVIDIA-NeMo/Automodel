@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from torch.distributed.checkpoint.stateful import Stateful
-from typing import Optional, Tuple
+from typing import Optional
 
 class StepScheduler(Stateful):
     """
