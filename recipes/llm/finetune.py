@@ -23,6 +23,7 @@ from nemo_automodel.distributed.init_utils import initialize_distributed
 from nemo_automodel.distributed.parallelizer import create_context_parallel_ctx, get_train_context
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.step_scheduler import StepScheduler
+from nemo_automodel.datasets.llm.hf_dataset_packed_sequence import HFDatasetPackedSequenceHelper
 from nemo_automodel.utils.dist_utils import reduce_loss, get_sync_ctx, rescale_gradients, clip_gradients
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 
@@ -130,6 +131,7 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, distributed_sampler_kwargs, seed
     Args:
         cfg_ds: Dataset configuration.
         cfg_dl: DataLoader configuration.
+        cfg_ps: Packed sequence configuration
         distributed_sampler_kwargs: Additional arguments for the DistributedSampler.
 
     Returns:
@@ -142,6 +144,18 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, distributed_sampler_kwargs, seed
     else:
         tokenizer = cfg_ds.tokenizer.instantiate()
     ds = cfg_ds.instantiate(tokenizer=tokenizer)
+    # Apply packing if configured
+    if getattr(cfg_ps, 'packed_sequence_size', 0) > 0:
+        helper = HFDatasetPackedSequenceHelper(
+            ds,
+            split=cfg_ds.split  # Assumes split is defined in dataset config
+        )
+        packed_ds = helper.pack(
+            packed_sequence_size=cfg_ps.packed_sequence_size,
+            split_across_pack=getattr(cfg_ps, 'split_across_pack', False),
+            max_packs=getattr(cfg_ps, 'max_packs', None)
+        )
+        ds = packed_ds
     sampler = StatefulDistributedSampler(
         ds,
         num_replicas=distributed_sampler_kwargs.get("num_replicas", 1),
@@ -266,6 +280,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.cfg.dataset,
             self.cfg.dataloader,
             self.cfg.model,
+            self.cfg.packed_sequence,
             distributed_sampler_kwargs,
             self.cfg.get("rng.seed", 42) + self.dist_env.rank,
         )
@@ -277,6 +292,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 self.cfg.validation_dataset,
                 self.cfg.validation_dataloader,
                 self.cfg.model,
+                self.cfg.packed_sequence,
                 distributed_sampler_kwargs,
                 self.cfg.get("rng.seed", 42) + self.dist_env.rank,
             )
