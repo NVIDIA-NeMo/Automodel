@@ -20,4 +20,5 @@ recipes/llm/finetune.py \
   --step_scheduler.grad_acc_steps 1 \
   --dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
   --validation_dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
-  --dataset.dataset_name /home/TestData/lite/hf_cache/squad/
+  --dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
+  --dataset.limit_dataset_samples 10
