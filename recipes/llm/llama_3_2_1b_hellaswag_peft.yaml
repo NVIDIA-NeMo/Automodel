@@ -38,9 +38,6 @@ dataset:
   _target_: nemo_automodel.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
-  tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -52,9 +49,6 @@ validation_dataset:
   _target_: nemo_automodel.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
-  tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
   num_samples_limit: 64
 
 validation_dataloader:

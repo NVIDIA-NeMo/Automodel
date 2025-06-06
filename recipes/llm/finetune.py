@@ -20,7 +20,7 @@ from nemo_automodel.distributed.parallelizer import create_context_parallel_ctx,
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.step_scheduler import StepScheduler
 from nemo_automodel.utils.dist_utils import reduce_loss, get_sync_ctx, rescale_gradients, clip_gradients
-
+from transformers import AutoTokenizer
 # ---------------------------
 #  Stateless helper functions
 # ---------------------------
@@ -91,7 +91,7 @@ def build_loss_fn(device, cfg_loss):
         return cfg_loss.instantiate().to(device)
 
 
-def build_dataloader(cfg_ds, cfg_dl, distributed_sampler_kwargs) -> DataLoader:
+def build_dataloader(cfg_ds, cfg_dl, cfg_model, distributed_sampler_kwargs) -> DataLoader:
     """
     Build a DataLoader for the dataset.
 
@@ -103,7 +103,11 @@ def build_dataloader(cfg_ds, cfg_dl, distributed_sampler_kwargs) -> DataLoader:
     Returns:
         The instantiated DataLoader.
     """
-    ds = cfg_ds.instantiate()
+    if not 'tokenizer' in cfg_ds:
+        tokenizer = AutoTokenizer.from_pretrained(cfg_model.pretrained_model_name_or_path)
+    else:
+        tokenizer = cfg_ds.tokenizer.instantiate()
+    ds = cfg_ds.instantiate(tokenizer=tokenizer)
     sampler = torch.utils.data.distributed.DistributedSampler(
         ds,
         num_replicas=distributed_sampler_kwargs.get("num_replicas", 1),
@@ -222,17 +226,17 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.dataloader = build_dataloader(
             self.cfg.dataset,
             self.cfg.dataloader,
+            self.cfg.model,
             distributed_sampler_kwargs,
         )
 
         # Build validation dataloader if the config provides it
         self.val_dataloader = None
-        val_ds_cfg = self.cfg.get("validation_dataset", None)
-        val_dl_cfg = self.cfg.get("validation_dataloader", None)
-        if val_ds_cfg is not None and val_dl_cfg is not None:
+        if 'validation_dataset' in self.cfg:
             self.val_dataloader = build_dataloader(
-                val_ds_cfg,
-                val_dl_cfg,
+                self.cfg.validation_dataset,
+                self.cfg.validation_dataloader,
+                self.cfg.model,
                 distributed_sampler_kwargs,
             )
 
