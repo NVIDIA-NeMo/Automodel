@@ -17,6 +17,7 @@ import os
 from functools import partial
 from logging import Filter, LogRecord
 from typing import Callable, Optional, Union
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -28,27 +29,11 @@ class RankFilter(logging.Filter):
     If a log record has an attribute 'all_ranks' set to True,
     the log message will always be output regardless of the process rank.
     """
-    def __init__(self, rank):
-        """
-        Decide whether to log the provided record.
-
-        If the log record has an attribute 'bypass_rank_filter' set to True,
-        the record is allowed. Otherwise, only messages from rank 0 are allowed.
-
-        Args:
-            record (logging.LogRecord): The log record to be evaluated.
-
-        Returns:
-            bool: True if the log record should be logged, False otherwise.
-        """
-        super().__init__()
-        self.rank = rank
-
     def filter(self, record):
         """
         Decide whether to log the provided record.
 
-        If the log record has an attribute 'bypass_rank_filter' set to True,
+        If the log record has an attribute 'all_ranks' set to True,
         the record is allowed. Otherwise, only messages from rank 0 are allowed.
 
         Args:
@@ -60,8 +45,8 @@ class RankFilter(logging.Filter):
         # If the log record explicitly requests to bypass the rank check, allow it.
         if getattr(record, 'all_ranks', False):
             return True
-        # Otherwise, only allow logs from rank 0.
-        return self.rank == 0
+        # TODO(@akoumparouli): make this PP aware.
+        return int(os.environ.get('LOCAL_RANK', '0')) != 0
 
 def warning_filter(record: LogRecord) -> bool:
     """Logging filter to exclude WARNING level messages.
@@ -147,5 +132,6 @@ def setup_logging(
 
     if filter_warning:
         add_filter_to_all_loggers(warning_filter)
+    logging.getLogger().addFilter(RankFilter())
     if modules_to_filter:
         add_filter_to_all_loggers(partial(module_filter, modules_to_filter=modules_to_filter))
