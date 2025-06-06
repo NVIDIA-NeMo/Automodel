@@ -1,4 +1,17 @@
-# config_loader.py
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import yaml
 import importlib
 from functools import reduce
@@ -8,6 +21,43 @@ import importlib.util
 import os
 import sys
 from functools import reduce
+import ast
+
+def translate_value(v):
+    """
+    Convert a string token into the corresponding Python object.
+
+    This function first checks for a handful of special symbols (None/true/false),
+    then falls back to `ast.literal_eval`, and finally to returning the original
+    string if parsing fails.
+
+    Args:
+        v (str):
+            The raw string value to translate.
+
+    Returns:
+        The translated Python value, which may be:
+          - None, True, or False for the special symbols
+          - an int, float, tuple, list, dict, etc. if `ast.literal_eval` succeeds
+          - the original string `v` if all parsing attempts fail
+    """
+    special_symbols = {
+        'none': None,
+        'None': None,
+        'true': True,
+        'True': True,
+        'false': False,
+        'False': False,
+    }
+    if v in special_symbols:
+        return special_symbols[v]
+    else:
+        try:
+            # smart-cast literals: numbers, dicts, lists, True/False, None
+            return ast.literal_eval(v)
+        except Exception:
+            # fallback to raw string
+            return v
 
 class ConfigNode:
     """
@@ -44,15 +94,8 @@ class ConfigNode:
             return [self._wrap('', i) for i in v]
         elif k.endswith('_fn'):
             return self._resolve_target(v)
-        elif isinstance(v, (int, float)):
-            return v
-        elif v.isdigit():
-            return int(v)
         else:
-            try:
-                return float(v)
-            except ValueError:
-                return v
+            return translate_value(v)
 
     def instantiate(self, *args, **kwargs):
         """
@@ -109,15 +152,7 @@ class ConfigNode:
         elif isinstance(v, list):
             return [self._instantiate_value(i) for i in v]
         else:
-            special_values = {
-                'none': None,
-                'None': None,
-                'true': True,
-                'True': True,
-                'false': False,
-                'False': False,
-            }
-            return special_values.get(v, v)
+            return translate_value(v)
 
     def _resolve_target(self, dotted_path):
         """

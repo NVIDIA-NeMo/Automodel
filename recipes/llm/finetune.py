@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from nemo_automodel.shared.import_utils import safe_import_from
 HAS_FSDP, FSDP = safe_import_from("megatron.core.distributed.custom_fsdp", "FSDP")
 
-from nemo_automodel.config.loader import load_yaml_config
+from nemo_automodel.config.cli import parse_args_and_load_config
 from nemo_automodel.distributed.init_utils import initialize_distributed
 from nemo_automodel.distributed.parallelizer import create_context_parallel_ctx, get_train_context
 from nemo_automodel.training.base_recipe import BaseRecipe
@@ -503,7 +503,7 @@ def main():
 
     Loads the configuration, sets up the trainer, and initiates the training loop.
     """
-    cfg = load_yaml_config("llama_3_2_1b_squad.yaml")
+    cfg = parse_args_and_load_config("llama_3_2_1b_hellaswag.yaml")
     trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
