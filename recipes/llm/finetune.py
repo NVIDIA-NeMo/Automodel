@@ -5,6 +5,14 @@ from wandb import Settings
 from nemo_automodel.loggers.wandb_utils import suppress_wandb_log_messages
 
 import torch.distributed as dist
+from torch.distributed.checkpoint.state_dict import (
+    get_model_state_dict,
+    get_optimizer_state_dict,
+    set_model_state_dict,
+    set_optimizer_state_dict,
+    StateDictOptions,
+)
+import torch.distributed.checkpoint as dcp
 from typing import Any, Dict
 
 import torch
@@ -20,6 +28,7 @@ from nemo_automodel.distributed.parallelizer import create_context_parallel_ctx,
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.step_scheduler import StepScheduler
 from nemo_automodel.utils.dist_utils import reduce_loss, get_sync_ctx, rescale_gradients, clip_gradients
+from nemo_automodel.checkpoint.checkpointing import save, load
 
 # ---------------------------
 #  Stateless helper functions
@@ -256,7 +265,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         and update model parameters when necessary. Also prints loss every gradient step.
         """
         self.model.train()
-        for epoch in self.step_scheduler.epochs:
+        for _ in self.step_scheduler.epochs:
             for batch_idx, batch in enumerate(self.dataloader):
                 is_optim_step, is_ckpt_step, is_val_step = self.step_scheduler.update(batch_idx)
                 grad_norm = self._run_train_step(batch, is_optim_step, 1.0)
@@ -271,9 +280,11 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                             f"grad_norm {grad_norm:.6f}"
                         )
 
-                if is_ckpt_step and self.dist_env.is_main:
-                #     self._save_checkpoint()
-                    pass
+                if is_ckpt_step:
+                    save(
+                        f"checkpoints/step_{self.step_scheduler.step}",
+                        **self.state_dict(),
+                    )
 
                 if is_val_step and self.val_dataloader is not None:
                     val_loss = self._run_validation_epoch()
@@ -292,6 +303,40 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                             f"loss {val_loss:.4f}",
                         )
 
+    # ------------------ checkpointing ------------------
+    def state_dict(self) -> dict[str, Any]:
+        # this line automatically manages FSDP FQN's, as well as sets the default state dict type to FSDP.SHARDED_STATE_DICT
+        # model_state_dict = get_model_state_dict(
+        #     self.model,
+        #     options=StateDictOptions(
+        #         cpu_offload=True,
+        #         full_state_dict=True,
+        #     ),
+        # )
+        # if self.model.config.tie_word_embeddings:
+        #     model_state_dict.pop("lm_head.weight", None)
+
+        optimizer_state_dict = get_optimizer_state_dict(
+            self.model,
+            self.optimizer,
+            options=StateDictOptions(
+                cpu_offload=True
+            ),
+        )
+        scheduler_state_dict = self.step_scheduler.state_dict()
+        dataloader_state_dict = self.dataloader.state_dict()
+        return {
+            "model_state_dict": model_state_dict,
+            "optimizer_state_dict": optimizer_state_dict,
+            "scheduler_state_dict": scheduler_state_dict,
+            "dataloader_state_dict": dataloader_state_dict,
+        }
+    
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        set_model_state_dict(self.model, state_dict["model_state_dict"])
+        set_optimizer_state_dict(self.model, self.optimizer, state_dict["optimizer_state_dict"])
+        self.step_scheduler.load_state_dict(state_dict["scheduler_state_dict"])
+        self.dataloader.load_state_dict(state_dict["dataloader_state_dict"])
 
     # ------------------ helpers ------------------
     def _run_train_step(self, batch, is_optim_step, clip_norm=1.0):

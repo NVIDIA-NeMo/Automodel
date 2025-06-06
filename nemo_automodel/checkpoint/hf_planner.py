@@ -3,7 +3,7 @@
 # taken and edited from https://github.com/pytorch/pytorch/blob/main/torch/distributed/checkpoint/_hf_planner.py
 
 # mypy: allow-untyped-defs
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from torch.distributed.checkpoint._dedup_save_plans import (
     dedup_save_plans_with_fqn_to_index_mapping,
@@ -51,3 +51,19 @@ class HuggingFaceLoadPlanner(DefaultLoadPlanner):
 
     def resolve_tensor(self, read_item: ReadItem):
         return self.lookup_tensor(read_item.dest_index)
+
+
+from torch.distributed.checkpoint.planner import WriteItemType
+
+# def dedup_save_plans_with_fqn_to_index_mapping(all_plans, fqn_to_index):
+#     num_ranks = len(all_plans)
+#     for rank, plan in enumerate(all_plans):
+#         kept = []
+#         for wi in plan.items:
+#             if wi.type == WriteItemType.SHARD:        # keep every shard
+#                 kept.append(wi)
+#             else:                                     # dedup replicated items
+#                 if (fqn_to_index[wi.index.fqn] - 1) % num_ranks == rank:
+#                     kept.append(wi)
+#         all_plans[rank] = replace(plan, items=kept)
+#     return all_plans

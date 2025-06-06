@@ -112,7 +112,11 @@ class HuggingFaceStorageWriter(FsspecWriter):
 
         file_queue: queue.Queue = queue.Queue()
         for file_index, write_items in buckets.items():
-            file_name = self._gen_file_name(file_index, highest_index)
+            # Use simple filename for single shard models
+            if highest_index == 1:
+                file_name = "model" + SUFFIX
+            else:
+                file_name = self._gen_file_name(file_index, highest_index)
             file_queue.put(
                 (self.fs.concat_path(self.path, file_name), file_name, write_items)
             )
@@ -120,7 +124,6 @@ class HuggingFaceStorageWriter(FsspecWriter):
         return super()._write_data(planner, file_queue)
 
     def finish(self, metadata: Metadata, results: list[list[WriteResult]]) -> None:
-        metadata_to_write = {}
         storage_md = {}
         total_size = 0
         for wr_list in results:
@@ -128,12 +131,16 @@ class HuggingFaceStorageWriter(FsspecWriter):
                 {wr.index.fqn: wr.storage_data.relative_path for wr in wr_list}
             )
             total_size += sum([wr.storage_data.length for wr in wr_list])
-        metadata_to_write["metadata"] = {"total_size": total_size}
-        metadata_to_write["weight_map"] = storage_md
+        
+        # Only create metadata file for multi-shard models
+        if len(set(storage_md.values())) > 1 or not any(path.endswith("model.safetensors") for path in storage_md.values()):
+            metadata_to_write = {}
+            metadata_to_write["metadata"] = {"total_size": total_size}
+            metadata_to_write["weight_map"] = storage_md
 
-        metadata_path = self.fs.concat_path(self.path, f"{_metadata_fn}")
-        with self.fs.create_stream(metadata_path, "w") as metadata_file:
-            json.dump(metadata_to_write, metadata_file, indent=2)
+            metadata_path = self.fs.concat_path(self.path, f"{_metadata_fn}")
+            with self.fs.create_stream(metadata_path, "w") as metadata_file:
+                json.dump(metadata_to_write, metadata_file, indent=2)
 
     def _split_by_storage_plan(
         self, storage_plan: dict[str, int], items: list[WriteItem]
@@ -184,6 +191,12 @@ class HuggingFaceStorageReader(FsspecReader):
         super().__init__(path=path, token=token)
         self.storage_data: dict[str, str] = {}
 
+    def set_up_storage_reader(self, metadata: Metadata, is_coordinator: bool) -> None:
+        """Set up the storage reader with metadata."""
+        super().set_up_storage_reader(metadata, is_coordinator)
+        # Populate storage_data from metadata for use in read_data
+        self.storage_data = metadata.storage_data
+
     def read_data(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:
         from safetensors.torch import load  # type: ignore[import-not-found]
 
@@ -230,19 +243,24 @@ class HuggingFaceStorageReader(FsspecReader):
 
             safetensors_files = []
             for file in self.fs.ls(self.path):
-                if file.endswith(SUFFIX):
-                    # safetensors_files.append(os.path.basename(file))
-                    safetensors_files.append(file)
+                basename = os.path.basename(file)
+                if basename.endswith(SUFFIX):
+                    safetensors_files.append(basename)
 
             if len(safetensors_files) != 1:
                 raise ValueError(
                     f"Need exactly one safetensors file to load without metadata, found {len(safetensors_files)} files"
                 )
+            
+            # Use the single safetensors file
+            safetensor_file = safetensors_files[0]
+            full_path = self.fs.concat_path(self.path, safetensor_file)
+            
             storage_data = {}
-            with safe_open(safetensors_files[0], framework="pt") as f:
+            with safe_open(full_path, framework="pt") as f:
                 for k in f.keys():
                     state_dict_metadata[k] = BytesStorageMetadata()
-                    storage_data[k] = os.path.basename(safetensors_files[0])
+                    storage_data[k] = safetensor_file
         else:
             with self.fs.create_stream(metadata_path, "r") as metadata_file:
                 metadata = json.load(metadata_file)

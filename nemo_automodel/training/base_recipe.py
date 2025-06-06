@@ -35,7 +35,7 @@ def has_load_restore_state(object):
         for attr in ('load_state_dict', 'state_dict')
     )
 
-class BaseRecipe(Stateful):
+class BaseRecipe:
     """
     Checkpoint registry
     """
