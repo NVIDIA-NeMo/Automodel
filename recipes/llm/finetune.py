@@ -187,6 +187,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         Raises:
             NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
         """
+        torch.cuda.reset_peak_memory_stats()
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
         # setups logging and adds the rankfilter to logging
         setup_logging()
@@ -402,10 +403,12 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             # log
             reporting_loss = self.log_train_metrics(grad_norm)
-            logging.info("step {} | epoch {} | loss {:.6f} | grad_norm {:.6f}".format(
-                    self.step_scheduler.step, self.step_scheduler.epoch, reporting_loss, grad_norm
+            logging.info("step {} | epoch {} | loss {:.6f} | grad_norm {:.6f} | mem: {:.2f} GiB".format(
+                    self.step_scheduler.step, self.step_scheduler.epoch, reporting_loss, grad_norm,
+                    torch.cuda.max_memory_allocated() / 1024 ** 3
                 )
             )
+            torch.cuda.reset_peak_memory_stats()
 
 
     @torch.no_grad()
