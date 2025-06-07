@@ -16,7 +16,14 @@ import torch
 import torch.nn as nn
 from torch.optim import Optimizer
 import os
-from nemo_automodel.checkpoint.checkpointing import save_model, save_optimizer
+from nemo_automodel.checkpoint.checkpointing import (
+    save_model,
+    save_optimizer,
+    load_model,
+    load_optimizer,
+)
+from pathlib import Path
+import re
 
 def has_load_restore_state(object):
     """ Checks whether object has load_state_dict and state_dict functions, ie whether the object
@@ -100,3 +107,74 @@ class BaseRecipe:
 
         save_model(model, path, self.checkpoint_config)
         save_optimizer(optimizer, model, path)
+    
+    def load_checkpoint(self, restore_from: str | None = None):
+        """
+        Load the latest checkpoint.
+        """
+        if not self.checkpoint_config.enabled:
+            if (
+                (
+                    not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+                ) and restore_from is not None
+            ):
+                print("Enable checkpointing to resume from a checkpoint, skipping...", flush=True)
+            return
+
+        if restore_from:
+            ckpt_dir = restore_from
+        else:
+            # Determine the latest checkpoint directory (e.g. ".../step_42").
+            ckpt_dir = _find_latest_checkpoint(self.checkpoint_config.checkpoint_dir)
+            if ckpt_dir is None:
+                return
+
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            print(f"Loading checkpoint from {ckpt_dir}", flush=True)
+        
+        # TODO(@adil-a): Change this when we create a LR scheduler class
+        model, optimizer = None, None
+
+        for key in self.__dict__['__state_tracked']:
+            if isinstance(getattr(self, key), nn.Module):
+                model = getattr(self, key)
+            elif isinstance(getattr(self, key), Optimizer):
+                optimizer = getattr(self, key)
+            else:
+                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                    getattr(self, key).load_state_dict(
+                        torch.load(
+                            os.path.join(ckpt_dir, f"{key}.pt"),
+                        )
+                    )
+                if torch.distributed.is_initialized():
+                    torch.distributed.barrier()
+
+        load_model(model, ckpt_dir, self.checkpoint_config)
+        load_optimizer(optimizer, model, ckpt_dir)
+    
+
+def _find_latest_checkpoint(checkpoint_dir):
+    """
+    Find the latest checkpoint in the checkpoint directory.
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+    if not checkpoint_dir.exists():
+        return
+    checkpoint_files = list(checkpoint_dir.glob("step_*"))
+    if not checkpoint_files:
+        return
+
+    def _step_num(path: Path):
+        """Return the numeric step from a path stem of the form step_<int>."""
+        m = re.search(r"step_(\d+)$", path.stem)
+        return int(m.group(1)) if m else -1
+
+    latest = max(checkpoint_files, key=_step_num)
+
+    # If no directory followed the expected "step_<int>" pattern, _step_num would be -1 for all of them.
+    # Treat that as "no valid checkpoint".
+    if _step_num(latest) == -1:
+        return
+
+    return latest

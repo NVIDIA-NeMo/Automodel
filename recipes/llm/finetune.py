@@ -79,7 +79,9 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id):
         model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
     )
     if cfg_ckpt is not None:
-        ckpt_kwargs |= cfg_ckpt.to_dict()
+        cfg_ckpt = cfg_ckpt.to_dict()
+        cfg_ckpt.pop('restore_from', None)
+        ckpt_kwargs |= cfg_ckpt
     return CheckpointingConfig(**ckpt_kwargs)
 
 def build_optimizer(cfg_opt, model, tp_size) -> 'Optimizer':  # noqa: F821
@@ -271,6 +273,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.step_scheduler = build_step_scheduler(self.cfg.get('step_scheduler', None), self.dataloader)
         
         # Build checkpointing config
+        restore_from = self.cfg.get('checkpoint.restore_from', None)
         self.checkpoint_config = build_checkpoint_config(
             self.cfg.get('checkpoint', None),
             self.cfg.get('model.cache_dir', None),
@@ -278,8 +281,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
 
         # Optionally resume
-        if (path := self.cfg.get("restore_from")) is not None:
-            raise NotImplemented("TODO resume from {}".format(path))
+        self.load_checkpoint(restore_from)
 
     # ------------------ main loop ------------------
     def run_train_validation_loop(self):
