@@ -279,3 +279,30 @@ class HuggingFaceStorageReader(FsspecReader):
         metadata.storage_meta.load_id = self.load_id
 
         return metadata
+
+
+def get_fqn_to_file_index_mapping(reference_model_path: str) -> dict[str, int]:
+    """
+    Get the FQN to file index mapping from the metadata.
+
+    Args:
+        reference_model_path: Path to reference model to copy file structure from.
+
+    Returns:
+        A mapping from tensor FQN to the index of the file that the tensor should be written to.
+        Indices are from 1 to N, where N is the number of files.
+    """
+    hf_storage_reader = HuggingFaceStorageReader(reference_model_path)
+    metadata = hf_storage_reader.read_metadata()
+    weight_map = metadata.storage_data
+    
+    fqn_to_file_index_mapping = {}
+    for fqn, filename in weight_map.items():
+        if "-" in filename:
+            index = int(filename.split("-")[1])
+            fqn_to_file_index_mapping[fqn] = index
+        else:
+            # For single-file models, all tensors go to index 1
+            fqn_to_file_index_mapping[fqn] = 1
+
+    return fqn_to_file_index_mapping
