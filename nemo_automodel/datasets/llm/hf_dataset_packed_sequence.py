@@ -69,7 +69,7 @@ class HFDatasetPackedSequenceHelper:
             self.contains_loss_mask = True
         # Buffer to hold samples until they are long enough to be added to self.packs
         current_pack = {
-            "tokens": [],
+            "input_ids": [],
             "labels": [],
             "position_ids": [],
             "seq_lens": [],
@@ -80,13 +80,13 @@ class HFDatasetPackedSequenceHelper:
         if rank == 0:
             pbar = tqdm(total=len(self.dataset), desc=f"Packing {self.split} dataset", dynamic_ncols=True)
         for sample in self.dataset:
-            tokens, labels = sample["input_ids"], sample["labels"]
+            input_ids, labels = sample["input_ids"], sample["labels"]
             if self.contains_loss_mask:
                 loss_mask = sample["loss_mask"]
             # If the dataset outputs samples that are larger than the specified
             # packed_sequence_size and we're unable to split it, user needs to modify
             # one of the two parameters
-            seq_len = len(tokens)
+            seq_len = len(input_ids)
             if seq_len > self.packed_sequence_size and not split_across_pack:
                 raise ValueError(
                     f"Dataset sample is too long ({seq_len} > {self.packed_sequence_size}). "
@@ -94,7 +94,7 @@ class HFDatasetPackedSequenceHelper:
                 )
             # Update the current pack
             # "position_ids" is the pos ids, "seq_lens" is the len of each seq within the pack
-            current_pack["tokens"] += tokens
+            current_pack["input_ids"] += input_ids
             current_pack["labels"] += labels
             current_pack["position_ids"] += [x % self.packed_sequence_size for x in range(seq_len)]
             current_pack["seq_lens"] += [seq_len]
@@ -103,20 +103,20 @@ class HFDatasetPackedSequenceHelper:
 
             # If the current pack is over the packed_sequence_size, add it to self.packs and
             # retain any truncated or bumped samples for next pack
-            while len(current_pack["tokens"]) > self.packed_sequence_size and not self._should_stop_packing():
+            while len(current_pack["input_ids"]) > self.packed_sequence_size and not self._should_stop_packing():
                 current_pack = self._split_and_add_pack(current_pack)
 
             if rank == 0:
                 pbar.update()
 
             # Keep track of previous sample boundary
-            self.previous_sample_boundary = len(current_pack["tokens"])
+            self.previous_sample_boundary = len(current_pack["input_ids"])
 
             if self._should_stop_packing():
                 break
 
         # Handle the last pack if there's leftover and we haven't filled up the max packs
-        if len(current_pack["tokens"]) > 0 and (self.max_packs is None or len(self.packs) < self.max_packs):
+        if len(current_pack["input_ids"]) > 0 and (self.max_packs is None or len(self.packs) < self.max_packs):
             # No need to handle splitting at this point so we can just add the current pack
             self._add_pack(current_pack)
 
@@ -148,7 +148,7 @@ class HFDatasetPackedSequenceHelper:
             seq_len_padding = []
 
         pack = {
-            "tokens": current_pack["tokens"][:boundary],
+            "input_ids": current_pack["input_ids"][:boundary],
             "labels": current_pack["labels"][:boundary],
             "position_ids": current_pack["position_ids"][:boundary],
             "seq_lens": current_pack["seq_lens"][:-1] + seq_len_padding,
@@ -162,11 +162,11 @@ class HFDatasetPackedSequenceHelper:
         # Return the length of the first sample in next pack if we are splitting across packs,
         # otherwise return the length of the last sample in the current pack
         next_seq_len = (
-            len(current_pack["tokens"][boundary:]) if self.split_across_pack else current_pack["seq_lens"][-1]
+            len(current_pack["input_ids"][boundary:]) if self.split_across_pack else current_pack["seq_lens"][-1]
         )
 
         output_dict = {
-            "tokens": current_pack["tokens"][boundary:],
+            "input_ids": current_pack["input_ids"][boundary:],
             "labels": current_pack["labels"][boundary:],
             "position_ids": current_pack["position_ids"][boundary:],
             "seq_lens": [next_seq_len],
@@ -184,7 +184,7 @@ class HFDatasetPackedSequenceHelper:
     def _convert_to_tensors(self, pack: PACK_TYPE) -> PACK_TYPE:
         """Converts a pack into tensors. Pack comes in as a dict of lists and is converted to tensors."""
         tensor_pack = {
-            "tokens": torch.tensor(pack["tokens"], dtype=torch.long),
+            "input_ids": torch.tensor(pack["input_ids"], dtype=torch.long),
             "labels": torch.tensor(pack["labels"], dtype=torch.long),
             "position_ids": torch.tensor(pack["position_ids"], dtype=torch.long),
             "seq_lens": torch.tensor(pack["seq_lens"], dtype=torch.long),
@@ -196,9 +196,9 @@ class HFDatasetPackedSequenceHelper:
     def _pad_pack(self, pack: PACK_TYPE, padding_idx: int) -> PACK_TYPE:
         """Pads a pack to ``self.packed_sequence_size``."""
         # Pad tokens
-        num_padding_tokens = self.packed_sequence_size - len(pack["tokens"])
+        num_padding_tokens = self.packed_sequence_size - len(pack["input_ids"])
         padded_tokens = F.pad(
-            pack["tokens"],
+            pack["input_ids"],
             (0, num_padding_tokens),
             value=padding_idx,
         )
@@ -237,7 +237,7 @@ class HFDatasetPackedSequenceHelper:
         padded_position_ids = torch.cat([pack["position_ids"], clamped_num_range])
 
         padded_pack = {
-            "tokens": padded_tokens,
+            "input_ids": padded_tokens,
             "labels": padded_labels,
             "position_ids": padded_position_ids,
             "seq_lens": padded_seq_lens,
