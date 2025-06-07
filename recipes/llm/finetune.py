@@ -28,7 +28,7 @@ from nemo_automodel.distributed.parallelizer import create_context_parallel_ctx,
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.step_scheduler import StepScheduler
 from nemo_automodel.utils.dist_utils import reduce_loss, get_sync_ctx, rescale_gradients, clip_gradients
-from nemo_automodel.checkpoint.checkpointing import save, load
+from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 
 # ---------------------------
 #  Stateless helper functions
@@ -63,6 +63,24 @@ def build_model(device, cfg_model, cfg_peft, model_wrapper) -> nn.Module:
         return model
     else:
         return model.to(device)
+
+
+def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id):
+    """
+    Build a checkpoint configuration.
+    """
+    from transformers.utils import TRANSFORMERS_CACHE
+
+    ckpt_kwargs = dict(  
+        enabled=True,
+        checkpoint_dir="checkpoints/",
+        model_save_format="safetensors",
+        model_repo_id=model_repo_id,
+        model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
+    )
+    if cfg_ckpt is not None:
+        ckpt_kwargs |= cfg_ckpt.to_dict()
+    return CheckpointingConfig(**ckpt_kwargs)
 
 def build_optimizer(cfg_opt, model, tp_size) -> 'Optimizer':  # noqa: F821
     """
@@ -251,6 +269,13 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Scheduler
         self.step_scheduler = build_step_scheduler(self.cfg.get('step_scheduler', None), self.dataloader)
+        
+        # Build checkpointing config
+        self.checkpoint_config = build_checkpoint_config(
+            self.cfg.get('checkpoint', None),
+            self.cfg.get('model.cache_dir', None),
+            self.cfg.model.pretrained_model_name_or_path,
+        )
 
         # Optionally resume
         if (path := self.cfg.get("restore_from")) is not None:
@@ -281,10 +306,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         )
 
                 if is_ckpt_step:
-                    save(
-                        f"checkpoints/step_{self.step_scheduler.step}",
-                        **self.state_dict(),
-                    )
+                    self.save_checkpoint()
 
                 if is_val_step and self.val_dataloader is not None:
                     val_loss = self._run_validation_epoch()
@@ -302,41 +324,6 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                             f"epoch {self.step_scheduler.epoch} | "
                             f"loss {val_loss:.4f}",
                         )
-
-    # ------------------ checkpointing ------------------
-    def state_dict(self) -> dict[str, Any]:
-        # this line automatically manages FSDP FQN's, as well as sets the default state dict type to FSDP.SHARDED_STATE_DICT
-        # model_state_dict = get_model_state_dict(
-        #     self.model,
-        #     options=StateDictOptions(
-        #         cpu_offload=True,
-        #         full_state_dict=True,
-        #     ),
-        # )
-        # if self.model.config.tie_word_embeddings:
-        #     model_state_dict.pop("lm_head.weight", None)
-
-        optimizer_state_dict = get_optimizer_state_dict(
-            self.model,
-            self.optimizer,
-            options=StateDictOptions(
-                cpu_offload=True
-            ),
-        )
-        scheduler_state_dict = self.step_scheduler.state_dict()
-        dataloader_state_dict = self.dataloader.state_dict()
-        return {
-            "model_state_dict": model_state_dict,
-            "optimizer_state_dict": optimizer_state_dict,
-            "scheduler_state_dict": scheduler_state_dict,
-            "dataloader_state_dict": dataloader_state_dict,
-        }
-    
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        set_model_state_dict(self.model, state_dict["model_state_dict"])
-        set_optimizer_state_dict(self.model, self.optimizer, state_dict["optimizer_state_dict"])
-        self.step_scheduler.load_state_dict(state_dict["scheduler_state_dict"])
-        self.dataloader.load_state_dict(state_dict["dataloader_state_dict"])
 
     # ------------------ helpers ------------------
     def _run_train_step(self, batch, is_optim_step, clip_norm=1.0):

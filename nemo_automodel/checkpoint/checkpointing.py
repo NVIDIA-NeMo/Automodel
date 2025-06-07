@@ -28,12 +28,13 @@ from nemo_automodel.checkpoint.hf_storage import (
     HuggingFaceStorageReader,
     get_fqn_to_file_index_mapping,
 )
-from torch.distributed.checkpoint import DefaultSavePlanner
-from torch.distributed.checkpoint.filesystem import SerializationFormat
 from nemo_automodel.checkpoint.stateful_wrappers import ModelState, OptimizerState
 import glob
+import json
+from torch.distributed.checkpoint.filesystem import SerializationFormat
 
 PathLike = Union[str, "os.PathLike[Any]"]
+    
 
 @dataclass
 class CheckpointingConfig:
@@ -59,9 +60,14 @@ def save_model(
     """
     Save a model state dictionary to a weights path.
 
+    This function can save a model in the following formats:
+    - safetensors (in HF format)
+    - torch_save (in DCP format)
+
     Args:
-        model_state_dict: Model state dictionary to save
+        model: Model to save
         weights_path: Path to save model weights
+        checkpoint_config: Checkpointing configuration
     """
     # TODO(@adil-a): Need to add support for PEFT.
     # We also need to eventually add suport for HSDP, so we only save on non-duplicate ranks.
@@ -71,15 +77,19 @@ def save_model(
     model_path = os.path.join(weights_path, "model")
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         os.makedirs(model_path, exist_ok=True)
+
+        # save the config.json file
+        if checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
+            with open(os.path.join(model_path, "config.json"), "w") as f:
+                f.write(model.config.to_json_string())
+
     # Ensure all ranks wait for rank 0 to handle directories
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    model_state = ModelState(model, checkpoint_config.model_save_format)
+    model_state_dict = ModelState(model, checkpoint_config.model_save_format).state_dict()
     
     if checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
-        model_state_dict = model_state.state_dict()
-
         # we first need to find the FQN -> .safetensors mapping
         index_path = _get_safetensors_index_path(
             checkpoint_config.model_cache_dir,
@@ -94,10 +104,7 @@ def save_model(
             if fqn not in fqn_to_file_index_mapping:
                 if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                     print(f"Adding missing key to mapping: {fqn}")
-                fqn_to_file_index_mapping[fqn] = default_index
-
-        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-            print(f"Saving checkpoint to {weights_path}")
+                fqn_to_file_index_mapping[fqn] = default_index          
 
         storage_writer = HuggingFaceStorageWriter(
             path=model_path,
@@ -110,96 +117,193 @@ def save_model(
                 checkpoint_id=model_path,
                 storage_writer=storage_writer,
                 no_dist=True,
-                planner=DefaultSavePlanner(),
             )
     elif checkpoint_config.model_save_format == SerializationFormat.TORCH_SAVE:
-        dcp.save({"model": model_state}, checkpoint_id=model_path)
+        dcp.save({"model": model_state_dict}, checkpoint_id=model_path)
     else:
         raise ValueError(f"Unsupported model save format: {checkpoint_config.model_save_format}")
 
-def save(
+
+def load_model(
+    model: torch.nn.Module,
     weights_path: str,
-    model_state_dict: dict[str, Any],
-    optimizer_state_dict: Optional[dict[str, Any]] = None,
-    scheduler_state_dict: Optional[dict[str, Any]] = None,
-    dataloader_state_dict: Optional[dict[str, Any]] = None,
-    tokenizer: Optional[Any] = None,
-    # reference_model_path: str = "/opt/models/models--meta-llama--Llama-3.2-1B/snapshots/4e20de362430cd3b72f300e6b0f18e50e7166e08/",
-    reference_model_path: str = "/opt/models/models--meta-llama--Llama-3.2-3B/snapshots/13afe5124825b4f3751f836b40dafda64c1ed062/",
-) -> None:
-    """Save a checkpoint of the model and optionally optimizer state.
+    checkpoint_config: CheckpointingConfig,
+):
+    """
+    Load a model state dictionary from a weights path.
 
     Args:
-        weights_path: Path to save model weights
-        model_state_dict: Model state dictionary to save
-        optimizer_state_dict: Optional optimizer state dictionary to save
-        scheduler_state_dict: Optional scheduler state dictionary to save
-        dataloader_state_dict: Optional dataloader state dictionary to save
-        tokenizer: Optional tokenizer to save
-        reference_model_path: Path to reference model to copy file structure from.
+        model: Model to load state into
+        weights_path: Path to load model weights from
+        checkpoint_config: Checkpointing configuration
     """
-    # Load mapping from reference model
-    hf_storage_reader = HuggingFaceStorageReader(reference_model_path)
-    metadata = hf_storage_reader.read_metadata()
-    weight_map = metadata.storage_data
-    
-    fqn_to_file_index_mapping = {}
-    for fqn, filename in weight_map.items():
-        if "-" in filename:
-            index = int(filename.split("-")[1])
-            fqn_to_file_index_mapping[fqn] = index
-        else:
-            # For single-file models, all tensors go to index 1
-            fqn_to_file_index_mapping[fqn] = 1
-    
-    # Add any missing keys from the model_state_dict
-    # These will go to the same file as the last file (or file 1 for single-file models)
-    default_index = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
-    for fqn in model_state_dict.keys():
-        if fqn not in fqn_to_file_index_mapping:
-            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                print(f"Adding missing key to mapping: {fqn}")
-            fqn_to_file_index_mapping[fqn] = default_index
-
-    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        print(f"Saving checkpoint to {weights_path}")
-    
     model_path = os.path.join(weights_path, "model")
-    optimizer_path = os.path.join(weights_path, "optimizer")
-    tokenizer_path = os.path.join(weights_path, "tokenizer")
 
-    # Only rank 0 handles directory operations to avoid race conditions
+    # Validate checkpoint directory
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model path {model_path} does not exist")
+
+    if checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
+        # For HF safetensors we rely on the custom HuggingFaceStorageReader which
+        # understands both sharded and single-file checkpoints. Since we saved the
+        # model with `no_dist=True`, we also load with `no_dist=True` so that only
+        # rank-0 touches the checkpoint files and then broadcasts tensors to the
+        # remaining ranks under the hood.
+
+        # Destination state dict – FSDP aware via ModelState
+        model_state_dict = {
+            "model": ModelState(model, checkpoint_config.model_save_format).state_dict()
+        }
+
+        storage_reader = HuggingFaceStorageReader(path=model_path)
+
+        # Allow the planner to resize tensors when the destination param has been
+        # replaced/expanded (e.g., when users add new special tokens). For exact
+        # restores this is a no-op.
+        from nemo_automodel.checkpoint.hf_planner import HuggingFaceLoadPlanner
+
+        load_planner = HuggingFaceLoadPlanner(allow_tensor_resize=True)
+
+        dcp.load(
+            state_dict=model_state_dict,
+            checkpoint_id=model_path,
+            storage_reader=storage_reader,
+            planner=load_planner,
+            no_dist=True,
+        )
+    elif checkpoint_config.model_save_format == SerializationFormat.TORCH_SAVE:
+        model_state_dict = {"model": ModelState(model, checkpoint_config.model_save_format).state_dict()}
+        dcp.load(state_dict=model_state_dict, checkpoint_id=model_path)
+    else:
+        raise ValueError(f"Unsupported model save format: {checkpoint_config.model_save_format}")
+
+
+def save_optimizer(
+    optimizer: torch.optim.Optimizer,
+    model: torch.nn.Module,
+    weights_path: str,
+    scheduler: Optional[Any] = None,
+):
+    """
+    Save an optimizer state dictionary to a weights path.
+
+    Args:
+        optimizer: Optimizer to save
+        model: Model to save optimizer state for
+        weights_path: Path to save optimizer weights
+        scheduler: Optional scheduler to save
+    """
+    optimizer_path = os.path.join(weights_path, "optim")
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        # Create fresh directories
-        os.makedirs(model_path, exist_ok=True)
         os.makedirs(optimizer_path, exist_ok=True)
-        os.makedirs(tokenizer_path, exist_ok=True)
+    optimizer_state_dict = OptimizerState(model, optimizer, scheduler).state_dict()
+    dcp.save({"optim": optimizer_state_dict}, checkpoint_id=optimizer_path)
+
+def load_optimizer(
+    optimizer: torch.optim.Optimizer,
+    model: torch.nn.Module,
+    weights_path: str,
+    scheduler: Optional[Any] = None,
+):
+    """
+    Load an optimizer state dictionary from a weights path.
+
+    Args:
+        optimizer: Optimizer to load state into
+        model: Model to load optimizer state for
+        weights_path: Path to load optimizer weights from
+        scheduler: Optional scheduler to load state into
+    """
+    optimizer_path = os.path.join(weights_path, "optim")
+    if not os.path.exists(optimizer_path):
+        raise FileNotFoundError(f"Optimizer path {optimizer_path} does not exist")
+
+    optimizer_state_dict = {"optim": OptimizerState(model, optimizer, scheduler).state_dict()}
+    dcp.load(state_dict=optimizer_state_dict, checkpoint_id=optimizer_path)
+
+# def save(
+#     weights_path: str,
+#     model_state_dict: dict[str, Any],
+#     optimizer_state_dict: Optional[dict[str, Any]] = None,
+#     scheduler_state_dict: Optional[dict[str, Any]] = None,
+#     dataloader_state_dict: Optional[dict[str, Any]] = None,
+#     tokenizer: Optional[Any] = None,
+#     # reference_model_path: str = "/opt/models/models--meta-llama--Llama-3.2-1B/snapshots/4e20de362430cd3b72f300e6b0f18e50e7166e08/",
+#     reference_model_path: str = "/opt/models/models--meta-llama--Llama-3.2-3B/snapshots/13afe5124825b4f3751f836b40dafda64c1ed062/",
+# ) -> None:
+#     """Save a checkpoint of the model and optionally optimizer state.
+
+#     Args:
+#         weights_path: Path to save model weights
+#         model_state_dict: Model state dictionary to save
+#         optimizer_state_dict: Optional optimizer state dictionary to save
+#         scheduler_state_dict: Optional scheduler state dictionary to save
+#         dataloader_state_dict: Optional dataloader state dictionary to save
+#         tokenizer: Optional tokenizer to save
+#         reference_model_path: Path to reference model to copy file structure from.
+#     """
+#     # Load mapping from reference model
+#     hf_storage_reader = HuggingFaceStorageReader(reference_model_path)
+#     metadata = hf_storage_reader.read_metadata()
+#     weight_map = metadata.storage_data
     
-    # Ensure all ranks wait for rank 0 to handle directories
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+#     fqn_to_file_index_mapping = {}
+#     for fqn, filename in weight_map.items():
+#         if "-" in filename:
+#             index = int(filename.split("-")[1])
+#             fqn_to_file_index_mapping[fqn] = index
+#         else:
+#             # For single-file models, all tensors go to index 1
+#             fqn_to_file_index_mapping[fqn] = 1
+    
+#     # Add any missing keys from the model_state_dict
+#     # These will go to the same file as the last file (or file 1 for single-file models)
+#     default_index = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
+#     for fqn in model_state_dict.keys():
+#         if fqn not in fqn_to_file_index_mapping:
+#             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+#                 print(f"Adding missing key to mapping: {fqn}")
+#             fqn_to_file_index_mapping[fqn] = default_index
 
-    storage_writer = HuggingFaceStorageWriter(
-        path=model_path,
-        fqn_to_index_mapping=fqn_to_file_index_mapping,
-    )
+#     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+#         print(f"Saving checkpoint to {weights_path}")
+    
+#     model_path = os.path.join(weights_path, "model")
+#     optimizer_path = os.path.join(weights_path, "optimizer")
+#     tokenizer_path = os.path.join(weights_path, "tokenizer")
 
-    if torch.distributed.get_rank() == 0:
-        dcp.save(model_state_dict, checkpoint_id=model_path, storage_writer=storage_writer, no_dist=True, planner=DefaultSavePlanner())
+#     # Only rank 0 handles directory operations to avoid race conditions
+#     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+#         # Create fresh directories
+#         os.makedirs(model_path, exist_ok=True)
+#         os.makedirs(optimizer_path, exist_ok=True)
+#         os.makedirs(tokenizer_path, exist_ok=True)
+    
+#     # Ensure all ranks wait for rank 0 to handle directories
+#     if torch.distributed.is_initialized():
+#         torch.distributed.barrier()
 
-    # Save optimizer and scheduler together to avoid overwrite warnings
-    if optimizer_state_dict is not None or scheduler_state_dict is not None:
-        combined_state = {}
-        if optimizer_state_dict is not None:
-            combined_state["optimizer"] = optimizer_state_dict
-        if scheduler_state_dict is not None:
-            combined_state["scheduler"] = scheduler_state_dict
-        dcp.save(combined_state, checkpoint_id=optimizer_path)
+#     storage_writer = HuggingFaceStorageWriter(
+#         path=model_path,
+#         fqn_to_index_mapping=fqn_to_file_index_mapping,
+#     )
 
-    if tokenizer is not None:
-        tokenizer.save_pretrained(tokenizer_path)
-    if dataloader_state_dict is not None:
-        torch.save(dataloader_state_dict, os.path.join(weights_path, "dataloader.pt"))
+#     if torch.distributed.get_rank() == 0:
+#         dcp.save(model_state_dict, checkpoint_id=model_path, storage_writer=storage_writer, no_dist=True, planner=DefaultSavePlanner())
+
+#     # Save optimizer and scheduler together to avoid overwrite warnings
+#     if optimizer_state_dict is not None or scheduler_state_dict is not None:
+#         combined_state = {}
+#         if optimizer_state_dict is not None:
+#             combined_state["optimizer"] = optimizer_state_dict
+#         if scheduler_state_dict is not None:
+#             combined_state["scheduler"] = scheduler_state_dict
+#         dcp.save(combined_state, checkpoint_id=optimizer_path)
+
+#     if tokenizer is not None:
+#         tokenizer.save_pretrained(tokenizer_path)
+#     if dataloader_state_dict is not None:
+#         torch.save(dataloader_state_dict, os.path.join(weights_path, "dataloader.pt"))
 
 
 def load(

@@ -24,6 +24,8 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.checkpoint.stateful import Stateful
 
+from torch.distributed.checkpoint.filesystem import SerializationFormat
+
 # modified from pytorch tutorial https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html
 class ModelState(Stateful):
     """Helper class for tracking model state in distributed checkpointing.
@@ -35,9 +37,10 @@ class ModelState(Stateful):
         model: The PyTorch model to track.
     """
 
-    def __init__(self, model: torch.nn.Module):
+    def __init__(self, model: torch.nn.Module, serialization_format: SerializationFormat):
         self.model = model
         self.remove_lm_head = model.config.tie_word_embeddings
+        self.serialization_format = serialization_format
 
     def state_dict(self) -> dict[str, Any]:
         """Get the model's state dictionary.
@@ -50,7 +53,7 @@ class ModelState(Stateful):
             self.model,
             options=StateDictOptions(
                 cpu_offload=True,
-                full_state_dict=True,
+                full_state_dict=True if self.serialization_format == SerializationFormat.SAFETENSORS else False,
             ),
         )
         if self.remove_lm_head:
