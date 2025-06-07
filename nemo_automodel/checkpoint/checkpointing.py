@@ -15,23 +15,107 @@
 """Checkpoint management utilities for HF models."""
 
 import os
-from typing import Any, Optional
+from typing import Any, Optional, Union
+from dataclasses import dataclass
+from pathlib import Path
 
 import torch
+import torch.nn as nn
 import torch.distributed
 import torch.distributed.checkpoint as dcp
-from torch.distributed.checkpoint.stateful import Stateful
-from transformers import AutoConfig, AutoTokenizer
 from nemo_automodel.checkpoint.hf_storage import (
     HuggingFaceStorageWriter,
     HuggingFaceStorageReader,
-)
-from nemo_automodel.checkpoint.hf_planner import (
-    HuggingFaceSavePlanner,
-    HuggingFaceLoadPlanner,
+    get_fqn_to_file_index_mapping,
 )
 from torch.distributed.checkpoint import DefaultSavePlanner
+from torch.distributed.checkpoint.filesystem import SerializationFormat
+from nemo_automodel.checkpoint.stateful_wrappers import ModelState, OptimizerState
+import glob
 
+PathLike = Union[str, "os.PathLike[Any]"]
+
+@dataclass
+class CheckpointingConfig:
+    enabled: bool
+    checkpoint_dir: str | Path
+    model_save_format: SerializationFormat | str
+    model_cache_dir: str | Path
+    model_repo_id: str
+
+    def __post_init__(self):
+        # Convert a raw string such as "safetensors" into the right Enum
+        if isinstance(self.model_save_format, str):
+            self.model_save_format = SerializationFormat[
+                self.model_save_format.upper()
+            ]
+
+
+def save_model(
+        model: nn.Module,
+        weights_path: str,
+        checkpoint_config: CheckpointingConfig,
+):
+    """
+    Save a model state dictionary to a weights path.
+
+    Args:
+        model_state_dict: Model state dictionary to save
+        weights_path: Path to save model weights
+    """
+    # TODO(@adil-a): Need to add support for PEFT.
+    # We also need to eventually add suport for HSDP, so we only save on non-duplicate ranks.
+    # Add functionality to chunk different layers for different ranks to save.
+    # The above functionality will also make it trivial to get a FQN -> rank mapping which doesn't leave out any user modified layers.
+        # This is because we need to create the mapping on the fly from the model state dict.
+    model_path = os.path.join(weights_path, "model")
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        os.makedirs(model_path, exist_ok=True)
+    # Ensure all ranks wait for rank 0 to handle directories
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+    model_state = ModelState(model, checkpoint_config.model_save_format)
+    
+    if checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
+        model_state_dict = model_state.state_dict()
+
+        # we first need to find the FQN -> .safetensors mapping
+        index_path = _get_safetensors_index_path(
+            checkpoint_config.model_cache_dir,
+            checkpoint_config.model_repo_id,
+        )
+        fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(index_path)
+
+        # Add any missing keys from the model_state_dict
+        # These will go to the same file as the last file (or file 1 for single-file models)
+        default_index = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
+        for fqn in model_state_dict.keys():
+            if fqn not in fqn_to_file_index_mapping:
+                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                    print(f"Adding missing key to mapping: {fqn}")
+                fqn_to_file_index_mapping[fqn] = default_index
+
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            print(f"Saving checkpoint to {weights_path}")
+
+        storage_writer = HuggingFaceStorageWriter(
+            path=model_path,
+            fqn_to_index_mapping=fqn_to_file_index_mapping,
+        )
+
+        if torch.distributed.get_rank() == 0:
+            dcp.save(
+                model_state_dict,
+                checkpoint_id=model_path,
+                storage_writer=storage_writer,
+                no_dist=True,
+                planner=DefaultSavePlanner(),
+            )
+    elif checkpoint_config.model_save_format == SerializationFormat.TORCH_SAVE:
+        dcp.save({"model": model_state}, checkpoint_id=model_path)
+    else:
+        raise ValueError(f"Unsupported model save format: {checkpoint_config.model_save_format}")
 
 def save(
     weights_path: str,
@@ -146,3 +230,48 @@ def load(
         print(f"Loading optimizer from {optimizer_path}")
         optimizer_state_dict = {"optim": OptimizerState(model, optimizer, scheduler)}
         dcp.load(state_dict=optimizer_state_dict, checkpoint_id=optimizer_path)
+
+
+def _get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
+    """
+    Return the directory containing the first `model.safetensors.index.json` found
+    for a given model, or ``None`` if it does not exist in the cache yet.
+
+    For example, if the file located is
+
+        /opt/models/models--meta-llama--Llama-3.2-3B/snapshots/13afe.../model.safetensors.index.json
+
+    this function will return the directory path
+
+        /opt/models/models--meta-llama--Llama-3.2-3B/snapshots/13afe...
+
+    This will error if the model hasn't been downloaded or if the cache directory is incorrect.
+
+    Args:
+        cache_dir: Path to cache directory
+        repo_id: Hugging Face repository ID
+
+    Returns:
+        Path to the directory containing the index file.
+    
+    Raises:
+        FileNotFoundError: If the index file is not found.
+    """
+    repo_dir = f"models--{repo_id.replace('/', '--')}"
+    snapshots_root = Path(cache_dir) / repo_dir / "snapshots"
+
+    # Look for an index file inside any snapshot directory.
+    pattern = snapshots_root / "*" / "model.safetensors.index.json"
+    matches = glob.glob(str(pattern))
+    if matches:
+        # Return the directory path that contains the index file.
+        return str(Path(matches[0]).parent)
+
+    # Fall back: if no index file, return the first available snapshot directory (if any).
+    # This is the case for single-file models.
+    snapshot_dirs = [p for p in glob.glob(str(snapshots_root / "*")) if Path(p).is_dir()]
+    if snapshot_dirs:
+        try:
+            return snapshot_dirs[0]
+        except IndexError:
+            raise FileNotFoundError(f"No snapshot directories found in {snapshots_root}")
