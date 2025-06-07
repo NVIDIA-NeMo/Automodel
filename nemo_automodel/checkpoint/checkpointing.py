@@ -154,7 +154,6 @@ def load_model(
         model_state_dict = ModelState(model, checkpoint_config.model_save_format).state_dict()
 
         storage_reader = HuggingFaceStorageReader(path=model_path)
-        breakpoint()
 
         # Allow the planner to resize tensors when the destination param has been
         # replaced/expanded (e.g., when users add new special tokens). For exact
