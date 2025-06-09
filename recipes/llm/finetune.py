@@ -24,6 +24,11 @@ from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.step_scheduler import StepScheduler
 from nemo_automodel.utils.dist_utils import reduce_loss, get_sync_ctx, rescale_gradients, clip_gradients
 from transformers import AutoTokenizer
+from nemo_automodel.loggers.log_utils import setup_logging
+
+import logging
+logger = logging.getLogger(__name__)
+
 # ---------------------------
 #  Stateless helper functions
 # ---------------------------
@@ -185,7 +190,10 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         Raises:
             NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
         """
+        torch.cuda.reset_peak_memory_stats()
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
+        # setups logging and adds the rankfilter to logging
+        setup_logging()
 
         self.device_mesh = None
         self.model_wrapper = None
@@ -216,7 +224,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 config=self.cfg,
                 settings=Settings(silent=True),
             )
-            print("🚀 View run at {}".format(run.url))
+            logging.info("🚀 View run at {}".format(run.url))
 
         # Build components
         self.model = build_model(self.dist_env.device, self.cfg.model, self.cfg.get('peft', None), self.model_wrapper)
@@ -408,13 +416,12 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             # log
             reporting_loss = self.log_train_metrics(grad_norm)
-            if self.dist_env.is_main:
-                print(
-                    f"step {self.step_scheduler.step} | "
-                    f"epoch {self.step_scheduler.epoch} | "
-                    f"loss {reporting_loss:.6f} | "
-                    f"grad_norm {grad_norm:.6f}"
+            logging.info("step {} | epoch {} | loss {:.6f} | grad_norm {:.6f} | mem: {:.2f} GiB".format(
+                    self.step_scheduler.step, self.step_scheduler.epoch, reporting_loss, grad_norm,
+                    torch.cuda.max_memory_allocated() / 1024 ** 3
                 )
+            )
+            torch.cuda.reset_peak_memory_stats()
 
 
     @torch.no_grad()
@@ -507,11 +514,10 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         "epoch": self.step_scheduler.epoch
                     }
                 )
-            print(
-                f"[val] step {self.step_scheduler.step} | "
-                f"epoch {self.step_scheduler.epoch} | "
-                f"loss {val_loss:.4f}",
+        logging.info("[val] step {} | epoch {} | loss {:.6f}".format(
+                self.step_scheduler.step, self.step_scheduler.epoch, val_loss
             )
+        )
 
     def log_train_metrics(self, grad_norm):
         """
