@@ -28,6 +28,10 @@ __all__ = [
 ]
 
 def __getattr__(name: str):
+    """
+    Lazily import and cache submodules listed in __all__ when accessed.
+    Raises AttributeError if the name isn’t in __all__.
+    """
     if name in __all__:
         # import submodule on first access
         module = importlib.import_module(f"{__name__}.{name}")
@@ -37,5 +41,7 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {rame!r}")
 
 def __dir__():
-    # so that dir(nemo_automodel) shows components
+    """
+    Expose the names of all available submodules for auto-completion.
+    """
     return sorted(__all__)
