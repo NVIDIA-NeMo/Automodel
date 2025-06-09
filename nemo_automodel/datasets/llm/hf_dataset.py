@@ -9,7 +9,7 @@ from datasets import Dataset, DatasetDict, load_dataset
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from nemo_automodel.utils.common_utils import log_single_rank
+from nemo_automodel.utils.dist_utils import log_single_rank
 from nemo_automodel.datasets.utils import batchify, pad_within_micro, extract_key_from_dicts
 
 logger = logging.getLogger(__name__)
