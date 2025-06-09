@@ -43,6 +43,7 @@ class RankFilter(logging.Filter):
             # permantly disable logging for rank != 0
             if rank > 0:
                 logging.disable(logging.CRITICAL)
+                return False
         return True
 
 def warning_filter(record: LogRecord) -> bool:
@@ -129,6 +130,9 @@ def setup_logging(
 
     if filter_warning:
         add_filter_to_all_loggers(warning_filter)
-    logging.getLogger().addFilter(RankFilter())
+    add_filter_to_all_loggers(RankFilter())
+    root = logging.getLogger()
+    for h in root.handlers:
+        h.addFilter(RankFilter())
     if modules_to_filter:
         add_filter_to_all_loggers(partial(module_filter, modules_to_filter=modules_to_filter))
