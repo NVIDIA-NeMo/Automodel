@@ -11,3 +11,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import importlib
+import sys
+
+__all__ = [
+    "_peft",
+    "config",
+    "datasets",
+    "distributed",
+    "loggers",
+    "loss",
+    "optim",
+    "training",
+    "transformers",
+    "utils"
+]
+
+def __getattr__(name: str):
+    if name in __all__:
+        # import submodule on first access
+        module = importlib.import_module(f"{__name__}.{name}")
+        # cache it in globals() so future lookups do not re-import
+        globals()[name] = module
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {rame!r}")
+
+def __dir__():
+    # so that dir(nemo_automodel) shows components
+    return sorted(__all__)
