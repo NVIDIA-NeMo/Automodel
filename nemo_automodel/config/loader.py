@@ -18,7 +18,6 @@ import importlib
 import importlib.util
 import os
 import sys
-from functools import reduce
 
 def translate_value(v):
     """
@@ -170,7 +169,6 @@ class ConfigNode:
         if not hasattr(self, "_target_"):
             raise AttributeError("No _target_ found to instantiate")
 
-        target = self._target_
         func = _resolve_target(self._target_)
 
         # Prepare kwargs from config
