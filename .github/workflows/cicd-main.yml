@@ -166,7 +166,7 @@ jobs:
       matrix:
         include:
           - script: L2_placeholder
-            runner: linux-amd64-cpu16
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
           - script: L2_HF_Transformer_PEFT
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
     needs: [cicd-unit-tests]

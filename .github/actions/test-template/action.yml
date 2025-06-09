@@ -232,8 +232,7 @@ runs:
           echo Test did not finish successfully.
           exit 1
         fi
-        echo "IS_SUCESS: $IS_SUCCESS"
-        echo "EXIT_CODE: $EXIT_CODE"
+
         exit $EXIT_CODE
 
     - name: Test coverage
