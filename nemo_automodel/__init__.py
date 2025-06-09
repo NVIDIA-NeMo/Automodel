@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
-import sys
 
 __all__ = [
     "_peft",
@@ -38,7 +37,7 @@ def __getattr__(name: str):
         # cache it in globals() so future lookups do not re-import
         globals()[name] = module
         return module
-    raise AttributeError(f"module {__name__!r} has no attribute {rame!r}")
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 def __dir__():
     """
