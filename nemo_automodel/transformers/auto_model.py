@@ -14,7 +14,7 @@
 
 import logging
 import types
-
+import torch
 from transformers import AutoModelForCausalLM
 from nemo_automodel.package_info import __version__
 
