@@ -14,7 +14,7 @@
 
 import logging
 import types
-
+import torch
 from transformers import AutoModelForCausalLM
 from nemo_automodel.package_info import __version__
 
@@ -115,9 +115,11 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
         constructed model and recursively reloads it once with
         ``use_liger_kernel=False``.
         """
+        torch_dtype = kwargs.get('default_dtype', torch.bfloat16)
         use_liger_kernel = kwargs.pop('use_liger_kernel', True)
         sdpa_method = kwargs.pop('sdpa_method', None)
-        model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs,
+            torch_dtype=torch_dtype)
         if use_liger_kernel:
             if not HAS_LIGER_KERNEL:
                 logging.warning("Asked to use Liger Kernel, but could not import")
@@ -128,7 +130,8 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
                 del model
                 # If patching failed, retry
                 return cls.from_pretrained(
-                    pretrained_model_name_or_path, *model_args, **kwargs, use_liger_kernel=False)
+                    pretrained_model_name_or_path, *model_args, **kwargs, torch_dtype=torch_dtype,
+                        use_liger_kernel=False)
         model = patch_attention(model, sdpa_method)
         model.config.update({"nemo_version" : __version__})
         return model
@@ -160,9 +163,10 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
         NeMoAutoModelForCausalLM.from_pretrained : Same logic for checkpoint
         loading.
         """
+        torch_dtype = kwargs.get('default_dtype', torch.bfloat16)
         use_liger_kernel = kwargs.pop('use_liger_kernel', True)
         sdpa_method = kwargs.pop('sdpa_method', None)
-        model = super().from_config(config, **kwargs)
+        model = super().from_config(config, **kwargs, torch_dtype=torch_dtype)
         if use_liger_kernel:
             if not HAS_LIGER_KERNEL:
                 logging.warning("Asked to use Liger Kernel, but could not import")
@@ -172,7 +176,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
             except Exception:
                 del model
                 # If patching failed, retry
-                return cls.from_config(config, **kwargs, use_liger_kernel=False)
+                return cls.from_config(config, **kwargs, use_liger_kernel=False, torch_dtype=torch_dtype)
         model = patch_attention(model, sdpa_method)
         model.config.update({"nemo_version" : __version__})
         return model

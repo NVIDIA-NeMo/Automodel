@@ -261,6 +261,21 @@ class ConfigNode:
                 return default
         return current
 
+    def set_by_dotted(self, dotted_key: str, value):
+        """
+        Set (or append) a value in the config using a dotted key.
+        e.g. set_by_dotted("foo.bar.abc", 1) will ensure self.foo.bar.abc == 1
+        """
+        parts = dotted_key.split(".")
+        node = self
+        # walk / create intermediate ConfigNodes
+        for p in parts[:-1]:
+            if p not in node.__dict__ or not isinstance(node.__dict__[p], ConfigNode):
+                node.__dict__[p] = ConfigNode({})
+            node = node.__dict__[p]
+        # wrap the final leaf value
+        node.__dict__[parts[-1]] = node._wrap(parts[-1], value)
+
     def __repr__(self, level=0):
         """
         Return a string representation of the configuration node with indentation.
