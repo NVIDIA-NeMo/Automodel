@@ -10,6 +10,7 @@ from typing import Any, Dict
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+import pathlib
 from torch.distributed.device_mesh import _mesh_resources
 
 try:
@@ -155,7 +156,7 @@ def build_step_scheduler(cfg, dataloader):
         num_epochs = 10,
         grad_acc_steps = 10,
         ckpt_every_steps = 100,
-        epoch_len = len(dataloader),
+        dataloader = dataloader,
     )
     if cfg is not None:
         default_kwargs |= cfg.to_dict()
@@ -272,14 +273,13 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
         self.model.train()
         for epoch in self.step_scheduler.epochs:
-            for batch_idx, batch in enumerate(self.dataloader):
-                is_optim_step, is_ckpt_step, is_val_step = self.step_scheduler.update(batch_idx)
-                self._run_train_step(batch, is_optim_step, 1.0)
-                if is_ckpt_step and self.dist_env.is_main:
+            for batch_idx, batch in enumerate(self.step_scheduler):
+                self._run_train_step(batch, self.step_scheduler.is_optim_step, 1.0)
+                if self.step_scheduler.is_ckpt_step and self.dist_env.is_main:
                 #     self._save_checkpoint()
                     pass
 
-                if is_val_step and self.val_dataloader is not None:
+                if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     self._run_validation_epoch()
 
 
@@ -566,7 +566,8 @@ def main():
 
     Loads the configuration, sets up the trainer, and initiates the training loop.
     """
-    cfg = parse_args_and_load_config("llama_3_2_1b_hellaswag.yaml")
+    script_path = pathlib.Path(__file__).parent.resolve()
+    cfg = parse_args_and_load_config(script_path / "llama_3_2_1b_hellaswag.yaml")
     trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
