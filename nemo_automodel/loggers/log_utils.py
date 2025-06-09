@@ -130,6 +130,6 @@ def setup_logging(
 
     if filter_warning:
         add_filter_to_all_loggers(warning_filter)
-    logging.getLogger().addFilter(RankFilter())
+    add_filter_to_all_loggers(RankFilter())
     if modules_to_filter:
         add_filter_to_all_loggers(partial(module_filter, modules_to_filter=modules_to_filter))
