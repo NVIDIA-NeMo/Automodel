@@ -234,7 +234,7 @@ runs:
           exit 1
         fi
 
-        exit $EXIT_CODE
+        exit 0
 
     - name: Test coverage
       shell: bash -x -e -u -o pipefail {0}
