@@ -201,8 +201,8 @@ def save_optimizer(
     optimizer_path = os.path.join(weights_path, "optim")
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         os.makedirs(optimizer_path, exist_ok=True)
-    optimizer_state_dict = OptimizerState(model, optimizer, scheduler).state_dict()
-    dcp.save({"optim": optimizer_state_dict}, checkpoint_id=optimizer_path)
+    optimizer_state = OptimizerState(model, optimizer, scheduler)
+    dcp.save({"optim": optimizer_state}, checkpoint_id=optimizer_path)
 
 
 def load_optimizer(
@@ -224,8 +224,8 @@ def load_optimizer(
     if not os.path.exists(optimizer_path):
         raise FileNotFoundError(f"Optimizer path {optimizer_path} does not exist")
 
-    optimizer_state_dict = {"optim": OptimizerState(model, optimizer, scheduler).state_dict()}
-    dcp.load(state_dict=optimizer_state_dict, checkpoint_id=optimizer_path)
+    optimizer_state = {"optim": OptimizerState(model, optimizer, scheduler)}
+    dcp.load(state_dict=optimizer_state, checkpoint_id=optimizer_path)
 
 
 def _get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
