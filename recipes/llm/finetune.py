@@ -11,9 +11,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import pathlib
+from torch.distributed.device_mesh import _mesh_resources
 
-from nemo_automodel.shared.import_utils import safe_import_from
-HAS_FSDP, FSDP = safe_import_from("megatron.core.distributed.custom_fsdp", "FSDP")
+try:
+    from nvfsdp import nvFSDP
+except ImportError:
+    from nemo_automodel.distributed.nvfsdp.nvfsdp import nvFSDP
 
 from nemo_automodel.config.cli import parse_args_and_load_config
 from nemo_automodel.distributed.init_utils import initialize_distributed
@@ -21,6 +24,11 @@ from nemo_automodel.distributed.parallelizer import create_context_parallel_ctx,
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.step_scheduler import StepScheduler
 from nemo_automodel.utils.dist_utils import reduce_loss, get_sync_ctx, rescale_gradients, clip_gradients
+from transformers import AutoTokenizer
+from nemo_automodel.loggers.log_utils import setup_logging
+
+import logging
+logger = logging.getLogger(__name__)
 
 # ---------------------------
 #  Stateless helper functions
@@ -92,7 +100,7 @@ def build_loss_fn(device, cfg_loss):
         return cfg_loss.instantiate().to(device)
 
 
-def build_dataloader(cfg_ds, cfg_dl, distributed_sampler_kwargs) -> DataLoader:
+def build_dataloader(cfg_ds, cfg_dl, cfg_model, distributed_sampler_kwargs) -> DataLoader:
     """
     Build a DataLoader for the dataset.
 
@@ -104,7 +112,11 @@ def build_dataloader(cfg_ds, cfg_dl, distributed_sampler_kwargs) -> DataLoader:
     Returns:
         The instantiated DataLoader.
     """
-    ds = cfg_ds.instantiate()
+    if not 'tokenizer' in cfg_ds:
+        tokenizer = AutoTokenizer.from_pretrained(cfg_model.pretrained_model_name_or_path)
+    else:
+        tokenizer = cfg_ds.tokenizer.instantiate()
+    ds = cfg_ds.instantiate(tokenizer=tokenizer)
     sampler = torch.utils.data.distributed.DistributedSampler(
         ds,
         num_replicas=distributed_sampler_kwargs.get("num_replicas", 1),
@@ -179,7 +191,10 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         Raises:
             NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
         """
+        torch.cuda.reset_peak_memory_stats()
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
+        # setups logging and adds the rankfilter to logging
+        setup_logging()
 
         self.device_mesh = None
         self.model_wrapper = None
@@ -210,7 +225,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 config=self.cfg,
                 settings=Settings(silent=True),
             )
-            print("🚀 View run at {}".format(run.url))
+            logging.info("🚀 View run at {}".format(run.url))
 
         # Build components
         self.model = build_model(self.dist_env.device, self.cfg.model, self.cfg.get('peft', None), self.model_wrapper)
@@ -223,17 +238,17 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.dataloader = build_dataloader(
             self.cfg.dataset,
             self.cfg.dataloader,
+            self.cfg.model,
             distributed_sampler_kwargs,
         )
 
         # Build validation dataloader if the config provides it
         self.val_dataloader = None
-        val_ds_cfg = self.cfg.get("validation_dataset", None)
-        val_dl_cfg = self.cfg.get("validation_dataloader", None)
-        if val_ds_cfg is not None and val_dl_cfg is not None:
+        if 'validation_dataset' in self.cfg:
             self.val_dataloader = build_dataloader(
-                val_ds_cfg,
-                val_dl_cfg,
+                self.cfg.validation_dataset,
+                self.cfg.validation_dataloader,
+                self.cfg.model,
                 distributed_sampler_kwargs,
             )
 
@@ -326,6 +341,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 False,
                 False,
             )
+
             with train_context(context_parallel_ctx):
                 out  = self.model(**batch)
 
@@ -362,8 +378,16 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             rescale_gradients(
                 self.model,
                 self.total_num_tokens,
-                self.device_mesh["data_parallel"].get_group(),
-                self.device_mesh["data_parallel"].size()
+                self.device_mesh[(
+                    "dp_cp"
+                    if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(self.device_mesh, {})
+                    else "data_parallel"
+                )].get_group(),
+                self.device_mesh[(
+                    "dp_cp"
+                    if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(self.device_mesh, {})
+                    else "data_parallel"
+                )].size()
             )
 
             # Clip gradients **after** any rescaling.
@@ -374,7 +398,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # TODO: TP WAR
                 grad_norm = 0.
 
-            if isinstance(self.model, FSDP):
+            if isinstance(self.model, nvFSDP):
                 # If the model uses nvFSDP, wait for all sharded gradients to be reduced and unsharded.
                 # Necessary because the post-backward reduce-scatter is asynchronous, so gradients and backward
                 # computations are concurrent, but the gradients of the final layer may not be available yet.
@@ -383,21 +407,21 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.optimizer.step()
             self.optimizer.zero_grad()
 
-            if isinstance(self.model, FSDP):
+            if isinstance(self.model, nvFSDP):
                 # If custom FSDP2 is configured with "optim" (optimizer state / high-precision model weight sharding),
                 # then the optimizer step will be applied to the main high-precision model weights. Update the model
                 # weights after the optimizer step.
-                self.model.param_and_grad_buffer.copy_main_weights_to_model_weights()
+                self.model.install_optimized_model_weights()
+                self.model.zero_grad_buffer()
 
             # log
             reporting_loss = self.log_train_metrics(grad_norm)
-            if self.dist_env.is_main:
-                print(
-                    f"step {self.step_scheduler.step} | "
-                    f"epoch {self.step_scheduler.epoch} | "
-                    f"loss {reporting_loss:.6f} | "
-                    f"grad_norm {grad_norm:.6f}"
+            logging.info("step {} | epoch {} | loss {:.6f} | grad_norm {:.6f} | mem: {:.2f} GiB".format(
+                    self.step_scheduler.step, self.step_scheduler.epoch, reporting_loss, grad_norm,
+                    torch.cuda.max_memory_allocated() / 1024 ** 3
                 )
+            )
+            torch.cuda.reset_peak_memory_stats()
 
 
     @torch.no_grad()
@@ -423,14 +447,54 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
             ):
                 batch["position_ids"] = torch.arange(0, batch['input_ids'].shape[1]).unsqueeze(0).to(self.model.device)
+            
+            if self.device_mesh["context_parallel"].size() > 1:
 
-            out = self.model(**batch)
-            local_loss = self.loss_fn(
-                out.logits.view(-1, out.logits.size(-1)),
-                labels.view(-1),
-                mask=loss_mask,
-                reduction="sum"
-            )
+                input_ids = batch["input_ids"].to(self.model.device)
+                position_ids = batch["position_ids"].to(self.model.device)
+
+                if loss_mask is not None:
+                    cp_buffers = [input_ids, labels, position_ids, loss_mask]
+                    cp_seq_dims = [1, 1, 1, 1]
+                    cp_no_restore_buffers = {input_ids, labels, loss_mask}
+                else:
+                    cp_buffers = [input_ids, labels, position_ids]
+                    cp_seq_dims = [1, 1, 1]
+                    cp_no_restore_buffers = {input_ids, labels}
+
+                context_parallel_ctx = create_context_parallel_ctx(
+                    cp_mesh=self.model_wrapper.device_mesh["context_parallel"],
+                    cp_buffers=cp_buffers,
+                    cp_seq_dims=cp_seq_dims,
+                    cp_no_restore_buffers=cp_no_restore_buffers,
+                    cp_rotate_method="allgather",  # TODO add "alltoall" option
+                )
+                train_context = get_train_context(
+                    False,
+                    False,
+                )
+                with train_context(context_parallel_ctx):
+                    out  = self.model(**batch)
+                    # Prepare for loss calculation
+                    logits = out.logits.float()
+                    n_cls = logits.shape[-1]
+                    logits = logits.view(-1, n_cls)
+                    labels = labels.view(-1)
+                    assert logits.shape[-2] == labels.shape[-1], "Expected logits & labels to have the same length"
+                    local_loss = self.loss_fn(logits, labels, loss_mask)
+
+                # In the case where all labels are masked, the loss should be 0.
+                if loss_mask is not None and loss_mask.bool().sum() == 0:
+                    local_loss.detach().copy_(torch.zeros_like(local_loss))
+            else:
+                out = self.model(**batch)
+                local_loss = self.loss_fn(
+                    out.logits.view(-1, out.logits.size(-1)),
+                    labels.view(-1),
+                    mask=loss_mask,
+                    reduction="sum"
+                )
+
             total_loss += local_loss.item()
             total_tokens += loss_mask.sum().item()
 
@@ -450,11 +514,10 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         "epoch": self.step_scheduler.epoch
                     }
                 )
-            print(
-                f"[val] step {self.step_scheduler.step} | "
-                f"epoch {self.step_scheduler.epoch} | "
-                f"loss {val_loss:.4f}",
+        logging.info("[val] step {} | epoch {} | loss {:.6f}".format(
+                self.step_scheduler.step, self.step_scheduler.epoch, val_loss
             )
+        )
 
     def log_train_metrics(self, grad_norm):
         """

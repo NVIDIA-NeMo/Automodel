@@ -1,18 +1,20 @@
 from dataclasses import dataclass, field
 from typing import Optional, List
 
-import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     RowwiseParallel,
 )
 
-from nemo_automodel.distributed.nvfsdp.distributed_data_parallel_config import (
-    DistributedDataParallelConfig,
-)
+try:
+    from nvfsdp import DistributedDataParallelConfig
+except ImportError:
+    from nemo_automodel.distributed.nvfsdp.distributed_data_parallel_config import (
+        DistributedDataParallelConfig,
+    )
+
 from nemo_automodel.distributed.parallelizer import (
     get_hf_tp_shard_plan,
     nvfsdp_strategy_parallelize,
@@ -36,10 +38,6 @@ class NVFSDPManager:
         tp_size (Optional[int]): Tensor-parallel group size. Defaults to 1 if zero/None.
         cp_size (int): Context-parallel group size for pipeline-like sharding.
         sequence_parallel (bool): Enables sequence parallelism in the TP plan when True.
-        mp_policy (MixedPrecisionPolicy): Defines the mixed precision policy for parameters,
-            reductions, and outputs.
-        offload_policy (CPUOffloadPolicy): Policy to offload parameters or optimizer states
-            to CPU, if specified.
         backend (str): Distributed backend to use (e.g., 'nccl' for GPUs or 'gloo' for CPUs).
         world_size (int): Total number of processes.
 
@@ -69,23 +67,6 @@ class NVFSDPManager:
         default=False,
         metadata={
             "help": "Enable sequence parallelism in TP plan if True. Not supported with nvFSDP right now."
-        },
-    )
-    mp_policy: Optional[MixedPrecisionPolicy] = field(
-        default=MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
-            output_dtype=torch.bfloat16,
-            cast_forward_inputs=True,
-        ),
-        metadata={
-            "help": "MixedPrecisionPolicy for FSDP2 (param/reduce/output dtypes)."
-        },
-    )
-    offload_policy: Optional[CPUOffloadPolicy] = field(
-        default=None,
-        metadata={
-            "help": "CPUOffloadPolicy to offload parameters/optim states to CPU."
         },
     )
     backend: Optional[str] = field(
@@ -222,33 +203,37 @@ class NVFSDPManager:
             average_in_collective=self.average_in_collective,
         )
 
-        if use_hf_tp_plan:
-            tp_shard_plan = get_hf_tp_shard_plan(model)
-        else:
-            # Parallelize the first embedding and the last linear out projection
-            base_model_tp_plan = {
-                "model.layers.*.self_attn.q_proj": ColwiseParallel(),
-                "model.layers.*.self_attn.k_proj": ColwiseParallel(),
-                "model.layers.*.self_attn.v_proj": ColwiseParallel(),
-                "model.layers.*.self_attn.o_proj": RowwiseParallel(),
-                "model.layers.*.mlp.up_proj": ColwiseParallel(),
-                "model.layers.*.mlp.gate_proj": ColwiseParallel(),
-                "model.layers.*.mlp.down_proj": RowwiseParallel(),
-            }
+        if self.device_mesh["tensor_parallel"].size() > 1:
+            if use_hf_tp_plan:
+                tp_shard_plan = get_hf_tp_shard_plan(model)
+            else:
+                # Parallelize the first embedding and the last linear out projection
+                base_model_tp_plan = {
+                    "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+                    "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+                    "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+                    "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+                    "model.layers.*.mlp.up_proj": ColwiseParallel(),
+                    "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+                    "model.layers.*.mlp.down_proj": RowwiseParallel(),
+                }
 
-            # TODO(boxiangw): investigate SP
-            if self.sequence_parallel and self.device_mesh.get_rank() == 0:
+                # TODO(boxiangw): investigate SP
+                if self.sequence_parallel and self.device_mesh.get_rank() == 0:
+                    # TODO(boxiangw): Change this to a log
+                    print(
+                        "Sequence parallelism is disabled. It is not compatible with nvFSDP."
+                    )
+
+                tp_shard_plan = base_model_tp_plan
                 # TODO(boxiangw): Change this to a log
-                print(
-                    "Sequence parallelism is disabled. It is not compatible with nvFSDP."
-                )
-
-            tp_shard_plan = base_model_tp_plan
-            # TODO(boxiangw): Change this to a log
-            if self.device_mesh.get_rank() == 0:
-                print(
-                    "Using default TP plan for parallelization. It is compatible with huggingface llama3-style models."
-                )
+                if self.device_mesh.get_rank() == 0:
+                    print(
+                        "Using default TP plan for parallelization. "
+                        "It is compatible with huggingface llama3-style models."
+                    )
+        else:
+            tp_shard_plan = None
 
         model = nvfsdp_strategy_parallelize(
             model,
