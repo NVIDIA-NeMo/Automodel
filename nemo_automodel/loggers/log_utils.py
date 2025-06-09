@@ -43,6 +43,7 @@ class RankFilter(logging.Filter):
             # permantly disable logging for rank != 0
             if rank > 0:
                 logging.disable(logging.CRITICAL)
+                return False
         return True
 
 def warning_filter(record: LogRecord) -> bool:

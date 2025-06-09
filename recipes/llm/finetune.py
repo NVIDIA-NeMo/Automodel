@@ -416,7 +416,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             # log
             reporting_loss = self.log_train_metrics(grad_norm)
-            logging.info("step {} | epoch {} | loss {:.6f} | grad_norm {:.6f} | mem: {:.2f} GiB".format(
+            logging.info("step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | mem: {:.2f} GiB".format(
                     self.step_scheduler.step, self.step_scheduler.epoch, reporting_loss, grad_norm,
                     torch.cuda.max_memory_allocated() / 1024 ** 3
                 )
@@ -447,7 +447,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
             ):
                 batch["position_ids"] = torch.arange(0, batch['input_ids'].shape[1]).unsqueeze(0).to(self.model.device)
-            
+
             if self.device_mesh["context_parallel"].size() > 1:
 
                 input_ids = batch["input_ids"].to(self.model.device)
@@ -514,7 +514,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         "epoch": self.step_scheduler.epoch
                     }
                 )
-        logging.info("[val] step {} | epoch {} | loss {:.6f}".format(
+        logging.info("[val] step {} | epoch {} | loss {:.4f}".format(
                 self.step_scheduler.step, self.step_scheduler.epoch, val_loss
             )
         )
