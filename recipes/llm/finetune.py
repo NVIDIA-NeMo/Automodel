@@ -308,12 +308,12 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         and update model parameters when necessary. Also prints loss every gradient step.
         """
         self.model.train()
-        for _ in self.step_scheduler.epochs:
+        for epoch in self.step_scheduler.epochs:
             for batch_idx, batch in enumerate(self.dataloader):
                 is_optim_step, is_ckpt_step, is_val_step = self.step_scheduler.update(batch_idx)
                 self._run_train_step(batch, is_optim_step, 1.0)
                 if is_ckpt_step:
-                    self.save_checkpoint()
+                    self.save_checkpoint(epoch, self.step_scheduler.step)
 
                 if is_val_step and self.val_dataloader is not None:
                     self._run_validation_epoch()

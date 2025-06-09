@@ -72,17 +72,21 @@ class BaseRecipe:
             self.__dict__['__state_tracked'].add(key)
         super().__setattr__(key, value)
 
-    def save_checkpoint(self):
+    def save_checkpoint(self, epoch: int, step: int):
         """
         Save the current training state as a checkpoint.
 
         As long as the object has a 'load_state_dict' and 'state_dict' function, it will be saved.
+
+        Args:
+            epoch (int): The current epoch.
+            step (int): The current step.
         """
         if not self.checkpoint_config.enabled:
             return
 
         path = self.checkpoint_config.checkpoint_dir
-        path = os.path.join(path, f"step_{self.step_scheduler.step}")
+        path = os.path.join(path, f"epoch_{epoch}_step_{step}")
         os.makedirs(path, exist_ok=True)
 
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
