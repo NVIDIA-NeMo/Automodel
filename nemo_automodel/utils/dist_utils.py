@@ -24,9 +24,9 @@ import torch.distributed
 from contextlib import ContextDecorator, nullcontext
 import torch.distributed as dist
 import yaml
-
 from nemo_automodel.utils.yaml_utils import safe_yaml_representers
 
+logger = logging.getLogger(__name__)
 
 
 class FirstRankPerNode(ContextDecorator):
@@ -136,16 +136,6 @@ def get_local_rank_preinit() -> int:
     return int(os.getenv("LOCAL_RANK", "0"))
 
 
-def print_rank_0(message: str) -> None:
-    """Print a message only on global rank 0.
-
-    Args:
-        message: The message string to print.
-    """
-    rank = get_rank_safe()
-    if rank == 0:
-        print(message, flush=True)
-
 
 def is_last_rank() -> bool:
     """Check if the current rank is the last rank in the default process group.
@@ -155,18 +145,6 @@ def is_last_rank() -> bool:
     """
     return torch.distributed.get_rank() == (torch.distributed.get_world_size() - 1)
 
-
-def print_rank_last(message: str) -> None:
-    """Print a message only on the last rank of the default process group.
-
-    Args:
-        message: The message string to print.
-    """
-    if torch.distributed.is_initialized():
-        if is_last_rank():
-            print(message, flush=True)
-    else:
-        print(message, flush=True)
 
 
 def append_to_progress_log(save_dir: str, string: str, barrier: bool = True) -> None:
@@ -203,7 +181,7 @@ def barrier_and_log(string: str) -> None:
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
     time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print_rank_0(f"[{string}] datetime: {time_str} ")
+    logger.info("[{}] datetime: {} ".format(string, time_str))
 
 
 def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs: Any):
