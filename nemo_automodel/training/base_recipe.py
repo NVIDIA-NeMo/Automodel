@@ -165,7 +165,11 @@ def _find_latest_checkpoint(checkpoint_dir):
     checkpoint_dir = Path(checkpoint_dir)
     if not checkpoint_dir.exists():
         return
-    checkpoint_files = list(checkpoint_dir.glob("step_*"))
+    # Accept checkpoints saved as either `step_<num>` or `epoch_<epoch>_step_<num>`
+    # (or any other pattern that contains the substring `step_`).
+    # This makes the checkpoint loading logic compatible with the naming scheme
+    # used in `save_checkpoint`, which currently saves to `epoch_{epoch}_step_{step}`.
+    checkpoint_files = list(checkpoint_dir.glob("*step_*"))
     if not checkpoint_files:
         return
 

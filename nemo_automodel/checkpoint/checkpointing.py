@@ -87,7 +87,7 @@ def save_model(
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    model_state_dict = ModelState(model, checkpoint_config.model_save_format).state_dict()
+    model_state = ModelState(model, checkpoint_config.model_save_format)
     
     if checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
         # we first need to find the FQN -> .safetensors mapping
@@ -100,7 +100,9 @@ def save_model(
         # Add any missing keys from the model_state_dict
         # These will go to the same file as the last file (or file 1 for single-file models)
         default_index = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
-        for fqn in model_state_dict.keys():
+
+        # TODO:(@adil-a): This will need to change when we add PP. Maybe we can cache the keys in ModelState.
+        for fqn in model.state_dict().keys():
             if fqn not in fqn_to_file_index_mapping:
                 if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                     print(f"Adding missing key to mapping: {fqn}")
@@ -113,13 +115,13 @@ def save_model(
 
         if torch.distributed.get_rank() == 0:
             dcp.save(
-                model_state_dict,
+                {"model": model_state},
                 checkpoint_id=model_path,
                 storage_writer=storage_writer,
                 no_dist=True,
             )
     elif checkpoint_config.model_save_format == SerializationFormat.TORCH_SAVE:
-        dcp.save({"model": model_state_dict}, checkpoint_id=model_path)
+        dcp.save({"model": model_state}, checkpoint_id=model_path)
     else:
         raise ValueError(f"Unsupported model save format: {checkpoint_config.model_save_format}")
 
@@ -150,8 +152,13 @@ def load_model(
         # rank-0 touches the checkpoint files and then broadcasts tensors to the
         # remaining ranks under the hood.
 
-        # Destination state dict – FSDP aware via ModelState
-        model_state_dict = ModelState(model, checkpoint_config.model_save_format).state_dict()
+        # Wrap the destination model in a Stateful helper so that DCP will call
+        # `load_state_dict` and push the loaded tensors back into the live
+        # parameters instead of simply filling a detached tensor dictionary. This
+        # was previously missing, which meant the tensors were loaded *into a
+        # temporary dict* but never copied to the actual model – causing the
+        # restored model to keep its random-initialised weights.
+        model_state = ModelState(model, checkpoint_config.model_save_format)
 
         storage_reader = HuggingFaceStorageReader(path=model_path)
 
@@ -163,15 +170,15 @@ def load_model(
         load_planner = HuggingFaceLoadPlanner(allow_tensor_resize=True)
 
         dcp.load(
-            state_dict=model_state_dict,
+            state_dict={"model": model_state},
             checkpoint_id=model_path,
             storage_reader=storage_reader,
             planner=load_planner,
             no_dist=True,
         )
     elif checkpoint_config.model_save_format == SerializationFormat.TORCH_SAVE:
-        model_state_dict = {"model": ModelState(model, checkpoint_config.model_save_format).state_dict()}
-        dcp.load(state_dict=model_state_dict, checkpoint_id=model_path)
+        model_state = ModelState(model, checkpoint_config.model_save_format)
+        dcp.load(state_dict={"model": model_state}, checkpoint_id=model_path)
     else:
         raise ValueError(f"Unsupported model save format: {checkpoint_config.model_save_format}")
 

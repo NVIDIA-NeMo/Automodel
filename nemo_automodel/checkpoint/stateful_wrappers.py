@@ -66,7 +66,15 @@ class ModelState(Stateful):
         Args:
             state_dict (dict): State dictionary to load.
         """
-        # sets our state dicts on the model, now that we've loaded
+        # If we intentionally skipped saving "lm_head.weight" (tied embeddings)
+        # PyTorch will complain during load even with strict=False depending on
+        # the underlying wrapper (e.g.
+        # torch.distributed.fsdp.wrap._MixedPrecisionHook).  To be fully
+        # compatible we inject a reference tensor so the key exists.
+        if self.remove_lm_head and "lm_head.weight" not in state_dict:
+            # weight tying guarantees this is identical to the embedding weight
+            state_dict["lm_head.weight"] = self.model.lm_head.weight.detach()
+
         set_model_state_dict(
             self.model,
             state_dict,
