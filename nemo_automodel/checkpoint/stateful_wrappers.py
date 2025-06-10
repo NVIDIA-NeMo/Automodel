@@ -39,7 +39,7 @@ class ModelState(Stateful):
 
     def __init__(self, model: torch.nn.Module, serialization_format: SerializationFormat):
         self.model = model
-        self.is_tied_lm_head = model.config.tie_word_embeddings
+        self.is_tied_lm_head = getattr(getattr(model, 'config', {}), 'tie_word_embeddings', False)
         self.serialization_format = serialization_format
 
     def state_dict(self) -> dict[str, Any]:
