@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from torch.distributed.checkpoint.stateful import Stateful
-from typing import Optional, Tuple
+from typing import Optional
 
 class StepScheduler(Stateful):
     """
@@ -30,11 +30,12 @@ class StepScheduler(Stateful):
     def __init__(self,
                  grad_acc_steps: int,
                  ckpt_every_steps: int,
-                 epoch_len: Optional[int],
+                 dataloader: Optional[int],
                  val_every_steps: Optional[int] = None,
                  start_step: int = 0,
                  start_epoch: int = 0,
-                 num_epochs: int = 10):
+                 num_epochs: int = 10,
+                 max_steps: Optional[int] = None):
         """
         Initialize the StepScheduler.
 
@@ -48,31 +49,30 @@ class StepScheduler(Stateful):
         """
         self.grad_acc_steps   = grad_acc_steps
         self.ckpt_every_steps = ckpt_every_steps
-        self.epoch_len        = epoch_len
+        self.dataloader        = dataloader
         self.step   = start_step
         self.epoch  = start_epoch
         self.num_epochs = num_epochs
+        self.epoch_len = len(dataloader)
         self.grad_step = 0        # number of optimizer steps taken
         self.val_every_steps = val_every_steps
+        self.max_steps = max_steps
 
 
-    def update(self, batch_idx: int) -> Tuple[bool, bool, bool]:
+    def __iter__(self):
+        """Iterates over dataloader while keeping track of counters
+
+        Raises:
+            StopIteration: If the dataloader was exhausted or max_steps was reached.
+
+        Yields:
+            dict: batch
         """
-        Update the scheduler for the next batch.
-
-        Args:
-            batch_idx (int): Index of the current batch.
-
-        Returns:
-            Tuple[bool, bool, bool]: A tuple of (is_optim_step, is_ckpt_step, is_val_step) indicating if a gradient
-            step, checkpoint step and validation step should be performed.
-        """
-        self.step += 1
-        is_grad = self.is_optim_step
-        is_val = self.is_val_step(is_grad)
-        is_ckpt = self.is_ckpt_step(batch_idx)
-        return is_grad, is_ckpt, is_val
-
+        for batch in self.dataloader:
+            self.step += 1
+            if isinstance(self.max_steps, int) and self.step > self.max_steps:
+                return
+            yield batch
 
     @property
     def is_optim_step(self):
@@ -82,24 +82,26 @@ class StepScheduler(Stateful):
             bool: if true, the optimizer should run.
         """
         is_grad = (self.step % self.grad_acc_steps) == 0
-        if is_grad:
-            self.grad_step += 1
+        self.grad_step += int(is_grad)
         return is_grad
 
-    def is_val_step(self, is_grad: bool):
+    @property
+    def is_val_step(self):
         """whether this step needs to call the validation
         """
         is_val = False
-        if self.val_every_steps and self.val_every_steps > 0 and is_grad:
+        if self.val_every_steps and self.val_every_steps > 0 and self.is_optim_step:
             is_val = (self.grad_step % self.val_every_steps) == 0
         return is_val
 
-    def is_ckpt_step(self, batch_idx: int):
+    @property
+    def is_ckpt_step(self):
         """whether this step needs to call the checkpoint saving.
 
         Returns:
             bool: if true, the checkpoint should run.
         """
+        batch_idx = self.step % self.epoch_len
         last_batch = self.epoch_len is not None and batch_idx == self.epoch_len - 1
         return ((self.step % self.ckpt_every_steps) == 0 and self.step != 0) or last_batch
 

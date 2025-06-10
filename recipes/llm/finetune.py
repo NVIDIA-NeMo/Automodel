@@ -10,6 +10,7 @@ from typing import Any, Dict
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+import pathlib
 from torch.distributed.device_mesh import _mesh_resources
 
 try:
@@ -24,6 +25,11 @@ from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.step_scheduler import StepScheduler
 from nemo_automodel.utils.dist_utils import reduce_loss, get_sync_ctx, rescale_gradients, clip_gradients
 from transformers import AutoTokenizer
+from nemo_automodel.loggers.log_utils import setup_logging
+
+import logging
+logger = logging.getLogger(__name__)
+
 # ---------------------------
 #  Stateless helper functions
 # ---------------------------
@@ -108,6 +114,8 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, distributed_sampler_kwargs) -> D
     """
     if not 'tokenizer' in cfg_ds:
         tokenizer = AutoTokenizer.from_pretrained(cfg_model.pretrained_model_name_or_path)
+    elif not '_target_' in cfg_ds.tokenizer:
+        tokenizer = AutoTokenizer.from_pretrained(**cfg_ds.tokenizer.to_dict())
     else:
         tokenizer = cfg_ds.tokenizer.instantiate()
     ds = cfg_ds.instantiate(tokenizer=tokenizer)
@@ -150,7 +158,7 @@ def build_step_scheduler(cfg, dataloader):
         num_epochs = 10,
         grad_acc_steps = 10,
         ckpt_every_steps = 100,
-        epoch_len = len(dataloader),
+        dataloader = dataloader,
     )
     if cfg is not None:
         default_kwargs |= cfg.to_dict()
@@ -185,7 +193,10 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         Raises:
             NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
         """
+        torch.cuda.reset_peak_memory_stats()
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
+        # setups logging and adds the rankfilter to logging
+        setup_logging()
 
         self.device_mesh = None
         self.model_wrapper = None
@@ -216,7 +227,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 config=self.cfg,
                 settings=Settings(silent=True),
             )
-            print("🚀 View run at {}".format(run.url))
+            logging.info("🚀 View run at {}".format(run.url))
 
         # Build components
         self.model = build_model(self.dist_env.device, self.cfg.model, self.cfg.get('peft', None), self.model_wrapper)
@@ -264,14 +275,13 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
         self.model.train()
         for epoch in self.step_scheduler.epochs:
-            for batch_idx, batch in enumerate(self.dataloader):
-                is_optim_step, is_ckpt_step, is_val_step = self.step_scheduler.update(batch_idx)
-                self._run_train_step(batch, is_optim_step, 1.0)
-                if is_ckpt_step and self.dist_env.is_main:
+            for batch_idx, batch in enumerate(self.step_scheduler):
+                self._run_train_step(batch, self.step_scheduler.is_optim_step, 1.0)
+                if self.step_scheduler.is_ckpt_step and self.dist_env.is_main:
                 #     self._save_checkpoint()
                     pass
 
-                if is_val_step and self.val_dataloader is not None:
+                if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     self._run_validation_epoch()
 
 
@@ -408,13 +418,12 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             # log
             reporting_loss = self.log_train_metrics(grad_norm)
-            if self.dist_env.is_main:
-                print(
-                    f"step {self.step_scheduler.step} | "
-                    f"epoch {self.step_scheduler.epoch} | "
-                    f"loss {reporting_loss:.6f} | "
-                    f"grad_norm {grad_norm:.6f}"
+            logging.info("step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | mem: {:.2f} GiB".format(
+                    self.step_scheduler.step, self.step_scheduler.epoch, reporting_loss, grad_norm,
+                    torch.cuda.max_memory_allocated() / 1024 ** 3
                 )
+            )
+            torch.cuda.reset_peak_memory_stats()
 
 
     @torch.no_grad()
@@ -440,7 +449,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
             ):
                 batch["position_ids"] = torch.arange(0, batch['input_ids'].shape[1]).unsqueeze(0).to(self.model.device)
-            
+
             if self.device_mesh["context_parallel"].size() > 1:
 
                 input_ids = batch["input_ids"].to(self.model.device)
@@ -507,11 +516,10 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         "epoch": self.step_scheduler.epoch
                     }
                 )
-            print(
-                f"[val] step {self.step_scheduler.step} | "
-                f"epoch {self.step_scheduler.epoch} | "
-                f"loss {val_loss:.4f}",
+        logging.info("[val] step {} | epoch {} | loss {:.4f}".format(
+                self.step_scheduler.step, self.step_scheduler.epoch, val_loss
             )
+        )
 
     def log_train_metrics(self, grad_norm):
         """
@@ -560,7 +568,8 @@ def main():
 
     Loads the configuration, sets up the trainer, and initiates the training loop.
     """
-    cfg = parse_args_and_load_config("llama_3_2_1b_hellaswag.yaml")
+    script_path = pathlib.Path(__file__).parent.resolve()
+    cfg = parse_args_and_load_config(script_path / "llama_3_2_1b_hellaswag.yaml")
     trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
