@@ -111,7 +111,7 @@ def save_model(
         # TODO:(@adil-a): This will need to change when we add PP. Maybe we can cache the keys in ModelState.
         # Make a mutable copy of the keys so we can safely remove items
         model_state_dict_keys = list(model.state_dict().keys())
-        if model_state.remove_lm_head and "lm_head.weight" in model_state_dict_keys:
+        if model_state.is_tied_lm_head and "lm_head.weight" in model_state_dict_keys:
             model_state_dict_keys.remove("lm_head.weight")
 
         for fqn in model_state_dict_keys:

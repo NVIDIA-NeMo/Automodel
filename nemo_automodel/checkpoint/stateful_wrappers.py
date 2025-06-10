@@ -39,7 +39,7 @@ class ModelState(Stateful):
 
     def __init__(self, model: torch.nn.Module, serialization_format: SerializationFormat):
         self.model = model
-        self.remove_lm_head = model.config.tie_word_embeddings
+        self.is_tied_lm_head = model.config.tie_word_embeddings
         self.serialization_format = serialization_format
 
     def state_dict(self) -> dict[str, Any]:
@@ -57,7 +57,7 @@ class ModelState(Stateful):
                 full_state_dict=True if self.serialization_format == SerializationFormat.SAFETENSORS else False,
             ),
         )
-        if self.remove_lm_head:
+        if self.is_tied_lm_head:
             model_state_dict.pop("lm_head.weight", None)
         return model_state_dict
 
@@ -70,7 +70,7 @@ class ModelState(Stateful):
         # If we intentionally skipped saving "lm_head.weight" (tied embeddings)
         # PyTorch will complain during load even with strict=False.
         # To be fully compatible we inject a reference tensor so the key exists.
-        if self.remove_lm_head and "lm_head.weight" not in state_dict:
+        if self.is_tied_lm_head and "lm_head.weight" not in state_dict:
             # weight tying guarantees this is identical to the embedding weight
             state_dict["lm_head.weight"] = self.model.lm_head.weight.detach()
 
