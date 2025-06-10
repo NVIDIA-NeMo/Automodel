@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# taken and edited from https://github.com/pytorch/pytorch/blob/c8d39a10457ea5d65184c6e8f037f46c5525d869/torch/distributed/checkpoint/_hf_storage.py
+# taken and edited from https://github.com/pytorch/pytorch/blob/c8d39a10457ea5d65184c6e8f037f46c5525d869/torch/distributed/checkpoint/_hf_storage.py  # pylint: disable=line-too-long
 
 import dataclasses
 import json
@@ -69,8 +69,9 @@ class HuggingFaceStorageWriter(FsspecWriter):
         Args:
             path: hf directory where the checkpoint will be written to. Should begin with hf://.
             token: The token to use to authenticate with huggingface hub.
-            fqn_to_index_mapping: A mapping from tensor FQN to the index of the file that the tensor should be written to.
-                              Indices are from 1 to N, where N is the number of files.
+            fqn_to_index_mapping: A mapping from tensor FQN to the index of the file that the
+                tensor should be written to. Indices are from 1 to N, where N is the number
+                of files.
 
         """
         from huggingface_hub import HfFileSystem  # type: ignore[import-not-found]
@@ -133,7 +134,11 @@ class HuggingFaceStorageWriter(FsspecWriter):
             total_size += sum([wr.storage_data.length for wr in wr_list])
         
         # Only create metadata file for multi-shard models
-        if len(set(storage_md.values())) > 1 or not any(path.endswith("model.safetensors") for path in storage_md.values()):
+        if len(
+            set(storage_md.values())
+        ) > 1 or not any(
+            path.endswith("model.safetensors"
+        ) for path in storage_md.values()):
             metadata_to_write = {}
             metadata_to_write["metadata"] = {"total_size": total_size}
             metadata_to_write["weight_map"] = storage_md

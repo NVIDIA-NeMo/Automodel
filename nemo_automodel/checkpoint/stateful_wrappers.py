@@ -48,7 +48,8 @@ class ModelState(Stateful):
         Returns:
             dict: Dictionary containing the model's state dict with CPU offloading enabled.
         """
-        # this line automatically manages FSDP FQN's, as well as sets the default state dict type to FSDP.SHARDED_STATE_DICT
+        # this line automatically manages FSDP FQN's, as well as sets the default state dict type
+        # to FSDP.SHARDED_STATE_DICT
         model_state_dict = get_model_state_dict(
             self.model,
             options=StateDictOptions(
@@ -111,7 +112,8 @@ class OptimizerState(Stateful):
         Returns:
             dict: Dictionary containing the optimizer and scheduler state dicts with CPU offloading enabled.
         """
-        # this line automatically manages FSDP FQN's, as well as sets the default state dict type to FSDP.SHARDED_STATE_DICT
+        # this line automatically manages FSDP FQN's, as well as sets the default state dict type
+        # to FSDP.SHARDED_STATE_DICT
         optimizer_state_dict = get_optimizer_state_dict(
             self.model,
             self.optimizer,
@@ -141,6 +143,6 @@ class OptimizerState(Stateful):
             state_dict["optim"],
         )
 
-        ## load the scheduler state if it exists
+        # load the scheduler state if it exists
         if "sched" in state_dict and self.scheduler is not None:
             self.scheduler.load_state_dict(state_dict["sched"])

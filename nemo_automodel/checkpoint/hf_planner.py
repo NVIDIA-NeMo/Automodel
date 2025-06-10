@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# taken and edited from https://github.com/pytorch/pytorch/blob/c8d39a10457ea5d65184c6e8f037f46c5525d869/torch/distributed/checkpoint/_hf_planner.py
+# taken and edited from https://github.com/pytorch/pytorch/blob/c8d39a10457ea5d65184c6e8f037f46c5525d869/torch/distributed/checkpoint/_hf_planner.py # pylint: disable=line-too-long
 
 # mypy: allow-untyped-defs
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from torch.distributed.checkpoint._dedup_save_plans import (
     dedup_save_plans_with_fqn_to_index_mapping,
@@ -57,25 +57,12 @@ class HuggingFaceSavePlanner(DefaultSavePlanner):
 
 
 class HuggingFaceLoadPlanner(DefaultLoadPlanner):
+    """
+    A load planner. Note that this is currently experimental.
+    """
     def __init__(self, allow_tensor_resize: bool = False):
         super().__init__()
         self.allow_tensor_resize = allow_tensor_resize
 
     def resolve_tensor(self, read_item: ReadItem):
         return self.lookup_tensor(read_item.dest_index)
-
-
-from torch.distributed.checkpoint.planner import WriteItemType
-
-# def dedup_save_plans_with_fqn_to_index_mapping(all_plans, fqn_to_index):
-#     num_ranks = len(all_plans)
-#     for rank, plan in enumerate(all_plans):
-#         kept = []
-#         for wi in plan.items:
-#             if wi.type == WriteItemType.SHARD:        # keep every shard
-#                 kept.append(wi)
-#             else:                                     # dedup replicated items
-#                 if (fqn_to_index[wi.index.fqn] - 1) % num_ranks == rank:
-#                     kept.append(wi)
-#         all_plans[rank] = replace(plan, items=kept)
-#     return all_plans

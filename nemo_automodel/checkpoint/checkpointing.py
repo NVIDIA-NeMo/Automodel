@@ -30,7 +30,6 @@ from nemo_automodel.checkpoint.hf_storage import (
 )
 from nemo_automodel.checkpoint.stateful_wrappers import ModelState, OptimizerState
 import glob
-import json
 from torch.distributed.checkpoint.filesystem import SerializationFormat
 
 PathLike = Union[str, "os.PathLike[Any]"]
@@ -38,6 +37,9 @@ PathLike = Union[str, "os.PathLike[Any]"]
 
 @dataclass
 class CheckpointingConfig:
+    """
+    Configuration for checkpointing.
+    """
     enabled: bool
     checkpoint_dir: str | Path
     model_save_format: SerializationFormat | str
@@ -72,8 +74,9 @@ def save_model(
     # TODO(@adil-a): Need to add support for PEFT.
     # We also need to eventually add suport for HSDP, so we only save on non-duplicate ranks.
     # Add functionality to chunk different layers for different ranks to save.
-    # The above functionality will also make it trivial to get a FQN -> rank mapping which doesn't leave out any user modified layers.
-        # This is because we need to create the mapping on the fly from the model state dict.
+    # The above functionality will also make it trivial to get a FQN -> rank mapping
+    # which doesn't leave out any user modified layers.
+    # This is because we need to create the mapping on the fly from the model state dict.
     model_path = os.path.join(weights_path, "model")
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         os.makedirs(model_path, exist_ok=True)
