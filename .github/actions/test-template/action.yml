@@ -215,7 +215,7 @@ runs:
       shell: bash
       run: |
         docker exec nemo_container_${{ github.run_id }} coverage combine || true
-        docker exec nemo_container_${{ github.run_id }} coverage xml
+        docker exec nemo_container_${{ github.run_id }} coverage xml || true
         docker cp nemo_container_${{ github.run_id }}:/workspace/.coverage .coverage
         docker cp nemo_container_${{ github.run_id }}:/workspace/coverage.xml coverage.xml
 
