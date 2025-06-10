@@ -14,6 +14,4 @@
 
 from .rdr import make_rdr_dataset
 
-__all__ = [
-    "make_rdr_dataset"
-] 
+__all__ = ["make_rdr_dataset"]

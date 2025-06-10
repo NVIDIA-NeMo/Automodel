@@ -20,7 +20,8 @@ from nemo_automodel.package_info import __version__
 
 from nemo_automodel.shared.import_utils import safe_import
 from torch.nn.attention import sdpa_kernel, SDPBackend
-HAS_LIGER_KERNEL, liger_kernel_trf = safe_import('liger_kernel.transformers')
+
+HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 logger = logging.getLogger(__name__)
 
 
@@ -46,11 +47,14 @@ def patch_attention(obj, sdpa_method=None):
             SDPBackend.MATH,
         ]
     orig_forward = obj.forward
+
     def patched_forward(self, *args, **kwargs):
         with sdpa_kernel(sdpa_method):
             return orig_forward(*args, **kwargs)
+
     obj.forward = types.MethodType(patched_forward, obj)
     return obj
+
 
 class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
     """
@@ -81,6 +85,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
     >>> model = NeMoAutoModelForCausalLM.from_pretrained(
     ...     "gpt2", use_liger_kernel=False)                                 # skip Liger
     """
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
         """
@@ -115,11 +120,15 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
         constructed model and recursively reloads it once with
         ``use_liger_kernel=False``.
         """
-        torch_dtype = kwargs.pop('torch_dtype', torch.bfloat16)
-        use_liger_kernel = kwargs.pop('use_liger_kernel', True)
-        sdpa_method = kwargs.pop('sdpa_method', None)
-        model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs,
-            torch_dtype=torch_dtype)
+        torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
+        use_liger_kernel = kwargs.pop("use_liger_kernel", True)
+        sdpa_method = kwargs.pop("sdpa_method", None)
+        model = super().from_pretrained(
+            pretrained_model_name_or_path,
+            *model_args,
+            **kwargs,
+            torch_dtype=torch_dtype,
+        )
         if use_liger_kernel:
             if not HAS_LIGER_KERNEL:
                 logging.warning("Asked to use Liger Kernel, but could not import")
@@ -130,12 +139,15 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
                 del model
                 # If patching failed, retry
                 return cls.from_pretrained(
-                    pretrained_model_name_or_path, *model_args, **kwargs, torch_dtype=torch_dtype,
-                        use_liger_kernel=False)
+                    pretrained_model_name_or_path,
+                    *model_args,
+                    **kwargs,
+                    torch_dtype=torch_dtype,
+                    use_liger_kernel=False,
+                )
         model = patch_attention(model, sdpa_method)
-        model.config.update({"nemo_version" : __version__})
+        model.config.update({"nemo_version": __version__})
         return model
-
 
     @classmethod
     def from_config(cls, config, **kwargs):
@@ -163,9 +175,9 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
         NeMoAutoModelForCausalLM.from_pretrained : Same logic for checkpoint
         loading.
         """
-        torch_dtype = kwargs.pop('torch_dtype', torch.bfloat16)
-        use_liger_kernel = kwargs.pop('use_liger_kernel', True)
-        sdpa_method = kwargs.pop('sdpa_method', None)
+        torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
+        use_liger_kernel = kwargs.pop("use_liger_kernel", True)
+        sdpa_method = kwargs.pop("sdpa_method", None)
         model = super().from_config(config, **kwargs, torch_dtype=torch_dtype)
         if use_liger_kernel:
             if not HAS_LIGER_KERNEL:
@@ -176,11 +188,14 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
             except Exception:
                 del model
                 # If patching failed, retry
-                return cls.from_config(config, **kwargs, use_liger_kernel=False, torch_dtype=torch_dtype)
+                return cls.from_config(
+                    config, **kwargs, use_liger_kernel=False, torch_dtype=torch_dtype
+                )
         model = patch_attention(model, sdpa_method)
-        model.config.update({"nemo_version" : __version__})
+        model.config.update({"nemo_version": __version__})
         return model
- 
+
+
 class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
     """
     Drop-in replacement for ``transformers.AutoModelForImageTextToText`` that can
@@ -210,6 +225,7 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
     >>> model = NeMoAutoModelForImageTextToText.from_pretrained(
     ...     "Qwen/Qwen2.5-VL-3B-Instruct", use_liger_kernel=False)                            # skip Liger
     """
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
         """
@@ -244,10 +260,15 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
         constructed model and recursively reloads it once with
         ``use_liger_kernel=False``.
         """
-        torch_dtype = kwargs.pop('torch_dtype', torch.bfloat16)
-        use_liger_kernel = kwargs.pop('use_liger_kernel', True)
-        sdpa_method = kwargs.pop('sdpa_method', None)
-        model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs, torch_dtype=torch_dtype)
+        torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
+        use_liger_kernel = kwargs.pop("use_liger_kernel", True)
+        sdpa_method = kwargs.pop("sdpa_method", None)
+        model = super().from_pretrained(
+            pretrained_model_name_or_path,
+            *model_args,
+            **kwargs,
+            torch_dtype=torch_dtype,
+        )
         if use_liger_kernel:
             if not HAS_LIGER_KERNEL:
                 logging.warning("Asked to use Liger Kernel, but could not import")
@@ -258,11 +279,15 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
                 del model
                 # If patching failed, retryd
                 return cls.from_pretrained(
-                    pretrained_model_name_or_path, *model_args, **kwargs, use_liger_kernel=False, torch_dtype=torch_dtype)
+                    pretrained_model_name_or_path,
+                    *model_args,
+                    **kwargs,
+                    use_liger_kernel=False,
+                    torch_dtype=torch_dtype,
+                )
         model = patch_attention(model, sdpa_method)
-        model.config.update({"nemo_version" : __version__})
+        model.config.update({"nemo_version": __version__})
         return model
-
 
     @classmethod
     def from_config(cls, config, **kwargs):
@@ -290,9 +315,9 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
         NeMoAutoModelForImageTextToText.from_pretrained : Same logic for checkpoint
         loading.
         """
-        torch_dtype = kwargs.pop('torch_dtype', torch.bfloat16)
-        use_liger_kernel = kwargs.pop('use_liger_kernel', True)
-        sdpa_method = kwargs.pop('sdpa_method', None)
+        torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
+        use_liger_kernel = kwargs.pop("use_liger_kernel", True)
+        sdpa_method = kwargs.pop("sdpa_method", None)
         model = super().from_config(config, **kwargs, torch_dtype=torch_dtype)
         if use_liger_kernel:
             if not HAS_LIGER_KERNEL:
@@ -303,9 +328,9 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
             except Exception:
                 del model
                 # If patching failed, retry
-                return cls.from_config(config, **kwargs, use_liger_kernel=False, torch_dtype=torch_dtype)
+                return cls.from_config(
+                    config, **kwargs, use_liger_kernel=False, torch_dtype=torch_dtype
+                )
         model = patch_attention(model, sdpa_method)
-        model.config.update({"nemo_version" : __version__})
+        model.config.update({"nemo_version": __version__})
         return model
-
-

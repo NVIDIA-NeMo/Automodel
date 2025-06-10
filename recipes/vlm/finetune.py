@@ -19,20 +19,30 @@ except ImportError:
 
 from nemo_automodel.config.cli import parse_args_and_load_config
 from nemo_automodel.distributed.init_utils import initialize_distributed
-from nemo_automodel.distributed.parallelizer import create_context_parallel_ctx, get_train_context
+from nemo_automodel.distributed.parallelizer import (
+    create_context_parallel_ctx,
+    get_train_context,
+)
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.step_scheduler import StepScheduler
-from nemo_automodel.utils.dist_utils import reduce_loss, get_sync_ctx, rescale_gradients, clip_gradients
+from nemo_automodel.utils.dist_utils import (
+    reduce_loss,
+    get_sync_ctx,
+    rescale_gradients,
+    clip_gradients,
+)
 from nemo_automodel.utils.model_utils import apply_parameter_freezing
 from nemo_automodel.loggers.log_utils import setup_logging
-from transformers import AutoTokenizer, AutoProcessor
+from transformers import AutoProcessor
 
 import logging
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------
 #  Stateless helper functions
 # ---------------------------
+
 
 def build_model(device, cfg_model, cfg_freeze, cfg_peft, model_wrapper) -> nn.Module:
     """
@@ -47,21 +57,21 @@ def build_model(device, cfg_model, cfg_freeze, cfg_peft, model_wrapper) -> nn.Mo
         The instantiated model on the specified device.
     """
     model = cfg_model.instantiate()
-    
+
     if cfg_freeze is not None:
         apply_parameter_freezing(model, cfg_freeze)
     else:
         for m in model.modules():
             if isinstance(m, nn.Embedding):
                 m.weight.requires_grad = False
-    
+
     # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
     if cfg_peft is not None:
         opts = cfg_peft.to_dict()
-        peft_fn = opts.pop('peft_fn')
+        peft_fn = opts.pop("peft_fn")
         peft_fn(model, **opts)
 
-    if callable(getattr(model_wrapper, 'parallelize', None)):
+    if callable(getattr(model_wrapper, "parallelize", None)):
         model = model_wrapper.parallelize(model)
 
         # FSDP2 and nvFSDP should already be on the correct device
@@ -69,7 +79,8 @@ def build_model(device, cfg_model, cfg_freeze, cfg_peft, model_wrapper) -> nn.Mo
     else:
         return model.to(device)
 
-def build_optimizer(cfg_opt, model, tp_size) -> 'Optimizer':  # noqa: F821
+
+def build_optimizer(cfg_opt, model, tp_size) -> "Optimizer":  # noqa: F821
     """
     Build an optimizer for the model.
 
@@ -88,6 +99,7 @@ def build_optimizer(cfg_opt, model, tp_size) -> 'Optimizer':  # noqa: F821
         cfg_opt.foreach = False
     return cfg_opt.instantiate(params=trainable_params)
 
+
 def build_loss_fn(device, cfg_loss):
     """
     Build a loss function.
@@ -105,7 +117,9 @@ def build_loss_fn(device, cfg_loss):
         return cfg_loss.instantiate().to(device)
 
 
-def build_dataloader(cfg_ds, cfg_dl, cfg_model, distributed_sampler_kwargs) -> DataLoader:
+def build_dataloader(
+    cfg_ds, cfg_dl, cfg_model, distributed_sampler_kwargs
+) -> DataLoader:
     """
     Build a distributed dataloader.
 
@@ -117,39 +131,45 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, distributed_sampler_kwargs) -> D
     Returns:
         The instantiated DataLoader.
     """
-    if hasattr(cfg_ds, '_target_') and 'vlm' in cfg_ds._target_:
-        processor = AutoProcessor.from_pretrained(cfg_model.pretrained_model_name_or_path)
-        
-        # For VLM datasets, instantiate with processor and get HFDatasetBuilder
-        hf_dataset_builder = cfg_ds.instantiate(
-            path_or_dataset=cfg_ds.path_or_dataset,
-            processor=processor
+    if hasattr(cfg_ds, "_target_") and "vlm" in cfg_ds._target_:
+        processor = AutoProcessor.from_pretrained(
+            cfg_model.pretrained_model_name_or_path
         )
 
-        split = getattr(cfg_ds, 'split', None)
+        # For VLM datasets, instantiate with processor and get HFDatasetBuilder
+        hf_dataset_builder = cfg_ds.instantiate(
+            path_or_dataset=cfg_ds.path_or_dataset, processor=processor
+        )
+
+        split = getattr(cfg_ds, "split", None)
 
         if split is not None:
-            if split == 'train':
+            if split == "train":
                 ds = hf_dataset_builder.train
-            elif split == 'validation':
+            elif split == "validation":
                 ds = hf_dataset_builder.val
             else:
-                raise ValueError(f"split (train or validation) is required for VLM datasets, but got {split}")
+                raise ValueError(
+                    f"split (train or validation) is required for VLM datasets, but got {split}"
+                )
         else:
-            raise ValueError(f"split (train or validation) is required for VLM datasets, but got {split}")
+            raise ValueError(
+                f"split (train or validation) is required for VLM datasets, but got {split}"
+            )
 
-        
         sampler = torch.utils.data.distributed.DistributedSampler(
             ds,
             num_replicas=distributed_sampler_kwargs.get("num_replicas", 1),
             rank=distributed_sampler_kwargs.get("rank", 0),
             shuffle=distributed_sampler_kwargs.get("shuffle", False),
-        )    
-    #TODO: HFDatasetBuilder has DLbuilder but is not stateful, didn't use it
-    return cfg_dl.instantiate(dataset=ds, sampler=sampler, collate_fn=hf_dataset_builder.collate_fn)
+        )
+    # TODO: HFDatasetBuilder has DLbuilder but is not stateful, didn't use it
+    return cfg_dl.instantiate(
+        dataset=ds, sampler=sampler, collate_fn=hf_dataset_builder.collate_fn
+    )
 
 
-def build_distributed(cfg_dist: Dict[str, Any]) -> 'DistInfo':  # noqa: F821
+def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
     """
     Build and initialize distributed training resources.
 
@@ -163,6 +183,7 @@ def build_distributed(cfg_dist: Dict[str, Any]) -> 'DistInfo':  # noqa: F821
     timeout = cfg_dist.get("timeout_minutes", 1)
     return initialize_distributed(backend=backend, timeout_minutes=timeout)
 
+
 def build_step_scheduler(cfg, dataloader):
     """
     Build the step scheduler.
@@ -174,12 +195,12 @@ def build_step_scheduler(cfg, dataloader):
     Returns:
         StepScheduler: the configured StepScheduler.
     """
-    assert not '_target_' in cfg, "_target_ not permitted in step scheduler"
+    assert not "_target_" in cfg, "_target_ not permitted in step scheduler"
     default_kwargs = dict(
-        num_epochs = 10,
-        grad_acc_steps = 10,
-        ckpt_every_steps = 100,
-        dataloader = dataloader,
+        num_epochs=10,
+        grad_acc_steps=10,
+        ckpt_every_steps=100,
+        dataloader=dataloader,
     )
     if cfg is not None:
         default_kwargs |= cfg.to_dict()
@@ -190,12 +211,14 @@ def build_step_scheduler(cfg, dataloader):
 #  Trainer class – orchestration only
 # ---------------------------------------------------------------------------
 
+
 class FinetuneRecipeForVLM(BaseRecipe):
     """
     Recipe for fine-tuning a model for VLM.
 
     This class orchestrates training, from setup to main training loop.
     """
+
     def __init__(self, cfg):
         """
         Initialize the recipe with configuration.
@@ -207,7 +230,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
     # ------------------ build phase ------------------
     def setup(self):
-        """ Builds all components needed for training/validation/logging/checkpointing/etc.
+        """Builds all components needed for training/validation/logging/checkpointing/etc.
 
         This is the last place where self.cfg should be referenced.
 
@@ -228,17 +251,19 @@ class FinetuneRecipeForVLM(BaseRecipe):
             )
             distributed_sampler_kwargs = {
                 "num_replicas": self.model_wrapper.device_mesh["data_parallel"].size(),
-                "rank": self.model_wrapper.device_mesh["data_parallel"].get_local_rank(),
+                "rank": self.model_wrapper.device_mesh[
+                    "data_parallel"
+                ].get_local_rank(),
                 "shuffle": self.cfg.dataloader.get("shuffle", True),
             }
             if "shuffle" in self.cfg.dataloader:
                 del self.cfg.dataloader.shuffle
-            if hasattr(self.model_wrapper, 'device_mesh'):
+            if hasattr(self.model_wrapper, "device_mesh"):
                 self.device_mesh = self.model_wrapper.device_mesh
 
         torch.manual_seed(self.cfg.get("seed", 42) + self.dist_env.rank)
 
-        if self.dist_env.is_main and hasattr(self.cfg, 'logger'):
+        if self.dist_env.is_main and hasattr(self.cfg, "logger"):
             suppress_wandb_log_messages()
             run = wandb.init(
                 project=self.cfg.logger.get("wandb_project", "default_project"),
@@ -251,13 +276,19 @@ class FinetuneRecipeForVLM(BaseRecipe):
             print("🚀 View run at {}".format(run.url))
 
         # Build components
-        self.model = build_model(self.dist_env.device, self.cfg.model, self.cfg.get('freeze_config', None), self.cfg.get('peft', None), self.model_wrapper)
+        self.model = build_model(
+            self.dist_env.device,
+            self.cfg.model,
+            self.cfg.get("freeze_config", None),
+            self.cfg.get("peft", None),
+            self.model_wrapper,
+        )
         self.optimizer = build_optimizer(
             self.cfg.optimizer,
             self.model,
             self.cfg.get("distributed.tp_size", 1),
         )
-        self.loss_fn   = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
+        self.loss_fn = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
         self.dataloader = build_dataloader(
             self.cfg.dataset,
             self.cfg.dataloader,
@@ -267,7 +298,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         # Build validation dataloader if the config provides it
         self.val_dataloader = None
-        if 'validation_dataset' in self.cfg:
+        if "validation_dataset" in self.cfg:
             self.val_dataloader = build_dataloader(
                 self.cfg.validation_dataset,
                 self.cfg.validation_dataloader,
@@ -280,7 +311,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.forward_data_store = []
 
         # Scheduler
-        self.step_scheduler = build_step_scheduler(self.cfg.get('step_scheduler', None), self.dataloader)
+        self.step_scheduler = build_step_scheduler(
+            self.cfg.get("step_scheduler", None), self.dataloader
+        )
 
         # Optionally resume
         if (path := self.cfg.get("restore_from")) is not None:
@@ -299,12 +332,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
             for batch_idx, batch in enumerate(self.step_scheduler):
                 self._run_train_step(batch, self.step_scheduler.is_optim_step, 1.0)
                 if self.step_scheduler.is_ckpt_step and self.dist_env.is_main:
-                #     self._save_checkpoint()
+                    #     self._save_checkpoint()
                     pass
 
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     self._run_validation_epoch()
-
 
     # ------------------ helpers ------------------
     def _run_train_step(self, batch, is_optim_step, clip_norm=1.0):
@@ -320,7 +352,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         """
         self.model.train()
 
-        batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
+        batch = {
+            k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()
+        }
         labels = batch.pop("labels")
         loss_mask = batch.pop("loss_mask", None)
         if loss_mask is None:
@@ -329,14 +363,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # TODO(@boxiangw): Refractor. Needed for SP support
         # If 'position_ids' does not exist in batch already then override it. batch in case of Packed sequence
         # contains 'position_ids' and we don't want to override it.
-        if (
-            'position_ids' not in batch and
-            (
-                self.device_mesh["context_parallel"].size() > 1 or
-                self.device_mesh["tensor_parallel"].size() > 1
-            )
+        if "position_ids" not in batch and (
+            self.device_mesh["context_parallel"].size() > 1
+            or self.device_mesh["tensor_parallel"].size() > 1
         ):
-            batch["position_ids"] = torch.arange(0, batch['input_ids'].shape[1]).unsqueeze(0).to(self.model.device)
+            batch["position_ids"] = (
+                torch.arange(0, batch["input_ids"].shape[1])
+                .unsqueeze(0)
+                .to(self.model.device)
+            )
 
         # based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/train.py#L336
         if self.device_mesh["context_parallel"].size() > 1:
@@ -366,14 +401,16 @@ class FinetuneRecipeForVLM(BaseRecipe):
             )
 
             with train_context(context_parallel_ctx):
-                out  = self.model(**batch)
+                out = self.model(**batch)
 
                 # Prepare for loss calculation
                 logits = out.logits.float()
                 n_cls = logits.shape[-1]
                 logits = logits.view(-1, n_cls)
                 labels = labels.view(-1)
-                assert logits.shape[-2] == labels.shape[-1], "Expected logits & labels to have the same length"
+                assert (
+                    logits.shape[-2] == labels.shape[-1]
+                ), "Expected logits & labels to have the same length"
                 local_loss = self.loss_fn(logits, labels, loss_mask)
 
             # In the case where all labels are masked, the loss should be 0.
@@ -381,12 +418,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 local_loss.detach().copy_(torch.zeros_like(local_loss))
 
         else:
-            out  = self.model(**batch)
+            out = self.model(**batch)
             local_loss = self.loss_fn(
                 out.logits.view(-1, out.logits.size(-1)),
                 labels.view(-1),
                 mask=loss_mask,
-                reduction="sum"
+                reduction="sum",
             )
 
         local_num_tokens = loss_mask.sum().detach().to(torch.int)
@@ -401,16 +438,26 @@ class FinetuneRecipeForVLM(BaseRecipe):
             rescale_gradients(
                 self.model,
                 self.total_num_tokens,
-                self.device_mesh[(
-                    "dp_cp"
-                    if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(self.device_mesh, {})
-                    else "data_parallel"
-                )].get_group(),
-                self.device_mesh[(
-                    "dp_cp"
-                    if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(self.device_mesh, {})
-                    else "data_parallel"
-                )].size()
+                self.device_mesh[
+                    (
+                        "dp_cp"
+                        if "dp_cp"
+                        in _mesh_resources.root_to_flatten_mapping.get(
+                            self.device_mesh, {}
+                        )
+                        else "data_parallel"
+                    )
+                ].get_group(),
+                self.device_mesh[
+                    (
+                        "dp_cp"
+                        if "dp_cp"
+                        in _mesh_resources.root_to_flatten_mapping.get(
+                            self.device_mesh, {}
+                        )
+                        else "data_parallel"
+                    )
+                ].size(),
             )
 
             # Clip gradients **after** any rescaling.
@@ -419,7 +466,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 grad_norm = clip_gradients(self.model, clip_norm)
             else:
                 # TODO: TP WAR
-                grad_norm = 0.
+                grad_norm = 0.0
 
             if isinstance(self.model, nvFSDP):
                 # If the model uses nvFSDP, wait for all sharded gradients to be reduced and unsharded.
@@ -439,13 +486,16 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
             # log
             reporting_loss = self.log_train_metrics(grad_norm)
-            logging.info("step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | mem: {:.2f} GiB".format(
-                    self.step_scheduler.step, self.step_scheduler.epoch, reporting_loss, grad_norm,
-                    torch.cuda.max_memory_allocated() / 1024 ** 3
+            logging.info(
+                "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | mem: {:.2f} GiB".format(
+                    self.step_scheduler.step,
+                    self.step_scheduler.epoch,
+                    reporting_loss,
+                    grad_norm,
+                    torch.cuda.max_memory_allocated() / 1024**3,
                 )
             )
             torch.cuda.reset_peak_memory_stats()
-
 
     @torch.no_grad()
     def _run_validation_epoch(self) -> float:
@@ -456,21 +506,25 @@ class FinetuneRecipeForVLM(BaseRecipe):
         total_tokens = 0
 
         for batch in self.val_dataloader:
-            batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
+            batch = {
+                k: v.to(self.dist_env.device, non_blocking=True)
+                for k, v in batch.items()
+            }
             labels = batch.pop("labels")
             loss_mask = batch.pop("loss_mask", None)
             if loss_mask is None:
                 loss_mask = (labels.detach() != -100).to(torch.int)
 
-            if (
-                'position_ids' not in batch and
-                (
-                    self.device_mesh["context_parallel"].size() > 1 or
-                    self.device_mesh["tensor_parallel"].size() > 1
-                )
+            if "position_ids" not in batch and (
+                self.device_mesh["context_parallel"].size() > 1
+                or self.device_mesh["tensor_parallel"].size() > 1
             ):
-                batch["position_ids"] = torch.arange(0, batch['input_ids'].shape[1]).unsqueeze(0).to(self.model.device)
-            
+                batch["position_ids"] = (
+                    torch.arange(0, batch["input_ids"].shape[1])
+                    .unsqueeze(0)
+                    .to(self.model.device)
+                )
+
             if self.device_mesh["context_parallel"].size() > 1:
 
                 input_ids = batch["input_ids"].to(self.model.device)
@@ -497,13 +551,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     False,
                 )
                 with train_context(context_parallel_ctx):
-                    out  = self.model(**batch)
+                    out = self.model(**batch)
                     # Prepare for loss calculation
                     logits = out.logits.float()
                     n_cls = logits.shape[-1]
                     logits = logits.view(-1, n_cls)
                     labels = labels.view(-1)
-                    assert logits.shape[-2] == labels.shape[-1], "Expected logits & labels to have the same length"
+                    assert (
+                        logits.shape[-2] == labels.shape[-1]
+                    ), "Expected logits & labels to have the same length"
                     local_loss = self.loss_fn(logits, labels, loss_mask)
 
                 # In the case where all labels are masked, the loss should be 0.
@@ -515,7 +571,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     out.logits.view(-1, out.logits.size(-1)),
                     labels.view(-1),
                     mask=loss_mask,
-                    reduction="sum"
+                    reduction="sum",
                 )
 
             total_loss += local_loss.item()
@@ -523,7 +579,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         # Aggregate across ranks if distributed is initialized
         if dist.is_initialized():
-            tensor = torch.tensor([total_loss, total_tokens], device=self.dist_env.device)
+            tensor = torch.tensor(
+                [total_loss, total_tokens], device=self.dist_env.device
+            )
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
             total_loss, total_tokens = tensor.tolist()
 
@@ -534,10 +592,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     {
                         "val_loss": val_loss,
                         "step": self.step_scheduler.step,
-                        "epoch": self.step_scheduler.epoch
+                        "epoch": self.step_scheduler.epoch,
                     }
                 )
-        logging.info("[val] step {} | epoch {} | loss {:.4f}".format(
+        logging.info(
+            "[val] step {} | epoch {} | loss {:.4f}".format(
                 self.step_scheduler.step, self.step_scheduler.epoch, val_loss
             )
         )
@@ -558,10 +617,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
             dp_group = self.device_mesh["data_parallel"].get_group()
 
         total_loss, total_num_tokens = reduce_loss(
-            self.forward_data_store, self.total_num_tokens, per_token_loss=True, dp_group=dp_group
+            self.forward_data_store,
+            self.total_num_tokens,
+            per_token_loss=True,
+            dp_group=dp_group,
         )
         reporting_loss = (total_loss / total_num_tokens).item()
-        grad_norm = grad_norm.item() if not isinstance(grad_norm, float) else grad_norm # TP WAR
+        grad_norm = (
+            grad_norm.item() if not isinstance(grad_norm, float) else grad_norm
+        )  # TP WAR
         self.total_num_tokens.zero_()
         self.forward_data_store = []
         log_data = {
@@ -573,15 +637,17 @@ class FinetuneRecipeForVLM(BaseRecipe):
             "num_tokens_per_step": total_num_tokens,
         }
         if self.optimizer.param_groups:
-            log_data["learning_rate"] = self.optimizer.param_groups[0]['lr']
+            log_data["learning_rate"] = self.optimizer.param_groups[0]["lr"]
 
         if wandb.run is not None:
             wandb.log(log_data)
         return reporting_loss
 
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
 
 def main():
     """
@@ -593,6 +659,7 @@ def main():
     trainer = FinetuneRecipeForVLM(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
+
 
 if __name__ == "__main__":
     main()

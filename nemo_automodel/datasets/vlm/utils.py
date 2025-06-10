@@ -12,10 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
-import random
 import torch
-from typing import Any, Dict, List, Optional, Union
+from typing import Dict, List, Optional
 
 
 def extract_skipped_token_ids(processor):
@@ -25,25 +23,37 @@ def extract_skipped_token_ids(processor):
     """
     # Common special tokens across VLM models
     QWEN_TOKENS = [
-        '<|im_start|>', '<|im_end|>', '<|vision_start|>', '<|vision_end|>',
-        '<|vision_pad|>', '<|image_pad|>', '<|video_pad|>'
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|vision_start|>",
+        "<|vision_end|>",
+        "<|vision_pad|>",
+        "<|image_pad|>",
+        "<|video_pad|>",
     ]
     LLAVA_TOKENS = ["<image>", "<pad>"]
     LLAMA_TOKENS = [
-        '<|begin_of_text|>', '<|end_of_text|>', '<|finetune_right_pad_id|>',
-        '<|step_id|>', '<|start_header_id|>', '<|end_header_id|>',
-        '<|eom_id|>', '<|eot_id|>', '<|python_tag|>', '<|image|>'
+        "<|begin_of_text|>",
+        "<|end_of_text|>",
+        "<|finetune_right_pad_id|>",
+        "<|step_id|>",
+        "<|start_header_id|>",
+        "<|end_header_id|>",
+        "<|eom_id|>",
+        "<|eot_id|>",
+        "<|python_tag|>",
+        "<|image|>",
     ]
-    GEMMA_TOKENS = ['<image_soft_token>']
-    
+    GEMMA_TOKENS = ["<image_soft_token>"]
+
     PAD_TOKENS = set(QWEN_TOKENS + LLAVA_TOKENS + LLAMA_TOKENS + GEMMA_TOKENS)
-    tokenizer = getattr(processor, 'tokenizer', processor)
-    
+    tokenizer = getattr(processor, "tokenizer", processor)
+
     skipped_token_ids = []
     for key, val in tokenizer.added_tokens_decoder.items():
         if str(val) in PAD_TOKENS:
             skipped_token_ids.append(key)
-    
+
     return torch.IntTensor(list(set(skipped_token_ids)))
 
 
@@ -62,7 +72,7 @@ def json2token(obj, sort_json_key: bool = True):
             else:
                 keys = obj.keys()
             for k in keys:
-                output += fr"<s_{k}>" + json2token(obj[k], sort_json_key) + fr"</s_{k}>"
+                output += rf"<s_{k}>" + json2token(obj[k], sort_json_key) + rf"</s_{k}>"
             return output
     elif type(obj) == list:
         return r"<sep/>".join([json2token(item, sort_json_key) for item in obj])
@@ -71,15 +81,17 @@ def json2token(obj, sort_json_key: bool = True):
         return obj
 
 
-def process_text_batch(processor, texts: List[str], images: Optional[List] = None) -> Dict[str, torch.Tensor]:
+def process_text_batch(
+    processor, texts: List[str], images: Optional[List] = None
+) -> Dict[str, torch.Tensor]:
     """
     Process a batch of texts and optionally images.
-    
+
     Args:
         processor: The processor to use for tokenization and image processing
         texts: List of text strings to process
         images: Optional list of images to process
-        
+
     Returns:
         Dict containing processed batch data
     """
@@ -98,25 +110,6 @@ def process_text_batch(processor, texts: List[str], images: Optional[List] = Non
             padding=True,
             return_tensors="pt",
         )
-    
+
     return batch
 
-
-def apply_chat_template(processor, conversation: List[Dict], **kwargs) -> str:
-    """
-    Apply chat template to conversation.
-    
-    Args:
-        processor: The processor to use for template application
-        conversation: List of conversation turns
-        **kwargs: Additional arguments for template application
-        
-    Returns:
-        str: Formatted conversation text
-    """
-    return processor.apply_chat_template(
-        conversation,
-        tokenize=False,
-        add_generation_prompt=False,
-        **kwargs
-    ) 
