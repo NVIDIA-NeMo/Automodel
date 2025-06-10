@@ -1,7 +1,18 @@
 name: Validate PR title
 
 on:
-  workflow_call:
+  pull_request_target:
+    types:
+      - opened
+      - edited
+      - synchronize
+      - reopened
+  pull_request:
+    types:
+      - opened
+      - edited
+      - synchronize
+      - reopened
 
 defaults:
   run:
