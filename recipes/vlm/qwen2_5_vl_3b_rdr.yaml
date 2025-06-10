@@ -59,6 +59,11 @@ optimizer:
   weight_decay: 0.01
   betas: [0.9, 0.95]
 
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_language_model: false
+  
 # Uncomment and configure for W&B logging
 # logger:
 #   wandb_project: nemo_automodel_vlm

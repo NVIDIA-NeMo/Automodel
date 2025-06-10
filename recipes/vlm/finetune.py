@@ -23,12 +23,13 @@ from nemo_automodel.distributed.parallelizer import create_context_parallel_ctx,
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.step_scheduler import StepScheduler
 from nemo_automodel.utils.dist_utils import reduce_loss, get_sync_ctx, rescale_gradients, clip_gradients
+from nemo_automodel.utils.model_utils import apply_parameter_freezing
 from transformers import AutoTokenizer, AutoProcessor
 # ---------------------------
 #  Stateless helper functions
 # ---------------------------
 
-def build_model(device, cfg_model, cfg_peft, model_wrapper) -> nn.Module:
+def build_model(device, cfg_model, cfg_freeze, cfg_peft, model_wrapper) -> nn.Module:
     """
     Build and initialize a model.
 
@@ -41,9 +42,14 @@ def build_model(device, cfg_model, cfg_peft, model_wrapper) -> nn.Module:
         The instantiated model on the specified device.
     """
     model = cfg_model.instantiate()
-    for m in model.modules():
-        if isinstance(m, nn.Embedding):
-            m.weight.requires_grad_(False)
+    
+    if cfg_freeze is not None:
+        apply_parameter_freezing(model, cfg_freeze)
+    else:
+        for m in model.modules():
+            if isinstance(m, nn.Embedding):
+                m.weight.requires_grad = False
+    
     # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
     if cfg_peft is not None:
         opts = cfg_peft.to_dict()
@@ -106,7 +112,6 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, distributed_sampler_kwargs) -> D
     Returns:
         The instantiated DataLoader.
     """
-    import pdb; pdb.set_trace()
     if hasattr(cfg_ds, '_target_') and 'vlm' in cfg_ds._target_:
         processor = AutoProcessor.from_pretrained(cfg_model.pretrained_model_name_or_path)
         
@@ -233,7 +238,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             print("🚀 View run at {}".format(run.url))
 
         # Build components
-        self.model = build_model(self.dist_env.device, self.cfg.model, self.cfg.get('peft', None), self.model_wrapper)
+        self.model = build_model(self.dist_env.device, self.cfg.model, self.cfg.get('freeze_config', None), self.cfg.get('peft', None), self.model_wrapper)
         self.optimizer = build_optimizer(
             self.cfg.optimizer,
             self.model,
