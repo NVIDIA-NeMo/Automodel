@@ -75,9 +75,48 @@ class ModelState(Stateful):
             # weight tying guarantees this is identical to the embedding weight
             state_dict["lm_head.weight"] = self.model.lm_head.weight.detach()
 
+        # pick the data-parallel mesh that already exists on every rank
+        mesh = getattr(self.model, "device_mesh", {}).get("data_parallel", None)
+        if mesh is None:  # Fallbacks for DDP or when wrapper did not stash the mesh
+            # 1) Try asking the MeshEnv for the current mesh (valid if we are already
+            #    inside a `with device_mesh:` context).
+            try:
+                mesh = torch.distributed.device_mesh._mesh_resources.get_current_mesh()
+            except Exception:  # no mesh is active in this thread
+                mesh = None
+
+        if mesh is None:
+            # 2) Build a trivial 1-D mesh that spans the whole world.  This works for
+            #    DDP and single-mesh FSDP setups and avoids accessing private
+            #    internals such as _mesh_resources["default"].
+            from torch.distributed.device_mesh import init_device_mesh
+
+            world_size = torch.distributed.get_world_size()
+            device_type = "cuda" if torch.cuda.is_available() else "cpu"
+            mesh = init_device_mesh(device_type, (world_size,))
+
+        from torch.distributed.tensor import DTensor, Replicate
+
+        for k, t in state_dict.items():
+            if isinstance(t, torch.Tensor) and not isinstance(t, DTensor):
+                # This is a regular tensor. To load it into an FSDP model,
+                # we represent it as a replicated DTensor.
+                # `set_model_state_dict` will then reshard it to match the
+                # model's parameter sharding.
+                state_dict[k] = DTensor.from_local(t, mesh, [Replicate()], run_check=False)
+            elif isinstance(t, DTensor):
+                if t._spec.mesh is None:
+                    # The loaded tensor is already a DTensor but is missing
+                    # the device mesh. We fill it in.
+                    t._spec.mesh = mesh
+
         set_model_state_dict(
             self.model,
             state_dict,
+            options=StateDictOptions(
+                full_state_dict=True if self.serialization_format == SerializationFormat.SAFETENSORS else False,
+                broadcast_from_rank0=True if self.serialization_format == SerializationFormat.SAFETENSORS else False,
+            ),
         )
 
 

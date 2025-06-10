@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# taken and edited from https://github.com/pytorch/pytorch/blob/main/torch/distributed/checkpoint/_hf_planner.py
+# taken and edited from https://github.com/pytorch/pytorch/blob/c8d39a10457ea5d65184c6e8f037f46c5525d869/torch/distributed/checkpoint/_hf_planner.py
 
 # mypy: allow-untyped-defs
 from dataclasses import dataclass, replace

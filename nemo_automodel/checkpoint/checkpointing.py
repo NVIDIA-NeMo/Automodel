@@ -102,7 +102,12 @@ def save_model(
         default_index = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
 
         # TODO:(@adil-a): This will need to change when we add PP. Maybe we can cache the keys in ModelState.
-        for fqn in model.state_dict().keys():
+        # Make a mutable copy of the keys so we can safely remove items
+        model_state_dict_keys = list(model.state_dict().keys())
+        if model_state.remove_lm_head and "lm_head.weight" in model_state_dict_keys:
+            model_state_dict_keys.remove("lm_head.weight")
+
+        for fqn in model_state_dict_keys:
             if fqn not in fqn_to_file_index_mapping:
                 if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                     print(f"Adding missing key to mapping: {fqn}")

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# taken and edited from https://github.com/pytorch/pytorch/blob/main/torch/distributed/checkpoint/_hf_storage.py
+# taken and edited from https://github.com/pytorch/pytorch/blob/c8d39a10457ea5d65184c6e8f037f46c5525d869/torch/distributed/checkpoint/_hf_storage.py
 
 import dataclasses
 import json
@@ -149,11 +149,26 @@ class HuggingFaceStorageWriter(FsspecWriter):
         buckets = {}
         for item in items:
             key = item.index.fqn
-            idx = storage_plan[key]
-            if idx not in buckets:
-                buckets[idx] = [item]
+
+            # Allow the caller to wrap a Stateful object under a root key such
+            # as "model" or "optim" (i.e. they passed {"model": ModelState(...)}
+            # to dcp.save).  In that case every FQN gets the extra "model." or
+            # "optim." prefix, while the reference weight-map coming from the
+            # original HF checkpoint does *not* include it.  Detect this case
+            # and fall back to the prefix-stripped key.
+            if key not in storage_plan and "." in key:
+                _, stripped_key = key.split(".", 1)
+                key_lookup = stripped_key if stripped_key in storage_plan else key
             else:
-                buckets[idx].append(item)
+                key_lookup = key
+
+            if key_lookup not in storage_plan:
+                raise KeyError(
+                    f"Key '{key}' (or '{stripped_key}') was not found in the FQN->file mapping."
+                )
+
+            idx = storage_plan[key_lookup]
+            buckets.setdefault(idx, []).append(item)
 
         return buckets
 
