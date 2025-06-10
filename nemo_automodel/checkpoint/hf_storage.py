@@ -23,7 +23,6 @@ from typing import Optional
 import fsspec  # type: ignore[import-untyped]
 
 from torch.distributed.checkpoint._fsspec_filesystem import FsspecReader, FsspecWriter
-from torch.distributed.checkpoint.filesystem import SerializationFormat
 from torch.distributed.checkpoint.metadata import (
     BytesStorageMetadata,
     Metadata,
@@ -41,6 +40,7 @@ from torch.distributed.checkpoint.planner import (
 from torch.distributed.checkpoint.storage import WriteResult
 from torch.futures import Future
 
+from nemo_automodel.checkpoint.checkpointing import SerializationFormat
 from nemo_automodel.checkpoint.hf_planner import HuggingFaceLoadPlanner, _FqnToFileMapping
 
 __all__ = ["HuggingFaceStorageWriter", "HuggingFaceStorageReader"]

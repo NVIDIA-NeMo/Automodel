@@ -30,7 +30,11 @@ from nemo_automodel.checkpoint.hf_storage import (
 )
 from nemo_automodel.checkpoint.stateful_wrappers import ModelState, OptimizerState
 import glob
-from torch.distributed.checkpoint.filesystem import SerializationFormat
+from enum import Enum
+
+class SerializationFormat(Enum):
+    TORCH_SAVE = "torch_save"
+    SAFETENSORS = "safetensors"
 
 PathLike = Union[str, "os.PathLike[Any]"]
     
