@@ -51,7 +51,6 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   num_workers: 4
   pin_memory: true
-  persistent_workers: true
   
 optimizer:
   _target_: torch.optim.AdamW
@@ -63,7 +62,7 @@ freeze_config:
   freeze_embeddings: true
   freeze_vision_tower: true
   freeze_language_model: false
-  
+
 # Uncomment and configure for W&B logging
 # logger:
 #   wandb_project: nemo_automodel_vlm
