@@ -1,6 +1,6 @@
 step_scheduler:
   grad_acc_steps: 4
-  ckpt_every_steps: 1000
+  ckpt_every_steps: 20
   val_every_steps: 10  # will run every x number of gradient steps
   num_epochs: 1
 
@@ -16,6 +16,13 @@ rng:
 model:
   _target_: nemo_automodel.transformers.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+  cache_dir: /opt/models/
+  torch_dtype: auto
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/
+  model_save_format: torch_save # torch_save or safetensors
 
 distributed:
   _target_: nemo_automodel.distributed.fsdp2.FSDP2Manager

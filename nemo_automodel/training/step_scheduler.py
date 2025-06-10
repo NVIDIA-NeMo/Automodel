@@ -74,6 +74,13 @@ class StepScheduler(Stateful):
                 return
             yield batch
 
+    def set_epoch(self, epoch: int):
+        """
+        Set the epoch for the dataloader.
+        """
+        self.epoch = epoch
+        self.dataloader.sampler.set_epoch(epoch)
+
     @property
     def is_optim_step(self):
         """whether this step needs to call the optimizer step
