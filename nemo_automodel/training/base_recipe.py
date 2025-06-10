@@ -145,14 +145,11 @@ class BaseRecipe:
             elif isinstance(getattr(self, key), Optimizer):
                 optimizer = getattr(self, key)
             else:
-                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                    getattr(self, key).load_state_dict(
-                        torch.load(
-                            os.path.join(ckpt_dir, f"{key}.pt"),
-                        )
+                getattr(self, key).load_state_dict(
+                    torch.load(
+                        os.path.join(ckpt_dir, f"{key}.pt"),
                     )
-                if torch.distributed.is_initialized():
-                    torch.distributed.barrier()
+                )
 
         load_model(model, ckpt_dir, self.checkpoint_config)
         load_optimizer(optimizer, model, ckpt_dir)
