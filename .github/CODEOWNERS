@@ -1,0 +1,7 @@
+.github/ @nvidia-nemo/automation
+docker/ @nvidia-nemo/automation
+pyproject.toml @nvidia-nemo/automation
+
+nemo_automodel @akoumpa
+recipes @akoumpa
+README.md @akoumpa
