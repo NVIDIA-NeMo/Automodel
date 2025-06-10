@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-TRANSFORMERS_OFFLINE=1 coverage run -a --data-file=/workspace/.coverage --source=/workspace/nemo \
+TRANSFORMERS_OFFLINE=1 coverage run -a --data-file=/workspace/.coverage --source=/workspace \
 recipes/llm/finetune.py \
   --config recipes/llm/llama_3_2_1b_squad.yaml \
   --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
