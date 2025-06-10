@@ -1,0 +1,15 @@
+name: Validate PR title
+
+on:
+  workflow_call:
+
+defaults:
+  run:
+    shell: bash -x -e -u -o pipefail {0}
+
+permissions:
+  pull-requests: read
+
+jobs:
+  semantic-pull-request:
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_semantic_pull_request.yml@v0.33.0
