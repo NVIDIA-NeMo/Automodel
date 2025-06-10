@@ -307,7 +307,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
         self.model.train()
         for epoch in self.step_scheduler.epochs:
-            self.dataloader.sampler.set_epoch(epoch)
+            self.step_scheduler.set_epoch(epoch)
             for batch_idx, batch in enumerate(self.step_scheduler):
                 self._run_train_step(batch, self.step_scheduler.is_optim_step, 1.0)
                 if self.step_scheduler.is_ckpt_step:
