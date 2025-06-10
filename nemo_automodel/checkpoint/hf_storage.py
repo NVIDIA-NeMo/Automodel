@@ -87,12 +87,16 @@ class HuggingFaceStorageWriter(FsspecWriter):
         self._fqn_to_index_mapping: dict[str, int] = fqn_to_index_mapping
 
     def prepare_local_plan(self, plan: SavePlan) -> SavePlan:
+        """
+        Prepares the local plan for writing.
+        """
         plan = super().prepare_local_plan(plan)
         return dataclasses.replace(
             plan, storage_data=_FqnToFileMapping(self._fqn_to_index_mapping)
         )
 
     def prepare_global_plan(self, plans: list[SavePlan]) -> list[SavePlan]:
+        """Prepares the global plan for writing."""
         return plans
 
     def write_data(
@@ -100,6 +104,7 @@ class HuggingFaceStorageWriter(FsspecWriter):
         plan: SavePlan,
         planner: SavePlanner,
     ) -> Future[list[WriteResult]]:
+        """Writes the data to the storage."""
         if len(plan.items) == 0:
             fut: Future = Future()
             fut.set_result([])
@@ -125,6 +130,7 @@ class HuggingFaceStorageWriter(FsspecWriter):
         return super()._write_data(planner, file_queue)
 
     def finish(self, metadata: Metadata, results: list[list[WriteResult]]) -> None:
+        """Finishes the writing of the data to the storage."""
         storage_md = {}
         total_size = 0
         for wr_list in results:
@@ -150,6 +156,7 @@ class HuggingFaceStorageWriter(FsspecWriter):
     def _split_by_storage_plan(
         self, storage_plan: dict[str, int], items: list[WriteItem]
     ) -> dict[int, list[WriteItem]]:
+        """Splits the items by the storage plan."""
         # storage_plan is a map from key to index
         buckets = {}
         for item in items:
@@ -178,6 +185,7 @@ class HuggingFaceStorageWriter(FsspecWriter):
         return buckets
 
     def _gen_file_name(self, index: int, largest_index: int) -> str:
+        """Generates the file name for the given index and largest index."""
         return (
             FILE_NAME.format(
                 cpt_idx=f"{index}".zfill(5), num_shards=f"{largest_index}".zfill(5)
@@ -187,6 +195,7 @@ class HuggingFaceStorageWriter(FsspecWriter):
 
     @property
     def metadata_path(self) -> str:
+        """Returns the path to the metadata file."""
         return _metadata_fn
 
 
@@ -218,6 +227,7 @@ class HuggingFaceStorageReader(FsspecReader):
         self.storage_data = metadata.storage_data
 
     def read_data(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:
+        """Reads the data from the storage."""
         from safetensors.torch import load  # type: ignore[import-not-found]
 
         per_file: dict[str, list[ReadItem]] = {}
@@ -252,6 +262,7 @@ class HuggingFaceStorageReader(FsspecReader):
         return fut
 
     def read_metadata(self) -> Metadata:
+        """Reads the metadata from the storage."""
         metadata_path = self.fs.concat_path(self.path, _metadata_fn)
 
         state_dict_metadata: dict[str, STORAGE_TYPES] = {}

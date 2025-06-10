@@ -61,8 +61,10 @@ class HuggingFaceLoadPlanner(DefaultLoadPlanner):
     A load planner. Note that this is currently experimental.
     """
     def __init__(self, allow_tensor_resize: bool = False):
+        """Initializes the load planner."""
         super().__init__()
         self.allow_tensor_resize = allow_tensor_resize
 
     def resolve_tensor(self, read_item: ReadItem):
+        """Resolves a tensor for a given read item."""
         return self.lookup_tensor(read_item.dest_index)
