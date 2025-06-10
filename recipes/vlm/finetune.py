@@ -116,16 +116,21 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, distributed_sampler_kwargs) -> D
             processor=processor
         )
         
-        ds = hf_dataset_builder.dataset
+        split = getattr(cfg_ds, 'split', None)
+        #TODO: recognize split without passing in the split name
+        if split is not None:
+            ds = hf_dataset_builder.dataset_splits[split]
+        else:
+            raise ValueError(f"split is required for VLM datasets, but got {split}")
+
         
-        # Follow LLM pattern: use the dataset object directly
         sampler = torch.utils.data.distributed.DistributedSampler(
             ds,
             num_replicas=distributed_sampler_kwargs.get("num_replicas", 1),
             rank=distributed_sampler_kwargs.get("rank", 0),
             shuffle=distributed_sampler_kwargs.get("shuffle", False),
         )    
-    
+    #TODO: HFDatasetBuilder has DLbuilder but is not stateful, didn't use it
     return cfg_dl.instantiate(dataset=ds, sampler=sampler, collate_fn=hf_dataset_builder.collate_fn)
 
 

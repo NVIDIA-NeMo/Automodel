@@ -40,27 +40,18 @@ distributed:
   cp_size: 1
   sequence_parallel: false
 
-loss_fn:
-  _target_: torch.nn.CrossEntropyLoss
-  ignore_index: -100
+loss_fn: nemo_automodel.loss.masked_ce.masked_cross_entropy
 
 dataset:
   _target_: nemo_automodel.datasets.vlm.rdr.make_rdr_dataset
   path_or_dataset: quintend/rdr-items
+  split: train
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   num_workers: 4
   pin_memory: true
   persistent_workers: true
-
-validation_dataset:
-  _target_: nemo_automodel.datasets.vlm.rdr.make_rdr_dataset
-  path_or_dataset: quintend/rdr-items
-
-validation_dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  batch_size: 1
   
 optimizer:
   _target_: torch.optim.AdamW

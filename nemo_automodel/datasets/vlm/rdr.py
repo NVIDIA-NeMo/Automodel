@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import torch
-from datasets import load_dataset
 from nemo_automodel.datasets.llm.hf_dataset import HFDatasetBuilder
 from nemo_automodel.datasets.vlm.utils import extract_skipped_token_ids
 
@@ -47,9 +46,8 @@ def make_rdr_dataset(
             },
             {"role": "assistant", "content": [{"type": "text", "text": sample["text"]}]},
         ]
-        return {"conversation": conversation, "images": [sample['image'].convert("RGB")]}
+        return {"conversation": conversation, "images": [sample['image']]}
 
-    # Create collate function
     collate_fn = None
     if processor is not None:
         skipped_tokens = extract_skipped_token_ids(processor)
@@ -65,11 +63,8 @@ def make_rdr_dataset(
                     add_generation_prompt=False))
                 images += example['images']
 
-            # Process batch
             batch = processor(text=text, images=images, padding=True, return_tensors="pt")
             batch["pixel_values"] = batch["pixel_values"].to(torch.bfloat16)
-            
-            # Create labels with proper masking
             labels = batch["input_ids"].clone()[:, 1:]
             labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
             labels[torch.isin(labels, skipped_tokens)] = -100
