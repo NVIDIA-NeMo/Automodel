@@ -189,6 +189,7 @@ runs:
           set -e
 
           docker exec -t nemo_container_${{ github.run_id }} bash -c '\
+            pip install -e . && \
             bash tests/${{ inputs.is_unit_test == 'true' && 'unit_tests' || 'functional_tests' }}/${{ inputs.script }}.sh && \
             echo "Finished successfully." || echo "Did not finish."'
         ) 2>&1 | tee err.log
@@ -213,13 +214,13 @@ runs:
       id: check
       shell: bash
       run: |
-        docker exec nemo_container_${{ github.run_id }} coverage combine || true
-        docker exec nemo_container_${{ github.run_id }} coverage xml
-        docker cp nemo_container_${{ github.run_id }}:/workspace/.coverage .coverage
-        docker cp nemo_container_${{ github.run_id }}:/workspace/coverage.xml coverage.xml
+        # docker exec nemo_container_${{ github.run_id }} coverage combine || true
+        # docker exec nemo_container_${{ github.run_id }} coverage xml || true
+        # docker cp nemo_container_${{ github.run_id }}:/workspace/.coverage .coverage
+        # docker cp nemo_container_${{ github.run_id }}:/workspace/coverage.xml coverage.xml
 
-        coverage_report=coverage-${{ steps.create.outputs.coverage-prefix }}-${{ github.run_id }}-$(uuidgen)
-        echo "coverage_report=$coverage_report" >> "$GITHUB_OUTPUT"
+        # coverage_report=coverage-${{ steps.create.outputs.coverage-prefix }}-${{ github.run_id }}-$(uuidgen)
+        # echo "coverage_report=$coverage_report" >> "$GITHUB_OUTPUT"
 
         IS_SUCCESS=$(tail -n 1 err.log | grep -q "Finished successfully." && echo "true" || echo "false")
 
@@ -235,17 +236,17 @@ runs:
 
         exit $EXIT_CODE
 
-    - name: Test coverage
-      shell: bash -x -e -u -o pipefail {0}
-      run: |
-        docker exec -t nemo_container_${{ github.run_id }} coverage report -i
+    # - name: Test coverage
+    #   shell: bash -x -e -u -o pipefail {0}
+    #   run: |
+    #     docker exec -t nemo_container_${{ github.run_id }} coverage report -i
 
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      if: ${{ steps.check.outputs.coverage_report != 'none' }}
-      with:
-        name: ${{ steps.check.outputs.coverage_report }}
-        path: |
-          coverage.xml
-          .coverage
-        include-hidden-files: true
+    # - name: Upload artifacts
+    #   uses: actions/upload-artifact@v4
+    #   if: ${{ steps.check.outputs.coverage_report != 'none' }}
+    #   with:
+    #     name: ${{ steps.check.outputs.coverage_report }}
+    #     path: |
+    #       coverage.xml
+    #       .coverage
+    #     include-hidden-files: true
