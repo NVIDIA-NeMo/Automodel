@@ -88,7 +88,24 @@ class HuggingFaceStorageWriter(FsspecWriter):
 
     def prepare_local_plan(self, plan: SavePlan) -> SavePlan:
         """
-        Prepares the local plan for writing.
+        Enrich the provided ``SavePlan`` with Hugging-Face specific routing
+        information.
+
+        The base :class:`torch.distributed.checkpoint._fsspec_filesystem.FsspecWriter`
+        converts the planner's generic *plan* into one that is compatible with
+        the target filesystem. Hugging Face sharded checkpoints require one
+        additional piece of information: a mapping that tells which fully-
+        qualified tensor name (FQN) should be written into which shard. This
+        method attaches that mapping so that :py:meth:`write_data` can later
+        group ``WriteItem`` objects by their target shard.
+
+        Args:
+            plan: The local plan produced by the checkpoint *planner*.
+
+        Returns:
+            A shallow copy of *plan* whose ``storage_data`` field now contains
+            an instance of :class:`_FqnToFileMapping` wrapping
+            ``self._fqn_to_index_mapping``.
         """
         plan = super().prepare_local_plan(plan)
         return dataclasses.replace(
@@ -96,7 +113,19 @@ class HuggingFaceStorageWriter(FsspecWriter):
         )
 
     def prepare_global_plan(self, plans: list[SavePlan]) -> list[SavePlan]:
-        """Prepares the global plan for writing."""
+        """
+        Forward the list of device-local plans unchanged.
+
+        The Hugging Face writer does not need to merge or otherwise transform
+        the per-rank plans produced by the planner, therefore this method
+        simply returns *plans* untouched.
+
+        Args:
+            plans: A list of :class:`SavePlan` objects (one per rank).
+
+        Returns:
+            The *plans* argument unmodified.
+        """
         return plans
 
     def write_data(
@@ -104,7 +133,28 @@ class HuggingFaceStorageWriter(FsspecWriter):
         plan: SavePlan,
         planner: SavePlanner,
     ) -> Future[list[WriteResult]]:
-        """Writes the data to the storage."""
+        """
+        Materialise the tensors described in *plan* to ``.safetensors`` files.
+
+        Workflow:
+            1. Group the incoming :class:`WriteItem` objects by their target
+               shard index as defined by ``plan.storage_data``.
+            2. Derive the correct filename for each shard following Hugging
+               Face conventions (single-shard -> ``model.safetensors``;
+               multi-shard -> ``model-{00000}-of-{00000}.safetensors``).
+            3. Hand off the per-shard work to
+               :py:meth:`FsspecWriter._write_data` which performs the actual
+               I/O in background threads.
+
+        Args:
+            plan: The per-rank :class:`SavePlan` that should be written to
+                disk.
+            planner: The ``SavePlanner`` instance that generated *plan*.
+
+        Returns:
+            A :class:`torch.futures.Future` that resolves to a list of
+            :class:`WriteResult` objects once all shards have been written.
+        """
         if len(plan.items) == 0:
             fut: Future = Future()
             fut.set_result([])
@@ -130,7 +180,26 @@ class HuggingFaceStorageWriter(FsspecWriter):
         return super()._write_data(planner, file_queue)
 
     def finish(self, metadata: Metadata, results: list[list[WriteResult]]) -> None:
-        """Finishes the writing of the data to the storage."""
+        """
+        Finalise the checkpoint by writing the Hugging Face *weight map*.
+
+        After all shards have been persisted, this method aggregates the
+        information contained in the returned :class:`WriteResult` objects,
+        computes the total byte size of the checkpoint and, when necessary,
+        creates ``model.safetensors.index.json`` which is the file expected by
+        the Hugging Face Hub.
+
+        The index file is generated when *either* of the following holds:
+
+        1. The checkpoint is split across multiple shards.
+        2. The (single) shard is not named ``model.safetensors``.
+
+        Args:
+            metadata: The global :class:`Metadata` object passed in from the
+                distributed-checkpoint runtime.
+            results: Nested list with the :class:`WriteResult` objects returned
+                from :py:meth:`write_data`.
+        """
         storage_md = {}
         total_size = 0
         for wr_list in results:
@@ -156,7 +225,22 @@ class HuggingFaceStorageWriter(FsspecWriter):
     def _split_by_storage_plan(
         self, storage_plan: dict[str, int], items: list[WriteItem]
     ) -> dict[int, list[WriteItem]]:
-        """Splits the items by the storage plan."""
+        """
+        Group ``WriteItem`` instances by their destination shard.
+
+        Args:
+            storage_plan: Mapping ``FQN -> shard_index`` (1-based) that was
+                created from the reference Hugging Face checkpoint.
+            items: List of :class:`WriteItem` objects to be grouped.
+
+        Returns:
+            A dictionary mapping the shard index to the list of items that
+            belong to it.
+
+        Raises:
+            KeyError: If an item's FQN (with or without a possible "model." or
+                "optim." prefix) cannot be found in *storage_plan*.
+        """
         # storage_plan is a map from key to index
         buckets = {}
         for item in items:
@@ -185,7 +269,17 @@ class HuggingFaceStorageWriter(FsspecWriter):
         return buckets
 
     def _gen_file_name(self, index: int, largest_index: int) -> str:
-        """Generates the file name for the given index and largest index."""
+        """
+        Return the canonical shard filename used by Hugging Face.
+
+        Args:
+            index: Current shard index (1-based).
+            largest_index: Highest shard index in the checkpoint (and thus the
+                total number of shards).
+
+        Returns:
+            str: ``"model-{index:05d}-of-{largest_index:05d}.safetensors"``
+        """
         return (
             FILE_NAME.format(
                 cpt_idx=f"{index}".zfill(5), num_shards=f"{largest_index}".zfill(5)
@@ -203,6 +297,8 @@ class HuggingFaceStorageReader(FsspecReader):
     """
     A reader that reads from a huggingface repository in the huggingface format.
     Uses in Fsspec back-end to communicate with the huggingface hub.
+
+    **Note**: This is currently experimental. Functionality is not guaranteed.
     """
 
     def __init__(self, path: str, token: Optional[str] = None) -> None:
@@ -262,7 +358,25 @@ class HuggingFaceStorageReader(FsspecReader):
         return fut
 
     def read_metadata(self) -> Metadata:
-        """Reads the metadata from the storage."""
+        """
+        Retrieve (or synthesise) the checkpoint's :class:`Metadata`.
+
+        Two cases are supported:
+
+        1. **Standard HF layout** – ``model.safetensors.index.json`` is present.
+           The method parses the JSON and converts the declared weight-map into
+           DCP-compatible structures.
+        2. **Legacy/Single-file layout** – the index file is absent and exactly
+           one ``.safetensors`` file is found. The method inspects the file and
+           builds an in-memory weight-map on the fly so that downstream code
+           can treat the checkpoint as if it had an index.
+
+        Returns:
+            A fully populated :class:`Metadata` instance whose
+            ``storage_data`` attribute maps FQNs to shard filenames and whose
+            ``state_dict_metadata`` marks every entry as
+            :class:`BytesStorageMetadata`.
+        """
         metadata_path = self.fs.concat_path(self.path, _metadata_fn)
 
         state_dict_metadata: dict[str, STORAGE_TYPES] = {}

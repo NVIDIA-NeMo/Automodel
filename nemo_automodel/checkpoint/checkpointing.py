@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 import torch.distributed
 import torch.distributed.checkpoint as dcp
+from nemo_automodel.checkpoint.hf_planner import HuggingFaceLoadPlanner
 from nemo_automodel.checkpoint.hf_storage import (
     HuggingFaceStorageWriter,
     HuggingFaceStorageReader,
@@ -158,26 +159,11 @@ def load_model(
         raise FileNotFoundError(f"Model path {model_path} does not exist")
 
     if checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
-        # For HF safetensors we rely on the custom HuggingFaceStorageReader which
-        # understands both sharded and single-file checkpoints. Since we saved the
-        # model with `no_dist=True`, we also load with `no_dist=True` so that only
-        # rank-0 touches the checkpoint files and then broadcasts tensors to the
-        # remaining ranks under the hood.
+        raise NotImplementedError("Safetensors checkpoint loading is not supported yet.")
 
-        # Wrap the destination model in a Stateful helper so that DCP will call
-        # `load_state_dict` and push the loaded tensors back into the live
-        # parameters instead of simply filling a detached tensor dictionary. This
-        # was previously missing, which meant the tensors were loaded *into a
-        # temporary dict* but never copied to the actual model – causing the
-        # restored model to keep its random-initialised weights.
         model_state = ModelState(model, checkpoint_config.model_save_format)
 
         storage_reader = HuggingFaceStorageReader(path=model_path)
-
-        # Allow the planner to resize tensors when the destination param has been
-        # replaced/expanded (e.g., when users add new special tokens). For exact
-        # restores this is a no-op.
-        from nemo_automodel.checkpoint.hf_planner import HuggingFaceLoadPlanner
 
         load_planner = HuggingFaceLoadPlanner(allow_tensor_resize=True)
 
