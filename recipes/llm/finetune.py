@@ -5,14 +5,6 @@ from wandb import Settings
 from nemo_automodel.loggers.wandb_utils import suppress_wandb_log_messages
 
 import torch.distributed as dist
-from torch.distributed.checkpoint.state_dict import (
-    get_model_state_dict,
-    get_optimizer_state_dict,
-    set_model_state_dict,
-    set_optimizer_state_dict,
-    StateDictOptions,
-)
-import torch.distributed.checkpoint as dcp
 from typing import Any, Dict
 
 import torch
@@ -35,6 +27,7 @@ from nemo_automodel.utils.dist_utils import reduce_loss, get_sync_ctx, rescale_g
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 
 from transformers import AutoTokenizer
+from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from nemo_automodel.loggers.log_utils import setup_logging
 
 import logging
@@ -130,7 +123,7 @@ def build_loss_fn(device, cfg_loss):
         return cfg_loss.instantiate().to(device)
 
 
-def build_dataloader(cfg_ds, cfg_dl, cfg_model, distributed_sampler_kwargs) -> DataLoader:
+def build_dataloader(cfg_ds, cfg_dl, cfg_model, distributed_sampler_kwargs, seed) -> DataLoader:
     """
     Build a DataLoader for the dataset.
 
@@ -147,11 +140,13 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, distributed_sampler_kwargs) -> D
     else:
         tokenizer = cfg_ds.tokenizer.instantiate()
     ds = cfg_ds.instantiate(tokenizer=tokenizer)
-    sampler = torch.utils.data.distributed.DistributedSampler(
+    sampler = StatefulDistributedSampler(
         ds,
         num_replicas=distributed_sampler_kwargs.get("num_replicas", 1),
         rank=distributed_sampler_kwargs.get("rank", 0),
         shuffle=distributed_sampler_kwargs.get("shuffle", False),
+        seed=seed,
+        drop_last=True,
     )
     return cfg_dl.instantiate(dataset=ds, sampler=sampler)
 
@@ -270,6 +265,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.cfg.dataloader,
             self.cfg.model,
             distributed_sampler_kwargs,
+            self.cfg.get("rng.seed", 42) + self.dist_env.rank,
         )
 
         # Build validation dataloader if the config provides it
@@ -280,6 +276,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 self.cfg.validation_dataloader,
                 self.cfg.model,
                 distributed_sampler_kwargs,
+                self.cfg.get("rng.seed", 42) + self.dist_env.rank,
             )
 
         # Initialize metrics required for calculating loss
@@ -310,6 +307,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
         self.model.train()
         for epoch in self.step_scheduler.epochs:
+            self.dataloader.sampler.set_epoch(epoch)
             for batch_idx, batch in enumerate(self.step_scheduler):
                 self._run_train_step(batch, self.step_scheduler.is_optim_step, 1.0)
                 if self.step_scheduler.is_ckpt_step:
