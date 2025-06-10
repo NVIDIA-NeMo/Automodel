@@ -130,13 +130,12 @@ def save_model(
             fqn_to_index_mapping=fqn_to_file_index_mapping,
         )
 
-        if torch.distributed.get_rank() == 0:
-            dcp.save(
-                {"model": model_state},
-                checkpoint_id=model_path,
-                storage_writer=storage_writer,
-                no_dist=True,
-            )
+        dcp.save(
+            {"model": model_state},
+            checkpoint_id=model_path,
+            storage_writer=storage_writer,
+            no_dist=True,
+        )
     elif checkpoint_config.model_save_format == SerializationFormat.TORCH_SAVE:
         dcp.save({"model": model_state}, checkpoint_id=model_path)
     else:

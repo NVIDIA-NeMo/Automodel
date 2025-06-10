@@ -15,11 +15,8 @@
 # taken and edited from https://github.com/pytorch/pytorch/blob/c8d39a10457ea5d65184c6e8f037f46c5525d869/torch/distributed/checkpoint/_hf_planner.py # pylint: disable=line-too-long
 
 # mypy: allow-untyped-defs
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from torch.distributed.checkpoint._dedup_save_plans import (
-    dedup_save_plans_with_fqn_to_index_mapping,
-)
 from torch.distributed.checkpoint.default_planner import (
     DefaultLoadPlanner,
     DefaultSavePlanner,
@@ -51,7 +48,7 @@ class HuggingFaceSavePlanner(DefaultSavePlanner):
             0
         ].storage_data.fqn_to_file_index_mapping
 
-        return dedup_save_plans_with_fqn_to_index_mapping(
+        return _dedup_save_plans_with_fqn_to_index_mapping(
             all_plans, fqn_to_index_mapping
         )
 
@@ -68,3 +65,28 @@ class HuggingFaceLoadPlanner(DefaultLoadPlanner):
     def resolve_tensor(self, read_item: ReadItem):
         """Resolves a tensor for a given read item."""
         return self.lookup_tensor(read_item.dest_index)
+    
+
+def _dedup_save_plans_with_fqn_to_index_mapping(
+    all_plans: list[SavePlan], fqn_to_index_mapping: dict[str, int]
+) -> list[SavePlan]:
+    """
+    Dedups the save plans based on the fqn to file index mapping.
+    """
+    num_plans = len(all_plans)
+
+    to_remove: list[set] = [set() for _ in range(len(all_plans))]
+    for plan_idx, plan in enumerate(all_plans):
+        for item_idx, item in enumerate(plan.items):
+            if (fqn_to_index_mapping[item.index.fqn] - 1) % num_plans != plan_idx:
+                to_remove[plan_idx].add(item_idx)
+
+    for plan_idx, remove_set in enumerate(to_remove):
+        new_items = [
+            write_item
+            for item_idx, write_item in enumerate(all_plans[plan_idx].items)
+            if item_idx not in remove_set
+        ]
+        all_plans[plan_idx] = replace(all_plans[plan_idx], items=new_items)
+
+    return all_plans
