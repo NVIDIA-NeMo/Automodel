@@ -169,7 +169,7 @@ def build_step_scheduler(cfg, dataloader):
         num_epochs = 10,
         grad_acc_steps = 10,
         ckpt_every_steps = 100,
-        epoch_len = len(dataloader),
+        dataloader = dataloader,
     )
     if cfg is not None:
         default_kwargs |= cfg.to_dict()
@@ -283,14 +283,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
         """
         self.model.train()
         for epoch in self.step_scheduler.epochs:
-            for batch_idx, batch in enumerate(self.dataloader):
-                is_optim_step, is_ckpt_step, is_val_step = self.step_scheduler.update(batch_idx)
-                self._run_train_step(batch, is_optim_step, 1.0)
-                if is_ckpt_step and self.dist_env.is_main:
+            for batch_idx, batch in enumerate(self.step_scheduler):
+                self._run_train_step(batch, self.step_scheduler.is_optim_step, 1.0)
+                if self.step_scheduler.is_ckpt_step and self.dist_env.is_main:
                 #     self._save_checkpoint()
                     pass
 
-                if is_val_step and self.val_dataloader is not None:
+                if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     self._run_validation_epoch()
 
 
