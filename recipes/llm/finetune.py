@@ -75,7 +75,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id):
     from transformers.utils import TRANSFORMERS_CACHE
 
     ckpt_kwargs = dict(  
-        enabled=True,
+        enabled=False,
         checkpoint_dir="checkpoints/",
         model_save_format="safetensors",
         model_repo_id=model_repo_id,
