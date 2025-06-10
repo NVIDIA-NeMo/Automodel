@@ -15,7 +15,7 @@
 """Checkpoint management utilities for HF models."""
 
 import os
-from typing import Any, Optional, Union
+from typing import Any, Optional
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,11 +34,11 @@ import glob
 from enum import Enum
 
 class SerializationFormat(Enum):
+    """
+    The format to save the model in.
+    """
     TORCH_SAVE = "torch_save"
     SAFETENSORS = "safetensors"
-
-PathLike = Union[str, "os.PathLike[Any]"]
-    
 
 @dataclass
 class CheckpointingConfig:
