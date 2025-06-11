@@ -34,10 +34,15 @@ try:
 except:
     HAVE_NVFSDP = False
 
-import logging
+from nemo_automodel.distributed.parallelizer import create_context_parallel_ctx, get_train_context
+from nemo_automodel.training.base_recipe import BaseRecipe
+from nemo_automodel.training.step_scheduler import StepScheduler
 
-from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoTokenizer
+from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+from nemo_automodel.loggers.log_utils import setup_logging
+import time
+import logging
 
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.config.cli import parse_args_and_load_config
@@ -45,9 +50,7 @@ from nemo_automodel.datasets.llm.packed_sequence import PackedSequence
 from nemo_automodel.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.distributed.init_utils import initialize_distributed
 from nemo_automodel.loggers.log_utils import setup_logging
-from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.rng import StatefulRNG
-from nemo_automodel.training.step_scheduler import StepScheduler
 from nemo_automodel.utils.dist_utils import (
     clip_gradients,
     get_sync_ctx,
@@ -158,6 +161,34 @@ def build_loss_fn(device, cfg_loss):
     else:
         return cfg_loss.instantiate().to(device)
 
+@torch.no_grad()
+def count_tail_padding(labels, ignore_label=-100):
+    """Counts the total number of padding token in the tail of labels
+
+    e.g.
+        labels = torch.tensor([
+            [-100, 1, 1, -100, -100],   # 2 tail -100s
+            [-100, -100, 2, 3, 4],      # 0 tail -100s
+            [5, 6, -100, -100, -100],   # 3 tail -100s
+        ])
+        count_tail_padding will return 5. Please do note there's more than 5 ignore labels.
+    Args:
+        labels (torch.Tensor): the labels
+        ignore_label (int, optional): ignore label index. Defaults to -100.
+
+    Returns:
+        int: total number of ignored tokens in the `labels` input.
+    """
+
+    # Flip along the last dimension (seq_len)
+    flipped = labels.flip(dims=[1])
+    tail_mask = flipped == ignore_label
+
+    # Compute cumulative product to "break" on first non ignore_label
+    prod_mask = torch.cumprod(tail_mask.int(), dim=1)
+
+    # Count tail -100s by summing cumprod mask along the sequence dimension
+    return prod_mask.view(-1).sum().item()
 
 def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_ps, device_mesh, seed) -> DataLoader:
     """Build a DataLoader for the dataset.
@@ -375,6 +406,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         and update model parameters when necessary. Also prints loss every gradient step.
         """
         self.model.train()
+        self.timestamp = time.perf_counter()
+        self.num_tokens = 0
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
             for batch_idx, batch in enumerate(self.step_scheduler):
@@ -403,6 +436,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         loss_mask = batch.pop("loss_mask", None)
         if loss_mask is None:
             loss_mask = (labels.detach() != -100).to(torch.int)
+        self.num_tokens += count_tail_padding(labels)
 
         if (
             "position_ids" not in batch
@@ -465,15 +499,24 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 self.model.install_optimized_model_weights()
                 self.model.zero_grad_buffer()
 
+            # Excluding the first/last iter, time_delta is calculated as follows
+            # fwd 0 | opt 0 | fwd 1 | opt 1 | fwd 2
+            #        ^              ^
+            t = time.perf_counter()
+            time_delta = t - self.timestamp
+            self.timestamp = t
+            tps = self.num_tokens / time_delta
+            self.num_tokens = 0
             # log
             reporting_loss = self.log_train_metrics(grad_norm)
             logging.info(
-                "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | mem: {:.2f} GiB".format(
+                "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | mem: {:.2f} GiB | tps {:.2f}".format(
                     self.step_scheduler.step,
                     self.step_scheduler.epoch,
                     reporting_loss,
                     grad_norm,
                     torch.cuda.max_memory_allocated() / 1024**3,
+                    tps,
                 )
             )
             torch.cuda.reset_peak_memory_stats()
