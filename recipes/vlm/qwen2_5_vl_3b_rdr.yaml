@@ -1,0 +1,71 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Configuration for fine-tuning Qwen2.5-VL-3B with RDR dataset for image description
+
+step_scheduler:
+  grad_acc_steps: 8
+  ckpt_every_steps: 500
+  val_every_steps: 50  # will run every x number of gradient steps
+  num_epochs: 3
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+rng:
+  _target_: nemo_automodel.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.transformers.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
+
+distributed:
+  _target_: nemo_automodel.distributed.fsdp2.FSDP2Manager
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+loss_fn: nemo_automodel.loss.masked_ce.masked_cross_entropy
+
+dataset:
+  _target_: nemo_automodel.datasets.vlm.rdr.make_rdr_dataset
+  path_or_dataset: quintend/rdr-items
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 4
+  pin_memory: true
+  
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_language_model: false
+
+# Uncomment and configure for W&B logging
+# logger:
+#   wandb_project: nemo_automodel_vlm
+#   wandb_entity: nvidia
+#   wandb_exp_name: qwen2_5_vl_3b_rdr
+#   wandb_save_dir: ./wandb_logs 
