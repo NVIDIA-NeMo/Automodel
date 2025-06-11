@@ -472,9 +472,9 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 self.model.install_optimized_model_weights()
                 self.model.zero_grad_buffer()
 
-            # Excluding the first/last iter, time_delta is calculated as follows
-            # fwd 0 | opt 0 | fwd 1 | opt 1 | fwd 2
-            #        ^              ^
+            # TPS is calculated as follows (assuming grad-accumulation-steps=2):
+            # fwd 0 | bwd 0 | fwd 1 | bwd 1 | opt 0 | fwd 2 | bwd 2 | ...
+            # ^                                     ^
             t = time.perf_counter()
             time_delta = t - self.timestamp
             self.timestamp = t
