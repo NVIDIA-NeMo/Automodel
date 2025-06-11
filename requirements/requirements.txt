@@ -7,3 +7,4 @@ torch
 torchdata
 transformers
 wandb
+nvFSDP @ git+https://github.com/NVIDIA-NeMo/nvFSDP.git@e48b3c6
