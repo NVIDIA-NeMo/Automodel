@@ -9,7 +9,6 @@ from datasets import Dataset, DatasetDict, load_dataset
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from nemo_automodel.utils.dist_utils import log_single_rank
 from nemo_automodel.datasets.utils import (
     batchify,
     pad_within_micro,
@@ -99,26 +98,22 @@ def make_dataset_splits(dataset, split, split_aliases):
         dataset_splits[split] = dataset
     elif isinstance(dataset, DatasetDict):
         dataset_split_names = dataset.keys()
-        log_single_rank(
-            logger,
-            logging.INFO,
-            f"HF dataset has the following splits: {dataset_split_names}",
+        logger.info(
+            "HF dataset has the following splits: {}".format(dataset_split_names)
         )
         for alias_split_name, split in dataset.items():
             split_name = alias_to_split[alias_split_name]
             assert dataset_splits[split_name] is None
             dataset_splits[split_name] = split
     elif isinstance(split, list):
-        log_single_rank(
-            logger, logging.INFO, f"Loaded HF dataset will use {split} splits."
-        )
+        logger.info("Loaded HF dataset will use {} splits.".format(split))
         assert isinstance(dataset, list)
         for i, alias_split_name in enumerate(map(clean_split, split)):
             split_name = alias_to_split[alias_split_name]
             assert dataset_splits[split_name] is None
             dataset_splits[split_name] = dataset[i]
     elif isinstance(split, str):
-        log_single_rank(logger, logging.INFO, "Loaded HF dataset has a single split.")
+        logger.info("Loaded HF dataset has a single split.")
         assert not isinstance(dataset, list)
         alias_split_name = split
         if "+" in alias_split_name:
@@ -233,10 +228,10 @@ class HFDatasetBuilder(DataloaderConfig):
 
         # self.dataset_splits will hold the actual dataset for each split.
         if isinstance(self.path_or_dataset, str):
-            log_single_rank(
-                logger,
-                logging.INFO,
-                f"Loading HF dataset from {self.path_or_dataset}, this may take a moment.",
+            logger.info(
+                "Loading HF dataset from {}, this may take a moment.".format(
+                    self.path_or_dataset
+                )
             )
             dataset = load_dataset(
                 self.path_or_dataset, split=self.split, **(self.dataset_kwargs or {})
@@ -244,9 +239,7 @@ class HFDatasetBuilder(DataloaderConfig):
         elif isinstance(self.path_or_dataset, Dataset) or isinstance(
             self.path_or_dataset, DatasetDict
         ):
-            log_single_rank(
-                logger, logging.INFO, f"Using passed HF dataset {self.path_or_dataset}"
-            )
+            logger.info("Using passed HF dataset {}".format(self.path_or_dataset))
             dataset = self.path_or_dataset
         else:
             raise ValueError(
