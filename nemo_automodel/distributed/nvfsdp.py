@@ -8,13 +8,6 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
 )
 
-try:
-    from nvfsdp import DistributedDataParallelConfig
-except ImportError:
-    from nemo_automodel.distributed.nvfsdp.distributed_data_parallel_config import (
-        DistributedDataParallelConfig,
-    )
-
 from nemo_automodel.distributed.parallelizer import (
     get_hf_tp_shard_plan,
     nvfsdp_strategy_parallelize,
