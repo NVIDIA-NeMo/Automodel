@@ -41,11 +41,11 @@ def patch_attention(obj, sdpa_method=None):
     """
     if sdpa_method is None:
         sdpa_method = [
-            SDPBackend.CUDNN_ATTENTION,
-            SDPBackend.FLASH_ATTENTION,
-            SDPBackend.EFFICIENT_ATTENTION,
-            SDPBackend.MATH,
-        ]
+            # SDPBackend.CUDNN_ATTENTION,
+            SDPBackend.FLASH_ATTENTION ]
+        #     SDPBackend.EFFICIENT_ATTENTION,
+        #     SDPBackend.MATH,
+        # ]
     orig_forward = obj.forward
 
     def patched_forward(self, *args, **kwargs):

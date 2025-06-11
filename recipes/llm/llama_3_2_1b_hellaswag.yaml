@@ -39,7 +39,8 @@ dataset:
   split: train
 
 packed_sequence:
-  packed_sequence_size: 2048
+  # Set packed_sequence_size > 0 to run with packed sequences
+  packed_sequence_size: 0
   split_across_pack: False
 
 dataloader:
