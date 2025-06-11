@@ -125,7 +125,7 @@ def build_loss_fn(device, cfg_loss):
         return cfg_loss.instantiate().to(device)
 
 
-def build_dataloader(cfg_ds, cfg_dl, cfg_model, distributed_sampler_kwargs, seed) -> DataLoader:
+def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_ps, distributed_sampler_kwargs, seed) -> DataLoader:
     """
     Build a DataLoader for the dataset.
 
