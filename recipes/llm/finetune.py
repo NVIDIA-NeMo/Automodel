@@ -240,9 +240,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.model_wrapper = self.cfg.distributed.instantiate(
                 world_size=self.dist_env.world_size
             )
-            if hasattr(self.model_wrapper, 'device_mesh'):
-                self.device_mesh = self.model_wrapper.device_mesh
-
+            self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
 
         if self.dist_env.is_main and hasattr(self.cfg, 'logger'):
             suppress_wandb_log_messages()
