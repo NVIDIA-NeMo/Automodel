@@ -146,14 +146,14 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, device_mesh, seed) -> DataLoader
             "num_replicas": device_mesh.get("data_parallel").size(),
             "rank": device_mesh.get["data_parallel"].get_local_rank(),
         }
+    if not 'tokenizer' in cfg_ds:
+        tokenizer = AutoTokenizer.from_pretrained(cfg_model.pretrained_model_name_or_path)
+    elif not '_target_' in cfg_ds.tokenizer:
+        tokenizer = AutoTokenizer.from_pretrained(**cfg_ds.tokenizer.to_dict())
+    else:
+        tokenizer = cfg_ds.tokenizer.instantiate()
 
     with StatefulRNG(seed=seed, ranked=True):
-        if not 'tokenizer' in cfg_ds:
-            tokenizer = AutoTokenizer.from_pretrained(cfg_model.pretrained_model_name_or_path)
-        elif not '_target_' in cfg_ds.tokenizer:
-            tokenizer = AutoTokenizer.from_pretrained(**cfg_ds.tokenizer.to_dict())
-        else:
-            tokenizer = cfg_ds.tokenizer.instantiate()
         ds = cfg_ds.instantiate(tokenizer=tokenizer)
         sampler = StatefulDistributedSampler(
             ds,
