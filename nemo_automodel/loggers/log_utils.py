@@ -38,8 +38,8 @@ class RankFilter(logging.Filter):
             bool: True if the log record should be logged, False otherwise.
         """
         # TODO(@akoumparouli): make this PP aware.
-        if 'LOCAL_RANK' in os.environ:
-            rank = int(os.environ.get('LOCAL_RANK'))
+        if 'RANK' in os.environ:
+            rank = int(os.environ.get('RANK'))
             # permantly disable logging for rank != 0
             if rank > 0:
                 logging.disable(logging.CRITICAL)
