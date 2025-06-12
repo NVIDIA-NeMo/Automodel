@@ -253,7 +253,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         self.device_mesh = None
         self.model_wrapper = None
-        distributed_sampler_kwargs = {}
         if "distributed" in self.cfg:
             self.model_wrapper = self.cfg.distributed.instantiate(
                 world_size=self.dist_env.world_size
