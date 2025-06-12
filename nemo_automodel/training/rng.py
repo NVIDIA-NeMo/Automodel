@@ -34,8 +34,7 @@ def init_all_rng(seed: int, ranked: bool = False):
         try:
             import torch.distributed as dist
             if dist.is_initialized():
-                rank = dist.get_rank()
-                seed += rank
+                seed += dist.get_rank()
         except ImportError:
             pass
 
