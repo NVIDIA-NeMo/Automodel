@@ -469,76 +469,77 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
     @torch.no_grad()
     def _run_validation_epoch(self) -> float:
         """Run one pass over `self.val_dataloader` and return average loss per token."""
-        self.model.eval()
+        with StatefulRNG(seed=1, ranked=True):
+            self.model.eval()
 
-        total_loss = 0.0
-        total_tokens = 0
+            total_loss = 0.0
+            total_tokens = 0
 
-        for batch in self.val_dataloader:
-            batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
-            labels = batch.pop("labels")
-            loss_mask = batch.pop("loss_mask", None)
-            if loss_mask is None:
-                loss_mask = (labels.detach() != -100).to(torch.int)
+            for batch in self.val_dataloader:
+                batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
+                labels = batch.pop("labels")
+                loss_mask = batch.pop("loss_mask", None)
+                if loss_mask is None:
+                    loss_mask = (labels.detach() != -100).to(torch.int)
 
-            if (
-                'position_ids' not in batch and
-                (
-                    self.device_mesh["context_parallel"].size() > 1 or
-                    self.device_mesh["tensor_parallel"].size() > 1
-                )
-            ):
-                batch["position_ids"] = torch.arange(0, batch['input_ids'].shape[1]).unsqueeze(0).to(self.model.device)
+                if (
+                    'position_ids' not in batch and
+                    (
+                        self.device_mesh["context_parallel"].size() > 1 or
+                        self.device_mesh["tensor_parallel"].size() > 1
+                    )
+                ):
+                    batch["position_ids"] = torch.arange(0, batch['input_ids'].shape[1]).unsqueeze(0).to(self.model.device)
 
-            if self.device_mesh["context_parallel"].size() > 1:
+                if self.device_mesh["context_parallel"].size() > 1:
 
-                input_ids = batch["input_ids"].to(self.model.device)
-                position_ids = batch["position_ids"].to(self.model.device)
+                    input_ids = batch["input_ids"].to(self.model.device)
+                    position_ids = batch["position_ids"].to(self.model.device)
 
-                if loss_mask is not None:
-                    cp_buffers = [input_ids, labels, position_ids, loss_mask]
-                    cp_seq_dims = [1, 1, 1, 1]
-                    cp_no_restore_buffers = {input_ids, labels, loss_mask}
+                    if loss_mask is not None:
+                        cp_buffers = [input_ids, labels, position_ids, loss_mask]
+                        cp_seq_dims = [1, 1, 1, 1]
+                        cp_no_restore_buffers = {input_ids, labels, loss_mask}
+                    else:
+                        cp_buffers = [input_ids, labels, position_ids]
+                        cp_seq_dims = [1, 1, 1]
+                        cp_no_restore_buffers = {input_ids, labels}
+
+                    context_parallel_ctx = create_context_parallel_ctx(
+                        cp_mesh=self.model_wrapper.device_mesh["context_parallel"],
+                        cp_buffers=cp_buffers,
+                        cp_seq_dims=cp_seq_dims,
+                        cp_no_restore_buffers=cp_no_restore_buffers,
+                        cp_rotate_method="allgather",  # TODO add "alltoall" option
+                    )
+                    train_context = get_train_context(
+                        False,
+                        False,
+                    )
+                    with train_context(context_parallel_ctx):
+                        out  = self.model(**batch)
+                        # Prepare for loss calculation
+                        logits = out.logits.float()
+                        n_cls = logits.shape[-1]
+                        logits = logits.view(-1, n_cls)
+                        labels = labels.view(-1)
+                        assert logits.shape[-2] == labels.shape[-1], "Expected logits & labels to have the same length"
+                        local_loss = self.loss_fn(logits, labels, loss_mask)
+
+                    # In the case where all labels are masked, the loss should be 0.
+                    if loss_mask is not None and loss_mask.bool().sum() == 0:
+                        local_loss.detach().copy_(torch.zeros_like(local_loss))
                 else:
-                    cp_buffers = [input_ids, labels, position_ids]
-                    cp_seq_dims = [1, 1, 1]
-                    cp_no_restore_buffers = {input_ids, labels}
+                    out = self.model(**batch)
+                    local_loss = self.loss_fn(
+                        out.logits.view(-1, out.logits.size(-1)),
+                        labels.view(-1),
+                        mask=loss_mask,
+                        reduction="sum"
+                    )
 
-                context_parallel_ctx = create_context_parallel_ctx(
-                    cp_mesh=self.model_wrapper.device_mesh["context_parallel"],
-                    cp_buffers=cp_buffers,
-                    cp_seq_dims=cp_seq_dims,
-                    cp_no_restore_buffers=cp_no_restore_buffers,
-                    cp_rotate_method="allgather",  # TODO add "alltoall" option
-                )
-                train_context = get_train_context(
-                    False,
-                    False,
-                )
-                with train_context(context_parallel_ctx):
-                    out  = self.model(**batch)
-                    # Prepare for loss calculation
-                    logits = out.logits.float()
-                    n_cls = logits.shape[-1]
-                    logits = logits.view(-1, n_cls)
-                    labels = labels.view(-1)
-                    assert logits.shape[-2] == labels.shape[-1], "Expected logits & labels to have the same length"
-                    local_loss = self.loss_fn(logits, labels, loss_mask)
-
-                # In the case where all labels are masked, the loss should be 0.
-                if loss_mask is not None and loss_mask.bool().sum() == 0:
-                    local_loss.detach().copy_(torch.zeros_like(local_loss))
-            else:
-                out = self.model(**batch)
-                local_loss = self.loss_fn(
-                    out.logits.view(-1, out.logits.size(-1)),
-                    labels.view(-1),
-                    mask=loss_mask,
-                    reduction="sum"
-                )
-
-            total_loss += local_loss.item()
-            total_tokens += loss_mask.sum().item()
+                total_loss += local_loss.item()
+                total_tokens += loss_mask.sum().item()
 
         # Aggregate across ranks if distributed is initialized
         if dist.is_initialized():
