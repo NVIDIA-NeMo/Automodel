@@ -259,8 +259,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             )
             self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
 
-        torch.manual_seed(self.cfg.get("seed", 42) + self.dist_env.rank)
-
         if self.dist_env.is_main and hasattr(self.cfg, "logger"):
             suppress_wandb_log_messages()
             run = wandb.init(
