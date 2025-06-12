@@ -34,6 +34,7 @@ from nemo_automodel.utils.dist_utils import (
 from nemo_automodel.utils.model_utils import apply_parameter_freezing
 from nemo_automodel.loggers.log_utils import setup_logging
 from transformers import AutoProcessor
+from nemo_automodel.training.rng import StatefulRNG
 
 import logging
 
@@ -44,7 +45,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------
 
 
-def build_model(device, cfg_model, cfg_freeze, cfg_peft, model_wrapper) -> nn.Module:
+def build_model(device, cfg_model, cfg_freeze, cfg_peft, model_wrapper, seed) -> nn.Module:
     """
     Build and initialize a model.
 
@@ -56,28 +57,29 @@ def build_model(device, cfg_model, cfg_freeze, cfg_peft, model_wrapper) -> nn.Mo
     Returns:
         The instantiated model on the specified device.
     """
-    model = cfg_model.instantiate()
+    with StatefulRNG(seed=seed, ranked=True):
+        model = cfg_model.instantiate()
 
-    if cfg_freeze is not None:
-        apply_parameter_freezing(model, cfg_freeze)
-    else:
-        for m in model.modules():
-            if isinstance(m, nn.Embedding):
-                m.weight.requires_grad = False
+        if cfg_freeze is not None:
+            apply_parameter_freezing(model, cfg_freeze)
+        else:
+            for m in model.modules():
+                if isinstance(m, nn.Embedding):
+                    m.weight.requires_grad = False
 
-    # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
-    if cfg_peft is not None:
-        opts = cfg_peft.to_dict()
-        peft_fn = opts.pop("peft_fn")
-        peft_fn(model, **opts)
+        # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
+        if cfg_peft is not None:
+            opts = cfg_peft.to_dict()
+            peft_fn = opts.pop("peft_fn")
+            peft_fn(model, **opts)
 
-    if callable(getattr(model_wrapper, "parallelize", None)):
-        model = model_wrapper.parallelize(model)
+        if callable(getattr(model_wrapper, "parallelize", None)):
+            model = model_wrapper.parallelize(model)
 
-        # FSDP2 and nvFSDP should already be on the correct device
-        return model
-    else:
-        return model.to(device)
+            # FSDP2 and nvFSDP should already be on the correct device
+            return model
+        else:
+            return model.to(device)
 
 
 def build_optimizer(cfg_opt, model, tp_size) -> "Optimizer":  # noqa: F821
@@ -118,7 +120,7 @@ def build_loss_fn(device, cfg_loss):
 
 
 def build_dataloader(
-    cfg_ds, cfg_dl, cfg_model, distributed_sampler_kwargs
+    cfg_ds, cfg_dl, cfg_model, device_mesh, seed
 ) -> DataLoader:
     """
     Build a distributed dataloader.
@@ -131,42 +133,49 @@ def build_dataloader(
     Returns:
         The instantiated DataLoader.
     """
-    if hasattr(cfg_ds, "_target_") and "vlm" in cfg_ds._target_:
-        processor = AutoProcessor.from_pretrained(
-            cfg_model.pretrained_model_name_or_path
-        )
+    dist_sampler_kwargs = {
+        "shuffle": cfg_dl.get("shuffle", True),
+    }
+    if not device_mesh is None:
+        dist_sampler_kwargs = {
+            "num_replicas": device_mesh.get("data_parallel").size(),
+            "rank": device_mesh.get["data_parallel"].get_local_rank(),
+        }
 
-        # For VLM datasets, instantiate with processor and get HFDatasetBuilder
-        hf_dataset_builder = cfg_ds.instantiate(
-            path_or_dataset=cfg_ds.path_or_dataset, processor=processor
-        )
+    with StatefulRNG(seed=seed, ranked=True):
+        if hasattr(cfg_ds, "_target_") and "vlm" in cfg_ds._target_:
+            processor = AutoProcessor.from_pretrained(
+                cfg_model.pretrained_model_name_or_path
+            )
 
-        split = getattr(cfg_ds, "split", None)
+            # For VLM datasets, instantiate with processor and get HFDatasetBuilder
+            hf_dataset_builder = cfg_ds.instantiate(
+                path_or_dataset=cfg_ds.path_or_dataset, processor=processor
+            )
 
-        if split is not None:
-            if split == "train":
-                ds = hf_dataset_builder.train
-            elif split == "validation":
-                ds = hf_dataset_builder.val
+            split = getattr(cfg_ds, "split", None)
+
+            if split is not None:
+                if split == "train":
+                    ds = hf_dataset_builder.train
+                elif split == "validation":
+                    ds = hf_dataset_builder.val
+                else:
+                    raise ValueError(
+                        f"split (train or validation) is required for VLM datasets, but got {split}"
+                    )
             else:
                 raise ValueError(
                     f"split (train or validation) is required for VLM datasets, but got {split}"
                 )
-        else:
-            raise ValueError(
-                f"split (train or validation) is required for VLM datasets, but got {split}"
-            )
 
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            ds,
-            num_replicas=distributed_sampler_kwargs.get("num_replicas", 1),
-            rank=distributed_sampler_kwargs.get("rank", 0),
-            shuffle=distributed_sampler_kwargs.get("shuffle", False),
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                ds, **dist_sampler_kwargs,
+            )
+        # TODO: HFDatasetBuilder has DLbuilder but is not stateful, didn't use it
+        return cfg_dl.instantiate(
+            dataset=ds, sampler=sampler, collate_fn=hf_dataset_builder.collate_fn
         )
-    # TODO: HFDatasetBuilder has DLbuilder but is not stateful, didn't use it
-    return cfg_dl.instantiate(
-        dataset=ds, sampler=sampler, collate_fn=hf_dataset_builder.collate_fn
-    )
 
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
@@ -249,17 +258,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.model_wrapper = self.cfg.distributed.instantiate(
                 world_size=self.dist_env.world_size
             )
-            distributed_sampler_kwargs = {
-                "num_replicas": self.model_wrapper.device_mesh["data_parallel"].size(),
-                "rank": self.model_wrapper.device_mesh[
-                    "data_parallel"
-                ].get_local_rank(),
-                "shuffle": self.cfg.dataloader.get("shuffle", True),
-            }
-            if "shuffle" in self.cfg.dataloader:
-                del self.cfg.dataloader.shuffle
-            if hasattr(self.model_wrapper, "device_mesh"):
-                self.device_mesh = self.model_wrapper.device_mesh
+            self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
 
         torch.manual_seed(self.cfg.get("seed", 42) + self.dist_env.rank)
 
@@ -282,6 +281,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.cfg.get("freeze_config", None),
             self.cfg.get("peft", None),
             self.model_wrapper,
+            seed=self.cfg.get("seed", 42),
         )
         self.optimizer = build_optimizer(
             self.cfg.optimizer,
@@ -293,7 +293,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.cfg.dataset,
             self.cfg.dataloader,
             self.cfg.model,
-            distributed_sampler_kwargs,
+            device_mesh=self.device_mesh,
+            seed=self.cfg.get("seed", 42),
         )
 
         # Build validation dataloader if the config provides it
@@ -303,7 +304,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 self.cfg.validation_dataset,
                 self.cfg.validation_dataloader,
                 self.cfg.model,
-                distributed_sampler_kwargs,
+                device_mesh=self.device_mesh,
+                seed=self.cfg.get("seed", 42),
             )
 
         # Initialize metrics required for calculating loss
@@ -314,6 +316,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.step_scheduler = build_step_scheduler(
             self.cfg.get("step_scheduler", None), self.dataloader
         )
+
+        # Set up the stateful random number generator
+        self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
         # Optionally resume
         if (path := self.cfg.get("restore_from")) is not None:
