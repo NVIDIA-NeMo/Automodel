@@ -16,8 +16,6 @@ import random
 import numpy as np
 import torch
 
-from nemo_automodel.utils.dist_utils import get_rank_safe
-
 
 
 def init_all_rng(seed: int, ranked: bool = False):
