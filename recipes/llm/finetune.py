@@ -18,6 +18,7 @@ try:
 except ImportError:
     from nemo_automodel.distributed.nvfsdp.nvfsdp import nvFSDP
 
+import torch.distributed as dist
 from nemo_automodel.config.cli import parse_args_and_load_config
 from nemo_automodel.distributed.init_utils import initialize_distributed
 from nemo_automodel.distributed.parallelizer import create_context_parallel_ctx, get_train_context
@@ -29,6 +30,7 @@ from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 from transformers import AutoTokenizer
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from nemo_automodel.loggers.log_utils import setup_logging
+from nemo_automodel.training.rng import StatefulRNG
 
 import logging
 logger = logging.getLogger(__name__)
@@ -37,7 +39,7 @@ logger = logging.getLogger(__name__)
 #  Stateless helper functions
 # ---------------------------
 
-def build_model(device, cfg_model, cfg_peft, model_wrapper) -> nn.Module:
+def build_model(device, cfg_model, cfg_peft, model_wrapper, seed) -> nn.Module:
     """
     Build and initialize a model.
 
@@ -49,23 +51,24 @@ def build_model(device, cfg_model, cfg_peft, model_wrapper) -> nn.Module:
     Returns:
         The instantiated model on the specified device.
     """
-    model = cfg_model.instantiate()
-    for m in model.modules():
-        if isinstance(m, nn.Embedding):
-            m.weight.requires_grad_(False)
-    # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
-    if cfg_peft is not None:
-        opts = cfg_peft.to_dict()
-        peft_fn = opts.pop('peft_fn')
-        peft_fn(model, **opts)
+    with StatefulRNG(seed=seed, ranked=True):
+        model = cfg_model.instantiate()
+        for m in model.modules():
+            if isinstance(m, nn.Embedding):
+                m.weight.requires_grad_(False)
+        # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
+        if cfg_peft is not None:
+            opts = cfg_peft.to_dict()
+            peft_fn = opts.pop('peft_fn')
+            peft_fn(model, **opts)
 
-    if callable(getattr(model_wrapper, 'parallelize', None)):
-        model = model_wrapper.parallelize(model)
+        if callable(getattr(model_wrapper, 'parallelize', None)):
+            model = model_wrapper.parallelize(model)
 
-        # FSDP2 and nvFSDP should already be on the correct device
-        return model
-    else:
-        return model.to(device)
+            # FSDP2 and nvFSDP should already be on the correct device
+            return model
+        else:
+            return model.to(device)
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id):
@@ -74,7 +77,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id):
     """
     from transformers.utils import TRANSFORMERS_CACHE
 
-    ckpt_kwargs = dict(  
+    ckpt_kwargs = dict(
         enabled=False,
         checkpoint_dir="checkpoints/",
         model_save_format="safetensors",
@@ -123,7 +126,7 @@ def build_loss_fn(device, cfg_loss):
         return cfg_loss.instantiate().to(device)
 
 
-def build_dataloader(cfg_ds, cfg_dl, cfg_model, distributed_sampler_kwargs, seed) -> DataLoader:
+def build_dataloader(cfg_ds, cfg_dl, cfg_model, device_mesh, seed) -> DataLoader:
     """
     Build a DataLoader for the dataset.
 
@@ -135,22 +138,30 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, distributed_sampler_kwargs, seed
     Returns:
         The instantiated DataLoader.
     """
-    if not 'tokenizer' in cfg_ds:
-        tokenizer = AutoTokenizer.from_pretrained(cfg_model.pretrained_model_name_or_path)
-    elif not '_target_' in cfg_ds.tokenizer:
-        tokenizer = AutoTokenizer.from_pretrained(**cfg_ds.tokenizer.to_dict())
-    else:
-        tokenizer = cfg_ds.tokenizer.instantiate()
-    ds = cfg_ds.instantiate(tokenizer=tokenizer)
-    sampler = StatefulDistributedSampler(
-        ds,
-        num_replicas=distributed_sampler_kwargs.get("num_replicas", 1),
-        rank=distributed_sampler_kwargs.get("rank", 0),
-        shuffle=distributed_sampler_kwargs.get("shuffle", False),
-        seed=seed,
-        drop_last=True,
-    )
-    return cfg_dl.instantiate(dataset=ds, sampler=sampler)
+    dist_sampler_kwargs = {
+        "shuffle": cfg_dl.get("shuffle", True),
+    }
+    if not device_mesh is None:
+        dist_sampler_kwargs = {
+            "num_replicas": device_mesh.get("data_parallel").size(),
+            "rank": device_mesh.get["data_parallel"].get_local_rank(),
+        }
+
+    with StatefulRNG(seed=seed, ranked=True):
+        if not 'tokenizer' in cfg_ds:
+            tokenizer = AutoTokenizer.from_pretrained(cfg_model.pretrained_model_name_or_path)
+        elif not '_target_' in cfg_ds.tokenizer:
+            tokenizer = AutoTokenizer.from_pretrained(**cfg_ds.tokenizer.to_dict())
+        else:
+            tokenizer = cfg_ds.tokenizer.instantiate()
+        ds = cfg_ds.instantiate(tokenizer=tokenizer)
+        sampler = StatefulDistributedSampler(
+            ds,
+            seed=seed,
+            drop_last=True,
+            **dist_sampler_kwargs,
+        )
+        return cfg_dl.instantiate(dataset=ds, sampler=sampler)
 
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> 'DistInfo':  # noqa: F821
@@ -225,22 +236,13 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         self.device_mesh = None
         self.model_wrapper = None
-        distributed_sampler_kwargs = {}
         if "distributed" in self.cfg:
             self.model_wrapper = self.cfg.distributed.instantiate(
                 world_size=self.dist_env.world_size
             )
-            distributed_sampler_kwargs = {
-                "num_replicas": self.model_wrapper.device_mesh["data_parallel"].size(),
-                "rank": self.model_wrapper.device_mesh["data_parallel"].get_local_rank(),
-                "shuffle": self.cfg.dataloader.get("shuffle", True),
-            }
-            if "shuffle" in self.cfg.dataloader:
-                del self.cfg.dataloader.shuffle
             if hasattr(self.model_wrapper, 'device_mesh'):
                 self.device_mesh = self.model_wrapper.device_mesh
 
-        torch.manual_seed(self.cfg.get("seed", 42) + self.dist_env.rank)
 
         if self.dist_env.is_main and hasattr(self.cfg, 'logger'):
             suppress_wandb_log_messages()
@@ -255,7 +257,11 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             logging.info("🚀 View run at {}".format(run.url))
 
         # Build components
-        self.model = build_model(self.dist_env.device, self.cfg.model, self.cfg.get('peft', None), self.model_wrapper)
+        self.model = build_model(
+            self.dist_env.device, self.cfg.model, self.cfg.get('peft', None),
+            self.model_wrapper,
+            seed=self.cfg.get("seed", 42),
+        )
         self.optimizer = build_optimizer(
             self.cfg.optimizer,
             self.model,
@@ -266,8 +272,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.cfg.dataset,
             self.cfg.dataloader,
             self.cfg.model,
-            distributed_sampler_kwargs,
-            self.cfg.get("rng.seed", 42) + self.dist_env.rank,
+            device_mesh=self.device_mesh,
+            seed=self.cfg.get("seed", 42),
         )
 
         # Build validation dataloader if the config provides it
@@ -277,8 +283,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 self.cfg.validation_dataset,
                 self.cfg.validation_dataloader,
                 self.cfg.model,
-                distributed_sampler_kwargs,
-                self.cfg.get("rng.seed", 42) + self.dist_env.rank,
+                device_mesh=self.device_mesh,
+                seed=self.cfg.get("seed", 42),
             )
 
         # Initialize metrics required for calculating loss
@@ -287,7 +293,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Scheduler
         self.step_scheduler = build_step_scheduler(self.cfg.get('step_scheduler', None), self.dataloader)
-        
+
         # Build checkpointing config
         restore_from = self.cfg.get('checkpoint.restore_from', None)
         self.checkpoint_config = build_checkpoint_config(
@@ -295,6 +301,9 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.cfg.get('model.cache_dir', None),
             self.cfg.model.pretrained_model_name_or_path,
         )
+
+        # Set up the stateful random number generator
+        self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
         # Optionally resume
         self.load_checkpoint(restore_from)
