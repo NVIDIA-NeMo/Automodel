@@ -22,8 +22,11 @@ from nemo_automodel.utils.dist_utils import get_rank_safe
 
 def init_all_rng(seed: int, ranked: bool = False):
     """
-    Initialize all RNGs (Python, NumPy, PyTorch) with a seed.
-    Optionally adjust for ranked environments like distributed training.
+    Initialize RNGs for Python, NumPy, and PyTorch (incl. CUDA) with a seed.
+
+    Args:
+        seed (int): Base seed value.
+        ranked (bool): Adjust seed by process rank if True.
     """
     assert isinstance(seed, int) and seed > 0, "Seed must be a positive integer"
     assert isinstance(ranked, bool), "Ranked must be a boolean"
@@ -47,17 +50,29 @@ def init_all_rng(seed: int, ranked: bool = False):
 
 class StatefulRNG:
     """
-    A context manager for managing reproducible RNG states across random,
-    NumPy, and PyTorch (including CUDA).
+    Context manager for reproducible RNG states across random, NumPy, and PyTorch.
     """
 
     def __init__(self, seed: int, ranked: bool = False):
+        """
+        Initialize and optionally rank-adjust RNGs with a given seed.
+
+        Args:
+            seed (int): Base seed for RNGs.
+            ranked (bool): Adjust seed based on process rank.
+        """
         init_all_rng(seed, ranked)
         self.seed = seed
         self.ranked = ranked
         self._saved_state = None
 
     def state_dict(self):
+        """
+        Get current RNG states.
+
+        Returns:
+            dict: RNG states for random, NumPy, and PyTorch.
+        """
         return {
             "random_rng_state": random.getstate(),
             "np_rng_state": np.random.get_state(),
@@ -66,14 +81,28 @@ class StatefulRNG:
         }
 
     def load_state_dict(self, state):  # pragma: no cover
+        """
+        Restore RNG states from a saved state.
+
+        Args:
+            state (dict): RNG states as returned by state_dict().
+        """
         random.setstate(state["random_rng_state"])
         np.random.set_state(state["np_rng_state"])
         torch.set_rng_state(state["torch_rng_state"])
         torch.cuda.set_rng_state_all(state["cuda_rng_state"])
 
     def __enter__(self):
+        """
+        Save current RNG states.
+        """
+        assert self._saved_state is None
         self._saved_state = self.state_dict()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        """
+        Restore RNG states on context exit.
+        """
         self.load_state_dict(self._saved_state)
+        self._saved_state = None
