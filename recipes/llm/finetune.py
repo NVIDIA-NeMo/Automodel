@@ -489,7 +489,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         self.device_mesh["tensor_parallel"].size() > 1
                     )
                 ):
-                    batch["position_ids"] = torch.arange(0, batch['input_ids'].shape[1]).unsqueeze(0).to(self.model.device)
+                    batch["position_ids"] = torch.arange(
+                        0, batch['input_ids'].shape[1]).unsqueeze(0).to(self.model.device)
 
                 if self.device_mesh["context_parallel"].size() > 1:
 
