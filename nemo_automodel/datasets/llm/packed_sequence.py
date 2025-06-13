@@ -117,7 +117,8 @@ class PackedSequence:
             self._add_pack(current_pack)
 
         # After packing all samples, convert self.packs to a Dataset object
-        self.packed_dataset = Dataset.from_dict({key: [pack[key] for pack in self.packs] for key in self.packs[0].keys()})
+        self.packed_dataset = Dataset.from_dict({key: [pack[key] for pack in self.packs]
+                                                 for key in self.packs[0].keys()})
         logger.info(f">>>>> Total number of packs created: {len(self.packs)} <<<<<")
         return self.packed_dataset
 
