@@ -12,7 +12,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import pathlib
 from torch.distributed.device_mesh import _mesh_resources
-from torch.nn.attention import SDPBackend
 
 try:
     from nvfsdp import nvFSDP
