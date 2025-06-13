@@ -13,10 +13,8 @@
 # limitations under the License.
 
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
-export CUDA_VISIBLE_DEVICES="0,1"
-export TRANSFORMERS_OFFLINE=1
 
-python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
+TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
 -m pytest tests/functional_tests/checkpoint/test_dcp.py \
     --config recipes/llm/llama_3_2_1b_squad.yaml \
     --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
