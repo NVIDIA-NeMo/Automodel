@@ -11,6 +11,7 @@ _OVERRIDES = [
     "dataset.tokenizer.pretrained_model_name_or_path",
     "validation_dataset.tokenizer.pretrained_model_name_or_path",
     "dataset.dataset_name",
+    "validation_dataset.dataset_name",
     "dataset.limit_dataset_samples",
     "step_scheduler.ckpt_every_steps",
     "checkpoint.enabled",
