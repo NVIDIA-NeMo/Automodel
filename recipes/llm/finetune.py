@@ -25,7 +25,7 @@ from nemo_automodel.distributed.init_utils import initialize_distributed
 from nemo_automodel.distributed.parallelizer import create_context_parallel_ctx, get_train_context
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.step_scheduler import StepScheduler
-from nemo_automodel.datasets.llm.hf_dataset_packed_sequence import HFDatasetPackedSequenceHelper
+from nemo_automodel.datasets.llm.packed_sequence import PackedSequenceHelper
 from nemo_automodel.utils.dist_utils import reduce_loss, get_sync_ctx, rescale_gradients, clip_gradients
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 
@@ -161,16 +161,14 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_ps, device_mesh, seed) -> Da
         # Apply packing if configured
         if getattr(cfg_ps, 'packed_sequence_size', 0) > 0:
             logger.info(f"Packing dataset with size: {cfg_ps.packed_sequence_size}")
-            helper = HFDatasetPackedSequenceHelper(
+            packed_ds = PackedSequenceHelper(
                 ds,
-                split=cfg_ds.split  # Assumes split is defined in dataset config
-            )
-            packed_ds = helper.pack(
+                split=cfg_ds.split,  # Assumes split is defined in dataset config
                 packed_sequence_size=cfg_ps.packed_sequence_size,
                 split_across_pack=getattr(cfg_ps, 'split_across_pack', False),
                 max_packs=getattr(cfg_ps, 'max_packs', None)
             )
-            ds = packed_ds
+            ds = packed_ds()
         sampler = StatefulDistributedSampler(
             ds,
             seed=seed,
@@ -272,11 +270,15 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Check if packed_sequence_size > 0
         if self.cfg.packed_sequence.packed_sequence_size > 0:
-            # Set sdpa_method to use FLASH_ATTENTION for packed sequences
-            self.cfg.model.sdpa_method = [SDPBackend.FLASH_ATTENTION]
+            # Explicilty set HF model's attn_implementation as flash_attention_2. There is a bug with attn_mask
+            # computation in packed sequences and is not enabled currently. Using HF's attention impl with FA2 does not
+            # require attn_mask and the code path computes attn_mask internally based on pos_ids.
+            # Using PyTorch’s SDPA for Flash Attention requires attn_mask to be computed for packed sequences hence
+            # using HF's flash_attention_2 for attn implementation is preferred here.
+            self.cfg.model.attn_implementation = "flash_attention_2"
             logger.warning(
                 "Packed sequence is supported only with Flash Attention. "
-                "Setting sdpa_method to FLASH_ATTENTION"
+                "Setting model's attn_implementation to flash_attention_2"
             )
 
         # Build components

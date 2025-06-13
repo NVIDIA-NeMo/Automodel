@@ -14,7 +14,7 @@
 
 import pytest
 from datasets import Dataset
-from nemo_automodel.datasets.llm.hf_dataset_packed_sequence import HFDatasetPackedSequenceHelper
+from nemo_automodel.datasets.llm.packed_sequence import PackedSequenceHelper
 
 @pytest.fixture
 def base_dataset():
@@ -26,7 +26,7 @@ def base_dataset():
 
 def test_basic_packing(base_dataset):
     """Test basic packing without splitting across packs"""
-    helper = HFDatasetPackedSequenceHelper(base_dataset, "train")
+    helper = PackedSequenceHelper(base_dataset, "train")
     packed_ds = helper.pack(
         packed_sequence_size=10,
         split_across_pack=False,
@@ -37,10 +37,10 @@ def test_basic_packing(base_dataset):
     # Check packed_ds[0] is [1,2,3,4,5,6,7,8,9] plus [0] for padding
     assert packed_ds[0]["input_ids"] == [1,2,3,4,5,6,7,8,9,0]
     # Padding len is included in the seq_lens array. Padded tokens are treated as part of the seq len.
-    # See packed sequence implementation: nemo_automodel/datasets/llm/hf_dataset_packed_sequence.py#L221-L226
+    # See packed sequence implementation: nemo_automodel/datasets/llm/packed_sequence.py#L221-L226
     assert packed_ds[0]["seq_lens"] == [3,4,2,1]
     # pos_ids of the last seq continue into padded tokens.
-    # See packed sequence implementation: nemo_automodel/datasets/llm/hf_dataset_packed_sequence.py#L228-L234
+    # See packed sequence implementation: nemo_automodel/datasets/llm/packed_sequence.py#L228-L234
     assert packed_ds[0]["position_ids"] == [0, 1, 2, 0, 1, 2, 3, 0, 1, 2]
     assert packed_ds[1]["input_ids"] == [10,11,12,13,14,0,0,0,0,0]
     # labels are padded with CROSS_ENTROPY_IGNORE_IDX i.e -100
@@ -53,7 +53,7 @@ def test_basic_packing(base_dataset):
 ])
 def test_split_across_pack(base_dataset, split_across_pack, max_packs, expected):
     """Test splitting sequences across packs with different configurations"""
-    helper = HFDatasetPackedSequenceHelper(base_dataset, "train")
+    helper = PackedSequenceHelper(base_dataset, "train")
     packed_ds = helper.pack(
         packed_sequence_size=5,
         split_across_pack=split_across_pack,
@@ -70,7 +70,7 @@ def test_loss_mask_handling():
         "loss_mask": [[1,1,0], [1,1,1]]
     })
     
-    helper = HFDatasetPackedSequenceHelper(ds_with_mask, "train")
+    helper = PackedSequenceHelper(ds_with_mask, "train")
     packed_ds = helper.pack(
         packed_sequence_size=5,
         split_across_pack=False,
@@ -83,7 +83,7 @@ def test_loss_mask_handling():
 
 def test_position_id_wrapping(base_dataset):
     """Test position ID generation with wrapping"""
-    helper = HFDatasetPackedSequenceHelper(base_dataset, "train")
+    helper = PackedSequenceHelper(base_dataset, "train")
     packed_ds = helper.pack(
         packed_sequence_size=5,
         split_across_pack=False,
@@ -99,7 +99,7 @@ def test_exact_fit():
         "labels": [[1,2,3,4,5]]
     })
     
-    helper = HFDatasetPackedSequenceHelper(exact_fit_ds, "train")
+    helper = PackedSequenceHelper(exact_fit_ds, "train")
     packed_ds = helper.pack(
         packed_sequence_size=5,
         split_across_pack=False,
@@ -115,7 +115,7 @@ def test_error_on_oversized_sequence():
         "labels": [[1,2,3,4,5,6]]
     })
     
-    helper = HFDatasetPackedSequenceHelper(oversized_ds, "train")
+    helper = PackedSequenceHelper(oversized_ds, "train")
     with pytest.raises(ValueError):
         helper.pack(
             packed_sequence_size=5,

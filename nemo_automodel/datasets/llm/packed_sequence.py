@@ -27,36 +27,35 @@ PACK_TYPE = Dict[str, Union[torch.Tensor, List[int]]]
 
 
 # based on https://github.com/pytorch/torchtune/blob/v0.6.1/torchtune/datasets/_packed.py#L17
-class HFDatasetPackedSequenceHelper:
+class PackedSequenceHelper:
     """
     Args:
     dataset: Actual dataset (can be 'train', 'val' or 'test')
     split (str): Whether the dataset is 'train', 'val' or 'test'
+    packed_sequence_size (int): Number of tokens in a pack
+    split_across_pack (bool): If the last sample in a pack does not fit in ``packed_sequence_size``,
+        split the sample into the next pack, or move it entirely to the beginning of the next pack. Default: False
+    max_packs (int): Maximum number of packs. Default: None
     """
 
-    def __init__(self, dataset, split):
+    def __init__(self, dataset, split, packed_sequence_size, split_across_pack=False, max_packs=None):
         self.dataset = dataset
         self.split = split
         self.padding_idx = 0  # Padding value to pack a sequence to self.packed_sequence_size
         self.contains_loss_mask = False
-
-    def pack(self, packed_sequence_size, split_across_pack, max_packs):
-        """Iterate through the dataset. Use a buffer to hold samples until packed_sequence_size,
-        then append the buffer to self.packs as a single "packed" sample. Continue
-        until max_packs or end of dataset.
-
-        Args:
-        packed_sequence_size (int): Number of tokens in a pack
-        split_across_pack (bool): If the last sample in a pack does not fit in ``packed_sequence_size``,
-        split the sample into the next pack, or move it entirely to the beginning of the next pack. Default: False
-        max_packs (int): Maximum number of packs. Default: None
-
-        Returns the Packed dataset which is an object of Dataset class.
-
-        """
         self.packed_sequence_size = packed_sequence_size
         self.split_across_pack = split_across_pack
         self.max_packs = max_packs
+        self.packs: List[PACK_TYPE] = []
+        # Call the private method _pack to perform packing
+        self._pack()
+        
+    def _pack(self):
+        """Iterate through the dataset. Use a buffer to hold samples until packed_sequence_size,
+        then append the buffer to self.packs as a single "packed" sample. Continue
+        until max_packs or end of dataset.
+        """
+
         # Only show progress bar on rank 0
         rank = (
             torch.distributed.get_rank()
@@ -64,8 +63,6 @@ class HFDatasetPackedSequenceHelper:
             else 0
         )
 
-        # Pack dataset
-        self.packs: List[PACK_TYPE] = []
         if "loss_mask" in self.dataset[0]:
             self.contains_loss_mask = True
         # Buffer to hold samples until they are long enough to be added to self.packs
@@ -88,7 +85,7 @@ class HFDatasetPackedSequenceHelper:
             # packed_sequence_size and we're unable to split it, user needs to modify
             # one of the two parameters
             seq_len = len(input_ids)
-            if seq_len > self.packed_sequence_size and not split_across_pack:
+            if seq_len > self.packed_sequence_size and not self.split_across_pack:
                 raise ValueError(
                     f"Dataset sample is too long ({seq_len} > {self.packed_sequence_size}). "
                     "Please set `split_across_pack=True` or increase `packed_sequence_size`."
@@ -122,9 +119,12 @@ class HFDatasetPackedSequenceHelper:
             self._add_pack(current_pack)
 
         # After packing all samples, convert self.packs to a Dataset object
-        packed_dataset = Dataset.from_dict({key: [pack[key] for pack in self.packs] for key in self.packs[0].keys()})
+        self.packed_dataset = Dataset.from_dict({key: [pack[key] for pack in self.packs] for key in self.packs[0].keys()})
         logger.info(f">>>>> Total number of packs created: {len(self.packs)} <<<<<")
-        return packed_dataset
+
+    def __call__(self):
+        """Returns the packed dataset."""
+        return self.packed_dataset
 
     def _should_stop_packing(self) -> bool:
         """If max packs is set, stop packing when we reach that number."""
