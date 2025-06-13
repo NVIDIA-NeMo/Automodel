@@ -27,7 +27,7 @@ PACK_TYPE = Dict[str, Union[torch.Tensor, List[int]]]
 
 
 # based on https://github.com/pytorch/torchtune/blob/v0.6.1/torchtune/datasets/_packed.py#L17
-class PackedSequenceHelper:
+class PackedSequence:
     """
     Args:
     dataset: Actual dataset (can be 'train', 'val' or 'test')
@@ -47,10 +47,8 @@ class PackedSequenceHelper:
         self.split_across_pack = split_across_pack
         self.max_packs = max_packs
         self.packs: List[PACK_TYPE] = []
-        # Call the private method _pack to perform packing
-        self._pack()
         
-    def _pack(self):
+    def pack(self):
         """Iterate through the dataset. Use a buffer to hold samples until packed_sequence_size,
         then append the buffer to self.packs as a single "packed" sample. Continue
         until max_packs or end of dataset.
@@ -121,9 +119,6 @@ class PackedSequenceHelper:
         # After packing all samples, convert self.packs to a Dataset object
         self.packed_dataset = Dataset.from_dict({key: [pack[key] for pack in self.packs] for key in self.packs[0].keys()})
         logger.info(f">>>>> Total number of packs created: {len(self.packs)} <<<<<")
-
-    def __call__(self):
-        """Returns the packed dataset."""
         return self.packed_dataset
 
     def _should_stop_packing(self) -> bool:

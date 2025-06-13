@@ -25,7 +25,7 @@ from nemo_automodel.distributed.init_utils import initialize_distributed
 from nemo_automodel.distributed.parallelizer import create_context_parallel_ctx, get_train_context
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.step_scheduler import StepScheduler
-from nemo_automodel.datasets.llm.packed_sequence import PackedSequenceHelper
+from nemo_automodel.datasets.llm.packed_sequence import PackedSequence
 from nemo_automodel.utils.dist_utils import reduce_loss, get_sync_ctx, rescale_gradients, clip_gradients
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 
@@ -171,14 +171,14 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_ps, device_mesh, seed) -> Da
         # Apply packing if configured
         if cfg_ps is not None and getattr(cfg_ps, 'packed_sequence_size', 0) > 0:
             logger.info(f"Packing dataset with size: {cfg_ps.packed_sequence_size}")
-            packed_ds = PackedSequenceHelper(
+            ds = PackedSequence(
                 ds,
                 split=cfg_ds.split,  # Assumes split is defined in dataset config
                 packed_sequence_size=cfg_ps.packed_sequence_size,
                 split_across_pack=getattr(cfg_ps, 'split_across_pack', False),
                 max_packs=getattr(cfg_ps, 'max_packs', None)
-            )
-            ds = packed_ds()
+            ).pack()
+
         sampler = StatefulDistributedSampler(
             ds,
             seed=seed,
