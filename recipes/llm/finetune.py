@@ -160,7 +160,7 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_ps, device_mesh, seed) -> Da
         ds = cfg_ds.instantiate(tokenizer=tokenizer)
         # Apply packing if configured
         if getattr(cfg_ps, 'packed_sequence_size', 0) > 0:
-            print("Packing dataset with size: ", cfg_ps.packed_sequence_size)
+            logger.info(f"Packing dataset with size: {cfg_ps.packed_sequence_size}")
             helper = HFDatasetPackedSequenceHelper(
                 ds,
                 split=cfg_ds.split  # Assumes split is defined in dataset config
@@ -274,7 +274,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.cfg.packed_sequence.packed_sequence_size > 0:
             # Set sdpa_method to use FLASH_ATTENTION for packed sequences
             self.cfg.model.sdpa_method = [SDPBackend.FLASH_ATTENTION]
-            print("Packed sequence is supported only with Flash Attention. Setting sdpa_method to FLASH_ATTENTION")
+            logger.warning("Packed sequence is supported only with Flash Attention. Setting sdpa_method to FLASH_ATTENTION")
 
         # Build components
         self.model = build_model(

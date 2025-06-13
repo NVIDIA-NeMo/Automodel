@@ -19,7 +19,8 @@ from datasets import Dataset
 from torch.nn import functional as F
 from tqdm import tqdm
 
-from nemo.utils import logging
+import logging
+logger = logging.getLogger(__name__)
 
 CROSS_ENTROPY_IGNORE_IDX = -100
 PACK_TYPE = Dict[str, Union[torch.Tensor, List[int]]]
@@ -122,7 +123,7 @@ class HFDatasetPackedSequenceHelper:
 
         # After packing all samples, convert self.packs to a Dataset object
         packed_dataset = Dataset.from_dict({key: [pack[key] for pack in self.packs] for key in self.packs[0].keys()})
-        logging.info(f">>>>> Total number of packs created: {len(self.packs)} <<<<<")
+        logger.info(f">>>>> Total number of packs created: {len(self.packs)} <<<<<")
         return packed_dataset
 
     def _should_stop_packing(self) -> bool:
