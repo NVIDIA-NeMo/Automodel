@@ -14,6 +14,7 @@
 """Tests for DCP checkpointing."""
 
 import os
+import shutil
 from pathlib import Path
 
 from recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction
@@ -216,6 +217,11 @@ def test_dcp_checkpoint():
             f"Value mismatch for key {k}. "
             f"Tensors are not numerically close"
         )
+        if torch.distributed.get_rank() == 0:
+            # delete the checkpoint directory
+            if Path(trainer.checkpoint_config.checkpoint_dir).exists():
+                shutil.rmtree(Path(trainer.checkpoint_config.checkpoint_dir))
+        torch.distributed.barrier()
 
 
 def _flatten(d: dict, parent_key: str | None = None):
