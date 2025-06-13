@@ -215,19 +215,17 @@ def build_step_scheduler(cfg, dataloader):
         default_kwargs |= cfg.to_dict()
     return StepScheduler(**default_kwargs)
 
+
 def build_wandb(cfg):
     """ Instantiates wandb and returns the instance.
     If no name is given, it will use the model name
     """
     assert cfg.get('wandb', None) is not None
-    name = cfg.wandb.get('name', None)
-    if name is None:
-        name = '_'.join(cfg.get("model.pretrained_model_name_or_path").split('/')[-2:])
-
+    kwargs = cfg.wandb.to_dict()
+    if kwargs.get('name', "") == "":
+        kwargs["name"] = '_'.join(cfg.get("model.pretrained_model_name_or_path").split('/')[-2:])
     run = wandb.init(
-        project=cfg.wandb.get("project", "default_project"),
-        entity=cfg.wandb.get("entity"),
-        name=name,
+        **kwargs,
         config=cfg,
         settings=Settings(silent=True),
     )
