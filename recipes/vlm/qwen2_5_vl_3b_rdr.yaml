@@ -64,8 +64,8 @@ freeze_config:
   freeze_language_model: false
 
 # Uncomment and configure for W&B logging
-# logger:
-#   wandb_project: nemo_automodel_vlm
-#   wandb_entity: nvidia
-#   wandb_exp_name: qwen2_5_vl_3b_rdr
-#   wandb_save_dir: ./wandb_logs 
+# wandb:
+#   project: nemo_automodel_vlm
+#   entity: nvidia
+#   name: qwen2_5_vl_3b_rdr
+#   save_dir: ./wandb_logs 

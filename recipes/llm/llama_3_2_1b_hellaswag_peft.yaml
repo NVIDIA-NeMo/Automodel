@@ -64,8 +64,9 @@ optimizer:
   weight_decay: 0
   # min_lr: 1.0e-5
 
-# logger:
-#   wandb_project: <your_wandb_project>
-#   wandb_entity: <your_wandb_entity>
-#   wandb_exp_name: <your_wandb_exp_name>
-#   wandb_save_dir: <your_wandb_save_dir>
+# Uncomment and configure for W&B logging
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: <your_wandb_exp_name>
+#   save_dir: <your_wandb_save_dir>

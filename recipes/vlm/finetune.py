@@ -216,6 +216,21 @@ def build_step_scheduler(cfg, dataloader):
     return StepScheduler(**default_kwargs)
 
 
+def build_wandb(cfg):
+    """ Instantiates wandb and returns the instance.
+    If no name is given, it will use the model name
+    """
+    assert cfg.get('wandb', None) is not None
+    kwargs = cfg.wandb.to_dict()
+    if kwargs.get('name', "") == "":
+        kwargs["name"] = '_'.join(cfg.get("model.pretrained_model_name_or_path").split('/')[-2:])
+    run = wandb.init(
+        **kwargs,
+        config=cfg,
+        settings=Settings(silent=True),
+    )
+    return run
+
 # ---------------------------------------------------------------------------
 #  Trainer class – orchestration only
 # ---------------------------------------------------------------------------
@@ -261,14 +276,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         if self.dist_env.is_main and hasattr(self.cfg, "logger"):
             suppress_wandb_log_messages()
-            run = wandb.init(
-                project=self.cfg.logger.get("wandb_project", "default_project"),
-                entity=self.cfg.logger.get("wandb_entity"),
-                name=self.cfg.logger.get("wandb_exp_name"),
-                dir=self.cfg.logger.get("wandb_save_dir"),
-                config=self.cfg,
-                settings=Settings(silent=True),
-            )
+            run = build_wandb(self.cfg)
             print("🚀 View run at {}".format(run.url))
 
         # Build components
