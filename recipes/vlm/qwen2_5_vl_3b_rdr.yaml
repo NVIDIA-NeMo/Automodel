@@ -67,5 +67,5 @@ freeze_config:
 # wandb:
 #   project: nemo_automodel_vlm
 #   entity: nvidia
-#   exp_name: qwen2_5_vl_3b_rdr
+#   name: qwen2_5_vl_3b_rdr
 #   save_dir: ./wandb_logs 
