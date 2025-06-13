@@ -32,6 +32,9 @@ dataset:
   dataset_name: rajpurkar/squad
   split: train
 
+packed_sequence:
+  packed_sequence_size: 0
+
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.datasets.utils.default_collater

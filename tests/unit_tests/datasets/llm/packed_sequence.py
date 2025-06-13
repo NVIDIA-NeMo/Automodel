@@ -26,12 +26,8 @@ def base_dataset():
 
 def test_basic_packing(base_dataset):
     """Test basic packing without splitting across packs"""
-    helper = PackedSequenceHelper(base_dataset, "train")
-    packed_ds = helper.pack(
-        packed_sequence_size=10,
-        split_across_pack=False,
-        max_packs=None
-    )
+    helper = PackedSequenceHelper(base_dataset, "train", packed_sequence_size=10, split_across_pack=False, max_packs=None)
+    packed_ds = helper()
 
     assert len(packed_ds) == 2
     # Check packed_ds[0] is [1,2,3,4,5,6,7,8,9] plus [0] for padding
@@ -53,12 +49,8 @@ def test_basic_packing(base_dataset):
 ])
 def test_split_across_pack(base_dataset, split_across_pack, max_packs, expected):
     """Test splitting sequences across packs with different configurations"""
-    helper = PackedSequenceHelper(base_dataset, "train")
-    packed_ds = helper.pack(
-        packed_sequence_size=5,
-        split_across_pack=split_across_pack,
-        max_packs=max_packs
-    )
+    helper = PackedSequenceHelper(base_dataset, "train", packed_sequence_size=5, split_across_pack=split_across_pack, max_packs=max_packs)
+    packed_ds = helper()
     assert len(packed_ds) == expected
 
 
@@ -70,12 +62,8 @@ def test_loss_mask_handling():
         "loss_mask": [[1,1,0], [1,1,1]]
     })
     
-    helper = PackedSequenceHelper(ds_with_mask, "train")
-    packed_ds = helper.pack(
-        packed_sequence_size=5,
-        split_across_pack=False,
-        max_packs=None
-    )
+    helper = PackedSequenceHelper(ds_with_mask, "train", packed_sequence_size=5, split_across_pack=False, max_packs=None)
+    packed_ds = helper()
     
     assert packed_ds[0]["loss_mask"] == [1,1,0,0,0]
     assert packed_ds[1]["loss_mask"] == [1,1,1,0,0]
@@ -83,12 +71,8 @@ def test_loss_mask_handling():
 
 def test_position_id_wrapping(base_dataset):
     """Test position ID generation with wrapping"""
-    helper = PackedSequenceHelper(base_dataset, "train")
-    packed_ds = helper.pack(
-        packed_sequence_size=5,
-        split_across_pack=False,
-        max_packs=None
-    )
+    helper = PackedSequenceHelper(base_dataset, "train", packed_sequence_size=5, split_across_pack=False, max_packs=None)
+    packed_ds = helper()
     assert packed_ds[0]["position_ids"] == [0,1,2,3,4]
 
 
@@ -99,12 +83,8 @@ def test_exact_fit():
         "labels": [[1,2,3,4,5]]
     })
     
-    helper = PackedSequenceHelper(exact_fit_ds, "train")
-    packed_ds = helper.pack(
-        packed_sequence_size=5,
-        split_across_pack=False,
-        max_packs=None
-    )
+    helper = PackedSequenceHelper(exact_fit_ds, "train", packed_sequence_size=5, split_across_pack=False, max_packs=None)
+    packed_ds = helper()
     assert len(packed_ds) == 1
     assert packed_ds[0]["input_ids"] == [1,2,3,4,5]
 
@@ -115,13 +95,5 @@ def test_error_on_oversized_sequence():
         "labels": [[1,2,3,4,5,6]]
     })
     
-    helper = PackedSequenceHelper(oversized_ds, "train")
     with pytest.raises(ValueError):
-        helper.pack(
-            packed_sequence_size=5,
-            split_across_pack=False,
-            max_packs=None
-        )
-
-test_exact_fit()
-test_error_on_oversized_sequence()
+        PackedSequenceHelper(oversized_ds, "train", packed_sequence_size=5, split_across_pack=False, max_packs=None)
