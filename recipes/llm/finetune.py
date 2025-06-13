@@ -6,13 +6,13 @@ from nemo_automodel.loggers.wandb_utils import suppress_wandb_log_messages
 
 import torch.distributed as dist
 from typing import Any, Dict
-import argparse
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import pathlib
 from torch.distributed.device_mesh import _mesh_resources
+from torch.nn.attention import SDPBackend
 
 try:
     from nvfsdp import nvFSDP
@@ -147,6 +147,7 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_ps, distributed_sampler_kwar
     ds = cfg_ds.instantiate(tokenizer=tokenizer)
     # Apply packing if configured
     if getattr(cfg_ps, 'packed_sequence_size', 0) > 0:
+        print("Packing dataset with size: ", cfg_ps.packed_sequence_size)
         helper = HFDatasetPackedSequenceHelper(
             ds,
             split=cfg_ds.split  # Assumes split is defined in dataset config
@@ -269,6 +270,12 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             logging.info("🚀 View run at {}".format(run.url))
 
+        # Check if packed_sequence_size > 0
+        if self.cfg.packed_sequence.packed_sequence_size > 0:
+            # Set sdpa_method to use FLASH_ATTENTION for packed sequences
+            self.cfg.model.sdpa_method = [SDPBackend.FLASH_ATTENTION]
+            print("Packed sequence is supported only with Flash Attention. Setting sdpa_method to FLASH_ATTENTION")
+
         # Build components
         self.model = build_model(self.dist_env.device, self.cfg.model, self.cfg.get('peft', None), self.model_wrapper)
         self.optimizer = build_optimizer(
@@ -289,11 +296,15 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Build validation dataloader if the config provides it
         self.val_dataloader = None
         if 'validation_dataset' in self.cfg:
+            # For validation,do not use packed sequences for fair comparison with baseline
+            val_packed_sequence_config = type('Config', (), {
+                'packed_sequence_size': 0,
+            })()
             self.val_dataloader = build_dataloader(
                 self.cfg.validation_dataset,
                 self.cfg.validation_dataloader,
                 self.cfg.model,
-                self.cfg.packed_sequence,
+                val_packed_sequence_config,  # Use unpacked config for validation
                 distributed_sampler_kwargs,
                 self.cfg.get("rng.seed", 42) + self.dist_env.rank,
             )

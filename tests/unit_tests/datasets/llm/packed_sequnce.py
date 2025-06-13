@@ -13,12 +13,12 @@
 # limitations under the License.
 
 import pytest
-import torch
 from datasets import Dataset
 from nemo_automodel.datasets.llm.hf_dataset_packed_sequence import HFDatasetPackedSequenceHelper
 
 @pytest.fixture
 def base_dataset():
+    """Sample dataset with 4 sequences of varying lengths"""
     return Dataset.from_dict({
         "input_ids": [[1,2,3], [4,5,6,7], [8,9], [10,11,12,13,14]],
         "labels": [[1,2,3], [4,5,6,7], [8,9], [10,11,12,13,14]],
@@ -36,10 +36,11 @@ def test_basic_packing(base_dataset):
     assert len(packed_ds) == 2
     # Check packed_ds[0] is [1,2,3,4,5,6,7,8,9] plus [0] for padding
     assert packed_ds[0]["input_ids"] == [1,2,3,4,5,6,7,8,9,0]
-    # Padding len is included in the seq_lens array. padded tokens are treated as part of the seq len, ref: 
-    # https://github.com/NVIDIA-NeMo/NeMo-Automodel/blob/athitten/generic_packed_seq/nemo_automodel/datasets/llm/hf_dataset_packed_sequence.py#L221-L226
+    # Padding len is included in the seq_lens array. Padded tokens are treated as part of the seq len.
+    # See packed sequence implementation: nemo_automodel/datasets/llm/hf_dataset_packed_sequence.py#L221-L226
     assert packed_ds[0]["seq_lens"] == [3,4,2,1]
-    # pos_ids of the last seq continue into padded tokens. ref: https://github.com/NVIDIA-NeMo/NeMo-Automodel/blob/athitten/generic_packed_seq/nemo_automodel/datasets/llm/hf_dataset_packed_sequence.py#L228-L234
+    # pos_ids of the last seq continue into padded tokens.
+    # See packed sequence implementation: nemo_automodel/datasets/llm/hf_dataset_packed_sequence.py#L228-L234
     assert packed_ds[0]["position_ids"] == [0, 1, 2, 0, 1, 2, 3, 0, 1, 2]
     assert packed_ds[1]["input_ids"] == [10,11,12,13,14,0,0,0,0,0]
     # labels are padded with CROSS_ENTROPY_IGNORE_IDX i.e -100
