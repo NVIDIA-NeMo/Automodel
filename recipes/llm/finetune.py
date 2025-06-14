@@ -24,6 +24,7 @@ from nemo_automodel.distributed.init_utils import initialize_distributed
 from nemo_automodel.distributed.parallelizer import create_context_parallel_ctx, get_train_context
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.step_scheduler import StepScheduler
+from nemo_automodel.datasets.llm.packed_sequence import PackedSequence
 from nemo_automodel.utils.dist_utils import reduce_loss, get_sync_ctx, rescale_gradients, clip_gradients
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 
@@ -39,7 +40,7 @@ logger = logging.getLogger(__name__)
 #  Stateless helper functions
 # ---------------------------
 
-def build_model(device, cfg_model, cfg_peft, model_wrapper, seed) -> nn.Module:
+def build_model(device, cfg_model, use_hf_fa2, cfg_peft, model_wrapper, seed) -> nn.Module:
     """
     Build and initialize a model.
 
@@ -47,12 +48,22 @@ def build_model(device, cfg_model, cfg_peft, model_wrapper, seed) -> nn.Module:
         device: The target device.
         model_wrapper: Optional parallelism wrapper.
         cfg_model: Configuration for model instantiation.
+        use_hf_fa2: Whether to use HF's flash_attention_2. This takes precedence over Pytorch's sdpa_methods for attn.
+        cfg_peft: Configuration for PEFT.
+        model_wrapper: Optional parallelism wrapper.
+        seed: Random seed.
 
     Returns:
         The instantiated model on the specified device.
     """
     with StatefulRNG(seed=seed, ranked=True):
-        model = cfg_model.instantiate()
+        kwargs = {}
+        if use_hf_fa2:
+            kwargs['attn_implementation'] = "flash_attention_2"
+            logger.warning(
+                "Packed sequence is supported only with Flash Attention. "
+                "Setting model's attn_implementation to flash_attention_2")
+        model = cfg_model.instantiate(**kwargs)
         for m in model.modules():
             if isinstance(m, nn.Embedding):
                 m.weight.requires_grad_(False)
@@ -126,13 +137,14 @@ def build_loss_fn(device, cfg_loss):
         return cfg_loss.instantiate().to(device)
 
 
-def build_dataloader(cfg_ds, cfg_dl, cfg_model, device_mesh, seed) -> DataLoader:
+def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_ps, device_mesh, seed) -> DataLoader:
     """
     Build a DataLoader for the dataset.
 
     Args:
         cfg_ds: Dataset configuration.
         cfg_dl: DataLoader configuration.
+        cfg_ps: Packed sequence configuration
         distributed_sampler_kwargs: Additional arguments for the DistributedSampler.
 
     Returns:
@@ -155,6 +167,17 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, device_mesh, seed) -> DataLoader
 
     with StatefulRNG(seed=seed, ranked=True):
         ds = cfg_ds.instantiate(tokenizer=tokenizer)
+        # Apply packing if configured
+        if cfg_ps is not None and getattr(cfg_ps, 'packed_sequence_size', 0) > 0:
+            logger.info(f"Packing dataset with size: {cfg_ps.packed_sequence_size}")
+            ds = PackedSequence(
+                ds,
+                split=cfg_ds.split,  # Assumes split is defined in dataset config
+                packed_sequence_size=cfg_ps.packed_sequence_size,
+                split_across_pack=getattr(cfg_ps, 'split_across_pack', False),
+                max_packs=getattr(cfg_ps, 'max_packs', None)
+            ).pack()
+
         sampler = StatefulDistributedSampler(
             ds,
             seed=seed,
@@ -261,9 +284,19 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             run = build_wandb(self.cfg)
             logging.info("🚀 View run at {}".format(run.url))
 
+        use_hf_fa2 = False
+        # Check if packed_sequence_size > 0 and use HF's flash_attention_2 for attn implementation.
+        if self.cfg.packed_sequence is not None and self.cfg.packed_sequence.packed_sequence_size > 0:
+            # There is a bug with attn_mask computation in packed sequences and is not enabled currently.
+            # Using HF's attention impl with FA2 does not require attn_mask and the code path computes attn_mask
+            # internally based on pos_ids. Using PyTorch’s SDPA for Flash Attention requires attn_mask to be computed
+            # for packed sequences hence using HF's flash_attention_2 for attn implementation is recommended here.
+            use_hf_fa2 = True
+
         # Build components
         self.model = build_model(
-            self.dist_env.device, self.cfg.model, self.cfg.get('peft', None),
+            self.dist_env.device, self.cfg.model, use_hf_fa2,
+            self.cfg.get('peft', None),
             self.model_wrapper,
             seed=self.cfg.get("seed", 42),
         )
@@ -277,6 +310,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.cfg.dataset,
             self.cfg.dataloader,
             self.cfg.model,
+            self.cfg.packed_sequence,
             device_mesh=self.device_mesh,
             seed=self.cfg.get("seed", 42),
         )
@@ -284,10 +318,13 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Build validation dataloader if the config provides it
         self.val_dataloader = None
         if 'validation_dataset' in self.cfg:
+            # For validation, do not use packed sequences for fair comparison with baseline
+            val_packed_sequence_config = None
             self.val_dataloader = build_dataloader(
                 self.cfg.validation_dataset,
                 self.cfg.validation_dataloader,
                 self.cfg.model,
+                val_packed_sequence_config,  # Use unpacked config for validation
                 device_mesh=self.device_mesh,
                 seed=self.cfg.get("seed", 42),
             )

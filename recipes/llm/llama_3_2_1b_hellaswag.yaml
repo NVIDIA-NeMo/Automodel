@@ -38,6 +38,11 @@ dataset:
   path_or_dataset: rowan/hellaswag
   split: train
 
+packed_sequence:
+  # Set packed_sequence_size > 0 to run with packed sequences
+  packed_sequence_size: 0
+  split_across_pack: False
+
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.datasets.utils.default_collater
