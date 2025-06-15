@@ -35,7 +35,6 @@ import torch
 import torch.nn as nn
 import torch.distributed
 import torch.distributed.checkpoint as dcp
-from nemo_automodel.checkpoint.hf_planner import HuggingFaceLoadPlanner
 from nemo_automodel.checkpoint.hf_storage import (
     HuggingFaceStorageWriter,
     HuggingFaceStorageReader,
@@ -90,10 +89,11 @@ def save_model(
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         os.makedirs(model_path, exist_ok=True)
 
-        # save the config.json file
-        if checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
-            with open(os.path.join(model_path, "config.json"), "w") as f:
-                f.write(model.config.to_json_string())
+        if False: # TODO(@adil-a): We currently can't load back a non-sharded safetensors checkpoint.
+            # save the config.json file
+            if checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
+                with open(os.path.join(model_path, "config.json"), "w") as f:
+                    f.write(model.config.to_json_string())
 
     # Ensure all ranks wait for rank 0 to handle directories
     if torch.distributed.is_initialized():
@@ -102,39 +102,38 @@ def save_model(
     model_state = ModelState(model, checkpoint_config.model_save_format)
     
     if checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
-        # we first need to find the FQN -> .safetensors mapping
-        index_path = _get_safetensors_index_path(
-            checkpoint_config.model_cache_dir,
-            checkpoint_config.model_repo_id,
-        )
-        fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(index_path)
+        fqn_to_file_index_mapping = None
+        if False: # TODO(@adil-a): We currently can't load back a non-sharded safetensors checkpoint.
+            # we first need to find the FQN -> .safetensors mapping
+            index_path = _get_safetensors_index_path(
+                checkpoint_config.model_cache_dir,
+                checkpoint_config.model_repo_id,
+            )
+            fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(index_path)
 
-        # Add any missing keys from the model_state_dict
-        # These will go to the same file as the last file (or file 1 for single-file models)
-        default_index = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
+            # Add any missing keys from the model_state_dict
+            # These will go to the same file as the last file (or file 1 for single-file models)
+            default_index = max(fqn_to_file_index_mapping.values())
 
-        # TODO:(@adil-a): This will need to change when we add PP. Maybe we can cache the keys in ModelState.
-        # Make a mutable copy of the keys so we can safely remove items
-        model_state_dict_keys = list(model.state_dict().keys())
-        if model_state.is_tied_lm_head and "lm_head.weight" in model_state_dict_keys:
-            model_state_dict_keys.remove("lm_head.weight")
-
-        for fqn in model_state_dict_keys:
-            if fqn not in fqn_to_file_index_mapping:
-                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                    print(f"Adding missing key to mapping: {fqn}")
-                fqn_to_file_index_mapping[fqn] = default_index          
+            # TODO:(@adil-a): This will need to change when we add PP. Maybe we can cache the keys in ModelState.
+            for fqn in list(model.state_dict().keys()):
+                if fqn not in fqn_to_file_index_mapping:
+                    if model_state.is_tied_lm_head and fqn == "lm_head.weight":
+                        continue
+                    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                        print(f"Adding missing key to mapping: {fqn}")
+                    fqn_to_file_index_mapping[fqn] = default_index          
 
         storage_writer = HuggingFaceStorageWriter(
             path=model_path,
             fqn_to_index_mapping=fqn_to_file_index_mapping,
+            save_sharded=True,
         )
 
         dcp.save(
             {"model": model_state},
             checkpoint_id=model_path,
             storage_writer=storage_writer,
-            no_dist=True,
         )
     elif checkpoint_config.model_save_format == SerializationFormat.TORCH_SAVE:
         dcp.save({"model": model_state}, checkpoint_id=model_path)
@@ -162,20 +161,14 @@ def load_model(
         raise FileNotFoundError(f"Model path {model_path} does not exist")
 
     if checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
-        raise NotImplementedError("Safetensors checkpoint loading is not supported yet.")
-
         model_state = ModelState(model, checkpoint_config.model_save_format)
-
         storage_reader = HuggingFaceStorageReader(path=model_path)
-
-        load_planner = HuggingFaceLoadPlanner(allow_tensor_resize=True)
 
         dcp.load(
             state_dict={"model": model_state},
             checkpoint_id=model_path,
             storage_reader=storage_reader,
-            planner=load_planner,
-            no_dist=True,
+            planner=dcp.DefaultLoadPlanner(),
         )
     elif checkpoint_config.model_save_format == SerializationFormat.TORCH_SAVE:
         model_state = ModelState(model, checkpoint_config.model_save_format)

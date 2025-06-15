@@ -20,7 +20,6 @@ from torch.distributed.checkpoint.state_dict import (
     get_optimizer_state_dict,
     set_model_state_dict,
     set_optimizer_state_dict,
-    StateDictOptions,
 )
 from torch.distributed.checkpoint.stateful import Stateful
 
@@ -48,15 +47,8 @@ class ModelState(Stateful):
         Returns:
             dict: Dictionary containing the model's state dict with CPU offloading enabled.
         """
-        # this line automatically manages FSDP FQN's, as well as sets the default state dict type
-        # to FSDP.SHARDED_STATE_DICT
-        model_state_dict = get_model_state_dict(
-            self.model,
-            options=StateDictOptions(
-                cpu_offload=True,
-                full_state_dict=True if self.serialization_format == SerializationFormat.SAFETENSORS else False,
-            ),
-        )
+        # this line automatically manages FSDP FQN's
+        model_state_dict = get_model_state_dict(self.model)
         if self.is_tied_lm_head:
             model_state_dict.pop("lm_head.weight", None)
         return model_state_dict
@@ -77,10 +69,6 @@ class ModelState(Stateful):
         set_model_state_dict(
             self.model,
             state_dict,
-            options=StateDictOptions(
-                full_state_dict=True if self.serialization_format == SerializationFormat.SAFETENSORS else False,
-                broadcast_from_rank0=True if self.serialization_format == SerializationFormat.SAFETENSORS else False,
-            ),
         )
 
 
