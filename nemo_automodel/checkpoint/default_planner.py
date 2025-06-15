@@ -1,5 +1,5 @@
 # taken and edited from https://github.com/pytorch/pytorch/blob/c13e725edd8dd21406c629bf625f2d6c59ceedd1/torch/distributed/checkpoint/default_planner.py # pylint: disable=line-too-long
-# pylint: disable=missing-module-docstring
+# pylint: disable=missing-function-docstring
 
 import logging
 from typing import Any, Optional
