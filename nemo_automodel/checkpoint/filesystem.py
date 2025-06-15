@@ -1,4 +1,5 @@
 # mypy: allow-untyped-defs
+# pylint: disable=missing-function-docstring
 import json
 import os
 import queue
@@ -17,7 +18,6 @@ from torch.distributed.checkpoint.filesystem import (
     _item_size,
     _write_item,
 )
-
 
 
 def _write_files_from_queue(
