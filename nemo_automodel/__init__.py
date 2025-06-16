@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
+from .__version__ import __version__
 
 __all__ = [
     "_peft",
@@ -23,8 +24,10 @@ __all__ = [
     "optim",
     "training",
     "transformers",
-    "utils"
+    "utils",
+    "__version__",
 ]
+
 
 def __getattr__(name: str):
     """
@@ -38,6 +41,7 @@ def __getattr__(name: str):
         globals()[name] = module
         return module
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 def __dir__():
     """
