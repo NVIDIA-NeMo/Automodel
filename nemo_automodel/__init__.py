@@ -13,6 +13,7 @@
 # limitations under the License.
 import importlib
 from .torch_backports import apply_patches as _nemo__apply_patches
+from .package_info import __version__, __package_name__
 
 __all__ = [
     "_peft",
@@ -24,19 +25,23 @@ __all__ = [
     "optim",
     "training",
     "_transformers",
-    "utils"
+    "utils",
+    "__version__",
+    "__package_name__",
 ]
 
 # ==== Promote NeMoAutoModelForCausalLM into the top level ====
 try:
     # adjust this import path if your class lives somewhere else
     from ._transformers.auto_model import NeMoAutoModelForCausalLM
+
     globals()["NeMoAutoModelForCausalLM"] = NeMoAutoModelForCausalLM
     __all__.append("NeMoAutoModelForCausalLM")
 except ImportError:
     # optional dependency might be missing,
     # leave the name off the module namespace so other imports still work
     pass
+
 
 def __getattr__(name: str):
     """
@@ -50,6 +55,7 @@ def __getattr__(name: str):
         globals()[name] = module
         return module
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 def __dir__():
     """
