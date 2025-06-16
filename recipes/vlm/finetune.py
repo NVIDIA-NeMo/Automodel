@@ -162,8 +162,8 @@ def build_dataloader(
     }
     if not device_mesh is None:
         dist_sampler_kwargs |= {
-            "num_replicas": device_mesh.get("data_parallel").size(),
-            "rank": device_mesh.get["data_parallel"].get_local_rank(),
+            "num_replicas": device_mesh["data_parallel"].size(),
+            "rank": device_mesh["data_parallel"].get_local_rank(),
         }
 
     with StatefulRNG(seed=seed, ranked=True):

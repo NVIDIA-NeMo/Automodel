@@ -16,7 +16,7 @@
 
 step_scheduler:
   grad_acc_steps: 8
-  ckpt_every_steps: 20
+  ckpt_every_steps: 100
   val_every_steps: 1000  # will run every x number of gradient steps
   max_steps: 1000
 
@@ -30,7 +30,7 @@ rng:
   ranked: true
 
 model:
-  _target_: nemo_automodel.transformers.NeMoAutoModelForImageTextToText.from_pretrained
+  _target_: nemo_automodel._transformers.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: google/gemma-3-4b-it
 # pretrained_model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
 
