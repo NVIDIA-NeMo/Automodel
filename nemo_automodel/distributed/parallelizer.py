@@ -32,12 +32,12 @@ from torch.distributed.tensor.parallel import (
 
 # TODO(boxiangw): Change to nvFSDP once it got published
 try:
-    from nvfsdp import nvFSDP, DistributedDataParallelConfig
+    from nvfsdp import fully_shard as nvfsdp_fully_shard
+    HAVE_NVFSDP_FULLY_SHARD = True
+
 except ImportError:
-    from nemo_automodel.distributed.nvfsdp.nvfsdp import nvFSDP
-    from nemo_automodel.distributed.nvfsdp.distributed_data_parallel_config import (
-        DistributedDataParallelConfig,
-    )
+    from nvfsdp import nvFSDP, DistributedDataParallelConfig
+    HAVE_NVFSDP_FULLY_SHARD = False
 
 
 # Taken and modified from torchtitan
@@ -150,12 +150,23 @@ def import_classes_from_paths(class_paths: List[str]):
 def nvfsdp_strategy_parallelize(
     model,
     device_mesh: DeviceMesh,
-    nvfsdp_config: Optional[DistributedDataParallelConfig] = None,
     nvfsdp_unit_modules: Optional[List[str]] = None,
-    init_nvfsdp_with_meta_device: bool = False,
     tp_shard_plan: Optional[
         Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]
     ] = None,
+    data_parallel_sharding_strategy: str = "optim_grads_params",
+    init_nvfsdp_with_meta_device: bool = False,
+    grad_reduce_in_fp32: bool = False,
+    preserve_fp32_weights: bool = False,
+    overlap_grad_reduce: bool = True,
+    overlap_param_gather: bool = True,
+    check_for_nan_in_grad: bool = True,
+    average_in_collective: bool = False,
+    disable_bucketing: bool = False,
+    calculate_per_token_loss: bool = False,
+    keep_fp8_transpose_cache_when_using_custom_fsdp: bool = False,
+    nccl_ub: bool = False,
+    fsdp_double_buffer: bool = False,
 ):
     """Apply parallelisms and activation checkpointing to the model.
 
@@ -191,30 +202,57 @@ def nvfsdp_strategy_parallelize(
     if tp_mesh.size() > 1:
         parallelize_module(model, tp_mesh, tp_shard_plan)
 
-    if nvfsdp_config is None:
-        # Default DDP config for nvFSDP.
-        # data_parallel_sharding_strategy="optim_grads_params" is required to shard the parameters. (ZeRO-3)
-        nvfsdp_config = DistributedDataParallelConfig(
-            check_for_nan_in_grad=True,
-            data_parallel_sharding_strategy="optim_grads_params",
-            grad_reduce_in_fp32=True,
-            overlap_grad_reduce=True,
-            overlap_param_gather=True,
-            average_in_collective=False,
-        )
-
     # Import nvFSDP unit modules specified by the user.
     nvfsdp_unit_modules = import_classes_from_paths(nvfsdp_unit_modules)
 
     # Wrap model with nvFSDP.
-    model = nvFSDP(
-        ddp_config=nvfsdp_config,
-        module=model,
-        fsdp_unit_modules=nvfsdp_unit_modules,
-        dp_cp_group=dp_mesh.get_group(),
-        calculate_per_token_loss=False,
-        init_model_with_meta_device=init_nvfsdp_with_meta_device,
-    )
+    if HAVE_NVFSDP_FULLY_SHARD:
+        model = nvfsdp_fully_shard(
+            module=model,
+            fsdp_unit_modules=nvfsdp_unit_modules,
+            dp_cp_group=dp_mesh.get_group(),
+            init_model_with_meta_device=init_nvfsdp_with_meta_device,
+            data_parallel_sharding_strategy=data_parallel_sharding_strategy,
+            init_nvfsdp_with_meta_device=init_nvfsdp_with_meta_device,
+            grad_reduce_in_fp32=grad_reduce_in_fp32,
+            preserve_fp32_weights=preserve_fp32_weights,
+            overlap_grad_reduce=overlap_grad_reduce,
+            overlap_param_gather=overlap_param_gather,
+            check_for_nan_in_grad=check_for_nan_in_grad,
+            average_in_collective=average_in_collective,
+            disable_bucketing=disable_bucketing,
+            calculate_per_token_loss=calculate_per_token_loss,
+            keep_fp8_transpose_cache_when_using_custom_fsdp=keep_fp8_transpose_cache_when_using_custom_fsdp,
+            nccl_ub=nccl_ub,
+            fsdp_double_buffer=fsdp_double_buffer,
+        )
+    else:
+        # Default DDP config for nvFSDP.
+        # data_parallel_sharding_strategy="optim_grads_params" is required to shard the parameters. (ZeRO-3)
+        nvfsdp_config = DistributedDataParallelConfig(
+            data_parallel_sharding_strategy=data_parallel_sharding_strategy,
+            init_nvfsdp_with_meta_device=init_nvfsdp_with_meta_device,
+            grad_reduce_in_fp32=grad_reduce_in_fp32,
+            preserve_fp32_weights=preserve_fp32_weights,
+            overlap_grad_reduce=overlap_grad_reduce,
+            overlap_param_gather=overlap_param_gather,
+            check_for_nan_in_grad=check_for_nan_in_grad,
+            average_in_collective=average_in_collective,
+            disable_bucketing=disable_bucketing,
+            calculate_per_token_loss=calculate_per_token_loss,
+            keep_fp8_transpose_cache_when_using_custom_fsdp=keep_fp8_transpose_cache_when_using_custom_fsdp,
+            nccl_ub=nccl_ub,
+            fsdp_double_buffer=fsdp_double_buffer,
+        )
+        
+        model = nvFSDP(
+            module=model,
+            ddp_config=nvfsdp_config,
+            fsdp_unit_modules=nvfsdp_unit_modules,
+            dp_cp_group=dp_mesh.get_group(),
+            calculate_per_token_loss=False,
+            init_model_with_meta_device=init_nvfsdp_with_meta_device,
+        )
 
     return model
 

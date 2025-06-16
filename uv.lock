@@ -1004,6 +1004,9 @@ docs = [
     { name = "sphinx-autodoc2" },
     { name = "sphinx-copybutton" },
 ]
+nvfsdp = [
+    { name = "nvfsdp" },
+]
 test = [
     { name = "coverage" },
     { name = "pytest" },
@@ -1033,6 +1036,7 @@ docs = [
     { name = "sphinx-autodoc2" },
     { name = "sphinx-copybutton" },
 ]
+nvfsdp = [{ name = "nvfsdp", git = "https://github.com/NVIDIA-NeMo/nvFSDP.git?rev=e48b3c622040b05a5ab4b27eb68a2ec598a985a3" }]
 test = [
     { name = "coverage" },
     { name = "pytest" },
@@ -1194,6 +1198,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/9d/a3/1e536797fd10eb3c5dbd2e376671667c9af19e241843548575267242ea02/numpy-2.3.0-pp311-pypy311_pp73-manylinux_2_28_aarch64.whl", hash = "sha256:33a5a12a45bb82d9997e2c0b12adae97507ad7c347546190a18ff14c28bbca12", size = 14398078, upload-time = "2025-06-07T14:52:00.122Z" },
     { url = "https://files.pythonhosted.org/packages/7c/61/9d574b10d9368ecb1a0c923952aa593510a20df4940aa615b3a71337c8db/numpy-2.3.0-pp311-pypy311_pp73-manylinux_2_28_x86_64.whl", hash = "sha256:54dfc8681c1906d239e95ab1508d0a533c4a9505e52ee2d71a5472b04437ef97", size = 16751324, upload-time = "2025-06-07T14:52:25.077Z" },
     { url = "https://files.pythonhosted.org/packages/39/de/bcad52ce972dc26232629ca3a99721fd4b22c1d2bda84d5db6541913ef9c/numpy-2.3.0-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:e017a8a251ff4d18d71f139e28bdc7c31edba7a507f72b1414ed902cbe48c74d", size = 12924237, upload-time = "2025-06-07T14:52:44.713Z" },
+]
+
+[[package]]
+name = "nvfsdp"
+version = "0.1.0rc0"
+source = { git = "https://github.com/NVIDIA-NeMo/nvFSDP.git?rev=e48b3c622040b05a5ab4b27eb68a2ec598a985a3#e48b3c622040b05a5ab4b27eb68a2ec598a985a3" }
+dependencies = [
+    { name = "packaging" },
+    { name = "torch" },
 ]
 
 [[package]]
