@@ -69,7 +69,6 @@ dependencies = [
     "cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@87a86ab",
     "datasets",
     "liger-kernel==0.5.8; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
-    "nvfsdp",
     "pyyaml",
     "torch",
     "torchdata",
@@ -94,6 +93,7 @@ docs = [
     "nvidia-sphinx-theme", # Our NVIDIA theme
 ]
 test = ["coverage", "pytest"]
+nvfsdp = ["nvfsdp"]
 
 [tool.uv]
 default-groups = ["docs", "test"]
