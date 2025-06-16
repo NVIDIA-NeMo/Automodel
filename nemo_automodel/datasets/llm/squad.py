@@ -71,12 +71,14 @@ def make_squad_dataset(
             example['answers']['text'][0].strip(),
         ]
         context_ids, answer_ids = list(map(lambda x: tokenizer(x)['input_ids'], formatted_text))
-        bos_id = getattr(tokenizer, 'bos_id', None)
-        eos_id = getattr(tokenizer, 'eos_id', None)
-        if len(context_ids) > 0 and bos_id is not None and context_ids[0] != bos_id:
-            context_ids.insert(0, bos_id)
-        if len(answer_ids) > 0 and eos_id is not None and answer_ids[-1] != eos_id:
-            answer_ids.append(eos_id)
+        bos_id = getattr(tokenizer, 'bos_token_id', None)
+        eos_id = getattr(tokenizer, 'eos_token_id', None)
+        # Remove EOS token from context's end
+        if len(context_ids) > 0 and context_ids[-1] == eos_id:
+            context_ids = context_ids[:-1]
+        # Remove BOS token from answer's start
+        if len(answer_ids) > 0 and answer_ids[0] == bos_id:
+            answer_ids = answer_ids[1:]
 
         input_ids = context_ids + answer_ids
         return dict(
