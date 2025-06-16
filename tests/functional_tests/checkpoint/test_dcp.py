@@ -51,6 +51,14 @@ def load_dcp(ckpt_dir: Path | str) -> dict[str, torch.Tensor]:
     )
     return state_dict
 
+def to_cpu(
+        state_dict: dict[str, torch.Tensor | dict[str, torch.Tensor]],
+    ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
+    """
+    Converts a state dictionary to CPU.
+    """
+    return {k: v.cpu() if isinstance(v, torch.Tensor) else to_cpu(v) for k, v in state_dict.items()}
+
 def test_dcp_checkpoint():
     """
     Tests DCP checkpoint
@@ -63,15 +71,15 @@ def test_dcp_checkpoint():
 
     # checkpoint is saved at this point
     # first extract the in-memory checkpoint
-    model_state_dict = ModelState(
+    model_state_dict = to_cpu(ModelState(
         trainer.model,
         trainer.checkpoint_config.model_save_format,
-    ).state_dict()
-    optimizer_state_dict = OptimizerState(
+    ).state_dict())
+    optimizer_state_dict = to_cpu(OptimizerState(
         trainer.model,
         trainer.optimizer,
         trainer.step_scheduler,
-    ).state_dict()["optim"]["state"]
+    ).state_dict()["optim"]["state"])
 
     # assert the correct paths exist
     output_files = [
