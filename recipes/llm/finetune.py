@@ -423,16 +423,13 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
 
             with train_context(context_parallel_ctx):
-                out  = self.model(**batch)
-
-                # Prepare for loss calculation
-                logits = out.logits.float()
-                n_cls = logits.shape[-1]
-                logits = logits.view(-1, n_cls)
-                labels = labels.view(-1)
-                assert logits.shape[-2] == labels.shape[-1], "Expected logits & labels to have the same length"
-                local_loss = self.loss_fn(logits, labels, loss_mask)
-
+                out = self.model(**batch)
+                local_loss = self.loss_fn(
+                    out.logits.view(-1, out.logits.size(-1)),
+                    labels.view(-1),
+                    mask=loss_mask,
+                    reduction="sum"
+                )
             # In the case where all labels are masked, the loss should be 0.
             if loss_mask is not None and loss_mask.bool().sum() == 0:
                 local_loss.detach().copy_(torch.zeros_like(local_loss))
@@ -550,15 +547,15 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         False,
                         False,
                     )
+
                     with train_context(context_parallel_ctx):
-                        out  = self.model(**batch)
-                        # Prepare for loss calculation
-                        logits = out.logits.float()
-                        n_cls = logits.shape[-1]
-                        logits = logits.view(-1, n_cls)
-                        labels = labels.view(-1)
-                        assert logits.shape[-2] == labels.shape[-1], "Expected logits & labels to have the same length"
-                        local_loss = self.loss_fn(logits, labels, loss_mask)
+                        out = self.model(**batch)
+                        local_loss = self.loss_fn(
+                            out.logits.view(-1, out.logits.size(-1)),
+                            labels.view(-1),
+                            mask=loss_mask,
+                            reduction="sum"
+                        )
 
                     # In the case where all labels are masked, the loss should be 0.
                     if loss_mask is not None and loss_mask.bool().sum() == 0:
