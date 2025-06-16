@@ -27,7 +27,7 @@ def _build_position_ids(batch, device):
         batch['position_ids'] = torch.arange(seq_len, device=device).unsqueeze(0)
     return batch
 
-# based on https://github.com/pytorch/torchtitan/blob/0b44d4c437c424b6bf719661c0eb4283dc4068bc/torchtitan/distributed/utils.py#L180  #
+# based on https://github.com/pytorch/torchtitan/blob/0b44d4c437c424b6bf719661c0eb4283dc4068bc/torchtitan/distributed/utils.py#L180  # pylint: disable=C0301
 def get_train_context(enable_loss_parallel: bool, enable_compiled_autograd: bool, cp_context=None):
     """
     Create a train context.
@@ -81,11 +81,13 @@ def create_context_parallel_ctx(
         cp_buffers (List[torch.Tensor]): The buffers for context parallel.
         cp_seq_dims (List[int]): The sequence dimensions for context parallel.
         cp_no_restore_buffers (Set[torch.Tensor]): The no restore buffers for context parallel.
-        cp_rotate_method (str): The rotation method for context parallel, such as "allgather" or "addtoall".
+        cp_rotate_method (str): The rotation method for context parallel,
+            such as "allgather" or "addtoall".
     """
     from torch.distributed.tensor.experimental import context_parallel
 
-    # TODO: uncomment this when torch.distributed.tensor.experimental._attention.set_rotate_method is available
+    # TODO: uncomment this when torch.distributed.tensor.experimental._attention.set_rotate_method
+    # is available
     # from torch.distributed.tensor.experimental._attention import set_rotate_method
     # set_rotate_method(cp_rotate_method)
     return context_parallel(
@@ -95,7 +97,21 @@ def create_context_parallel_ctx(
         no_restore_buffers=cp_no_restore_buffers,
     )
 
-def make_cp_batch_and_ctx(device_mesh, batch, enable_loss_parallel: bool = False, enable_compiled_autograd: bool = False):
+def make_cp_batch_and_ctx(device_mesh, batch):
+    """
+    Build a CP context manager and shards a batch. If the input device_mesh is None or the size
+    of the context_parallel submesh is 1, this function is effectively a no-op.
+
+    Args:
+        cp_mesh (DeviceMesh): The device mesh for context parallel.
+        batch (Dict[str, torch.Tensor]): The input batch containing (string, torch.Tensor)
+
+    Returns:
+        tuple (contextmanager, dict[str, torch.Tensor]): Returns a tuple with a context manager
+        and a new batch. The context manager is either nullcontext (no CP) or CP context manager as
+        returned by `create_context_parallel_ctx`. The batch has also been passed to
+        `create_context_parallel_ctx` and is accordingly sharded.
+    """
     from contextlib import nullcontext
     if device_mesh is None:
         cp_mesh = None
@@ -123,4 +139,7 @@ def make_cp_batch_and_ctx(device_mesh, batch, enable_loss_parallel: bool = False
         cp_no_restore_buffers=no_restore,
         cp_rotate_method="allgather",   # TODO: expose through cfg
     )
+    # TODO(@akoumparouli): surface these in the future.
+    enable_loss_parallel: bool = False
+    enable_compiled_autograd: bool = False
     return get_train_context(enable_loss_parallel, enable_compiled_autograd, cp_ctx), batch
