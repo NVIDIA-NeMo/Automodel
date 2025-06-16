@@ -457,7 +457,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         )
                         else "data_parallel"
                     )
-                ].get_group()
+                ].get_group() if self.device_mesh is not None else None,
             )
 
             # Clip gradients **after** any rescaling.
