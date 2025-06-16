@@ -307,7 +307,7 @@ class LoRATritonFunction(torch.autograd.Function):
         """
         Stores context for LoRA backward pass.
         """
-        x, lora_A, lora_B, scale, _, _ = inputs
+        x, lora_A, lora_B, scale, _ = inputs
         ctx.save_for_backward(x, lora_A, lora_B)
         ctx.scale = scale
 
