@@ -22,9 +22,20 @@ __all__ = [
     "loss",
     "optim",
     "training",
-    "transformers",
+    "_transformers",
     "utils"
 ]
+
+# ==== Promote NeMoAutoModelForCausalLM into the top level ====
+try:
+    # adjust this import path if your class lives somewhere else
+    from ._transformers.auto_model import NeMoAutoModelForCausalLM
+    globals()["NeMoAutoModelForCausalLM"] = NeMoAutoModelForCausalLM
+    __all__.append("NeMoAutoModelForCausalLM")
+except ImportError:
+    # optional dependency might be missing,
+    # leave the name off the module namespace so other imports still work
+    pass
 
 def __getattr__(name: str):
     """

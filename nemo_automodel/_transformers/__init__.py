@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .auto_model import NeMoAutoModelForCausalLM, NeMoAutoModelForImageTextToText
+
+from nemo_automodel._transformers.auto_model import NeMoAutoModelForCausalLM, NeMoAutoModelForImageTextToText
 
 __all__ = ["NeMoAutoModelForCausalLM", "NeMoAutoModelForImageTextToText"]
+
