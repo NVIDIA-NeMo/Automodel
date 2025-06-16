@@ -18,29 +18,18 @@ import os
 from typing import Any, Optional
 from dataclasses import dataclass
 from pathlib import Path
-from enum import Enum
-
-# -----------------------------------------------------------------------------
-# Enum definitions (must come *before* importing modules that depend on them to
-# avoid circular-import issues).
-# -----------------------------------------------------------------------------
-
-class SerializationFormat(Enum):
-    """Enumeration of supported on-disk checkpoint formats."""
-
-    TORCH_SAVE = "torch_save"
-    SAFETENSORS = "safetensors"
 
 import torch
 import torch.nn as nn
 import torch.distributed
 import torch.distributed.checkpoint as dcp
-from nemo_automodel.checkpoint.hf_storage import (
+from nemo_automodel.checkpoint._backports.hf_storage import (
     HuggingFaceStorageWriter,
     HuggingFaceStorageReader,
     get_fqn_to_file_index_mapping,
 )
 from nemo_automodel.checkpoint.stateful_wrappers import ModelState, OptimizerState
+from nemo_automodel.checkpoint._backports.filesystem import SerializationFormat
 import glob
 
 @dataclass

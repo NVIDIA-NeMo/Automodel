@@ -12,14 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Runtime back-ports for old PyTorch versions.
-
-This helper rewires selected functions/classes inside
-``torch.distributed.checkpoint`` to newer implementations bundled with
-NeMo-Automodel.  It must be imported *before* you construct any
-``SavePlanner``/``LoadPlanner``/etc.  The project's ``__init__.py
-automatically calls :pyfunc:`apply_patches` on import, so users usually
-don't have to do anything manually.
+"""Runtime back-ports for old PyTorch versions. Will be deleted in future stable PyTorch versions.
 """
 from __future__ import annotations
 
@@ -29,69 +22,36 @@ import logging
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-#  Helper – make patching idempotent.
-# ---------------------------------------------------------------------------
-_SENTINEL = "__nemo_backport__"
-
-def _already_patched(obj) -> bool:
-    return getattr(obj, _SENTINEL, False)
-
-def _mark_patched(obj) -> None:
-    setattr(obj, _SENTINEL, True)
-
-
-# ---------------------------------------------------------------------------
 #  Public API
 # ---------------------------------------------------------------------------
 
 def apply_patches() -> None:
-    """Inject newer helpers into an *old* ``torch.distributed.checkpoint``.
-
-    Safe to call multiple times – only the first invocation does work.
-    Subsequent calls exit early.
     """
-
+    Inject modified modules into an *old* ``torch.distributed.checkpoint``.
+    """
+    # -----------------------------------------------------------------
+    # Ensure SavePlanner provides the _cached_metadata class attribute.
+    # This is required by NeMo-Automodel's extended planners but may be
+    # missing from older PyTorch versions (< 2.4).  Monkey-patch it here
+    # so downstream code can rely on its existence independent of the
+    # installed torch release.
+    # -----------------------------------------------------------------
     try:
-        torch_fs_mod = importlib.import_module("torch.distributed.checkpoint.filesystem")
-        torch_dp_mod = importlib.import_module("torch.distributed.checkpoint.default_planner")
-    except ModuleNotFoundError as exc:  # pragma: no cover – exotic env
-        logger.warning("torch.distributed.checkpoint not available – skipping back-ports (%s)", exc)
-        return
+        planner_mod = importlib.import_module("torch.distributed.checkpoint.planner")
+        SavePlanner = getattr(planner_mod, "SavePlanner", None)
+        if SavePlanner is not None and not hasattr(SavePlanner, "_cached_metadata"):
+            # Forward-declare attribute; note we don't import Metadata to
+            # avoid circular deps – a forward reference string in the
+            # annotation keeps static checkers happy while remaining
+            # runtime-safe.
+            SavePlanner._cached_metadata = {}
 
-    # Import NeMo replacement implementations lazily (avoids circular deps)
-    nemo_fs_mod = importlib.import_module("nemo_automodel.checkpoint.filesystem")
-    nemo_dp_mod = importlib.import_module("nemo_automodel.checkpoint.default_planner")
+            # Update type annotations dynamically for better type hints
+            anns = getattr(SavePlanner, "__annotations__", {})
+            anns.setdefault("_cached_metadata", "dict[str, 'Metadata']")
+            SavePlanner.__annotations__ = anns  # type: ignore[attr-defined]
 
-    # ---------------------------------------------------------------------
-    # filesystem._write_files_from_queue
-    # ---------------------------------------------------------------------
-    if not _already_patched(torch_fs_mod._write_files_from_queue):
-        torch_fs_mod._write_files_from_queue = nemo_fs_mod._write_files_from_queue
-        _mark_patched(torch_fs_mod._write_files_from_queue)
-        logger.debug("Patched torch.distributed.checkpoint.filesystem._write_files_from_queue")
-
-    # ---------------------------------------------------------------------
-    # default_planner.create_default_local_load_plan
-    # ---------------------------------------------------------------------
-    if not _already_patched(torch_dp_mod.create_default_local_load_plan):
-        torch_dp_mod.create_default_local_load_plan = nemo_dp_mod.create_default_local_load_plan
-        _mark_patched(torch_dp_mod.create_default_local_load_plan)
-        logger.debug("Patched default_planner.create_default_local_load_plan")
-
-    # ---------------------------------------------------------------------
-    # _EmptyStateDictLoadPlanner.set_up_planner
-    # ---------------------------------------------------------------------
-    if hasattr(torch_dp_mod, "_EmptyStateDictLoadPlanner") and hasattr(nemo_dp_mod, "_EmptyStateDictLoadPlanner"):
-        torch_cls = torch_dp_mod._EmptyStateDictLoadPlanner
-        nemo_cls = nemo_dp_mod._EmptyStateDictLoadPlanner
-        if not _already_patched(torch_cls.set_up_planner):
-            torch_cls.set_up_planner = nemo_cls.set_up_planner
-            _mark_patched(torch_cls.set_up_planner)
-            logger.debug("Patched _EmptyStateDictLoadPlanner.set_up_planner")
-
-    # Also alias our extended SerializationFormat so identity checks succeed
-    if not hasattr(torch_fs_mod, "_nemo_enum_aliased"):
-        torch_fs_mod.SerializationFormat = nemo_fs_mod.SerializationFormat
-        torch_fs_mod._nemo_enum_aliased = True
-
-    logger.info("NeMo-Automodel: torch.distributed.checkpoint back-ports applied") 
+            logger.debug("Added missing SavePlanner._cached_metadata back-port")
+    except ModuleNotFoundError:
+        # planner module unavailable – nothing to patch
+        pass

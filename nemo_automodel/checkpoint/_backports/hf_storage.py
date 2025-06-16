@@ -10,8 +10,8 @@ from typing import Any, Optional
 
 import torch
 from torch.distributed._shard._utils import narrow_tensor_by_index
-from torch.distributed.checkpoint._fsspec_filesystem import FsspecReader, FsspecWriter
-from torch.distributed.checkpoint.filesystem import _StorageInfo
+from nemo_automodel.checkpoint._backports._fsspec_filesystem import FsspecReader, FsspecWriter
+from nemo_automodel.checkpoint._backports.filesystem import _StorageInfo
 from torch.distributed.checkpoint.metadata import (
     ChunkStorageMetadata,
     Metadata,
@@ -31,8 +31,8 @@ from torch.distributed.checkpoint.planner import (
 from torch.distributed.checkpoint.storage import WriteResult
 from torch.futures import Future
 
-from nemo_automodel.checkpoint.checkpointing import SerializationFormat
-from nemo_automodel.checkpoint.hf_planner import _HuggingFaceLoadPlanner
+from nemo_automodel.checkpoint._backports.filesystem import SerializationFormat
+from nemo_automodel.checkpoint._backports.hf_planner import _HuggingFaceLoadPlanner
 
 
 __all__ = ["HuggingFaceStorageWriter", "HuggingFaceStorageReader"]
