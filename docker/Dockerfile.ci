@@ -40,7 +40,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 # Install all
 COPY nemo_automodel/__init__.py /workspace/nemo_automodel/__init__.py
-COPY nemo_automodel/__version__.py /workspace/nemo_automodel/__version__.py
+COPY nemo_automodel/package_info.py /workspace/nemo_automodel/package_info.py
 COPY README.md /workspace/README.md
 COPY uv.lock /workspace/uv.lock
 COPY pyproject.toml /workspace/pyproject.toml
