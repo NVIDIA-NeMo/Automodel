@@ -65,7 +65,7 @@ def get_train_context(enable_loss_parallel: bool, enable_compiled_autograd: bool
     return context
 
 
-def make_cp_batch_and_ctx(device_mesh, batch):
+def make_cp_batch_and_ctx(device_mesh, batch, enable_loss_parallel: bool = False, enable_compiled_autograd: bool = False):
     from contextlib import nullcontext
     if device_mesh is None:
         cp_mesh = None
@@ -93,4 +93,4 @@ def make_cp_batch_and_ctx(device_mesh, batch):
         cp_no_restore_buffers=no_restore,
         cp_rotate_method="allgather",   # TODO: expose through cfg
     )
-    return get_train_context(False, False, cp_ctx), batch
+    return get_train_context(enable_loss_parallel, enable_compiled_autograd, cp_ctx), batch
