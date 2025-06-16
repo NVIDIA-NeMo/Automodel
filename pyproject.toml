@@ -39,7 +39,7 @@ classifiers = [
     #  5 - Production/Stable
     #  6 - Mature
     #  7 - Inactive
-    'Development Status :: 5 - Production/Stable',
+    'Development Status :: 4 - Beta',
     # Indicate who your project is intended for
     'Intended Audience :: Developers',
     'Intended Audience :: Science/Research',
