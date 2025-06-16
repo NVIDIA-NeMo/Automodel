@@ -1,6 +1,0 @@
-sphinx
-sphinx-autobuild
-sphinx-autodoc2
-sphinx-copybutton
-myst_parser
-nvidia-sphinx-theme

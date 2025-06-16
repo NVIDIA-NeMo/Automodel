@@ -16,7 +16,7 @@ import logging
 import types
 import torch
 from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
-from nemo_automodel.package_info import __version__
+from nemo_automodel import __version__
 
 from nemo_automodel.shared.import_utils import safe_import
 from torch.nn.attention import sdpa_kernel, SDPBackend

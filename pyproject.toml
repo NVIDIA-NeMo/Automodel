@@ -16,26 +16,86 @@
 requires = ["setuptools >= 61.0"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["nemo_automodel", "nemo_automodel.*"]
 
 [project]
+description = "NeMo Automodel - Delivers zero-day integration with Hugging Face models automating fine-tuning and pretraining with built-in parallelism, custom-kernels and optimized recipes"
 name = "nemo-automodel"
-dynamic = ["dependencies", "optional-dependencies", "version"]
-description = "Add your description here"
+dynamic = ["version"]
 readme = "README.md"
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 maintainers = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 requires-python = ">=3.10"
+classifiers = [
+    # How mature is this project? Common values are
+    #  1 - Planning
+    #  2 - Pre-Alpha
+    #  3 - Alpha
+    #  4 - Beta
+    #  5 - Production/Stable
+    #  6 - Mature
+    #  7 - Inactive
+    'Development Status :: 4 - Beta',
+    # Indicate who your project is intended for
+    'Intended Audience :: Developers',
+    'Intended Audience :: Science/Research',
+    'Intended Audience :: Information Technology',
+    # Indicate what your project relates to
+    'Topic :: Scientific/Engineering',
+    'Topic :: Scientific/Engineering :: Mathematics',
+    'Topic :: Scientific/Engineering :: Image Recognition',
+    'Topic :: Scientific/Engineering :: Artificial Intelligence',
+    'Topic :: Software Development :: Libraries',
+    'Topic :: Software Development :: Libraries :: Python Modules',
+    'Topic :: Utilities',
+    # Pick your license as you wish (should match "license" above)
+    'License :: OSI Approved :: Apache Software License',
+    # Supported python versions
+    'Programming Language :: Python :: 3',
+    'Programming Language :: Python :: 3.10',
+    'Programming Language :: Python :: 3.11',
+    'Programming Language :: Python :: 3.12',
+    # Additional Setting
+    'Environment :: Console',
+    'Natural Language :: English',
+    'Operating System :: OS Independent',
+]
+dependencies = [
+    "bitsandbytes==0.45.3; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
+    "cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@87a86ab",
+    "datasets",
+    "liger-kernel==0.5.8; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
+    "pyyaml",
+    "torch",
+    "torchdata",
+    "transformers",
+    "wandb",
 
-[tool.setuptools]
-py-modules = ["nemo_automodel"]
+]
+[project.optional-dependencies]
+vlm = ["qwen-vl-utils[decord]"]
+[project.urls]
+Homepage = "https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/stable/"
+Repository = "https://github.com/NVIDIA/NeMo-Automodel"
+Download = "https://github.com/NVIDIA/NeMo-Automodel/releases"
+
+[dependency-groups]
+docs = [
+    "sphinx",
+    "sphinx-autobuild",    # For live doc serving while editing docs
+    "sphinx-autodoc2",     # For documenting Python API
+    "sphinx-copybutton",   # Adds a copy button for code blocks
+    "myst_parser",         # For our markdown docs
+    "nvidia-sphinx-theme", # Our NVIDIA theme
+]
+test = ["coverage", "pytest"]
+
+[tool.uv]
+default-groups = ["docs", "test"]
 
 [tool.coverage.paths]
-source = [
-    ".",
-    "/workspace",
-    "/home/runner/work/NeMo-Automodel/NeMo-Automodel",
-]
-
-[project.urls]
-Download = "https://github.com/NVIDIA/NeMo-Automodel/releases"
-Homepage = "https://github.com/nvidia/nemo"
+source = [".", "/workspace", "/home/runner/work/NeMo-Automodel/NeMo-Automodel"]
