@@ -243,14 +243,15 @@ def reduce_loss(
         Tuple of reduced loss and denominator.
     """
     loss = torch.sum(torch.stack(loss_store).float()).view(1).clone().detach()
-
-    torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+    if dp_group is not None:
+        dist.all_reduce(loss, op=torch.distributed.ReduceOp.SUM, group=dp_group)
 
     if per_token_loss:
         denominator = total_num_tokens.clone().detach().to(torch.int)
     else:
         denominator = torch.tensor([len(loss_store)], dtype=torch.int, device="cuda")
-    torch.distributed.all_reduce(denominator, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+    if dp_group is not None:
+        dist.all_reduce(denominator, op=torch.distributed.ReduceOp.SUM, group=dp_group)
     return loss, denominator
 
 
@@ -280,7 +281,8 @@ def get_sync_ctx(model, is_optim_step):
         sync_ctx = nullcontext()
     return sync_ctx
 
-def rescale_gradients(model, num_tokens_for_grad_scaling, dp_group, dp_size):
+@torch.no_grad()
+def rescale_gradients(model, num_tokens_for_grad_scaling, dp_group=None):
     """
     Rescale gradients across the DP group.
 
@@ -290,9 +292,12 @@ def rescale_gradients(model, num_tokens_for_grad_scaling, dp_group, dp_size):
         dp_group: The process group to rescale the gradients across.
     """
     num_tokens_for_grad_scaling = num_tokens_for_grad_scaling.clone().detach()
-    dist.all_reduce(num_tokens_for_grad_scaling, group=dp_group)
+    dp_group_size = 1
+    if dp_group is not None:
+       dist.all_reduce(num_tokens_for_grad_scaling, group=dp_group)
+       dp_group_size = dist.get_world_size(group=dp_group)
     # DDP/FSDP reduces gradients across ranks, so we need to scale by the world size to inverse it
-    scaling_factor = dp_size / num_tokens_for_grad_scaling
+    scaling_factor = dp_group_size / num_tokens_for_grad_scaling
     for param in model.parameters():
         if param.grad is not None:
             param.grad.data.mul_(scaling_factor)

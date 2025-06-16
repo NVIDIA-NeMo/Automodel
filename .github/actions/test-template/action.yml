@@ -173,7 +173,6 @@ runs:
 
         echo "$cmd" | tee "retry_job.sh"
         bash retry_job.sh
-        docker exec -t nemo_container_${{ github.run_id }} bash -c 'pip install -e .'
 
     - name: Create run-script
       id: create
@@ -189,7 +188,7 @@ runs:
           set -e
 
           docker exec -t nemo_container_${{ github.run_id }} bash -c '\
-            pip install -e . && \
+            uv pip install --no-deps -e . && \
             bash tests/${{ inputs.is_unit_test == 'true' && 'unit_tests' || 'functional_tests' }}/${{ inputs.script }}.sh && \
             echo "Finished successfully." || echo "Did not finish."'
         ) 2>&1 | tee err.log
