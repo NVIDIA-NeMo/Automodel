@@ -144,7 +144,7 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_ps, device_mesh, seed) -> Da
     Args:
         cfg_ds: Dataset configuration.
         cfg_dl: DataLoader configuration.
-        cfg_ps: Packed sequence configuration
+        cfg_ps: Packed sequence configuration.
         distributed_sampler_kwargs: Additional arguments for the DistributedSampler.
 
     Returns:
@@ -154,7 +154,7 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_ps, device_mesh, seed) -> Da
         "shuffle": cfg_dl.get("shuffle", True),
     }
     if not device_mesh is None:
-        dist_sampler_kwargs = {
+        dist_sampler_kwargs |= {
             "num_replicas": device_mesh["data_parallel"].size(),
             "rank": device_mesh["data_parallel"].get_local_rank(),
         }
@@ -168,7 +168,7 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_ps, device_mesh, seed) -> Da
     with StatefulRNG(seed=seed, ranked=True):
         ds = cfg_ds.instantiate(tokenizer=tokenizer)
         # Apply packing if configured
-        if cfg_ps is not None and getattr(cfg_ps, 'packed_sequence_size', 0) > 0:
+        if getattr(cfg_ps, 'packed_sequence_size', 0) > 0:
             logger.info(f"Packing dataset with size: {cfg_ps.packed_sequence_size}")
             ds = PackedSequence(
                 ds,
@@ -284,14 +284,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             run = build_wandb(self.cfg)
             logging.info("🚀 View run at {}".format(run.url))
 
-        use_hf_fa2 = False
         # Check if packed_sequence_size > 0 and use HF's flash_attention_2 for attn implementation.
-        if self.cfg.packed_sequence is not None and self.cfg.packed_sequence.packed_sequence_size > 0:
-            # There is a bug with attn_mask computation in packed sequences and is not enabled currently.
-            # Using HF's attention impl with FA2 does not require attn_mask and the code path computes attn_mask
-            # internally based on pos_ids. Using PyTorch’s SDPA for Flash Attention requires attn_mask to be computed
-            # for packed sequences hence using HF's flash_attention_2 for attn implementation is recommended here.
-            use_hf_fa2 = True
+        use_hf_fa2 = self.cfg.get('packed_sequence.packed_sequence_size', 0) > 0
 
         # Build components
         self.model = build_model(
@@ -319,12 +313,12 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.val_dataloader = None
         if 'validation_dataset' in self.cfg:
             # For validation, do not use packed sequences for fair comparison with baseline
-            val_packed_sequence_config = None
+
             self.val_dataloader = build_dataloader(
                 self.cfg.validation_dataset,
                 self.cfg.validation_dataloader,
                 self.cfg.model,
-                val_packed_sequence_config,  # Use unpacked config for validation
+                cfg_ps=None, # Use unpacked config for validation
                 device_mesh=self.device_mesh,
                 seed=self.cfg.get("seed", 42),
             )
@@ -393,7 +387,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # If 'position_ids' does not exist in batch already then override it. batch in case of Packed sequence
         # contains 'position_ids' and we don't want to override it.
         if (
-            'position_ids' not in batch and
+            'position_ids' not in batch and self.device_mesh is not None and
             (
                 self.device_mesh["context_parallel"].size() > 1 or
                 self.device_mesh["tensor_parallel"].size() > 1
@@ -402,7 +396,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             batch["position_ids"] = torch.arange(0, batch['input_ids'].shape[1]).unsqueeze(0).to(self.model.device)
 
         # based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/train.py#L336
-        if self.device_mesh["context_parallel"].size() > 1:
+        if self.device_mesh and self.device_mesh["context_parallel"].size() > 1:
 
             input_ids = batch["input_ids"].to(self.model.device)
             position_ids = batch["position_ids"].to(self.model.device)
@@ -468,17 +462,12 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     "dp_cp"
                     if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(self.device_mesh, {})
                     else "data_parallel"
-                )].get_group(),
-                self.device_mesh[(
-                    "dp_cp"
-                    if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(self.device_mesh, {})
-                    else "data_parallel"
-                )].size()
+                )].get_group() if self.device_mesh is not None else None,
             )
 
             # Clip gradients **after** any rescaling.
             # TODO(@boxiangw): Fix TP gradient clipping
-            if self.device_mesh["tensor_parallel"].size() == 1:
+            if not self.device_mesh or self.device_mesh["tensor_parallel"].size() == 1:
                 grad_norm = clip_gradients(self.model, clip_norm)
             else:
                 # TODO: TP WAR
@@ -527,7 +516,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     loss_mask = (labels.detach() != -100).to(torch.int)
 
                 if (
-                    'position_ids' not in batch and
+                    self.device_mesh and 'position_ids' not in batch and
                     (
                         self.device_mesh["context_parallel"].size() > 1 or
                         self.device_mesh["tensor_parallel"].size() > 1
@@ -536,7 +525,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     batch["position_ids"] = torch.arange(
                         0, batch['input_ids'].shape[1]).unsqueeze(0).to(self.model.device)
 
-                if self.device_mesh["context_parallel"].size() > 1:
+                if self.device_mesh and self.device_mesh["context_parallel"].size() > 1:
 
                     input_ids = batch["input_ids"].to(self.model.device)
                     position_ids = batch["position_ids"].to(self.model.device)
@@ -617,7 +606,9 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         Returns:
             Reporting loss.
         """
-        if self.device_mesh["context_parallel"].size() > 1:
+        if not self.device_mesh:
+            dp_group = None
+        elif self.device_mesh["context_parallel"].size() > 1:
             dp_group = self.device_mesh["dp_cp"].get_group()
         else:
             dp_group = self.device_mesh["data_parallel"].get_group()
