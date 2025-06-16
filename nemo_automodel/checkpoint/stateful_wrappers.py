@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 import torch
 from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
     get_model_state_dict,
     get_optimizer_state_dict,
     set_model_state_dict,
@@ -49,6 +50,19 @@ class ModelState(Stateful):
         """
         # this line automatically manages FSDP FQN's
         model_state_dict = get_model_state_dict(self.model)
+
+        # TODO: This is a hack to fix the issue with the model state dict being saved with the "model." prefix.
+        # Need to move this inside HFStorageWriter.
+        if self.serialization_format == SerializationFormat.SAFETENSORS:
+            keys_to_fix = [k for k in model_state_dict if k.startswith("model.")]
+            for old_key in keys_to_fix:
+                new_key = old_key[len("model."):]
+                # avoid overwriting if new_key already exists (shouldn't happen, but be safe)
+                if new_key not in model_state_dict:
+                    model_state_dict[new_key] = model_state_dict[old_key]
+                # delete the old, over-prefixed key
+                del model_state_dict[old_key]
+
         if self.is_tied_lm_head:
             model_state_dict.pop("lm_head.weight", None)
         return model_state_dict
@@ -59,6 +73,19 @@ class ModelState(Stateful):
         Args:
             state_dict (dict): State dictionary to load.
         """
+        # Undo the prefix-stripping that happened at save-time: DCP removes the
+        # container name ("model") when it dispatches the dict to this
+        # ModelState, so every key now lacks the leading "model." segment that
+        # HuggingFace modules normally carry.  Re-add it so that
+        # set_model_state_dict can match parameters correctly.
+        if self.serialization_format == SerializationFormat.SAFETENSORS:
+            keys_to_fix = [k for k in state_dict if not k.startswith("model.") and k != "lm_head.weight"]
+            for old_key in keys_to_fix:
+                new_key = f"model.{old_key}"
+                if new_key not in state_dict:
+                    state_dict[new_key] = state_dict[old_key]
+                del state_dict[old_key]
+
         # If we intentionally skipped saving "lm_head.weight" (tied embeddings)
         # PyTorch will complain during load even with strict=False.
         # To be fully compatible we inject a reference tensor so the key exists.

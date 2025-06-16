@@ -2,16 +2,14 @@
 # pylint: disable=missing-function-docstring
 
 import dataclasses
-import io
 import json
 import queue
-import struct
 from typing import Any, Optional
 
 import torch
 from torch.distributed._shard._utils import narrow_tensor_by_index
 from nemo_automodel.checkpoint._backports._fsspec_filesystem import FsspecReader, FsspecWriter
-from nemo_automodel.checkpoint._backports.filesystem import _StorageInfo
+from nemo_automodel.checkpoint._backports.consolidate_hf_safetensors import consolidate_safetensors_files
 from torch.distributed.checkpoint.metadata import (
     ChunkStorageMetadata,
     Metadata,
@@ -32,40 +30,27 @@ from torch.distributed.checkpoint.storage import WriteResult
 from torch.futures import Future
 
 from nemo_automodel.checkpoint._backports.filesystem import SerializationFormat
-from nemo_automodel.checkpoint._backports.hf_planner import _HuggingFaceLoadPlanner
+
+from nemo_automodel.checkpoint._backports.hf_utils import (
+    _metadata_fn,
+    _HFStorageInfo,
+    CUSTOM_METADATA_KEY,
+    DATA_KEY,
+    DATA_OFFSETS_KEY,
+    DEFAULT_EXTRA_METADATA_KEY,
+    DTYPE_KEY,
+    SAVED_OFFSETS_KEY,
+    SHAPE_KEY,
+    SUFFIX,
+    _gen_file_name,
+    _get_safetensors_file_metadata,
+    _get_dtype,
+)
+
+__all__ = ["_HuggingFaceStorageWriter", "_HuggingFaceStorageReader"]
 
 
-__all__ = ["HuggingFaceStorageWriter", "HuggingFaceStorageReader"]
-
-_metadata_fn: str = "model.safetensors.index.json"
-
-FILE_NAME = "model-{cpt_idx}-of-{num_files}"
-SHARDED_FILE_NAME = "shard-{shard_idx}-model-{cpt_idx}-of-{num_files}"
-SUFFIX = ".safetensors"
-
-# metadata keys
-CUSTOM_METADATA_KEY = "DCP_SHARDING_INFO"
-DEFAULT_EXTRA_METADATA_KEY = "__metadata__"
-SAVED_OFFSETS_KEY = "saved_offsets"
-SHAPE_KEY = "shape"
-DATA_KEY = "data"
-DTYPE_KEY = "dtype"
-DATA_OFFSETS_KEY = "data_offsets"
-
-DTYPE_MAP = {
-    "F16": torch.float16,
-    "F32": torch.float32,
-    "F64": torch.float64,
-    "I8": torch.int8,
-    "U8": torch.uint8,
-    "I16": torch.int16,
-    "I32": torch.int32,
-    "I64": torch.int64,
-    "BF16": torch.bfloat16,
-}
-
-
-class HuggingFaceStorageWriter(FsspecWriter):
+class _HuggingFaceStorageWriter(FsspecWriter):
     """
     A writer that writes to a huggingface repository in the huggingface format.
     Uses Fsspec back-end to communicate with back-end storage.
@@ -76,8 +61,11 @@ class HuggingFaceStorageWriter(FsspecWriter):
         self,
         path: str,
         fqn_to_index_mapping: Optional[dict[str, int]] = None,
+        thread_count: int = 1,
         token: Optional[str] = None,
         save_sharded: bool = False,
+        consolidated_output_path: Optional[str] = None,
+        num_threads_consolidation: Optional[int] = None,
     ) -> None:
         """
         Initialize the huggingface writer pointing to path.
@@ -86,6 +74,7 @@ class HuggingFaceStorageWriter(FsspecWriter):
             path: hf directory where the checkpoint will be read from.
                   Needs to have .safetensors files, but can be from any fsspec supported storage,
                   including localFS and hf://.
+                  This needs to be a remote path if you want to enable consolidation after saving.
             fqn_to_index_mapping: A mapping from tensor FQN to the index of the file that the tensor should be written to.
                               Indices are from 1 to N, where N is the number of files. If not provided,
                               the tensors will be written to a single file. If none, then all the tensors on the
@@ -93,7 +82,8 @@ class HuggingFaceStorageWriter(FsspecWriter):
             token: The token to use to authenticate with huggingface hub.
             save_sharded: If True, save the checkpoint as a sharded checkpoint where every rank saves its own shard.
                         Default is False which assumes full tensors are being saved.
-
+            consolidated_output_path: If provided, the output path where the consolidated files will be written in the finish step. This needs to be a local fs path right now.
+            num_threads_consolidation: Number of threads to use for parallel processing of saving data to output files. If not provided, the default value is the number of output files.
         """
 
         if token is not None:
@@ -109,6 +99,16 @@ class HuggingFaceStorageWriter(FsspecWriter):
             )
         self._fqn_to_index_mapping: Optional[dict[str, int]] = fqn_to_index_mapping
         self._save_sharded = save_sharded
+        self._consolidated_output_path = consolidated_output_path
+
+        if num_threads_consolidation:
+            self._num_threads_consolidation = num_threads_consolidation
+        elif self._fqn_to_index_mapping:
+            self._num_threads_consolidation = max(self._fqn_to_index_mapping.values())
+        else:
+            self._num_threads_consolidation = 1
+
+        self.thread_count = thread_count
 
     def prepare_global_plan(self, plans: list[SavePlan]) -> list[SavePlan]:
         new_plans = []
@@ -147,7 +147,7 @@ class HuggingFaceStorageWriter(FsspecWriter):
 
         file_queue: queue.Queue = queue.Queue()
         for file_index, write_items in buckets.items():
-            file_name = self._gen_file_name(file_index, highest_index, shard_index)
+            file_name = _gen_file_name(file_index, highest_index, shard_index)
             file_queue.put(
                 (self.fs.concat_path(self.path, file_name), file_name, write_items)
             )
@@ -155,8 +155,10 @@ class HuggingFaceStorageWriter(FsspecWriter):
         return super()._write_data(planner, file_queue)
 
     def finish(self, metadata: Metadata, results: list[list[WriteResult]]) -> None:
-        if self._save_sharded:
+        if self._save_sharded and not self._consolidated_output_path:
             return
+        if self._save_sharded:
+            return consolidate_safetensors_files(input_dir=self.path, output_dir=self._consolidated_output_path, num_threads=self._num_threads_consolidation)
 
         metadata_to_write = {}
         storage_md = {}
@@ -184,29 +186,7 @@ class HuggingFaceStorageWriter(FsspecWriter):
         for item in items:
             key = item.index.fqn
 
-            # Exact match first.
-            idx = storage_plan.get(key)
-
-            # If the storage plan does not contain the key as-is, progressively
-            # strip off leading module prefixes (e.g. "model." or
-            # "module.") until we find a match.  This allows us to reuse a
-            # reference weight-map built from plain HF checkpoints even when
-            # our local state_dict is wrapped one (or more) levels deep, such
-            # as when calling DCP with ``{"model": my_model}``.
-            if idx is None:
-                stripped_key = key
-                while "." in stripped_key and idx is None:
-                    # Remove the first prefix segment.
-                    stripped_key = stripped_key.split(".", 1)[1]
-                    idx = storage_plan.get(stripped_key)
-
-            if idx is None:
-                raise KeyError(
-                    f"No file-index mapping found for tensor '{key}'. "
-                    "Consider updating the reference index or relaxing the "
-                    "prefix-stripping logic."
-                )
-
+            idx = storage_plan[key]
             if idx not in buckets:
                 buckets[idx] = [item]
             else:
@@ -214,32 +194,12 @@ class HuggingFaceStorageWriter(FsspecWriter):
 
         return buckets
 
-    def _gen_file_name(
-        self, index: int, largest_index: int, shard_index: Optional[int]
-    ) -> str:
-        if shard_index is not None:
-            return (
-                SHARDED_FILE_NAME.format(
-                    shard_idx=f"{shard_index}".zfill(5),
-                    cpt_idx=f"{index}".zfill(5),
-                    num_files=f"{largest_index}".zfill(5),
-                )
-                + SUFFIX
-            )
-        else:
-            return (
-                FILE_NAME.format(
-                    cpt_idx=f"{index}".zfill(5), num_files=f"{largest_index}".zfill(5)
-                )
-                + SUFFIX
-            )
-
     @property
     def metadata_path(self) -> str:
         return _metadata_fn
 
 
-class HuggingFaceStorageReader(FsspecReader):
+class _HuggingFaceStorageReader(FsspecReader):
     """
     A reader that reads from a huggingface repository in the huggingface format.
     Uses in Fsspec back-end to communicate with storage.
@@ -268,7 +228,7 @@ class HuggingFaceStorageReader(FsspecReader):
         per_file: dict[str, list[ReadItem]] = {}
 
         for read_item in plan.items:
-            item_md: _StorageInfo = self.storage_data[read_item.storage_index]
+            item_md: _HFStorageInfo = self.storage_data[read_item.storage_index]
             file_name = item_md.relative_path
             per_file.setdefault(file_name, []).append(read_item)
 
@@ -276,48 +236,29 @@ class HuggingFaceStorageReader(FsspecReader):
             with self.fs.create_stream(file_name, "rb") as stream:
                 # TODO: make this more efficient by doing offset reads instead of a
                 # full deserialization of the file
-
                 deserialized = deserialize(stream.read())
                 deserialized_dict: dict[str, dict[str, Any]] = {
                     tensor_info[0]: tensor_info[1] for tensor_info in deserialized
                 }
 
                 for req in reqs:
+                    item_md: _HFStorageInfo = self.storage_data[req.storage_index]
+
                     tensor_bytes = deserialized_dict[req.dest_index.fqn][DATA_KEY]
-                    planner_metadata = planner.metadata  # type: ignore[attr-defined]
+
                     tensor = torch.frombuffer(
                         tensor_bytes,
-                        dtype=planner_metadata.state_dict_metadata[
-                            req.dest_index.fqn
-                        ].properties.dtype,
+                        dtype=item_md.dtype,
                     )
-                    # TODO: update this to req.lengths once I get rid of allow_tensor_resize,
-                    # shouldn't need to look at the deserialized
-                    # dict for metadata as we've already done that in read_metadata file
-                    tensor = tensor.reshape(
-                        deserialized_dict[req.dest_index.fqn][SHAPE_KEY]
+                    tensor = tensor.reshape(item_md.shape)
+                    tensor = narrow_tensor_by_index(
+                        tensor, req.storage_offsets, req.lengths
                     )
+                    target_tensor = planner.resolve_tensor(req).detach()
 
-                    if (
-                        isinstance(planner, _HuggingFaceLoadPlanner)
-                        and planner.allow_tensor_resize
-                    ):
-                        # this is to support the case when users are calling load on
-                        # an empty state dict without specifying the correct size of the tensors
-                        # in the state dict. Resizing is a hacky way to support this use case.
-                        # But will migrate users to _load_state_dict_from_keys method and deprecate this.
-                        target_tensor = planner.resolve_tensor(req)
-                        target_tensor.resize_(tensor.size())
-                        target_tensor = target_tensor.detach()
-                    else:
-                        tensor = narrow_tensor_by_index(
-                            tensor, req.storage_offsets, req.lengths
-                        )
-                        target_tensor = planner.resolve_tensor(req).detach()
-
-                        assert target_tensor.size() == tensor.size(), (
-                            f"req {req.storage_index} mismatch sizes {target_tensor.size()} vs {tensor.size()}"
-                        )
+                    assert target_tensor.size() == tensor.size(), (
+                        f"req {req.storage_index} mismatch sizes {target_tensor.size()} vs {tensor.size()}"
+                    )
 
                     target_tensor.copy_(tensor)
                     planner.commit_tensor(req, target_tensor)
@@ -328,7 +269,7 @@ class HuggingFaceStorageReader(FsspecReader):
 
     def read_metadata(self) -> Metadata:
         state_dict_metadata: dict[str, TensorStorageMetadata] = {}
-        storage_data: dict[MetadataIndex, _StorageInfo] = {}
+        storage_data: dict[MetadataIndex, _HFStorageInfo] = {}
 
         safetensors_files = []
         for file in self.fs.ls(self.path):
@@ -337,7 +278,7 @@ class HuggingFaceStorageReader(FsspecReader):
 
         for safetensor_file in safetensors_files:
             with self.fs.create_stream(safetensor_file, "rb") as f:
-                safetensors_metadata = _get_safetensors_file_metadata(f)
+                safetensors_metadata, _ = _get_safetensors_file_metadata(f)
                 custom_metadata = safetensors_metadata.get(DEFAULT_EXTRA_METADATA_KEY)
 
                 dcp_sharding_info = None
@@ -394,10 +335,12 @@ class HuggingFaceStorageReader(FsspecReader):
                         metadata_index = MetadataIndex(
                             fqn=key, offset=[0] * len(val[SHAPE_KEY])
                         )
-                    storage_data[metadata_index] = _StorageInfo(
-                        safetensor_file,
-                        val[DATA_OFFSETS_KEY][0],
-                        val[DATA_OFFSETS_KEY][1] - val[DATA_OFFSETS_KEY][0],
+                    storage_data[metadata_index] = _HFStorageInfo(
+                        relative_path=safetensor_file,
+                        offset=val[DATA_OFFSETS_KEY][0],
+                        length=val[DATA_OFFSETS_KEY][1] - val[DATA_OFFSETS_KEY][0],
+                        shape=torch.Size(val[SHAPE_KEY]),
+                        dtype=_get_dtype(val[DTYPE_KEY]),
                     )
 
         metadata = Metadata(
@@ -410,28 +353,6 @@ class HuggingFaceStorageReader(FsspecReader):
         metadata.storage_meta.load_id = self.load_id  # type: ignore[union-attr]
 
         return metadata
-
-
-def _get_safetensors_file_metadata(file_bytes: io.IOBase) -> Any:
-    # this uses the same logic that's done in HF code base
-    # https://github.com/2404589803/huggingface_hub/blob/main/src/huggingface_hub/hf_api.py#L5308
-    # and follows their documentation on how their files are serialized
-    # https://huggingface.co/docs/safetensors/index#format
-
-    header_len_bytes = file_bytes.read(8)
-    header_len = struct.unpack("<Q", header_len_bytes)[0]
-    header_json = file_bytes.read(header_len)
-    metadata = json.loads(header_json)
-    return metadata
-
-
-def _get_dtype(dtype_str: str) -> torch.dtype:
-    try:
-        dtype = DTYPE_MAP[dtype_str]
-    except KeyError:
-        dtype = torch.get_default_dtype()
-
-    return dtype
 
 
 def _extract_file_index(filename: str) -> int:
@@ -485,7 +406,7 @@ def get_fqn_to_file_index_mapping(reference_model_path: str) -> dict[str, int]:
         A mapping from tensor FQN to the index of the file that the tensor should be written to.
         Indices are from 1 to N, where N is the number of files.
     """
-    hf_reader = HuggingFaceStorageReader(reference_model_path)
+    hf_reader = _HuggingFaceStorageReader(reference_model_path)
 
     fqn_to_file_index_mapping: dict[str, int] = {}
 

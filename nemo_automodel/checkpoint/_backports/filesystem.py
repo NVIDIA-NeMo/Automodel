@@ -31,6 +31,11 @@ from torch.distributed.checkpoint._extension import (
     ExtensionRegistry,
     StreamTransformExtension,
 )
+from nemo_automodel.checkpoint._backports.hf_utils import (
+    CUSTOM_METADATA_KEY,
+    DCP_VERSION_KEY,
+    HF_DCP_VERSION,
+)
 from torch.distributed.checkpoint.metadata import Metadata, STATE_DICT_TYPE, StorageMeta
 from torch.distributed.checkpoint.planner import (
     LoadItemType,
@@ -451,8 +456,9 @@ def _write_files_from_queue(
                         save(
                             tensor_dict,
                             metadata={
-                                "DCP_SHARDING_INFO": json.dumps(metadata_dict),
-                                "DCP_VERSION": "1.0",
+                                CUSTOM_METADATA_KEY: json.dumps(metadata_dict),
+                                DCP_VERSION_KEY: str(HF_DCP_VERSION),
+                                "format": "pt",
                             },
                         )
                     )
