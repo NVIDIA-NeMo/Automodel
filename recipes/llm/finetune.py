@@ -24,6 +24,7 @@ from nemo_automodel.distributed.init_utils import initialize_distributed
 from nemo_automodel.distributed.parallelizer import create_context_parallel_ctx, get_train_context
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.step_scheduler import StepScheduler
+from nemo_automodel.datasets.llm.packed_sequence import PackedSequence
 from nemo_automodel.utils.dist_utils import reduce_loss, get_sync_ctx, rescale_gradients, clip_gradients
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 
@@ -39,7 +40,7 @@ logger = logging.getLogger(__name__)
 #  Stateless helper functions
 # ---------------------------
 
-def build_model(device, cfg_model, cfg_peft, model_wrapper, seed) -> nn.Module:
+def build_model(device, cfg_model, use_hf_fa2, cfg_peft, model_wrapper, seed) -> nn.Module:
     """
     Build and initialize a model.
 
@@ -47,12 +48,22 @@ def build_model(device, cfg_model, cfg_peft, model_wrapper, seed) -> nn.Module:
         device: The target device.
         model_wrapper: Optional parallelism wrapper.
         cfg_model: Configuration for model instantiation.
+        use_hf_fa2: Whether to use HF's flash_attention_2. This takes precedence over Pytorch's sdpa_methods for attn.
+        cfg_peft: Configuration for PEFT.
+        model_wrapper: Optional parallelism wrapper.
+        seed: Random seed.
 
     Returns:
         The instantiated model on the specified device.
     """
     with StatefulRNG(seed=seed, ranked=True):
-        model = cfg_model.instantiate()
+        kwargs = {}
+        if use_hf_fa2:
+            kwargs['attn_implementation'] = "flash_attention_2"
+            logger.warning(
+                "Packed sequence is supported only with Flash Attention. "
+                "Setting model's attn_implementation to flash_attention_2")
+        model = cfg_model.instantiate(**kwargs)
         for m in model.modules():
             if isinstance(m, nn.Embedding):
                 m.weight.requires_grad_(False)
@@ -126,13 +137,14 @@ def build_loss_fn(device, cfg_loss):
         return cfg_loss.instantiate().to(device)
 
 
-def build_dataloader(cfg_ds, cfg_dl, cfg_model, device_mesh, seed) -> DataLoader:
+def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_ps, device_mesh, seed) -> DataLoader:
     """
     Build a DataLoader for the dataset.
 
     Args:
         cfg_ds: Dataset configuration.
         cfg_dl: DataLoader configuration.
+        cfg_ps: Packed sequence configuration.
         distributed_sampler_kwargs: Additional arguments for the DistributedSampler.
 
     Returns:
@@ -142,7 +154,7 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, device_mesh, seed) -> DataLoader
         "shuffle": cfg_dl.get("shuffle", True),
     }
     if not device_mesh is None:
-        dist_sampler_kwargs = {
+        dist_sampler_kwargs |= {
             "num_replicas": device_mesh["data_parallel"].size(),
             "rank": device_mesh["data_parallel"].get_local_rank(),
         }
@@ -155,6 +167,17 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, device_mesh, seed) -> DataLoader
 
     with StatefulRNG(seed=seed, ranked=True):
         ds = cfg_ds.instantiate(tokenizer=tokenizer)
+        # Apply packing if configured
+        if getattr(cfg_ps, 'packed_sequence_size', 0) > 0:
+            logger.info(f"Packing dataset with size: {cfg_ps.packed_sequence_size}")
+            ds = PackedSequence(
+                ds,
+                split=cfg_ds.split,  # Assumes split is defined in dataset config
+                packed_sequence_size=cfg_ps.packed_sequence_size,
+                split_across_pack=getattr(cfg_ps, 'split_across_pack', False),
+                max_packs=getattr(cfg_ps, 'max_packs', None)
+            ).pack()
+
         sampler = StatefulDistributedSampler(
             ds,
             seed=seed,
@@ -200,6 +223,20 @@ def build_step_scheduler(cfg, dataloader):
         default_kwargs |= cfg.to_dict()
     return StepScheduler(**default_kwargs)
 
+def build_wandb(cfg):
+    """ Instantiates wandb and returns the instance.
+    If no name is given, it will use the model name
+    """
+    assert cfg.get('wandb', None) is not None
+    kwargs = cfg.wandb.to_dict()
+    if kwargs.get('name', "") == "":
+        kwargs["name"] = '_'.join(cfg.get("model.pretrained_model_name_or_path").split('/')[-2:])
+    run = wandb.init(
+        **kwargs,
+        config=cfg,
+        settings=Settings(silent=True),
+    )
+    return run
 
 # ---------------------------------------------------------------------------
 #  Trainer class – orchestration only
@@ -242,21 +279,18 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
 
-        if self.dist_env.is_main and hasattr(self.cfg, 'logger'):
+        if self.dist_env.is_main and hasattr(self.cfg, 'wandb'):
             suppress_wandb_log_messages()
-            run = wandb.init(
-                project=self.cfg.logger.get("wandb_project", "default_project"),
-                entity=self.cfg.logger.get("wandb_entity"),
-                name=self.cfg.logger.get("wandb_exp_name"),
-                dir=self.cfg.logger.get("wandb_save_dir"),
-                config=self.cfg,
-                settings=Settings(silent=True),
-            )
+            run = build_wandb(self.cfg)
             logging.info("🚀 View run at {}".format(run.url))
+
+        # Check if packed_sequence_size > 0 and use HF's flash_attention_2 for attn implementation.
+        use_hf_fa2 = self.cfg.get('packed_sequence.packed_sequence_size', 0) > 0
 
         # Build components
         self.model = build_model(
-            self.dist_env.device, self.cfg.model, self.cfg.get('peft', None),
+            self.dist_env.device, self.cfg.model, use_hf_fa2,
+            self.cfg.get('peft', None),
             self.model_wrapper,
             seed=self.cfg.get("seed", 42),
         )
@@ -270,6 +304,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.cfg.dataset,
             self.cfg.dataloader,
             self.cfg.model,
+            self.cfg.packed_sequence,
             device_mesh=self.device_mesh,
             seed=self.cfg.get("seed", 42),
         )
@@ -277,10 +312,13 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Build validation dataloader if the config provides it
         self.val_dataloader = None
         if 'validation_dataset' in self.cfg:
+            # For validation, do not use packed sequences for fair comparison with baseline
+
             self.val_dataloader = build_dataloader(
                 self.cfg.validation_dataset,
                 self.cfg.validation_dataloader,
                 self.cfg.model,
+                cfg_ps=None, # Use unpacked config for validation
                 device_mesh=self.device_mesh,
                 seed=self.cfg.get("seed", 42),
             )
@@ -349,7 +387,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # If 'position_ids' does not exist in batch already then override it. batch in case of Packed sequence
         # contains 'position_ids' and we don't want to override it.
         if (
-            'position_ids' not in batch and
+            'position_ids' not in batch and self.device_mesh is not None and
             (
                 self.device_mesh["context_parallel"].size() > 1 or
                 self.device_mesh["tensor_parallel"].size() > 1
@@ -358,7 +396,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             batch["position_ids"] = torch.arange(0, batch['input_ids'].shape[1]).unsqueeze(0).to(self.model.device)
 
         # based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/train.py#L336
-        if self.device_mesh["context_parallel"].size() > 1:
+        if self.device_mesh and self.device_mesh["context_parallel"].size() > 1:
 
             input_ids = batch["input_ids"].to(self.model.device)
             position_ids = batch["position_ids"].to(self.model.device)
@@ -424,17 +462,12 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     "dp_cp"
                     if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(self.device_mesh, {})
                     else "data_parallel"
-                )].get_group(),
-                self.device_mesh[(
-                    "dp_cp"
-                    if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(self.device_mesh, {})
-                    else "data_parallel"
-                )].size()
+                )].get_group() if self.device_mesh is not None else None,
             )
 
             # Clip gradients **after** any rescaling.
             # TODO(@boxiangw): Fix TP gradient clipping
-            if self.device_mesh["tensor_parallel"].size() == 1:
+            if not self.device_mesh or self.device_mesh["tensor_parallel"].size() == 1:
                 grad_norm = clip_gradients(self.model, clip_norm)
             else:
                 # TODO: TP WAR
@@ -483,7 +516,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     loss_mask = (labels.detach() != -100).to(torch.int)
 
                 if (
-                    'position_ids' not in batch and
+                    self.device_mesh and 'position_ids' not in batch and
                     (
                         self.device_mesh["context_parallel"].size() > 1 or
                         self.device_mesh["tensor_parallel"].size() > 1
@@ -492,7 +525,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     batch["position_ids"] = torch.arange(
                         0, batch['input_ids'].shape[1]).unsqueeze(0).to(self.model.device)
 
-                if self.device_mesh["context_parallel"].size() > 1:
+                if self.device_mesh and self.device_mesh["context_parallel"].size() > 1:
 
                     input_ids = batch["input_ids"].to(self.model.device)
                     position_ids = batch["position_ids"].to(self.model.device)
@@ -573,7 +606,9 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         Returns:
             Reporting loss.
         """
-        if self.device_mesh["context_parallel"].size() > 1:
+        if not self.device_mesh:
+            dp_group = None
+        elif self.device_mesh["context_parallel"].size() > 1:
             dp_group = self.device_mesh["dp_cp"].get_group()
         else:
             dp_group = self.device_mesh["data_parallel"].get_group()

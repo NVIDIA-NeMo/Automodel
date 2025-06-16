@@ -205,7 +205,7 @@ setuptools.setup(
         'Natural Language :: English',
         'Operating System :: OS Independent',
     ],
-    packages=setuptools.find_packages(include=['automodel']),
+    packages=setuptools.find_packages(include=['nemo_automodel', 'nemo_automodel.*']),
     python_requires='>=3.10',
     install_requires=install_requires,
     # Add in any packaged data.
