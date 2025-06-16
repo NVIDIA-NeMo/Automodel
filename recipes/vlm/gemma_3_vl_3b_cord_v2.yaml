@@ -32,13 +32,13 @@ rng:
 model:
   _target_: nemo_automodel.transformers.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: google/gemma-3-4b-it
-  pretrained_model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
-  
-processor:
-  _target_: transformers.AutoProcessor.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
-  min_pixels: 200704  # 256*28*28
-  max_pixels: 1003520  # 1280*28*28
+# pretrained_model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
+
+# processor:
+#   _target_: transformers.AutoProcessor.from_pretrained
+#   pretrained_model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
+#   min_pixels: 200704  # 256*28*28
+#   max_pixels: 1003520  # 1280*28*28
 
 distributed:
   _target_: nemo_automodel.distributed.fsdp2.FSDP2Manager
@@ -50,14 +50,26 @@ distributed:
 loss_fn: nemo_automodel.loss.masked_ce.masked_cross_entropy
 
 dataset:
-  _target_: nemo_automodel.datasets.vlm.datasets.make_rdr_dataset
-  path_or_dataset: quintend/rdr-items
+  _target_: nemo_automodel.datasets.vlm.datasets.make_cord_v2_dataset
+  path_or_dataset: naver-clova-ix/cord-v2
   split: train
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  num_workers: 0
+  batch_size: 1
+  num_workers: 1
   pin_memory: true
+  persistent_workers: true
+
+validation_dataset:
+  _target_: nemo_automodel.datasets.vlm.datasets.make_cord_v2_dataset
+  path_or_dataset: naver-clova-ix/cord-v2
+  split: validation
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.datasets.utils.default_collater
+  batch_size: 1
   
 optimizer:
   _target_: torch.optim.AdamW
@@ -69,7 +81,7 @@ freeze_config:
   freeze_embeddings: true
   freeze_vision_tower: true
   freeze_language_model: false
-
+  
 # Uncomment and configure for W&B logging
 # logger:
 #   wandb_project: nemo_automodel_vlm

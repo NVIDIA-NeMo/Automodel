@@ -34,6 +34,7 @@ from nemo_automodel.utils.dist_utils import (
 from nemo_automodel.utils.model_utils import apply_parameter_freezing
 from nemo_automodel.loggers.log_utils import setup_logging
 from transformers import AutoProcessor
+from nemo_automodel.datasets.vlm.collate_fns import COLLATE_FNS
 
 import logging
 
@@ -118,7 +119,7 @@ def build_loss_fn(device, cfg_loss):
 
 
 def build_dataloader(
-    cfg_ds, cfg_dl, cfg_model, distributed_sampler_kwargs
+    cfg_ds, cfg_dl, cfg_model, cfg_processor, distributed_sampler_kwargs
 ) -> DataLoader:
     """
     Build a distributed dataloader.
@@ -126,36 +127,22 @@ def build_dataloader(
     Args:
         cfg_ds: Dataset configuration.
         cfg_dl: DataLoader configuration.
+        cfg_model: Model configuration.
+        cfg_processor: Processor configuration.
         distributed_sampler_kwargs: Additional arguments for the DistributedSampler.
 
     Returns:
         The instantiated DataLoader.
     """
     if hasattr(cfg_ds, "_target_") and "vlm" in cfg_ds._target_:
-        processor = AutoProcessor.from_pretrained(
-            cfg_model.pretrained_model_name_or_path
-        )
-
-        # For VLM datasets, instantiate with processor and get HFDatasetBuilder
-        hf_dataset_builder = cfg_ds.instantiate(
-            path_or_dataset=cfg_ds.path_or_dataset, processor=processor
-        )
-
-        split = getattr(cfg_ds, "split", None)
-
-        if split is not None:
-            if split == "train":
-                ds = hf_dataset_builder.train
-            elif split == "validation":
-                ds = hf_dataset_builder.val
-            else:
-                raise ValueError(
-                    f"split (train or validation) is required for VLM datasets, but got {split}"
-                )
+        if cfg_processor is not None:
+            processor = cfg_processor.instantiate()
         else:
-            raise ValueError(
-                f"split (train or validation) is required for VLM datasets, but got {split}"
+            processor = AutoProcessor.from_pretrained(
+                cfg_model.pretrained_model_name_or_path
             )
+
+        ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
 
         sampler = torch.utils.data.distributed.DistributedSampler(
             ds,
@@ -163,9 +150,15 @@ def build_dataloader(
             rank=distributed_sampler_kwargs.get("rank", 0),
             shuffle=distributed_sampler_kwargs.get("shuffle", False),
         )
-    # TODO: HFDatasetBuilder has DLbuilder but is not stateful, didn't use it
+
+        # Get the appropriate collate function
+        processor_type = type(processor).__name__
+        if processor_type not in COLLATE_FNS:
+            raise ValueError(f"Processor type {processor_type} not supported. Supported types: {list(COLLATE_FNS.keys())}")
+        collate_fn = lambda examples: COLLATE_FNS[processor_type](examples, processor)
+
     return cfg_dl.instantiate(
-        dataset=ds, sampler=sampler, collate_fn=hf_dataset_builder.collate_fn
+        dataset=ds, sampler=sampler, collate_fn=collate_fn
     )
 
 
@@ -293,6 +286,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.cfg.dataset,
             self.cfg.dataloader,
             self.cfg.model,
+            self.cfg.get("processor", None),
             distributed_sampler_kwargs,
         )
 
@@ -303,6 +297,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 self.cfg.validation_dataset,
                 self.cfg.validation_dataloader,
                 self.cfg.model,
+                self.cfg.get("processor", None),
                 distributed_sampler_kwargs,
             )
 
