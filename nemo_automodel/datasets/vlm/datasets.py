@@ -16,13 +16,9 @@ from nemo_automodel.datasets.vlm.utils import json2token
 import json
 import random
 from datasets import load_dataset
-from PIL import Image
-import io
 
 
-def make_rdr_dataset(
-    path_or_dataset="quintend/rdr-items", split="train", **kwargs
-):
+def make_rdr_dataset(path_or_dataset="quintend/rdr-items", split="train", **kwargs):
     """
     Load and preprocess the RDR dataset for image-to-text fine-tuning.
 
@@ -41,21 +37,22 @@ def make_rdr_dataset(
         return {
             "conversation": [
                 {
-                    "role": "user", 
+                    "role": "user",
                     "content": [
                         {"type": "image", "image": example["image"]},
-                        {"type": "text", "text": "Describe this image."}
+                        {"type": "text", "text": "Describe this image."},
                     ],
                 },
                 {
                     "role": "assistant",
-                    "content": [{"type": "text", "text": example["text"]}]
-                }
+                    "content": [{"type": "text", "text": example["text"]}],
+                },
             ]
         }
-    
+
     return [format(example) for example in dataset]
-    #return dataset.map(format, batched=False)
+    # return dataset.map(format, batched=False)
+
 
 def make_cord_v2_dataset(
     path_or_dataset="naver-clova-ix/cord-v2", split="train", **kwargs
@@ -81,23 +78,19 @@ def make_cord_v2_dataset(
         text = random.choice(
             [json2token(gt_json, sort_json_key=True) for gt_json in gt_jsons]
         )
-            
+
         return {
             "conversation": [
                 {
-                    "role": "user", 
+                    "role": "user",
                     "content": [
                         {"type": "image", "image": example["image"]},
-                        {"type": "text", "text": "Describe this image."}
+                        {"type": "text", "text": "Describe this image."},
                     ],
                 },
-                {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": text}]
-                }
+                {"role": "assistant", "content": [{"type": "text", "text": text}]},
             ]
         }
 
-    
     return [format(example) for example in dataset]
-    #return dataset.map(format, batched=False, num_proc=8,remove_columns=["ground_truth"])
+    # return dataset.map(format, batched=False, num_proc=8,remove_columns=["ground_truth"])
