@@ -11,17 +11,11 @@ def qwen2_5_collate_fn(examples: list, processor) -> Dict[str, torch.Tensor]:
     texts = [processor.apply_chat_template(example["conversation"], tokenize=False) for example in examples]
     image_inputs = [process_vision_info(example["conversation"])[0] for example in examples]
     
-    # Get processor parameters from config if they exist
-    min_pixels = getattr(processor, "min_pixels", None)
-    max_pixels = getattr(processor, "max_pixels", None)
-    
     batch = processor(
         text=texts, 
         images=image_inputs, 
         padding=True, 
         return_tensors="pt",
-        min_pixels=min_pixels,
-        max_pixels=max_pixels
     )
 
     labels = batch["input_ids"].clone()[:, 1:]

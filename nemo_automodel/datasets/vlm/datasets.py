@@ -29,8 +29,6 @@ def make_rdr_dataset(
     Args:
         path_or_dataset (str): Path or identifier for the RDR dataset.
         split (str): Dataset split to load.
-        limit_dataset_samples (int, optional): Limit number of samples.
-        instruction (str): Instruction text for prompting.
         **kwargs: Additional arguments.
 
     Returns:
