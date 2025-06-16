@@ -364,6 +364,10 @@ def lora_db_kernel(a_ptr, b_ptr, c_ptr,
                     BLOCK_SIZE_N: tl.constexpr,
                     GROUP_SIZE_M: tl.constexpr
                     ):
+    """
+    Kernel for computing the matmul AXT = A x X^T
+    A has shape (M, K), X has shape (N, K).
+    """
 
     pid_m, pid_n = get_pid_coords(M, N,
                                 BLOCK_SIZE_M,

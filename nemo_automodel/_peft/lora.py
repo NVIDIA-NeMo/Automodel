@@ -293,6 +293,7 @@ def apply_lora_to_linear_modules(
                 dropout_position=dropout_position,
                 lora_A_init_method=lora_A_init,
                 lora_dtype=lora_dtype,
+                use_triton=use_triton
            )
     return num_modules_matched
 
