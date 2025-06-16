@@ -18,17 +18,20 @@ try:
 except ImportError:
     from nemo_automodel.distributed.nvfsdp.nvfsdp import nvFSDP
 
+import torch.distributed as dist
 from nemo_automodel.config.cli import parse_args_and_load_config
 from nemo_automodel.distributed.init_utils import initialize_distributed
 from nemo_automodel.distributed.parallelizer import create_context_parallel_ctx, get_train_context
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.step_scheduler import StepScheduler
+from nemo_automodel.datasets.llm.packed_sequence import PackedSequence
 from nemo_automodel.utils.dist_utils import reduce_loss, get_sync_ctx, rescale_gradients, clip_gradients
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 
 from transformers import AutoTokenizer
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from nemo_automodel.loggers.log_utils import setup_logging
+from nemo_automodel.training.rng import StatefulRNG
 
 import logging
 logger = logging.getLogger(__name__)
@@ -37,7 +40,7 @@ logger = logging.getLogger(__name__)
 #  Stateless helper functions
 # ---------------------------
 
-def build_model(device, cfg_model, cfg_peft, model_wrapper) -> nn.Module:
+def build_model(device, cfg_model, use_hf_fa2, cfg_peft, model_wrapper, seed) -> nn.Module:
     """
     Build and initialize a model.
 
@@ -45,27 +48,38 @@ def build_model(device, cfg_model, cfg_peft, model_wrapper) -> nn.Module:
         device: The target device.
         model_wrapper: Optional parallelism wrapper.
         cfg_model: Configuration for model instantiation.
+        use_hf_fa2: Whether to use HF's flash_attention_2. This takes precedence over Pytorch's sdpa_methods for attn.
+        cfg_peft: Configuration for PEFT.
+        model_wrapper: Optional parallelism wrapper.
+        seed: Random seed.
 
     Returns:
         The instantiated model on the specified device.
     """
-    model = cfg_model.instantiate()
-    for m in model.modules():
-        if isinstance(m, nn.Embedding):
-            m.weight.requires_grad_(False)
-    # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
-    if cfg_peft is not None:
-        opts = cfg_peft.to_dict()
-        peft_fn = opts.pop('peft_fn')
-        peft_fn(model, **opts)
+    with StatefulRNG(seed=seed, ranked=True):
+        kwargs = {}
+        if use_hf_fa2:
+            kwargs['attn_implementation'] = "flash_attention_2"
+            logger.warning(
+                "Packed sequence is supported only with Flash Attention. "
+                "Setting model's attn_implementation to flash_attention_2")
+        model = cfg_model.instantiate(**kwargs)
+        for m in model.modules():
+            if isinstance(m, nn.Embedding):
+                m.weight.requires_grad_(False)
+        # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
+        if cfg_peft is not None:
+            opts = cfg_peft.to_dict()
+            peft_fn = opts.pop('peft_fn')
+            peft_fn(model, **opts)
 
-    if callable(getattr(model_wrapper, 'parallelize', None)):
-        model = model_wrapper.parallelize(model)
+        if callable(getattr(model_wrapper, 'parallelize', None)):
+            model = model_wrapper.parallelize(model)
 
-        # FSDP2 and nvFSDP should already be on the correct device
-        return model
-    else:
-        return model.to(device)
+            # FSDP2 and nvFSDP should already be on the correct device
+            return model
+        else:
+            return model.to(device)
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id):
@@ -74,7 +88,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id):
     """
     from transformers.utils import TRANSFORMERS_CACHE
 
-    ckpt_kwargs = dict(  
+    ckpt_kwargs = dict(
         enabled=False,
         checkpoint_dir="checkpoints/",
         model_save_format="safetensors",
@@ -123,34 +137,54 @@ def build_loss_fn(device, cfg_loss):
         return cfg_loss.instantiate().to(device)
 
 
-def build_dataloader(cfg_ds, cfg_dl, cfg_model, distributed_sampler_kwargs, seed) -> DataLoader:
+def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_ps, device_mesh, seed) -> DataLoader:
     """
     Build a DataLoader for the dataset.
 
     Args:
         cfg_ds: Dataset configuration.
         cfg_dl: DataLoader configuration.
+        cfg_ps: Packed sequence configuration
         distributed_sampler_kwargs: Additional arguments for the DistributedSampler.
 
     Returns:
         The instantiated DataLoader.
     """
+    dist_sampler_kwargs = {
+        "shuffle": cfg_dl.get("shuffle", True),
+    }
+    if not device_mesh is None:
+        dist_sampler_kwargs = {
+            "num_replicas": device_mesh["data_parallel"].size(),
+            "rank": device_mesh["data_parallel"].get_local_rank(),
+        }
     if not 'tokenizer' in cfg_ds:
         tokenizer = AutoTokenizer.from_pretrained(cfg_model.pretrained_model_name_or_path)
     elif not '_target_' in cfg_ds.tokenizer:
         tokenizer = AutoTokenizer.from_pretrained(**cfg_ds.tokenizer.to_dict())
     else:
         tokenizer = cfg_ds.tokenizer.instantiate()
-    ds = cfg_ds.instantiate(tokenizer=tokenizer)
-    sampler = StatefulDistributedSampler(
-        ds,
-        num_replicas=distributed_sampler_kwargs.get("num_replicas", 1),
-        rank=distributed_sampler_kwargs.get("rank", 0),
-        shuffle=distributed_sampler_kwargs.get("shuffle", False),
-        seed=seed,
-        drop_last=True,
-    )
-    return cfg_dl.instantiate(dataset=ds, sampler=sampler)
+
+    with StatefulRNG(seed=seed, ranked=True):
+        ds = cfg_ds.instantiate(tokenizer=tokenizer)
+        # Apply packing if configured
+        if cfg_ps is not None and getattr(cfg_ps, 'packed_sequence_size', 0) > 0:
+            logger.info(f"Packing dataset with size: {cfg_ps.packed_sequence_size}")
+            ds = PackedSequence(
+                ds,
+                split=cfg_ds.split,  # Assumes split is defined in dataset config
+                packed_sequence_size=cfg_ps.packed_sequence_size,
+                split_across_pack=getattr(cfg_ps, 'split_across_pack', False),
+                max_packs=getattr(cfg_ps, 'max_packs', None)
+            ).pack()
+
+        sampler = StatefulDistributedSampler(
+            ds,
+            seed=seed,
+            drop_last=True,
+            **dist_sampler_kwargs,
+        )
+        return cfg_dl.instantiate(dataset=ds, sampler=sampler)
 
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> 'DistInfo':  # noqa: F821
@@ -189,6 +223,20 @@ def build_step_scheduler(cfg, dataloader):
         default_kwargs |= cfg.to_dict()
     return StepScheduler(**default_kwargs)
 
+def build_wandb(cfg):
+    """ Instantiates wandb and returns the instance.
+    If no name is given, it will use the model name
+    """
+    assert cfg.get('wandb', None) is not None
+    kwargs = cfg.wandb.to_dict()
+    if kwargs.get('name', "") == "":
+        kwargs["name"] = '_'.join(cfg.get("model.pretrained_model_name_or_path").split('/')[-2:])
+    run = wandb.init(
+        **kwargs,
+        config=cfg,
+        settings=Settings(silent=True),
+    )
+    return run
 
 # ---------------------------------------------------------------------------
 #  Trainer class – orchestration only
@@ -225,37 +273,33 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         self.device_mesh = None
         self.model_wrapper = None
-        distributed_sampler_kwargs = {}
         if "distributed" in self.cfg:
             self.model_wrapper = self.cfg.distributed.instantiate(
                 world_size=self.dist_env.world_size
             )
-            distributed_sampler_kwargs = {
-                "num_replicas": self.model_wrapper.device_mesh["data_parallel"].size(),
-                "rank": self.model_wrapper.device_mesh["data_parallel"].get_local_rank(),
-                "shuffle": self.cfg.dataloader.get("shuffle", True),
-            }
-            if "shuffle" in self.cfg.dataloader:
-                del self.cfg.dataloader.shuffle
-            if hasattr(self.model_wrapper, 'device_mesh'):
-                self.device_mesh = self.model_wrapper.device_mesh
+            self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
 
-        torch.manual_seed(self.cfg.get("seed", 42) + self.dist_env.rank)
-
-        if self.dist_env.is_main and hasattr(self.cfg, 'logger'):
+        if self.dist_env.is_main and hasattr(self.cfg, 'wandb'):
             suppress_wandb_log_messages()
-            run = wandb.init(
-                project=self.cfg.logger.get("wandb_project", "default_project"),
-                entity=self.cfg.logger.get("wandb_entity"),
-                name=self.cfg.logger.get("wandb_exp_name"),
-                dir=self.cfg.logger.get("wandb_save_dir"),
-                config=self.cfg,
-                settings=Settings(silent=True),
-            )
+            run = build_wandb(self.cfg)
             logging.info("🚀 View run at {}".format(run.url))
 
+        use_hf_fa2 = False
+        # Check if packed_sequence_size > 0 and use HF's flash_attention_2 for attn implementation.
+        if self.cfg.packed_sequence is not None and self.cfg.packed_sequence.packed_sequence_size > 0:
+            # There is a bug with attn_mask computation in packed sequences and is not enabled currently.
+            # Using HF's attention impl with FA2 does not require attn_mask and the code path computes attn_mask
+            # internally based on pos_ids. Using PyTorch’s SDPA for Flash Attention requires attn_mask to be computed
+            # for packed sequences hence using HF's flash_attention_2 for attn implementation is recommended here.
+            use_hf_fa2 = True
+
         # Build components
-        self.model = build_model(self.dist_env.device, self.cfg.model, self.cfg.get('peft', None), self.model_wrapper)
+        self.model = build_model(
+            self.dist_env.device, self.cfg.model, use_hf_fa2,
+            self.cfg.get('peft', None),
+            self.model_wrapper,
+            seed=self.cfg.get("seed", 42),
+        )
         self.optimizer = build_optimizer(
             self.cfg.optimizer,
             self.model,
@@ -266,19 +310,23 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.cfg.dataset,
             self.cfg.dataloader,
             self.cfg.model,
-            distributed_sampler_kwargs,
-            self.cfg.get("rng.seed", 42) + self.dist_env.rank,
+            self.cfg.packed_sequence,
+            device_mesh=self.device_mesh,
+            seed=self.cfg.get("seed", 42),
         )
 
         # Build validation dataloader if the config provides it
         self.val_dataloader = None
         if 'validation_dataset' in self.cfg:
+            # For validation, do not use packed sequences for fair comparison with baseline
+            val_packed_sequence_config = None
             self.val_dataloader = build_dataloader(
                 self.cfg.validation_dataset,
                 self.cfg.validation_dataloader,
                 self.cfg.model,
-                distributed_sampler_kwargs,
-                self.cfg.get("rng.seed", 42) + self.dist_env.rank,
+                val_packed_sequence_config,  # Use unpacked config for validation
+                device_mesh=self.device_mesh,
+                seed=self.cfg.get("seed", 42),
             )
 
         # Initialize metrics required for calculating loss
@@ -287,7 +335,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Scheduler
         self.step_scheduler = build_step_scheduler(self.cfg.get('step_scheduler', None), self.dataloader)
-        
+
         # Build checkpointing config
         restore_from = self.cfg.get('checkpoint.restore_from', None)
         self.checkpoint_config = build_checkpoint_config(
@@ -295,6 +343,9 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.cfg.get('model.cache_dir', None),
             self.cfg.model.pretrained_model_name_or_path,
         )
+
+        # Set up the stateful random number generator
+        self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
         # Optionally resume
         self.load_checkpoint(restore_from)
@@ -462,76 +513,78 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
     @torch.no_grad()
     def _run_validation_epoch(self) -> float:
         """Run one pass over `self.val_dataloader` and return average loss per token."""
-        self.model.eval()
+        with StatefulRNG(seed=1, ranked=True):
+            self.model.eval()
 
-        total_loss = 0.0
-        total_tokens = 0
+            total_loss = 0.0
+            total_tokens = 0
 
-        for batch in self.val_dataloader:
-            batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
-            labels = batch.pop("labels")
-            loss_mask = batch.pop("loss_mask", None)
-            if loss_mask is None:
-                loss_mask = (labels.detach() != -100).to(torch.int)
+            for batch in self.val_dataloader:
+                batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
+                labels = batch.pop("labels")
+                loss_mask = batch.pop("loss_mask", None)
+                if loss_mask is None:
+                    loss_mask = (labels.detach() != -100).to(torch.int)
 
-            if (
-                'position_ids' not in batch and
-                (
-                    self.device_mesh["context_parallel"].size() > 1 or
-                    self.device_mesh["tensor_parallel"].size() > 1
-                )
-            ):
-                batch["position_ids"] = torch.arange(0, batch['input_ids'].shape[1]).unsqueeze(0).to(self.model.device)
+                if (
+                    'position_ids' not in batch and
+                    (
+                        self.device_mesh["context_parallel"].size() > 1 or
+                        self.device_mesh["tensor_parallel"].size() > 1
+                    )
+                ):
+                    batch["position_ids"] = torch.arange(
+                        0, batch['input_ids'].shape[1]).unsqueeze(0).to(self.model.device)
 
-            if self.device_mesh["context_parallel"].size() > 1:
+                if self.device_mesh["context_parallel"].size() > 1:
 
-                input_ids = batch["input_ids"].to(self.model.device)
-                position_ids = batch["position_ids"].to(self.model.device)
+                    input_ids = batch["input_ids"].to(self.model.device)
+                    position_ids = batch["position_ids"].to(self.model.device)
 
-                if loss_mask is not None:
-                    cp_buffers = [input_ids, labels, position_ids, loss_mask]
-                    cp_seq_dims = [1, 1, 1, 1]
-                    cp_no_restore_buffers = {input_ids, labels, loss_mask}
+                    if loss_mask is not None:
+                        cp_buffers = [input_ids, labels, position_ids, loss_mask]
+                        cp_seq_dims = [1, 1, 1, 1]
+                        cp_no_restore_buffers = {input_ids, labels, loss_mask}
+                    else:
+                        cp_buffers = [input_ids, labels, position_ids]
+                        cp_seq_dims = [1, 1, 1]
+                        cp_no_restore_buffers = {input_ids, labels}
+
+                    context_parallel_ctx = create_context_parallel_ctx(
+                        cp_mesh=self.model_wrapper.device_mesh["context_parallel"],
+                        cp_buffers=cp_buffers,
+                        cp_seq_dims=cp_seq_dims,
+                        cp_no_restore_buffers=cp_no_restore_buffers,
+                        cp_rotate_method="allgather",  # TODO add "alltoall" option
+                    )
+                    train_context = get_train_context(
+                        False,
+                        False,
+                    )
+                    with train_context(context_parallel_ctx):
+                        out  = self.model(**batch)
+                        # Prepare for loss calculation
+                        logits = out.logits.float()
+                        n_cls = logits.shape[-1]
+                        logits = logits.view(-1, n_cls)
+                        labels = labels.view(-1)
+                        assert logits.shape[-2] == labels.shape[-1], "Expected logits & labels to have the same length"
+                        local_loss = self.loss_fn(logits, labels, loss_mask)
+
+                    # In the case where all labels are masked, the loss should be 0.
+                    if loss_mask is not None and loss_mask.bool().sum() == 0:
+                        local_loss.detach().copy_(torch.zeros_like(local_loss))
                 else:
-                    cp_buffers = [input_ids, labels, position_ids]
-                    cp_seq_dims = [1, 1, 1]
-                    cp_no_restore_buffers = {input_ids, labels}
+                    out = self.model(**batch)
+                    local_loss = self.loss_fn(
+                        out.logits.view(-1, out.logits.size(-1)),
+                        labels.view(-1),
+                        mask=loss_mask,
+                        reduction="sum"
+                    )
 
-                context_parallel_ctx = create_context_parallel_ctx(
-                    cp_mesh=self.model_wrapper.device_mesh["context_parallel"],
-                    cp_buffers=cp_buffers,
-                    cp_seq_dims=cp_seq_dims,
-                    cp_no_restore_buffers=cp_no_restore_buffers,
-                    cp_rotate_method="allgather",  # TODO add "alltoall" option
-                )
-                train_context = get_train_context(
-                    False,
-                    False,
-                )
-                with train_context(context_parallel_ctx):
-                    out  = self.model(**batch)
-                    # Prepare for loss calculation
-                    logits = out.logits.float()
-                    n_cls = logits.shape[-1]
-                    logits = logits.view(-1, n_cls)
-                    labels = labels.view(-1)
-                    assert logits.shape[-2] == labels.shape[-1], "Expected logits & labels to have the same length"
-                    local_loss = self.loss_fn(logits, labels, loss_mask)
-
-                # In the case where all labels are masked, the loss should be 0.
-                if loss_mask is not None and loss_mask.bool().sum() == 0:
-                    local_loss.detach().copy_(torch.zeros_like(local_loss))
-            else:
-                out = self.model(**batch)
-                local_loss = self.loss_fn(
-                    out.logits.view(-1, out.logits.size(-1)),
-                    labels.view(-1),
-                    mask=loss_mask,
-                    reduction="sum"
-                )
-
-            total_loss += local_loss.item()
-            total_tokens += loss_mask.sum().item()
+                total_loss += local_loss.item()
+                total_tokens += loss_mask.sum().item()
 
         # Aggregate across ranks if distributed is initialized
         if dist.is_initialized():
