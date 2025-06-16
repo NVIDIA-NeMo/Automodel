@@ -353,7 +353,6 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         and update model parameters when necessary. Also prints loss every gradient step.
         """
         self.model.train()
-
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
             for batch_idx, batch in enumerate(self.step_scheduler):
@@ -388,7 +387,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # If 'position_ids' does not exist in batch already then override it. batch in case of Packed sequence
         # contains 'position_ids' and we don't want to override it.
         if (
-            'position_ids' not in batch and self.device_mesh is not None and False and
+            'position_ids' not in batch and self.device_mesh is not None and
             (
                 self.device_mesh["context_parallel"].size() > 1 or
                 self.device_mesh["tensor_parallel"].size() > 1
