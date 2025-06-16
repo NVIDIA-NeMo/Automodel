@@ -34,6 +34,8 @@ on:
         required: true
       AZURE_SUBSCRIPTION_ID:
         required: true
+      PAT:
+        required: true
 
 jobs:
   pre-flight:
@@ -67,7 +69,7 @@ jobs:
           echo "EOF" >> $GITHUB_OUTPUT
 
   build:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.29.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.37.0
     needs: [pre-flight]
     with:
       image-name: ${{ inputs.image-name }}
@@ -81,3 +83,4 @@ jobs:
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      GH_TOKEN: ${{ secrets.PAT }}

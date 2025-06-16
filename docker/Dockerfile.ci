@@ -45,7 +45,11 @@ COPY README.md /workspace/README.md
 COPY uv.lock /workspace/uv.lock
 COPY pyproject.toml /workspace/pyproject.toml
 WORKDIR /workspace
-RUN bash -ex <<"EOF"
+RUN --mount=type=secret,id=GH_TOKEN bash -ex <<"EOF"
+    PAT=$(cat /run/secrets/GH_TOKEN)
+    echo -e "machine github.com\n  login token\n  password $PAT" > ~/.netrc
+    chmod 600 ~/.netrc
     uv venv ${UV_PROJECT_ENVIRONMENT}
     uv sync
+    rm ~/.netrc
 EOF
