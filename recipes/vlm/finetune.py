@@ -457,17 +457,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         )
                         else "data_parallel"
                     )
-                ].get_group(),
-                self.device_mesh[
-                    (
-                        "dp_cp"
-                        if "dp_cp"
-                        in _mesh_resources.root_to_flatten_mapping.get(
-                            self.device_mesh, {}
-                        )
-                        else "data_parallel"
-                    )
-                ].size(),
+                ].get_group()
             )
 
             # Clip gradients **after** any rescaling.
