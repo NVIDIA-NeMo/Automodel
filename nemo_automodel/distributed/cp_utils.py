@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-# ---------------------------------------------------------------------------
-#  CP utilities
-# ---------------------------------------------------------------------------
+import torch
+import contextlib
+from typing import Dict, Generator, List, Optional, Set, Union
 
 def _build_position_ids(batch, device):
     """Add position_ids to the batch only if they are missing."""
@@ -64,6 +63,36 @@ def get_train_context(enable_loss_parallel: bool, enable_compiled_autograd: bool
 
     return context
 
+
+# based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/utils.py#L113
+def create_context_parallel_ctx(
+    cp_mesh: DeviceMesh,
+    cp_buffers: List[torch.Tensor],
+    cp_seq_dims: List[int],
+    cp_no_restore_buffers: Set[torch.Tensor],
+    cp_rotate_method: str,
+):
+    """
+    Create a context parallel context.
+
+    Args:
+        cp_mesh (DeviceMesh): The device mesh for context parallel.
+        cp_buffers (List[torch.Tensor]): The buffers for context parallel.
+        cp_seq_dims (List[int]): The sequence dimensions for context parallel.
+        cp_no_restore_buffers (Set[torch.Tensor]): The no restore buffers for context parallel.
+        cp_rotate_method (str): The rotation method for context parallel, such as "allgather" or "addtoall".
+    """
+    from torch.distributed.tensor.experimental import context_parallel
+
+    # TODO: uncomment this when torch.distributed.tensor.experimental._attention.set_rotate_method is available
+    # from torch.distributed.tensor.experimental._attention import set_rotate_method
+    # set_rotate_method(cp_rotate_method)
+    return context_parallel(
+        cp_mesh,
+        buffers=cp_buffers,
+        buffer_seq_dims=cp_seq_dims,
+        no_restore_buffers=cp_no_restore_buffers,
+    )
 
 def make_cp_batch_and_ctx(device_mesh, batch, enable_loss_parallel: bool = False, enable_compiled_autograd: bool = False):
     from contextlib import nullcontext
