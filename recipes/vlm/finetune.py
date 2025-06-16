@@ -137,7 +137,7 @@ def build_dataloader(
         "shuffle": cfg_dl.get("shuffle", True),
     }
     if not device_mesh is None:
-        dist_sampler_kwargs = {
+        dist_sampler_kwargs |= {
             "num_replicas": device_mesh.get("data_parallel").size(),
             "rank": device_mesh.get["data_parallel"].get_local_rank(),
         }
@@ -457,17 +457,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         )
                         else "data_parallel"
                     )
-                ].get_group(),
-                self.device_mesh[
-                    (
-                        "dp_cp"
-                        if "dp_cp"
-                        in _mesh_resources.root_to_flatten_mapping.get(
-                            self.device_mesh, {}
-                        )
-                        else "data_parallel"
-                    )
-                ].size(),
+                ].get_group() if self.device_mesh is not None else None,
             )
 
             # Clip gradients **after** any rescaling.

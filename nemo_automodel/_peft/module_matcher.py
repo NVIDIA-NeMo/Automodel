@@ -60,6 +60,10 @@ class ModuleMatcher:
 
     def __post_init__(self):
         """ input validation """
+        if isinstance(self.target_modules, str):
+            self.target_modules = [self.target_modules]
+        if isinstance(self.exclude_modules, str):
+            self.exclude_modules = [self.exclude_modules]
         if self.match_all_linear is False and (
             not isinstance(self.target_modules, list) or len(self.target_modules) == 0
         ) and (
