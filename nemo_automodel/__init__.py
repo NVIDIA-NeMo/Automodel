@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
-from .__version__ import __version__
+from .package_info import __version__, __package_name__
 
 __all__ = [
     "_peft",
@@ -26,6 +26,7 @@ __all__ = [
     "_transformers",
     "utils",
     "__version__",
+    "__package_name__",
 ]
 
 # ==== Promote NeMoAutoModelForCausalLM into the top level ====
