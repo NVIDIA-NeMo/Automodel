@@ -12,16 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ast
 import yaml
-import importlib
-from functools import reduce
-import os
 import importlib
 import importlib.util
 import os
 import sys
-from functools import reduce
-import ast
 
 def translate_value(v):
     """
@@ -59,6 +55,62 @@ def translate_value(v):
             # fallback to raw string
             return v
 
+def _resolve_target(dotted_path: str):
+    """
+    Resolve a dotted path to a Python object.
+    1) Find the longest importable module prefix.
+    2) getattr() the rest.
+    3) If that fails, fall back to scanning sys.path for .py or package dirs.
+    """
+    parts = dotted_path.split(".")
+
+    # 1) Try longest‐prefix module import + getattr the rest
+    for i in range(len(parts), 0, -1):
+        module_name = ".".join(parts[:i])
+        remainder = parts[i:]
+        try:
+            module = importlib.import_module(module_name)
+        except ModuleNotFoundError:
+            continue
+        # we got a module; now walk its attributes
+        try:
+            obj = module
+            for name in remainder:
+                obj = getattr(obj, name)
+            return obj
+        except AttributeError:
+            # we imported module_name but one of the remainder attrs failed
+            raise ImportError(
+                f"Module '{module_name}' loaded, "
+                f"but cannot resolve attribute '{'.'.join(remainder)}' in '{dotted_path}'"
+            )
+
+    # 2) Fallback: scan sys.path for a .py file or package dir matching parts[:-1]
+    for base in sys.path:
+        pkg_dir = os.path.join(base, *parts[:-1])
+        candidates = [
+            pkg_dir + ".py",
+            os.path.join(pkg_dir, "__init__.py"),
+        ]
+        for cand in candidates:
+            if not os.path.isfile(cand):
+                continue
+            module_name = "_dynamic_" + "_".join(parts[:-1])
+            spec = importlib.util.spec_from_file_location(module_name, cand)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = mod
+            spec.loader.exec_module(mod)
+            try:
+                return getattr(mod, parts[-1])
+            except AttributeError:
+                raise ImportError(
+                    f"Loaded '{cand}' as module but no attribute '{parts[-1]}'"
+                )
+
+    # 3) Give up
+    raise ImportError(f"Cannot resolve target: {dotted_path}")
+
+
 class ConfigNode:
     """
     A configuration node that wraps a dictionary (or parts of it) from a YAML file.
@@ -93,7 +145,7 @@ class ConfigNode:
         elif isinstance(v, list):
             return [self._wrap('', i) for i in v]
         elif k.endswith('_fn'):
-            return self._resolve_target(v)
+            return _resolve_target(v)
         else:
             return translate_value(v)
 
@@ -117,8 +169,7 @@ class ConfigNode:
         if not hasattr(self, "_target_"):
             raise AttributeError("No _target_ found to instantiate")
 
-        target = self._target_
-        func = self._resolve_target(target)
+        func = _resolve_target(self._target_)
 
         # Prepare kwargs from config
         config_kwargs = {}
@@ -153,51 +204,6 @@ class ConfigNode:
             return [self._instantiate_value(i) for i in v]
         else:
             return translate_value(v)
-
-    def _resolve_target(self, dotted_path):
-        """
-        Resolve a dotted path to a Python object.
-
-        This function first attempts a standard import and, if that fails, searches for a
-        local module by traversing sys.path.
-
-        Args:
-            dotted_path (str): A string representing the dotted path to the object.
-
-        Returns:
-            The Python object referenced by the dotted path.
-
-        Raises:
-            ImportError: If the target cannot be resolved.
-        """
-        parts = dotted_path.split(".")
-
-        # Try standard import first
-        # e.g.: torchdata.stateful_dataloader.StatefulDataLoader
-        # TODO(@akoumparouli): make this more robust
-        if len(parts) > 2:
-            try:
-                module = importlib.import_module('.'.join(parts[:-1]))
-                return getattr(module, parts[-1])
-            except (ModuleNotFoundError, AttributeError):
-                pass
-        try:
-            module = importlib.import_module(parts[0])
-            return reduce(getattr, parts[1:], module)
-        except (ModuleNotFoundError, AttributeError):
-            pass
-
-        # Try to resolve it as a local module by searching sys.path
-        for path in sys.path:
-            try_path = os.path.join(path, *parts[:-1]) + ".py"
-            if os.path.isfile(try_path):
-                module_name = "_dynamic_" + "_".join(parts[:-1])
-                spec = importlib.util.spec_from_file_location(module_name, try_path)
-                mod = importlib.util.module_from_spec(spec)
-                sys.modules[module_name] = mod
-                spec.loader.exec_module(mod)
-                return getattr(mod, parts[-1])
-        raise ImportError(f"Cannot resolve target: {dotted_path}. Searched paths for: {'.'.join(parts[:-1])}.py")
 
     def to_dict(self):
         """

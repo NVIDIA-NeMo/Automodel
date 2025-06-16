@@ -21,21 +21,31 @@ RUN apt-get update && apt-get install -y \
     git \
     libopenmpi-dev \
     vim \
+    curl \
     && rm -rf /var/lib/apt/lists/* && \
     python3 -m venv /opt/venv && \
     /opt/venv/bin/pip install --no-cache-dir -U pip setuptools
+
+# Install uv and python
+ARG UV_VERSION=0.7.2
+ENV PATH="/root/.local/bin:$PATH"
+RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
+ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
+ENV UV_LINK_MODE=copy
+
 
 # Set venv as default
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Install all
+COPY nemo_automodel/__init__.py /workspace/nemo_automodel/__init__.py
+COPY nemo_automodel/__version__.py /workspace/nemo_automodel/__version__.py
+COPY README.md /workspace/README.md
+COPY uv.lock /workspace/uv.lock
+COPY pyproject.toml /workspace/pyproject.toml
 WORKDIR /workspace
-RUN --mount=type=bind,source=setup.py,target=/workspace/setup.py \
-    --mount=type=bind,source=nemo_automodel/__init__.py,target=/workspace/nemo_automodel/__init__.py \
-    --mount=type=bind,source=nemo_automodel/package_info.py,target=/workspace/nemo_automodel/package_info.py \
-    --mount=type=bind,source=README.md,target=/workspace/README.md \
-    --mount=type=bind,source=requirements,target=/workspace/requirements \
-    pip install --no-cache-dir .
-
-# Test install
-RUN pip install coverage pytest
+RUN bash -ex <<"EOF"
+    uv venv ${UV_PROJECT_ENVIRONMENT}
+    uv sync
+EOF
