@@ -167,6 +167,8 @@ jobs:
         include:
           - script: L2_HF_Transformer_PEFT
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+          - script: L2_DCP_Checkpoint
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
     needs: [cicd-unit-tests]
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.script }}
