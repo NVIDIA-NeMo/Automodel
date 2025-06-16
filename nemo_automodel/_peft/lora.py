@@ -195,7 +195,7 @@ def patch_linear_module(
         (nn.Module): the monkey-patched (nn.Linear + LoRA) nn.Module
     """
 
-    assert isinstance(orig_linear, nn.Linear)
+    assert isinstance(orig_linear, nn.Linear), type(orig_linear)
     assert not hasattr(orig_linear, 'super_fwd'), orig_linear.super_fwd
 
     if isinstance(orig_linear, nn.Linear):
@@ -222,7 +222,7 @@ def apply_lora_to_linear_modules(
     model: nn.Module,
     target_modules = [],
     exclude_modules = [],
-    match_all_linear = True,
+    match_all_linear = False,
     dim: int = 8,
     alpha: int = 32,
     dropout: float = 0.0,
@@ -241,20 +241,15 @@ def apply_lora_to_linear_modules(
     for name, module in list(model.named_modules()):
         if matcher.match(module, name):
             num_modules_matched += 1
-            parent, attr = _parent_and_attr(model, name)
-            setattr(
-                parent,
-                attr,
-                LinearLoRA(
-                    module,
-                    dim=dim,
-                    alpha=alpha,
-                    dropout=dropout,
-                    dropout_position=dropout_position,
-                    lora_A_init_method=lora_A_init,
-                    lora_dtype=lora_dtype,
-                ),
-            )
+            patch_linear_module(
+                module,
+                dim=dim,
+                alpha=alpha,
+                dropout=dropout,
+                dropout_position=dropout_position,
+                lora_A_init_method=lora_A_init,
+                lora_dtype=lora_dtype,
+           )
     return num_modules_matched
 
 def _parent_and_attr(root: nn.Module, fqname: str):
