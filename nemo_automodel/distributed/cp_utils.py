@@ -14,7 +14,8 @@
 
 import torch
 import contextlib
-from typing import Dict, Generator, List, Optional, Set, Union
+from typing import List, Set
+from torch.distributed.device_mesh import DeviceMesh
 
 def _build_position_ids(batch, device):
     """Add position_ids to the batch only if they are missing."""
@@ -26,7 +27,7 @@ def _build_position_ids(batch, device):
         batch['position_ids'] = torch.arange(seq_len, device=device).unsqueeze(0)
     return batch
 
-# based on https://github.com/pytorch/torchtitan/blob/0b44d4c437c424b6bf719661c0eb4283dc4068bc/torchtitan/distributed/utils.py#L180
+# based on https://github.com/pytorch/torchtitan/blob/0b44d4c437c424b6bf719661c0eb4283dc4068bc/torchtitan/distributed/utils.py#L180  #
 def get_train_context(enable_loss_parallel: bool, enable_compiled_autograd: bool, cp_context=None):
     """
     Create a train context.
