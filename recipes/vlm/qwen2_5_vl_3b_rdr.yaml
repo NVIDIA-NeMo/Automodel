@@ -16,7 +16,7 @@
 
 step_scheduler:
   grad_acc_steps: 8
-  ckpt_every_steps: 500
+  ckpt_every_steps: 50
   val_every_steps: 50  # will run every x number of gradient steps
   num_epochs: 3
 
@@ -39,6 +39,11 @@ processor:
   pretrained_model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
   min_pixels: 200704  # 256*28*28
   max_pixels: 1003520  # 1280*28*28
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/
+  model_save_format: torch_save
 
 distributed:
   _target_: nemo_automodel.distributed.fsdp2.FSDP2Manager

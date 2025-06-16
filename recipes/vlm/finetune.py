@@ -36,6 +36,7 @@ from nemo_automodel.loggers.log_utils import setup_logging
 from transformers import AutoProcessor
 from nemo_automodel.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.training.rng import StatefulRNG
+from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 
 import logging
 
@@ -82,6 +83,24 @@ def build_model(device, cfg_model, cfg_freeze, cfg_peft, model_wrapper, seed) ->
         else:
             return model.to(device)
 
+def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id):
+    """
+    Build a checkpoint configuration.
+    """
+    from transformers.utils import TRANSFORMERS_CACHE
+
+    ckpt_kwargs = dict(
+        enabled=False,
+        checkpoint_dir="checkpoints/",
+        model_save_format="safetensors",
+        model_repo_id=model_repo_id,
+        model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
+    )
+    if cfg_ckpt is not None:
+        cfg_ckpt = cfg_ckpt.to_dict()
+        cfg_ckpt.pop('restore_from', None)
+        ckpt_kwargs |= cfg_ckpt
+    return CheckpointingConfig(**ckpt_kwargs)
 
 def build_optimizer(cfg_opt, model, tp_size) -> "Optimizer":  # noqa: F821
     """
@@ -313,12 +332,19 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.cfg.get("step_scheduler", None), self.dataloader
         )
 
+        # Build checkpointing config
+        restore_from = self.cfg.get('checkpoint.restore_from', None)
+        self.checkpoint_config = build_checkpoint_config(
+            self.cfg.get('checkpoint', None),
+            self.cfg.get('model.cache_dir', None),
+            self.cfg.model.pretrained_model_name_or_path,
+        )
+
         # Set up the stateful random number generator
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
         # Optionally resume
-        if (path := self.cfg.get("restore_from")) is not None:
-            raise NotImplemented("TODO resume from {}".format(path))
+        self.load_checkpoint(restore_from)
 
     # ------------------ main loop ------------------
     def run_train_validation_loop(self):
@@ -330,11 +356,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
         """
         self.model.train()
         for epoch in self.step_scheduler.epochs:
+            self.step_scheduler.set_epoch(epoch)
             for batch_idx, batch in enumerate(self.step_scheduler):
                 self._run_train_step(batch, self.step_scheduler.is_optim_step, 1.0)
-                if self.step_scheduler.is_ckpt_step and self.dist_env.is_main:
-                    #     self._save_checkpoint()
-                    pass
+                if self.step_scheduler.is_ckpt_step:
+                    self.save_checkpoint(epoch, self.step_scheduler.step)
 
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     self._run_validation_epoch()
