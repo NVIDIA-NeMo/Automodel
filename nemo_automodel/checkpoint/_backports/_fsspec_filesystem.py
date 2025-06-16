@@ -1,3 +1,4 @@
+# taken from https://github.com/pytorch/pytorch/blob/156b28e62a225214a5685088a848c5efe6a4b95e/torch/distributed/checkpoint/_fsspec_filesystem.py # pylint: disable=line-too-long
 # pylint: disable=missing-class-docstring, missing-function-docstring
 
 import io

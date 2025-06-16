@@ -1,3 +1,4 @@
+# taken from https://github.com/pytorch/pytorch/blob/c13e725edd8dd21406c629bf625f2d6c59ceedd1/torch/distributed/checkpoint/filesystem.py # pylint: disable=line-too-long
 # pylint: disable=missing-function-docstring, missing-class-docstring
 import collections
 import dataclasses

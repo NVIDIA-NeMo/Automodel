@@ -1,3 +1,5 @@
+# taken from https://github.com/pytorch/pytorch/blob/c13e725edd8dd21406c629bf625f2d6c59ceedd1/torch/distributed/checkpoint/planner_helpers.py # pylint: disable=line-too-long
+
 from torch.distributed.checkpoint.planner import SavePlan
 
 def _contains_usable_plan(delta_plans: list[SavePlan]) -> bool:
