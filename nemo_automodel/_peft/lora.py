@@ -235,8 +235,11 @@ def apply_lora_to_linear_modules(
 
     target_modules accepts wildcard fragments, e.g. ["q_proj", "k_proj", ".*fc.*"].
     """
-    matcher = ModuleMatcher(target_modules, exclude_modules, match_all_linear)
+    # Freeze base model parameters
+    for w in model.parameters():
+        w.requires_grad_(False)
 
+    matcher = ModuleMatcher(target_modules, exclude_modules, match_all_linear)
     num_modules_matched = 0
     for name, module in list(model.named_modules()):
         if matcher.match(module, name):
