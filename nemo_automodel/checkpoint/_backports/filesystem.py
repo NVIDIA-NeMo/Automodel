@@ -1,6 +1,4 @@
-# mypy: allow-untyped-defs
-# pylint: disable=missing-function-docstring
-# mypy: allow-untyped-defs
+# pylint: disable=missing-function-docstring, missing-class-docstring
 import collections
 import dataclasses
 import io
@@ -606,7 +604,8 @@ class _FileSystemWriter(StorageWriter):
             overwrite: Whether to allow overwriting existing checkpoints. Defaults to True.
             _extensions: Extensions to apply to output streams (EXPERIMENTAL)
 
-        N. B. If sync_files is disabled, there's no guarantee that the checkpoint will be consistent in the case of a failure.
+        N. B. If sync_files is disabled, there's no guarantee that the checkpoint will be consistent
+        in the case of a failure.
         """
         # Torch DCP's StorageWriter base-class defines no custom __init__, however due to
         # the complex monkey-patching we perform the ``super()`` resolution can fail when
@@ -957,12 +956,14 @@ class FileSystemWriter(_FileSystemWriter, BlockingAsyncStager):
             thread_count: Number of IO threads to use to write. Default to 1.
             per_thread_copy_ahead: How many bytes to copy from the GPU ahead of saving then. Default 10Mb.
             cache_staged_state_dict: Whether to cache the staged state_dict. This option decreases staging latency
-                at the cost of increases memory usage. Additionally, if this parameter is set to True, it's the expectation
-                that the stager is maintained and re-used for multiple dcp.async_save calls. Default to False.
+                at the cost of increases memory usage. Additionally, if this parameter is set to True, it's the
+                expectation that the stager is maintained and re-used for multiple dcp.async_save calls.
+                Default to False.
             overwrite: Whether to allow overwriting existing checkpoints. Defaults to True.
             _extensions: Extensions to apply to output streams (EXPERIMENTAL)
 
-        N. B. If sync_files is disabled, there's no guarantee that the checkpoint will be consistent in the case of a failure.
+        N. B. If sync_files is disabled, there's no guarantee that the checkpoint will be consistent in the
+        case of a failure.
         """
         _FileSystemWriter.__init__(
             self,

@@ -1,5 +1,4 @@
-# Mypy will not try inferring the types of any 3rd party libraries installed.
-# mypy: ignore-errors
+# pylint: disable=missing-class-docstring, missing-function-docstring
 
 import io
 import os
@@ -136,7 +135,8 @@ class FsspecWriter(FileSystemWriter):
             overwrite: Whether to allow overwriting existing checkpoints. Defaults to True.
             _extensions: Extensions to apply to output streams (EXPERIMENTAL)
 
-        N. B. If sync_files is disabled, there's no guarantee that the checkpoint will be consistent in the case of a failure.
+        N. B. If sync_files is disabled, there's no guarantee that the checkpoint will be consistent in the
+        case of a failure.
         """
         super().__init__(
             path,
