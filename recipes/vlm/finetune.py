@@ -177,14 +177,18 @@ def build_dataloader(
         sampler = torch.utils.data.distributed.DistributedSampler(
                 ds, **dist_sampler_kwargs,
             )
-        # Get the appropriate collate function
-        processor_type = type(processor).__name__
-        if processor_type not in COLLATE_FNS:
-            raise ValueError(
-                f"Processor type {processor_type} not supported. "
-                f"Supported types: {list(COLLATE_FNS.keys())}"
-            )
-        collate_fn = lambda examples: COLLATE_FNS[processor_type](examples, processor)
+        collate_cfg = cfg_dl.get("collate_fn", None)
+        if collate_cfg:
+            collate_fn = lambda examples: collate_cfg.instantiate(examples=examples, processor=processor)
+        else:
+            # Get the appropriate collate function
+            processor_type = type(processor).__name__
+            if processor_type not in COLLATE_FNS:
+                processor_type = "default"
+                logging.warning(
+                    f"You are using {processor_type} with default collate function."
+                )
+            collate_fn = lambda examples: COLLATE_FNS[processor_type](examples, processor)
 
         return cfg_dl.instantiate(
             dataset=ds, sampler=sampler, collate_fn=collate_fn

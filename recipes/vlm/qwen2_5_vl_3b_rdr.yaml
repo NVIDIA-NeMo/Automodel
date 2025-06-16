@@ -63,7 +63,10 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   num_workers: 0
   pin_memory: true
-  
+  # collate_fn:
+  #   _target_: nemo_automodel.datasets.vlm.collate_fns.qwen2_5_collate_fn
+
+    
 optimizer:
   _target_: torch.optim.AdamW
   lr: 1e-5

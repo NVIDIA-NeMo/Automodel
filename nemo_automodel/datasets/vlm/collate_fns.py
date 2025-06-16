@@ -8,7 +8,6 @@ def qwen2_5_collate_fn(examples: list, processor) -> Dict[str, torch.Tensor]:
     """Collate function for Qwen2.5 VL model."""
     skipped_tokens = extract_skipped_token_ids(processor)
 
-    # examples = preprocess_examples(examples)
     texts = [
         processor.apply_chat_template(example["conversation"], tokenize=False)
         for example in examples
@@ -32,11 +31,10 @@ def qwen2_5_collate_fn(examples: list, processor) -> Dict[str, torch.Tensor]:
     return batch
 
 
-def gemma3_collate_fn(examples: list, processor) -> Dict[str, torch.Tensor]:
-    """Collate function for Gemma3 model."""
+def default_collate_fn(examples: list, processor) -> Dict[str, torch.Tensor]:
+    """Default collate function for VLM models."""
     skipped_tokens = extract_skipped_token_ids(processor)
 
-    # examples = preprocess_examples(examples)
     batch = processor.apply_chat_template(
         [example["conversation"] for example in examples],
         tokenize=True,
@@ -53,9 +51,8 @@ def gemma3_collate_fn(examples: list, processor) -> Dict[str, torch.Tensor]:
 
     return batch
 
-
 # Mapping of processor types to their collate functions
 COLLATE_FNS = {
     "Qwen2_5_VLProcessor": qwen2_5_collate_fn,
-    "Gemma3Processor": gemma3_collate_fn,
+    "default": default_collate_fn,
 }
