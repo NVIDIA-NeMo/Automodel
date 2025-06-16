@@ -83,6 +83,7 @@ def build_model(device, cfg_model, cfg_freeze, cfg_peft, model_wrapper, seed) ->
         else:
             return model.to(device)
 
+
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id):
     """
     Build a checkpoint configuration.
@@ -98,9 +99,10 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id):
     )
     if cfg_ckpt is not None:
         cfg_ckpt = cfg_ckpt.to_dict()
-        cfg_ckpt.pop('restore_from', None)
+        cfg_ckpt.pop("restore_from", None)
         ckpt_kwargs |= cfg_ckpt
     return CheckpointingConfig(**ckpt_kwargs)
+
 
 def build_optimizer(cfg_opt, model, tp_size) -> "Optimizer":  # noqa: F821
     """
@@ -178,7 +180,10 @@ def build_dataloader(
         # Get the appropriate collate function
         processor_type = type(processor).__name__
         if processor_type not in COLLATE_FNS:
-            raise ValueError(f"Processor type {processor_type} not supported. Supported types: {list(COLLATE_FNS.keys())}")
+            raise ValueError(
+                f"Processor type {processor_type} not supported. "
+                f"Supported types: {list(COLLATE_FNS.keys())}"
+            )
         collate_fn = lambda examples: COLLATE_FNS[processor_type](examples, processor)
 
         return cfg_dl.instantiate(
@@ -238,6 +243,7 @@ def build_wandb(cfg):
         settings=Settings(silent=True),
     )
     return run
+
 
 # ---------------------------------------------------------------------------
 #  Trainer class – orchestration only
@@ -333,10 +339,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
 
         # Build checkpointing config
-        restore_from = self.cfg.get('checkpoint.restore_from', None)
+        restore_from = self.cfg.get("checkpoint.restore_from", None)
         self.checkpoint_config = build_checkpoint_config(
-            self.cfg.get('checkpoint', None),
-            self.cfg.get('model.cache_dir', None),
+            self.cfg.get("checkpoint", None),
+            self.cfg.get("model.cache_dir", None),
             self.cfg.model.pretrained_model_name_or_path,
         )
 
