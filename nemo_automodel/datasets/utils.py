@@ -92,8 +92,8 @@ def default_collater(batch, pad_token_id=0, pad_seq_len_divisible=None):
                         )
                     ),
                     pad_seq_len_divisible,
-                )
-            )
+                ),
+            ),
         )
         for key in batch[0].keys()
     }
@@ -141,16 +141,16 @@ class SFTSingleTurnPreprocessor:
         out = {}
         out["input_ids"] = [
             c_ids + t_ids for c_ids, t_ids in zip(ctx_tok["input_ids"],
-                                                  tgt_tok["input_ids"])
+                                                  tgt_tok["input_ids"], strict=False)
         ]
         out["attention_mask"] = [
             c_m + t_m for c_m, t_m in zip(ctx_tok["attention_mask"],
-                                          tgt_tok["attention_mask"])
+                                          tgt_tok["attention_mask"], strict=False)
         ]
         # label: -100 for ctx, true ids for tgt
         out["labels"] = [
             [-100] * (len(c_ids)-1) + t_ids + [-100]
-            for c_ids, t_ids in zip(ctx_tok["input_ids"], tgt_tok["input_ids"])
+            for c_ids, t_ids in zip(ctx_tok["input_ids"], tgt_tok["input_ids"], strict=False)
         ]
 
         out["loss_mask"] = [
@@ -159,7 +159,7 @@ class SFTSingleTurnPreprocessor:
         return out
 
     def _compute_dataset_max_len(self, tokenized_ds):
-        max_len = max(map(lambda x: len(x['input_ids']), tokenized_ds))
+        max_len = max(map(lambda x: len(x["input_ids"]), tokenized_ds))
         # make multiple of 8
         max_len = math.ceil(max_len / 8) * 8
         # respect model block size
@@ -194,15 +194,17 @@ class SFTSingleTurnPreprocessor:
         return _pad
 
     def process(self, raw_dataset, ds):
-        """Main processor entry.
+        """
+        Main processor entry.
 
         Args:
             raw_dataset (datasets.DatasetDict): the dataset (e.g. returned by load_dataset)
+            ds (dataset): the dataset with get_target method.
 
         Returns:
             datasets.DatasetDict: tokenized + padded datasets (all splits preserved).
         """
-        if not hasattr(self.tokenizer, 'pad_token') and hasattr(self.tokenizer, 'bos_token'):
+        if not hasattr(self.tokenizer, "pad_token") and hasattr(self.tokenizer, "bos_token"):
             self.tokenizer.pad_token = self.tokenizer.bos_token
 
         # 1. tokenise ----------------------------------------------------------------
@@ -211,7 +213,7 @@ class SFTSingleTurnPreprocessor:
             batched=True,
             num_proc=self.preprocessing_num_workers,
             remove_columns=raw_dataset.column_names,
-            load_from_cache_file=False, #not self.overwrite_cache,
+            load_from_cache_file=not self.overwrite_cache,
             desc="Running tokenizer on dataset",
         )
 

@@ -27,7 +27,7 @@ class HellaSwag:
     Attributes:
         dataset (Dataset): The processed dataset ready for model training or evaluation.
     """
-    def __init__(self, path_or_dataset, tokenizer, split='train', num_samples_limit=None, trust_remote_code=True):
+    def __init__(self, path_or_dataset, tokenizer, split="train", num_samples_limit=None, trust_remote_code=True):
         """Initialize the HellaSwag dataset wrapper.
 
         Args:
@@ -41,7 +41,7 @@ class HellaSwag:
             If num_samples_limit is an integer, it limits the dataset size using slicing.
         """
         if isinstance(num_samples_limit, int):
-            split = f'{split}[:{num_samples_limit}]'
+            split = f"{split}[:{num_samples_limit}]"
         raw_datasets = load_dataset(path_or_dataset, split=split, trust_remote_code=trust_remote_code)
         processor = SFTSingleTurnPreprocessor(tokenizer)
         self.dataset = processor.process(raw_datasets, self)
@@ -68,7 +68,7 @@ class HellaSwag:
             list[str]: The gold target strings based on the label index.
         """
         return [
-            endings[int(lbl)] for endings, lbl in zip(examples["endings"], examples["label"])
+            endings[int(lbl)] for endings, lbl in zip(examples["endings"], examples["label"], strict=False)
         ]
 
     def __getitem__(self, index):
@@ -81,7 +81,7 @@ class HellaSwag:
             dict: A tokenized and preprocessed example.
         """
         ans = self.dataset[index]
-        ans.pop('attention_mask', None)
+        ans.pop("attention_mask", None)
         return ans
 
     def __len__(self):

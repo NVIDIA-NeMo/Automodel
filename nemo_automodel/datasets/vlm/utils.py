@@ -12,9 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List, Optional
-
 import torch
+
+
+# Common special tokens across VLM models
+QWEN_TOKENS = [
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|vision_start|>",
+    "<|vision_end|>",
+    "<|vision_pad|>",
+    "<|image_pad|>",
+    "<|video_pad|>",
+]
+LLAVA_TOKENS = ["<image>", "<pad>"]
+LLAMA_TOKENS = [
+    "<|begin_of_text|>",
+    "<|end_of_text|>",
+    "<|finetune_right_pad_id|>",
+    "<|step_id|>",
+    "<|start_header_id|>",
+    "<|end_header_id|>",
+    "<|eom_id|>",
+    "<|eot_id|>",
+    "<|python_tag|>",
+    "<|image|>",
+]
+GEMMA_TOKENS = ["<image_soft_token>"]
+
+PAD_TOKENS = set(QWEN_TOKENS + LLAVA_TOKENS + LLAMA_TOKENS + GEMMA_TOKENS)
 
 
 def extract_skipped_token_ids(processor):
@@ -23,32 +49,6 @@ def extract_skipped_token_ids(processor):
 
     Extracted from NeMo's HFAutoModelForImageTextToText.extract_skipped_token_ids
     """
-    # Common special tokens across VLM models
-    QWEN_TOKENS = [
-        "<|im_start|>",
-        "<|im_end|>",
-        "<|vision_start|>",
-        "<|vision_end|>",
-        "<|vision_pad|>",
-        "<|image_pad|>",
-        "<|video_pad|>",
-    ]
-    LLAVA_TOKENS = ["<image>", "<pad>"]
-    LLAMA_TOKENS = [
-        "<|begin_of_text|>",
-        "<|end_of_text|>",
-        "<|finetune_right_pad_id|>",
-        "<|step_id|>",
-        "<|start_header_id|>",
-        "<|end_header_id|>",
-        "<|eom_id|>",
-        "<|eot_id|>",
-        "<|python_tag|>",
-        "<|image|>",
-    ]
-    GEMMA_TOKENS = ["<image_soft_token>"]
-
-    PAD_TOKENS = set(QWEN_TOKENS + LLAVA_TOKENS + LLAMA_TOKENS + GEMMA_TOKENS)
     tokenizer = getattr(processor, "tokenizer", processor)
 
     skipped_token_ids = []
@@ -68,25 +68,19 @@ def json2token(obj, sort_json_key: bool = True):
     if type(obj) is dict:
         if len(obj) == 1 and "text_sequence" in obj:
             return obj["text_sequence"]
-        else:
-            output = ""
-            if sort_json_key:
-                keys = sorted(obj.keys(), reverse=True)
-            else:
-                keys = obj.keys()
-            for k in keys:
-                output += rf"<s_{k}>" + json2token(obj[k], sort_json_key) + rf"</s_{k}>"
-            return output
-    elif type(obj) is list:
+        output = ""
+        keys = sorted(obj.keys(), reverse=True) if sort_json_key else obj.keys()
+        for k in keys:
+            output += rf"<s_{k}>" + json2token(obj[k], sort_json_key) + rf"</s_{k}>"
+        return output
+    if type(obj) is list:
         return r"<sep/>".join([json2token(item, sort_json_key) for item in obj])
-    else:
-        obj = str(obj)
-        return obj
+    return str(obj)
 
 
 def process_text_batch(
-    processor, texts: List[str], images: Optional[List] = None
-) -> Dict[str, torch.Tensor]:
+    processor, texts: list[str], images: list | None = None,
+) -> dict[str, torch.Tensor]:
     """
     Process a batch of texts and optionally images.
 

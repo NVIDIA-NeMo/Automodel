@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import logging
-from typing import Dict, List, Union
 
 import torch
 from datasets import Dataset
@@ -23,7 +22,7 @@ from tqdm import tqdm
 logger = logging.getLogger(__name__)
 
 CROSS_ENTROPY_IGNORE_IDX = -100
-PACK_TYPE = Dict[str, Union[torch.Tensor, List[int]]]
+PACK_TYPE = dict[str, torch.Tensor | list[int]]
 
 
 # based on https://github.com/pytorch/torchtune/blob/v0.6.1/torchtune/datasets/_packed.py#L17
@@ -64,7 +63,7 @@ class PackedSequence:
         self.packed_sequence_size = packed_sequence_size
         self.split_across_pack = split_across_pack
         self.max_packs = max_packs
-        self.packs: List[PACK_TYPE] = []
+        self.packs: list[PACK_TYPE] = []
 
     def pack(self):
         """
@@ -106,7 +105,7 @@ class PackedSequence:
             if seq_len > self.packed_sequence_size and not self.split_across_pack:
                 raise ValueError(
                     f"Dataset sample is too long ({seq_len} > {self.packed_sequence_size}). "
-                    "Please set `split_across_pack=True` or increase `packed_sequence_size`."
+                    "Please set `split_across_pack=True` or increase `packed_sequence_size`.",
                 )
             # Update the current pack
             # "position_ids" is the pos ids, "seq_lens" is the len of each seq within the pack
@@ -275,7 +274,7 @@ class PackedSequence:
         return padded_pack
 
 
-def create_block_causal_mask(seq_lens: List[torch.Tensor]) -> torch.Tensor:
+def create_block_causal_mask(seq_lens: list[torch.Tensor]) -> torch.Tensor:
     """
     Creates causal mask block for specified lengths.
 
@@ -308,7 +307,7 @@ def create_block_causal_mask(seq_lens: List[torch.Tensor]) -> torch.Tensor:
                     seq_len,
                     seq_len,
                     dtype=torch.bool,
-                )
+                ),
             )
             for i, seq_len in enumerate(seq_lens[sample_idx])
         ]
@@ -319,7 +318,7 @@ def create_block_causal_mask(seq_lens: List[torch.Tensor]) -> torch.Tensor:
     return torch.stack(batch_block_attn_masks).unsqueeze(1)
 
 
-def packed_block_causal_mask(seq_lens: List[torch.Tensor]):
+def packed_block_causal_mask(seq_lens: list[torch.Tensor]):
     """
     Create a 2D block causal document mask for a batch of packed sequences.
 
