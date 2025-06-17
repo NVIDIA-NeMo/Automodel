@@ -16,9 +16,9 @@
 
 step_scheduler:
   grad_acc_steps: 8
-  ckpt_every_steps: 50
-  val_every_steps: 50  # will run every x number of gradient steps
-  num_epochs: 3
+  ckpt_every_steps: 100
+  val_every_steps: 1000  # will run every x number of gradient steps
+  max_steps: 1000
 
 dist_env:
   backend: nccl
@@ -31,13 +31,14 @@ rng:
 
 model:
   _target_: nemo_automodel._transformers.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
-  
-processor:
-  _target_: transformers.AutoProcessor.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
-  min_pixels: 200704  # 256*28*28
-  max_pixels: 1003520  # 1280*28*28
+  pretrained_model_name_or_path: google/gemma-3-4b-it
+# pretrained_model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
+
+# processor:
+#   _target_: transformers.AutoProcessor.from_pretrained
+#   pretrained_model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
+#   min_pixels: 200704  # 256*28*28
+#   max_pixels: 1003520  # 1280*28*28
 
 checkpoint:
   enabled: true
@@ -54,18 +55,27 @@ distributed:
 loss_fn: nemo_automodel.loss.masked_ce.masked_cross_entropy
 
 dataset:
-  _target_: nemo_automodel.datasets.vlm.datasets.make_rdr_dataset
-  path_or_dataset: quintend/rdr-items
+  _target_: nemo_automodel.datasets.vlm.datasets.make_cord_v2_dataset
+  path_or_dataset: naver-clova-ix/cord-v2
   split: train
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  num_workers: 0
+  batch_size: 1
+  num_workers: 1
   pin_memory: true
-  # collate_fn:
-  #   _target_: nemo_automodel.datasets.vlm.collate_fns.qwen2_5_collate_fn
+  persistent_workers: true
 
-    
+validation_dataset:
+  _target_: nemo_automodel.datasets.vlm.datasets.make_cord_v2_dataset
+  path_or_dataset: naver-clova-ix/cord-v2
+  split: validation
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.datasets.utils.default_collater
+  batch_size: 1
+  
 optimizer:
   _target_: torch.optim.AdamW
   lr: 1e-5
@@ -76,10 +86,10 @@ freeze_config:
   freeze_embeddings: true
   freeze_vision_tower: true
   freeze_language_model: false
-
+  
 # Uncomment and configure for W&B logging
-# wandb:
-#   project: nemo_automodel_vlm
-#   entity: nvidia
-#   name: qwen2_5_vl_3b_rdr
-#   save_dir: ./wandb_logs 
+# logger:
+#   wandb_project: nemo_automodel_vlm
+#   wandb_entity: nvidia
+#   wandb_exp_name: qwen2_5_vl_3b_rdr
+#   wandb_save_dir: ./wandb_logs 
