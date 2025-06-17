@@ -70,7 +70,10 @@ class _InputFileData:
     metadata: Any = None
     
 
-def _parse_input_metadata(input_files_data: dict[str, _InputFileData], output_files_data: dict[str, _OutputFileData]) -> None:
+def _parse_input_metadata(
+        input_files_data: dict[str, _InputFileData],
+        output_files_data: dict[str, _OutputFileData],
+    ) -> None:
     """
     Parse metadata from input safetensors files to determine the full tensor shapes and types.
     
@@ -91,7 +94,10 @@ def _parse_input_metadata(input_files_data: dict[str, _InputFileData], output_fi
         safetensors_metadata = file_data.metadata
         dcp_sharding_info = _get_dcp_custom_metadata(safetensors_metadata)
         if not dcp_sharding_info:
-            raise ValueError("No DCP custom metadata found in safetensors file. The file must be saved with DCP to be consolidated.")
+            raise ValueError(
+                "No DCP custom metadata found in safetensors file. "
+                "The file must be saved with DCP to be consolidated."
+            )
 
         for key, val in safetensors_metadata.items():
             if key == DEFAULT_EXTRA_METADATA_KEY:
@@ -319,33 +325,30 @@ def _write_row_wise_tensor(
         output_file_path: The path to the file where the full tensor is stored
         output_start_byte: The starting byte of the full tensor in the file
     """
-    # Open the output file in read+binary mode to allow seeking and writing
+    # The shard is contiguous in row-major order, so we can write the whole block
+    # in a single I/O operation instead of looping over every row.
+
+    # Total number of elements in one row of the *full* tensor.
+    elements_per_row = full_tensor_strides[0]
+
+    # Size (in bytes) of a single row in the full tensor.
+    row_size_bytes = elements_per_row * element_size
+
+    # Starting byte in the *output* file where this shard should be written.
+    first_row = sub_tensor_offsets[0]
+    first_byte_offset = output_start_byte + first_row * row_size_bytes
+
+    # Total byte length of the shard (all its rows are stored contiguously in
+    # the buffer we already read from the source file).
+    total_shard_bytes = row_size_bytes * sub_tensor_shape[0]
+
+    # Sanity-check – we should have exactly this many bytes in the buffer.
+    shard_bytes = memoryview(sub_tensor_bytes)[:total_shard_bytes]
+
+    # Single seek / write.
     with fs.open(output_file_path, "r+b") as out_f:
-        # Calculate the number of elements in each row
-        elements_per_row = full_tensor_strides[0]  # This is the stride of the first dimension
-        
-        # For each row in the sub-tensor
-        for row_idx in range(sub_tensor_shape[0]):
-            # Calculate the row index in the full tensor
-            full_row_idx = sub_tensor_offsets[0] + row_idx
-            
-            # Calculate the position in the full tensor
-            full_pos = full_row_idx * full_tensor_strides[0]
-            full_byte_offset = output_start_byte + full_pos * element_size
-            
-            # Calculate the position in the sub-tensor
-            sub_pos = row_idx * sub_tensor_strides[0]
-            sub_byte_offset = sub_pos * element_size
-            
-            # Extract the row data from the sub-tensor
-            row_size = elements_per_row * element_size
-            row_data = sub_tensor_bytes[
-                sub_byte_offset : sub_byte_offset + row_size
-            ]
-            
-            # Seek to the correct position in the output file and write the data
-            out_f.seek(full_byte_offset)
-            out_f.write(row_data)
+        out_f.seek(first_byte_offset)
+        out_f.write(shard_bytes)
 
 def _write_column_wise_tensor(
     fs: fsspec.AbstractFileSystem,
@@ -374,31 +377,26 @@ def _write_column_wise_tensor(
         output_file_path: The path to the file where the full tensor is stored
         output_start_byte: The starting byte of the full tensor in the file
     """
-    # Open the output file in read+binary mode to allow seeking and writing
+    # Optimised implementation: each row of the shard is contiguous in memory, so
+    # we write an entire row-slice in one I/O op rather than one element at a time.
+
+    shard_cols = sub_tensor_shape[1]
+    first_col  = sub_tensor_offsets[1]
+    row_size_bytes_full = tensor_shape[1] * element_size  # full-tensor row size
+    row_size_bytes_shard = shard_cols * element_size      # bytes we need to write per row
+
     with fs.open(output_file_path, "r+b") as out_f:
-        # For each column in the sub-tensor
-        for col_idx in range(sub_tensor_shape[1]):
-            # Calculate the column index in the full tensor
-            full_col_idx = sub_tensor_offsets[1] + col_idx
-            
-            # For each row in the column
-            for row_idx in range(sub_tensor_shape[0]):
-                # Calculate the position in the full tensor
-                full_pos = row_idx * tensor_shape[1] + full_col_idx
-                full_byte_offset = output_start_byte + full_pos * element_size
-                
-                # Calculate the position in the sub-tensor
-                sub_pos = row_idx * sub_tensor_shape[1] + col_idx
-                sub_byte_offset = sub_pos * element_size
-                
-                # Extract the element data from the sub-tensor
-                element_data = sub_tensor_bytes[
-                    sub_byte_offset : sub_byte_offset + element_size
-                ]
-                
-                # Seek to the correct position in the output file and write the data
-                out_f.seek(full_byte_offset)
-                out_f.write(element_data)
+        for row_idx in range(sub_tensor_shape[0]):
+            # byte offset of the row slice in the destination file
+            full_row_byte_offset = output_start_byte + row_idx * row_size_bytes_full + first_col * element_size
+
+            # byte offset of the same row inside the shard buffer
+            shard_row_byte_offset = row_idx * row_size_bytes_shard
+
+            out_f.seek(full_row_byte_offset)
+            out_f.write(memoryview(sub_tensor_bytes)[
+                shard_row_byte_offset : shard_row_byte_offset + row_size_bytes_shard
+            ])
 
 def _write_element_by_element(
     fs: fsspec.AbstractFileSystem,
@@ -430,46 +428,51 @@ def _write_element_by_element(
         output_file_path: The path to the file where the full tensor is stored
         output_start_byte: The starting byte of the full tensor in the file
     """
-    # Open the output file in read+binary mode to allow seeking and writing
+    # Generic fallback for arbitrary sharding. Instead of writing every single
+    # element, write one contiguous slice along the innermost dimension (i.e.,
+    # the full "row" in C-order tensors). This reduces system-calls from
+    # O(total_elements) to O(outer_elements).
+
+    inner_dim = tensor_shape[-1]
+    inner_dim_bytes = inner_dim * element_size
+
+    shard_inner_dim = sub_tensor_shape[-1]
+    shard_inner_bytes = shard_inner_dim * element_size
+
+    # Number of outer rows to iterate over (product of all dims except last)
+    outer_shape = sub_tensor_shape[:-1]
+    outer_size = 1
+    for s in outer_shape:
+        outer_size *= s
+
     with fs.open(output_file_path, "r+b") as out_f:
-        # Create a list to hold the current indices for each dimension
-        indices = [0] * len(tensor_shape)
-        
-        # Calculate the total number of elements in the sub-tensor
-        total_elements = 1
-        for dim_size in sub_tensor_shape:
-            total_elements *= dim_size
-        
-        # Process each element in the sub-tensor
-        for element_idx in range(total_elements):
-            # Calculate the indices for this element in the sub-tensor
-            sub_idx = element_idx
-            for dim in range(len(sub_tensor_shape) - 1, -1, -1):
-                indices[dim] = sub_idx % sub_tensor_shape[dim]
-                sub_idx //= sub_tensor_shape[dim]
-            
-            # Calculate the position of this element in the sub-tensor's byte array
-            sub_pos = 0
-            for dim in range(len(sub_tensor_shape)):
-                sub_pos += indices[dim] * sub_tensor_strides[dim]
-            sub_byte_offset = sub_pos * element_size
-            
-            # Calculate the position of this element in the full tensor
-            full_pos = 0
-            for dim in range(len(tensor_shape)):
-                # The global index is the local index plus the offset for this dimension
-                global_idx = indices[dim] + sub_tensor_offsets[dim]
-                full_pos += global_idx * full_tensor_strides[dim]
-            full_byte_offset = output_start_byte + full_pos * element_size
-            
-            # Extract the element data from the sub-tensor
-            element_data = sub_tensor_bytes[
-                sub_byte_offset : sub_byte_offset + element_size
+        for outer_idx in range(outer_size):
+            # Unravel outer_idx to multidim index to compute offsets
+            rem = outer_idx
+            dst_byte_offset = 0
+            src_byte_offset = 0
+
+            for dim in range(len(outer_shape) - 1, -1, -1):
+                idx = rem % outer_shape[dim]
+                rem //= outer_shape[dim]
+
+                # destination offset (include global shard offsets)
+                dst_idx = idx + sub_tensor_offsets[dim]
+                dst_byte_offset += dst_idx * full_tensor_strides[dim] * element_size
+
+                # source offset inside shard buffer
+                src_byte_offset += idx * sub_tensor_strides[dim] * element_size
+
+            # Add innermost dimension offset
+            dst_byte_offset += output_start_byte + sub_tensor_offsets[-1] * element_size
+
+            # View contiguous slice for the current row
+            row_slice = memoryview(sub_tensor_bytes)[
+                src_byte_offset : src_byte_offset + shard_inner_bytes
             ]
-            
-            # Seek to the correct position in the output file and write the data
-            out_f.seek(full_byte_offset)
-            out_f.write(element_data)
+
+            out_f.seek(dst_byte_offset)
+            out_f.write(row_slice)
 
 def _write_sub_tensor_to_file(
     fs: fsspec.AbstractFileSystem,
@@ -517,19 +520,12 @@ def _write_sub_tensor_to_file(
         sub_tensor_strides[i] = sub_tensor_strides[i + 1] * sub_tensor_shape[i + 1]
 
     # Check if this is a row-wise sharded tensor
-    # Row-wise sharding is detected when the last dimension is complete
-    # and only the first dimension is partial
-    is_row_wise = False
-    if len(tensor_shape) >= 2:
-        # Check if all dimensions except the first are complete
-        all_other_dims_complete = True
-        for i in range(1, len(tensor_shape)):
-            if sub_tensor_shape[i] != tensor_shape[i]:
-                all_other_dims_complete = False
-                break
-        
-        # Row-wise sharding: first dimension is partial, all others are complete
-        is_row_wise = all_other_dims_complete and sub_tensor_shape[0] < tensor_shape[0]
+    # Row-wise sharding: all dimensions except possibly the first are complete.
+    is_row_wise = True
+    for i in range(1, len(tensor_shape)):
+        if sub_tensor_shape[i] != tensor_shape[i]:
+            is_row_wise = False
+            break
     
     # Check if this is a column-wise sharded 2D tensor
     # Column-wise sharding is detected when the first dimension is complete
