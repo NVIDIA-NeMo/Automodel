@@ -21,15 +21,11 @@ def batchify(tensor):
     """
     Ensures that the input tensor has at least two dimensions by adding an extra batch dimension if necessary.
 
-    Parameters
-    ----------
-    tensor : torch.Tensor
-        The input tensor to be batchified.
+    Args:
+        tensor (torch.Tensor): The input tensor to be batchified.
 
     Returns:
-    -------
-    torch.Tensor
-        The tensor with an extra dimension added if it was originally 1-dimensional.
+        torch.Tensor:  The tensor with an extra dimension added if it was originally 1-dimensional.
         Otherwise, the tensor is returned as-is.
     """
     if tensor.ndim == 1:
@@ -41,17 +37,12 @@ def extract_key_from_dicts(batch, key):
     """
     Extracts the value of the given key from each dictionary in a list of dictionaries.
 
-    Parameters
-    ----------
-    batch : List[dict]
-        A list of dictionaries.
-    key : str
-        The key whose values are to be extracted from each dictionary.
+    Args:
+        batch (List[dict]): A list of dictionaries.
+        key (str): The key whose values are to be extracted from each dictionary.
 
     Returns:
-    -------
-    List
-        A list of values associated with the specified key, in the same order as
+        List: A list of values associated with the specified key, in the same order as
         the dictionaries in the input batch.
     """
     return list(map(lambda x: x[key], batch))
@@ -61,20 +52,16 @@ def pad_within_micro(batch, pad_token_id, pad_seq_len_divisible=None):
     """
     Pads each list in a batch of lists to the same length with a specified token.
 
-    Parameters
-    ----------
-    batch : List[List[int]]
-        A batch of sequences (e.g., token IDs), where each sequence is a list of integers.
-    pad_token_id : int
-        The token ID to use for padding shorter sequences.
-    pad_seq_len_divisible : int
-        The value to use for padding sequence length so that it is divisible by pad_seq_len_divisible.
+    Args:
+        batch (List[List[int]]): A batch of sequences (e.g., token IDs), where each sequence
+            is a list of integers.
+        pad_token_id (int): The token ID to use for padding shorter sequences.
+        pad_seq_len_divisible (int): The value to use for padding sequence length so that it is
+            divisible by pad_seq_len_divisible.
 
     Returns:
-    -------
-    List[List[int]]
-        A batch of sequences where each inner list has been padded with the pad token
-        to match the length of the longest sequence in the batch.
+        List[List[int]]: A batch of sequences where each inner list has been padded with the pad
+        token to match the length of the longest sequence in the batch.
     """
     max_len = max(map(len, batch))
     if pad_seq_len_divisible:
@@ -117,7 +104,7 @@ class SFTSingleTurnPreprocessor:
     Generic single-turn text-to-text SFT (supervised-fine-tuning) pre-processor.
 
     Args:
-        tokenizer      : Pre-trained tokenizer (HF).
+        tokenizer: Pre-trained tokenizer (HF).
     """
 
     def __init__(self, tokenizer):
@@ -125,7 +112,7 @@ class SFTSingleTurnPreprocessor:
         SFTSingleTurnPreprocessor constructor.
 
         Args:
-            tokenizer (_type_): Pretrained tokenizer.
+            tokenizer: Pretrained tokenizer.
         """
         self.tokenizer = tokenizer
         self.block_size = None
@@ -207,16 +194,13 @@ class SFTSingleTurnPreprocessor:
         return _pad
 
     def process(self, raw_dataset, ds):
-        """Main entry.
+        """Main processor entry.
 
-        Parameters
-        ----------
-        raw_dataset : datasets.DatasetDict  (e.g. returned by load_dataset)
-        split        : Which split from raw_dataset to process.
+        Args:
+            raw_dataset (datasets.DatasetDict): the dataset (e.g. returned by load_dataset)
 
         Returns:
-        -------
-        datasets.DatasetDict  - tokenized + padded datasets (all splits preserved).
+            datasets.DatasetDict: tokenized + padded datasets (all splits preserved).
         """
         if not hasattr(self.tokenizer, 'pad_token') and hasattr(self.tokenizer, 'bos_token'):
             self.tokenizer.pad_token = self.tokenizer.bos_token
