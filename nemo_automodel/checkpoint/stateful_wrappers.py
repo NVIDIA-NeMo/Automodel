@@ -20,11 +20,10 @@ from torch.distributed.checkpoint.state_dict import (
     get_optimizer_state_dict,
     set_model_state_dict,
     set_optimizer_state_dict,
-    StateDictOptions,
 )
 from torch.distributed.checkpoint.stateful import Stateful
 
-from nemo_automodel.checkpoint.checkpointing import SerializationFormat
+from nemo_automodel.checkpoint._backports.filesystem import SerializationFormat
 
 # modified from pytorch tutorial https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html
 class ModelState(Stateful):
@@ -48,15 +47,22 @@ class ModelState(Stateful):
         Returns:
             dict: Dictionary containing the model's state dict with CPU offloading enabled.
         """
-        # this line automatically manages FSDP FQN's, as well as sets the default state dict type
-        # to FSDP.SHARDED_STATE_DICT
-        model_state_dict = get_model_state_dict(
-            self.model,
-            options=StateDictOptions(
-                cpu_offload=True,
-                full_state_dict=True if self.serialization_format == SerializationFormat.SAFETENSORS else False,
-            ),
-        )
+        # this line automatically manages FSDP FQN's
+        model_state_dict = get_model_state_dict(self.model)
+
+        # This is a hack to fix the issue with the model state dict being saved with the "model.model." prefix.
+        # This is necessary when saving consolidated safetensors. This is because calling HF's
+        # .from_pretrained() requires the model to be saved with a single "model." prefix.
+        if self.serialization_format == SerializationFormat.SAFETENSORS:
+            keys_to_fix = [k for k in model_state_dict if k.startswith("model.")]
+            for old_key in keys_to_fix:
+                new_key = old_key[len("model."):]
+                # avoid overwriting if new_key already exists (shouldn't happen, but be safe)
+                if new_key not in model_state_dict:
+                    model_state_dict[new_key] = model_state_dict[old_key]
+                # delete the old, over-prefixed key
+                del model_state_dict[old_key]
+
         if self.is_tied_lm_head:
             model_state_dict.pop("lm_head.weight", None)
         return model_state_dict
@@ -67,6 +73,19 @@ class ModelState(Stateful):
         Args:
             state_dict (dict): State dictionary to load.
         """
+        # Undo the prefix-stripping that happened at save-time: DCP removes the
+        # container name ("model") when it dispatches the dict to this
+        # ModelState, so every key now lacks the leading "model." segment that
+        # HuggingFace modules normally carry.  Re-add it so that
+        # set_model_state_dict can match parameters correctly.
+        if self.serialization_format == SerializationFormat.SAFETENSORS:
+            keys_to_fix = [k for k in state_dict if not k.startswith("model.") and k != "lm_head.weight"]
+            for old_key in keys_to_fix:
+                new_key = f"model.{old_key}"
+                if new_key not in state_dict:
+                    state_dict[new_key] = state_dict[old_key]
+                del state_dict[old_key]
+
         # If we intentionally skipped saving "lm_head.weight" (tied embeddings)
         # PyTorch will complain during load even with strict=False.
         # To be fully compatible we inject a reference tensor so the key exists.
@@ -77,10 +96,6 @@ class ModelState(Stateful):
         set_model_state_dict(
             self.model,
             state_dict,
-            options=StateDictOptions(
-                full_state_dict=True if self.serialization_format == SerializationFormat.SAFETENSORS else False,
-                broadcast_from_rank0=True if self.serialization_format == SerializationFormat.SAFETENSORS else False,
-            ),
         )
 
 
@@ -117,9 +132,6 @@ class OptimizerState(Stateful):
         optimizer_state_dict = get_optimizer_state_dict(
             self.model,
             self.optimizer,
-            options=torch.distributed.checkpoint.state_dict.StateDictOptions(
-                cpu_offload=True
-            ),
         )
 
         state_dict = {

@@ -18,12 +18,12 @@ _OVERRIDES = [
     "checkpoint.checkpoint_dir",
     "checkpoint.model_save_format",
     "dataloader.batch_size",
+    "checkpoint.save_consolidated",
 ]
 
 
 def pytest_addoption(parser: pytest.Parser):
     """Register the NeMo-Automodel CLI overrides so that pytest accepts them.
-
     The functional test launchers forward these arguments after a ``--``
     separator.  If pytest is unaware of an option it treats it as a file
     path and aborts collection.  Declaring each option here is enough to

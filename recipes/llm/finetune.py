@@ -94,6 +94,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id):
         model_save_format="safetensors",
         model_repo_id=model_repo_id,
         model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
+        save_consolidated=False,
     )
     if cfg_ckpt is not None:
         cfg_ckpt = cfg_ckpt.to_dict()
