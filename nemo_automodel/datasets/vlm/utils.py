@@ -18,7 +18,9 @@ import torch
 
 
 def extract_skipped_token_ids(processor):
-    """Returns list of tokens to mask in labels.
+    """
+    Returns list of tokens to mask in labels.
+
     Extracted from NeMo's HFAutoModelForImageTextToText.extract_skipped_token_ids
     """
     # Common special tokens across VLM models
@@ -58,7 +60,9 @@ def extract_skipped_token_ids(processor):
 
 
 def json2token(obj, sort_json_key: bool = True):
-    """Convert an ordered JSON object into a token sequence.
+    """
+    Convert an ordered JSON object into a token sequence.
+
     From NeMo's automodel_datasets.py
     """
     if type(obj) is dict:
@@ -83,7 +87,8 @@ def json2token(obj, sort_json_key: bool = True):
 def process_text_batch(
     processor, texts: List[str], images: Optional[List] = None
 ) -> Dict[str, torch.Tensor]:
-    """Process a batch of texts and optionally images.
+    """
+    Process a batch of texts and optionally images.
 
     Args:
         processor: The processor to use for tokenization and image processing

@@ -18,7 +18,8 @@ import torch
 
 
 def batchify(tensor):
-    """Ensures that the input tensor has at least two dimensions by adding an extra batch dimension if necessary.
+    """
+    Ensures that the input tensor has at least two dimensions by adding an extra batch dimension if necessary.
 
     Parameters
     ----------
@@ -37,7 +38,8 @@ def batchify(tensor):
 
 
 def extract_key_from_dicts(batch, key):
-    """Extracts the value of the given key from each dictionary in a list of dictionaries.
+    """
+    Extracts the value of the given key from each dictionary in a list of dictionaries.
 
     Parameters
     ----------
@@ -56,7 +58,8 @@ def extract_key_from_dicts(batch, key):
 
 
 def pad_within_micro(batch, pad_token_id, pad_seq_len_divisible=None):
-    """Pads each list in a batch of lists to the same length with a specified token.
+    """
+    Pads each list in a batch of lists to the same length with a specified token.
 
     Parameters
     ----------
@@ -80,7 +83,8 @@ def pad_within_micro(batch, pad_token_id, pad_seq_len_divisible=None):
 
 
 def default_collater(batch, pad_token_id=0, pad_seq_len_divisible=None):
-    """Default batch collator that handles padding and batching.
+    """
+    Default batch collator that handles padding and batching.
 
     Args:
         batch: A batch of examples.
@@ -109,20 +113,20 @@ def default_collater(batch, pad_token_id=0, pad_seq_len_divisible=None):
 
 
 class SFTSingleTurnPreprocessor:
-    """Generic single-turn text-to-text SFT (supervised-fine-tuning) pre-processor.
+    """
+    Generic single-turn text-to-text SFT (supervised-fine-tuning) pre-processor.
 
-    Parameters
-    ----------
-    args           : argparse.Namespace or similar - must expose the fields
-                     `dataset_name`, `model_name_or_path`, `preprocessing_num_workers`,
-                     `overwrite_cache`.
-    tokenizer      : Pre-trained tokenizer (HF).
-    accelerator    : accelerate.Accelerator.
-    task_dict      : Dict[str, Task] mapping dataset_name -> task object that
-                     provides `get_context()` and `get_target()` callables.
+    Args:
+        tokenizer      : Pre-trained tokenizer (HF).
     """
 
     def __init__(self, tokenizer):
+        """
+        SFTSingleTurnPreprocessor constructor.
+
+        Args:
+            tokenizer (_type_): Pretrained tokenizer.
+        """
         self.tokenizer = tokenizer
         self.block_size = None
         self.preprocessing_num_workers = 1

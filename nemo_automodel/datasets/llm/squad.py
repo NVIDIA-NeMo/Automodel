@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# from nemo_automodel.datasets.llm.hf_dataset import HFDatasetBuilder
 from datasets import load_dataset
 
 
@@ -24,7 +23,8 @@ def make_squad_dataset(
     split='train',
     dataset_name="rajpurkar/squad",
 ):
-    """Load and preprocess a SQuAD-style QA dataset for model fine-tuning.
+    """
+    Load and preprocess a SQuAD-style QA dataset for model fine-tuning.
 
     This function retrieves the specified split of the SQuAD dataset, applies
     either a simple prompt–completion format or a chat‐template format
@@ -113,11 +113,11 @@ def make_squad_dataset(
 
     fmt_fn = formatting_prompts_func
     if chat_template is not None:
-        fmt_fn = lambda x: formatting_prompts_func_with_chat_template(x, start_of_turn_token)
+        fmt_fn = lambda x: formatting_prompts_func_with_chat_template(x, start_of_turn_token)  # noqa: E731
 
     if isinstance(seq_length, int):
         fmt_fn_ = fmt_fn
-        fmt_fn = lambda x: pad_to_seq_length(fmt_fn_(x))
+        fmt_fn = lambda x: pad_to_seq_length(fmt_fn_(x))  # noqa: E731
 
     return dataset.map(
         fmt_fn,
