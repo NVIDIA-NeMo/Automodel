@@ -107,7 +107,7 @@ source = [".", "/workspace", "/home/runner/work/NeMo-Automodel/NeMo-Automodel"]
 [tool.ruff]
 line-length = 120
 
-# Whatever other rules you like
+# Whatever other rules you like; D = pydocstyle
 select = ["E", "F", "I", "D"]
 # Keep D417, but maybe mute some basic missing-docstring rules
 ignore = ["D100", "D104", "D212", "D200"]
