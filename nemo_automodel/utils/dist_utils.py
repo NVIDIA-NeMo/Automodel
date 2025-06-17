@@ -27,6 +27,7 @@ import yaml
 
 from nemo_automodel.utils.yaml_utils import safe_yaml_representers
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,6 +43,13 @@ class FirstRankPerNode(ContextDecorator):
     """
 
     def __enter__(self):
+        """
+        Create / bootstrap a (distributed) proc. group that rank0 enters first.
+
+        Returns:
+            bool: ``True``  – if the current process is node-rank-0
+                  ``False`` – otherwise
+        """
         self._created_pg = False
         self._node0_group = None
         self._first = True  # default for single‑GPU / no‑dist case
@@ -74,6 +82,25 @@ class FirstRankPerNode(ContextDecorator):
         return self._first
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        """
+        Tear down the context.
+
+        1. If the current process was the first on its node, release the
+           waiting peer ranks by issuing a barrier.
+        2. If an exception occurred, abort the *entire* distributed job.
+        3. If this context manager created the process group, destroy it.
+
+        Args:
+            exc_type (Type[BaseException] | None): Exception class if one
+                occurred inside the ``with`` block.
+            exc_val  (BaseException | None): The raised exception instance.
+            exc_tb   (TracebackType | None): Traceback associated with the
+                exception.
+
+        Returns:
+            bool: ``False`` so that any exception raised inside the ``with``
+                  block is propagated to the caller (standard CM semantics).
+        """
         try:
             if self._first and dist.is_initialized():
                 # Re‑sync the whole world so that non‑rank‑0s can proceed
@@ -88,7 +115,9 @@ class FirstRankPerNode(ContextDecorator):
         return False
 
     def _try_bootstrap_pg(self) -> bool:
-        """Try to create a default pg from env:// variables."""
+        """
+        Try to create a default pg from env:// variables.
+        """
         env = os.environ
         required = ("WORLD_SIZE", "RANK", "MASTER_ADDR", "MASTER_PORT")
         if all(k in env for k in required):
@@ -241,7 +270,8 @@ def reduce_loss(
     per_token_loss: bool = True,
     dp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reduce loss across all ranks.
+    """
+    Reduce loss across all ranks.
 
     Args:
         loss_store: List of loss tensors to reduce.
@@ -266,7 +296,8 @@ def reduce_loss(
 
 
 def get_sync_ctx(model, is_optim_step):
-    """Get the synchronization context for the model.
+    """
+    Get the synchronization context for the model.
 
     Args:
         model: The model to synchronize.
@@ -292,7 +323,8 @@ def get_sync_ctx(model, is_optim_step):
 
 @torch.no_grad()
 def rescale_gradients(model, num_tokens_for_grad_scaling, dp_group=None):
-    """Rescale gradients across the DP group.
+    """
+    Rescale gradients across the DP group.
 
     Args:
         model: The model to rescale.
@@ -313,11 +345,13 @@ def rescale_gradients(model, num_tokens_for_grad_scaling, dp_group=None):
 # based on: https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/utils.py#L278
 @torch.no_grad()
 def clip_gradients(model, clip_norm, foreach=True):
-    """Clip gradients across the DP group.
+    """
+    Clip gradients across the DP group.
 
     Args:
         model: The model to clip the gradients of.
         clip_norm: The maximum norm of the gradients.
+        foreach: if enabled will use fused operations.
     """
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     grad_norm = torch.nn.utils.get_total_norm(grads, foreach=foreach)

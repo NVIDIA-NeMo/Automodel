@@ -18,8 +18,8 @@ from nemo_automodel.config.loader import load_yaml_config, translate_value
 
 
 def parse_cli_argv(cfg_path=None):
-    """1) Pulls out --config / -c <path>
-    2) Collects all other --dotted.paths (with or without '=') as overrides
+    """
+    Parses CLI args, pulls out --config and collects other --dotted.path options.
 
     Args:
         cfg_path (str, optional): Default config (yaml) path. Defaults to None.
@@ -73,7 +73,8 @@ def parse_cli_argv(cfg_path=None):
     return cfg_path, overrides
 
 def parse_args_and_load_config(cfg_path=None):
-    """3) Loads YAML, applies overrides via ConfigNode.set_by_dotted
+    """
+    Loads YAML, applies overrides via ConfigNode.set_by_dotted.
     """
     cfg_path, overrides = parse_cli_argv(cfg_path)
     # load the base YAML

@@ -15,6 +15,7 @@ import importlib
 from .torch_backports import apply_patches as _nemo__apply_patches
 from .package_info import __version__, __package_name__
 
+
 __all__ = [
     "_peft",
     "config",
@@ -46,7 +47,9 @@ except ImportError:
 def __getattr__(name: str):
     """
     Lazily import and cache submodules listed in __all__ when accessed.
-    Raises AttributeError if the name isn't in __all__.
+
+    Raises:
+        AttributeError if the name isn’t in __all__.
     """
     if name in __all__:
         # import submodule on first access
@@ -58,7 +61,8 @@ def __getattr__(name: str):
 
 
 def __dir__():
-    """Expose the names of all available submodules for auto-completion.
+    """
+    Expose the names of all available submodules for auto-completion.
     """
     return sorted(__all__)
 

@@ -18,5 +18,6 @@ from nemo_automodel._transformers.auto_model import (
     NeMoAutoModelForImageTextToText,
 )
 
+
 __all__ = ["NeMoAutoModelForCausalLM", "NeMoAutoModelForImageTextToText"]
 

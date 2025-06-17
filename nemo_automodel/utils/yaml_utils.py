@@ -15,15 +15,16 @@
 import enum
 import functools
 import inspect
+from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Generator
 
 import yaml
 
 
 @contextmanager
 def safe_yaml_representers() -> Generator[None, None, None]:
-    """Context manager for safely adding and removing custom YAML representers.
+    """
+    Context manager for safely adding and removing custom YAML representers.
 
     Temporarily adds custom representers for functions, classes, and other objects
     to the YAML SafeDumper, and restores the original representers when exiting
@@ -140,8 +141,7 @@ def _partial_representer(dumper, data):
 
     # Add keyword arguments if any exist
     if data.keywords:
-        for k, v in data.keywords.items():
-            value[k] = v
+        value |= data.keywords
 
     return dumper.represent_data(value)
 

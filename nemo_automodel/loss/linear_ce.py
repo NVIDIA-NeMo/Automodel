@@ -64,6 +64,7 @@ import torch
 
 from nemo_automodel.shared.import_utils import safe_import_from
 
+
 HAVE_LINEAR_LOSS_CE, linear_cross_entropy = safe_import_from(
     "cut_cross_entropy",
     "linear_cross_entropy",

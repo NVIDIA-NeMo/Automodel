@@ -20,7 +20,8 @@ import torch.nn as nn
 
 
 def wildcard_match(pattern, key):
-    """Return whether the pattern (target module to add LoRA) matches the key (model weight name).
+    """
+    Return whether the pattern (target module to add LoRA) matches the key (model weight name).
 
     Example:
     --------
@@ -37,7 +38,8 @@ def wildcard_match(pattern, key):
 
 @dataclass
 class ModuleMatcher:
-    """Matches Modules to apply PEFT adapters on.
+    """
+    Matches Modules to apply PEFT adapters on.
 
     Args:
         target_modules (List[str], optional): A list of module names to apply LoRA to.
@@ -59,7 +61,9 @@ class ModuleMatcher:
     match_all_linear: bool = field(default=False)
 
     def __post_init__(self):
-        """Input validation"""
+        """
+        Input validation.
+        """
         if isinstance(self.target_modules, str):
             self.target_modules = [self.target_modules]
         if isinstance(self.exclude_modules, str):
@@ -76,7 +80,8 @@ class ModuleMatcher:
     # Public API                                                            #
     # --------------------------------------------------------------------- #
     def match(self, m: nn.Module, name: str = None, prefix: str = None):
-        """Return (pattern, full_name) if the module matches; otherwise None.
+        """
+        Return (pattern, full_name) if the module matches; otherwise None.
         """
         full_name = f"{prefix}.{name}" if prefix else name
 

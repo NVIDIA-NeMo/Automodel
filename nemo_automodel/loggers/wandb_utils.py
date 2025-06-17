@@ -15,8 +15,10 @@ import logging
 
 
 def suppress_wandb_log_messages():
-    """Patches wandb logger to suppress upload messages, commonly occuring on KeyboardInterrupt
-    or program crash.
+    """
+    Patches wandb logger to suppress upload messages.
+
+    These occur usually on KeyboardInterrupt or program crash.
 
     To print the log url:
     run = wandb.init(...)

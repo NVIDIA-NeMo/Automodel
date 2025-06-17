@@ -22,15 +22,15 @@ import yaml
 
 
 def translate_value(v):
-    """Convert a string token into the corresponding Python object.
+    """
+    Convert a string token into the corresponding Python object.
 
     This function first checks for a handful of special symbols (None/true/false),
     then falls back to `ast.literal_eval`, and finally to returning the original
     string if parsing fails.
 
     Args:
-        v (str):
-            The raw string value to translate.
+        v (str): The raw string value to translate.
 
     Returns:
         The translated Python value, which may be:
@@ -57,7 +57,9 @@ def translate_value(v):
             return v
 
 def _resolve_target(dotted_path: str):
-    """Resolve a dotted path to a Python object.
+    """
+    Resolve a dotted path to a Python object.
+
     1) Find the longest importable module prefix.
     2) getattr() the rest.
     3) If that fails, fall back to scanning sys.path for .py or package dirs.
@@ -112,7 +114,8 @@ def _resolve_target(dotted_path: str):
 
 
 class ConfigNode:
-    """A configuration node that wraps a dictionary (or parts of it) from a YAML file.
+    """
+    A configuration node that wraps a dictionary (or parts of it) from a YAML file.
 
     This class allows nested dictionaries and lists to be accessed as attributes and
     provides functionality to instantiate objects from configuration.
@@ -183,7 +186,8 @@ class ConfigNode:
         return func(*args, **config_kwargs)
 
     def _instantiate_value(self, v):
-        """Recursively instantiate configuration values.
+        """
+        Recursively instantiate configuration values.
 
         Args:
             v: The configuration value.
@@ -201,7 +205,8 @@ class ConfigNode:
             return translate_value(v)
 
     def to_dict(self):
-        """Convert the configuration node back to a dictionary.
+        """
+        Convert the configuration node back to a dictionary.
 
         Returns:
             dict: A dictionary representation of the configuration node.
@@ -211,7 +216,8 @@ class ConfigNode:
         }
 
     def _unwrap(self, v):
-        """Recursively convert wrapped configuration values to basic Python types.
+        """
+        Recursively convert wrapped configuration values to basic Python types.
 
         Args:
             v: The configuration value.
@@ -227,7 +233,8 @@ class ConfigNode:
             return v
 
     def get(self, key, default=None):
-        """Retrieve a configuration value using a dotted key.
+        """
+        Retrieve a configuration value using a dotted key.
 
         If any component of the path is missing, returns the specified default value.
 
@@ -260,7 +267,9 @@ class ConfigNode:
         return current
 
     def set_by_dotted(self, dotted_key: str, value):
-        """Set (or append) a value in the config using a dotted key.
+        """
+        Set (or append) a value in the config using a dotted key.
+
         e.g. set_by_dotted("foo.bar.abc", 1) will ensure self.foo.bar.abc == 1
         """
         parts = dotted_key.split(".")
@@ -274,7 +283,8 @@ class ConfigNode:
         node.__dict__[parts[-1]] = node._wrap(parts[-1], value)
 
     def __repr__(self, level=0):
-        """Return a string representation of the configuration node with indentation.
+        """
+        Return a string representation of the configuration node with indentation.
 
         Args:
             level (int): The current indentation level.
@@ -287,7 +297,8 @@ class ConfigNode:
         return "\n#path: " + "\n".join(lines) + f"\n{indent}"
 
     def _repr_value(self, value, level):
-        """Format a configuration value for the string representation.
+        """
+        Format a configuration value for the string representation.
 
         Args:
             value: The configuration value.
@@ -306,7 +317,8 @@ class ConfigNode:
             return repr(value)
 
     def __str__(self):
-        """Return a string representation of the configuration node.
+        """
+        Return a string representation of the configuration node.
 
         Returns:
             str: The string representation.
@@ -314,7 +326,8 @@ class ConfigNode:
         return self.__repr__(level=0)
 
     def __contains__(self, key):
-        """Check if a dotted key exists in the configuration.
+        """
+        Check if a dotted key exists in the configuration.
 
         Args:
             key (str): The dotted key to check.
@@ -333,7 +346,8 @@ class ConfigNode:
         return current != self
 
 def load_yaml_config(path):
-    """Load a YAML configuration file and convert it to a ConfigNode.
+    """
+    Load a YAML configuration file and convert it to a ConfigNode.
 
     Args:
         path (str): The path to the YAML configuration file.

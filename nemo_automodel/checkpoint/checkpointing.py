@@ -35,7 +35,8 @@ import glob
 
 @dataclass
 class CheckpointingConfig:
-    """Configuration for checkpointing.
+    """
+    Configuration for checkpointing.
     """
     enabled: bool
     checkpoint_dir: str | Path
@@ -45,7 +46,9 @@ class CheckpointingConfig:
     save_consolidated: bool
 
     def __post_init__(self):
-        # Convert a raw string such as "safetensors" into the right Enum
+        """
+        Convert a raw string such as "safetensors" into the right Enum.
+        """
         if isinstance(self.model_save_format, str):
             self.model_save_format = SerializationFormat[
                 self.model_save_format.upper()
@@ -57,7 +60,8 @@ def save_model(
         weights_path: str,
         checkpoint_config: CheckpointingConfig,
 ):
-    """Save a model state dictionary to a weights path.
+    """
+    Save a model state dictionary to a weights path.
 
     This function can save a model in the following formats:
     - safetensors (in HF format)
@@ -96,7 +100,7 @@ def save_model(
         torch.distributed.barrier()
 
     model_state = ModelState(model, checkpoint_config.model_save_format)
-    
+
     if checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
         fqn_to_file_index_mapping = None
         if checkpoint_config.save_consolidated:
@@ -121,7 +125,17 @@ def save_model(
                             print(f"Adding missing key to mapping: {fqn}")
                         fqn_to_file_index_mapping[fqn] = default_index
 
+<<<<<<< HEAD
         storage_writer = _HuggingFaceStorageWriter(
+=======
+        for fqn in model_state_dict_keys:
+            if fqn not in fqn_to_file_index_mapping:
+                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                    print(f"Adding missing key to mapping: {fqn}")
+                fqn_to_file_index_mapping[fqn] = default_index
+
+        storage_writer = HuggingFaceStorageWriter(
+>>>>>>> 356fc8b (fix)
             path=model_path,
             save_sharded=True,
             consolidated_output_path=consolidated_model_path,
@@ -144,7 +158,8 @@ def load_model(
     weights_path: str,
     checkpoint_config: CheckpointingConfig,
 ):
-    """Load a model state dictionary from a weights path.
+    """
+    Load a model state dictionary from a weights path.
 
     Args:
         model: Model to load state into
@@ -180,7 +195,8 @@ def save_optimizer(
     weights_path: str,
     scheduler: Optional[Any] = None,
 ):
-    """Save an optimizer state dictionary to a weights path.
+    """
+    Save an optimizer state dictionary to a weights path.
 
     Args:
         optimizer: Optimizer to save
@@ -201,7 +217,8 @@ def load_optimizer(
     weights_path: str,
     scheduler: Optional[Any] = None,
 ):
-    """Load an optimizer state dictionary from a weights path.
+    """
+    Load an optimizer state dictionary from a weights path.
 
     Args:
         optimizer: Optimizer to load state into
@@ -218,8 +235,10 @@ def load_optimizer(
 
 
 def _get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
-    """Return the directory containing the first `model.safetensors.index.json` found
-    for a given model, or ``None`` if it does not exist in the cache yet.
+    """
+    Return the directory containing the first `model.safetensors.index.json` found for given model.
+
+    If no `model.safetensors.index.json` is found then it returns None.
 
     For example, if the file located is
 
