@@ -18,6 +18,7 @@ _OVERRIDES = [
     "checkpoint.checkpoint_dir",
     "checkpoint.model_save_format",
     "dataloader.batch_size",
+    "checkpoint.save_consolidated",
 ]
 
 

@@ -106,20 +106,21 @@ def save_model(
                 checkpoint_config.model_cache_dir,
                 checkpoint_config.model_repo_id,
             )
-            fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(index_path)
+            if index_path:
+                fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(index_path)
 
-            # Add any missing keys from the model_state_dict
-            # These will go to the same file as the last file (or file 1 for single-file models)
-            default_index = max(fqn_to_file_index_mapping.values())
+                # Add any missing keys from the model_state_dict
+                # These will go to the same file as the last file (or file 1 for single-file models)
+                default_index = max(fqn_to_file_index_mapping.values())
 
-            # TODO:(@adil-a): This will need to change when we add PP. Maybe we can cache the keys in ModelState.
-            for fqn in list(model.state_dict().keys()):
-                if fqn not in fqn_to_file_index_mapping:
-                    if model_state.is_tied_lm_head and fqn == "lm_head.weight":
-                        continue
-                    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                        print(f"Adding missing key to mapping: {fqn}")
-                    fqn_to_file_index_mapping[fqn] = default_index
+                # TODO:(@adil-a): This will need to change when we add PP. Maybe we can cache the keys in ModelState.
+                for fqn in list(model.state_dict().keys()):
+                    if fqn not in fqn_to_file_index_mapping:
+                        if model_state.is_tied_lm_head and fqn == "lm_head.weight":
+                            continue
+                        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                            print(f"Adding missing key to mapping: {fqn}")
+                        fqn_to_file_index_mapping[fqn] = default_index
 
         storage_writer = _HuggingFaceStorageWriter(
             path=model_path,
