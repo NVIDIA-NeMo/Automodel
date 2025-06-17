@@ -23,8 +23,7 @@ import yaml
 
 @contextmanager
 def safe_yaml_representers() -> Generator[None, None, None]:
-    """
-    Context manager for safely adding and removing custom YAML representers.
+    """Context manager for safely adding and removing custom YAML representers.
 
     Temporarily adds custom representers for functions, classes, and other objects
     to the YAML SafeDumper, and restores the original representers when exiting
@@ -96,8 +95,7 @@ def _torch_dtype_representer(dumper, data):
 
 
 def _safe_object_representer(dumper, data):
-    """
-    General object representer for YAML.
+    """General object representer for YAML.
 
     This function is a fallback for objects that don't have specific representers.
     If the object has __qualname__ attr,

@@ -14,20 +14,24 @@
 
 import math
 from typing import Literal, Optional
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from nemo_automodel.shared.import_utils import safe_import
-from nemo_automodel._peft.lora_kernel import lora_forward_wrapper, lora_da_dx_update_wrapper, \
-    lora_db_update_wrapper
+from nemo_automodel._peft.lora_kernel import (
+    lora_da_dx_update_wrapper,
+    lora_db_update_wrapper,
+    lora_forward_wrapper,
+)
 from nemo_automodel._peft.module_matcher import ModuleMatcher
+from nemo_automodel.shared.import_utils import safe_import
+
 HAS_BNB, bitsandbytes = safe_import("bitsandbytes")
 
 
 class LinearLoRA(nn.Linear):
-    """
-    Linear + LoRA, maintains ckpts structure (i.e. Linear's weight/bias remain at the same FQN)
+    """Linear + LoRA, maintains ckpts structure (i.e. Linear's weight/bias remain at the same FQN)
 
     The _init_wrapper and _forward methods provide the LoRA functionality. We want to be able to
     use those inside LinearLoRA but also for monkey-patching modules, without repeating the
@@ -128,8 +132,7 @@ class LinearLoRA(nn.Linear):
         obj.dropout_position = dropout_position
 
     def forward(self, x):
-        """
-        Forward pass through the original linear layer augmented with the LoRA pathway.
+        """Forward pass through the original linear layer augmented with the LoRA pathway.
 
         Applies LoRA either before or after the dropout, depending on the configuration.
         The result of the original linear transformation is combined with the LoRA output.
@@ -160,8 +163,7 @@ class LinearLoRA(nn.Linear):
 
 
 class TritonLinearLoRA(LinearLoRA):
-    """
-    Subclass of LinearLoRA that uses triton kernels for forward and backward passes.
+    """Subclass of LinearLoRA that uses triton kernels for forward and backward passes.
 
     Args:
         orig_linear (nn.Module): the linear module to augment.
@@ -230,7 +232,6 @@ def patch_linear_module(
     Returns:
         (nn.Module): the monkey-patched (nn.Linear + LoRA) nn.Module
     """
-
     assert isinstance(orig_linear, nn.Linear), type(orig_linear)
     assert not hasattr(orig_linear, 'super_fwd'), orig_linear.super_fwd
 
@@ -271,8 +272,7 @@ def apply_lora_to_linear_modules(
     lora_dtype: Optional[torch.dtype] = None,
     use_triton: bool = True
 ):
-    """
-    Replace selected nn.Linear layers with LinearLoRA layers (in-place).
+    """Replace selected nn.Linear layers with LinearLoRA layers (in-place).
 
     target_modules accepts wildcard fragments, e.g. ["q_proj", "k_proj", ".*fc.*"].
     """
@@ -299,13 +299,11 @@ def apply_lora_to_linear_modules(
 
 
 class LoRATritonFunction(torch.autograd.Function):
-    """
-    Autograd function that calls the triton kernel wrappers for the LoRA forward and backward passes.
+    """Autograd function that calls the triton kernel wrappers for the LoRA forward and backward passes.
     """
     @staticmethod
     def setup_context(ctx, inputs, output):
-        """
-        Stores context for LoRA backward pass.
+        """Stores context for LoRA backward pass.
         """
         x, lora_A, lora_B, scale, _ = inputs
         ctx.save_for_backward(x, lora_A, lora_B)
@@ -313,8 +311,7 @@ class LoRATritonFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(x, lora_A, lora_B, scale, dtype):
-        """
-        Forward method for LoRA. Reshapes 3D tensors into 2D and then calls the triton kernel.
+        """Forward method for LoRA. Reshapes 3D tensors into 2D and then calls the triton kernel.
         """
         reshape = x.dim() == 3
         if reshape:
@@ -330,8 +327,7 @@ class LoRATritonFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, d_y):
-        """
-        Backward method for LoRA. Reshapes 3D tensors into 2D and then calls the kernels to update
+        """Backward method for LoRA. Reshapes 3D tensors into 2D and then calls the kernels to update
         d_lora_a, d_lora_b, and dx.
         """
         x, lora_A, lora_B = ctx.saved_tensors

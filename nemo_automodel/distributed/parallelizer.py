@@ -34,9 +34,17 @@ from torch.distributed.tensor.parallel import (
 HAVE_NVFSDP = False
 try:
     from nvfsdp import fully_shard as nvfsdp_fully_shard
+<<<<<<< HEAD
     HAVE_NVFSDP = True
 except:
     pass
+=======
+    HAVE_NVFSDP_FULLY_SHARD = True
+
+except ImportError:
+    from nvfsdp import DistributedDataParallelConfig, nvFSDP
+    HAVE_NVFSDP_FULLY_SHARD = False
+>>>>>>> e79f416 (add ruff linter)
 
 
 # Taken and modified from torchtitan
@@ -67,7 +75,6 @@ def fsdp2_strategy_parallelize(
     because the model parallel strategy does not respect all settings of `Fabric(precision=...)` at the moment.
     NOTE: Currently, the user should make sure that custom_tp_plan is compatible with the model architecture.
     """
-
     if not mp_policy:
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16, reduce_dtype=torch.float32
@@ -131,8 +138,7 @@ def fsdp2_strategy_parallelize(
 
 
 def import_classes_from_paths(class_paths: List[str]):
-    """
-    Helper function to import classes from string paths.
+    """Helper function to import classes from string paths.
 
     Args:
         class_paths (List[str]): The list of string paths to the classes.
@@ -232,8 +238,7 @@ def nvfsdp_strategy_parallelize(
 
 
 def get_hf_tp_shard_plan(model):
-    """
-    Get the tensor parallel sharding plan from the model.
+    """Get the tensor parallel sharding plan from the model.
     """
     hf_tp_shard_plan = {}
     if hasattr(model, "_tp_plan") and model._tp_plan is not None:
@@ -251,8 +256,7 @@ def get_hf_tp_shard_plan(model):
 
 @lru_cache
 def translate_to_torch_parallel_style(style: str):
-    """
-    In model configurations, we use a neutral type (string) to specify parallel
+    """In model configurations, we use a neutral type (string) to specify parallel
     styles, here we translate them into torch.distributed tensor-parallel
     types.
     """
@@ -274,8 +278,7 @@ def translate_to_torch_parallel_style(style: str):
 
 
 def to_cpu(v):
-    """
-    Move a tensor or distributed tensor to the CPU.
+    """Move a tensor or distributed tensor to the CPU.
 
     This function takes an input tensor, which can be either a `DTensor` (distributed tensor)
     or a standard `Tensor`, and ensures that it is moved to the CPU.
@@ -331,8 +334,7 @@ def create_context_parallel_ctx(
     cp_no_restore_buffers: Set[torch.Tensor],
     cp_rotate_method: str,
 ):
-    """
-    Create a context parallel context.
+    """Create a context parallel context.
 
     Args:
         cp_mesh (DeviceMesh): The device mesh for context parallel.
@@ -356,8 +358,7 @@ def create_context_parallel_ctx(
 
 # based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/utils.py#L138
 def get_train_context(enable_loss_parallel: bool, enable_compiled_autograd: bool):
-    """
-    Create a train context.
+    """Create a train context.
 
     Args:
         enable_loss_parallel (bool): Whether to enable loss parallelism.

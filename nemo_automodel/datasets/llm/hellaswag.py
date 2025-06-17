@@ -13,11 +13,12 @@
 # limitations under the License.
 
 from datasets import load_dataset
+
 from nemo_automodel.datasets.utils import SFTSingleTurnPreprocessor
 
+
 class HellaSwag:
-    """
-    A dataset wrapper for the HellaSwag benchmark, tailored for single-turn supervised fine-tuning (SFT).
+    """A dataset wrapper for the HellaSwag benchmark, tailored for single-turn supervised fine-tuning (SFT).
 
     This class loads and preprocesses the HellaSwag dataset using a tokenizer and a custom preprocessing
     pipeline for language model fine-tuning. The dataset consists of context and multiple-choice endings,
@@ -27,8 +28,7 @@ class HellaSwag:
         dataset (Dataset): The processed dataset ready for model training or evaluation.
     """
     def __init__(self, path_or_dataset, tokenizer, split='train', num_samples_limit=None, trust_remote_code=True):
-        """
-        Initialize the HellaSwag dataset wrapper.
+        """Initialize the HellaSwag dataset wrapper.
 
         Args:
             path_or_dataset (str or Dataset): Path to the dataset or a HuggingFace Dataset object.
@@ -48,8 +48,7 @@ class HellaSwag:
 
 
     def get_context(self, examples):
-        """
-        Extracts the context part of each example.
+        """Extracts the context part of each example.
 
         Args:
             examples (dict): A dictionary containing example data with a "ctx" key.
@@ -60,8 +59,7 @@ class HellaSwag:
         return examples["ctx"]
 
     def get_target(self, examples):
-        """
-        Extracts the correct ending based on the label.
+        """Extracts the correct ending based on the label.
 
         Args:
             examples (dict): A dictionary with "endings" (list of strings) and "label" (index of correct ending).
@@ -74,8 +72,7 @@ class HellaSwag:
         ]
 
     def __getitem__(self, index):
-        """
-        Get a processed example by index.
+        """Get a processed example by index.
 
         Args:
             index (int): Index of the example.
@@ -88,8 +85,7 @@ class HellaSwag:
         return ans
 
     def __len__(self):
-        """
-        Get the number of examples in the dataset.
+        """Get the number of examples in the dataset.
 
         Returns:
             int: Length of the processed dataset.

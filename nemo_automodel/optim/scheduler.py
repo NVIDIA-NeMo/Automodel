@@ -124,7 +124,6 @@ class OptimizerParamScheduler:
         Args:
             param_group (dict): parameter group from the optimizer.
         """
-
         max_lr = param_group.get("max_lr", self.max_lr)
         min_lr = param_group.get("min_lr", self.min_lr)
 
@@ -219,7 +218,6 @@ class OptimizerParamScheduler:
             sd_value (float): checkpoint value
             name (str): name of the parameter
         """
-
         if self.override_opt_param_scheduler:
             log_single_rank(logger, logging.INFO, f" > overriding {name} value to {cls_value}")
             return cls_value
@@ -239,7 +237,6 @@ class OptimizerParamScheduler:
         Args:
             state_dict (dict): state dict to be load
         """
-
         if "start_lr" in state_dict:
             max_lr_ = state_dict["start_lr"]
         else:

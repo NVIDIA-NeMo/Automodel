@@ -12,21 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import re
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
-import os
+
 from nemo_automodel.checkpoint.checkpointing import (
-    save_model,
-    save_optimizer,
     load_model,
     load_optimizer,
+    save_model,
+    save_optimizer,
 )
-from pathlib import Path
-import re
+
 
 def has_load_restore_state(object):
-    """ Checks whether object has load_state_dict and state_dict functions, ie whether the object
+    """Checks whether object has load_state_dict and state_dict functions, ie whether the object
     follows the nn.Module API.
 
     TODO: also need to check function signatures.
@@ -43,11 +46,10 @@ def has_load_restore_state(object):
     )
 
 class BaseRecipe:
-    """
-    Checkpoint registry
+    """Checkpoint registry
     """
     def __setattr__(self, key, value):
-        """ Overriden __setattr__ to keep track of stateful classes.
+        """Overriden __setattr__ to keep track of stateful classes.
 
         Args:
             key (str): attribute named.
@@ -60,7 +62,7 @@ class BaseRecipe:
         # assuming no one will do recipe.__dict__['__state_tracked'] = None
         if key == '__state_tracked':
             raise ValueError("cannot set __state_tracked")
-        if not '__state_tracked' in self.__dict__:
+        if '__state_tracked' not in self.__dict__:
             self.__dict__['__state_tracked'] = set()
         # Track stateful objects unless they are validation/eval components.
         should_track = (
@@ -73,8 +75,7 @@ class BaseRecipe:
         super().__setattr__(key, value)
 
     def save_checkpoint(self, epoch: int, step: int):
-        """
-        Save the current training state as a checkpoint.
+        """Save the current training state as a checkpoint.
 
         As long as the object has a 'load_state_dict' and 'state_dict' function, it will be saved.
 
@@ -113,8 +114,7 @@ class BaseRecipe:
         save_optimizer(optimizer, model, path)
     
     def load_checkpoint(self, restore_from: str | None = None):
-        """
-        Load the latest checkpoint.
+        """Load the latest checkpoint.
         """
         if not self.checkpoint_config.enabled:
             if (
@@ -156,8 +156,7 @@ class BaseRecipe:
     
 
 def _find_latest_checkpoint(checkpoint_dir):
-    """
-    Find the latest checkpoint in the checkpoint directory.
+    """Find the latest checkpoint in the checkpoint directory.
     """
     checkpoint_dir = Path(checkpoint_dir)
     if not checkpoint_dir.exists():

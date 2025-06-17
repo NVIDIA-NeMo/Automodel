@@ -265,7 +265,7 @@ def safe_import(module, *, msg=None, alt=None):
         An optional module to be used in place of the given module if it
         fails to import
 
-    Returns
+    Returns:
     -------
     Tuple(bool, object)
         The imported module, the given alternate, or a class derived from
@@ -311,7 +311,7 @@ def safe_import_from(module, symbol, *, msg=None, alt=None, fallback_module=None
         Alternative name of the model in which the symbol is defined. The function will first to
         import using the `module` value and if that fails will also try the `fallback_module`.
 
-    Returns
+    Returns:
     -------
     Tuple(object, bool)
         The imported symbol, the given alternate, or a class derived from
@@ -357,13 +357,12 @@ def gpu_only_import(module, *, alt=None):
         An optional module to be used in place of the given module if it
         fails to import in a non-GPU-enabled install
 
-    Returns
+    Returns:
     -------
     object
         The imported module, the given alternate, or a class derived from
         UnavailableMeta.
     """
-
     return safe_import(
         module,
         msg=f"{module} is not enabled in non GPU-enabled installations or environemnts. {GPU_INSTALL_STRING}",
@@ -390,7 +389,7 @@ def gpu_only_import_from(module, symbol, *, alt=None):
         An optional object to be used in place of the given symbol if it fails
         to import in a non-GPU-enabled install
 
-    Returns
+    Returns:
     -------
     object
         The imported symbol, the given alternate, or a class derived from
@@ -405,7 +404,7 @@ def gpu_only_import_from(module, symbol, *, alt=None):
 
 
 def get_torch_version():
-    """return pytorch version with fallback if unavailable
+    """Return pytorch version with fallback if unavailable
 
     Returns:
         PkgVersion: Pytorch's version

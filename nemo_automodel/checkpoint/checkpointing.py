@@ -15,12 +15,12 @@
 """Checkpoint management utilities for HF models."""
 
 import os
-from typing import Any, Optional
 from dataclasses import dataclass
 from pathlib import Path
 
+import glob
+
 import torch
-import torch.nn as nn
 import torch.distributed
 import torch.distributed.checkpoint as dcp
 from nemo_automodel.checkpoint._backports.hf_storage import (
@@ -34,8 +34,7 @@ import glob
 
 @dataclass
 class CheckpointingConfig:
-    """
-    Configuration for checkpointing.
+    """Configuration for checkpointing.
     """
     enabled: bool
     checkpoint_dir: str | Path
@@ -57,8 +56,7 @@ def save_model(
         weights_path: str,
         checkpoint_config: CheckpointingConfig,
 ):
-    """
-    Save a model state dictionary to a weights path.
+    """Save a model state dictionary to a weights path.
 
     This function can save a model in the following formats:
     - safetensors (in HF format)
@@ -145,8 +143,7 @@ def load_model(
     weights_path: str,
     checkpoint_config: CheckpointingConfig,
 ):
-    """
-    Load a model state dictionary from a weights path.
+    """Load a model state dictionary from a weights path.
 
     Args:
         model: Model to load state into
@@ -182,8 +179,7 @@ def save_optimizer(
     weights_path: str,
     scheduler: Optional[Any] = None,
 ):
-    """
-    Save an optimizer state dictionary to a weights path.
+    """Save an optimizer state dictionary to a weights path.
 
     Args:
         optimizer: Optimizer to save
@@ -204,8 +200,7 @@ def load_optimizer(
     weights_path: str,
     scheduler: Optional[Any] = None,
 ):
-    """
-    Load an optimizer state dictionary from a weights path.
+    """Load an optimizer state dictionary from a weights path.
 
     Args:
         optimizer: Optimizer to load state into
@@ -222,8 +217,7 @@ def load_optimizer(
 
 
 def _get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
-    """
-    Return the directory containing the first `model.safetensors.index.json` found
+    """Return the directory containing the first `model.safetensors.index.json` found
     for a given model, or ``None`` if it does not exist in the cache yet.
 
     For example, if the file located is

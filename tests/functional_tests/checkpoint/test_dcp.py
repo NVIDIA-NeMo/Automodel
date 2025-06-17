@@ -19,16 +19,17 @@ import os
 import shutil
 from pathlib import Path
 
-from recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction
-from nemo_automodel.config.cli import parse_args_and_load_config
-from nemo_automodel.checkpoint.stateful_wrappers import ModelState, OptimizerState
 import torch
-import torch.distributed.tensor
 import torch.distributed.checkpoint as dcp
+import torch.distributed.tensor
+
+from nemo_automodel.checkpoint.stateful_wrappers import ModelState, OptimizerState
+from nemo_automodel.config.cli import parse_args_and_load_config
+from recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction
+
 
 def load_dcp(ckpt_dir: Path | str) -> dict[str, torch.Tensor]:
-    """
-    Loads a DCP checkpoint in a state dictionary from a directory.
+    """Loads a DCP checkpoint in a state dictionary from a directory.
 
     Args:
         ckpt_dir: The directory containing the DCP checkpoint.
@@ -56,14 +57,12 @@ def load_dcp(ckpt_dir: Path | str) -> dict[str, torch.Tensor]:
 def to_cpu(
         state_dict: dict[str, torch.Tensor | dict[str, torch.Tensor]],
     ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
-    """
-    Converts a state dictionary to CPU.
+    """Converts a state dictionary to CPU.
     """
     return {k: v.cpu() if isinstance(v, torch.Tensor) else to_cpu(v) for k, v in state_dict.items()}
 
 def test_dcp_checkpoint():
-    """
-    Tests DCP checkpoint
+    """Tests DCP checkpoint
     """
     expected_model_keys = {
         "model.embed_tokens.weight": ([16000, 512], torch.bfloat16, "cpu"),
@@ -507,7 +506,6 @@ def _flatten(d: dict, parent_key: str | None = None):
     ("optim" in our case) so that the resulting keys match the exact strings
     stored on disk by torch.distributed.checkpoint.
     """
-
     flat: dict[str, torch.Tensor] = {}
     for k, v in d.items():
         key = f"{parent_key}.{k}" if parent_key else k

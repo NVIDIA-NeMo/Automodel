@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from typing import Dict, List, Union
 
 import torch
@@ -19,7 +20,6 @@ from datasets import Dataset
 from torch.nn import functional as F
 from tqdm import tqdm
 
-import logging
 logger = logging.getLogger(__name__)
 
 CROSS_ENTROPY_IGNORE_IDX = -100
@@ -28,8 +28,7 @@ PACK_TYPE = Dict[str, Union[torch.Tensor, List[int]]]
 
 # based on https://github.com/pytorch/torchtune/blob/v0.6.1/torchtune/datasets/_packed.py#L17
 class PackedSequence:
-    """
-    Args:
+    """Args:
     dataset: Actual dataset (can be 'train', 'val' or 'test')
     split (str): Whether the dataset is 'train', 'val' or 'test'
     packed_sequence_size (int): Number of tokens in a pack
@@ -53,7 +52,6 @@ class PackedSequence:
         then append the buffer to self.packs as a single "packed" sample. Continue
         until max_packs or end of dataset.
         """
-
         # Only show progress bar on rank 0
         rank = (
             torch.distributed.get_rank()
@@ -124,15 +122,14 @@ class PackedSequence:
 
     def _should_stop_packing(self) -> bool:
         """If max packs is set, stop packing when we reach that number."""
-
         if self.max_packs is not None and len(self.packs) == self.max_packs:
             return True
         return False
 
     def _split_and_add_pack(self, current_pack: PACK_TYPE) -> PACK_TYPE:
         """Splits the current pack at the boundary, processes it, adds it to ``self.packs`` and
-        returns the start of the next pack."""
-
+        returns the start of the next pack.
+        """
         if self.split_across_pack:
             boundary = self.packed_sequence_size
             # The last elem in ``seq_lens`` ensures that ``sum(seq_lens) == self.packed_sequence_size``
@@ -245,8 +242,7 @@ class PackedSequence:
 
 
 def create_block_causal_mask(seq_lens: List[torch.Tensor]) -> torch.Tensor:
-    """
-    Given a batch tensor of seq lens defining the lengths of samples in each pack,
+    """Given a batch tensor of seq lens defining the lengths of samples in each pack,
     Construct a 2D block causal mask for each pack in the batch. For example, if
     a single sample's seq_lens is [3, 2, 1], the mask would be::
         mask = [
@@ -257,10 +253,12 @@ def create_block_causal_mask(seq_lens: List[torch.Tensor]) -> torch.Tensor:
             [0, 0, 0, 1, 1, 0],
             [0, 0, 0, 0, 0, 1],
         ]
+
     Args:
         seq_lens (List[torch.Tensor]): Sequence lengths of samples in each pack in the batch,
             shape (batch_size, n), where n is the max number of sequences in a pack and can vary
             across packs.
+
     Returns:
         Tensor: Block causal mask of shape (batch_size, packed_sequence_size, packed_sequence_size).
     """
@@ -285,13 +283,14 @@ def create_block_causal_mask(seq_lens: List[torch.Tensor]) -> torch.Tensor:
 
 
 def packed_block_causal_mask(seq_lens: List[torch.Tensor]):
-    """
-    Create a block causal document mask for a batch of packed sequences. A standard 2D block causal mask is created
+    """Create a block causal document mask for a batch of packed sequences. A standard 2D block causal mask is created
     and returned.
+
     Args:
         seq_lens (List[torch.Tensor]): Sequence lengths of samples in each pack in the batch,
             shape (batch_size, n), where n is the max number of sequences in a pack and can vary
             across packs.
+
     Returns:
         _MaskType: BlockMask or Tensor if torch version < 2.5.0.
     """

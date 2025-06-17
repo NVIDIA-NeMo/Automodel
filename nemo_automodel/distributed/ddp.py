@@ -13,15 +13,16 @@
 # limitations under the License.
 
 import os
+from dataclasses import dataclass, field
+
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from dataclasses import dataclass, field
+
 
 @dataclass
 class DDPManager:
-    """
-    Manages setting up distributed training using PyTorch's distributed package and wraps a model
+    """Manages setting up distributed training using PyTorch's distributed package and wraps a model
     with DistributedDataParallel (DDP).
 
     Attributes:
@@ -47,8 +48,7 @@ class DDPManager:
     )
 
     def setup_distributed(self):
-        """
-        Initialize the torch.distributed process group and set up device configuration.
+        """Initialize the torch.distributed process group and set up device configuration.
 
         This method requires the following environment variables to be set:
             - RANK: Global rank of the process.
@@ -78,8 +78,7 @@ class DDPManager:
             self.device = torch.device("cpu")
 
     def wrap_model(self, model):
-        """
-        Wraps the given model with DistributedDataParallel (DDP).
+        """Wraps the given model with DistributedDataParallel (DDP).
 
         Moves the model to the initialized device before wrapping. For CUDA devices,
         the device id is passed to DDP as device_ids; for CPU, no device ids are provided.

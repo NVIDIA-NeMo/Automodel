@@ -17,19 +17,16 @@ import os
 from functools import partial
 from logging import Filter, LogRecord
 from typing import Callable, Optional, Union
-import os
 
 logger = logging.getLogger(__name__)
 
 class RankFilter(logging.Filter):
-    """
-    A logging filter that controls log output based on the process rank.
+    """A logging filter that controls log output based on the process rank.
 
     This filter allows log messages only for rank 0 by default.
     """
     def filter(self, record):
-        """
-        Decide whether to log the provided record.
+        """Decide whether to log the provided record.
 
         Args:
             record (logging.LogRecord): The log record to be evaluated.

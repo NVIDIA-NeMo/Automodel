@@ -58,8 +58,7 @@ def __getattr__(name: str):
 
 
 def __dir__():
-    """
-    Expose the names of all available submodules for auto-completion.
+    """Expose the names of all available submodules for auto-completion.
     """
     return sorted(__all__)
 

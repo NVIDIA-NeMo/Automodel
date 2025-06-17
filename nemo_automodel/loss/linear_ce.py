@@ -117,8 +117,7 @@ def fused_linear_cross_entropy(
     logit_softcapping: float = 0,
     accuracy_threshold: str = "auto",
 ):
-    """
-    Compute fused linear cross entropy loss that matches PyTorch's cross_entropy behavior.
+    """Compute fused linear cross entropy loss that matches PyTorch's cross_entropy behavior.
 
     Args:
         hidden_states: Input hidden states

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import List, Optional
 
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
@@ -30,8 +30,7 @@ from nemo_automodel.distributed.parallelizer import (
 
 @dataclass
 class NVFSDPManager:
-    """
-    Manager for setting up and parallelizing models using nvFSDP with Tensor-Parallel,
+    """Manager for setting up and parallelizing models using nvFSDP with Tensor-Parallel,
     Data-Parallel, and Context-Parallel sharding strategies.
 
     This manager initializes the torch.distributed process group, infers the group sizes
@@ -134,14 +133,12 @@ class NVFSDPManager:
     )
 
     def __post_init__(self):
-        """
-        Post-initialization hook that sets up the distributed environment.
+        """Post-initialization hook that sets up the distributed environment.
         """
         return self._setup_distributed()
 
     def _setup_distributed(self):
-        """
-        Initializes the distributed environment:
+        """Initializes the distributed environment:
 
         - Checks availability and initialization of torch.distributed.
         - Infers data-parallel and tensor-parallel sizes if not provided.
@@ -190,8 +187,7 @@ class NVFSDPManager:
         return self
 
     def parallelize(self, model, use_hf_tp_plan=False):
-        """
-        Parallelizes the given model using FSDP2 and TP sharding strategies.
+        """Parallelizes the given model using FSDP2 and TP sharding strategies.
 
         This method must be called after the distributed environment has been set up.
         It selects a TP sharding plan (currently supporting Hugging Face

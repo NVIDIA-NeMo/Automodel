@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
 import math
+
+import torch
+
 
 def batchify(tensor):
     """Ensures that the input tensor has at least two dimensions by adding an extra batch dimension if necessary.
@@ -23,7 +25,7 @@ def batchify(tensor):
     tensor : torch.Tensor
         The input tensor to be batchified.
 
-    Returns
+    Returns:
     -------
     torch.Tensor
         The tensor with an extra dimension added if it was originally 1-dimensional.
@@ -44,7 +46,7 @@ def extract_key_from_dicts(batch, key):
     key : str
         The key whose values are to be extracted from each dictionary.
 
-    Returns
+    Returns:
     -------
     List
         A list of values associated with the specified key, in the same order as
@@ -64,7 +66,8 @@ def pad_within_micro(batch, pad_token_id, pad_seq_len_divisible=None):
         The token ID to use for padding shorter sequences.
     pad_seq_len_divisible : int
         The value to use for padding sequence length so that it is divisible by pad_seq_len_divisible.
-    Returns
+
+    Returns:
     -------
     List[List[int]]
         A batch of sequences where each inner list has been padded with the pad token
@@ -106,8 +109,7 @@ def default_collater(batch, pad_token_id=0, pad_seq_len_divisible=None):
 
 
 class SFTSingleTurnPreprocessor:
-    """
-    Generic single-turn text-to-text SFT (supervised-fine-tuning) pre-processor.
+    """Generic single-turn text-to-text SFT (supervised-fine-tuning) pre-processor.
 
     Parameters
     ----------
@@ -201,19 +203,17 @@ class SFTSingleTurnPreprocessor:
         return _pad
 
     def process(self, raw_dataset, ds):
-        """
-        Main entry.
+        """Main entry.
 
         Parameters
         ----------
         raw_dataset : datasets.DatasetDict  (e.g. returned by load_dataset)
         split        : Which split from raw_dataset to process.
 
-        Returns
+        Returns:
         -------
         datasets.DatasetDict  - tokenized + padded datasets (all splits preserved).
         """
-
         if not hasattr(self.tokenizer, 'pad_token') and hasattr(self.tokenizer, 'bos_token'):
             self.tokenizer.pad_token = self.tokenizer.bos_token
 

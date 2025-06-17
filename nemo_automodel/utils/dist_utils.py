@@ -16,22 +16,22 @@
 
 import logging
 import os
+from contextlib import ContextDecorator, nullcontext
 from datetime import datetime
 from typing import Any, Optional
 
 import torch
 import torch.distributed
-from contextlib import ContextDecorator, nullcontext
 import torch.distributed as dist
 import yaml
+
 from nemo_automodel.utils.yaml_utils import safe_yaml_representers
 
 logger = logging.getLogger(__name__)
 
 
 class FirstRankPerNode(ContextDecorator):
-    """
-    Context manager that:
+    """Context manager that:
       • Lets LOCAL_RANK==0 run the protected code first on each node.
       • Inserts an extra barrier across *only* the node‑local rank‑0 processes.
       • Works on a single GPU (no env flags, no distributed initialisation).
@@ -256,8 +256,7 @@ def reduce_loss(
 
 
 def get_sync_ctx(model, is_optim_step):
-    """
-    Get the synchronization context for the model.
+    """Get the synchronization context for the model.
 
     Args:
         model: The model to synchronize.
@@ -283,8 +282,7 @@ def get_sync_ctx(model, is_optim_step):
 
 @torch.no_grad()
 def rescale_gradients(model, num_tokens_for_grad_scaling, dp_group=None):
-    """
-    Rescale gradients across the DP group.
+    """Rescale gradients across the DP group.
 
     Args:
         model: The model to rescale.
@@ -305,8 +303,8 @@ def rescale_gradients(model, num_tokens_for_grad_scaling, dp_group=None):
 # based on: https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/utils.py#L278
 @torch.no_grad()
 def clip_gradients(model, clip_norm, foreach=True):
-    """
-    Clip gradients across the DP group.
+    """Clip gradients across the DP group.
+
     Args:
         model: The model to clip the gradients of.
         clip_norm: The maximum norm of the gradients.

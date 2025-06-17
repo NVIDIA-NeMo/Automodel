@@ -24,8 +24,7 @@ def make_squad_dataset(
     split='train',
     dataset_name="rajpurkar/squad",
 ):
-    """
-    Load and preprocess a SQuAD-style QA dataset for model fine-tuning.
+    """Load and preprocess a SQuAD-style QA dataset for model fine-tuning.
 
     This function retrieves the specified split of the SQuAD dataset, applies
     either a simple prompt–completion format or a chat‐template format

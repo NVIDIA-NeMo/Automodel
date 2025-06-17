@@ -25,8 +25,8 @@ from torch.utils.data.distributed import DistributedSampler
 
 from nemo_automodel.datasets.utils import (
     batchify,
-    pad_within_micro,
     extract_key_from_dicts,
+    pad_within_micro,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,8 +63,7 @@ def clean_split(name):
 
 
 def make_dataset_splits(dataset, split, split_aliases):
-    """
-    Given a dataset (e.g. from datasets.load_dataset or datasets.Dataset.from_dict) it
+    """Given a dataset (e.g. from datasets.load_dataset or datasets.Dataset.from_dict) it
     returns a dictionary containing the corresponding dataset splits.
 
     For example:
@@ -149,7 +148,7 @@ def make_dataset_splits(dataset, split, split_aliases):
 
 
 def has_dist_env_init_or_rank_env_var():
-    """returns whether it runs on a dist-environment"""
+    """Returns whether it runs on a dist-environment"""
     return dist.is_initialized() or int(os.environ.get("WORLD_SIZE", "0")) > 1
 
 

@@ -115,8 +115,7 @@ class DummyTimer(TimerBase):
 
 
 class Timer(TimerBase):
-    """
-    Timer class with ability to start/stop.
+    """Timer class with ability to start/stop.
 
     Comment on using `barrier`: If this flag is passed, then all
     the caller processes will wait till all reach the timing routine.
@@ -297,7 +296,6 @@ class Timers:
         Returns:
             torch.tensor: Tensor of size [world_size, len(names)] with times in float.
         """
-
         # First make sure all the callers are in sync.
         if barrier:
             torch.distributed.barrier()
@@ -328,7 +326,6 @@ class Timers:
 
     def _get_global_min_max_time(self, names, reset, barrier, normalizer):
         """Report only min and max times across all ranks."""
-
         rank_name_to_time = self._get_elapsed_time_all_ranks(names, reset, barrier)
         name_to_min_max_time = {}
         for i, name in enumerate(names):
@@ -403,7 +400,6 @@ class Timers:
         Returns:
             str: Formatted string with the timer values.
         """
-
         if names == None:  # get all registered timers
             names = self._timers.keys()
 
@@ -427,7 +423,7 @@ class Timers:
         reset: bool = True,
         barrier: bool = False,
     ):
-        """logs the timers passed in names to stdout. Example usage is to log average per step
+        """Logs the timers passed in names to stdout. Example usage is to log average per step
            value for timer 'foo', this function can be called with normalizer factor set to logging
            interval.
 
@@ -441,7 +437,6 @@ class Timers:
             barrier (bool, optional): Whether to do a global barrier before time measurments.
                                       Defaults to False.
         """
-
         output_string = self.get_all_timers_string(names, normalizer, reset, barrier)
         # If no input rank is provided, log on last rank.
         if rank is None:
