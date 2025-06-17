@@ -13,5 +13,6 @@
 # limitations under the License.
 
 from ._torch_backports import apply_patches as _nemo__apply_patches
-_nemo__apply_patches()
-
+import torch
+if torch.__version__ <= "2.7.1":
+    _nemo__apply_patches()
