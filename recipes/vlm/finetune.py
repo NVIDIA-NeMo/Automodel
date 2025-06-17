@@ -14,8 +14,9 @@ from torch.distributed.device_mesh import _mesh_resources
 
 try:
     from nvfsdp import nvFSDP
-except ImportError:
-    from nemo_automodel.distributed.nvfsdp.nvfsdp import nvFSDP
+    HAVE_NVFSDP = True
+except:
+    HAVE_NVFSDP = False
 
 from nemo_automodel.config.cli import parse_args_and_load_config
 from nemo_automodel.distributed.init_utils import initialize_distributed
@@ -495,7 +496,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 # TODO: TP WAR
                 grad_norm = 0.0
 
-            if isinstance(self.model, nvFSDP):
+            if HAVE_NVFSDP and isinstance(self.model, nvFSDP):
                 # If the model uses nvFSDP, wait for all sharded gradients to be reduced and unsharded.
                 # Necessary because the post-backward reduce-scatter is asynchronous, so gradients and backward
                 # computations are concurrent, but the gradients of the final layer may not be available yet.
@@ -504,7 +505,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.optimizer.step()
             self.optimizer.zero_grad()
 
-            if isinstance(self.model, nvFSDP):
+            if HAVE_NVFSDP and isinstance(self.model, nvFSDP):
                 # If custom FSDP2 is configured with "optim" (optimizer state / high-precision model weight sharding),
                 # then the optimizer step will be applied to the main high-precision model weights. Update the model
                 # weights after the optimizer step.

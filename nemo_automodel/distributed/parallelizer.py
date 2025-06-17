@@ -31,13 +31,12 @@ from torch.distributed.tensor.parallel import (
 )
 
 # TODO(boxiangw): Change to nvFSDP once it got published
+HAVE_NVFSDP = False
 try:
     from nvfsdp import fully_shard as nvfsdp_fully_shard
-    HAVE_NVFSDP_FULLY_SHARD = True
-
-except ImportError:
-    from nvfsdp import nvFSDP, DistributedDataParallelConfig
-    HAVE_NVFSDP_FULLY_SHARD = False
+    HAVE_NVFSDP = True
+except:
+    pass
 
 
 # Taken and modified from torchtitan
@@ -184,6 +183,9 @@ def nvfsdp_strategy_parallelize(
     NOTE: Currently, the user should make sure that custom_tp_plan is compatible with the model architecture.
     """
 
+    assert HAVE_NVFSDP, "nvFSDP is not installed, please visit \
+        https://github.com/NVIDIA-NeMo/nvFSDP for more information"
+
     # DP_CP ranks are sharded by FSDP.
     dp_mesh = device_mesh[
         (
@@ -206,53 +208,25 @@ def nvfsdp_strategy_parallelize(
     nvfsdp_unit_modules = import_classes_from_paths(nvfsdp_unit_modules)
 
     # Wrap model with nvFSDP.
-    if HAVE_NVFSDP_FULLY_SHARD:
-        model = nvfsdp_fully_shard(
-            module=model,
-            fsdp_unit_modules=nvfsdp_unit_modules,
-            dp_cp_group=dp_mesh.get_group(),
-            init_model_with_meta_device=init_nvfsdp_with_meta_device,
-            data_parallel_sharding_strategy=data_parallel_sharding_strategy,
-            init_nvfsdp_with_meta_device=init_nvfsdp_with_meta_device,
-            grad_reduce_in_fp32=grad_reduce_in_fp32,
-            preserve_fp32_weights=preserve_fp32_weights,
-            overlap_grad_reduce=overlap_grad_reduce,
-            overlap_param_gather=overlap_param_gather,
-            check_for_nan_in_grad=check_for_nan_in_grad,
-            average_in_collective=average_in_collective,
-            disable_bucketing=disable_bucketing,
-            calculate_per_token_loss=calculate_per_token_loss,
-            keep_fp8_transpose_cache_when_using_custom_fsdp=keep_fp8_transpose_cache_when_using_custom_fsdp,
-            nccl_ub=nccl_ub,
-            fsdp_double_buffer=fsdp_double_buffer,
-        )
-    else:
-        # Default DDP config for nvFSDP.
-        # data_parallel_sharding_strategy="optim_grads_params" is required to shard the parameters. (ZeRO-3)
-        nvfsdp_config = DistributedDataParallelConfig(
-            data_parallel_sharding_strategy=data_parallel_sharding_strategy,
-            init_nvfsdp_with_meta_device=init_nvfsdp_with_meta_device,
-            grad_reduce_in_fp32=grad_reduce_in_fp32,
-            preserve_fp32_weights=preserve_fp32_weights,
-            overlap_grad_reduce=overlap_grad_reduce,
-            overlap_param_gather=overlap_param_gather,
-            check_for_nan_in_grad=check_for_nan_in_grad,
-            average_in_collective=average_in_collective,
-            disable_bucketing=disable_bucketing,
-            calculate_per_token_loss=calculate_per_token_loss,
-            keep_fp8_transpose_cache_when_using_custom_fsdp=keep_fp8_transpose_cache_when_using_custom_fsdp,
-            nccl_ub=nccl_ub,
-            fsdp_double_buffer=fsdp_double_buffer,
-        )
-        
-        model = nvFSDP(
-            module=model,
-            ddp_config=nvfsdp_config,
-            fsdp_unit_modules=nvfsdp_unit_modules,
-            dp_cp_group=dp_mesh.get_group(),
-            calculate_per_token_loss=False,
-            init_model_with_meta_device=init_nvfsdp_with_meta_device,
-        )
+    model = nvfsdp_fully_shard(
+        module=model,
+        fsdp_unit_modules=nvfsdp_unit_modules,
+        dp_cp_group=dp_mesh.get_group(),
+        init_model_with_meta_device=init_nvfsdp_with_meta_device,
+        data_parallel_sharding_strategy=data_parallel_sharding_strategy,
+        init_nvfsdp_with_meta_device=init_nvfsdp_with_meta_device,
+        grad_reduce_in_fp32=grad_reduce_in_fp32,
+        preserve_fp32_weights=preserve_fp32_weights,
+        overlap_grad_reduce=overlap_grad_reduce,
+        overlap_param_gather=overlap_param_gather,
+        check_for_nan_in_grad=check_for_nan_in_grad,
+        average_in_collective=average_in_collective,
+        disable_bucketing=disable_bucketing,
+        calculate_per_token_loss=calculate_per_token_loss,
+        keep_fp8_transpose_cache_when_using_custom_fsdp=keep_fp8_transpose_cache_when_using_custom_fsdp,
+        nccl_ub=nccl_ub,
+        fsdp_double_buffer=fsdp_double_buffer,
+    )
 
     return model
 
