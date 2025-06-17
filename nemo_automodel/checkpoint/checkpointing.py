@@ -125,17 +125,7 @@ def save_model(
                             print(f"Adding missing key to mapping: {fqn}")
                         fqn_to_file_index_mapping[fqn] = default_index
 
-<<<<<<< HEAD
         storage_writer = _HuggingFaceStorageWriter(
-=======
-        for fqn in model_state_dict_keys:
-            if fqn not in fqn_to_file_index_mapping:
-                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                    print(f"Adding missing key to mapping: {fqn}")
-                fqn_to_file_index_mapping[fqn] = default_index
-
-        storage_writer = HuggingFaceStorageWriter(
->>>>>>> 356fc8b (fix)
             path=model_path,
             save_sharded=True,
             consolidated_output_path=consolidated_model_path,
