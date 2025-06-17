@@ -570,5 +570,3 @@ def _flatten(d: dict, parent_key: str | None = None):
         else:
             flat[key] = v
     return flat
-
-test_hf_sharded_checkpoint()

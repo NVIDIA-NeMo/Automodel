@@ -432,10 +432,6 @@ def _write_element_by_element(
     # element, write one contiguous slice along the innermost dimension (i.e.,
     # the full "row" in C-order tensors). This reduces system-calls from
     # O(total_elements) to O(outer_elements).
-
-    inner_dim = tensor_shape[-1]
-    inner_dim_bytes = inner_dim * element_size
-
     shard_inner_dim = sub_tensor_shape[-1]
     shard_inner_bytes = shard_inner_dim * element_size
 
