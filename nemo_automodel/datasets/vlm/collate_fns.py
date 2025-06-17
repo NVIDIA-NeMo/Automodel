@@ -1,10 +1,11 @@
-from typing import Dict
+
 import torch
-from nemo_automodel.datasets.vlm.utils import extract_skipped_token_ids
 from qwen_vl_utils import process_vision_info
 
+from nemo_automodel.datasets.vlm.utils import extract_skipped_token_ids
 
-def qwen2_5_collate_fn(examples: list, processor) -> Dict[str, torch.Tensor]:
+
+def qwen2_5_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
     """Collate function for Qwen2.5 VL model."""
     skipped_tokens = extract_skipped_token_ids(processor)
 
@@ -31,7 +32,7 @@ def qwen2_5_collate_fn(examples: list, processor) -> Dict[str, torch.Tensor]:
     return batch
 
 
-def default_collate_fn(examples: list, processor) -> Dict[str, torch.Tensor]:
+def default_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
     """Default collate function for VLM models."""
     skipped_tokens = extract_skipped_token_ids(processor)
 

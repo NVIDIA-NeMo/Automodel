@@ -13,16 +13,17 @@
 # limitations under the License.
 
 import os
+from dataclasses import dataclass, field
+
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from dataclasses import dataclass, field
+
 
 @dataclass
 class DDPManager:
     """
-    Manages setting up distributed training using PyTorch's distributed package and wraps a model
-    with DistributedDataParallel (DDP).
+    Manages setting up distributed training using PyTorch's DDP.
 
     Attributes:
         backend (str): The distributed backend to use (e.g. "nccl" or "gloo"). Defaults to "nccl".

@@ -19,8 +19,7 @@ import pytest
 
 
 def pytest_addoption(parser):
-    """
-    Additional command-line arguments passed to pytest.
+    """Additional command-line arguments passed to pytest.
     For now:
         --cpu: use CPU during testing (DEFAULT: GPU)
         --use_local_test_data: use local test data/skip downloading from URL/GitHub (DEFAULT: False)
@@ -92,8 +91,7 @@ def reset_env_vars():
 
 
 def pytest_configure(config):
-    """
-    Initial configuration of conftest.
+    """Initial configuration of conftest.
     The function checks if test_data.tar.gz is present in tests/.data.
     If so, compares its size with github's test_data.tar.gz.
     If file absent or sizes not equal, function downloads the archive from github and unpacks it.

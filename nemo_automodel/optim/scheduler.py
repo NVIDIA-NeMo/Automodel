@@ -10,11 +10,13 @@ from torch.optim.optimizer import Optimizer
 
 from nemo_automodel.utils.common_utils import log_single_rank
 
+
 logger = logging.getLogger(__name__)
 
 
 class OptimizerParamScheduler:
-    """Anneals learning rate and weight decay
+    """
+    Anneals learning rate and weight decay.
 
     Args:
         optimizer (Optimizer): the optimizer to be used
@@ -29,13 +31,12 @@ class OptimizerParamScheduler:
         wd_incr_steps (int): number of weight decay increment steps
         wd_incr_style (str): weight decay increment style
         use_checkpoint_opt_param_scheduler (bool, optional): whether to use the checkpoint values
-            for the optimizer param scheduler
+            for the optimizer param scheduler. Defaults to True.
         override_opt_param_scheduler (bool, optional): whether to override the optimizer param
-            scheduler values with the class values
-        wsd_decay_steps (int, optional): number of weight decay decay steps
+            scheduler values with the class values. Defaults to False.
+        wsd_decay_steps (int, optional): number of weight decay decay steps. Defaults to None.
         lr_wsd_decay_style (str, optional): decay style for learning rate during weight decay decay
-            steps
-
+            steps. Defaults to None.
     """
 
     def __init__(
@@ -56,6 +57,29 @@ class OptimizerParamScheduler:
         wsd_decay_steps: Optional[int] = None,
         lr_wsd_decay_style: Optional[str] = None,
     ) -> None:
+        """
+        Constructor for OptimizerParamScheduler.
+
+        Args:
+            optimizer (Optimizer): the optimizer to be used
+            init_lr (float): initial learning rate
+            max_lr (float): maximum learning rate
+            min_lr (float): minimum learning rate
+            lr_warmup_steps (int): number of warmup steps
+            lr_decay_steps (int): number of decay steps
+            lr_decay_style (str): decay style for learning rate
+            start_wd (float): initial weight decay
+            end_wd (float): final weight decay
+            wd_incr_steps (int): number of weight decay increment steps
+            wd_incr_style (str): weight decay increment style
+            use_checkpoint_opt_param_scheduler (bool, optional): whether to use the checkpoint values
+                for the optimizer param scheduler. Defaults to True.
+            override_opt_param_scheduler (bool, optional): whether to override the optimizer param
+                scheduler values with the class values. Defaults to False.
+            wsd_decay_steps (int, optional): number of weight decay decay steps. Defaults to None.
+            lr_wsd_decay_style (str, optional): decay style for learning rate during weight decay decay
+                steps. Defaults to None.
+        """
         # Class values.
         self.optimizer = optimizer
 
@@ -95,7 +119,9 @@ class OptimizerParamScheduler:
         log_single_rank(logger, logging.INFO, f"> learning rate decay style: {self.lr_decay_style}")
 
     def get_wd(self) -> float:
-        """Weight decay incr functions"""
+        """
+        Weight decay incr functions.
+        """
         if self.num_steps > self.wd_incr_steps:
             return self.end_wd
 
@@ -118,13 +144,12 @@ class OptimizerParamScheduler:
         return self.start_wd + coeff * delta_wd
 
     def get_lr(self, param_group: dict) -> float:
-        """Learning rate decay functions from:
-        https://openreview.net/pdf?id=BJYwwY9ll pg. 4
+        """
+        Learning rate decay functions from: https://openreview.net/pdf?id=BJYwwY9ll pg. 4.
 
-        Args:
+        Argsa:
             param_group (dict): parameter group from the optimizer.
         """
-
         max_lr = param_group.get("max_lr", self.max_lr)
         min_lr = param_group.get("min_lr", self.min_lr)
 
@@ -182,7 +207,8 @@ class OptimizerParamScheduler:
         return min_lr + coeff * delta_lr
 
     def step(self, increment: int) -> None:
-        """Set lr for all parameters groups.
+        """
+        Set lr for all parameters groups.
 
         Args:
             increment (int): number of steps to increment
@@ -195,7 +221,9 @@ class OptimizerParamScheduler:
             param_group["weight_decay"] = new_wd * param_group.get("wd_mult", 1.0)
 
     def state_dict(self) -> dict:
-        """Return the state dict."""
+        """
+        Return the state dict.
+        """
         state_dict = {
             "max_lr": self.max_lr,
             "lr_warmup_steps": self.lr_warmup_steps,
@@ -211,15 +239,14 @@ class OptimizerParamScheduler:
         return state_dict
 
     def _check_and_set(self, cls_value: float, sd_value: float, name: str) -> float:
-        """Auxiliary function for checking the values in the checkpoint and
-        setting them.
+        """
+        Auxiliary function for checking the values in the checkpoint and setting them.
 
         Args:
             cls_value (float): class value
             sd_value (float): checkpoint value
             name (str): name of the parameter
         """
-
         if self.override_opt_param_scheduler:
             log_single_rank(logger, logging.INFO, f" > overriding {name} value to {cls_value}")
             return cls_value
@@ -234,12 +261,12 @@ class OptimizerParamScheduler:
         return sd_value
 
     def load_state_dict(self, state_dict: dict) -> None:
-        """Load the state dict.
+        """
+        Load the state dict.
 
         Args:
             state_dict (dict): state dict to be load
         """
-
         if "start_lr" in state_dict:
             max_lr_ = state_dict["start_lr"]
         else:

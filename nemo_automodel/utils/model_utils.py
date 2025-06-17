@@ -12,16 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch.nn as nn
 import logging
+
+import torch.nn as nn
+
 from nemo_automodel.utils.dist_utils import get_rank_safe
+
 
 logger = logging.getLogger(__name__)
 
 
 def print_trainable_parameters(model):
-    """
-    Print the number of trainable parameters in the model.
+    """Print the number of trainable parameters in the model.
 
     Args:
         model: Model to analyze
@@ -47,8 +49,7 @@ def print_trainable_parameters(model):
 
 
 def apply_parameter_freezing(model, freeze_config):
-    """
-    Apply parameter freezing based on configuration.
+    """Apply parameter freezing based on configuration.
 
     Args:
         model: The model to apply freezing to.

@@ -14,23 +14,25 @@
 
 """Checkpoint management utilities for HF models."""
 
+import glob
 import os
-from typing import Any, Optional
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Optional
 
 import torch
-import torch.nn as nn
 import torch.distributed
 import torch.distributed.checkpoint as dcp
+import torch.nn as nn
+
+from nemo_automodel.checkpoint._backports.filesystem import SerializationFormat
 from nemo_automodel.checkpoint._backports.hf_storage import (
-    _HuggingFaceStorageWriter,
     _HuggingFaceStorageReader,
+    _HuggingFaceStorageWriter,
     get_fqn_to_file_index_mapping,
 )
 from nemo_automodel.checkpoint.stateful_wrappers import ModelState, OptimizerState
-from nemo_automodel.checkpoint._backports.filesystem import SerializationFormat
-import glob
+
 
 @dataclass
 class CheckpointingConfig:
@@ -45,7 +47,9 @@ class CheckpointingConfig:
     save_consolidated: bool
 
     def __post_init__(self):
-        # Convert a raw string such as "safetensors" into the right Enum
+        """
+        Convert a raw string such as "safetensors" into the right Enum.
+        """
         if isinstance(self.model_save_format, str):
             self.model_save_format = SerializationFormat[
                 self.model_save_format.upper()
@@ -97,7 +101,7 @@ def save_model(
         torch.distributed.barrier()
 
     model_state = ModelState(model, checkpoint_config.model_save_format)
-    
+
     if checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
         fqn_to_file_index_mapping = None
         if checkpoint_config.save_consolidated:
@@ -223,8 +227,9 @@ def load_optimizer(
 
 def _get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
     """
-    Return the directory containing the first `model.safetensors.index.json` found
-    for a given model, or ``None`` if it does not exist in the cache yet.
+    Return the directory containing the first `model.safetensors.index.json` found for given model.
+
+    If no `model.safetensors.index.json` is found then it returns None.
 
     For example, if the file located is
 

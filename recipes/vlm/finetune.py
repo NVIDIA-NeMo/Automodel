@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import wandb
-from wandb import Settings
-from nemo_automodel.loggers.wandb_utils import suppress_wandb_log_messages
-
-import torch.distributed as dist
 from typing import Any, Dict
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
-from torch.utils.data import DataLoader
 from torch.distributed.device_mesh import _mesh_resources
+from torch.utils.data import DataLoader
+
+import wandb
+from nemo_automodel.loggers.wandb_utils import suppress_wandb_log_messages
+from wandb import Settings
 
 try:
     from nvfsdp import nvFSDP
@@ -18,28 +18,29 @@ try:
 except:
     HAVE_NVFSDP = False
 
+import logging
+
+from transformers import AutoProcessor
+
+from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.config.cli import parse_args_and_load_config
+from nemo_automodel.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.distributed.init_utils import initialize_distributed
 from nemo_automodel.distributed.parallelizer import (
     create_context_parallel_ctx,
     get_train_context,
 )
+from nemo_automodel.loggers.log_utils import setup_logging
 from nemo_automodel.training.base_recipe import BaseRecipe
+from nemo_automodel.training.rng import StatefulRNG
 from nemo_automodel.training.step_scheduler import StepScheduler
 from nemo_automodel.utils.dist_utils import (
-    reduce_loss,
-    get_sync_ctx,
-    rescale_gradients,
     clip_gradients,
+    get_sync_ctx,
+    reduce_loss,
+    rescale_gradients,
 )
 from nemo_automodel.utils.model_utils import apply_parameter_freezing
-from nemo_automodel.loggers.log_utils import setup_logging
-from transformers import AutoProcessor
-from nemo_automodel.datasets.vlm.collate_fns import COLLATE_FNS
-from nemo_automodel.training.rng import StatefulRNG
-from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -49,8 +50,7 @@ logger = logging.getLogger(__name__)
 
 
 def build_model(device, cfg_model, cfg_freeze, cfg_peft, model_wrapper, seed) -> nn.Module:
-    """
-    Build and initialize a model.
+    """Build and initialize a model.
 
     Args:
         device: The target device.
@@ -86,8 +86,7 @@ def build_model(device, cfg_model, cfg_freeze, cfg_peft, model_wrapper, seed) ->
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id):
-    """
-    Build a checkpoint configuration.
+    """Build a checkpoint configuration.
     """
     from transformers.utils import TRANSFORMERS_CACHE
 
@@ -106,8 +105,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id):
 
 
 def build_optimizer(cfg_opt, model, tp_size) -> "Optimizer":  # noqa: F821
-    """
-    Build an optimizer for the model.
+    """Build an optimizer for the model.
 
     Args:
         cfg_opt: Configuration for optimizer instantiation.
@@ -126,8 +124,7 @@ def build_optimizer(cfg_opt, model, tp_size) -> "Optimizer":  # noqa: F821
 
 
 def build_loss_fn(device, cfg_loss):
-    """
-    Build a loss function.
+    """Build a loss function.
 
     Args:
         device: The target device.
@@ -145,8 +142,7 @@ def build_loss_fn(device, cfg_loss):
 def build_dataloader(
     cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed
 ) -> DataLoader:
-    """
-    Build a distributed dataloader.
+    """Build a distributed dataloader.
 
     Args:
         cfg_ds: Dataset configuration.
@@ -161,7 +157,7 @@ def build_dataloader(
     dist_sampler_kwargs = {
         "shuffle": cfg_dl.get("shuffle", True),
     }
-    if not device_mesh is None:
+    if device_mesh is not None:
         dist_sampler_kwargs |= {
             "num_replicas": device_mesh["data_parallel"].size(),
             "rank": device_mesh["data_parallel"].get_local_rank(),
@@ -197,8 +193,7 @@ def build_dataloader(
 
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
-    """
-    Build and initialize distributed training resources.
+    """Build and initialize distributed training resources.
 
     Args:
         cfg_dist: Configuration for distributed training.
@@ -212,8 +207,7 @@ def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
 
 
 def build_step_scheduler(cfg, dataloader):
-    """
-    Build the step scheduler.
+    """Build the step scheduler.
 
     Args:
         cfg: configuration for the StepScheduler class.
@@ -222,7 +216,7 @@ def build_step_scheduler(cfg, dataloader):
     Returns:
         StepScheduler: the configured StepScheduler.
     """
-    assert not "_target_" in cfg, "_target_ not permitted in step scheduler"
+    assert "_target_" not in cfg, "_target_ not permitted in step scheduler"
     default_kwargs = dict(
         num_epochs=10,
         grad_acc_steps=10,
@@ -235,7 +229,7 @@ def build_step_scheduler(cfg, dataloader):
 
 
 def build_wandb(cfg):
-    """ Instantiates wandb and returns the instance.
+    """Instantiates wandb and returns the instance.
     If no name is given, it will use the model name
     """
     assert cfg.get('wandb', None) is not None
@@ -256,15 +250,13 @@ def build_wandb(cfg):
 
 
 class FinetuneRecipeForVLM(BaseRecipe):
-    """
-    Recipe for fine-tuning a model for VLM.
+    """Recipe for fine-tuning a model for VLM.
 
     This class orchestrates training, from setup to main training loop.
     """
 
     def __init__(self, cfg):
-        """
-        Initialize the recipe with configuration.
+        """Initialize the recipe with configuration.
 
         Args:
             cfg: Configuration dictionary/object for training.
@@ -359,8 +351,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
     # ------------------ main loop ------------------
     def run_train_validation_loop(self):
-        """
-        Run the training loop over all epochs and batches.
+        """Run the training loop over all epochs and batches.
 
         For each batch, perform a forward pass, compute loss, backpropagate,
         and update model parameters when necessary. Also prints loss every gradient step.
@@ -378,8 +369,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
     # ------------------ helpers ------------------
     def _run_train_step(self, batch, is_optim_step, clip_norm=1.0):
-        """
-        Execute a single training step.
+        """Execute a single training step.
 
         Args:
             batch: Batch of training data.
@@ -630,8 +620,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
 
     def log_train_metrics(self, grad_norm):
-        """
-        Log metrics to wandb.
+        """Log metrics to wandb.
 
         Args:
             grad_norm: Grad norm from the training step.
@@ -678,8 +667,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
 
 def main():
-    """
-    Main entry point for the fine-tuning recipe.
+    """Main entry point for the fine-tuning recipe.
 
     Loads the configuration, sets up the trainer, and initiates the training loop.
     """
