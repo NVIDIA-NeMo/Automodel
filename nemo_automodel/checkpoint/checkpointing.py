@@ -42,6 +42,7 @@ class CheckpointingConfig:
     model_save_format: SerializationFormat | str
     model_cache_dir: str | Path
     model_repo_id: str
+    save_consolidated: bool
 
     def __post_init__(self):
         # Convert a raw string such as "safetensors" into the right Enum
@@ -75,13 +76,17 @@ def save_model(
     # which doesn't leave out any user modified layers.
     # This is because we need to create the mapping on the fly from the model state dict.
     model_path = os.path.join(weights_path, "model")
+    consolidated_model_path = None
+    if checkpoint_config.save_consolidated:
+        consolidated_model_path = os.path.join(model_path, "consolidated")
+
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         os.makedirs(model_path, exist_ok=True)
-        os.makedirs(os.path.join(model_path, "consolidated"), exist_ok=True)
 
-        # save the config.json file
-        if checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
-            with open(os.path.join(model_path, "config.json"), "w") as f:
+        if checkpoint_config.save_consolidated and checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
+            os.makedirs(consolidated_model_path, exist_ok=True)
+            # save the config.json file
+            with open(os.path.join(consolidated_model_path, "config.json"), "w") as f:
                 f.write(model.config.to_json_string())
 
     # Ensure all ranks wait for rank 0 to handle directories
@@ -91,31 +96,33 @@ def save_model(
     model_state = ModelState(model, checkpoint_config.model_save_format)
     
     if checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
-        # fqn_to_file_index_mapping = None
-        # # we first need to find the FQN -> .safetensors mapping
-        # index_path = _get_safetensors_index_path(
-        #     checkpoint_config.model_cache_dir,
-        #     checkpoint_config.model_repo_id,
-        # )
-        # fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(index_path)
+        fqn_to_file_index_mapping = None
+        if checkpoint_config.save_consolidated:
+            # we first need to find the FQN -> .safetensors mapping
+            index_path = _get_safetensors_index_path(
+                checkpoint_config.model_cache_dir,
+                checkpoint_config.model_repo_id,
+            )
+            fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(index_path)
 
-        # # Add any missing keys from the model_state_dict
-        # # These will go to the same file as the last file (or file 1 for single-file models)
-        # default_index = max(fqn_to_file_index_mapping.values())
+            # Add any missing keys from the model_state_dict
+            # These will go to the same file as the last file (or file 1 for single-file models)
+            default_index = max(fqn_to_file_index_mapping.values())
 
-        # # TODO:(@adil-a): This will need to change when we add PP. Maybe we can cache the keys in ModelState.
-        # for fqn in list(model.state_dict().keys()):
-        #     if fqn not in fqn_to_file_index_mapping:
-        #         if model_state.is_tied_lm_head and fqn == "lm_head.weight":
-        #             continue
-        #         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        #             print(f"Adding missing key to mapping: {fqn}")
-        #         fqn_to_file_index_mapping[fqn] = default_index          
+            # TODO:(@adil-a): This will need to change when we add PP. Maybe we can cache the keys in ModelState.
+            for fqn in list(model.state_dict().keys()):
+                if fqn not in fqn_to_file_index_mapping:
+                    if model_state.is_tied_lm_head and fqn == "lm_head.weight":
+                        continue
+                    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                        print(f"Adding missing key to mapping: {fqn}")
+                    fqn_to_file_index_mapping[fqn] = default_index
 
         storage_writer = _HuggingFaceStorageWriter(
             path=model_path,
             save_sharded=True,
-            consolidated_output_path=os.path.join(model_path, "consolidated"),
+            consolidated_output_path=consolidated_model_path,
+            fqn_to_index_mapping=fqn_to_file_index_mapping,
         )
 
         dcp.save(

@@ -114,8 +114,9 @@ class _HuggingFaceStorageWriter(FsspecWriter):
         new_plans = []
         for i, plan in enumerate(plans, start=1):
             storage_data: dict[str, Any] = {}
-            if self._fqn_to_index_mapping is not None:
-                storage_data["fqn_to_index_mapping"] = self._fqn_to_index_mapping
+            # save default shard mapping. We only use fqn_to_index_mapping for consolidation.
+            # if self._fqn_to_index_mapping is not None:
+            #     storage_data["fqn_to_index_mapping"] = self._fqn_to_index_mapping
             if self._save_sharded:
                 storage_data["shard_index"] = i
 
@@ -158,7 +159,12 @@ class _HuggingFaceStorageWriter(FsspecWriter):
         if self._save_sharded and not self._consolidated_output_path:
             return
         if self._save_sharded:
-            return consolidate_safetensors_files(input_dir=self.path, output_dir=self._consolidated_output_path, num_threads=self._num_threads_consolidation)
+            return consolidate_safetensors_files(
+                input_dir=self.path,
+                output_dir=self._consolidated_output_path,
+                num_threads=self._num_threads_consolidation,
+                fqn_to_index_mapping=self._fqn_to_index_mapping
+            )
 
         metadata_to_write = {}
         storage_md = {}

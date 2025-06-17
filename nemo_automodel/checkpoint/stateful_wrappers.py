@@ -16,7 +16,6 @@ from typing import Any, Optional
 
 import torch
 from torch.distributed.checkpoint.state_dict import (
-    StateDictOptions,
     get_model_state_dict,
     get_optimizer_state_dict,
     set_model_state_dict,
@@ -132,9 +131,6 @@ class OptimizerState(Stateful):
         optimizer_state_dict = get_optimizer_state_dict(
             self.model,
             self.optimizer,
-            options=torch.distributed.checkpoint.state_dict.StateDictOptions(
-                cpu_offload=True
-            ),
         )
 
         state_dict = {
