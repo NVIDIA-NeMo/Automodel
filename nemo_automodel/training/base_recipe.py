@@ -147,7 +147,7 @@ class BaseRecipe:
             else:
                 getattr(self, key).load_state_dict(
                     torch.load(
-                        os.path.join(ckpt_dir, f"{key}.pt"),
+                        os.path.join(ckpt_dir, f"{key}.pt"), weights_only=False
                     )
                 )
 

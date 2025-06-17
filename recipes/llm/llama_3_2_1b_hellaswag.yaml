@@ -23,6 +23,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: torch_save # torch_save or safetensors
+  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 distributed:
   _target_: nemo_automodel.distributed.fsdp2.FSDP2Manager
