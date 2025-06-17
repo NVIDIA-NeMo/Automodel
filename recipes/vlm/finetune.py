@@ -34,7 +34,9 @@ from nemo_automodel.utils.dist_utils import (
 from nemo_automodel.utils.model_utils import apply_parameter_freezing
 from nemo_automodel.loggers.log_utils import setup_logging
 from transformers import AutoProcessor
+from nemo_automodel.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.training.rng import StatefulRNG
+from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 
 import logging
 
@@ -82,6 +84,26 @@ def build_model(device, cfg_model, cfg_freeze, cfg_peft, model_wrapper, seed) ->
             return model.to(device)
 
 
+def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id):
+    """
+    Build a checkpoint configuration.
+    """
+    from transformers.utils import TRANSFORMERS_CACHE
+
+    ckpt_kwargs = dict(
+        enabled=False,
+        checkpoint_dir="checkpoints/",
+        model_save_format="safetensors",
+        model_repo_id=model_repo_id,
+        model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
+    )
+    if cfg_ckpt is not None:
+        cfg_ckpt = cfg_ckpt.to_dict()
+        cfg_ckpt.pop("restore_from", None)
+        ckpt_kwargs |= cfg_ckpt
+    return CheckpointingConfig(**ckpt_kwargs)
+
+
 def build_optimizer(cfg_opt, model, tp_size) -> "Optimizer":  # noqa: F821
     """
     Build an optimizer for the model.
@@ -120,7 +142,7 @@ def build_loss_fn(device, cfg_loss):
 
 
 def build_dataloader(
-    cfg_ds, cfg_dl, cfg_model, device_mesh, seed
+    cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed
 ) -> DataLoader:
     """
     Build a distributed dataloader.
@@ -128,6 +150,8 @@ def build_dataloader(
     Args:
         cfg_ds: Dataset configuration.
         cfg_dl: DataLoader configuration.
+        cfg_model: Model configuration.
+        cfg_processor: Processor configuration.
         distributed_sampler_kwargs: Additional arguments for the DistributedSampler.
 
     Returns:
@@ -138,8 +162,8 @@ def build_dataloader(
     }
     if not device_mesh is None:
         dist_sampler_kwargs |= {
-            "num_replicas": device_mesh.get("data_parallel").size(),
-            "rank": device_mesh.get["data_parallel"].get_local_rank(),
+            "num_replicas": device_mesh["data_parallel"].size(),
+            "rank": device_mesh["data_parallel"].get_local_rank(),
         }
 
     with StatefulRNG(seed=seed, ranked=True):
@@ -148,33 +172,26 @@ def build_dataloader(
                 cfg_model.pretrained_model_name_or_path
             )
 
-            # For VLM datasets, instantiate with processor and get HFDatasetBuilder
-            hf_dataset_builder = cfg_ds.instantiate(
-                path_or_dataset=cfg_ds.path_or_dataset, processor=processor
-            )
+        ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
 
-            split = getattr(cfg_ds, "split", None)
-
-            if split is not None:
-                if split == "train":
-                    ds = hf_dataset_builder.train
-                elif split == "validation":
-                    ds = hf_dataset_builder.val
-                else:
-                    raise ValueError(
-                        f"split (train or validation) is required for VLM datasets, but got {split}"
-                    )
-            else:
-                raise ValueError(
-                    f"split (train or validation) is required for VLM datasets, but got {split}"
-                )
-
-            sampler = torch.utils.data.distributed.DistributedSampler(
+        sampler = torch.utils.data.distributed.DistributedSampler(
                 ds, **dist_sampler_kwargs,
             )
-        # TODO: HFDatasetBuilder has DLbuilder but is not stateful, didn't use it
+        collate_cfg = cfg_dl.get("collate_fn", None)
+        if collate_cfg:
+            collate_fn = lambda examples: collate_cfg.instantiate(examples=examples, processor=processor)
+        else:
+            # Get the appropriate collate function
+            processor_type = type(processor).__name__
+            if processor_type not in COLLATE_FNS:
+                processor_type = "default"
+                logging.warning(
+                    f"You are using {processor_type} with default collate function."
+                )
+            collate_fn = lambda examples: COLLATE_FNS[processor_type](examples, processor)
+
         return cfg_dl.instantiate(
-            dataset=ds, sampler=sampler, collate_fn=hf_dataset_builder.collate_fn
+            dataset=ds, sampler=sampler, collate_fn=collate_fn
         )
 
 
@@ -231,6 +248,7 @@ def build_wandb(cfg):
     )
     return run
 
+
 # ---------------------------------------------------------------------------
 #  Trainer class – orchestration only
 # ---------------------------------------------------------------------------
@@ -274,10 +292,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
             )
             self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
 
-        if self.dist_env.is_main and hasattr(self.cfg, "logger"):
+        if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
             run = build_wandb(self.cfg)
-            print("🚀 View run at {}".format(run.url))
+            logging.info("🚀 View run at {}".format(run.url))
 
         # Build components
         self.model = build_model(
@@ -298,6 +316,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.cfg.dataset,
             self.cfg.dataloader,
             self.cfg.model,
+            self.cfg.get("processor", None),
             device_mesh=self.device_mesh,
             seed=self.cfg.get("seed", 42),
         )
@@ -309,6 +328,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 self.cfg.validation_dataset,
                 self.cfg.validation_dataloader,
                 self.cfg.model,
+                self.cfg.get("processor", None),
                 device_mesh=self.device_mesh,
                 seed=self.cfg.get("seed", 42),
             )
@@ -322,12 +342,19 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.cfg.get("step_scheduler", None), self.dataloader
         )
 
+        # Build checkpointing config
+        restore_from = self.cfg.get("checkpoint.restore_from", None)
+        self.checkpoint_config = build_checkpoint_config(
+            self.cfg.get("checkpoint", None),
+            self.cfg.get("model.cache_dir", None),
+            self.cfg.model.pretrained_model_name_or_path,
+        )
+
         # Set up the stateful random number generator
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
         # Optionally resume
-        if (path := self.cfg.get("restore_from")) is not None:
-            raise NotImplemented("TODO resume from {}".format(path))
+        self.load_checkpoint(restore_from)
 
     # ------------------ main loop ------------------
     def run_train_validation_loop(self):
@@ -339,11 +366,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
         """
         self.model.train()
         for epoch in self.step_scheduler.epochs:
+            self.step_scheduler.set_epoch(epoch)
             for batch_idx, batch in enumerate(self.step_scheduler):
                 self._run_train_step(batch, self.step_scheduler.is_optim_step, 1.0)
-                if self.step_scheduler.is_ckpt_step and self.dist_env.is_main:
-                    #     self._save_checkpoint()
-                    pass
+                if self.step_scheduler.is_ckpt_step:
+                    self.save_checkpoint(epoch, self.step_scheduler.step)
 
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     self._run_validation_epoch()

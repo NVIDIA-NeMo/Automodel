@@ -19,15 +19,15 @@ import torch.nn.functional as F
 from torch import nn
 
 from nemo_automodel.shared.import_utils import safe_import
+from nemo_automodel._peft.lora_kernel import lora_forward_wrapper, lora_da_dx_update_wrapper, \
+    lora_db_update_wrapper
 from nemo_automodel._peft.module_matcher import ModuleMatcher
 HAS_BNB, bitsandbytes = safe_import("bitsandbytes")
 
 
-
-
 class LinearLoRA(nn.Linear):
     """
-    Linear + LoRA, maintains ckpts structrue (i.e. Linear's weight/bias remain at the same FQN)
+    Linear + LoRA, maintains ckpts structure (i.e. Linear's weight/bias remain at the same FQN)
 
     The _init_wrapper and _forward methods provide the LoRA functionality. We want to be able to
     use those inside LinearLoRA but also for monkey-patching modules, without repeating the
@@ -159,6 +159,40 @@ class LinearLoRA(nn.Linear):
         return res + lora_res
 
 
+class TritonLinearLoRA(LinearLoRA):
+    """
+    Subclass of LinearLoRA that uses triton kernels for forward and backward passes.
+
+    Args:
+        orig_linear (nn.Module): the linear module to augment.
+        dim (int): lora's dim in_features -> dim -> out_features.
+        alpha (int): lora's scaling alpha.
+        dropout (float): dropout prob (default: 0.0).
+        dropout_position (str): where to apply dropout rel. to lora (choices= ['pre', 'post'], default=post)
+        lora_A_init_method (str): init method for lora_A (choices= ['xavier', 'uniform'])
+        lora_dtype (torch.dtype): weight's dtype, by default will use orig_linear's but if they
+        are quantized weights (e.g. 4bit) needs to be specified explicitly.
+    """
+    def forward(self, x):
+        # pylint: disable=C0115,C0116
+        # If LinearLoRA is used to monkey-patch a nn.Linear module, we want to use nn.Linear's
+        # forward in the case where it uses quantized weights. We store a reference to nn.Linear's
+        # forward in `super_fwd` attribute. If the attribute does not exist we do the usual linear.
+        if (fwd := getattr(self, 'super_fwd', None)) is not None:
+            assert fwd != self.forward
+            res = fwd(x)
+        else:
+            res = F.linear(x, self.weight, self.bias)
+
+        if self.dropout_position == 'pre':
+            x = self.dropout(x)
+        lora_res = LoRATritonFunction.apply(x, self.lora_A.weight, self.lora_B.weight, self.scale, x.dtype)
+        if self.dropout_position == "post":
+            lora_res = self.dropout(lora_res)
+
+        return res + lora_res
+
+
 def patch_linear_module(
     orig_linear,
     dim=8,
@@ -167,6 +201,7 @@ def patch_linear_module(
     dropout_position='post',
     lora_A_init_method='xavier',
     lora_dtype=None,
+    use_triton=True
 ):
     """Monkey-patches a nn.Linear (orig_linear param) to be a LinearLoRA, for all purposes
     think of this function as replacing a nn.Linear with a LinearLoRA defined above.
@@ -190,6 +225,7 @@ def patch_linear_module(
         lora_dtype (_type_, optional): Lora weights' dtype. By default will use orig_linear's dtype
         but orig_linear might use non-trainable dtype (e.g., 4bit), in which case the user must
         specify the dtype manually. Defaults to None.
+        use_triton (bool, optional): By default we use the triton kernel LoRA implementation.
 
     Returns:
         (nn.Module): the monkey-patched (nn.Linear + LoRA) nn.Module
@@ -199,9 +235,12 @@ def patch_linear_module(
     assert not hasattr(orig_linear, 'super_fwd'), orig_linear.super_fwd
 
     if isinstance(orig_linear, nn.Linear):
-        LinearLoRA._init_adapter(orig_linear, dim, alpha, dropout, dropout_position, lora_A_init_method, lora_dtype)
+        linear_lora_cls = TritonLinearLoRA if use_triton else LinearLoRA
+        linear_lora_cls._init_adapter(
+            orig_linear, dim, alpha, dropout, dropout_position, lora_A_init_method,
+            lora_dtype)
         cls = orig_linear.__class__
-        new_cls = type('PatchedLinearLoRA', (LinearLoRA, cls), {})
+        new_cls = type('PatchedLinearLoRA', (linear_lora_cls, cls), {})
     else:
         raise NotImplementedError("Expected isinstance(orig_linear, nn.Linear)")
 
@@ -214,6 +253,7 @@ def patch_linear_module(
 
     orig_linear.__class__ = new_cls
     return orig_linear
+
 
 # -----------------------------------------------------------------------------#
 # 2.  Convenience: patch a model in-place                                      #
@@ -229,6 +269,7 @@ def apply_lora_to_linear_modules(
     dropout_position: Literal["pre", "post"] = "post",
     lora_A_init: str = "xavier",
     lora_dtype: Optional[torch.dtype] = None,
+    use_triton: bool = True
 ):
     """
     Replace selected nn.Linear layers with LinearLoRA layers (in-place).
@@ -252,8 +293,64 @@ def apply_lora_to_linear_modules(
                 dropout_position=dropout_position,
                 lora_A_init_method=lora_A_init,
                 lora_dtype=lora_dtype,
+                use_triton=use_triton
            )
     return num_modules_matched
+
+
+class LoRATritonFunction(torch.autograd.Function):
+    """
+    Autograd function that calls the triton kernel wrappers for the LoRA forward and backward passes.
+    """
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        """
+        Stores context for LoRA backward pass.
+        """
+        x, lora_A, lora_B, scale, _ = inputs
+        ctx.save_for_backward(x, lora_A, lora_B)
+        ctx.scale = scale
+
+    @staticmethod
+    def forward(x, lora_A, lora_B, scale, dtype):
+        """
+        Forward method for LoRA. Reshapes 3D tensors into 2D and then calls the triton kernel.
+        """
+        reshape = x.dim() == 3
+        if reshape:
+            bs, seq_len, d = x.shape
+            x = x.reshape(-1, d)
+
+        lora_res = lora_forward_wrapper(x, lora_A.t(), lora_B.t(), res=None, scale=scale, dtype=dtype)
+
+        if reshape:
+            return lora_res.view(bs, seq_len, -1)
+        else:
+            return lora_res
+
+    @staticmethod
+    def backward(ctx, d_y):
+        """
+        Backward method for LoRA. Reshapes 3D tensors into 2D and then calls the kernels to update
+        d_lora_a, d_lora_b, and dx.
+        """
+        x, lora_A, lora_B = ctx.saved_tensors
+        scale = ctx.scale
+        dtype = x.dtype
+
+        reshape = x.dim() == 3
+        if reshape:
+            bs, seq_len, d = x.shape
+            d_y = d_y.reshape(-1, d_y.shape[-1])
+            x = x.reshape(-1, d)
+
+        d_lora_A, d_x = lora_da_dx_update_wrapper(x.t(), d_y, lora_B, lora_A, scale, dtype=dtype)
+        d_lora_B = lora_db_update_wrapper(lora_A, x.t(), d_y, scale, dtype)
+
+        if reshape:
+            d_x = d_x.view(bs, seq_len, d)
+        return d_x, d_lora_A.t(), d_lora_B, None, None, None
+
 
 def _parent_and_attr(root: nn.Module, fqname: str):
     """Return (parent_module, attribute_name) for fully-qualified module name."""
