@@ -29,8 +29,8 @@ from nemo_automodel.checkpoint.checkpointing import (
 
 
 def has_load_restore_state(object):
-    """Checks whether object has load_state_dict and state_dict functions, ie whether the object
-    follows the nn.Module API.
+    """
+    Checks whether object has load_state_dict and state_dict functions.
 
     TODO: also need to check function signatures.
 
@@ -46,10 +46,12 @@ def has_load_restore_state(object):
     )
 
 class BaseRecipe:
-    """Checkpoint registry
+    """
+    BaseRecipe provides checkpoint load/save functionality for recipes.
     """
     def __setattr__(self, key, value):
-        """Overriden __setattr__ to keep track of stateful classes.
+        """
+        Overriden __setattr__ to keep track of stateful classes.
 
         Args:
             key (str): attribute named.
@@ -75,7 +77,8 @@ class BaseRecipe:
         super().__setattr__(key, value)
 
     def save_checkpoint(self, epoch: int, step: int):
-        """Save the current training state as a checkpoint.
+        """
+        Save the current training state as a checkpoint.
 
         As long as the object has a 'load_state_dict' and 'state_dict' function, it will be saved.
 
@@ -112,9 +115,10 @@ class BaseRecipe:
 
         save_model(model, path, self.checkpoint_config)
         save_optimizer(optimizer, model, path)
-    
+
     def load_checkpoint(self, restore_from: str | None = None):
-        """Load the latest checkpoint.
+        """
+        Loads the latest checkpoint.
         """
         if not self.checkpoint_config.enabled:
             if (
@@ -135,7 +139,7 @@ class BaseRecipe:
 
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             print(f"Loading checkpoint from {ckpt_dir}", flush=True)
-        
+
         # TODO(@adil-a): Change this when we create a LR scheduler class
         model, optimizer = None, None
 
@@ -153,10 +157,11 @@ class BaseRecipe:
 
         load_model(model, ckpt_dir, self.checkpoint_config)
         load_optimizer(optimizer, model, ckpt_dir)
-    
+
 
 def _find_latest_checkpoint(checkpoint_dir):
-    """Find the latest checkpoint in the checkpoint directory.
+    """
+    Find the latest checkpoint in the checkpoint directory and return it.
     """
     checkpoint_dir = Path(checkpoint_dir)
     if not checkpoint_dir.exists():

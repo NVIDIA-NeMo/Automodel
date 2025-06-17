@@ -16,7 +16,8 @@ import torch.nn.functional as F
 
 
 def masked_cross_entropy(logits, targets, mask=None, fp32_upcast=True, ignore_index=-100, reduction="mean"):
-    """Compute the masked cross-entropy loss between logits and targets.
+    """
+    Compute the masked cross-entropy loss between logits and targets.
 
     If a mask is provided, the loss is computed per element, multiplied by the mask,
     and then averaged. If no mask is provided, the standard cross-entropy loss is used.
@@ -29,6 +30,8 @@ def masked_cross_entropy(logits, targets, mask=None, fp32_upcast=True, ignore_in
             of the loss. Defaults to None.
         fp32_upcast (bool, optional): if True it will cast logits to float32 before computing
         cross entropy. Default: True.
+        ignore_index (int): label to ignore in CE calculation. Defaults to -100.
+        reduction (str): type of reduction. Defaults to "mean".
 
     Returns:
         torch.Tensor: The computed loss as a scalar tensor.

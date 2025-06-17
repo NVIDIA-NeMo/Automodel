@@ -61,7 +61,7 @@ def json2token(obj, sort_json_key: bool = True):
     """Convert an ordered JSON object into a token sequence.
     From NeMo's automodel_datasets.py
     """
-    if type(obj) == dict:
+    if type(obj) is dict:
         if len(obj) == 1 and "text_sequence" in obj:
             return obj["text_sequence"]
         else:
@@ -73,7 +73,7 @@ def json2token(obj, sort_json_key: bool = True):
             for k in keys:
                 output += rf"<s_{k}>" + json2token(obj[k], sort_json_key) + rf"</s_{k}>"
             return output
-    elif type(obj) == list:
+    elif type(obj) is list:
         return r"<sep/>".join([json2token(item, sort_json_key) for item in obj])
     else:
         obj = str(obj)

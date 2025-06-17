@@ -17,14 +17,23 @@ else:
 
 
 class TimerBase(ABC):
-    """Timer base class."""
+    """
+    Timer base class.
+    """
 
-    def __init__(self, name):
+    def __init__(self, name : str):
+        """
+        Base class for Timers.
+
+        Args:
+            name (str): The name of the timer.
+        """
         self.name = name
         self._context_barrier = False
 
     def with_barrier(self, barrier=True):
-        """Set the barrier option for use in context manager.
+        """
+        Set the barrier option for use in context manager.
 
         Args:
             barrier (bool, optional): Whether to use barrier in context manager. Defaults to True.
@@ -36,19 +45,24 @@ class TimerBase(ABC):
         return self
 
     def __enter__(self):
-        """Start the timer when entering a context using the configured barrier option."""
+        """
+        Start the timer when entering a context using the configured barrier option.
+        """
         self.start(barrier=self._context_barrier)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Stop the timer when exiting a context using the configured barrier option."""
+        """
+        Stop the timer when exiting a context using the configured barrier option.
+        """
         self.stop(barrier=self._context_barrier)
         # Reset context barrier to default
         self._context_barrier = False
 
     @abstractmethod
     def start(self, barrier=False):
-        """Start the timer.
+        """
+        Start the timer.
 
         Args:
             barrier (bool, optional): Synchronizes ranks before starting. Defaults to False.
@@ -57,7 +71,8 @@ class TimerBase(ABC):
 
     @abstractmethod
     def stop(self, barrier=False):
-        """Stop the timer.
+        """
+        Stop the timer.
 
         Args:
             barrier (bool, optional): Synchronizes ranks before stopping. Defaults to False.
@@ -66,12 +81,15 @@ class TimerBase(ABC):
 
     @abstractmethod
     def reset(self):
-        """Reset timer."""
+        """
+        Reset timer.
+        """
         pass
 
     @abstractmethod
     def elapsed(self, reset=True, barrier=False):
-        """Calculates the elapsed time and restarts timer.
+        """
+        Calculates the elapsed time and restarts timer.
 
         Args:
             reset (bool, optional): Resets timer before restarting. Defaults to True.
@@ -84,28 +102,47 @@ class TimerBase(ABC):
 
 
 class DummyTimer(TimerBase):
-    """Dummy Timer."""
+    """
+    Dummy Timer.
+    """
 
     def __init__(self):
+        """
+        Dummy timer init.
+        """
         super().__init__("dummy timer")
 
     def start(self, barrier=False):
+        """
+        Dummy timer start.
+        """
         return
 
     def stop(self, barrier=False):
+        """
+        Dummy timer stop.
+        """
         return
 
     def reset(self):
+        """
+        Dummy timer reset.
+        """
         return
 
     def elapsed(self, reset=True, barrier=False):
+        """
+        Dummy timer elapsed time.
+        """
         raise Exception(
             "dummy timer should not be used to calculate elapsed time, "
             "check if timer's log_level <= self._log_level."
         )
 
     def active_time(self):
-        """Returns the cumulative duration the timer has been active.
+        """
+        Returns the cumulative duration the timer has been active.
+
         Note: Not supported for DummyTimer.
         """
         raise Exception(
@@ -115,7 +152,8 @@ class DummyTimer(TimerBase):
 
 
 class Timer(TimerBase):
-    """Timer class with ability to start/stop.
+    """
+    Timer class with ability to start/stop.
 
     Comment on using `barrier`: If this flag is passed, then all
     the caller processes will wait till all reach the timing routine.
@@ -140,7 +178,8 @@ class Timer(TimerBase):
         self._start_time = time.time()
 
     def set_barrier_group(self, barrier_group):
-        """Sets barrier group.
+        """
+        Sets barrier group.
 
         Args:
             barrier_group (ProcessGroup): Torch ProcessGroup for barrier.
@@ -148,7 +187,8 @@ class Timer(TimerBase):
         self._barrier_group = barrier_group
 
     def start(self, barrier=False):
-        """Start the timer.
+        """
+        Start the timer.
 
         Args:
             barrier (bool, optional): Synchronizes ranks before starting. Defaults to False.
@@ -161,7 +201,8 @@ class Timer(TimerBase):
         self._started = True
 
     def stop(self, barrier=False):
-        """Stop the timer.
+        """
+        Stop the timer.
 
         Args:
             barrier (bool, optional): Synchronizes ranks before stopping. Defaults to False.
@@ -176,13 +217,16 @@ class Timer(TimerBase):
         self._started = False
 
     def reset(self):
-        """Reset timer."""
+        """
+        Reset timer.
+        """
         # Don't reset _active_time
         self._elapsed = 0.0
         self._started = False
 
     def elapsed(self, reset=True, barrier=False):
-        """Calculates the elapsed time and restarts timer.
+        """
+        Calculates the elapsed time and restarts timer.
 
         Args:
             reset (bool, optional): Resets timer before restarting. Defaults to True.
@@ -206,15 +250,20 @@ class Timer(TimerBase):
         return _elapsed
 
     def active_time(self):
-        """Calculates the cumulative duration for which the timer has been active"""
+        """
+        Calculates the cumulative duration for which the timer has been active.
+        """
         return self._active_time
 
 
 class Timers:
-    """Class for a group of Timers."""
+    """
+    Class for a group of Timers.
+    """
 
     def __init__(self, log_level, log_option):
-        """Initialize group of timers.
+        """
+        Initialize group of timers.
 
         Args:
             log_level (int): Log level to control what timers are enabled.
@@ -233,7 +282,8 @@ class Timers:
         self._max_log_level = 2
 
     def __call__(self, name, log_level=None, barrier=False):
-        """Call timer with name and log level.
+        """
+        Call timer with name and log level.
 
         Returns a timer object that can be used as a context manager.
 
@@ -281,7 +331,9 @@ class Timers:
         return timer.with_barrier(barrier) if barrier else timer
 
     def _get_elapsed_time_all_ranks(self, names, reset, barrier):
-        """Returns elapsed times of timers in names.
+        """
+        Returns elapsed times of timers in names.
+
         Assumptions:
             - All the ranks call this function.
             - `names` are identical on all ranks.
@@ -325,7 +377,9 @@ class Timers:
         return rank_name_to_time
 
     def _get_global_min_max_time(self, names, reset, barrier, normalizer):
-        """Report only min and max times across all ranks."""
+        """
+        Report only min and max times across all ranks.
+        """
         rank_name_to_time = self._get_elapsed_time_all_ranks(names, reset, barrier)
         name_to_min_max_time = {}
         for i, name in enumerate(names):
@@ -341,7 +395,9 @@ class Timers:
         return name_to_min_max_time
 
     def _get_global_min_max_time_string(self, names, reset, barrier, normalizer, max_only):
-        """Report strings for max/minmax times across all ranks."""
+        """
+        Report strings for max/minmax times across all ranks.
+        """
         name_to_min_max_time = self._get_global_min_max_time(names, reset, barrier, normalizer)
         if not name_to_min_max_time:
             return None
@@ -358,7 +414,9 @@ class Timers:
         return output_string
 
     def _get_all_ranks_time_string(self, names, reset, barrier, normalizer):
-        """Report times across all ranks."""
+        """
+        Report times across all ranks.
+        """
         rank_name_to_time = self._get_elapsed_time_all_ranks(names, reset, barrier)
 
         output_string = "times across ranks (ms):"
@@ -383,7 +441,8 @@ class Timers:
         reset: bool = True,
         barrier: bool = False,
     ):
-        """Returns the output string with logged timer values according to configured options.
+        """
+        Returns the output string with logged timer values according to configured options.
 
         Args:
             names (List[str]): Names of the timers to log. If None, all registered timers are
@@ -400,7 +459,7 @@ class Timers:
         Returns:
             str: Formatted string with the timer values.
         """
-        if names == None:  # get all registered timers
+        if names is None:  # get all registered timers
             names = self._timers.keys()
 
         assert normalizer > 0.0
@@ -423,9 +482,11 @@ class Timers:
         reset: bool = True,
         barrier: bool = False,
     ):
-        """Logs the timers passed in names to stdout. Example usage is to log average per step
-           value for timer 'foo', this function can be called with normalizer factor set to logging
-           interval.
+        """
+        Logs the timers passed in names to stdout.
+
+        Example usage is to log average per step value for timer 'foo', this function can be called
+        with normalizer factor set to logging interval.
 
         Args:
             names (List[str]): Names of the timers to log.
@@ -487,7 +548,9 @@ class Timers:
         reset: bool = True,
         barrier: bool = False,
     ) -> None:
-        """Patch to write timers to wandb for Megatron Core Timers."""
+        """
+        Patch to write timers to wandb for Megatron Core Timers.
+        """
         # currently when using add_scalars,
         # torch.utils.add_scalars makes each timer its own run, which
         # polutes the runs list, so we just add each as a scalar

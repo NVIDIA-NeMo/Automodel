@@ -14,6 +14,7 @@
 
 """Checkpoint management utilities for HF models."""
 
+import glob
 import os
 from dataclasses import dataclass
 from pathlib import Path

@@ -41,7 +41,9 @@ class UnavailableError(Exception):
 
 @contextmanager
 def null_decorator(*args, **kwargs):
-    """null_decorator"""
+    """
+    No-op decorator
+    """
     if len(kwargs) == 0 and len(args) == 1 and callable(args[0]):
         return args[0]
     else:

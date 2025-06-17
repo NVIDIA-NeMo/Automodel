@@ -74,7 +74,8 @@ if HAVE_LINEAR_LOSS_CE:
 
     # Create replacement functions
     def new_is_triton_greater_or_equal(version_str):
-        """Check if pytorch-triton version is greater than or equal to the specified version.
+        """
+        Check if pytorch-triton version is greater than or equal to the specified version.
 
         Args:
             version_str: Version string to check
@@ -95,7 +96,8 @@ if HAVE_LINEAR_LOSS_CE:
             return False
 
     def new_is_triton_greater_or_equal_3_2_0():
-        """Check if pytorch-triton version is greater than or equal to 3.1.0
+        """
+        Check if pytorch-triton version is greater than or equal to 3.1.0.
 
         Returns:
             bool: True if pytorch-triton version >= 3.1.0
@@ -117,7 +119,8 @@ def fused_linear_cross_entropy(
     logit_softcapping: float = 0,
     accuracy_threshold: str = "auto",
 ):
-    """Compute fused linear cross entropy loss that matches PyTorch's cross_entropy behavior.
+    """
+    Compute fused linear cross entropy loss that matches PyTorch's cross_entropy behavior.
 
     Args:
         hidden_states: Input hidden states

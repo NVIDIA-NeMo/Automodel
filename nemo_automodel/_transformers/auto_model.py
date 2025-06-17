@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 
 
 def patch_attention(obj, sdpa_method=None):
-    """Wrap the `forward` method of `obj` in an `sdap_kernel` context to
-    enable a sequence of SDP attention backends.
+    """
+    Wrap the `forward` method of `obj` in an `sdap_kernel` context manager.
 
     Args:
         obj: Any object with a `.forward(*args, **kwargs)` method.
@@ -57,9 +57,8 @@ def patch_attention(obj, sdpa_method=None):
 
 
 class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
-    """Drop-in replacement for ``transformers.AutoModelForCausalLM`` that can
-    transparently patch the loaded model with NVIDIA Liger fused-attention
-    kernels for higher inference throughput.
+    """
+    Drop-in replacement for ``transformers.AutoModelForCausalLM`` that includes custom-kernels.
 
     The class only overrides ``from_pretrained`` and ``from_config`` to add the
     optional ``use_liger_kernel`` flag.  If the flag is ``True`` (default) and
@@ -87,8 +86,8 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        """Load a pretrained causal-language-model and (optionally) patch it with
-        Liger fused-attention kernels.
+        """
+        Load a pretrained causal-language-model and (optionally) patch it with custom kernels.
 
         Parameters
         ----------
@@ -149,8 +148,8 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
 
     @classmethod
     def from_config(cls, config, **kwargs):
-        """Instantiate a model from a config object and (optionally) patch it with
-        Liger fused-attention kernels.
+        """
+        Instantiate a model from a config object and (optionally) patch it with custom kernels.
 
         Parameters
         ----------
@@ -194,9 +193,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
 
 
 class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
-    """Drop-in replacement for ``transformers.AutoModelForImageTextToText`` that can
-    transparently patch the loaded model with NVIDIA Liger fused-attention
-    kernels for higher inference throughput.
+    """Drop-in replacement for ``transformers.AutoModelForImageTextToText`` with custom-kernels.
 
     The class only overrides ``from_pretrained`` and ``from_config`` to add the
     optional ``use_liger_kernel`` flag.  If the flag is ``True`` (default) and
@@ -224,8 +221,8 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        """Load a pretrained causal-language-model and (optionally) patch it with
-        Liger fused-attention kernels.
+        """
+        Load a pretrained causal-language-model and (optionally) patch it with custom kernels.
 
         Parameters
         ----------
@@ -286,8 +283,8 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
 
     @classmethod
     def from_config(cls, config, **kwargs):
-        """Instantiate a model from a config object and (optionally) patch it with
-        Liger fused-attention kernels.
+        """
+        Instantiate a model from a config object and (optionally) patch it with custom kernels.
 
         Parameters
         ----------
