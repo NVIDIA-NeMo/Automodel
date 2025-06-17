@@ -8,8 +8,6 @@ from typing import Any, Optional
 
 import torch
 from torch.distributed._shard._utils import narrow_tensor_by_index
-from nemo_automodel.checkpoint._backports._fsspec_filesystem import FsspecReader, FsspecWriter
-from nemo_automodel.checkpoint._backports.consolidate_hf_safetensors import consolidate_safetensors_files
 from torch.distributed.checkpoint.metadata import (
     ChunkStorageMetadata,
     Metadata,
@@ -29,11 +27,10 @@ from torch.distributed.checkpoint.planner import (
 from torch.distributed.checkpoint.storage import WriteResult
 from torch.futures import Future
 
+from nemo_automodel.checkpoint._backports._fsspec_filesystem import FsspecReader, FsspecWriter
+from nemo_automodel.checkpoint._backports.consolidate_hf_safetensors import consolidate_safetensors_files
 from nemo_automodel.checkpoint._backports.filesystem import SerializationFormat
-
 from nemo_automodel.checkpoint._backports.hf_utils import (
-    _metadata_fn,
-    _HFStorageInfo,
     CUSTOM_METADATA_KEY,
     DATA_KEY,
     DATA_OFFSETS_KEY,
@@ -43,9 +40,12 @@ from nemo_automodel.checkpoint._backports.hf_utils import (
     SHAPE_KEY,
     SUFFIX,
     _gen_file_name,
-    _get_safetensors_file_metadata,
     _get_dtype,
+    _get_safetensors_file_metadata,
+    _HFStorageInfo,
+    _metadata_fn,
 )
+
 
 __all__ = ["_HuggingFaceStorageWriter", "_HuggingFaceStorageReader"]
 
@@ -85,7 +85,6 @@ class _HuggingFaceStorageWriter(FsspecWriter):
             consolidated_output_path: If provided, the output path where the consolidated files will be written in the finish step. This needs to be a local fs path right now.
             num_threads_consolidation: Number of threads to use for parallel processing of saving data to output files. If not provided, the default value is the number of output files.
         """
-
         if token is not None:
             super().__init__(
                 path=path,
@@ -222,7 +221,6 @@ class _HuggingFaceStorageReader(FsspecReader):
             including localFS and hf://.
             token: The token to use to authenticate with huggingface hub.
         """
-
         if token is not None:
             super().__init__(path=path, token=token)
         else:
@@ -377,7 +375,6 @@ def _extract_file_index(filename: str) -> int:
         The numeric shard index, defaulting to ``1`` when no explicit index is
         present or when the filename cannot be parsed.
     """
-
     # Strip any leading directory components so we only deal with the basename.
     basename = filename.split("/")[-1]
 

@@ -6,11 +6,11 @@ import os
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional, TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 from fsspec.core import url_to_fs
-
 from torch.distributed.checkpoint._extension import StreamTransformExtension
+
 from nemo_automodel.checkpoint._backports.filesystem import (
     FileSystemBase,
     FileSystemReader,

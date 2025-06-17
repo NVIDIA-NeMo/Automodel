@@ -64,6 +64,7 @@ import torch
 
 from nemo_automodel.shared.import_utils import safe_import_from
 
+
 HAVE_LINEAR_LOSS_CE, linear_cross_entropy = safe_import_from(
     "cut_cross_entropy",
     "linear_cross_entropy",
@@ -74,7 +75,8 @@ if HAVE_LINEAR_LOSS_CE:
 
     # Create replacement functions
     def new_is_triton_greater_or_equal(version_str):
-        """Check if pytorch-triton version is greater than or equal to the specified version.
+        """
+        Check if pytorch-triton version is greater than or equal to the specified version.
 
         Args:
             version_str: Version string to check
@@ -95,7 +97,8 @@ if HAVE_LINEAR_LOSS_CE:
             return False
 
     def new_is_triton_greater_or_equal_3_2_0():
-        """Check if pytorch-triton version is greater than or equal to 3.1.0
+        """
+        Check if pytorch-triton version is greater than or equal to 3.1.0.
 
         Returns:
             bool: True if pytorch-triton version >= 3.1.0

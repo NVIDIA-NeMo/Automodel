@@ -24,6 +24,7 @@ from contextlib import contextmanager
 import torch
 from packaging.version import Version as PkgVersion
 
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 logger.addHandler(logging.StreamHandler())
@@ -36,12 +37,16 @@ or use `pip install --extra-index-url https://pypi.nvidia.com ".[cuda12x]"` if i
 
 
 class UnavailableError(Exception):
-    """Error thrown if a symbol is unavailable due to an issue importing it"""
+    """
+    Error thrown if a symbol is unavailable due to an issue importing it.
+    """
 
 
 @contextmanager
 def null_decorator(*args, **kwargs):
-    """null_decorator"""
+    """
+    No-op decorator.
+    """
     if len(kwargs) == 0 and len(args) == 1 and callable(args[0]):
         return args[0]
     else:
@@ -52,8 +57,9 @@ def null_decorator(*args, **kwargs):
         return inner
 
 
-class UnavailableMeta(type):
-    """A metaclass for generating placeholder objects for unavailable symbols
+class UnavailableMeta(type): # noqa D105
+    """
+    A metaclass for generating placeholder objects for unavailable symbols.
 
     This metaclass allows errors to be deferred from import time to the time
     that a symbol is actually used in order to streamline the usage of optional
@@ -75,200 +81,175 @@ class UnavailableMeta(type):
     TypeErrors) will be thrown instead.
     """
 
-    def __new__(meta, name, bases, dct):
+    def __new__(meta, name, bases, dct): # noqa D105
         if dct.get("_msg", None) is None:
             dct["_msg"] = f"{name} could not be imported"
         name = f"MISSING{name}"
         return super(UnavailableMeta, meta).__new__(meta, name, bases, dct)
 
-    def __call__(cls, *args, **kwargs):
+    def __call__(cls, *args, **kwargs): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __getattr__(cls, name):
+    def __getattr__(cls, name): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __eq__(cls, other):
+    def __eq__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __lt__(cls, other):
+    def __lt__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __gt__(cls, other):
+    def __gt__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __le__(cls, other):
+    def __le__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __ge__(cls, other):
+    def __ge__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __ne__(cls, other):
+    def __ne__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __abs__(cls):
+    def __abs__(cls): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __add__(cls, other):
+    def __add__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __radd__(cls, other):
+    def __radd__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __iadd__(cls, other):
+    def __iadd__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __floordiv__(cls, other):
+    def __floordiv__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __rfloordiv__(cls, other):
+    def __rfloordiv__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __ifloordiv__(cls, other):
+    def __ifloordiv__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __lshift__(cls, other):
+    def __lshift__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __rlshift__(cls, other):
+    def __rlshift__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __mul__(cls, other):
+    def __mul__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __rmul__(cls, other):
+    def __rmul__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __imul__(cls, other):
+    def __imul__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __ilshift__(cls, other):
+    def __ilshift__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __pow__(cls, other):
+    def __pow__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __rpow__(cls, other):
+    def __rpow__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __ipow__(cls, other):
+    def __ipow__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __rshift__(cls, other):
+    def __rshift__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __rrshift__(cls, other):
+    def __rrshift__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __irshift__(cls, other):
+    def __irshift__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __sub__(cls, other):
+    def __sub__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __rsub__(cls, other):
+    def __rsub__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __isub__(cls, other):
+    def __isub__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __truediv__(cls, other):
+    def __truediv__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __rtruediv__(cls, other):
+    def __rtruediv__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __itruediv__(cls, other):
+    def __itruediv__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __divmod__(cls, other):
+    def __divmod__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __rdivmod__(cls, other):
+    def __rdivmod__(cls, other): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __neg__(cls):
+    def __neg__(cls): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __invert__(cls):
+    def __invert__(cls): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __hash__(cls):
+    def __hash__(cls): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __index__(cls):
+    def __index__(cls): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __iter__(cls):
+    def __iter__(cls): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __delitem__(cls, name):
+    def __delitem__(cls, name): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __setitem__(cls, name, value):
+    def __setitem__(cls, name, value): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __enter__(cls, *args, **kwargs):
+    def __enter__(cls, *args, **kwargs): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __get__(cls, *args, **kwargs):
+    def __get__(cls, *args, **kwargs): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __delete__(cls, *args, **kwargs):
+    def __delete__(cls, *args, **kwargs): # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __len__(cls):
+    def __len__(cls): # noqa D105
         raise UnavailableError(cls._msg)
 
 
 def is_unavailable(obj):
-    """Helper to check if given symbol is actually a placeholder"""
+    """
+    Helper to check if given symbol is actually a placeholder.
+    """
     return type(obj) is UnavailableMeta
 
 
-class UnavailableNullContext:
-    """A placeholder class for unavailable context managers
-
-    This context manager will return a value which will throw an
-    UnavailableError if used in any way, but the context manager itself can be
-    safely invoked.
-    """
-
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def __enter__(self):
-        return UnavailableMeta(
-            "MissingContextValue",
-            (),
-            {"_msg": "Attempted to make use of placeholder context return value."},
-        )
-
-    def __exit__(self, *args, **kwargs):
-        pass
-
-
 def safe_import(module, *, msg=None, alt=None):
-    """A function used to import modules that may not be available
+    """
+    A function used to import modules that may not be available.
 
     This function will attempt to import a module with the given name, but it
     will not throw an ImportError if the module is not found. Instead, it will
     return a placeholder object which will raise an exception only if used.
 
-    Parameters
-    ----------
-    module: str
-        The name of the module to import.
-    msg: str or None
-        An optional error message to be displayed if this module is used
-        after a failed import.
-    alt: object
-        An optional module to be used in place of the given module if it
-        fails to import
+    Args:
+        module (str): The name of the module to import.
+        msg (str or None): An optional error message to be displayed if this module is used
+            after a failed import.
+        alt (object): An optional module to be used in place of the given module if it
+            fails to import
 
-    Returns
-    -------
-    Tuple(bool, object)
-        The imported module, the given alternate, or a class derived from
+    Returns:
+        Tuple(bool, object): The imported module, the given alternate, or a class derived from
         UnavailableMeta, and a boolean indicating whether the intended import was successful.
     """
     try:
@@ -288,33 +269,27 @@ def safe_import(module, *, msg=None, alt=None):
 
 
 def safe_import_from(module, symbol, *, msg=None, alt=None, fallback_module=None):
-    """A function used to import symbols from modules that may not be available
+    """
+    A function used to import symbols from modules that may not be available.
 
     This function will attempt to import a symbol with the given name from
     the given module, but it will not throw an ImportError if the symbol is not
     found. Instead, it will return a placeholder object which will raise an
     exception only if used.
 
-    Parameters
-    ----------
-    module: str
-        The name of the module in which the symbol is defined.
-    symbol: str
-        The name of the symbol to import.
-    msg: str or None
-        An optional error message to be displayed if this symbol is used
-        after a failed import.
-    alt: object
-        An optional object to be used in place of the given symbol if it fails
-        to import
-    fallback_module: str
-        Alternative name of the model in which the symbol is defined. The function will first to
-        import using the `module` value and if that fails will also try the `fallback_module`.
+    Args:
+        module (str): The name of the module in which the symbol is defined.
+        symbol (str): The name of the symbol to import.
+        msg (str or None): An optional error message to be displayed if this symbol is used
+            after a failed import.
+        alt (object): An optional object to be used in place of the given symbol if it fails
+            to import
+        fallback_module (str): Alternative name of the model in which the symbol is defined.
+            The function will first to import using the `module` value and if that fails will also
+            try the `fallback_module`.
 
-    Returns
-    -------
-    Tuple(object, bool)
-        The imported symbol, the given alternate, or a class derived from
+    Returns:
+        Tuple(object, bool): The imported symbol, the given alternate, or a class derived from
         UnavailableMeta, and a boolean indicating whether the intended import was successful.
     """
     try:
@@ -341,7 +316,8 @@ def safe_import_from(module, symbol, *, msg=None, alt=None, fallback_module=None
 
 
 def gpu_only_import(module, *, alt=None):
-    """A function used to import modules required only in GPU installs
+    """
+    A function used to import modules required only in GPU installs.
 
     This function will attempt to import a module with the given name.
     This function will attempt to import a symbol with the given name from
@@ -349,21 +325,15 @@ def gpu_only_import(module, *, alt=None):
     found. Instead, it will return a placeholder object which will raise an
     exception only if used with instructions on installing a GPU build.
 
-    Parameters
-    ----------
-    module: str
-        The name of the module to import.
-    alt: object
-        An optional module to be used in place of the given module if it
-        fails to import in a non-GPU-enabled install
+    Args:
+        module (str): The name of the module to import.
+        alt (object): An optional module to be used in place of the given module if it
+            fails to import in a non-GPU-enabled install
 
-    Returns
-    -------
-    object
-        The imported module, the given alternate, or a class derived from
+    Returns:
+        object: The imported module, the given alternate, or a class derived from
         UnavailableMeta.
     """
-
     return safe_import(
         module,
         msg=f"{module} is not enabled in non GPU-enabled installations or environemnts. {GPU_INSTALL_STRING}",
@@ -372,7 +342,8 @@ def gpu_only_import(module, *, alt=None):
 
 
 def gpu_only_import_from(module, symbol, *, alt=None):
-    """A function used to import symbols required only in GPU installs
+    """
+    A function used to import symbols required only in GPU installs.
 
     This function will attempt to import a module with the given name.
     This function will attempt to import a symbol with the given name from
@@ -380,20 +351,14 @@ def gpu_only_import_from(module, symbol, *, alt=None):
     found. Instead, it will return a placeholder object which will raise an
     exception only if used with instructions on installing a GPU build.
 
-    Parameters
-    ----------
-    module: str
-        The name of the module to import.
-    symbol: str
-        The name of the symbol to import.
-    alt: object
-        An optional object to be used in place of the given symbol if it fails
-        to import in a non-GPU-enabled install
+    Args:
+        module (str): The name of the module to import.
+        symbol (str): The name of the symbol to import.
+        alt (object): An optional object to be used in place of the given symbol if it fails
+            to import in a non-GPU-enabled install
 
-    Returns
-    -------
-    object
-        The imported symbol, the given alternate, or a class derived from
+    Returns:
+        object: The imported symbol, the given alternate, or a class derived from
         UnavailableMeta.
     """
     return safe_import_from(
@@ -405,7 +370,8 @@ def gpu_only_import_from(module, symbol, *, alt=None):
 
 
 def get_torch_version():
-    """return pytorch version with fallback if unavailable
+    """
+    Return pytorch version with fallback if unavailable.
 
     Returns:
         PkgVersion: Pytorch's version
@@ -419,7 +385,9 @@ def get_torch_version():
 
 
 def is_torch_min_version(version, check_equality=True):
-    """Check if minimum version of `torch` is installed."""
+    """
+    Check if minimum version of `torch` is installed.
+    """
     if check_equality:
         return get_torch_version() >= PkgVersion(version)
     return get_torch_version() > PkgVersion(version)

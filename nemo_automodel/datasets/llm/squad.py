@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# from nemo_automodel.datasets.llm.hf_dataset import HFDatasetBuilder
 from datasets import load_dataset
 
 
@@ -21,7 +20,7 @@ def make_squad_dataset(
     limit_dataset_samples=None,
     start_of_turn_token=None,
     fp8=False,
-    split='train',
+    split="train",
     dataset_name="rajpurkar/squad",
 ):
     """
@@ -58,21 +57,21 @@ def make_squad_dataset(
         - `loss_mask`: List of 0/1 flags indicating which tokens contribute
           to the loss (answers only).
     """
-    eos_token_id = getattr(tokenizer, 'eos_token_id', 0)
-    chat_template = getattr(tokenizer, 'chat_template', None)
+    eos_token_id = getattr(tokenizer, "eos_token_id", 0)
+    chat_template = getattr(tokenizer, "chat_template", None)
 
     def pad_to_seq_length(sample):
         seq_pad_len_ar = max(0, seq_length - len(next(iter(sample.values()))))
-        return {k: v + [eos_token_id if v != 'loss_mask' else 0] * seq_pad_len_ar for k, v in sample.items()}
+        return {k: v + [eos_token_id if v != "loss_mask" else 0] * seq_pad_len_ar for k, v in sample.items()}
 
     def formatting_prompts_func(example):
         formatted_text = [
             f"{example['context']} {example['question']} ",
-            example['answers']['text'][0].strip(),
+            example["answers"]["text"][0].strip(),
         ]
-        context_ids, answer_ids = list(map(lambda x: tokenizer(x)['input_ids'], formatted_text))
-        bos_id = getattr(tokenizer, 'bos_token_id', None)
-        eos_id = getattr(tokenizer, 'eos_token_id', None)
+        context_ids, answer_ids = list(map(lambda x: tokenizer(x)["input_ids"], formatted_text))
+        bos_id = getattr(tokenizer, "bos_token_id", None)
+        eos_id = getattr(tokenizer, "eos_token_id", None)
         # Remove EOS token from context's end
         if len(context_ids) > 0 and context_ids[-1] == eos_id:
             context_ids = context_ids[:-1]
@@ -89,12 +88,12 @@ def make_squad_dataset(
 
     def formatting_prompts_func_with_chat_template(example, start_of_turn_token=None):
         formatted_text = [
-            {'role': 'user', 'content': f"{example['context']} {example['question']}"},
-            {'role': 'assistant', 'content': example['answers']['text'][0].strip()},
+            {"role": "user", "content": f"{example['context']} {example['question']}"},
+            {"role": "assistant", "content": example["answers"]["text"][0].strip()},
         ]
         input_ids = tokenizer.apply_chat_template(formatted_text)
         if isinstance(start_of_turn_token, str):
-            start_of_turn_token_id = tokenizer(start_of_turn_token, add_special_tokens=False)['input_ids'][0]
+            start_of_turn_token_id = tokenizer(start_of_turn_token, add_special_tokens=False)["input_ids"][0]
             first_start_of_turn_token_id = input_ids.index(start_of_turn_token_id)
             response_start = input_ids.index(start_of_turn_token_id, first_start_of_turn_token_id + 1) + 1
         else:
@@ -102,26 +101,26 @@ def make_squad_dataset(
         loss_mask = [0] * response_start + [1] * (len(input_ids) - response_start)
         return dict(
             input_ids=input_ids,
-            labels=input_ids[1:] + [getattr(tokenizer, 'eos_token_id', None) or input_ids[-1]],
+            labels=input_ids[1:] + [getattr(tokenizer, "eos_token_id", None) or input_ids[-1]],
             loss_mask=loss_mask,
         )
 
     if limit_dataset_samples is not None:
         assert isinstance(limit_dataset_samples, int), "Expected limit_dataset_samples to be an int"
-        split = f'{split}[:{limit_dataset_samples}]'
+        split = f"{split}[:{limit_dataset_samples}]"
 
     dataset = load_dataset(dataset_name, split=split)
 
     fmt_fn = formatting_prompts_func
     if chat_template is not None:
-        fmt_fn = lambda x: formatting_prompts_func_with_chat_template(x, start_of_turn_token)
+        fmt_fn = lambda x: formatting_prompts_func_with_chat_template(x, start_of_turn_token)  # noqa: E731
 
     if isinstance(seq_length, int):
         fmt_fn_ = fmt_fn
-        fmt_fn = lambda x: pad_to_seq_length(fmt_fn_(x))
+        fmt_fn = lambda x: pad_to_seq_length(fmt_fn_(x))  # noqa: E731
 
     return dataset.map(
         fmt_fn,
         batched=False,
-        remove_columns=["id", "title", "context", "question", 'answers'],
+        remove_columns=["id", "title", "context", "question", "answers"],
     )

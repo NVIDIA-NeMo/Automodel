@@ -13,7 +13,11 @@
 # limitations under the License.
 
 
-from nemo_automodel._transformers.auto_model import NeMoAutoModelForCausalLM, NeMoAutoModelForImageTextToText
+from nemo_automodel._transformers.auto_model import (
+    NeMoAutoModelForCausalLM,
+    NeMoAutoModelForImageTextToText,
+)
+
 
 __all__ = ["NeMoAutoModelForCausalLM", "NeMoAutoModelForImageTextToText"]
 

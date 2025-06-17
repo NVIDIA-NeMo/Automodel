@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
 import torch.nn as nn
-import pytest
 
 from nemo_automodel._peft.lora import LinearLoRA, apply_lora_to_linear_modules
 

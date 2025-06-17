@@ -15,15 +15,18 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.loss.linear_ce import HAVE_LINEAR_LOSS_CE, fused_linear_cross_entropy
+from nemo_automodel.loss.linear_ce import (
+    HAVE_LINEAR_LOSS_CE,
+    fused_linear_cross_entropy,
+)
 
 
 @pytest.mark.skipif(not HAVE_LINEAR_LOSS_CE, reason="Linear loss CE is not installed")
 def test_fused_cross_entropy():
-    """
-    Tests fused_linear_cross_entropy against PyTorch's cross_entropy implementation, fused_linear_cross_entropy should:
-        * has close output with PyTorch's cross_entropy
-        * uses less memory than PyTorch's cross_entropy
+    """Tests fused_linear_cross_entropy against PyTorch's CE.
+
+    * has close output with PyTorch's cross_entropy
+    * uses less memory than PyTorch's cross_entropy
     """
     if not torch.cuda.is_available():
         pytest.skip("This test requires a GPU")

@@ -16,30 +16,40 @@
 
 import logging
 import os
+from contextlib import ContextDecorator, nullcontext
 from datetime import datetime
 from typing import Any, Optional
 
 import torch
 import torch.distributed
-from contextlib import ContextDecorator, nullcontext
 import torch.distributed as dist
 import yaml
+
 from nemo_automodel.utils.yaml_utils import safe_yaml_representers
+
 
 logger = logging.getLogger(__name__)
 
 
 class FirstRankPerNode(ContextDecorator):
     """
-    Context manager that:
-      • Lets LOCAL_RANK==0 run the protected code first on each node.
-      • Inserts an extra barrier across *only* the node‑local rank‑0 processes.
-      • Works on a single GPU (no env flags, no distributed initialisation).
+    Context manager to enforce rank0 to process section over other ranks.
+
+      - Lets LOCAL_RANK==0 run the protected code first on each node.
+      - Inserts an extra barrier across *only* the node‑local rank‑0 processes.
+      - Works on a single GPU (no env flags, no distributed initialisation).
 
     Note: it is assumed the scoped code is not torch.distributed heavy.
     """
 
     def __enter__(self):
+        """
+        Create / bootstrap a (distributed) proc. group that rank0 enters first.
+
+        Returns:
+            bool: ``True``  – if the current process is node-rank-0
+                  ``False`` – otherwise
+        """
         self._created_pg = False
         self._node0_group = None
         self._first = True  # default for single‑GPU / no‑dist case
@@ -72,6 +82,25 @@ class FirstRankPerNode(ContextDecorator):
         return self._first
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        """
+        Tear down the context.
+
+        1. If the current process was the first on its node, release the
+           waiting peer ranks by issuing a barrier.
+        2. If an exception occurred, abort the *entire* distributed job.
+        3. If this context manager created the process group, destroy it.
+
+        Args:
+            exc_type (Type[BaseException] | None): Exception class if one
+                occurred inside the ``with`` block.
+            exc_val  (BaseException | None): The raised exception instance.
+            exc_tb   (TracebackType | None): Traceback associated with the
+                exception.
+
+        Returns:
+            bool: ``False`` so that any exception raised inside the ``with``
+                  block is propagated to the caller (standard CM semantics).
+        """
         try:
             if self._first and dist.is_initialized():
                 # Re‑sync the whole world so that non‑rank‑0s can proceed
@@ -86,7 +115,9 @@ class FirstRankPerNode(ContextDecorator):
         return False
 
     def _try_bootstrap_pg(self) -> bool:
-        """Try to create a default pg from env:// variables."""
+        """
+        Try to create a default pg from env:// variables.
+        """
         env = os.environ
         required = ("WORLD_SIZE", "RANK", "MASTER_ADDR", "MASTER_PORT")
         if all(k in env for k in required):
@@ -100,7 +131,8 @@ class FirstRankPerNode(ContextDecorator):
 
 
 def get_rank_safe() -> int:
-    """Get the distributed rank safely, even if torch.distributed is not initialized.
+    """
+    Get the distributed rank safely, even if torch.distributed is not initialized.
 
     Returns:
         The current process rank.
@@ -114,7 +146,8 @@ def get_rank_safe() -> int:
 
 
 def get_world_size_safe() -> int:
-    """Get the distributed world size safely, even if torch.distributed is not initialized.
+    """
+    Get the distributed world size safely, even if torch.distributed is not initialized.
 
     Returns:
         The total number of processes in the distributed job.
@@ -128,7 +161,8 @@ def get_world_size_safe() -> int:
 
 
 def get_local_rank_preinit() -> int:
-    """Get the local rank from the environment variable, intended for use before full init.
+    """
+    Get the local rank from the environment variable, intended for use before full init.
 
     Returns:
         The local rank of the current process.
@@ -138,7 +172,8 @@ def get_local_rank_preinit() -> int:
 
 
 def is_last_rank() -> bool:
-    """Check if the current rank is the last rank in the default process group.
+    """
+    Check if the current rank is the last rank in the default process group.
 
     Returns:
         True if the current rank is the last one, False otherwise.
@@ -148,7 +183,8 @@ def is_last_rank() -> bool:
 
 
 def append_to_progress_log(save_dir: str, string: str, barrier: bool = True) -> None:
-    """Append a formatted string to the progress log file (rank 0 only).
+    """
+    Append a formatted string to the progress log file (rank 0 only).
 
     Includes timestamp, job ID, and number of GPUs in the log entry.
 
@@ -173,7 +209,8 @@ def append_to_progress_log(save_dir: str, string: str, barrier: bool = True) -> 
 
 
 def barrier_and_log(string: str) -> None:
-    """Perform a distributed barrier and then log a message on rank 0.
+    """
+    Perform a distributed barrier and then log a message on rank 0.
 
     Args:
         string: The message string to log.
@@ -185,7 +222,8 @@ def barrier_and_log(string: str) -> None:
 
 
 def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs: Any):
-    """If torch distributed is initialized, log only on rank
+    """
+    If torch distributed is initialized, log only on rank.
 
     Args:
         logger (logging.Logger): The logger to write the logs
@@ -204,7 +242,8 @@ def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs:
 
 
 def dump_dataclass_to_yaml(obj: Any, filename: Optional[str] = None) -> Optional[str]:
-    """Dump a dataclass object or other Python object to a YAML file or string.
+    """
+    Dump a dataclass object or other Python object to a YAML file or string.
 
     Uses safe representers to handle common types.
 
@@ -231,7 +270,8 @@ def reduce_loss(
     per_token_loss: bool = True,
     dp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reduce loss across all ranks.
+    """
+    Reduce loss across all ranks.
 
     Args:
         loss_store: List of loss tensors to reduce.
@@ -307,9 +347,11 @@ def rescale_gradients(model, num_tokens_for_grad_scaling, dp_group=None):
 def clip_gradients(model, clip_norm, foreach=True):
     """
     Clip gradients across the DP group.
+
     Args:
         model: The model to clip the gradients of.
         clip_norm: The maximum norm of the gradients.
+        foreach: if enabled will use fused operations.
     """
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     grad_norm = torch.nn.utils.get_total_norm(grads, foreach=foreach)

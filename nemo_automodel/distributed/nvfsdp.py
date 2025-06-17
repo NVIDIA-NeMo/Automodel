@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import List, Optional
 
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
@@ -31,8 +31,7 @@ from nemo_automodel.distributed.parallelizer import (
 @dataclass
 class NVFSDPManager:
     """
-    Manager for setting up and parallelizing models using nvFSDP with Tensor-Parallel,
-    Data-Parallel, and Context-Parallel sharding strategies.
+    Manager for setting up and parallelizing models using nvFSDP with TP, DP, CP sharding.
 
     This manager initializes the torch.distributed process group, infers the group sizes
     for data parallelism (DP) and tensor parallelism (TP), builds the device mesh for
@@ -141,7 +140,7 @@ class NVFSDPManager:
 
     def _setup_distributed(self):
         """
-        Initializes the distributed environment:
+        Initializes the distributed environment.
 
         - Checks availability and initialization of torch.distributed.
         - Infers data-parallel and tensor-parallel sizes if not provided.
@@ -199,6 +198,7 @@ class NVFSDPManager:
 
         Args:
             model: The model to be parallelized.
+            use_hf_tp_plan (bool): if true, will query the model for the TP plan.
 
         Returns:
             The parallelized model.

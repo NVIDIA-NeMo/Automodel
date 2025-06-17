@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import signal
+import types
 from typing import Any, Optional
 
 import torch
@@ -22,7 +23,8 @@ from nemo_automodel.utils.common_utils import get_world_size_safe, print_rank_0
 
 
 def get_device(local_rank: Optional[int] = None) -> torch.device:
-    """Get the appropriate torch device based on the distributed backend.
+    """
+    Get the appropriate torch device based on the distributed backend.
 
     Args:
         local_rank: The local rank, used to specify the CUDA device index for NCCL.
@@ -88,7 +90,8 @@ def all_gather_item(
 
 
 class DistributedSignalHandler:
-    """Context manager to handle signals gracefully in a distributed setting.
+    """
+    Context manager to handle signals gracefully in a distributed setting.
 
     Installs a signal handler upon entering the context that sets a flag
     when the specified signal is received. The `signals_received` method
@@ -101,13 +104,20 @@ class DistributedSignalHandler:
     """
 
     def __init__(self, sig: int = signal.SIGTERM) -> None:
+        """
+        Constructor for the DistributedSignalHandler.
+
+        Args:
+            sig (int, optional): The signal to handle. Defaults to signal.SIGTERM.
+        """
         self.sig = sig
         self._signal_received = False
         self.released = False
         self.original_handler = None
 
     def signals_received(self) -> list[bool]:
-        """Check if any rank in the default group received the signal.
+        """
+        Check if any rank in the default group received the signal.
 
         Uses all_gather to collect the signal status from all ranks.
 
@@ -119,6 +129,12 @@ class DistributedSignalHandler:
         return all_received
 
     def __enter__(self) -> "DistributedSignalHandler":
+        """
+        Enters the signal-managed area.
+
+        Returns:
+            DistributedSignalHandler: returns self.
+        """
         self._signal_received = False
         self.released = False
         self.original_handler = signal.getsignal(self.sig)
@@ -132,12 +148,17 @@ class DistributedSignalHandler:
 
         return self
 
-    def __exit__(self, exc_type: Optional[type], exc_val: Optional[Exception], exc_tb: Optional[Any]) -> None:
-        """Release the signal handler and restore the original handler."""
+    def __exit__(self, exc_type: Optional[type],
+        exc_val: BaseException | None, exc_tb: types.TracebackType | None
+    ) -> None:  # noqa: E501
+        """
+        Release the signal handler and restore the original handler.
+        """
         self.release()
 
     def release(self) -> bool:
-        """Restore the original signal handler.
+        """
+        Restore the original signal handler.
 
         Returns:
             True if the handler was released, False if it was already released.

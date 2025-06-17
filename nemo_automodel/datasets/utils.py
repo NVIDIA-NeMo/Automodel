@@ -12,21 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
 import math
 
+import torch
+
+
 def batchify(tensor):
-    """Ensures that the input tensor has at least two dimensions by adding an extra batch dimension if necessary.
+    """
+    Ensures that the input tensor has at least two dimensions by adding an extra batch dimension if necessary.
 
-    Parameters
-    ----------
-    tensor : torch.Tensor
-        The input tensor to be batchified.
+    Args:
+        tensor (torch.Tensor): The input tensor to be batchified.
 
-    Returns
-    -------
-    torch.Tensor
-        The tensor with an extra dimension added if it was originally 1-dimensional.
+    Returns:
+        torch.Tensor:  The tensor with an extra dimension added if it was originally 1-dimensional.
         Otherwise, the tensor is returned as-is.
     """
     if tensor.ndim == 1:
@@ -35,40 +34,34 @@ def batchify(tensor):
 
 
 def extract_key_from_dicts(batch, key):
-    """Extracts the value of the given key from each dictionary in a list of dictionaries.
+    """
+    Extracts the value of the given key from each dictionary in a list of dictionaries.
 
-    Parameters
-    ----------
-    batch : List[dict]
-        A list of dictionaries.
-    key : str
-        The key whose values are to be extracted from each dictionary.
+    Args:
+        batch (List[dict]): A list of dictionaries.
+        key (str): The key whose values are to be extracted from each dictionary.
 
-    Returns
-    -------
-    List
-        A list of values associated with the specified key, in the same order as
+    Returns:
+        List: A list of values associated with the specified key, in the same order as
         the dictionaries in the input batch.
     """
     return list(map(lambda x: x[key], batch))
 
 
 def pad_within_micro(batch, pad_token_id, pad_seq_len_divisible=None):
-    """Pads each list in a batch of lists to the same length with a specified token.
+    """
+    Pads each list in a batch of lists to the same length with a specified token.
 
-    Parameters
-    ----------
-    batch : List[List[int]]
-        A batch of sequences (e.g., token IDs), where each sequence is a list of integers.
-    pad_token_id : int
-        The token ID to use for padding shorter sequences.
-    pad_seq_len_divisible : int
-        The value to use for padding sequence length so that it is divisible by pad_seq_len_divisible.
-    Returns
-    -------
-    List[List[int]]
-        A batch of sequences where each inner list has been padded with the pad token
-        to match the length of the longest sequence in the batch.
+    Args:
+        batch (List[List[int]]): A batch of sequences (e.g., token IDs), where each sequence
+            is a list of integers.
+        pad_token_id (int): The token ID to use for padding shorter sequences.
+        pad_seq_len_divisible (int): The value to use for padding sequence length so that it is
+            divisible by pad_seq_len_divisible.
+
+    Returns:
+        List[List[int]]: A batch of sequences where each inner list has been padded with the pad
+        token to match the length of the longest sequence in the batch.
     """
     max_len = max(map(len, batch))
     if pad_seq_len_divisible:
@@ -77,7 +70,8 @@ def pad_within_micro(batch, pad_token_id, pad_seq_len_divisible=None):
 
 
 def default_collater(batch, pad_token_id=0, pad_seq_len_divisible=None):
-    """Default batch collator that handles padding and batching.
+    """
+    Default batch collator that handles padding and batching.
 
     Args:
         batch: A batch of examples.
@@ -98,8 +92,8 @@ def default_collater(batch, pad_token_id=0, pad_seq_len_divisible=None):
                         )
                     ),
                     pad_seq_len_divisible,
-                )
-            )
+                ),
+            ),
         )
         for key in batch[0].keys()
     }
@@ -109,18 +103,17 @@ class SFTSingleTurnPreprocessor:
     """
     Generic single-turn text-to-text SFT (supervised-fine-tuning) pre-processor.
 
-    Parameters
-    ----------
-    args           : argparse.Namespace or similar - must expose the fields
-                     `dataset_name`, `model_name_or_path`, `preprocessing_num_workers`,
-                     `overwrite_cache`.
-    tokenizer      : Pre-trained tokenizer (HF).
-    accelerator    : accelerate.Accelerator.
-    task_dict      : Dict[str, Task] mapping dataset_name -> task object that
-                     provides `get_context()` and `get_target()` callables.
+    Args:
+        tokenizer: Pre-trained tokenizer (HF).
     """
 
     def __init__(self, tokenizer):
+        """
+        SFTSingleTurnPreprocessor constructor.
+
+        Args:
+            tokenizer: Pretrained tokenizer.
+        """
         self.tokenizer = tokenizer
         self.block_size = None
         self.preprocessing_num_workers = 1
@@ -148,16 +141,16 @@ class SFTSingleTurnPreprocessor:
         out = {}
         out["input_ids"] = [
             c_ids + t_ids for c_ids, t_ids in zip(ctx_tok["input_ids"],
-                                                  tgt_tok["input_ids"])
+                                                  tgt_tok["input_ids"], strict=False)
         ]
         out["attention_mask"] = [
             c_m + t_m for c_m, t_m in zip(ctx_tok["attention_mask"],
-                                          tgt_tok["attention_mask"])
+                                          tgt_tok["attention_mask"], strict=False)
         ]
         # label: -100 for ctx, true ids for tgt
         out["labels"] = [
             [-100] * (len(c_ids)-1) + t_ids + [-100]
-            for c_ids, t_ids in zip(ctx_tok["input_ids"], tgt_tok["input_ids"])
+            for c_ids, t_ids in zip(ctx_tok["input_ids"], tgt_tok["input_ids"], strict=False)
         ]
 
         out["loss_mask"] = [
@@ -166,7 +159,7 @@ class SFTSingleTurnPreprocessor:
         return out
 
     def _compute_dataset_max_len(self, tokenized_ds):
-        max_len = max(map(lambda x: len(x['input_ids']), tokenized_ds))
+        max_len = max(map(lambda x: len(x["input_ids"]), tokenized_ds))
         # make multiple of 8
         max_len = math.ceil(max_len / 8) * 8
         # respect model block size
@@ -202,19 +195,16 @@ class SFTSingleTurnPreprocessor:
 
     def process(self, raw_dataset, ds):
         """
-        Main entry.
+        Main processor entry.
 
-        Parameters
-        ----------
-        raw_dataset : datasets.DatasetDict  (e.g. returned by load_dataset)
-        split        : Which split from raw_dataset to process.
+        Args:
+            raw_dataset (datasets.DatasetDict): the dataset (e.g. returned by load_dataset)
+            ds (dataset): the dataset with get_target method.
 
-        Returns
-        -------
-        datasets.DatasetDict  - tokenized + padded datasets (all splits preserved).
+        Returns:
+            datasets.DatasetDict: tokenized + padded datasets (all splits preserved).
         """
-
-        if not hasattr(self.tokenizer, 'pad_token') and hasattr(self.tokenizer, 'bos_token'):
+        if not hasattr(self.tokenizer, "pad_token") and hasattr(self.tokenizer, "bos_token"):
             self.tokenizer.pad_token = self.tokenizer.bos_token
 
         # 1. tokenise ----------------------------------------------------------------
@@ -223,7 +213,7 @@ class SFTSingleTurnPreprocessor:
             batched=True,
             num_proc=self.preprocessing_num_workers,
             remove_columns=raw_dataset.column_names,
-            load_from_cache_file=False, #not self.overwrite_cache,
+            load_from_cache_file=not self.overwrite_cache,
             desc="Running tokenizer on dataset",
         )
 

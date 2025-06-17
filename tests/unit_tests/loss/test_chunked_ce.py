@@ -20,6 +20,7 @@ from nemo_automodel.loss.chunked_ce import chunked_cross_entropy, compute_cross_
 def test_compute_cross_entropy_basic():
     """
     Tests compute_cross_entropy with a small set of logits and targets.
+
     Verifies results match PyTorch's built-in cross_entropy.
     """
     # Create sample logits and targets
@@ -39,6 +40,7 @@ def test_compute_cross_entropy_basic():
 def test_compute_cross_entropy_ignore_index():
     """
     Tests compute_cross_entropy with ignore_index to ensure ignored targets
+
     don't contribute to the loss.
     """
     # Create sample logits and targets with ignore_index
@@ -58,6 +60,7 @@ def test_compute_cross_entropy_ignore_index():
 def test_chunked_cross_entropy_matches_compute_cross_entropy():
     """
     Tests that chunked_cross_entropy produces the same result as compute_cross_entropy
+
     when the entire sequence is processed in one chunk.
     """
     # Create random test data
@@ -82,6 +85,7 @@ def test_chunked_cross_entropy_matches_compute_cross_entropy():
 def test_chunked_cross_entropy_ignore_index_and_mask():
     """
     Tests that chunked_cross_entropy properly ignores indices and respects masks.
+
     Verifies consistency with compute_cross_entropy.
     """
     seq_len = 10

@@ -12,20 +12,20 @@ from typing import Any, Optional
 
 import fsspec
 import torch
-
 from fsspec.core import url_to_fs
+
 from nemo_automodel.checkpoint._backports.hf_utils import (
-    _metadata_fn,
-    _gen_file_name,
-    _get_dcp_custom_metadata,
-    _get_dtype,
-    _get_safetensors_file_metadata,
     DATA_OFFSETS_KEY,
     DEFAULT_EXTRA_METADATA_KEY,
     DTYPE_KEY,
     SAVED_OFFSETS_KEY,
     SHAPE_KEY,
     SUFFIX,
+    _gen_file_name,
+    _get_dcp_custom_metadata,
+    _get_dtype,
+    _get_safetensors_file_metadata,
+    _metadata_fn,
 )
 
 

@@ -13,10 +13,9 @@
 # limitations under the License.
 
 
+import torch
 import triton
 import triton.language as tl
-
-import torch
 
 
 def forward_autotune_configs():
@@ -68,10 +67,11 @@ def inner_kernel(pid_m, pid_n,
                  BLOCK_SIZE_N: tl.constexpr,
                  scale):
     """
-    Performs the matrix multiplication AB where A is an M x K matrix and B is an
-    N x K matrix. The result is returned to be stored by the calling method.
-    """
+    Performs the matrix multiplication AB.
 
+    A is an M x K matrix and B is an N x K matrix.
+    The result is returned to be stored by the calling method.
+    """
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M))
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -103,8 +103,9 @@ def block_vector_mul(pid_m, pid_n,
            BLOCK_SIZE_N: tl.constexpr,
            BLOCK_SIZE_L: tl.constexpr):
     """
-    Multiplies an M x N vector AB and and N x L vector C and adds the result to
-    the output vector D.  N is assumed to be smaller than BLOCK_SIZE_N.
+    Multiplies an M x N vector AB and and N x L vector C and adds the result to the output vector D.
+
+    N is assumed to be smaller than BLOCK_SIZE_N.
     """
     offs_cn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))
     offs_l = tl.arange(0, BLOCK_SIZE_L)
@@ -149,7 +150,9 @@ def lora_forward_kernel(
     BLOCK_SIZE_L: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,  #
 ):
-    """Kernel for computing the matmul D = A x B x C.
+    """
+    Kernel for computing the matmul D = A x B x C.
+
     A has shape (M, K), B has shape (K, N), C has shape (N, L), and D has shape (M, L)
     N, the LoRA dimension must be less than or equal to than BLOCK_SIZE_N.
     """
@@ -179,11 +182,13 @@ def lora_forward_wrapper(x, lora_A, lora_B, res, scale, dtype=torch.float32):
     """
     Computes LoRA forward pass.
 
-    x: input activations,  (M x K)
-    lora_A: LoRA A weights (K x N)
-    lora_B: LoRA B weights (N x L)
-    scale: LoRA scale factor (scalar)
-    dtype: dtype for output
+    Args:
+        x: input activations,  (M x K)
+        lora_A: LoRA A weights (K x N)
+        lora_B: LoRA B weights (N x L)
+        res (optional(torch.Tensor)): output tensor
+        scale: LoRA scale factor (scalar)
+        dtype: dtype for output
     """
     assert x.shape[1] == lora_A.shape[0], "Incompatible X and LoRA A dimensions"
     assert lora_A.shape[1] == lora_B.shape[0], "Incompatible LoRA dimensions"
@@ -222,7 +227,7 @@ def da_dx_autotune_configs():
             for blk_m in [64, 128]:
                 out.append(
                     triton.Config(
-                        {'BLOCK_SIZE_K': blk_k,  'BLOCK_SIZE_L': blk_l, 
+                        {'BLOCK_SIZE_K': blk_k,  'BLOCK_SIZE_L': blk_l,
                         'BLOCK_SIZE_M': blk_m, 'GROUP_SIZE_M': 8},
                         num_stages=4,
                         num_warps=4,
@@ -251,7 +256,8 @@ def lora_da_dx_kernel(dy_ptr, b_ptr, a_ptr, dx_ptr, dyb_ptr,
                     BLOCK_SIZE_L: tl.constexpr,
 ):
     """
-    Kernel for computing the matmul DYB = DY x B and DX = DY * B * A
+    Kernel for computing the matmul DYB = DY x B and DX = DY * B * A.
+
     XT has shape (S, M), DY has shape (M, K), B has shape (K, N), and A has shape (N, L)
     N, the LoRA dimension must be less than or equal to than BLOCK_SIZE_N.
     The result returned by this kernel is reduced in the wrapper.
@@ -295,8 +301,7 @@ def lora_da_dx_kernel(dy_ptr, b_ptr, a_ptr, dx_ptr, dyb_ptr,
 
 
 def lora_da_dx_update_wrapper(xt, dy, lora_B, lora_A, scale, dtype=torch.float32):
-    """
-    Computes dlora_A and dx.
+    """Computes dlora_A and dx.
 
     xt: input activation weights, transposed (S x M)
     dy: gradients (M x K)
@@ -365,10 +370,10 @@ def lora_db_kernel(a_ptr, b_ptr, c_ptr,
                     GROUP_SIZE_M: tl.constexpr
                     ):
     """
-    Kernel for computing the matmul AXT = A x X^T
+    Kernel for computing the matmul AXT = A x X^T.
+
     A has shape (M, K), X has shape (N, K).
     """
-
     pid_m, pid_n = get_pid_coords(M, N,
                                 BLOCK_SIZE_M,
                                 BLOCK_SIZE_N,
@@ -389,8 +394,7 @@ def lora_db_kernel(a_ptr, b_ptr, c_ptr,
 
 
 def lora_db_update_wrapper(lora_A, xt, dy, scale, dtype=torch.float32):
-    """
-    Computes d_lora_B.
+    """Computes d_lora_B.
 
     lora_A: LoRA A weights (M x K)
     xt: input activation weights, transposed (K x N)

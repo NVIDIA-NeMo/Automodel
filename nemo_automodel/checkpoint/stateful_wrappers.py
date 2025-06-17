@@ -25,9 +25,11 @@ from torch.distributed.checkpoint.stateful import Stateful
 
 from nemo_automodel.checkpoint._backports.filesystem import SerializationFormat
 
+
 # modified from pytorch tutorial https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html
 class ModelState(Stateful):
-    """Helper class for tracking model state in distributed checkpointing.
+    """
+    Helper class for tracking model state in distributed checkpointing.
 
     This class is compliant with the Stateful protocol, allowing DCP to automatically
     call state_dict/load_state_dict as needed in the dcp.save/load APIs.
@@ -37,12 +39,27 @@ class ModelState(Stateful):
     """
 
     def __init__(self, model: torch.nn.Module, serialization_format: SerializationFormat):
+        """
+        Initialize a ModelState instance for distributed checkpointing.
+
+        The constructor records the model reference, detects whether the model
+        ties its language-model head to the input embeddings, and stores the
+        desired serialization backend so that DCP can correctly save and restore
+        the model’s parameters and buffers.
+
+        Args:
+            model (torch.nn.Module): The PyTorch model whose state should be
+                captured during checkpointing.
+            serialization_format (SerializationFormat): Backend/format to use when
+                persisting the model state (e.g., torch, safetensors).
+        """
         self.model = model
         self.is_tied_lm_head = getattr(getattr(model, 'config', {}), 'tie_word_embeddings', False)
         self.serialization_format = serialization_format
 
     def state_dict(self) -> dict[str, Any]:
-        """Get the model's state dictionary.
+        """
+        Get the model's state dictionary.
 
         Returns:
             dict: Dictionary containing the model's state dict with CPU offloading enabled.
@@ -68,7 +85,8 @@ class ModelState(Stateful):
         return model_state_dict
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        """Load the state dictionary into the model.
+        """
+        Load the state dictionary into the model.
 
         Args:
             state_dict (dict): State dictionary to load.
@@ -100,7 +118,8 @@ class ModelState(Stateful):
 
 
 class OptimizerState(Stateful):
-    """Helper class for tracking optimizer state in distributed checkpointing.
+    """
+    Helper class for tracking optimizer state in distributed checkpointing.
 
     This class is compliant with the Stateful protocol, allowing DCP to automatically
     call state_dict/load_state_dict as needed in the dcp.save/load APIs.
@@ -117,12 +136,30 @@ class OptimizerState(Stateful):
         optimizer: torch.optim.Optimizer,
         scheduler: Optional[Any] = None,
     ):
+        """
+        Initialize an OptimizerState instance.
+
+        The constructor simply stores references to the model, optimizer, and
+        (optionally) learning-rate scheduler so that their state can be captured
+        and restored by the Distributed Checkpointing (DCP) framework.
+
+        Args:
+            model (torch.nn.Module): The neural-network model whose parameters the
+                optimizer updates. Keeping the reference allows DCP to re-establish
+                the model–optimizer relationship when loading a checkpoint.
+            optimizer (torch.optim.Optimizer): Optimizer whose internal buffers
+                (e.g., momentum, Adam moments, step counters) need to be saved and
+                restored.
+            scheduler (Optional[Any], optional): Learning-rate scheduler to track
+                alongside the optimizer. Pass ``None`` if no scheduler is used.
+        """
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
 
     def state_dict(self) -> dict[str, Any]:
-        """Get the optimizer and scheduler state dictionaries.
+        """
+        Get the optimizer and scheduler state dictionaries.
 
         Returns:
             dict: Dictionary containing the optimizer and scheduler state dicts with CPU offloading enabled.
@@ -143,7 +180,8 @@ class OptimizerState(Stateful):
         return state_dict
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        """Load the state dictionaries into the optimizer and scheduler.
+        """
+        Load the state dictionaries into the optimizer and scheduler.
 
         Args:
             state_dict (dict): State dictionary containing optimizer and scheduler states to load.

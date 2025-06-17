@@ -18,10 +18,7 @@ from dataclasses import dataclass
 from enum import Enum
 from io import UnsupportedOperation
 from pathlib import Path
-from typing import Any, Callable, cast, IO, Optional, Union
-
-# introduced as collections.abc.Buffer in Python 3.12
-from typing_extensions import Buffer
+from typing import IO, Any, Callable, Optional, Union, cast
 
 import torch
 from torch import Tensor
@@ -31,12 +28,7 @@ from torch.distributed.checkpoint._extension import (
     ExtensionRegistry,
     StreamTransformExtension,
 )
-from nemo_automodel.checkpoint._backports.hf_utils import (
-    CUSTOM_METADATA_KEY,
-    DCP_VERSION_KEY,
-    HF_DCP_VERSION,
-)
-from torch.distributed.checkpoint.metadata import Metadata, STATE_DICT_TYPE, StorageMeta
+from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata, StorageMeta
 from torch.distributed.checkpoint.planner import (
     LoadItemType,
     LoadPlan,
@@ -55,6 +47,15 @@ from torch.distributed.checkpoint.storage import (
 )
 from torch.distributed.checkpoint.utils import _create_file_view
 from torch.futures import Future
+
+# introduced as collections.abc.Buffer in Python 3.12
+from typing_extensions import Buffer
+
+from nemo_automodel.checkpoint._backports.hf_utils import (
+    CUSTOM_METADATA_KEY,
+    DCP_VERSION_KEY,
+    HF_DCP_VERSION,
+)
 
 
 __all__ = [

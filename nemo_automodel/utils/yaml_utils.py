@@ -15,8 +15,8 @@
 import enum
 import functools
 import inspect
+from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Generator
 
 import yaml
 
@@ -96,8 +96,7 @@ def _torch_dtype_representer(dumper, data):
 
 
 def _safe_object_representer(dumper, data):
-    """
-    General object representer for YAML.
+    """General object representer for YAML.
 
     This function is a fallback for objects that don't have specific representers.
     If the object has __qualname__ attr,
@@ -142,8 +141,7 @@ def _partial_representer(dumper, data):
 
     # Add keyword arguments if any exist
     if data.keywords:
-        for k, v in data.keywords.items():
-            value[k] = v
+        value |= data.keywords
 
     return dumper.represent_data(value)
 

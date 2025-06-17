@@ -35,8 +35,7 @@ from nemo_automodel.distributed.parallelizer import (
 @dataclass
 class FSDP2Manager:
     """
-    Manager for setting up and parallelizing models using FSDP2 with Tensor-Parallel,
-    Data-Parallel, and Context-Parallel sharding strategies.
+    Manager for setting up and parallelizing models using FSDP2 with TP, DP, CP sharding.
 
     This manager initializes the torch.distributed process group, infers the group sizes
     for data parallelism (DP) and tensor parallelism (TP), builds the device mesh for
@@ -116,7 +115,7 @@ class FSDP2Manager:
 
     def _setup_distributed(self):
         """
-        Initializes the distributed environment:
+        Initializes the distributed environment.
 
         - Checks availability and initialization of torch.distributed.
         - Infers data-parallel and tensor-parallel sizes if not provided.
@@ -173,7 +172,8 @@ class FSDP2Manager:
         TP plan via get_hf_tp_shard_plan) and applies the FSDP2 parallelization strategy.
 
         Args:
-            model: The model to be parallelized.
+            model (nn.Module): The model to be parallelized.
+            use_hf_tp_plan (bool): if true, will attempt to get the TP plan from the model.
 
         Returns:
             The parallelized model.

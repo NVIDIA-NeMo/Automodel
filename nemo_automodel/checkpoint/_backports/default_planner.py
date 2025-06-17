@@ -7,7 +7,7 @@ import logging
 import operator
 from collections import ChainMap
 from functools import reduce
-from typing import Any, cast, Optional, Union
+from typing import Any, Optional, Union, cast
 
 import torch
 from torch.distributed._shard._utils import narrow_tensor_by_index
@@ -19,12 +19,12 @@ from torch.distributed.checkpoint._nested_dict import (
 from torch.distributed.checkpoint._sharded_tensor_utils import _flatten_sharded_tensors
 from torch.distributed.checkpoint._traverse import set_element
 from torch.distributed.checkpoint.metadata import (
+    STATE_DICT_TYPE,
+    STORAGE_TYPES,
     BytesStorageMetadata,
     ChunkStorageMetadata,
     Metadata,
     MetadataIndex,
-    STATE_DICT_TYPE,
-    STORAGE_TYPES,
     StorageMeta,
     TensorStorageMetadata,
 )

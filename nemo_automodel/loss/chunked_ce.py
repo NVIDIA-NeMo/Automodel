@@ -14,6 +14,7 @@
 import torch
 import torch.nn.functional as F
 
+
 _compiled_compute_cross_entropy = None
 
 
@@ -22,8 +23,7 @@ def compute_cross_entropy(
     targets: torch.Tensor,
     ignore_index=-100,
 ):
-    """
-    Computes the cross-entropy loss between logits and targets.
+    """Computes the cross-entropy loss between logits and targets.
 
     Args:
         logits (torch.Tensor): Model predictions of shape (sequence_length, num_classes).
@@ -38,8 +38,7 @@ def compute_cross_entropy(
 
 
 def chunked_cross_entropy(logits, targets, mask=None, chunk_len=32, compile=True, ignore_index=-100):
-    """
-    Computes cross-entropy loss in chunks to handle long sequences more efficiently.
+    """Computes cross-entropy loss in chunks to handle long sequences more efficiently.
 
     Args:
         logits (torch.Tensor): Model output logits of shape (sequence_length, num_classes).
