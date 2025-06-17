@@ -18,20 +18,21 @@ import glob
 import os
 from dataclasses import dataclass
 from pathlib import Path
-
-import glob
+from typing import Any, Optional
 
 import torch
 import torch.distributed
 import torch.distributed.checkpoint as dcp
+import torch.nn as nn
+
+from nemo_automodel.checkpoint._backports.filesystem import SerializationFormat
 from nemo_automodel.checkpoint._backports.hf_storage import (
-    _HuggingFaceStorageWriter,
     _HuggingFaceStorageReader,
+    _HuggingFaceStorageWriter,
     get_fqn_to_file_index_mapping,
 )
 from nemo_automodel.checkpoint.stateful_wrappers import ModelState, OptimizerState
-from nemo_automodel.checkpoint._backports.filesystem import SerializationFormat
-import glob
+
 
 @dataclass
 class CheckpointingConfig:

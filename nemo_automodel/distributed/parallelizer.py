@@ -218,7 +218,6 @@ def nvfsdp_strategy_parallelize(
     NOTE: The user must ensure that the provided tp_shard_plan is compatible
     with the model architecture.
     """
-
     assert HAVE_NVFSDP, "nvFSDP is not installed, please visit \
         https://github.com/NVIDIA-NeMo/nvFSDP for more information"
 

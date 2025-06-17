@@ -164,6 +164,7 @@ lines-after-imports = 2
 "test_*.py" = ["D101", "D103"]
 "*_test.py" = ["D101", "D103"]
 "tests/*.py" = ["D101", "D103"]
+"nemo_automodel/checkpoint/_backports/*.py" = ["D101", "D103", "D205", "D417", "D415"]
 
 [tool.ruff.format]
 # Match black configuration

@@ -16,7 +16,6 @@ from typing import Any, Optional
 
 import torch
 from torch.distributed.checkpoint.state_dict import (
-    StateDictOptions,
     get_model_state_dict,
     get_optimizer_state_dict,
     set_model_state_dict,
