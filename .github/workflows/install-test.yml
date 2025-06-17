@@ -76,9 +76,12 @@ jobs:
 
       - name: Install project
         env:
+          PAT: ${{ secrets.PAT }}
           UV_PROJECT_ENVIRONMENT: ./venv
         shell: bash
         run: |
+          echo -e "machine github.com\n  login token\n  password ${{ secrets.PAT }}" > ~/.netrc
+          chmod 600 ~/.netrc 
           python -m venv ./venv
           source ./venv/bin/activate
 
@@ -89,6 +92,7 @@ jobs:
   uv-test:
     runs-on: ${{ matrix.arch }}
     name: UV on ${{ matrix.arch }}
+    environment: nemo-ci
     strategy:
       fail-fast: false
       matrix:
@@ -105,7 +109,11 @@ jobs:
       - name: Install dependencies with UV
         env:
           UV_PROJECT_ENVIRONMENT: ./venv
+          PAT: ${{ secrets.PAT }}
         run: |
+
+          echo -e "machine github.com\n  login token\n  password ${{ secrets.PAT }}" > ~/.netrc
+          chmod 600 ~/.netrc 
 
           export PATH=".bin/:$PATH"
 
