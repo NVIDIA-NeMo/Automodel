@@ -191,7 +191,8 @@ def nvfsdp_strategy_parallelize(
     NOTE: Currently, the user should make sure that custom_tp_plan is compatible with the model architecture.
     """
 
-    assert HAVE_NVFSDP, "nvFSDP is not installed, please visit https://github.com/NVIDIA-NeMo/nvFSDP for more information"
+    assert HAVE_NVFSDP, "nvFSDP is not installed, please visit \
+        https://github.com/NVIDIA-NeMo/nvFSDP for more information"
 
     # DP_CP ranks are sharded by FSDP.
     dp_mesh = device_mesh[
