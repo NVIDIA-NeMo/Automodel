@@ -50,8 +50,9 @@ class ModelState(Stateful):
         # this line automatically manages FSDP FQN's
         model_state_dict = get_model_state_dict(self.model)
 
-        # TODO: This is a hack to fix the issue with the model state dict being saved with the "model." prefix.
-        # Need to move this inside HFStorageWriter.
+        # This is a hack to fix the issue with the model state dict being saved with the "model.model." prefix.
+        # This is necessary when saving consolidated safetensors. This is because calling HF's
+        # .from_pretrained() requires the model to be saved with a single "model." prefix.
         if self.serialization_format == SerializationFormat.SAFETENSORS:
             keys_to_fix = [k for k in model_state_dict if k.startswith("model.")]
             for old_key in keys_to_fix:
@@ -77,13 +78,13 @@ class ModelState(Stateful):
         # ModelState, so every key now lacks the leading "model." segment that
         # HuggingFace modules normally carry.  Re-add it so that
         # set_model_state_dict can match parameters correctly.
-        if self.serialization_format == SerializationFormat.SAFETENSORS:
-            keys_to_fix = [k for k in state_dict if not k.startswith("model.") and k != "lm_head.weight"]
-            for old_key in keys_to_fix:
-                new_key = f"model.{old_key}"
-                if new_key not in state_dict:
-                    state_dict[new_key] = state_dict[old_key]
-                del state_dict[old_key]
+        # if self.serialization_format == SerializationFormat.SAFETENSORS:
+        #     keys_to_fix = [k for k in state_dict if not k.startswith("model.") and k != "lm_head.weight"]
+        #     for old_key in keys_to_fix:
+        #         new_key = f"model.{old_key}"
+        #         if new_key not in state_dict:
+        #             state_dict[new_key] = state_dict[old_key]
+        #         del state_dict[old_key]
 
         # If we intentionally skipped saving "lm_head.weight" (tied embeddings)
         # PyTorch will complain during load even with strict=False.
