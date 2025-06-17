@@ -78,13 +78,13 @@ class ModelState(Stateful):
         # ModelState, so every key now lacks the leading "model." segment that
         # HuggingFace modules normally carry.  Re-add it so that
         # set_model_state_dict can match parameters correctly.
-        # if self.serialization_format == SerializationFormat.SAFETENSORS:
-        #     keys_to_fix = [k for k in state_dict if not k.startswith("model.") and k != "lm_head.weight"]
-        #     for old_key in keys_to_fix:
-        #         new_key = f"model.{old_key}"
-        #         if new_key not in state_dict:
-        #             state_dict[new_key] = state_dict[old_key]
-        #         del state_dict[old_key]
+        if self.serialization_format == SerializationFormat.SAFETENSORS:
+            keys_to_fix = [k for k in state_dict if not k.startswith("model.") and k != "lm_head.weight"]
+            for old_key in keys_to_fix:
+                new_key = f"model.{old_key}"
+                if new_key not in state_dict:
+                    state_dict[new_key] = state_dict[old_key]
+                del state_dict[old_key]
 
         # If we intentionally skipped saving "lm_head.weight" (tied embeddings)
         # PyTorch will complain during load even with strict=False.
