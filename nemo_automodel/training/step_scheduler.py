@@ -18,7 +18,8 @@ from torch.distributed.checkpoint.stateful import Stateful
 
 
 class StepScheduler(Stateful):
-    """Scheduler for managing gradient accumulation and checkpointing steps.
+    """
+    Scheduler for managing gradient accumulation and checkpointing steps.
 
     Attributes:
         grad_acc_steps (int): Steps to accumulate gradients.
@@ -37,7 +38,8 @@ class StepScheduler(Stateful):
                  start_epoch: int = 0,
                  num_epochs: int = 10,
                  max_steps: Optional[int] = None):
-        """Initialize the StepScheduler.
+        """
+        Initialize the StepScheduler.
 
         Args:
             grad_acc_steps (int): Number of steps for gradient accumulation.
@@ -60,7 +62,8 @@ class StepScheduler(Stateful):
 
 
     def __iter__(self):
-        """Iterates over dataloader while keeping track of counters
+        """
+        Iterates over dataloader while keeping track of counters
 
         Raises:
             StopIteration: If the dataloader was exhausted or max_steps was reached.
@@ -75,14 +78,16 @@ class StepScheduler(Stateful):
             yield batch
 
     def set_epoch(self, epoch: int):
-        """Set the epoch for the dataloader.
+        """
+        Set the epoch for the dataloader.
         """
         self.epoch = epoch
         self.dataloader.sampler.set_epoch(epoch)
 
     @property
     def is_optim_step(self):
-        """Whether this step needs to call the optimizer step
+        """
+        Whether this step needs to call the optimizer step
 
         Returns:
             bool: if true, the optimizer should run.
@@ -93,7 +98,8 @@ class StepScheduler(Stateful):
 
     @property
     def is_val_step(self):
-        """Whether this step needs to call the validation
+        """
+        Whether this step needs to call the validation
         """
         is_val = False
         if self.val_every_steps and self.val_every_steps > 0 and self.is_optim_step:
@@ -102,7 +108,8 @@ class StepScheduler(Stateful):
 
     @property
     def is_ckpt_step(self):
-        """Whether this step needs to call the checkpoint saving.
+        """
+        Whether this step needs to call the checkpoint saving.
 
         Returns:
             bool: if true, the checkpoint should run.
@@ -113,16 +120,17 @@ class StepScheduler(Stateful):
 
     @property
     def epochs(self):
-        """Epoch iterator
+        """
+        Epoch iterator
 
         Yields:
             iterator: over epochs
         """
         yield from range(self.epoch, self.num_epochs)
 
-    # (optional) persistence
     def state_dict(self):
-        """Get the current state of the scheduler.
+        """
+        Get the current state of the scheduler.
 
         Returns:
             dict: Current state with 'step' and 'epoch' keys.
@@ -130,7 +138,8 @@ class StepScheduler(Stateful):
         return {"step": self.step, "epoch": self.epoch}
 
     def load_state_dict(self, s):
-        """Load the scheduler state from a dictionary.
+        """
+        Load the scheduler state from a dictionary.
 
         Args:
             s (dict): Dictionary containing 'step' and 'epoch'.

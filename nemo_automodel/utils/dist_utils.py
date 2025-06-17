@@ -31,10 +31,12 @@ logger = logging.getLogger(__name__)
 
 
 class FirstRankPerNode(ContextDecorator):
-    """Context manager that:
-      • Lets LOCAL_RANK==0 run the protected code first on each node.
-      • Inserts an extra barrier across *only* the node‑local rank‑0 processes.
-      • Works on a single GPU (no env flags, no distributed initialisation).
+    """
+    Context manager to enforce rank0 to process section over other ranks.
+
+      - Lets LOCAL_RANK==0 run the protected code first on each node.
+      - Inserts an extra barrier across *only* the node‑local rank‑0 processes.
+      - Works on a single GPU (no env flags, no distributed initialisation).
 
     Note: it is assumed the scoped code is not torch.distributed heavy.
     """
@@ -100,7 +102,8 @@ class FirstRankPerNode(ContextDecorator):
 
 
 def get_rank_safe() -> int:
-    """Get the distributed rank safely, even if torch.distributed is not initialized.
+    """
+    Get the distributed rank safely, even if torch.distributed is not initialized.
 
     Returns:
         The current process rank.
@@ -114,7 +117,8 @@ def get_rank_safe() -> int:
 
 
 def get_world_size_safe() -> int:
-    """Get the distributed world size safely, even if torch.distributed is not initialized.
+    """
+    Get the distributed world size safely, even if torch.distributed is not initialized.
 
     Returns:
         The total number of processes in the distributed job.
@@ -128,7 +132,8 @@ def get_world_size_safe() -> int:
 
 
 def get_local_rank_preinit() -> int:
-    """Get the local rank from the environment variable, intended for use before full init.
+    """
+    Get the local rank from the environment variable, intended for use before full init.
 
     Returns:
         The local rank of the current process.
@@ -138,7 +143,8 @@ def get_local_rank_preinit() -> int:
 
 
 def is_last_rank() -> bool:
-    """Check if the current rank is the last rank in the default process group.
+    """
+    Check if the current rank is the last rank in the default process group.
 
     Returns:
         True if the current rank is the last one, False otherwise.
@@ -148,7 +154,8 @@ def is_last_rank() -> bool:
 
 
 def append_to_progress_log(save_dir: str, string: str, barrier: bool = True) -> None:
-    """Append a formatted string to the progress log file (rank 0 only).
+    """
+    Append a formatted string to the progress log file (rank 0 only).
 
     Includes timestamp, job ID, and number of GPUs in the log entry.
 
@@ -173,7 +180,8 @@ def append_to_progress_log(save_dir: str, string: str, barrier: bool = True) -> 
 
 
 def barrier_and_log(string: str) -> None:
-    """Perform a distributed barrier and then log a message on rank 0.
+    """
+    Perform a distributed barrier and then log a message on rank 0.
 
     Args:
         string: The message string to log.
@@ -185,7 +193,8 @@ def barrier_and_log(string: str) -> None:
 
 
 def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs: Any):
-    """If torch distributed is initialized, log only on rank
+    """
+    If torch distributed is initialized, log only on rank.
 
     Args:
         logger (logging.Logger): The logger to write the logs
@@ -204,7 +213,8 @@ def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs:
 
 
 def dump_dataclass_to_yaml(obj: Any, filename: Optional[str] = None) -> Optional[str]:
-    """Dump a dataclass object or other Python object to a YAML file or string.
+    """
+    Dump a dataclass object or other Python object to a YAML file or string.
 
     Uses safe representers to handle common types.
 

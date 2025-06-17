@@ -453,7 +453,9 @@ class Timers:
         reset: bool = True,
         barrier: bool = False,
     ):
-        """Write timers to a tensorboard writer.
+        """
+        Write timers to a tensorboard writer.
+
         Note that we only report maximum time across ranks to tensorboard.
 
         Args:
