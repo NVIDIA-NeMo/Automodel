@@ -480,17 +480,17 @@ def test_hf_sharded_checkpoint():
         else:
             # this can be the parameter step which is a scalar Tensor
             curr_shard = restored_optim_dict[k]
-        assert list(v.shape) == expected_shape, (
+        assert list(curr_shard.shape) == expected_shape, (
             f"Shape mismatch for key {k}. "
-            f"Expected shape {expected_shape} but got {v.shape}"
+            f"Expected shape {expected_shape} but got {curr_shard.shape}"
         )
-        assert v.dtype == expected_dtype, (
+        assert curr_shard.dtype == expected_dtype, (
             f"Dtype mismatch for key {k}. "
-            f"Expected dtype {expected_dtype} but got {v.dtype}"
+            f"Expected dtype {expected_dtype} but got {curr_shard.dtype}"
         )
-        assert str(v.device) == expected_device, (
+        assert str(curr_shard.device) == expected_device, (
             f"Device mismatch for key {k}. "
-            f"Expected device {expected_device} but got {v.device}"
+            f"Expected device {expected_device} but got {curr_shard.device}"
         )
         assert torch.allclose(v, curr_shard), (
             f"Value mismatch for key {k}. "
