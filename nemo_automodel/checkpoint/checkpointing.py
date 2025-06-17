@@ -83,7 +83,10 @@ def save_model(
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         os.makedirs(model_path, exist_ok=True)
 
-        if checkpoint_config.save_consolidated and checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
+        if (
+            checkpoint_config.save_consolidated 
+            and checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS
+        ):
             os.makedirs(consolidated_model_path, exist_ok=True)
             # save the config.json file
             with open(os.path.join(consolidated_model_path, "config.json"), "w") as f:
