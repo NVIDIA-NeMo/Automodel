@@ -32,6 +32,36 @@ jobs:
           files: |
             **/*.py
 
+      - name: Run ruff
+        id: ruff
+        env:
+          CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
+          SKIP_DOCS: ${{ contains(github.event.pull_request.labels.*.name, 'skip-docs') }}
+          SKIP_LINTING: ${{ contains(github.event.pull_request.labels.*.name, 'skip-linting') }}
+        run: |
+          if [[ -z "$CHANGED_FILES" ]]; then
+            echo Nothing to lint.
+            echo "exit-code=0" | tee -a "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ $SKIP_DOCS == true ]]; then
+            ADDITIONAL_PYLINT_ARGS="--disable=C0115,C0116"
+          else
+            ADDITIONAL_PYLINT_ARGS=""
+          fi
+
+          if [[ $SKIP_LINTING == true ]]; then
+            ADDITIONAL_PYLINT_ARGS="--exit-zero"
+          fi
+
+          pip install ruff
+          set +e
+          # todo: use changed_files?
+          ruff check nemo_automodel/
+          ruff format --check nemo_automodel/
+          echo "exit-code=$?" | tee -a "$GITHUB_OUTPUT"
+
       - name: Run PyLint
         id: pylint
         env:

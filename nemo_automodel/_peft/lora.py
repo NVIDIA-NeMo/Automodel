@@ -14,20 +14,26 @@
 
 import math
 from typing import Literal, Optional
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from nemo_automodel.shared.import_utils import safe_import
-from nemo_automodel._peft.lora_kernel import lora_forward_wrapper, lora_da_dx_update_wrapper, \
-    lora_db_update_wrapper
+from nemo_automodel._peft.lora_kernel import (
+    lora_da_dx_update_wrapper,
+    lora_db_update_wrapper,
+    lora_forward_wrapper,
+)
 from nemo_automodel._peft.module_matcher import ModuleMatcher
+from nemo_automodel.shared.import_utils import safe_import
+
+
 HAS_BNB, bitsandbytes = safe_import("bitsandbytes")
 
 
 class LinearLoRA(nn.Linear):
     """
-    Linear + LoRA, maintains ckpts structure (i.e. Linear's weight/bias remain at the same FQN)
+    Linear + LoRA, maintains ckpts structure (i.e. Linear's weight/bias remain at the same FQN).
 
     The _init_wrapper and _forward methods provide the LoRA functionality. We want to be able to
     use those inside LinearLoRA but also for monkey-patching modules, without repeating the
@@ -44,7 +50,8 @@ class LinearLoRA(nn.Linear):
         lora_A_init_method='xavier',
         lora_dtype=None,
     ):
-        """LinearLora constructor
+        """
+        LinearLora constructor.
 
         Args:
             orig_linear (nn.Module): the linear module to augment.
@@ -90,8 +97,8 @@ class LinearLoRA(nn.Linear):
         lora_A_init_method='xavier',
         lora_dtype=None,
     ):
-        """Adds LoRA weights to obj. The obj is either a LinearLoRA or an nn.Module (when
-        monkey-patching).
+        """
+        Adds LoRA weights to obj. Obj is either a LinearLoRA or an nn.Module (when monkey-patching).
 
         Args:
             obj (LinearLoRA | nn.Module): input module to adapt.
@@ -174,7 +181,15 @@ class TritonLinearLoRA(LinearLoRA):
         are quantized weights (e.g. 4bit) needs to be specified explicitly.
     """
     def forward(self, x):
-        # pylint: disable=C0115,C0116
+        """
+        Forward function for LoRA with triton kernels.
+
+        Args:
+            x (torch.Tensor): the input tensor.
+
+        Returns:
+            torch.Tensor: the output tensor.
+        """
         # If LinearLoRA is used to monkey-patch a nn.Linear module, we want to use nn.Linear's
         # forward in the case where it uses quantized weights. We store a reference to nn.Linear's
         # forward in `super_fwd` attribute. If the attribute does not exist we do the usual linear.
@@ -203,8 +218,8 @@ def patch_linear_module(
     lora_dtype=None,
     use_triton=True
 ):
-    """Monkey-patches a nn.Linear (orig_linear param) to be a LinearLoRA, for all purposes
-    think of this function as replacing a nn.Linear with a LinearLoRA defined above.
+    """
+    Monkey-patches a nn.Linear (orig_linear param) to be a LinearLoRA.
 
     The orig_linear might not contain valid weights, for example, the given orig_linear was
     initialized within a context-manager that uses a "meta" device. Therefore, we cannot copy
@@ -230,7 +245,6 @@ def patch_linear_module(
     Returns:
         (nn.Module): the monkey-patched (nn.Linear + LoRA) nn.Module
     """
-
     assert isinstance(orig_linear, nn.Linear), type(orig_linear)
     assert not hasattr(orig_linear, 'super_fwd'), orig_linear.super_fwd
 
@@ -314,7 +328,9 @@ class LoRATritonFunction(torch.autograd.Function):
     @staticmethod
     def forward(x, lora_A, lora_B, scale, dtype):
         """
-        Forward method for LoRA. Reshapes 3D tensors into 2D and then calls the triton kernel.
+        Forward method for LoRATriton.
+
+        Reshapes 3D tensors into 2D and then calls the triton kernel.
         """
         reshape = x.dim() == 3
         if reshape:
@@ -331,8 +347,9 @@ class LoRATritonFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, d_y):
         """
-        Backward method for LoRA. Reshapes 3D tensors into 2D and then calls the kernels to update
-        d_lora_a, d_lora_b, and dx.
+        Backward method for LoRATriton.
+
+        Reshapes 3D tensors into 2D and then calls the kernels to update d_lora_a, d_lora_b, and dx.
         """
         x, lora_A, lora_B = ctx.saved_tensors
         scale = ctx.scale
@@ -350,12 +367,3 @@ class LoRATritonFunction(torch.autograd.Function):
         if reshape:
             d_x = d_x.view(bs, seq_len, d)
         return d_x, d_lora_A.t(), d_lora_B, None, None, None
-
-
-def _parent_and_attr(root: nn.Module, fqname: str):
-    """Return (parent_module, attribute_name) for fully-qualified module name."""
-    parts = fqname.split(".")
-    parent = root
-    for p in parts[:-1]:
-        parent = getattr(parent, p)
-    return parent, parts[-1]

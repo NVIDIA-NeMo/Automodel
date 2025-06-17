@@ -12,33 +12,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List, Union
+import logging
 
 import torch
 from datasets import Dataset
 from torch.nn import functional as F
 from tqdm import tqdm
 
-import logging
+
 logger = logging.getLogger(__name__)
 
 CROSS_ENTROPY_IGNORE_IDX = -100
-PACK_TYPE = Dict[str, Union[torch.Tensor, List[int]]]
+PACK_TYPE = dict[str, torch.Tensor | list[int]]
 
 
 # based on https://github.com/pytorch/torchtune/blob/v0.6.1/torchtune/datasets/_packed.py#L17
 class PackedSequence:
     """
+    Implements Packed Sequence for input dataset.
+
     Args:
-    dataset: Actual dataset (can be 'train', 'val' or 'test')
-    split (str): Whether the dataset is 'train', 'val' or 'test'
-    packed_sequence_size (int): Number of tokens in a pack
-    split_across_pack (bool): If the last sample in a pack does not fit in ``packed_sequence_size``,
-        split the sample into the next pack, or move it entirely to the beginning of the next pack. Default: False
-    max_packs (int): Maximum number of packs. Default: None
+        dataset: Actual dataset (can be 'train', 'val' or 'test')
+        split (str): Whether the dataset is 'train', 'val' or 'test'
+        packed_sequence_size (int): Number of tokens in a pack
+        split_across_pack (bool): If the last sample in a pack does not fit in
+            ``packed_sequence_size``, split the sample into the next pack, or move it entirely
+            to the beginning of the next pack. Default: False
+        max_packs (int): Maximum number of packs. Default: None
     """
 
     def __init__(self, dataset, split, packed_sequence_size, split_across_pack=False, max_packs=None):
+        """
+        Packed Sequence constructor.
+
+        Given the dataset and the rest of the arguments, it will create (using the .pack) method
+        another dataset containing packed sequences.
+
+        Args:
+            dataset: Actual dataset (can be 'train', 'val' or 'test')
+            split (str): Whether the dataset is 'train', 'val' or 'test'
+            packed_sequence_size (int): Number of tokens in a pack
+            split_across_pack (bool): If the last sample in a pack does not fit in
+                ``packed_sequence_size``, split the sample into the next pack, or move it entirely
+                to the beginning of the next pack. Default: False
+            max_packs (int): Maximum number of packs. Default: None
+        """
         self.dataset = dataset
         self.split = split
         self.padding_idx = 0  # Padding value to pack a sequence to self.packed_sequence_size
@@ -46,14 +64,16 @@ class PackedSequence:
         self.packed_sequence_size = packed_sequence_size
         self.split_across_pack = split_across_pack
         self.max_packs = max_packs
-        self.packs: List[PACK_TYPE] = []
-        
-    def pack(self):
-        """Iterate through the dataset. Use a buffer to hold samples until packed_sequence_size,
-        then append the buffer to self.packs as a single "packed" sample. Continue
-        until max_packs or end of dataset.
-        """
+        self.packs: list[PACK_TYPE] = []
 
+    def pack(self):
+        """
+        Pack the dataset to defined length.
+
+        In particulat, it will iterate through the dataset. Use a buffer to hold samples until
+        packed_sequence_size, then append the buffer to self.packs as a single "packed" sample.
+        Continue until max_packs or end of dataset.
+        """
         # Only show progress bar on rank 0
         rank = (
             torch.distributed.get_rank()
@@ -86,7 +106,7 @@ class PackedSequence:
             if seq_len > self.packed_sequence_size and not self.split_across_pack:
                 raise ValueError(
                     f"Dataset sample is too long ({seq_len} > {self.packed_sequence_size}). "
-                    "Please set `split_across_pack=True` or increase `packed_sequence_size`."
+                    "Please set `split_across_pack=True` or increase `packed_sequence_size`.",
                 )
             # Update the current pack
             # "position_ids" is the pos ids, "seq_lens" is the len of each seq within the pack
@@ -123,16 +143,21 @@ class PackedSequence:
         return self.packed_dataset
 
     def _should_stop_packing(self) -> bool:
-        """If max packs is set, stop packing when we reach that number."""
-
+        """
+        If max packs is set, stop packing when we reach that number.
+        """
         if self.max_packs is not None and len(self.packs) == self.max_packs:
             return True
         return False
 
     def _split_and_add_pack(self, current_pack: PACK_TYPE) -> PACK_TYPE:
-        """Splits the current pack at the boundary, processes it, adds it to ``self.packs`` and
-        returns the start of the next pack."""
+        """
+        Splits the current pack at the boundary, processes it, adds it to ``self.packs``.
 
+        ...and returns the start of the next pack.
+
+        TODO(@akoumparouli): refactor.
+        """
         if self.split_across_pack:
             boundary = self.packed_sequence_size
             # The last elem in ``seq_lens`` ensures that ``sum(seq_lens) == self.packed_sequence_size``
@@ -173,13 +198,17 @@ class PackedSequence:
         return output_dict
 
     def _add_pack(self, pack: PACK_TYPE) -> None:
-        """Processes, pads and adds a pack to ``self.packs``."""
+        """
+        Processes, pads and adds a pack to ``self.packs``.
+        """
         pack = self._convert_to_tensors(pack)
         pack = self._pad_pack(pack, padding_idx=self.padding_idx)
         self.packs.append(pack)
 
     def _convert_to_tensors(self, pack: PACK_TYPE) -> PACK_TYPE:
-        """Converts a pack into tensors. Pack comes in as a dict of lists and is converted to tensors."""
+        """
+        Converts a pack into tensors. Pack comes in as a dict of lists and is converted to tensors.
+        """
         tensor_pack = {
             "input_ids": torch.tensor(pack["input_ids"], dtype=torch.long),
             "labels": torch.tensor(pack["labels"], dtype=torch.long),
@@ -191,7 +220,9 @@ class PackedSequence:
         return tensor_pack
 
     def _pad_pack(self, pack: PACK_TYPE, padding_idx: int) -> PACK_TYPE:
-        """Pads a pack to ``self.packed_sequence_size``."""
+        """
+        Pads a pack to ``self.packed_sequence_size``.
+        """
         # Pad tokens
         num_padding_tokens = self.packed_sequence_size - len(pack["input_ids"])
         padded_tokens = F.pad(
@@ -244,9 +275,11 @@ class PackedSequence:
         return padded_pack
 
 
-def create_block_causal_mask(seq_lens: List[torch.Tensor]) -> torch.Tensor:
+def create_block_causal_mask(seq_lens: list[torch.Tensor]) -> torch.Tensor:
     """
-    Given a batch tensor of seq lens defining the lengths of samples in each pack,
+    Creates causal mask block for specified lengths.
+
+    In particular, given a batch tensor of seq lens defining the lengths of samples in each pack,
     Construct a 2D block causal mask for each pack in the batch. For example, if
     a single sample's seq_lens is [3, 2, 1], the mask would be::
         mask = [
@@ -257,10 +290,12 @@ def create_block_causal_mask(seq_lens: List[torch.Tensor]) -> torch.Tensor:
             [0, 0, 0, 1, 1, 0],
             [0, 0, 0, 0, 0, 1],
         ]
+
     Args:
         seq_lens (List[torch.Tensor]): Sequence lengths of samples in each pack in the batch,
             shape (batch_size, n), where n is the max number of sequences in a pack and can vary
             across packs.
+
     Returns:
         Tensor: Block causal mask of shape (batch_size, packed_sequence_size, packed_sequence_size).
     """
@@ -273,7 +308,7 @@ def create_block_causal_mask(seq_lens: List[torch.Tensor]) -> torch.Tensor:
                     seq_len,
                     seq_len,
                     dtype=torch.bool,
-                )
+                ),
             )
             for i, seq_len in enumerate(seq_lens[sample_idx])
         ]
@@ -284,14 +319,15 @@ def create_block_causal_mask(seq_lens: List[torch.Tensor]) -> torch.Tensor:
     return torch.stack(batch_block_attn_masks).unsqueeze(1)
 
 
-def packed_block_causal_mask(seq_lens: List[torch.Tensor]):
+def packed_block_causal_mask(seq_lens: list[torch.Tensor]):
     """
-    Create a block causal document mask for a batch of packed sequences. A standard 2D block causal mask is created
-    and returned.
+    Create a 2D block causal document mask for a batch of packed sequences.
+
     Args:
         seq_lens (List[torch.Tensor]): Sequence lengths of samples in each pack in the batch,
             shape (batch_size, n), where n is the max number of sequences in a pack and can vary
             across packs.
+
     Returns:
         _MaskType: BlockMask or Tensor if torch version < 2.5.0.
     """
