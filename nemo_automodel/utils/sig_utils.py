@@ -149,7 +149,8 @@ class DistributedSignalHandler:
         return self
 
     def __exit__(self, exc_type: Optional[type],
-        exc_val: BaseException | None, exc_tb: types.TracebackType | None) -> None:  # noqa: E501
+        exc_val: BaseException | None, exc_tb: types.TracebackType | None
+    ) -> None:  # noqa: E501
         """
         Release the signal handler and restore the original handler.
         """
