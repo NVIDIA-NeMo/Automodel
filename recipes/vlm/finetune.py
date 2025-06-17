@@ -31,7 +31,7 @@ from nemo_automodel.utils.dist_utils import (
     rescale_gradients,
     clip_gradients,
 )
-from nemo_automodel.utils.model_utils import apply_parameter_freezing
+from nemo_automodel.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
 from nemo_automodel.loggers.log_utils import setup_logging
 from transformers import AutoProcessor
 from nemo_automodel.datasets.vlm.collate_fns import COLLATE_FNS
@@ -74,6 +74,8 @@ def build_model(device, cfg_model, cfg_freeze, cfg_peft, model_wrapper, seed) ->
             opts = cfg_peft.to_dict()
             peft_fn = opts.pop("peft_fn")
             peft_fn(model, **opts)
+
+        print_trainable_parameters(model)
 
         if callable(getattr(model_wrapper, "parallelize", None)):
             model = model_wrapper.parallelize(model)
