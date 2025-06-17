@@ -440,17 +440,17 @@ def test_dcp_checkpoint():
             restored_model_dict[k],
             restored_model_dict[k].shape[0] // 2,
         )[torch.distributed.get_rank()]
-        assert list(v.shape) == expected_shape, (
+        assert list(curr_shard.shape) == expected_shape, (
             f"Shape mismatch for key {k}. "
-            f"Expected shape {expected_shape} but got {v.shape}"
+            f"Expected shape {expected_shape} but got {curr_shard.shape}"
         )
-        assert v.dtype == expected_dtype, (
+        assert curr_shard.dtype == expected_dtype, (
             f"Dtype mismatch for key {k}. "
-            f"Expected dtype {expected_dtype} but got {v.dtype}"
+            f"Expected dtype {expected_dtype} but got {curr_shard.dtype}"
         )
-        assert str(v.device) == expected_device, (
+        assert str(curr_shard.device) == expected_device, (
             f"Device mismatch for key {k}. "
-            f"Expected device {expected_device} but got {v.device}"
+            f"Expected device {expected_device} but got {curr_shard.device}"
         )
         assert torch.allclose(v, curr_shard), (
             f"Value mismatch for key {k}. "
@@ -477,27 +477,27 @@ def test_dcp_checkpoint():
         else:
             # this can be the parameter step which is a scalar Tensor
             curr_shard = restored_optim_dict[k]
-        assert list(v.shape) == expected_shape, (
+        assert list(curr_shard.shape) == expected_shape, (
             f"Shape mismatch for key {k}. "
-            f"Expected shape {expected_shape} but got {v.shape}"
+            f"Expected shape {expected_shape} but got {curr_shard.shape}"
         )
-        assert v.dtype == expected_dtype, (
+        assert curr_shard.dtype == expected_dtype, (
             f"Dtype mismatch for key {k}. "
-            f"Expected dtype {expected_dtype} but got {v.dtype}"
+            f"Expected dtype {expected_dtype} but got {curr_shard.dtype}"
         )
-        assert str(v.device) == expected_device, (
+        assert str(curr_shard.device) == expected_device, (
             f"Device mismatch for key {k}. "
-            f"Expected device {expected_device} but got {v.device}"
+            f"Expected device {expected_device} but got {curr_shard.device}"
         )
         assert torch.allclose(v, curr_shard), (
             f"Value mismatch for key {k}. "
             f"Tensors are not numerically close"
         )
-        if torch.distributed.get_rank() == 0:
-            # delete the checkpoint directory
-            if Path(trainer.checkpoint_config.checkpoint_dir).exists():
-                shutil.rmtree(Path(trainer.checkpoint_config.checkpoint_dir))
-        torch.distributed.barrier()
+    if torch.distributed.get_rank() == 0:
+        # delete the checkpoint directory
+        if Path(trainer.checkpoint_config.checkpoint_dir).exists():
+            shutil.rmtree(Path(trainer.checkpoint_config.checkpoint_dir))
+    torch.distributed.barrier()
 
 
 def _flatten(d: dict, parent_key: str | None = None):
