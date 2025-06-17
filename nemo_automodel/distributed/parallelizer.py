@@ -31,13 +31,20 @@ from torch.distributed.tensor.parallel import (
 )
 
 # TODO(boxiangw): Change to nvFSDP once it got published
+HAVE_NVFSDP_FULLY_SHARD = False
+HAVE_NVFSDP = False
 try:
     from nvfsdp import fully_shard as nvfsdp_fully_shard
     HAVE_NVFSDP_FULLY_SHARD = True
+    HAVE_NVFSDP = True
+except:
+    pass
 
-except ImportError:
+try:
     from nvfsdp import nvFSDP, DistributedDataParallelConfig
-    HAVE_NVFSDP_FULLY_SHARD = False
+    HAVE_NVFSDP = True
+except:
+    pass
 
 
 # Taken and modified from torchtitan
@@ -183,6 +190,8 @@ def nvfsdp_strategy_parallelize(
     the model must fit on GPU or CPU memory.
     NOTE: Currently, the user should make sure that custom_tp_plan is compatible with the model architecture.
     """
+
+    assert HAVE_NVFSDP, "nvFSDP is not installed, please visit https://github.com/NVIDIA-NeMo/nvFSDP for more information"
 
     # DP_CP ranks are sharded by FSDP.
     dp_mesh = device_mesh[
