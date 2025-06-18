@@ -20,7 +20,7 @@
 
 ## ✨ What is NeMo AutoModel?
 
-NeMo AutoModel is a framework that delivers **zero-day support** for Hugging Face models with enterprise-grade distributed training capabilities. It streamlines the journey from experimentation to production deployment, combining ease of use with scalability and performance optimizations.
+NeMo AutoModel is a framework that delivers **zero-day support** for Hugging Face models with distributed training capabilities. It streamlines the journey from experimentation to production deployment, combining ease of use with scalability and performance optimizations.
 
 
 ### 📋 Ready-to-Use Recipes
@@ -35,11 +35,11 @@ NeMo AutoModel is a framework that delivers **zero-day support** for Hugging Fac
 
 - **🔥 Day-0 Hugging Face Support**: Any model on Hugging Face Hub works instantly with zero configuration
 - **⚡ Lightning Fast Performance**: Custom CUDA kernels deliver 2-5x speedups
-- **🌐 Enterprise-Scale Distributed Training**: Built-in FSDP2 and nvFSDP for seamless multi-node scaling
+- **🌐 Large-Scale Distributed Training**: Built-in FSDP2 and nvFSDP for seamless multi-node scaling
 - **👁️ Vision-Language Model Ready**: Native support for VLMs (Qwen2-VL, Gemma-3-VL, etc)
 - **🧩 Advanced PEFT Methods**: LoRA and extensible PEFT system out of the box
 - **📦 Seamless HF Ecosystem**: Fine-tuned models work perfectly with Transformers pipeline
-- **⚙️ Production-Grade Infrastructure**: Enterprise checkpointing, logging, monitoring, and resiliency
+- **⚙️ Production-Grade Infrastructure**: Checkpointing, logging, monitoring, and resiliency
 - **🎯 Optimized Recipes**: Pre-built configurations for common models and datasets
 - **🔧 Flexible Configuration**: YAML-based configuration system for reproducible experiments
 
