@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
-
 from .package_info import __package_name__, __version__
-from .torch_backports import apply_patches as _nemo__apply_patches
-
 
 __all__ = [
     "_peft",
@@ -66,5 +63,3 @@ def __dir__():
     Expose the names of all available submodules for auto-completion.
     """
     return sorted(__all__)
-
-_nemo__apply_patches()

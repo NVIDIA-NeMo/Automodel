@@ -11,3 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from packaging.version import parse as vparse
+from ._torch_backports import apply_patches as _nemo__apply_patches
+import torch
+if vparse(torch.__version__).base_version <= "2.7.1":
+    _nemo__apply_patches()
