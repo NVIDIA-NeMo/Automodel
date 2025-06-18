@@ -74,7 +74,6 @@ def save_model(
         weights_path: Path to save model weights
         checkpoint_config: Checkpointing configuration
     """
-    breakpoint()
     # TODO(@adil-a): Need to add support for PEFT.
     # We also need to eventually add suport for HSDP, so we only save on non-duplicate ranks.
     # Add functionality to chunk different layers for different ranks to save.
