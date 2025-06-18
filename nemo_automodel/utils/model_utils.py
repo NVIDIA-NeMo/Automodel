@@ -95,5 +95,3 @@ def apply_parameter_freezing(model, freeze_config):
                 for param in module.parameters():
                     param.requires_grad = False
 
-    # Log freezing info
-    print_trainable_parameters(model)
