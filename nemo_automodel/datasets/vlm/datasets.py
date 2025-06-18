@@ -12,15 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.datasets.vlm.utils import json2token
 import json
 import random
+
 from datasets import load_dataset
+
+from nemo_automodel.datasets.vlm.utils import json2token
 
 
 def make_rdr_dataset(path_or_dataset="quintend/rdr-items", split="train", **kwargs):
-    """
-    Load and preprocess the RDR dataset for image-to-text fine-tuning.
+    """Load and preprocess the RDR dataset for image-to-text fine-tuning.
 
     Args:
         path_or_dataset (str): Path or identifier for the RDR dataset.
@@ -30,7 +31,6 @@ def make_rdr_dataset(path_or_dataset="quintend/rdr-items", split="train", **kwar
     Returns:
         Dataset: The processed dataset.
     """
-
     dataset = load_dataset(path_or_dataset, split=split)
 
     def format(example):
@@ -47,7 +47,7 @@ def make_rdr_dataset(path_or_dataset="quintend/rdr-items", split="train", **kwar
                     "role": "assistant",
                     "content": [{"type": "text", "text": example["text"]}],
                 },
-            ]
+            ],
         }
 
     return [format(example) for example in dataset]
@@ -55,10 +55,9 @@ def make_rdr_dataset(path_or_dataset="quintend/rdr-items", split="train", **kwar
 
 
 def make_cord_v2_dataset(
-    path_or_dataset="naver-clova-ix/cord-v2", split="train", **kwargs
+    path_or_dataset="naver-clova-ix/cord-v2", split="train", **kwargs,
 ):
-    """
-    Load and preprocess the CORD-V2 dataset for image-to-text fine-tuning.
+    """Load and preprocess the CORD-V2 dataset for image-to-text fine-tuning.
     """
     dataset = load_dataset(path_or_dataset, split=split)
 
@@ -71,12 +70,12 @@ def make_cord_v2_dataset(
             gt_jsons = ground_truth["gt_parses"]
         else:
             assert "gt_parse" in ground_truth and isinstance(
-                ground_truth["gt_parse"], dict
+                ground_truth["gt_parse"], dict,
             )
             gt_jsons = [ground_truth["gt_parse"]]
 
         text = random.choice(
-            [json2token(gt_json, sort_json_key=True) for gt_json in gt_jsons]
+            [json2token(gt_json, sort_json_key=True) for gt_json in gt_jsons],
         )
 
         return {
@@ -89,7 +88,7 @@ def make_cord_v2_dataset(
                     ],
                 },
                 {"role": "assistant", "content": [{"type": "text", "text": text}]},
-            ]
+            ],
         }
 
     return [format(example) for example in dataset]

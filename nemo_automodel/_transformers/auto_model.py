@@ -14,12 +14,14 @@
 
 import logging
 import types
-import torch
-from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
-from nemo_automodel import __version__
 
+import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
+
+from nemo_automodel import __version__
 from nemo_automodel.shared.import_utils import safe_import
-from torch.nn.attention import sdpa_kernel, SDPBackend
+
 
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 logger = logging.getLogger(__name__)
@@ -27,8 +29,7 @@ logger = logging.getLogger(__name__)
 
 def patch_attention(obj, sdpa_method=None):
     """
-    Wrap the `forward` method of `obj` in an `sdap_kernel` context to
-    enable a sequence of SDP attention backends.
+    Wrap the `forward` method of `obj` in an `sdap_kernel` context manager.
 
     Args:
         obj: Any object with a `.forward(*args, **kwargs)` method.
@@ -58,9 +59,7 @@ def patch_attention(obj, sdpa_method=None):
 
 class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
     """
-    Drop-in replacement for ``transformers.AutoModelForCausalLM`` that can
-    transparently patch the loaded model with NVIDIA Liger fused-attention
-    kernels for higher inference throughput.
+    Drop-in replacement for ``transformers.AutoModelForCausalLM`` that includes custom-kernels.
 
     The class only overrides ``from_pretrained`` and ``from_config`` to add the
     optional ``use_liger_kernel`` flag.  If the flag is ``True`` (default) and
@@ -72,14 +71,14 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
 
     @akoumpa: currently only supporting liger_kernel for demonstration purposes.
 
-    Notes
+    Notes:
     -----
     - No changes are made to the model's public API; forward signatures,
       generation utilities, and weight shapes remain identical.
     - Only decoder-style (causal) architectures are currently supported by the
       Liger patch.  Unsupported models will silently fall back.
 
-    Examples
+    Examples:
     --------
     >>> model = NeMoAutoModelForCausalLM.from_pretrained("gpt2")            # try Liger
     >>> model = NeMoAutoModelForCausalLM.from_pretrained(
@@ -89,8 +88,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
         """
-        Load a pretrained causal-language-model and (optionally) patch it with
-        Liger fused-attention kernels.
+        Load a pretrained causal-language-model and (optionally) patch it with custom kernels.
 
         Parameters
         ----------
@@ -104,12 +102,12 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
         **kwargs
             Keyword arguments forwarded verbatim to the superclass.
 
-        Returns
+        Returns:
         -------
         transformers.PreTrainedModel
             The instantiated model, possibly Liger-patched.
 
-        Warnings
+        Warnings:
         --------
         Emits a ``logging.warning`` if ``use_liger_kernel=True`` but the Liger
         package is not available.
@@ -152,8 +150,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
     @classmethod
     def from_config(cls, config, **kwargs):
         """
-        Instantiate a model from a config object and (optionally) patch it with
-        Liger fused-attention kernels.
+        Instantiate a model from a config object and (optionally) patch it with custom kernels.
 
         Parameters
         ----------
@@ -165,12 +162,12 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
         **kwargs
             Additional keyword arguments forwarded to the superclass.
 
-        Returns
+        Returns:
         -------
         transformers.PreTrainedModel
             The instantiated model, possibly Liger-patched.
 
-        See Also
+        See Also:
         --------
         NeMoAutoModelForCausalLM.from_pretrained : Same logic for checkpoint
         loading.
@@ -197,10 +194,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
 
 
 class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
-    """
-    Drop-in replacement for ``transformers.AutoModelForImageTextToText`` that can
-    transparently patch the loaded model with NVIDIA Liger fused-attention
-    kernels for higher inference throughput.
+    """Drop-in replacement for ``transformers.AutoModelForImageTextToText`` with custom-kernels.
 
     The class only overrides ``from_pretrained`` and ``from_config`` to add the
     optional ``use_liger_kernel`` flag.  If the flag is ``True`` (default) and
@@ -212,14 +206,14 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
 
     @akoumpa: currently only supporting liger_kernel for demonstration purposes.
 
-    Notes
+    Notes:
     -----
     - No changes are made to the model's public API; forward signatures,
       generation utilities, and weight shapes remain identical.
     - Only decoder-style (causal) architectures are currently supported by the
       Liger patch.  Unsupported models will silently fall back.
 
-    Examples
+    Examples:
     --------
     >>> model = NeMoAutoModelForImageTextToText.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct") # try Liger
     >>> model = NeMoAutoModelForImageTextToText.from_pretrained(
@@ -229,8 +223,7 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
         """
-        Load a pretrained causal-language-model and (optionally) patch it with
-        Liger fused-attention kernels.
+        Load a pretrained causal-language-model and (optionally) patch it with custom kernels.
 
         Parameters
         ----------
@@ -244,12 +237,12 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
         **kwargs
             Keyword arguments forwarded verbatim to the superclass.
 
-        Returns
+        Returns:
         -------
         transformers.PreTrainedModel
             The instantiated model, possibly Liger-patched.
 
-        Warnings
+        Warnings:
         --------
         Emits a ``logging.warning`` if ``use_liger_kernel=True`` but the Liger
         package is not available.
@@ -292,8 +285,7 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
     @classmethod
     def from_config(cls, config, **kwargs):
         """
-        Instantiate a model from a config object and (optionally) patch it with
-        Liger fused-attention kernels.
+        Instantiate a model from a config object and (optionally) patch it with custom kernels.
 
         Parameters
         ----------
@@ -305,12 +297,12 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
         **kwargs
             Additional keyword arguments forwarded to the superclass.
 
-        Returns
+        Returns:
         -------
         transformers.PreTrainedModel
             The instantiated model, possibly Liger-patched.
 
-        See Also
+        See Also:
         --------
         NeMoAutoModelForImageTextToText.from_pretrained : Same logic for checkpoint
         loading.

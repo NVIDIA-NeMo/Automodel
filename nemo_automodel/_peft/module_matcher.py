@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from dataclasses import dataclass, field
 from typing import List
-import re
+
 import torch.nn as nn
+
 
 def wildcard_match(pattern, key):
     """
@@ -59,7 +61,9 @@ class ModuleMatcher:
     match_all_linear: bool = field(default=False)
 
     def __post_init__(self):
-        """ input validation """
+        """
+        Input validation.
+        """
         if isinstance(self.target_modules, str):
             self.target_modules = [self.target_modules]
         if isinstance(self.exclude_modules, str):

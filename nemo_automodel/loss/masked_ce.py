@@ -30,6 +30,9 @@ def masked_cross_entropy(logits, targets, mask=None, fp32_upcast=True, ignore_in
             of the loss. Defaults to None.
         fp32_upcast (bool, optional): if True it will cast logits to float32 before computing
         cross entropy. Default: True.
+        ignore_index (int): label to ignore in CE calculation. Defaults to -100.
+        reduction (str): type of reduction. Defaults to "mean".
+
     Returns:
         torch.Tensor: The computed loss as a scalar tensor.
     """
