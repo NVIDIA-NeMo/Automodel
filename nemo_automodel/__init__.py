@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
-from .package_info import __version__, __package_name__
+from .package_info import __package_name__, __version__
 
 __all__ = [
     "_peft",
