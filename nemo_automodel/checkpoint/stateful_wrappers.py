@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 import torch
 from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
     get_model_state_dict,
     get_optimizer_state_dict,
     set_model_state_dict,
@@ -38,7 +39,7 @@ class ModelState(Stateful):
         model: The PyTorch model to track.
     """
 
-    def __init__(self, model: torch.nn.Module, serialization_format: SerializationFormat):
+    def __init__(self, model: torch.nn.Module, serialization_format: SerializationFormat, is_peft: bool):
         """
         Initialize a ModelState instance for distributed checkpointing.
 
@@ -52,10 +53,12 @@ class ModelState(Stateful):
                 captured during checkpointing.
             serialization_format (SerializationFormat): Backend/format to use when
                 persisting the model state (e.g., torch, safetensors).
+            is_peft (bool): Whether the model is PEFT.
         """
         self.model = model
         self.is_tied_lm_head = getattr(getattr(model, 'config', {}), 'tie_word_embeddings', False)
         self.serialization_format = serialization_format
+        self.is_peft = is_peft
 
     def state_dict(self) -> dict[str, Any]:
         """
@@ -66,6 +69,9 @@ class ModelState(Stateful):
         """
         # this line automatically manages FSDP FQN's
         model_state_dict = get_model_state_dict(self.model)
+
+        if self.is_peft:
+            model_state_dict = {k: v for k, v in model_state_dict.items() if "lora" in k}
 
         # This is a hack to fix the issue with the model state dict being saved with the "model.model." prefix.
         # This is necessary when saving consolidated safetensors. This is because calling HF's
@@ -114,6 +120,7 @@ class ModelState(Stateful):
         set_model_state_dict(
             self.model,
             state_dict,
+            options=StateDictOptions(strict=False if self.is_peft else True),
         )
 
 

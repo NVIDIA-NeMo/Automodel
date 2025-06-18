@@ -45,6 +45,7 @@ class CheckpointingConfig:
     model_cache_dir: str | Path
     model_repo_id: str
     save_consolidated: bool
+    is_peft: bool
 
     def __post_init__(self):
         """
@@ -73,6 +74,7 @@ def save_model(
         weights_path: Path to save model weights
         checkpoint_config: Checkpointing configuration
     """
+    breakpoint()
     # TODO(@adil-a): Need to add support for PEFT.
     # We also need to eventually add suport for HSDP, so we only save on non-duplicate ranks.
     # Add functionality to chunk different layers for different ranks to save.
@@ -100,7 +102,7 @@ def save_model(
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    model_state = ModelState(model, checkpoint_config.model_save_format)
+    model_state = ModelState(model, checkpoint_config.model_save_format, checkpoint_config.is_peft)
 
     if checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
         fqn_to_file_index_mapping = None
@@ -162,9 +164,9 @@ def load_model(
     # Validate checkpoint directory
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model path {model_path} does not exist")
+    model_state = ModelState(model, checkpoint_config.model_save_format, checkpoint_config.is_peft)
 
     if checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
-        model_state = ModelState(model, checkpoint_config.model_save_format)
         storage_reader = _HuggingFaceStorageReader(path=model_path)
 
         dcp.load(
@@ -174,7 +176,6 @@ def load_model(
             planner=dcp.DefaultLoadPlanner(),
         )
     elif checkpoint_config.model_save_format == SerializationFormat.TORCH_SAVE:
-        model_state = ModelState(model, checkpoint_config.model_save_format)
         dcp.load(state_dict={"model": model_state}, checkpoint_id=model_path)
     else:
         raise ValueError(f"Unsupported model save format: {checkpoint_config.model_save_format}")
