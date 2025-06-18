@@ -20,7 +20,7 @@
 
 ## ✨ What is NeMo AutoModel?
 
-NeMo AutoModel is a framework that delivers **zero-day support** for Hugging Face models with distributed training capabilities. It streamlines the journey from experimentation to production deployment, combining ease of use with scalability and performance optimizations.
+NeMo AutoModel is a framework that delivers **zero-day support** for finetuning Hugging Face models with support for distributed training, fast custom kernels and low memory usage. It streamlines the journey from experimentation to production deployment, combining ease of use with scalability and performance optimizations.
 
 
 ### 📋 Ready-to-Use Recipes
