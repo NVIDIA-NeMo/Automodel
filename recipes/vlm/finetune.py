@@ -48,7 +48,16 @@ logger = logging.getLogger(__name__)
 # ---------------------------
 
 
-def build_model_and_optimizer(device, cfg_model, cfg_opt, cfg_freeze, cfg_peft, model_wrapper, seed, tp_size=1) -> tuple[nn.Module, 'Optimizer']: # noqa: F821
+def build_model_and_optimizer(
+        device, 
+        cfg_model, 
+        cfg_opt, 
+        cfg_freeze, 
+        cfg_peft, 
+        model_wrapper, 
+        seed, 
+        tp_size=1,
+    ) -> tuple[nn.Module, 'Optimizer']: # noqa: F821
     """Build and initialize a model.
 
     Args:
