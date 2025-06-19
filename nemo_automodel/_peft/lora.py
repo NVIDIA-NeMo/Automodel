@@ -293,8 +293,13 @@ def apply_lora_to_linear_modules(
     # Freeze base model parameters
     for w in model.parameters():
         w.requires_grad_(False)
+    
+    is_causal_lm = False
+    if hasattr(model, "config") and "CausalLM" in model.config.architectures[0]:
+        # for example, LlamaForCausalLM
+        is_causal_lm = True
 
-    matcher = ModuleMatcher(target_modules, exclude_modules, match_all_linear)
+    matcher = ModuleMatcher(target_modules, exclude_modules, match_all_linear, is_causal_lm)
     num_modules_matched = 0
     for name, module in list(model.named_modules()):
         if "lm_head" in name:
