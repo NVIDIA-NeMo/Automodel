@@ -68,10 +68,14 @@ class ModelState(Stateful):
             dict: Dictionary containing the model's state dict with CPU offloading enabled.
         """
         # this line automatically manages FSDP FQN's
-        model_state_dict = get_model_state_dict(self.model)
-
+        options = None
         if self.is_peft:
-            model_state_dict = {k: v for k, v in model_state_dict.items() if "lora" in k}
+            options = StateDictOptions(
+                full_state_dict=True,
+                cpu_offload=True,
+                ignore_frozen_params=True
+            )
+        model_state_dict = get_model_state_dict(self.model, options=options)
 
         # This is a hack to fix the issue with the model state dict being saved with the "model.model." prefix.
         # This is necessary when saving consolidated safetensors. This is because calling HF's
