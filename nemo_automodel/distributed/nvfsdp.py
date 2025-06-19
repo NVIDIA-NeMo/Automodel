@@ -199,8 +199,9 @@ class NVFSDPManager:
 
         Args:
             model: The model to be parallelized.
-            optimizer: The optimizer for the model. If None, user need to call model.finish_grad_sync() before optimizer.step(),
-                model.install_optimized_model_weights() and model.zero_grad_buffer() after optimizer.zero_grad()
+            optimizer: The optimizer for the model. If None, user need to call model.finish_grad_sync() 
+                before optimizer.step(), model.install_optimized_model_weights() and model.zero_grad_buffer()
+                after optimizer.zero_grad()
             use_hf_tp_plan (bool): if true, will query the model for the TP plan.
 
         Returns:
