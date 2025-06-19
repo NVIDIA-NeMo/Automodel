@@ -13,13 +13,12 @@ from torch.utils.data import DataLoader
 import pathlib
 from torch.distributed.device_mesh import _mesh_resources
 
-try:
-    from nvfsdp import nvFSDP
-    HAVE_NVFSDP = True
-except:
-    HAVE_NVFSDP = False
+import logging
 
-import torch.distributed as dist
+from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+from transformers import AutoTokenizer
+
+from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.config.cli import parse_args_and_load_config
 from nemo_automodel.distributed.init_utils import initialize_distributed
 from nemo_automodel.distributed.nvfsdp import NVFSDPManager
@@ -46,7 +45,7 @@ logger = logging.getLogger(__name__)
 #  Stateless helper functions
 # ---------------------------
 
-def build_model_and_optimizer(device, cfg_model, cfg_opt, use_hf_fa2, cfg_peft, model_wrapper, seed, tp_size=1) -> tuple[nn.Module, 'Optimizer']:
+def build_model_and_optimizer(device, cfg_model, cfg_opt, use_hf_fa2, cfg_peft, model_wrapper, seed, tp_size=1) -> tuple[nn.Module, 'Optimizer']: # noqa: F821
     """Build and initialize a model.
 
     Args:
@@ -86,7 +85,7 @@ def build_model_and_optimizer(device, cfg_model, cfg_opt, use_hf_fa2, cfg_peft, 
         optimizer = cfg_opt.instantiate(params=trainable_params)
 
         if callable(getattr(model_wrapper, 'parallelize', None)):
-            if HAVE_NVFSDP and isinstance(model_wrapper, NVFSDPManager):
+            if isinstance(model_wrapper, NVFSDPManager):
                 model, optimizer = model_wrapper.parallelize(model, optimizer)
             else:
                 model = model_wrapper.parallelize(model)
