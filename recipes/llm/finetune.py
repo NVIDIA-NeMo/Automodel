@@ -465,21 +465,15 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # TODO: TP WAR
                 grad_norm = 0.
 
-            if HAVE_NVFSDP and isinstance(self.model, nvFSDP):
-                # If the model uses nvFSDP, wait for all sharded gradients to be reduced and unsharded.
-                # Necessary because the post-backward reduce-scatter is asynchronous, so gradients and backward
-                # computations are concurrent, but the gradients of the final layer may not be available yet.
-                self.model.finish_grad_sync()
+            # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
+            # self.model.finish_grad_sync()
 
             self.optimizer.step()
             self.optimizer.zero_grad()
 
-            if HAVE_NVFSDP and isinstance(self.model, nvFSDP):
-                # If custom FSDP2 is configured with "optim" (optimizer state / high-precision model weight sharding),
-                # then the optimizer step will be applied to the main high-precision model weights. Update the model
-                # weights after the optimizer step.
-                self.model.install_optimized_model_weights()
-                self.model.zero_grad_buffer()
+            # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
+            # self.model.install_optimized_model_weights()
+            # self.model.zero_grad_buffer()
 
             # log
             reporting_loss = self.log_train_metrics(grad_norm)
