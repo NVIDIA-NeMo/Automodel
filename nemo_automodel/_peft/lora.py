@@ -302,8 +302,6 @@ def apply_lora_to_linear_modules(
     matcher = ModuleMatcher(target_modules, exclude_modules, match_all_linear, is_causal_lm)
     num_modules_matched = 0
     for name, module in list(model.named_modules()):
-        if "lm_head" in name:
-            continue
         if matcher.match(module, name):
             num_modules_matched += 1
             patch_linear_module(
