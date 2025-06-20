@@ -620,6 +620,8 @@ def test_hf_peft_checkpoint():
         open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "model" / "adapter_config.json"),
     )
 
+    assert len(restored_config) == len(expected_config), f"Mismatch between in-memory and on-disk config. Expected length {len(expected_config)} but got {len(restored_config)}"
+
     for k, v in expected_config.items():
         assert k in restored_config, "Key {} not found in restored config".format(k)
         error_msg = "Mismatch between in-memory and on-disk config. Expected {{}} but got {{}}"
