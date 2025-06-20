@@ -58,7 +58,7 @@ class ModelState(Stateful):
         model: The PyTorch model to track.
     """
 
-    def __init__(self, model: torch.nn.Module, serialization_format: SerializationFormat, is_peft: bool):
+    def __init__(self, model: torch.nn.Module, serialization_format: SerializationFormat, is_peft: bool = False):
         """
         Initialize a ModelState instance for distributed checkpointing.
 
