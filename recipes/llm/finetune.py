@@ -90,7 +90,7 @@ def build_model(device, cfg_model, use_hf_fa2, cfg_peft, model_wrapper, seed) ->
             return model.to(device)
 
 
-def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id):
+def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
     """Build a checkpoint configuration.
     """
     from transformers.utils import TRANSFORMERS_CACHE
@@ -102,6 +102,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id):
         model_repo_id=model_repo_id,
         model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
         save_consolidated=False,
+        is_peft=is_peft,
     )
     if cfg_ckpt is not None:
         cfg_ckpt = cfg_ckpt.to_dict()
@@ -337,6 +338,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.cfg.get('checkpoint', None),
             self.cfg.get('model.cache_dir', None),
             self.cfg.model.pretrained_model_name_or_path,
+            True if self.cfg.get('peft', None) else False,
         )
 
         # Set up the stateful random number generator
