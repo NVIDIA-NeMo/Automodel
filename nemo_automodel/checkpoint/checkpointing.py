@@ -24,7 +24,7 @@ import torch
 import torch.distributed
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
-
+import logging
 from nemo_automodel.checkpoint._backports.filesystem import SerializationFormat
 from nemo_automodel.checkpoint._backports.hf_storage import (
     _HuggingFaceStorageReader,
@@ -55,6 +55,54 @@ class CheckpointingConfig:
                 self.model_save_format.upper()
             ]
 
+
+def build_safetensor_shard_map(model, model_state, model_cache_dir, model_repo_id):
+    """
+    Return a complete FQN→shard-index map for saving a model as sharded ``.safetensors`` files.
+
+    The function reads the existing ``safetensors`` index (if present) and
+    augments it with any parameters currently in ``model.state_dict()`` that are
+    missing from the index. New tensors are assigned to the last shard in the
+    index (or shard 0 for single-file checkpoints).
+
+    Args:
+        model: The PyTorch model whose parameters will be saved.
+        model_state: Runtime metadata for the model; must expose
+            ``is_tied_lm_head`` (bool) to indicate whether the LM head shares
+            weights with the embedding layer.
+        model_cache_dir: Local directory that stores downloaded model files.
+        model_repo_id: Hugging Face Hub repository ID for the model.
+
+    Returns:
+        A dictionary mapping fully-qualified tensor names (FQNs) to integer
+        shard indices. Returns ``None`` if no ``safetensors`` index is found.
+
+    Notes:
+        • If ``model_state.is_tied_lm_head`` is ``True``, the key
+          ``"lm_head.weight"`` is skipped because it points to shared weights.
+        • Only rank 0 prints diagnostics when running under
+          ``torch.distributed``.
+    """
+    # we first need to find the FQN -> .safetensors mapping
+    index_path = _get_safetensors_index_path(model_cache_dir, model_repo_id)
+    fqn_to_file_index_mapping = None
+    if not index_path:
+        return fqn_to_file_index_mapping
+
+    fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(index_path)
+    # Add any missing keys from the model_state_dict
+    # These will go to the same file as the last file (or file 1 for single-file models)
+    default_index = max(fqn_to_file_index_mapping.values())
+
+    # TODO:(@adil-a): This will need to change when we add PP. Maybe we can cache the keys in ModelState.
+    for fqn in model.state_dict().keys():
+        if fqn not in fqn_to_file_index_mapping:
+            if model_state.is_tied_lm_head and fqn == "lm_head.weight":
+                continue
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                logging.info(f"Adding missing key to mapping: {fqn}")
+            fqn_to_file_index_mapping[fqn] = default_index
+    return fqn_to_file_index_mapping
 
 def save_model(
         model: nn.Module,
@@ -88,7 +136,7 @@ def save_model(
         os.makedirs(model_path, exist_ok=True)
 
         if (
-            checkpoint_config.save_consolidated 
+            checkpoint_config.save_consolidated
             and checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS
         ):
             os.makedirs(consolidated_model_path, exist_ok=True)
@@ -106,25 +154,11 @@ def save_model(
         fqn_to_file_index_mapping = None
         if checkpoint_config.save_consolidated:
             # we first need to find the FQN -> .safetensors mapping
-            index_path = _get_safetensors_index_path(
+            fqn_to_file_index_mapping = build_safetensor_shard_map(model,
+                model_state,
                 checkpoint_config.model_cache_dir,
-                checkpoint_config.model_repo_id,
+                checkpoint_config.model_repo_id
             )
-            if index_path:
-                fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(index_path)
-
-                # Add any missing keys from the model_state_dict
-                # These will go to the same file as the last file (or file 1 for single-file models)
-                default_index = max(fqn_to_file_index_mapping.values())
-
-                # TODO:(@adil-a): This will need to change when we add PP. Maybe we can cache the keys in ModelState.
-                for fqn in list(model.state_dict().keys()):
-                    if fqn not in fqn_to_file_index_mapping:
-                        if model_state.is_tied_lm_head and fqn == "lm_head.weight":
-                            continue
-                        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                            print(f"Adding missing key to mapping: {fqn}")
-                        fqn_to_file_index_mapping[fqn] = default_index
 
         storage_writer = _HuggingFaceStorageWriter(
             path=model_path,

@@ -8,8 +8,6 @@ from typing import Optional
 
 from torch.optim.optimizer import Optimizer
 
-from nemo_automodel.utils.common_utils import log_single_rank
-
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +114,7 @@ class OptimizerParamScheduler:
 
         # Set the learning rate
         self.step(0)
-        log_single_rank(logger, logging.INFO, f"> learning rate decay style: {self.lr_decay_style}")
+        logger.info("> learning rate decay style: {}".format(self.lr_decay_style))
 
     def get_wd(self) -> float:
         """
@@ -145,66 +143,91 @@ class OptimizerParamScheduler:
 
     def get_lr(self, param_group: dict) -> float:
         """
-        Learning rate decay functions from: https://openreview.net/pdf?id=BJYwwY9ll pg. 4.
+        Returns the current LR.
 
-        Argsa:
-            param_group (dict): parameter group from the optimizer.
+        Args:
+            param_group (dict[str, Any]): _description_
+
+        Raises:
+            ValueError: if the lr decay style is unkown
+
+        Returns:
+            float: the new LR.
         """
         max_lr = param_group.get("max_lr", self.max_lr)
         min_lr = param_group.get("min_lr", self.min_lr)
 
-        # Use linear warmup for the initial part.
-        if self.lr_warmup_steps > 0 and self.num_steps <= self.lr_warmup_steps:
-            return self.init_lr + ((max_lr - self.init_lr) * float(self.num_steps) / float(self.lr_warmup_steps))
+        # 1. warm-up
+        if self._in_warmup:
+            return self._warmup_lr(max_lr)
 
-        # If the learning rate is constant, just return the initial value.
+        # 2. constant
         if self.lr_decay_style == "constant":
             return max_lr
 
-        # For any steps larger than `self.lr_decay_steps`, use `min_lr`.
+        # 3. post-decay floor
         if self.num_steps > self.lr_decay_steps:
             return min_lr
 
-        # If we are done with the warmup period, use the decay style.
+        # 4. style-specific decay
         if self.lr_decay_style == "inverse-square-root":
-            warmup_steps = max(self.lr_warmup_steps, 1)
-            num_steps = max(self.num_steps, 1)
-            lr = max_lr * warmup_steps**0.5 / (num_steps**0.5)
-            return max(min_lr, lr)
+            return self._inverse_sqrt_decay(max_lr, min_lr)
 
-        num_steps_ = self.num_steps - self.lr_warmup_steps
-        decay_steps_ = self.lr_decay_steps - self.lr_warmup_steps
-        decay_ratio = float(num_steps_) / float(decay_steps_)
-        assert decay_ratio >= 0.0
-        assert decay_ratio <= 1.0
-        delta_lr = max_lr - min_lr
-
-        coeff = None
         if self.lr_decay_style == "linear":
-            coeff = 1.0 - decay_ratio
+            coeff = self._linear_coeff()
         elif self.lr_decay_style == "cosine":
-            coeff = 0.5 * (math.cos(math.pi * decay_ratio) + 1.0)
+            coeff = self._cosine_coeff()
         elif self.lr_decay_style == "WSD":
-            wsd_anneal_start_ = self.lr_decay_steps - self.wsd_decay_steps
-            if self.num_steps <= wsd_anneal_start_:
-                coeff = 1.0
-            else:
-                wsd_steps = self.num_steps - wsd_anneal_start_
-                wsd_decay_ratio = float(wsd_steps) / float(self.wsd_decay_steps)
-                if self.lr_wsd_decay_style == "linear":
-                    coeff = 1.0 - wsd_decay_ratio
-                elif self.lr_wsd_decay_style == "cosine":
-                    coeff = 0.5 * (math.cos(math.pi * wsd_decay_ratio) + 1.0)
-                elif self.lr_wsd_decay_style == "exponential":
-                    coeff = (2.0 * math.pow(0.5, wsd_decay_ratio)) - 1.0
-                elif self.lr_wsd_decay_style == "minus_sqrt":
-                    coeff = 1.0 - math.sqrt(wsd_decay_ratio)
-
+            coeff = self._wsd_coeff()
         else:
-            raise Exception(f"{self.lr_decay_style} decay style is not supported.")
-        assert coeff is not None
+            raise ValueError(f"Unknown lr_decay_style {self.lr_decay_style}")
 
-        return min_lr + coeff * delta_lr
+        return self._interp(min_lr, max_lr, coeff)
+
+    @property
+    def _in_warmup(self) -> bool:
+        return self.lr_warmup_steps > 0 and self.num_steps <= self.lr_warmup_steps
+
+    def _warmup_lr(self, max_lr: float) -> float:
+        return self.init_lr + (max_lr - self.init_lr) * self.num_steps / self.lr_warmup_steps
+
+    def _inverse_sqrt_decay(self, max_lr: float, min_lr: float) -> float:
+        warmup_steps = max(self.lr_warmup_steps, 1)
+        num_steps    = max(self.num_steps, 1)
+        lr = max_lr * warmup_steps**0.5 / num_steps**0.5
+        return max(min_lr, lr)
+
+    def _decay_ratio(self) -> float:
+        return max(0.0, (self.num_steps - self.lr_warmup_steps) /
+                          (self.lr_decay_steps - self.lr_warmup_steps))
+
+    def _linear_coeff(self) -> float:
+        return 1.0 - self._decay_ratio()
+
+    def _cosine_coeff(self) -> float:
+        return 0.5 * (math.cos(math.pi * self._decay_ratio()) + 1.0)
+
+    def _wsd_coeff(self) -> float:
+        # before WSD subsection begins, stay at full coeff
+        wsd_start = self.lr_decay_steps - self.wsd_decay_steps
+        if self.num_steps <= wsd_start:
+            return 1.0
+
+        wsd_ratio = (self.num_steps - wsd_start) / self.wsd_decay_steps
+        style = self.lr_wsd_decay_style
+        if style == "linear":
+            return 1.0 - wsd_ratio
+        if style == "cosine":
+            return 0.5 * (math.cos(math.pi * wsd_ratio) + 1.0)
+        if style == "exponential":
+            return (2.0 * 0.5 ** wsd_ratio) - 1.0
+        if style == "minus_sqrt":
+            return 1.0 - math.sqrt(wsd_ratio)
+        raise ValueError(f"Unknown lr_wsd_decay_style {style}")
+
+    @staticmethod
+    def _interp(lo: float, hi: float, coeff: float) -> float:
+        return lo + coeff * (hi - lo)
 
     def step(self, increment: int) -> None:
         """
@@ -248,7 +271,7 @@ class OptimizerParamScheduler:
             name (str): name of the parameter
         """
         if self.override_opt_param_scheduler:
-            log_single_rank(logger, logging.INFO, f" > overriding {name} value to {cls_value}")
+            logger.info(" > overriding {} value to {}".format(name, cls_value))
             return cls_value
 
         if not self.use_checkpoint_opt_param_scheduler:
@@ -257,7 +280,7 @@ class OptimizerParamScheduler:
                 f"value {sd_value} for {name} do not match"
             )
 
-        log_single_rank(logger, logging.INFO, f" > using checkpoint value {sd_value} for {name}")
+        logger.INFO(" > using checkpoint value {} for {}".format(sd_value, name))
         return sd_value
 
     def load_state_dict(self, state_dict: dict) -> None:

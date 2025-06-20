@@ -66,81 +66,89 @@ class PackedSequence:
         self.max_packs = max_packs
         self.packs: list[PACK_TYPE] = []
 
-    def pack(self):
+    # --------------------------------- public API ---------------------------------
+    def pack(self) -> Dataset:
         """
         Pack the dataset to defined length.
 
-        In particulat, it will iterate through the dataset. Use a buffer to hold samples until
+        In particular, it will iterate through the dataset. Use a buffer to hold samples until
         packed_sequence_size, then append the buffer to self.packs as a single "packed" sample.
         Continue until max_packs or end of dataset.
         """
-        # Only show progress bar on rank 0
-        rank = (
+        self._start_packing()
+
+        for sample in self.dataset:
+            self._process_sample(sample)
+            if self._should_stop_packing():
+                break
+
+        self._finalize_packing()
+        return self.packed_dataset
+
+    # ----------------------------- private helpers --------------------------------
+    def _start_packing(self) -> None:
+        """Prepare state and progress-bar."""
+        self.contains_loss_mask = "loss_mask" in self.dataset[0]
+        self.current_pack      = self._new_empty_pack()
+        self.previous_sample_boundary = 0
+        self.rank = (
             torch.distributed.get_rank()
             if torch.distributed.is_available() and torch.distributed.is_initialized()
             else 0
         )
+        if self.rank == 0:
+            self.pbar = tqdm(total=len(self.dataset),
+                            desc=f"Packing {self.split} dataset",
+                            dynamic_ncols=True)
 
-        if "loss_mask" in self.dataset[0]:
-            self.contains_loss_mask = True
-        # Buffer to hold samples until they are long enough to be added to self.packs
-        current_pack = {
-            "input_ids": [],
-            "labels": [],
-            "position_ids": [],
-            "seq_lens": [],
-        }
+    def _process_sample(self, sample: dict) -> None:
+        """Ingest one sample, handle overflow, update progress-bar/boundary."""
+        self._append_to_pack(sample)
+        self._handle_overflow()
+
+        if self.rank == 0:
+            self.pbar.update()
+        self.previous_sample_boundary = len(self.current_pack["input_ids"])
+
+    def _handle_overflow(self) -> None:
+        """Split current_pack while it is too large and we are still allowed to."""
+        while (len(self.current_pack["input_ids"]) > self.packed_sequence_size
+            and not self._should_stop_packing()):
+            self.current_pack = self._split_and_add_pack(self.current_pack)
+
+    def _append_to_pack(self, sample: dict) -> None:
+        """Concatenate one sample onto current_pack."""
+        ids, lbls = sample["input_ids"], sample["labels"]
+        if len(ids) > self.packed_sequence_size and not self.split_across_pack:
+            raise ValueError(
+                f"Dataset sample is too long ({len(ids)} > {self.packed_sequence_size}). "
+                "Set `split_across_pack=True` or increase `packed_sequence_size`."
+            )
+
+        self.current_pack["input_ids"]   += ids
+        self.current_pack["labels"]      += lbls
+        self.current_pack["position_ids"]+= [i % self.packed_sequence_size for i in range(len(ids))]
+        self.current_pack["seq_lens"]    += [len(ids)]
         if self.contains_loss_mask:
-            current_pack["loss_mask"] = []
-        self.previous_sample_boundary: int = 0
-        if rank == 0:
-            pbar = tqdm(total=len(self.dataset), desc=f"Packing {self.split} dataset", dynamic_ncols=True)
-        for sample in self.dataset:
-            input_ids, labels = sample["input_ids"], sample["labels"]
-            if self.contains_loss_mask:
-                loss_mask = sample["loss_mask"]
-            # If the dataset outputs samples that are larger than the specified
-            # packed_sequence_size and we're unable to split it, user needs to modify
-            # one of the two parameters
-            seq_len = len(input_ids)
-            if seq_len > self.packed_sequence_size and not self.split_across_pack:
-                raise ValueError(
-                    f"Dataset sample is too long ({seq_len} > {self.packed_sequence_size}). "
-                    "Please set `split_across_pack=True` or increase `packed_sequence_size`.",
-                )
-            # Update the current pack
-            # "position_ids" is the pos ids, "seq_lens" is the len of each seq within the pack
-            current_pack["input_ids"] += input_ids
-            current_pack["labels"] += labels
-            current_pack["position_ids"] += [x % self.packed_sequence_size for x in range(seq_len)]
-            current_pack["seq_lens"] += [seq_len]
-            if self.contains_loss_mask:
-                current_pack["loss_mask"] += loss_mask
+            self.current_pack["loss_mask"] += sample["loss_mask"]
 
-            # If the current pack is over the packed_sequence_size, add it to self.packs and
-            # retain any truncated or bumped samples for next pack
-            while len(current_pack["input_ids"]) > self.packed_sequence_size and not self._should_stop_packing():
-                current_pack = self._split_and_add_pack(current_pack)
+    def _finalize_packing(self) -> None:
+        """Flush leftovers and build the final HF-Dataset."""
+        if (self.current_pack["input_ids"] and
+            (self.max_packs is None or len(self.packs) < self.max_packs)):
+            self._add_pack(self.current_pack)
 
-            if rank == 0:
-                pbar.update()
-
-            # Keep track of previous sample boundary
-            self.previous_sample_boundary = len(current_pack["input_ids"])
-
-            if self._should_stop_packing():
-                break
-
-        # Handle the last pack if there's leftover and we haven't filled up the max packs
-        if len(current_pack["input_ids"]) > 0 and (self.max_packs is None or len(self.packs) < self.max_packs):
-            # No need to handle splitting at this point so we can just add the current pack
-            self._add_pack(current_pack)
-
-        # After packing all samples, convert self.packs to a Dataset object
-        self.packed_dataset = Dataset.from_dict({key: [pack[key] for pack in self.packs]
-                                                 for key in self.packs[0].keys()})
+        self.packed_dataset = Dataset.from_dict(
+            {k: [p[k] for p in self.packs] for k in self.packs[0]}
+        )
         logger.info(f">>>>> Total number of packs created: {len(self.packs)} <<<<<")
-        return self.packed_dataset
+
+    # -------------------- tiny utility: create empty pack dict --------------------
+    def _new_empty_pack(self) -> dict:
+        d = {"input_ids": [], "labels": [], "position_ids": [], "seq_lens": []}
+        if getattr(self, "contains_loss_mask", False):
+            d["loss_mask"] = []
+        return d
 
     def _should_stop_packing(self) -> bool:
         """

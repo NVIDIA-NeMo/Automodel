@@ -47,6 +47,51 @@ def print_trainable_parameters(model):
 
     return trainable_params, all_param
 
+def _freeze_with_type(module, module_type):
+    """
+    Sets requires_grad=None for modules matching the module_type.
+
+    Args:
+        module (nn.Module): the module to freeze.
+        module_type (nn.Module): the module to match during freeze.
+    """
+    for m in module.modules():
+        if not isinstance(m, module_type):
+            continue
+        m.requires_grad = False
+
+def _freeze_with_pattern(module, pattern=None):
+    """
+    Sets requires_grad=None for modules matching the pattern or all modules if pattern is None.
+
+    Args:
+        module (nn.Module): The module to freeze.
+        pattern (list[str], optional): The pattern of attribute names to match. Defaults to None.
+
+    Returns:
+        None: the change happens in-place in input module.
+    """
+    def matches(name, pattern):
+        """
+        Checks if name matches any pattern.
+
+        Args:
+            name (str): the module name.
+            pattern (list[str]): the list of allowed names.
+
+        Returns:
+            bool: whether the name matches any pattern
+        """
+        name = name.lower()
+        return any(
+            pattern in name
+            for pattern in ["vision", "visual", "image_encoder"]
+        )
+
+    for name, m in module.named_modules():
+        if pattern and not matches(name, pattern):
+            continue
+        m.requires_grad = False
 
 def apply_parameter_freezing(model, freeze_config):
     """Apply parameter freezing based on configuration.
@@ -66,32 +111,19 @@ def apply_parameter_freezing(model, freeze_config):
 
     # Freeze embeddings
     if freeze_embeddings:
-        for m in model.modules():
-            if isinstance(m, nn.Embedding):
-                m.weight.requires_grad = False
+        _freeze_with_type(model, nn.Embedding)
 
     # Freeze vision tower
     if freeze_vision_tower:
         if hasattr(model, "vision_tower"):
-            for param in model.vision_tower.parameters():
-                param.requires_grad = False
+            _freeze_with_pattern(model.vision_tower, None)
         # Alternative patterns for different VLM architectures
-        for name, module in model.named_modules():
-            if any(
-                pattern in name.lower()
-                for pattern in ["vision", "visual", "image_encoder"]
-            ):
-                for param in module.parameters():
-                    param.requires_grad = False
+        _freeze_with_pattern(model, ["vision", "visual", "image_encoder"])
 
     # Freeze language model backbone
     if freeze_language_model:
         if hasattr(model, "language_model"):
-            for param in model.language_model.parameters():
-                param.requires_grad = False
+            _freeze_with_pattern(model.language_model, None)
         # Alternative patterns
-        for name, module in model.named_modules():
-            if any(pattern in name.lower() for pattern in ["language", "text", "llm"]):
-                for param in module.parameters():
-                    param.requires_grad = False
+        _freeze_with_pattern(model, ["language", "text", "llm"])
 
