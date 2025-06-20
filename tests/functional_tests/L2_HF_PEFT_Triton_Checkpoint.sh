@@ -18,9 +18,9 @@ set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1"
 
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
--m pytest tests/functional_tests/checkpoint/test_hf_peft.py \
-    --config recipes/llm/llama_3_2_1b_hellaswag_peft.yaml \
+TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/opt/Automodel --parallel-mode \
+-m pytest tests/functional_tests/checkpoint/test_peft.py \
+    --config recipes/llm/llama_3_2_1b_squad.yaml \
     --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
     --step_scheduler.max_steps 10 \
     --step_scheduler.grad_acc_steps 4 \
@@ -36,5 +36,6 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --peft.match_all_linear true \
     --peft.dim 8 \
     --peft.alpha 32 \
-    --peft.use_triton true
+    --peft.use_triton true \
+    --peft.peft_fn nemo_automodel._peft.lora.apply_lora_to_linear_modules
 coverage combine

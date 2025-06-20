@@ -19,6 +19,11 @@ _OVERRIDES = [
     "checkpoint.model_save_format",
     "dataloader.batch_size",
     "checkpoint.save_consolidated",
+    "peft.peft_fn",
+    "peft.match_all_linear",
+    "peft.dim",
+    "peft.alpha",
+    "peft.use_triton",
 ]
 
 
