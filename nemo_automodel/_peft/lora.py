@@ -24,6 +24,14 @@ from nemo_automodel._peft.lora_kernel import lora_forward_wrapper, lora_da_dx_up
 from nemo_automodel._peft.module_matcher import ModuleMatcher
 HAS_BNB, bitsandbytes = safe_import("bitsandbytes")
 
+MODEL_TYPE_TO_PEFT_TASK_TYPE = {
+        "SequenceClassification": "SEQ_CLS",
+        "Seq2SeqLM": "SEQ_2_SEQ_LM", 
+        "CausalLM": "CAUSAL_LM",
+        "TokenClassification": "TOKEN_CLS",
+        "QuestionAnswering": "QUESTION_ANS",
+        "FeatureExtraction": "FEATURE_EXTRACTION",
+    }
 
 class LinearLoRA(nn.Linear):
     """
@@ -276,14 +284,25 @@ def apply_lora_to_linear_modules(
 
     target_modules accepts wildcard fragments, e.g. ["q_proj", "k_proj", ".*fc.*"].
     """
+    # To make our PeftConfig compatible with HF, we need to keep track of the
+    # final target modules, without the wildcard fragments.
+    final_target_modules = set()
+
     # Freeze base model parameters
     for w in model.parameters():
         w.requires_grad_(False)
+    
+    is_causal_lm = False
+    if hasattr(model, "config") and "CausalLM" in model.config.architectures[0]:
+        # for example, LlamaForCausalLM
+        is_causal_lm = True
 
-    matcher = ModuleMatcher(target_modules, exclude_modules, match_all_linear)
+    matcher = ModuleMatcher(target_modules, exclude_modules, match_all_linear, is_causal_lm)
     num_modules_matched = 0
     for name, module in list(model.named_modules()):
         if matcher.match(module, name):
+            final_target_modules.add(name.split(".")[-1])
+
             num_modules_matched += 1
             patch_linear_module(
                 module,
@@ -295,6 +314,21 @@ def apply_lora_to_linear_modules(
                 lora_dtype=lora_dtype,
                 use_triton=use_triton
            )
+
+    # finalize the peft config
+    model_task = model.config.architectures[0].split("For")[-1]
+    task_type = MODEL_TYPE_TO_PEFT_TASK_TYPE[model_task]
+    model._automodel_peft_config = {
+        "task_type": task_type,
+        "peft_type": "LORA",
+        "r": dim,
+        "lora_alpha": alpha,
+        "target_modules": list(final_target_modules),
+        "bias": "none",
+        "base_model_name_or_path": model.config.name_or_path,
+        "lora_dropout": dropout,
+    }
+    
     return num_modules_matched
 
 
