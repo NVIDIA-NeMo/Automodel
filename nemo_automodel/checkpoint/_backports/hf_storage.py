@@ -13,7 +13,7 @@
 # limitations under the License.
 # taken and edited from
 # https://github.com/pytorch/pytorch/blob/6ebe9a4f47e9cd1c9ccd467bcdfdea9445fd98d6/torch/distributed/checkpoint/hf_storage.py
-# pylint: disable=missing-function-docstring
+# pylint: disable=missing-function-docstring,line-too-long
 
 import dataclasses
 import json
