@@ -14,7 +14,7 @@
 
 # taken and edited from
 # https://github.com/pytorch/pytorch/blob/c13e725edd8dd21406c629bf625f2d6c59ceedd1/torch/distributed/checkpoint/default_planner.py
-# pylint: disable=missing-class-docstring, missing-function-docstring
+# pylint: disable=missing-class-docstring, missing-function-docstring,line-too-long
 
 import dataclasses
 import io
