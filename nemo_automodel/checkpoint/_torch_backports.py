@@ -22,10 +22,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-#  Public API
-# ---------------------------------------------------------------------------
-
 def apply_patches() -> None:
     """
     Inject modified modules into an *old* ``torch.distributed.checkpoint``.

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -91,7 +91,6 @@ jobs:
 
           echo "main=$no_fail_fast" | tee -a "$GITHUB_OUTPUT"
 
-
   cicd-wait-in-queue:
     needs: [pre-flight]
     runs-on: ubuntu-latest
@@ -173,6 +172,10 @@ jobs:
           - script: L2_HF_DCP_Checkpoint
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
           - script: L2_HF_Consolidated_Checkpoint
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+          - script: L2_HF_PEFT_Triton_Checkpoint
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+          - script: L2_HF_PEFT_Checkpoint
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
     needs: [cicd-unit-tests]
     runs-on: ${{ matrix.runner }}

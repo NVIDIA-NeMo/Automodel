@@ -19,11 +19,16 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+import json
 
 import torch
 import torch.distributed
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
+
+from transformers import PreTrainedModel
+from safetensors.torch import save_file
+from safetensors import safe_open
 
 from nemo_automodel.checkpoint._backports.filesystem import SerializationFormat
 from nemo_automodel.checkpoint._backports.hf_storage import (
@@ -45,6 +50,7 @@ class CheckpointingConfig:
     model_cache_dir: str | Path
     model_repo_id: str
     save_consolidated: bool
+    is_peft: bool
 
     def __post_init__(self):
         """
@@ -57,7 +63,7 @@ class CheckpointingConfig:
 
 
 def save_model(
-        model: nn.Module,
+        model: nn.Module | PreTrainedModel,
         weights_path: str,
         checkpoint_config: CheckpointingConfig,
 ):
@@ -90,6 +96,7 @@ def save_model(
         if (
             checkpoint_config.save_consolidated 
             and checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS
+            and not checkpoint_config.is_peft
         ):
             os.makedirs(consolidated_model_path, exist_ok=True)
             # save the config.json file
@@ -100,9 +107,21 @@ def save_model(
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    model_state = ModelState(model, checkpoint_config.model_save_format)
+    model_state = ModelState(model, checkpoint_config.model_save_format, checkpoint_config.is_peft)
 
-    if checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
+    if checkpoint_config.is_peft:
+        if not isinstance(model, PreTrainedModel):
+            raise ValueError("PEFT checkpointing is only supported for PreTrainedModel")
+        if not hasattr(model, "_automodel_peft_config"):
+            raise ValueError("PEFT checkpointing is only supported for models that have been trained with PEFT. "
+                             "Please use the `apply_lora_to_linear_modules` function to apply LoRA to the model.")
+        peft_config = model._automodel_peft_config
+        state_dict = model_state.state_dict()
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            with open(os.path.join(model_path, "adapter_config.json"), "w") as f:
+                json.dump(peft_config, f, indent=2, sort_keys=True)
+            save_file(state_dict, os.path.join(model_path, "adapter_model.safetensors"))
+    elif checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
         fqn_to_file_index_mapping = None
         if checkpoint_config.save_consolidated:
             # we first need to find the FQN -> .safetensors mapping
@@ -145,7 +164,7 @@ def save_model(
 
 
 def load_model(
-    model: torch.nn.Module,
+    model: torch.nn.Module | PreTrainedModel,
     weights_path: str,
     checkpoint_config: CheckpointingConfig,
 ):
@@ -162,9 +181,20 @@ def load_model(
     # Validate checkpoint directory
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model path {model_path} does not exist")
+    model_state = ModelState(model, checkpoint_config.model_save_format, checkpoint_config.is_peft)
 
-    if checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
-        model_state = ModelState(model, checkpoint_config.model_save_format)
+    if checkpoint_config.is_peft:
+        if not isinstance(model, PreTrainedModel):
+            raise ValueError("PEFT checkpointing is only supported for PreTrainedModel")
+        state_dict = model.state_dict()
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            with safe_open(os.path.join(model_path, "adapter_model.safetensors"), framework="pt") as f:
+                state_dict = {k: f.get_tensor(k) for k in f.keys()}
+        # since we're loading the PEFT adapters on rank0, we don't need to call dcp.load
+        # the call below will broadcast from rank0 to all other ranks
+        model_state.load_state_dict(state_dict)
+
+    elif checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
         storage_reader = _HuggingFaceStorageReader(path=model_path)
 
         dcp.load(
@@ -174,7 +204,6 @@ def load_model(
             planner=dcp.DefaultLoadPlanner(),
         )
     elif checkpoint_config.model_save_format == SerializationFormat.TORCH_SAVE:
-        model_state = ModelState(model, checkpoint_config.model_save_format)
         dcp.load(state_dict={"model": model_state}, checkpoint_id=model_path)
     else:
         raise ValueError(f"Unsupported model save format: {checkpoint_config.model_save_format}")

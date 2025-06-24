@@ -1,3 +1,17 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # taken from https://github.com/pytorch/pytorch/blob/156b28e62a225214a5685088a848c5efe6a4b95e/torch/distributed/checkpoint/_fsspec_filesystem.py # pylint: disable=line-too-long
 # pylint: disable=missing-class-docstring, missing-function-docstring
 
@@ -34,9 +48,7 @@ class FileSystem(FileSystemBase):
         self.fs: Optional[AbstractFileSystem] = None
 
     @contextmanager
-    def create_stream(
-        self, path: Union[str, os.PathLike], mode: str
-    ) -> Generator[io.IOBase, None, None]:
+    def create_stream(self, path: Union[str, os.PathLike], mode: str) -> Generator[io.IOBase, None, None]:
         assert self.fs is not None
         path = os.fspath(path)
 
@@ -54,20 +66,14 @@ class FileSystem(FileSystemBase):
                         pass
                 raise
 
-    def concat_path(
-        self, path: Union[str, os.PathLike], suffix: str
-    ) -> Union[str, os.PathLike]:
+    def concat_path(self, path: Union[str, os.PathLike], suffix: str) -> Union[str, os.PathLike]:
         return os.path.join(path, suffix)
 
-    def init_path(
-        self, path: Union[str, os.PathLike], **kwargs
-    ) -> Union[str, os.PathLike]:
+    def init_path(self, path: Union[str, os.PathLike], **kwargs) -> Union[str, os.PathLike]:
         self.fs, _ = url_to_fs(path, **kwargs)
         return path
 
-    def rename(
-        self, path: Union[str, os.PathLike], new_path: Union[str, os.PathLike]
-    ) -> None:
+    def rename(self, path: Union[str, os.PathLike], new_path: Union[str, os.PathLike]) -> None:
         self.fs.rename(path, new_path)
 
     def mkdir(self, path: Union[str, os.PathLike]) -> None:

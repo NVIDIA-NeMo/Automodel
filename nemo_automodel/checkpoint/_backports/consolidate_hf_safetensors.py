@@ -1,3 +1,16 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
 # pyre-strict
@@ -33,70 +46,74 @@ from nemo_automodel.checkpoint._backports.hf_utils import (
 class _FqnData:
     """
     Dataclass to store information about a tensor (identified by its fully qualified name).
-    
+
     Attributes:
         offset_in_file: Byte offset where this tensor's data begins in the output file
         shape_in_file: Shape of the tensor in the output file
         dtype_size: Size of the tensor's data type in bytes
         dtype_str: String representation of the tensor's data type
     """
+
     offset_in_file: int = 0
     shape_in_file: list[int] = field(default_factory=list)
     dtype_size: int = 0
     dtype_str: str = ""
 
+
 @dataclass
 class _OutputFileData:
     """
     Dataclass to store information about an output safetensors file.
-    
+
     Attributes:
         metadata_size: Size of the metadata section in bytes
         fqn_data: Dictionary mapping tensor names to their metadata
     """
+
     metadata_size: int = 0
     fqn_data: dict[str, _FqnData] = field(default_factory=dict)
+
 
 @dataclass
 class _InputFileData:
     """
     Dataclass to store information about an input safetensors file.
-    
+
     Attributes:
         metadata_size: Size of the metadata section in bytes
         metadata: Json metadata from the safetensors file
     """
+
     metadata_size: int = 0
     metadata: Any = None
-    
+
 
 def _parse_input_metadata(
-        input_files_data: dict[str, _InputFileData],
-        output_files_data: dict[str, _OutputFileData],
-    ) -> None:
+    input_files_data: dict[str, _InputFileData],
+    output_files_data: dict[str, _OutputFileData],
+) -> None:
     """
     Parse metadata from input safetensors files to determine the full tensor shapes and types.
-    
+
     This function analyzes the metadata from all input files to determine the complete shape
     of each tensor after consolidation. It updates the output_files_data with this information.
-    
+
     Args:
         input_files_data: dict of metadata from input safetensors files
         output_files_data: Dictionary mapping output file paths to their metadata
-    
+
     Raises:
         ValueError: If no DCP custom metadata is found in a safetensors file
     """
     # Dictionary to track the full size of each tensor across all shards
-    fqn_to_size_mapping : dict[str, tuple[list[int], str]]= {}
+    fqn_to_size_mapping: dict[str, tuple[list[int], str]] = {}
 
     for file_data in input_files_data.values():
         safetensors_metadata = file_data.metadata
         dcp_sharding_info = _get_dcp_custom_metadata(safetensors_metadata)
         if not dcp_sharding_info:
             raise ValueError(
-                "No DCP custom metadata found in safetensors file. "
-                "The file must be saved with DCP to be consolidated."
+                "No DCP custom metadata found in safetensors file. The file must be saved with DCP to be consolidated."
             )
 
         for key, val in safetensors_metadata.items():
@@ -106,7 +123,7 @@ def _parse_input_metadata(
             # Get the shape of this tensor shard and its offset in the full tensor
             sizes = val[SHAPE_KEY]
             offsets = dcp_sharding_info[key][SAVED_OFFSETS_KEY]
-       
+
             if key not in fqn_to_size_mapping:
                 # First time seeing this tensor - calculate its full size by adding offsets to dimensions
                 cur_size = [size + offset for size, offset in zip(sizes, offsets)]
@@ -133,15 +150,15 @@ def _parse_input_metadata(
 
 def _write_metadata(
     fs: fsspec.AbstractFileSystem,
-    output_files_data: dict[str, _OutputFileData],  
+    output_files_data: dict[str, _OutputFileData],
 ) -> None:
     """
     Write metadata to the beginning of each output safetensors file.
-    
+
     This function writes the metadata section to each output file, including information
     about tensor shapes, data types, and offsets. It also updates the offset_in_file
     field for each tensor in the output_files_data.
-    
+
     Args:
         fs: Filesystem interface for file operations
         output_files_data: Dictionary mapping output file paths to their metadata
@@ -151,17 +168,17 @@ def _write_metadata(
         with fs.open(file_path, "wb") as f:
             metadata = {}
             curr_offset = 0
-            
+
             # Calculate offsets for each tensor in the file
             for fqn, fqn_data in output_data.fqn_data.items():
                 # Calculate the end offset by multiplying all dimensions and the data type size
                 end_offset = curr_offset + math.prod(fqn_data.shape_in_file) * fqn_data.dtype_size
-                
+
                 # Store metadata for this tensor
                 metadata[fqn] = {
-                        SHAPE_KEY: fqn_data.shape_in_file,
-                        DTYPE_KEY: fqn_data.dtype_str,
-                        DATA_OFFSETS_KEY: [curr_offset, end_offset],  # Start and end byte offsets
+                    SHAPE_KEY: fqn_data.shape_in_file,
+                    DTYPE_KEY: fqn_data.dtype_str,
+                    DATA_OFFSETS_KEY: [curr_offset, end_offset],  # Start and end byte offsets
                 }
                 # Store the offset for later use when writing the actual tensor data
                 fqn_data.offset_in_file = curr_offset
@@ -171,11 +188,11 @@ def _write_metadata(
 
             # Convert metadata to JSON and encode as bytes
             json_metadata = json.dumps(metadata)
-            json_bytes = json_metadata.encode('utf-8')
-            
+            json_bytes = json_metadata.encode("utf-8")
+
             # Write the metadata size as an 8-byte unsigned integer (little-endian)
             size_in_bytes = len(json_bytes)
-            header_len = struct.pack('<Q', size_in_bytes)
+            header_len = struct.pack("<Q", size_in_bytes)
 
             # Write the header length and metadata to the file
             f.write(header_len)
@@ -183,6 +200,7 @@ def _write_metadata(
 
             # Store the total metadata size (header + JSON) for later use
             output_data.metadata_size = f.tell()
+
 
 def _process_output_file(
     input_fs: fsspec.AbstractFileSystem,
@@ -193,9 +211,9 @@ def _process_output_file(
 ) -> None:
     """
     Process a single output file by writing tensor data from input files.
-    
+
     This function is designed to be run in parallel for different output files.
-    
+
     Args:
         input_fs: Filesystem interface for input file operations
         output_fs: Filesystem interface for output file operations
@@ -212,7 +230,7 @@ def _process_output_file(
             for fqn, metadata in file_metadata.items():
                 if fqn == DEFAULT_EXTRA_METADATA_KEY:
                     continue
-                
+
                 # Skip if this tensor doesn't belong in this output file
                 if fqn not in output_data.fqn_data:
                     continue
@@ -221,13 +239,13 @@ def _process_output_file(
                 # Get the tensor data as bytes
                 f.seek(input_metadata_size + data_offsets[0])
                 data_to_write = f.read(data_offsets[1])
-                
+
                 # Get the offsets of this tensor shard within the full tensor
                 offsets_of_tensor_being_read = _get_dcp_custom_metadata(file_metadata)[fqn][SAVED_OFFSETS_KEY]
 
                 # Get metadata for this tensor in the output file
                 fqn_data = output_data.fqn_data[fqn]
-                
+
                 # Write this tensor shard to the appropriate position in the output file
                 _write_sub_tensor_to_file(
                     output_fs,
@@ -241,6 +259,7 @@ def _process_output_file(
                     output_data.metadata_size + fqn_data.offset_in_file,
                 )
 
+
 def _write_data(
     input_fs: fsspec.AbstractFileSystem,
     output_fs: fsspec.AbstractFileSystem,
@@ -250,11 +269,11 @@ def _write_data(
 ) -> None:
     """
     Write tensor data from input files to the output files.
-    
+
     This function reads tensor data from each input file and writes it to the appropriate
     position in the output files based on the tensor's offsets. When num_threads > 1,
     the work is split across threads with each thread handling a different output file.
-    
+
     Args:
         input_fs: Filesystem interface for input file operations
         output_fs: Filesystem interface for output file operations
@@ -265,13 +284,7 @@ def _write_data(
     if num_threads <= 1 or len(output_files_data) <= 1:
         # Sequential processing
         for output_file, output_data in output_files_data.items():
-            _process_output_file(
-                input_fs,
-                output_fs,
-                output_file,
-                output_data,
-                input_files_data
-            )
+            _process_output_file(input_fs, output_fs, output_file, output_data, input_files_data)
     else:
         # Parallel processing with ThreadPoolExecutor
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(num_threads, len(output_files_data))) as executor:
@@ -279,15 +292,10 @@ def _write_data(
             for output_file, output_data in output_files_data.items():
                 futures.append(
                     executor.submit(
-                        _process_output_file,
-                        input_fs,
-                        output_fs,
-                        output_file,
-                        output_data,
-                        input_files_data
+                        _process_output_file, input_fs, output_fs, output_file, output_data, input_files_data
                     )
                 )
-            
+
             # Wait for all futures to complete
             for future in concurrent.futures.as_completed(futures):
                 # Handle any exceptions that might have occurred
@@ -296,7 +304,8 @@ def _write_data(
                 except Exception as e:
                     print(f"Error processing output file: {e}")
                     raise
-                    
+
+
 def _write_row_wise_tensor(
     fs: fsspec.AbstractFileSystem,
     sub_tensor_bytes: bytearray,
@@ -310,10 +319,10 @@ def _write_row_wise_tensor(
 ):
     """
     Writes a row-wise sharded tensor to the output file.
-    
+
     This is an optimized path for tensors that are sharded along the first dimension,
     with all other dimensions being complete. This allows writing entire rows at once.
-    
+
     Args:
         fs: Filesystem interface for file operations
         sub_tensor_bytes: Byte array containing the sub-tensor data
@@ -350,6 +359,7 @@ def _write_row_wise_tensor(
         out_f.seek(first_byte_offset)
         out_f.write(shard_bytes)
 
+
 def _write_column_wise_tensor(
     fs: fsspec.AbstractFileSystem,
     sub_tensor_bytes: bytearray,
@@ -362,10 +372,10 @@ def _write_column_wise_tensor(
 ):
     """
     Writes a column-wise sharded 2D tensor to the output file.
-    
+
     This is an optimized path for 2D tensors that are sharded along the second dimension,
     with the first dimension being complete. This requires writing column by column.
-    
+
     Args:
         fs: Filesystem interface for file operations
         sub_tensor_bytes: Byte array containing the sub-tensor data
@@ -381,9 +391,9 @@ def _write_column_wise_tensor(
     # we write an entire row-slice in one I/O op rather than one element at a time.
 
     shard_cols = sub_tensor_shape[1]
-    first_col  = sub_tensor_offsets[1]
+    first_col = sub_tensor_offsets[1]
     row_size_bytes_full = tensor_shape[1] * element_size  # full-tensor row size
-    row_size_bytes_shard = shard_cols * element_size      # bytes we need to write per row
+    row_size_bytes_shard = shard_cols * element_size  # bytes we need to write per row
 
     with fs.open(output_file_path, "r+b") as out_f:
         for row_idx in range(sub_tensor_shape[0]):
@@ -394,9 +404,10 @@ def _write_column_wise_tensor(
             shard_row_byte_offset = row_idx * row_size_bytes_shard
 
             out_f.seek(full_row_byte_offset)
-            out_f.write(memoryview(sub_tensor_bytes)[
-                shard_row_byte_offset : shard_row_byte_offset + row_size_bytes_shard
-            ])
+            out_f.write(
+                memoryview(sub_tensor_bytes)[shard_row_byte_offset : shard_row_byte_offset + row_size_bytes_shard]
+            )
+
 
 def _write_element_by_element(
     fs: fsspec.AbstractFileSystem,
@@ -412,10 +423,10 @@ def _write_element_by_element(
 ):
     """
     Writes a sub-tensor to the output file using a general element-by-element approach.
-    
+
     This is a general approach that works for any sharding pattern, but is less efficient
     than the specialized approaches for row-wise or column-wise sharding.
-    
+
     Args:
         fs: Filesystem interface for file operations
         sub_tensor_bytes: Byte array containing the sub-tensor data
@@ -463,12 +474,11 @@ def _write_element_by_element(
             dst_byte_offset += output_start_byte + sub_tensor_offsets[-1] * element_size
 
             # View contiguous slice for the current row
-            row_slice = memoryview(sub_tensor_bytes)[
-                src_byte_offset : src_byte_offset + shard_inner_bytes
-            ]
+            row_slice = memoryview(sub_tensor_bytes)[src_byte_offset : src_byte_offset + shard_inner_bytes]
 
             out_f.seek(dst_byte_offset)
             out_f.write(row_slice)
+
 
 def _write_sub_tensor_to_file(
     fs: fsspec.AbstractFileSystem,
@@ -522,15 +532,14 @@ def _write_sub_tensor_to_file(
         if sub_tensor_shape[i] != tensor_shape[i]:
             is_row_wise = False
             break
-    
+
     # Check if this is a column-wise sharded 2D tensor
     # Column-wise sharding is detected when the first dimension is complete
     # and the second dimension is partial (only for 2D tensors)
     is_column_wise = False
     if len(tensor_shape) == 2:
-        is_column_wise = (sub_tensor_shape[0] == tensor_shape[0] and 
-                         sub_tensor_shape[1] < tensor_shape[1])
-    
+        is_column_wise = sub_tensor_shape[0] == tensor_shape[0] and sub_tensor_shape[1] < tensor_shape[1]
+
     # Call the appropriate function based on the sharding pattern
     if is_row_wise:
         _write_row_wise_tensor(
@@ -569,6 +578,7 @@ def _write_sub_tensor_to_file(
             output_start_byte,
         )
 
+
 def _write_overall_metadata_file(
     fs: fsspec.AbstractFileSystem,
     output_dir: str,
@@ -589,6 +599,7 @@ def _write_overall_metadata_file(
     with fs.open(metadata_path, "w") as metadata_file:
         json.dump(metadata_to_write, metadata_file, indent=2)
 
+
 def consolidate_safetensors_files(
     input_dir: str,
     output_dir: str,
@@ -597,7 +608,7 @@ def consolidate_safetensors_files(
 ) -> None:
     """
     Main function to consolidate sharded safetensors files into one or more output files.
-    
+
     This function orchestrates the entire consolidation process:
     1. Sets up the output file structure based on the fqn_to_index_mapping
     2. Finds all safetensors files in the input directory
@@ -605,7 +616,7 @@ def consolidate_safetensors_files(
     4. Writes metadata to the output files
     5. Writes tensor data from input files to output files
     6. Writes overall model.index.safetensors.json file with weight map
-    
+
     Args:
         input_dir: Directory containing sharded safetensors files
         output_dir: Directory where consolidated files will be written
@@ -618,9 +629,9 @@ def consolidate_safetensors_files(
     output_fs, _ = url_to_fs(output_dir)
 
     # Initialize the output file structure
-    output_files_data : dict[str, _OutputFileData] = {}
+    output_files_data: dict[str, _OutputFileData] = {}
     if fqn_to_index_mapping is not None:
-         # Create multiple output files based on the provided mapping
+        # Create multiple output files based on the provided mapping
         for fqn, index in fqn_to_index_mapping.items():
             # Generate names like "model-00001-of-00005.safetensors"
             file_name = _gen_file_name(index, max(fqn_to_index_mapping.values()))
@@ -635,7 +646,6 @@ def consolidate_safetensors_files(
         file_name = _gen_file_name(1, 1)
         output_path = f"{output_dir}/{file_name}"
         output_files_data[output_path] = _OutputFileData()
-       
 
     # Find all safetensors files in the input directory
     safetensors_files = []
@@ -644,12 +654,12 @@ def consolidate_safetensors_files(
             safetensors_files.append(file)
 
     # Read metadata from all input files
-    input_files_data : dict[str, _InputFileData]= {}
+    input_files_data: dict[str, _InputFileData] = {}
     for safetensor_file in safetensors_files:
         with input_fs.open(safetensor_file, "rb") as f:
             metadata, size = _get_safetensors_file_metadata(f)
             input_files_data[safetensor_file] = _InputFileData(metadata_size=size, metadata=metadata)
-    
+
     # Step 1: Parse metadata to determine tensor shapes and types
     _parse_input_metadata(input_files_data, output_files_data)
 

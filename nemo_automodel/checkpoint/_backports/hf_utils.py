@@ -1,3 +1,16 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import io
 import json
 import struct
@@ -54,17 +67,15 @@ class _HFStorageInfo:
 
 
 def _gen_file_name(index: int, largest_index: int, shard_index: Optional[int] = None) -> str:
-        if shard_index is not None:
-            return SHARDED_FILE_NAME.format(
+    if shard_index is not None:
+        return (
+            SHARDED_FILE_NAME.format(
                 shard_idx=f"{shard_index}".zfill(5), cpt_idx=f"{index}".zfill(5), num_files=f"{largest_index}".zfill(5)
-            ) + SUFFIX
-        else:
-            return (
-                FILE_NAME.format(
-                cpt_idx=f"{index}".zfill(5), num_files=f"{largest_index}".zfill(5)
-                )
-                + SUFFIX
             )
+            + SUFFIX
+        )
+    else:
+        return FILE_NAME.format(cpt_idx=f"{index}".zfill(5), num_files=f"{largest_index}".zfill(5)) + SUFFIX
 
 
 def _get_safetensors_file_metadata(file_bytes: io.IOBase) -> tuple[Any, int]:
@@ -88,6 +99,7 @@ def _get_dtype(dtype_str: str) -> torch.dtype:
         dtype = torch.get_default_dtype()
 
     return dtype
+
 
 def _get_dcp_custom_metadata(metadata: Any) -> Optional[Any]:
     if DEFAULT_EXTRA_METADATA_KEY in metadata:
