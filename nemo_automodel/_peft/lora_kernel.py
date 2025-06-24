@@ -31,6 +31,8 @@ except ImportError:
 if not HAVE_TRITON:
     triton = MagicMock()
     triton.jit = noop_decorator
+    triton.autotune = noop_decorator
+    triton.heuristics = noop_decorator
     tl = MagicMock()
 
 
