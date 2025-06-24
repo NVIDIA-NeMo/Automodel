@@ -15,11 +15,10 @@
 import signal
 import types
 from typing import Any, Optional
+import logging
 
 import torch
 import torch.distributed
-
-from nemo_automodel.utils.common_utils import get_world_size_safe, print_rank_0
 
 
 def get_device(local_rank: Optional[int] = None) -> torch.device:
@@ -80,7 +79,7 @@ def all_gather_item(
     if group is not None:
         group_size = group.size()
     else:
-        group_size = get_world_size_safe()
+        group_size = torch.distributed.get_world_size()
 
     tensor = torch.tensor([item], device=device, dtype=dtype)
     output_tensors = [torch.zeros(1, dtype=tensor.dtype, device=tensor.device) for _ in range(group_size)]
@@ -140,11 +139,11 @@ class DistributedSignalHandler:
         self.original_handler = signal.getsignal(self.sig)
 
         def handler(signum: int, frame: Optional[Any]) -> None:
-            print_rank_0(f"Received signal {signum}, initiating graceful stop")
+            logging.info("Received signal {}, initiating graceful stop".format(signum))
             self._signal_received = True
 
         signal.signal(self.sig, handler)
-        print_rank_0(f"Signal handler installed for {self.sig}")
+        logging.info("Signal handler installed for {}".format(self.sig))
 
         return self
 
