@@ -17,3 +17,7 @@ MISSING_QWEN_VL_UTILS_MSG = "qwen_vl_utils is not installed. Please install it w
 MISSING_CUT_CROSS_ENTROPY_MSG = (
     "cut_cross_entropy is not installed. Please install it with `pip install cut-cross-entropy`."
 )
+
+
+def noop_decorator(func):
+    return func

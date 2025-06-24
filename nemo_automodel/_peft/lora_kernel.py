@@ -12,20 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.utils.import_utils import MISSING_TRITON_MSG
+from nemo_automodel.utils.import_utils import MISSING_TRITON_MSG, noop_decorator
 import torch
+from packaging import version
+from unittest.mock import MagicMock
 
 try:
     import triton
     import triton.language as tl
 
-    HAVE_TRITON = True
+    if version.parse(triton.__version__) < version.parse("3.4.0") and not torch.cuda.is_available():
+        triton = MagicMock()
+        triton.jit = noop_decorator
+        tl = MagicMock()
+
+    HAVE_TRITON = version.parse(triton.__version__) >= version.parse("2.0.0")
 except ImportError:
-    from unittest.mock import MagicMock
-
-    def noop_decorator(func):
-        return func
-
     triton = MagicMock()
     triton.jit = noop_decorator
     tl = MagicMock()
