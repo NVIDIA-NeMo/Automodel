@@ -19,6 +19,6 @@ MISSING_CUT_CROSS_ENTROPY_MSG = (
 )
 
 
-def noop_decorator(func):
+def noop_decorator(func, *args, **kwargs):
     """A replacement for decorators that cannot be imported."""
     return func
