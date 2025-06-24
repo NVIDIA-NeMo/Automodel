@@ -1,5 +1,20 @@
-# taken and edited from https://github.com/pytorch/pytorch/blob/c13e725edd8dd21406c629bf625f2d6c59ceedd1/torch/distributed/checkpoint/default_planner.py # pylint: disable=line-too-long
-# pylint: disable=missing-class-docstring, missing-function-docstring
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# taken and edited from
+# https://github.com/pytorch/pytorch/blob/c13e725edd8dd21406c629bf625f2d6c59ceedd1/torch/distributed/checkpoint/default_planner.py
+# pylint: disable=missing-class-docstring, missing-function-docstring,line-too-long
 
 import dataclasses
 import io
@@ -111,15 +126,10 @@ class DefaultSavePlanner(SavePlanner):
 
         if self._enable_plan_caching:
             # If plans are equal, we can skip sending the plan to the coordinator.
-            if (
-                self._cached_plans_key in SavePlanner._cached_save_plan
-                and _compare_save_plans(
-                    plan, SavePlanner._cached_save_plan[self._cached_plans_key]
-                )
+            if self._cached_plans_key in SavePlanner._cached_save_plan and _compare_save_plans(
+                plan, SavePlanner._cached_save_plan[self._cached_plans_key]
             ):
-                logger.info(
-                    "No change in the local plan. Skipping sending the plan to the coordinator"
-                )
+                logger.info("No change in the local plan. Skipping sending the plan to the coordinator")
                 return SavePlan([], usable=False)
             else:
                 SavePlanner._cached_save_plan[self._cached_plans_key] = plan
@@ -129,9 +139,7 @@ class DefaultSavePlanner(SavePlanner):
     def _dedup_save_plans(self, all_plans: list[SavePlan]) -> list[SavePlan]:
         return dedup_save_plans(all_plans, self.dedup_save_to_lowest_rank)
 
-    def _create_global_plan(
-        self, all_plans: list[SavePlan]
-    ) -> tuple[list[SavePlan], Metadata]:
+    def _create_global_plan(self, all_plans: list[SavePlan]) -> tuple[list[SavePlan], Metadata]:
         deduped_plans = self._dedup_save_plans(all_plans)
 
         global_plan, metadata = create_default_global_save_plan(deduped_plans)
@@ -187,17 +195,13 @@ class DefaultSavePlanner(SavePlanner):
             # Updated plans will overwrite the cached plans. New global plan and metadata will be created and cached.
             # Global plan delta will be created by comparing the new global plan with the cached global plan.
             # Only the global plan delta (updated ones) will be sent to the coordinator to avoid the collective overhead.
-            merged_plans = _merge_delta_local_plans(
-                SavePlanner._cached_all_plans[self._cached_plans_key], all_plans
-            )
+            merged_plans = _merge_delta_local_plans(SavePlanner._cached_all_plans[self._cached_plans_key], all_plans)
             # Cache the updated local plans
             SavePlanner._cached_all_plans[self._cached_plans_key] = merged_plans
             global_plan, metadata = self._create_global_plan(merged_plans)
 
             if self._cached_plans_key in self._cached_global_plan:
-                for cached_plan, new_plan in zip(
-                    SavePlanner._cached_global_plan[self._cached_plans_key], global_plan
-                ):
+                for cached_plan, new_plan in zip(SavePlanner._cached_global_plan[self._cached_plans_key], global_plan):
                     if _compare_save_plans(cached_plan, new_plan):
                         global_plan_delta.append(SavePlan([], usable=False))
                     else:
@@ -209,9 +213,7 @@ class DefaultSavePlanner(SavePlanner):
 
         return global_plan_delta, global_plan, metadata
 
-    def create_global_plan(
-        self, all_plans: list[SavePlan]
-    ) -> tuple[list[SavePlan], Metadata]:
+    def create_global_plan(self, all_plans: list[SavePlan]) -> tuple[list[SavePlan], Metadata]:
         global_plan_delta: list[SavePlan] = []
         if self._enable_plan_caching:
             # If the plans are cached, we only need to send the global plan delta to be scattered
@@ -337,9 +339,7 @@ class DefaultLoadPlanner(LoadPlanner):
             missing_keys = load_keys - current_keys
             if missing_keys:
                 _version._derived_version = "2_3"
-                old_state_dict, old_mappings = flatten_state_dict(
-                    self.original_state_dict
-                )
+                old_state_dict, old_mappings = flatten_state_dict(self.original_state_dict)
                 old_keys = set(old_state_dict.keys())
                 if old_keys & missing_keys:
                     self.state_dict, self.mappings = old_state_dict, old_mappings
@@ -347,9 +347,7 @@ class DefaultLoadPlanner(LoadPlanner):
                 # Set it back to None so that later we can save to a new version.
                 _version._derived_version = None
 
-        return create_default_local_load_plan(
-            self.state_dict, self.metadata, not self.allow_partial_load
-        )
+        return create_default_local_load_plan(self.state_dict, self.metadata, not self.allow_partial_load)
 
     def create_global_plan(self, global_plan: list[LoadPlan]) -> list[LoadPlan]:
         return create_default_global_load_plan(global_plan)
@@ -365,9 +363,7 @@ class DefaultLoadPlanner(LoadPlanner):
                 torch.load(value, weights_only=False),
             )
         else:
-            self.state_dict[read_item.dest_index.fqn] = torch.load(
-                value, weights_only=False
-            )
+            self.state_dict[read_item.dest_index.fqn] = torch.load(value, weights_only=False)
 
     def resolve_tensor(self, read_item: ReadItem):
         tensor = self.lookup_tensor(read_item.dest_index)
@@ -414,9 +410,7 @@ class _EmptyStateDictLoadPlanner(DefaultLoadPlanner):
         planner_data = metadata.planner_data.get(key)
         for unflattened_key in planner_data:
             if unflattened_keys:
-                unflattened_keys.append(
-                    ".".join([unflattened_keys[-1], str(unflattened_key)])
-                )
+                unflattened_keys.append(".".join([unflattened_keys[-1], str(unflattened_key)]))
 
             else:
                 unflattened_keys.append(unflattened_key)
@@ -450,9 +444,7 @@ class _EmptyStateDictLoadPlanner(DefaultLoadPlanner):
         super().set_up_planner(state_dict, metadata, is_coordinator)
 
 
-def create_default_local_load_plan(
-    state_dict: dict[str, Any], metadata: Metadata, strict: bool = True
-) -> LoadPlan:
+def create_default_local_load_plan(state_dict: dict[str, Any], metadata: Metadata, strict: bool = True) -> LoadPlan:
     requests = []
     """
     Create the ``LoadPlan`` used by DefaultLoadPlanner.
@@ -473,11 +465,7 @@ def create_default_local_load_plan(
                 continue
 
         md = metadata.state_dict_metadata[fqn]
-        if (
-            isinstance(md, TensorStorageMetadata)
-            and getattr(obj, "size", None) is not None
-            and md.size != obj.size()
-        ):
+        if isinstance(md, TensorStorageMetadata) and getattr(obj, "size", None) is not None and md.size != obj.size():
             raise ValueError(
                 f"Size mismatch between saved {md.size} and current: {obj.size()} for {fqn}",
             )
@@ -504,9 +492,7 @@ def create_default_global_load_plan(
     return all_plans
 
 
-def create_default_local_save_plan(
-    state_dict: dict[str, Any], is_coordinator: bool
-) -> SavePlan:
+def create_default_local_save_plan(state_dict: dict[str, Any], is_coordinator: bool) -> SavePlan:
     """
     Create the ``SavePlan`` used by DefaultSavePlanner.
 
@@ -569,9 +555,7 @@ def create_default_global_save_plan(
                 )
                 new_item = item
                 if rewrite_index_hints:
-                    new_index = dataclasses.replace(
-                        item.index, index=len(tensor_md.chunks)
-                    )
+                    new_index = dataclasses.replace(item.index, index=len(tensor_md.chunks))
                     new_item = dataclasses.replace(item, index=new_index)
                 new_items.append(new_item)
 
@@ -607,9 +591,7 @@ def _check_box_overlap(box0: ChunkStorageMetadata, box1: ChunkStorageMetadata) -
     return True
 
 
-def _check_box_bounds(
-    outer_box_size: torch.Size, inner_box: ChunkStorageMetadata
-) -> bool:
+def _check_box_bounds(outer_box_size: torch.Size, inner_box: ChunkStorageMetadata) -> bool:
     for i in range(len(outer_box_size)):
         if inner_box.offsets[i] < 0:
             return False
@@ -647,9 +629,7 @@ def _validate_global_plan(global_plan: list[SavePlan], metadata: Metadata) -> bo
             # Check for overlap
             for chunk1 in value.chunks[chunk_idx + 1 :]:
                 if _check_box_overlap(chunk0, chunk1):
-                    logger.warning(
-                        "key:%s has overlapping chunks: %s %s", key, chunk0, chunk1
-                    )
+                    logger.warning("key:%s has overlapping chunks: %s %s", key, chunk0, chunk1)
                     all_good = False
 
         # Check whether combined chunk cover the whole tensor

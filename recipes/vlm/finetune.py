@@ -1,3 +1,17 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 from typing import Any, Dict
@@ -14,6 +28,7 @@ from wandb import Settings
 
 try:
     from nvfsdp import nvFSDP
+
     HAVE_NVFSDP = True
 except:
     HAVE_NVFSDP = False
@@ -96,8 +111,7 @@ def build_model(device, cfg_model, cfg_freeze, cfg_peft, model_wrapper, seed) ->
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id):
-    """Build a checkpoint configuration.
-    """
+    """Build a checkpoint configuration."""
     from transformers.utils import TRANSFORMERS_CACHE
 
     ckpt_kwargs = dict(
@@ -149,9 +163,7 @@ def build_loss_fn(device, cfg_loss):
         return cfg_loss.instantiate().to(device)
 
 
-def build_dataloader(
-    cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed
-) -> DataLoader:
+def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed) -> DataLoader:
     """Build a distributed dataloader.
 
     Args:
@@ -175,15 +187,14 @@ def build_dataloader(
 
     with StatefulRNG(seed=seed, ranked=True):
         if hasattr(cfg_ds, "_target_") and "vlm" in cfg_ds._target_:
-            processor = AutoProcessor.from_pretrained(
-                cfg_model.pretrained_model_name_or_path
-            )
+            processor = AutoProcessor.from_pretrained(cfg_model.pretrained_model_name_or_path)
 
         ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
 
         sampler = torch.utils.data.distributed.DistributedSampler(
-                ds, **dist_sampler_kwargs,
-            )
+            ds,
+            **dist_sampler_kwargs,
+        )
         collate_cfg = cfg_dl.get("collate_fn", None)
         if collate_cfg:
             collate_fn = lambda examples: collate_cfg.instantiate(examples=examples, processor=processor)
@@ -192,14 +203,10 @@ def build_dataloader(
             processor_type = type(processor).__name__
             if processor_type not in COLLATE_FNS:
                 processor_type = "default"
-                logging.warning(
-                    f"You are using {processor_type} with default collate function."
-                )
+                logging.warning(f"You are using {processor_type} with default collate function.")
             collate_fn = lambda examples: COLLATE_FNS[processor_type](examples, processor)
 
-        return cfg_dl.instantiate(
-            dataset=ds, sampler=sampler, collate_fn=collate_fn
-        )
+        return cfg_dl.instantiate(dataset=ds, sampler=sampler, collate_fn=collate_fn)
 
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
@@ -242,10 +249,10 @@ def build_wandb(cfg):
     """Instantiates wandb and returns the instance.
     If no name is given, it will use the model name
     """
-    assert cfg.get('wandb', None) is not None
+    assert cfg.get("wandb", None) is not None
     kwargs = cfg.wandb.to_dict()
-    if kwargs.get('name', "") == "":
-        kwargs["name"] = '_'.join(cfg.get("model.pretrained_model_name_or_path").split('/')[-2:])
+    if kwargs.get("name", "") == "":
+        kwargs["name"] = "_".join(cfg.get("model.pretrained_model_name_or_path").split("/")[-2:])
     run = wandb.init(
         **kwargs,
         config=cfg,
@@ -290,9 +297,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.device_mesh = None
         self.model_wrapper = None
         if "distributed" in self.cfg:
-            self.model_wrapper = self.cfg.distributed.instantiate(
-                world_size=self.dist_env.world_size
-            )
+            self.model_wrapper = self.cfg.distributed.instantiate(world_size=self.dist_env.world_size)
             self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
@@ -341,9 +346,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.forward_data_store = []
 
         # Scheduler
-        self.step_scheduler = build_step_scheduler(
-            self.cfg.get("step_scheduler", None), self.dataloader
-        )
+        self.step_scheduler = build_step_scheduler(self.cfg.get("step_scheduler", None), self.dataloader)
 
         # Build checkpointing config
         restore_from = self.cfg.get("checkpoint.restore_from", None)
@@ -390,9 +393,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         """
         self.model.train()
 
-        batch = {
-            k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()
-        }
+        batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
         labels = batch.pop("labels")
         loss_mask = batch.pop("loss_mask", None)
         if loss_mask is None:
@@ -402,18 +403,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # If 'position_ids' does not exist in batch already then override it. batch in case of Packed sequence
         # contains 'position_ids' and we don't want to override it.
         if "position_ids" not in batch and (
-            self.device_mesh["context_parallel"].size() > 1
-            or self.device_mesh["tensor_parallel"].size() > 1
+            self.device_mesh["context_parallel"].size() > 1 or self.device_mesh["tensor_parallel"].size() > 1
         ):
-            batch["position_ids"] = (
-                torch.arange(0, batch["input_ids"].shape[1])
-                .unsqueeze(0)
-                .to(self.model.device)
-            )
+            batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
 
         # based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/train.py#L336
         if self.device_mesh["context_parallel"].size() > 1:
-
             input_ids = batch["input_ids"].to(self.model.device)
             position_ids = batch["position_ids"].to(self.model.device)
 
@@ -446,9 +441,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 n_cls = logits.shape[-1]
                 logits = logits.view(-1, n_cls)
                 labels = labels.view(-1)
-                assert (
-                    logits.shape[-2] == labels.shape[-1]
-                ), "Expected logits & labels to have the same length"
+                assert logits.shape[-2] == labels.shape[-1], "Expected logits & labels to have the same length"
                 local_loss = self.loss_fn(logits, labels, loss_mask)
 
             # In the case where all labels are masked, the loss should be 0.
@@ -479,13 +472,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 self.device_mesh[
                     (
                         "dp_cp"
-                        if "dp_cp"
-                        in _mesh_resources.root_to_flatten_mapping.get(
-                            self.device_mesh, {}
-                        )
+                        if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(self.device_mesh, {})
                         else "data_parallel"
                     )
-                ].get_group() if self.device_mesh is not None else None,
+                ].get_group()
+                if self.device_mesh is not None
+                else None,
             )
 
             # Clip gradients **after** any rescaling.
@@ -534,27 +526,20 @@ class FinetuneRecipeForVLM(BaseRecipe):
             total_tokens = 0
 
             for batch in self.val_dataloader:
-                batch = {
-                    k: v.to(self.dist_env.device, non_blocking=True)
-                    for k, v in batch.items()
-                }
+                batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
                 labels = batch.pop("labels")
                 loss_mask = batch.pop("loss_mask", None)
                 if loss_mask is None:
                     loss_mask = (labels.detach() != -100).to(torch.int)
 
                 if "position_ids" not in batch and (
-                    self.device_mesh["context_parallel"].size() > 1
-                    or self.device_mesh["tensor_parallel"].size() > 1
+                    self.device_mesh["context_parallel"].size() > 1 or self.device_mesh["tensor_parallel"].size() > 1
                 ):
                     batch["position_ids"] = (
-                        torch.arange(0, batch["input_ids"].shape[1])
-                        .unsqueeze(0)
-                        .to(self.model.device)
+                        torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
                     )
 
                 if self.device_mesh["context_parallel"].size() > 1:
-
                     input_ids = batch["input_ids"].to(self.model.device)
                     position_ids = batch["position_ids"].to(self.model.device)
 
@@ -585,9 +570,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         n_cls = logits.shape[-1]
                         logits = logits.view(-1, n_cls)
                         labels = labels.view(-1)
-                        assert (
-                            logits.shape[-2] == labels.shape[-1]
-                        ), "Expected logits & labels to have the same length"
+                        assert logits.shape[-2] == labels.shape[-1], "Expected logits & labels to have the same length"
                         local_loss = self.loss_fn(logits, labels, loss_mask)
 
                     # In the case where all labels are masked, the loss should be 0.
@@ -607,9 +590,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         # Aggregate across ranks if distributed is initialized
         if dist.is_initialized():
-            tensor = torch.tensor(
-                [total_loss, total_tokens], device=self.dist_env.device
-            )
+            tensor = torch.tensor([total_loss, total_tokens], device=self.dist_env.device)
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
             total_loss, total_tokens = tensor.tolist()
 
@@ -650,9 +631,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             dp_group=dp_group,
         )
         reporting_loss = (total_loss / total_num_tokens).item()
-        grad_norm = (
-            grad_norm.item() if not isinstance(grad_norm, float) else grad_norm
-        )  # TP WAR
+        grad_norm = grad_norm.item() if not isinstance(grad_norm, float) else grad_norm  # TP WAR
         self.total_num_tokens.zero_()
         self.forward_data_store = []
         log_data = {

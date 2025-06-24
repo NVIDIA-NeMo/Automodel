@@ -11,21 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# taken from
-# https://github.com/pytorch/pytorch/blob/c13e725edd8dd21406c629bf625f2d6c59ceedd1/torch/distributed/checkpoint/planner_helpers.py
 
-from torch.distributed.checkpoint.planner import SavePlan
+name: Copyright check
 
+on:
+  pull_request:
 
-def _contains_usable_plan(delta_plans: list[SavePlan]) -> bool:
-    """
-    Check if any delta plan is usable, indicating the plan has changed.
-
-    Args:
-        delta_plans (List[SavePlan]): A list of delta plans to check.
-
-    Returns:
-        True if any delta plan is usable, False otherwise.
-    """
-    return any(delta_plan and delta_plan.usable for delta_plan in delta_plans)
+jobs:
+  copyright-check:
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_copyright_check.yml@v0.2.0

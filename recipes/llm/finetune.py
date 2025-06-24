@@ -1,3 +1,17 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import pathlib
@@ -15,6 +29,7 @@ from wandb import Settings
 
 try:
     from nvfsdp import nvFSDP
+
     HAVE_NVFSDP = True
 except:
     HAVE_NVFSDP = False
@@ -49,6 +64,7 @@ logger = logging.getLogger(__name__)
 #  Stateless helper functions
 # ---------------------------
 
+
 def build_model(device, cfg_model, use_hf_fa2, cfg_peft, model_wrapper, seed) -> nn.Module:
     """Build and initialize a model.
 
@@ -67,10 +83,11 @@ def build_model(device, cfg_model, use_hf_fa2, cfg_peft, model_wrapper, seed) ->
     with StatefulRNG(seed=seed, ranked=True):
         kwargs = {}
         if use_hf_fa2:
-            kwargs['attn_implementation'] = "flash_attention_2"
+            kwargs["attn_implementation"] = "flash_attention_2"
             logger.warning(
                 "Packed sequence is supported only with Flash Attention. "
-                "Setting model's attn_implementation to flash_attention_2")
+                "Setting model's attn_implementation to flash_attention_2"
+            )
         model = cfg_model.instantiate(**kwargs)
         for m in model.modules():
             if isinstance(m, nn.Embedding):
@@ -78,10 +95,10 @@ def build_model(device, cfg_model, use_hf_fa2, cfg_peft, model_wrapper, seed) ->
         # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
         if cfg_peft is not None:
             opts = cfg_peft.to_dict()
-            peft_fn = opts.pop('peft_fn')
+            peft_fn = opts.pop("peft_fn")
             peft_fn(model, **opts)
 
-        if callable(getattr(model_wrapper, 'parallelize', None)):
+        if callable(getattr(model_wrapper, "parallelize", None)):
             model = model_wrapper.parallelize(model)
 
             # FSDP2 and nvFSDP should already be on the correct device
@@ -91,8 +108,7 @@ def build_model(device, cfg_model, use_hf_fa2, cfg_peft, model_wrapper, seed) ->
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
-    """Build a checkpoint configuration.
-    """
+    """Build a checkpoint configuration."""
     from transformers.utils import TRANSFORMERS_CACHE
 
     ckpt_kwargs = dict(
@@ -106,11 +122,12 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
     )
     if cfg_ckpt is not None:
         cfg_ckpt = cfg_ckpt.to_dict()
-        cfg_ckpt.pop('restore_from', None)
+        cfg_ckpt.pop("restore_from", None)
         ckpt_kwargs |= cfg_ckpt
     return CheckpointingConfig(**ckpt_kwargs)
 
-def build_optimizer(cfg_opt, model, tp_size) -> 'Optimizer':  # noqa: F821
+
+def build_optimizer(cfg_opt, model, tp_size) -> "Optimizer":  # noqa: F821
     """Build an optimizer for the model.
 
     Args:
@@ -127,6 +144,7 @@ def build_optimizer(cfg_opt, model, tp_size) -> 'Optimizer':  # noqa: F821
         # TP does not support foreach
         cfg_opt.foreach = False
     return cfg_opt.instantiate(params=trainable_params)
+
 
 def build_loss_fn(device, cfg_loss):
     """Build a loss function.
@@ -164,9 +182,9 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_ps, device_mesh, seed) -> Da
             "num_replicas": device_mesh["data_parallel"].size(),
             "rank": device_mesh["data_parallel"].get_local_rank(),
         }
-    if 'tokenizer' not in cfg_ds:
+    if "tokenizer" not in cfg_ds:
         tokenizer = AutoTokenizer.from_pretrained(cfg_model.pretrained_model_name_or_path)
-    elif '_target_' not in cfg_ds.tokenizer:
+    elif "_target_" not in cfg_ds.tokenizer:
         tokenizer = AutoTokenizer.from_pretrained(**cfg_ds.tokenizer.to_dict())
     else:
         tokenizer = cfg_ds.tokenizer.instantiate()
@@ -174,14 +192,14 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_ps, device_mesh, seed) -> Da
     with StatefulRNG(seed=seed, ranked=True):
         ds = cfg_ds.instantiate(tokenizer=tokenizer)
         # Apply packing if configured
-        if getattr(cfg_ps, 'packed_sequence_size', 0) > 0:
+        if getattr(cfg_ps, "packed_sequence_size", 0) > 0:
             logger.info(f"Packing dataset with size: {cfg_ps.packed_sequence_size}")
             ds = PackedSequence(
                 ds,
                 split=cfg_ds.split,  # Assumes split is defined in dataset config
                 packed_sequence_size=cfg_ps.packed_sequence_size,
-                split_across_pack=getattr(cfg_ps, 'split_across_pack', False),
-                max_packs=getattr(cfg_ps, 'max_packs', None)
+                split_across_pack=getattr(cfg_ps, "split_across_pack", False),
+                max_packs=getattr(cfg_ps, "max_packs", None),
             ).pack()
 
         sampler = StatefulDistributedSampler(
@@ -193,7 +211,7 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_ps, device_mesh, seed) -> Da
         return cfg_dl.instantiate(dataset=ds, sampler=sampler)
 
 
-def build_distributed(cfg_dist: Dict[str, Any]) -> 'DistInfo':  # noqa: F821
+def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
     """Build and initialize distributed training resources.
 
     Args:
@@ -206,6 +224,7 @@ def build_distributed(cfg_dist: Dict[str, Any]) -> 'DistInfo':  # noqa: F821
     timeout = cfg_dist.get("timeout_minutes", 1)
     return initialize_distributed(backend=backend, timeout_minutes=timeout)
 
+
 def build_step_scheduler(cfg, dataloader):
     """Build the step scheduler.
 
@@ -216,25 +235,26 @@ def build_step_scheduler(cfg, dataloader):
     Returns:
         StepScheduler: the configured StepScheduler.
     """
-    assert '_target_' not in cfg, "_target_ not permitted in step scheduler"
+    assert "_target_" not in cfg, "_target_ not permitted in step scheduler"
     default_kwargs = dict(
-        num_epochs = 10,
-        grad_acc_steps = 10,
-        ckpt_every_steps = 100,
-        dataloader = dataloader,
+        num_epochs=10,
+        grad_acc_steps=10,
+        ckpt_every_steps=100,
+        dataloader=dataloader,
     )
     if cfg is not None:
         default_kwargs |= cfg.to_dict()
     return StepScheduler(**default_kwargs)
 
+
 def build_wandb(cfg):
     """Instantiates wandb and returns the instance.
     If no name is given, it will use the model name
     """
-    assert cfg.get('wandb', None) is not None
+    assert cfg.get("wandb", None) is not None
     kwargs = cfg.wandb.to_dict()
-    if kwargs.get('name', "") == "":
-        kwargs["name"] = '_'.join(cfg.get("model.pretrained_model_name_or_path").split('/')[-2:])
+    if kwargs.get("name", "") == "":
+        kwargs["name"] = "_".join(cfg.get("model.pretrained_model_name_or_path").split("/")[-2:])
     run = wandb.init(
         **kwargs,
         config=cfg,
@@ -242,15 +262,18 @@ def build_wandb(cfg):
     )
     return run
 
+
 # ---------------------------------------------------------------------------
 #  Trainer class – orchestration only
 # ---------------------------------------------------------------------------
+
 
 class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
     """Recipe for fine-tuning a model for next-token prediction.
 
     This class orchestrates training, from setup to main training loop.
     """
+
     def __init__(self, cfg):
         """Initialize the recipe with configuration.
 
@@ -276,23 +299,23 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.device_mesh = None
         self.model_wrapper = None
         if "distributed" in self.cfg:
-            self.model_wrapper = self.cfg.distributed.instantiate(
-                world_size=self.dist_env.world_size
-            )
+            self.model_wrapper = self.cfg.distributed.instantiate(world_size=self.dist_env.world_size)
             self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
 
-        if self.dist_env.is_main and hasattr(self.cfg, 'wandb'):
+        if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
             run = build_wandb(self.cfg)
             logging.info("🚀 View run at {}".format(run.url))
 
         # Check if packed_sequence_size > 0 and use HF's flash_attention_2 for attn implementation.
-        use_hf_fa2 = self.cfg.get('packed_sequence.packed_sequence_size', 0) > 0
+        use_hf_fa2 = self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
 
         # Build components
         self.model = build_model(
-            self.dist_env.device, self.cfg.model, use_hf_fa2,
-            self.cfg.get('peft', None),
+            self.dist_env.device,
+            self.cfg.model,
+            use_hf_fa2,
+            self.cfg.get("peft", None),
             self.model_wrapper,
             seed=self.cfg.get("seed", 42),
         )
@@ -301,7 +324,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.model,
             self.cfg.get("distributed.tp_size", 1),
         )
-        self.loss_fn   = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
+        self.loss_fn = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
         self.dataloader = build_dataloader(
             self.cfg.dataset,
             self.cfg.dataloader,
@@ -313,14 +336,14 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Build validation dataloader if the config provides it
         self.val_dataloader = None
-        if 'validation_dataset' in self.cfg:
+        if "validation_dataset" in self.cfg:
             # For validation, do not use packed sequences for fair comparison with baseline
 
             self.val_dataloader = build_dataloader(
                 self.cfg.validation_dataset,
                 self.cfg.validation_dataloader,
                 self.cfg.model,
-                cfg_ps=None, # Use unpacked config for validation
+                cfg_ps=None,  # Use unpacked config for validation
                 device_mesh=self.device_mesh,
                 seed=self.cfg.get("seed", 42),
             )
@@ -330,15 +353,15 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.forward_data_store = []
 
         # Scheduler
-        self.step_scheduler = build_step_scheduler(self.cfg.get('step_scheduler', None), self.dataloader)
+        self.step_scheduler = build_step_scheduler(self.cfg.get("step_scheduler", None), self.dataloader)
 
         # Build checkpointing config
-        restore_from = self.cfg.get('checkpoint.restore_from', None)
+        restore_from = self.cfg.get("checkpoint.restore_from", None)
         self.checkpoint_config = build_checkpoint_config(
-            self.cfg.get('checkpoint', None),
-            self.cfg.get('model.cache_dir', None),
+            self.cfg.get("checkpoint", None),
+            self.cfg.get("model.cache_dir", None),
             self.cfg.model.pretrained_model_name_or_path,
-            True if self.cfg.get('peft', None) else False,
+            True if self.cfg.get("peft", None) else False,
         )
 
         # Set up the stateful random number generator
@@ -388,17 +411,14 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # If 'position_ids' does not exist in batch already then override it. batch in case of Packed sequence
         # contains 'position_ids' and we don't want to override it.
         if (
-            'position_ids' not in batch and self.device_mesh is not None and
-            (
-                self.device_mesh["context_parallel"].size() > 1 or
-                self.device_mesh["tensor_parallel"].size() > 1
-            )
+            "position_ids" not in batch
+            and self.device_mesh is not None
+            and (self.device_mesh["context_parallel"].size() > 1 or self.device_mesh["tensor_parallel"].size() > 1)
         ):
-            batch["position_ids"] = torch.arange(0, batch['input_ids'].shape[1]).unsqueeze(0).to(self.model.device)
+            batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
 
         # based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/train.py#L336
         if self.device_mesh and self.device_mesh["context_parallel"].size() > 1:
-
             input_ids = batch["input_ids"].to(self.model.device)
             position_ids = batch["position_ids"].to(self.model.device)
 
@@ -426,22 +446,16 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             with train_context(context_parallel_ctx):
                 out = self.model(**batch)
                 local_loss = self.loss_fn(
-                    out.logits.view(-1, out.logits.size(-1)),
-                    labels.view(-1),
-                    mask=loss_mask,
-                    reduction="sum"
+                    out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum"
                 )
             # In the case where all labels are masked, the loss should be 0.
             if loss_mask is not None and loss_mask.bool().sum() == 0:
                 local_loss.detach().copy_(torch.zeros_like(local_loss))
 
         else:
-            out  = self.model(**batch)
+            out = self.model(**batch)
             local_loss = self.loss_fn(
-                out.logits.view(-1, out.logits.size(-1)),
-                labels.view(-1),
-                mask=loss_mask,
-                reduction="sum"
+                out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum"
             )
 
         local_num_tokens = loss_mask.sum().detach().to(torch.int)
@@ -456,11 +470,15 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             rescale_gradients(
                 self.model,
                 self.total_num_tokens,
-                self.device_mesh[(
-                    "dp_cp"
-                    if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(self.device_mesh, {})
-                    else "data_parallel"
-                )].get_group() if self.device_mesh is not None else None,
+                self.device_mesh[
+                    (
+                        "dp_cp"
+                        if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(self.device_mesh, {})
+                        else "data_parallel"
+                    )
+                ].get_group()
+                if self.device_mesh is not None
+                else None,
             )
 
             # Clip gradients **after** any rescaling.
@@ -469,7 +487,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 grad_norm = clip_gradients(self.model, clip_norm)
             else:
                 # TODO: TP WAR
-                grad_norm = 0.
+                grad_norm = 0.0
 
             if HAVE_NVFSDP and isinstance(self.model, nvFSDP):
                 # If the model uses nvFSDP, wait for all sharded gradients to be reduced and unsharded.
@@ -489,13 +507,16 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             # log
             reporting_loss = self.log_train_metrics(grad_norm)
-            logging.info("step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | mem: {:.2f} GiB".format(
-                    self.step_scheduler.step, self.step_scheduler.epoch, reporting_loss, grad_norm,
-                    torch.cuda.max_memory_allocated() / 1024 ** 3
+            logging.info(
+                "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | mem: {:.2f} GiB".format(
+                    self.step_scheduler.step,
+                    self.step_scheduler.epoch,
+                    reporting_loss,
+                    grad_norm,
+                    torch.cuda.max_memory_allocated() / 1024**3,
                 )
             )
             torch.cuda.reset_peak_memory_stats()
-
 
     @torch.no_grad()
     def _run_validation_epoch(self) -> float:
@@ -514,17 +535,18 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     loss_mask = (labels.detach() != -100).to(torch.int)
 
                 if (
-                    self.device_mesh and 'position_ids' not in batch and
-                    (
-                        self.device_mesh["context_parallel"].size() > 1 or
-                        self.device_mesh["tensor_parallel"].size() > 1
+                    self.device_mesh
+                    and "position_ids" not in batch
+                    and (
+                        self.device_mesh["context_parallel"].size() > 1
+                        or self.device_mesh["tensor_parallel"].size() > 1
                     )
                 ):
-                    batch["position_ids"] = torch.arange(
-                        0, batch['input_ids'].shape[1]).unsqueeze(0).to(self.model.device)
+                    batch["position_ids"] = (
+                        torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
+                    )
 
                 if self.device_mesh and self.device_mesh["context_parallel"].size() > 1:
-
                     input_ids = batch["input_ids"].to(self.model.device)
                     position_ids = batch["position_ids"].to(self.model.device)
 
@@ -552,10 +574,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     with train_context(context_parallel_ctx):
                         out = self.model(**batch)
                         local_loss = self.loss_fn(
-                            out.logits.view(-1, out.logits.size(-1)),
-                            labels.view(-1),
-                            mask=loss_mask,
-                            reduction="sum"
+                            out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum"
                         )
 
                     # In the case where all labels are masked, the loss should be 0.
@@ -564,10 +583,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 else:
                     out = self.model(**batch)
                     local_loss = self.loss_fn(
-                        out.logits.view(-1, out.logits.size(-1)),
-                        labels.view(-1),
-                        mask=loss_mask,
-                        reduction="sum"
+                        out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum"
                     )
 
                 total_loss += local_loss.item()
@@ -582,14 +598,9 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         val_loss = total_loss / max(total_tokens, 1e-8)
         if self.dist_env.is_main:
             if wandb.run is not None:
-                wandb.log(
-                    {
-                        "val_loss": val_loss,
-                        "step": self.step_scheduler.step,
-                        "epoch": self.step_scheduler.epoch
-                    }
-                )
-        logging.info("[val] step {} | epoch {} | loss {:.4f}".format(
+                wandb.log({"val_loss": val_loss, "step": self.step_scheduler.step, "epoch": self.step_scheduler.epoch})
+        logging.info(
+            "[val] step {} | epoch {} | loss {:.4f}".format(
                 self.step_scheduler.step, self.step_scheduler.epoch, val_loss
             )
         )
@@ -614,7 +625,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.forward_data_store, self.total_num_tokens, per_token_loss=True, dp_group=dp_group
         )
         reporting_loss = (total_loss / total_num_tokens).item()
-        grad_norm = grad_norm.item() if not isinstance(grad_norm, float) else grad_norm # TP WAR
+        grad_norm = grad_norm.item() if not isinstance(grad_norm, float) else grad_norm  # TP WAR
         self.total_num_tokens.zero_()
         self.forward_data_store = []
         log_data = {
@@ -626,15 +637,17 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             "num_tokens_per_step": total_num_tokens,
         }
         if self.optimizer.param_groups:
-            log_data["learning_rate"] = self.optimizer.param_groups[0]['lr']
+            log_data["learning_rate"] = self.optimizer.param_groups[0]["lr"]
 
         if wandb.run is not None:
             wandb.log(log_data)
         return reporting_loss
 
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
 
 def main():
     """Main entry point for the fine-tuning recipe.
@@ -646,6 +659,7 @@ def main():
     trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
+
 
 if __name__ == "__main__":
     main()
