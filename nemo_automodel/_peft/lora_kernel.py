@@ -25,8 +25,9 @@ try:
         triton = MagicMock()
         triton.jit = noop_decorator
         tl = MagicMock()
-
-    HAVE_TRITON = version.parse(triton.__version__) >= version.parse("2.0.0")
+        HAVE_TRITON = False
+    else:
+        HAVE_TRITON = version.parse(triton.__version__) >= version.parse("2.0.0")
 except ImportError:
     triton = MagicMock()
     triton.jit = noop_decorator
