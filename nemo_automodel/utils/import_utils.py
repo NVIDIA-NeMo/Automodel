@@ -13,3 +13,4 @@
 # limitations under the License.
 
 MISSING_TRITON_MSG = "triton is not installed. Please install it with `pip install triton`."
+MISSING_QWEN_VL_UTILS_MSG = "qwen_vl_utils is not installed. Please install it with `pip install qwen-vl-utils`."
