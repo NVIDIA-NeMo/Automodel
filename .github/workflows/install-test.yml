@@ -30,7 +30,20 @@ jobs:
 
       - name: Install project
         run: |
-          pip install ".[vlm]"
+          pip install "."
+
+      - name: Checkout check-imports
+        uses: actions/checkout@v4
+        with:
+          repository: NVIDIA-NeMo/FW-CI-templates
+          ref: v0.39.0
+          path: FW-CI-templates
+
+      - name: Check imports for nemo_automodel
+        uses: ./FW-CI-templates/.github/actions/check-imports
+        with:
+          package-name: nemo_automodel
+          python-binary: python
 
   ngc-cuda-test:
     runs-on: linux-amd64-cpu16
@@ -87,7 +100,20 @@ jobs:
 
           export PATH="./bin/:$PATH"
 
-          pip install ".[vlm]"
+          pip install "."
+
+      - name: Checkout check-imports
+        uses: actions/checkout@v4
+        with:
+          repository: NVIDIA-NeMo/FW-CI-templates
+          ref: v0.39.0
+          path: FW-CI-templates
+
+      - name: Check imports for nemo_automodel
+        uses: ./FW-CI-templates/.github/actions/check-imports
+        with:
+          package-name: nemo_automodel
+          python-binary: ./venv/bin/python
 
   uv-test:
     runs-on: ${{ matrix.arch }}
@@ -120,6 +146,19 @@ jobs:
           uv venv ${UV_PROJECT_ENVIRONMENT}
 
           uv sync --link-mode copy --locked --all-groups
+
+      - name: Checkout check-imports
+        uses: actions/checkout@v4
+        with:
+          repository: NVIDIA-NeMo/FW-CI-templates
+          ref: v0.39.0
+          path: FW-CI-templates
+
+      - name: Check imports for nemo_automodel
+        uses: ./FW-CI-templates/.github/actions/check-imports
+        with:
+          package-name: nemo_automodel
+          python-binary: ./venv/bin/python
 
   install-test-summary:
     needs: [pip-test, uv-test, ngc-cuda-test]
