@@ -322,7 +322,7 @@ def da_dx_autotune_configs():
 
 
 @triton.autotune(
-    configs=da_dx_autotune_configs(),
+    configs=da_dx_autotune_configs() if HAVE_TRITON else list(),
     key=["N", "K", "L"],
 )
 @triton.heuristics(values={"BLOCK_SIZE_N": lambda args: max(triton.next_power_of_2(args["N"]), 16)})
