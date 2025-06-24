@@ -22,17 +22,16 @@ try:
     import triton.language as tl
 
     if version.parse(triton.__version__) < version.parse("3.4.0") and not torch.cuda.is_available():
-        triton = MagicMock()
-        triton.jit = noop_decorator
-        tl = MagicMock()
         HAVE_TRITON = False
     else:
         HAVE_TRITON = version.parse(triton.__version__) >= version.parse("2.0.0")
 except ImportError:
+    HAVE_TRITON = False
+
+if not HAVE_TRITON:
     triton = MagicMock()
     triton.jit = noop_decorator
     tl = MagicMock()
-    HAVE_TRITON = False
 
 
 def forward_autotune_configs():
