@@ -221,26 +221,6 @@ def barrier_and_log(string: str) -> None:
     logger.info("[{}] datetime: {} ".format(string, time_str))
 
 
-def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs: Any):
-    """
-    If torch distributed is initialized, log only on rank.
-
-    Args:
-        logger (logging.Logger): The logger to write the logs
-
-        args (Tuple[Any]): All logging.Logger.log positional arguments
-
-        rank (int, optional): The rank to write on. Defaults to 0.
-
-        kwargs (Dict[str, Any]): All logging.Logger.log keyword arguments
-    """
-    if torch.distributed.is_initialized():
-        if torch.distributed.get_rank() == rank:
-            logger.log(*args, **kwargs)
-    else:
-        logger.log(*args, **kwargs)
-
-
 def dump_dataclass_to_yaml(obj: Any, filename: Optional[str] = None) -> Optional[str]:
     """
     Dump a dataclass object or other Python object to a YAML file or string.
