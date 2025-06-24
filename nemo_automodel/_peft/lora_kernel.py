@@ -482,7 +482,7 @@ def db_autotune_configs():
 
 
 @triton.autotune(
-    configs=db_autotune_configs(),
+    configs=db_autotune_configs() if HAVE_TRITON else list(),
     key=["S", "M", "K"],
 )
 @triton.jit
