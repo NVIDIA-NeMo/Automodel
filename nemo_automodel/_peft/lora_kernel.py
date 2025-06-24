@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.utils.import_utils import MISSING_TRITON_MSG, noop_decorator
+from nemo_automodel.shared.import_utils import MISSING_TRITON_MSG, null_decorator
 import torch
 from packaging import version
 from unittest.mock import MagicMock
@@ -30,9 +30,9 @@ except ImportError:
 
 if not HAVE_TRITON:
     triton = MagicMock()
-    triton.jit = noop_decorator
-    triton.autotune = noop_decorator
-    triton.heuristics = noop_decorator
+    triton.jit = null_decorator
+    triton.autotune = null_decorator
+    triton.heuristics = null_decorator
     tl = MagicMock()
 
 
