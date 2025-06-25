@@ -201,8 +201,6 @@ runs:
           # Create virtual environment and install dependencies
           uv venv ${UV_PROJECT_ENVIRONMENT}
           uv sync
-
-          sleep $(( ${{ inputs.timeout }} * 60 + 60 ))
         '
 
     - name: Create run-script
