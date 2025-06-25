@@ -210,7 +210,7 @@ runs:
         COVERAGE_PREFIX=$([[ "${{ inputs.is_unit_test }}" == "true" ]] && echo "unit-test" || echo "e2e")
         echo "coverage-prefix=$COVERAGE_PREFIX" | tee -a "$GITHUB_OUTPUT"
 
-        cmd=$(cat <<'EOF'
+        cmd=$(cat <<'RUN_TEST_EOF'
         #!/bin/bash
 
         (
