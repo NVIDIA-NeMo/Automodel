@@ -97,7 +97,7 @@ def create_context_parallel_ctx(
         no_restore_buffers=cp_no_restore_buffers,
     )
 
-def make_cp_batch_and_ctx(device_mesh, batch):
+def make_cp_batch_and_ctx(device_mesh, batch, labels, loss_mask):
     """
     Build a CP context manager and shards a batch. If the input device_mesh is None or the size
     of the context_parallel submesh is 1, this function is effectively a no-op.
@@ -118,25 +118,26 @@ def make_cp_batch_and_ctx(device_mesh, batch):
     else:
         cp_mesh = device_mesh["context_parallel"]
 
-    # return nullcontext()
     if cp_mesh is None or cp_mesh.size() == 1:
-        return nullcontext(), batch
-    # CP > 0
-    # add positions_ids to batch
-    batch = _build_position_ids(batch, device=torch.cuda.current_device())
-    # prepare buffers
-    cp_buffers = list(batch.values())
-    cp_seq_dims = [1] * len(cp_buffers)
-    no_restore = {
-        v
-        for k, v in batch.items()
-        if v != 'position_ids'
-    }
+        return nullcontext, batch
+
+    input_ids = batch["input_ids"]
+    position_ids = batch["position_ids"]
+
+    if loss_mask is not None:
+        cp_buffers = [input_ids, labels, position_ids, loss_mask]
+        cp_seq_dims = [1, 1, 1, 1]
+        cp_no_restore_buffers = {input_ids, labels, loss_mask}
+    else:
+        cp_buffers = [input_ids, labels, position_ids]
+        cp_seq_dims = [1, 1, 1]
+        cp_no_restore_buffers = {input_ids, labels}
+
     cp_ctx = create_context_parallel_ctx(
         cp_mesh=cp_mesh,
         cp_buffers=cp_buffers,
         cp_seq_dims=cp_seq_dims,
-        cp_no_restore_buffers=no_restore,
+        cp_no_restore_buffers=cp_no_restore_buffers,
         cp_rotate_method="allgather",   # TODO: expose through cfg
     )
     # TODO(@akoumparouli): surface these in the future.

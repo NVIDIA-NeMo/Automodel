@@ -411,7 +411,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         ):
             batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
 
-        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
+        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels, loss_mask)
         with train_ctx():
             out  = self.model(**batch)
             local_loss = self.loss_fn(
@@ -494,7 +494,19 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 if loss_mask is None:
                     loss_mask = (labels.detach() != -100).to(torch.int)
 
-                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
+                if (
+                    self.device_mesh
+                    and "position_ids" not in batch
+                    and (
+                        self.device_mesh["context_parallel"].size() > 1
+                        or self.device_mesh["tensor_parallel"].size() > 1
+                    )
+                ):
+                    batch["position_ids"] = (
+                        torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
+                    )
+
+                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels, loss_mask)
                 with train_ctx():
                     out = self.model(**batch)
                     local_loss = self.loss_fn(
