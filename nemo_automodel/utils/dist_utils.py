@@ -18,14 +18,9 @@ import logging
 import os
 from contextlib import ContextDecorator, nullcontext
 from datetime import datetime
-from typing import Any, Optional
-
 import torch
 import torch.distributed
 import torch.distributed as dist
-import yaml
-
-from nemo_automodel.utils.yaml_utils import safe_yaml_representers
 
 
 logger = logging.getLogger(__name__)
