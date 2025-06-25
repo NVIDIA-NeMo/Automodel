@@ -1,9 +1,25 @@
-from datasets import Dataset, Features, Sequence, Value
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import random
+
+from datasets import Dataset, Features, Sequence, Value
+
 
 def make_vocab(vocab_size:int=100):
     """
-    Build a trivial vocab; index 0=<pad>, 1=<eos>, rest = tok_i
+    Build a trivial vocab; index 0=<pad>, 1=<eos>, rest = tok_i.
     """
     vocab = {"<pad>": 0, "<eos>": 1}
     for i in range(2, vocab_size):
@@ -11,7 +27,9 @@ def make_vocab(vocab_size:int=100):
     return vocab
 
 def gen_sentence_ids(vocab, mean_len:float, std_len:float, max_len:int):
-    """ Sentence generator with Gaussian length control """
+    """
+    Sentence generator with Gaussian length control.
+    """
     words = list(vocab.values())[2:]     # exclude <pad>, <eos>
     L = max(1, min(max_len, int(random.gauss(mean_len, std_len))))
     return random.choices(words, k=L) + [vocab["<eos>"]]
@@ -27,6 +45,7 @@ def build_unpacked_dataset(
 ):
     """
     Build a dataset where each example is one sentence (variable length).
+
     Returns:
       - a HuggingFace Dataset with fields:
           input_ids:     Sequence(int64)

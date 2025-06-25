@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from dataclasses import dataclass, field
 from typing import List
-import re
+
 import torch.nn as nn
+
 
 def wildcard_match(pattern, key):
     """
@@ -50,6 +52,9 @@ class ModuleMatcher:
             Target modules can also contain wildcards. For example, you can specify
                 target_modules=['*.layers.0.*.linear_qkv', '*.layers.1.*.linear_qkv'] to add LoRA to only linear_qkv
                 on the first two layers.
+        exclude_modules (List[str], optional): A list of module names to exclude from applying LoRA to.
+        match_all_linear (bool, optional): Whether to match all linear layers.
+        is_causal_lm (bool, optional): Whether the model is a causal language model.
     """
 
     target_modules: List[str] = field(
@@ -57,9 +62,12 @@ class ModuleMatcher:
     )
     exclude_modules: List[str] = field(default_factory=list)
     match_all_linear: bool = field(default=False)
+    is_causal_lm: bool = field(default=False)
 
     def __post_init__(self):
-        """ input validation """
+        """
+        Input validation.
+        """
         if isinstance(self.target_modules, str):
             self.target_modules = [self.target_modules]
         if isinstance(self.exclude_modules, str):
@@ -80,6 +88,10 @@ class ModuleMatcher:
         Return (pattern, full_name) if the module matches; otherwise None.
         """
         full_name = f"{prefix}.{name}" if prefix else name
+
+        if self.is_causal_lm:
+            if "lm_head" in full_name:
+                return False
 
         # 1. matching by layer type takes absolute precedence
         if self.match_all_linear and isinstance(m, nn.Linear):

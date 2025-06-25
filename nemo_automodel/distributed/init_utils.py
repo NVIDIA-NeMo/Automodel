@@ -15,22 +15,21 @@
 import atexit
 import datetime
 import signal
+from dataclasses import dataclass
 
 import torch
 import torch.distributed
-from dataclasses import dataclass
 
 from nemo_automodel.utils.dist_utils import (
     get_local_rank_preinit,
     get_rank_safe,
-    get_world_size_safe
+    get_world_size_safe,
 )
 
 
 @dataclass
 class DistInfo:
-    """
-    Holds information about the distributed training environment.
+    """Holds information about the distributed training environment.
 
     Attributes:
         backend (str): The backend used for torch.distributed (e.g., 'nccl').
@@ -48,8 +47,7 @@ class DistInfo:
 def initialize_distributed(
     backend, timeout_minutes=1,
 ):
-    """
-    Initialize the torch.distributed environment and core model parallel infrastructure.
+    """Initialize the torch.distributed environment and core model parallel infrastructure.
 
     This function sets the device based on the local rank, configures the process group,
     and calls torch.distributed.init_process_group with the appropriate parameters.
@@ -110,8 +108,7 @@ def initialize_distributed(
 
 
 def destroy_global_state():
-    """
-    Destroy the torch.distributed process group during cleanup.
+    """Destroy the torch.distributed process group during cleanup.
 
     This function is registered to execute at exit to ensure the process group is properly destroyed.
     It temporarily ignores SIGINT to avoid interruption during cleanup.

@@ -1,5 +1,19 @@
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import List, Optional
 
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
@@ -7,13 +21,6 @@ from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     RowwiseParallel,
 )
-
-try:
-    from nvfsdp import DistributedDataParallelConfig
-except ImportError:
-    from nemo_automodel.distributed.nvfsdp.distributed_data_parallel_config import (
-        DistributedDataParallelConfig,
-    )
 
 from nemo_automodel.distributed.parallelizer import (
     get_hf_tp_shard_plan,
@@ -24,8 +31,7 @@ from nemo_automodel.distributed.parallelizer import (
 @dataclass
 class NVFSDPManager:
     """
-    Manager for setting up and parallelizing models using nvFSDP with Tensor-Parallel,
-    Data-Parallel, and Context-Parallel sharding strategies.
+    Manager for setting up and parallelizing models using nvFSDP with TP, DP, CP sharding.
 
     This manager initializes the torch.distributed process group, infers the group sizes
     for data parallelism (DP) and tensor parallelism (TP), builds the device mesh for
@@ -83,18 +89,14 @@ class NVFSDPManager:
         ],
         metadata={"help": "List of unit modules to be wrapped with nvFSDP."},
     )
-    init_nvfsdp_with_meta_device: Optional[bool] = field(
-        default=False, metadata={"help": "Initialize nvFSDP with meta device if True."}
-    )
-    # TODO(boxiangw): rename this after nvFSDP is published
 
-    # nvfsdp_config configs
-    check_for_nan_in_grad: Optional[bool] = field(
-        default=True, metadata={"help": "Check for NaN in gradients if True."}
-    )
+    # nvFSDP config
     data_parallel_sharding_strategy: Optional[str] = field(
         default="optim_grads_params",
         metadata={"help": "Data parallel sharding strategy."},
+    )
+    init_nvfsdp_with_meta_device: Optional[bool] = field(
+        default=False, metadata={"help": "Initialize nvFSDP with meta device if True."}
     )
     grad_reduce_in_fp32: Optional[bool] = field(
         default=False, metadata={"help": "Reduce gradients in fp32 if True."}
@@ -108,8 +110,26 @@ class NVFSDPManager:
     overlap_param_gather: Optional[bool] = field(
         default=True, metadata={"help": "Overlap parameter gathering if True."}
     )
+    check_for_nan_in_grad: Optional[bool] = field(
+        default=True, metadata={"help": "Check for NaN in gradients if True."}
+    )
     average_in_collective: Optional[bool] = field(
         default=False, metadata={"help": "Average in collective if True."}
+    )
+    disable_bucketing: Optional[bool] = field(
+        default=False, metadata={"help": "Disable bucketing if True."}
+    )
+    calculate_per_token_loss: Optional[bool] = field(
+        default=False, metadata={"help": "Calculate per token loss if True."}
+    )
+    keep_fp8_transpose_cache_when_using_custom_fsdp: Optional[bool] = field(
+        default=False, metadata={"help": "Keep fp8 transpose cache when using custom FSDP if True."}
+    )
+    nccl_ub: Optional[bool] = field(
+        default=False, metadata={"help": "Use NCCL UBs if True."}
+    )
+    fsdp_double_buffer: Optional[bool] = field(
+        default=False, metadata={"help": "Use double buffer if True."}
     )
 
     def __post_init__(self):
@@ -120,7 +140,7 @@ class NVFSDPManager:
 
     def _setup_distributed(self):
         """
-        Initializes the distributed environment:
+        Initializes the distributed environment.
 
         - Checks availability and initialization of torch.distributed.
         - Infers data-parallel and tensor-parallel sizes if not provided.
@@ -178,6 +198,7 @@ class NVFSDPManager:
 
         Args:
             model: The model to be parallelized.
+            use_hf_tp_plan (bool): if true, will query the model for the TP plan.
 
         Returns:
             The parallelized model.
@@ -191,17 +212,6 @@ class NVFSDPManager:
                     "Warning: nvFSDP data_parallel_sharding_strategy is not optim_grads_params. "
                     "Parameters will not be sharded."
                 )
-
-        # TODO(boxiangw): any other configs necessary?
-        nvfsdp_config = DistributedDataParallelConfig(
-            check_for_nan_in_grad=self.check_for_nan_in_grad,
-            data_parallel_sharding_strategy=self.data_parallel_sharding_strategy,
-            grad_reduce_in_fp32=self.grad_reduce_in_fp32,
-            preserve_fp32_weights=self.preserve_fp32_weights,
-            overlap_grad_reduce=self.overlap_grad_reduce,
-            overlap_param_gather=self.overlap_param_gather,
-            average_in_collective=self.average_in_collective,
-        )
 
         if self.device_mesh["tensor_parallel"].size() > 1:
             if use_hf_tp_plan:
@@ -238,10 +248,21 @@ class NVFSDPManager:
         model = nvfsdp_strategy_parallelize(
             model,
             device_mesh=self.device_mesh,
-            nvfsdp_config=nvfsdp_config,
             nvfsdp_unit_modules=self.nvfsdp_unit_modules,
-            init_nvfsdp_with_meta_device=self.init_nvfsdp_with_meta_device,
             tp_shard_plan=tp_shard_plan,
+            data_parallel_sharding_strategy=self.data_parallel_sharding_strategy,
+            init_nvfsdp_with_meta_device=self.init_nvfsdp_with_meta_device,
+            grad_reduce_in_fp32=self.grad_reduce_in_fp32,
+            preserve_fp32_weights=self.preserve_fp32_weights,
+            overlap_grad_reduce=self.overlap_grad_reduce,
+            overlap_param_gather=self.overlap_param_gather,
+            check_for_nan_in_grad=self.check_for_nan_in_grad,
+            average_in_collective=self.average_in_collective,
+            disable_bucketing=self.disable_bucketing,
+            calculate_per_token_loss=self.calculate_per_token_loss,
+            keep_fp8_transpose_cache_when_using_custom_fsdp=self.keep_fp8_transpose_cache_when_using_custom_fsdp,
+            nccl_ub=self.nccl_ub,
+            fsdp_double_buffer=self.fsdp_double_buffer,
         )
 
         return model

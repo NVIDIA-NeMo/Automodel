@@ -1,42 +1,69 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
-import wandb
-from wandb import Settings
-from nemo_automodel.loggers.wandb_utils import suppress_wandb_log_messages
-
-import torch.distributed as dist
 from typing import Any, Dict
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
-from torch.utils.data import DataLoader
 from torch.distributed.device_mesh import _mesh_resources
+from torch.utils.data import DataLoader
+
+import wandb
+from nemo_automodel.loggers.wandb_utils import suppress_wandb_log_messages
+from wandb import Settings
 
 try:
     from nvfsdp import nvFSDP
-except ImportError:
-    from nemo_automodel.distributed.nvfsdp.nvfsdp import nvFSDP
 
+    HAVE_NVFSDP = True
+except:
+    HAVE_NVFSDP = False
+
+import logging
+
+from transformers import AutoProcessor
+
+from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.config.cli import parse_args_and_load_config
+from nemo_automodel.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.distributed.init_utils import initialize_distributed
 from nemo_automodel.distributed.parallelizer import (
     create_context_parallel_ctx,
     get_train_context,
 )
+from nemo_automodel.loggers.log_utils import setup_logging
 from nemo_automodel.training.base_recipe import BaseRecipe
+from nemo_automodel.training.rng import StatefulRNG
 from nemo_automodel.training.step_scheduler import StepScheduler
 from nemo_automodel.utils.dist_utils import (
-    reduce_loss,
-    get_sync_ctx,
-    rescale_gradients,
     clip_gradients,
+    get_sync_ctx,
+    reduce_loss,
+    rescale_gradients,
 )
-from nemo_automodel.utils.model_utils import apply_parameter_freezing
+from nemo_automodel.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
 from nemo_automodel.loggers.log_utils import setup_logging
 from transformers import AutoProcessor
+from nemo_automodel.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.training.rng import StatefulRNG
+from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 
 import logging
+from nemo_automodel.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +73,7 @@ logger = logging.getLogger(__name__)
 
 
 def build_model(device, cfg_model, cfg_freeze, cfg_peft, model_wrapper, seed) -> nn.Module:
-    """
-    Build and initialize a model.
+    """Build and initialize a model.
 
     Args:
         device: The target device.
@@ -73,6 +99,8 @@ def build_model(device, cfg_model, cfg_freeze, cfg_peft, model_wrapper, seed) ->
             peft_fn = opts.pop("peft_fn")
             peft_fn(model, **opts)
 
+        print_trainable_parameters(model)
+
         if callable(getattr(model_wrapper, "parallelize", None)):
             model = model_wrapper.parallelize(model)
 
@@ -82,9 +110,26 @@ def build_model(device, cfg_model, cfg_freeze, cfg_peft, model_wrapper, seed) ->
             return model.to(device)
 
 
+def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id):
+    """Build a checkpoint configuration."""
+    from transformers.utils import TRANSFORMERS_CACHE
+
+    ckpt_kwargs = dict(
+        enabled=False,
+        checkpoint_dir="checkpoints/",
+        model_save_format="safetensors",
+        model_repo_id=model_repo_id,
+        model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
+    )
+    if cfg_ckpt is not None:
+        cfg_ckpt = cfg_ckpt.to_dict()
+        cfg_ckpt.pop("restore_from", None)
+        ckpt_kwargs |= cfg_ckpt
+    return CheckpointingConfig(**ckpt_kwargs)
+
+
 def build_optimizer(cfg_opt, model, tp_size) -> "Optimizer":  # noqa: F821
-    """
-    Build an optimizer for the model.
+    """Build an optimizer for the model.
 
     Args:
         cfg_opt: Configuration for optimizer instantiation.
@@ -103,8 +148,7 @@ def build_optimizer(cfg_opt, model, tp_size) -> "Optimizer":  # noqa: F821
 
 
 def build_loss_fn(device, cfg_loss):
-    """
-    Build a loss function.
+    """Build a loss function.
 
     Args:
         device: The target device.
@@ -119,15 +163,14 @@ def build_loss_fn(device, cfg_loss):
         return cfg_loss.instantiate().to(device)
 
 
-def build_dataloader(
-    cfg_ds, cfg_dl, cfg_model, device_mesh, seed
-) -> DataLoader:
-    """
-    Build a distributed dataloader.
+def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed) -> DataLoader:
+    """Build a distributed dataloader.
 
     Args:
         cfg_ds: Dataset configuration.
         cfg_dl: DataLoader configuration.
+        cfg_model: Model configuration.
+        cfg_processor: Processor configuration.
         distributed_sampler_kwargs: Additional arguments for the DistributedSampler.
 
     Returns:
@@ -136,51 +179,38 @@ def build_dataloader(
     dist_sampler_kwargs = {
         "shuffle": cfg_dl.get("shuffle", True),
     }
-    if not device_mesh is None:
+    if device_mesh is not None:
         dist_sampler_kwargs |= {
-            "num_replicas": device_mesh.get("data_parallel").size(),
-            "rank": device_mesh.get["data_parallel"].get_local_rank(),
+            "num_replicas": device_mesh["data_parallel"].size(),
+            "rank": device_mesh["data_parallel"].get_local_rank(),
         }
 
     with StatefulRNG(seed=seed, ranked=True):
         if hasattr(cfg_ds, "_target_") and "vlm" in cfg_ds._target_:
-            processor = AutoProcessor.from_pretrained(
-                cfg_model.pretrained_model_name_or_path
-            )
+            processor = AutoProcessor.from_pretrained(cfg_model.pretrained_model_name_or_path)
 
-            # For VLM datasets, instantiate with processor and get HFDatasetBuilder
-            hf_dataset_builder = cfg_ds.instantiate(
-                path_or_dataset=cfg_ds.path_or_dataset, processor=processor
-            )
+        ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
 
-            split = getattr(cfg_ds, "split", None)
-
-            if split is not None:
-                if split == "train":
-                    ds = hf_dataset_builder.train
-                elif split == "validation":
-                    ds = hf_dataset_builder.val
-                else:
-                    raise ValueError(
-                        f"split (train or validation) is required for VLM datasets, but got {split}"
-                    )
-            else:
-                raise ValueError(
-                    f"split (train or validation) is required for VLM datasets, but got {split}"
-                )
-
-            sampler = torch.utils.data.distributed.DistributedSampler(
-                ds, **dist_sampler_kwargs,
-            )
-        # TODO: HFDatasetBuilder has DLbuilder but is not stateful, didn't use it
-        return cfg_dl.instantiate(
-            dataset=ds, sampler=sampler, collate_fn=hf_dataset_builder.collate_fn
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            ds,
+            **dist_sampler_kwargs,
         )
+        collate_cfg = cfg_dl.get("collate_fn", None)
+        if collate_cfg:
+            collate_fn = lambda examples: collate_cfg.instantiate(examples=examples, processor=processor)
+        else:
+            # Get the appropriate collate function
+            processor_type = type(processor).__name__
+            if processor_type not in COLLATE_FNS:
+                processor_type = "default"
+                logging.warning(f"You are using {processor_type} with default collate function.")
+            collate_fn = lambda examples: COLLATE_FNS[processor_type](examples, processor)
+
+        return cfg_dl.instantiate(dataset=ds, sampler=sampler, collate_fn=collate_fn)
 
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
-    """
-    Build and initialize distributed training resources.
+    """Build and initialize distributed training resources.
 
     Args:
         cfg_dist: Configuration for distributed training.
@@ -194,8 +224,7 @@ def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
 
 
 def build_step_scheduler(cfg, dataloader):
-    """
-    Build the step scheduler.
+    """Build the step scheduler.
 
     Args:
         cfg: configuration for the StepScheduler class.
@@ -204,7 +233,7 @@ def build_step_scheduler(cfg, dataloader):
     Returns:
         StepScheduler: the configured StepScheduler.
     """
-    assert not "_target_" in cfg, "_target_ not permitted in step scheduler"
+    assert "_target_" not in cfg, "_target_ not permitted in step scheduler"
     default_kwargs = dict(
         num_epochs=10,
         grad_acc_steps=10,
@@ -217,13 +246,13 @@ def build_step_scheduler(cfg, dataloader):
 
 
 def build_wandb(cfg):
-    """ Instantiates wandb and returns the instance.
+    """Instantiates wandb and returns the instance.
     If no name is given, it will use the model name
     """
-    assert cfg.get('wandb', None) is not None
+    assert cfg.get("wandb", None) is not None
     kwargs = cfg.wandb.to_dict()
-    if kwargs.get('name', "") == "":
-        kwargs["name"] = '_'.join(cfg.get("model.pretrained_model_name_or_path").split('/')[-2:])
+    if kwargs.get("name", "") == "":
+        kwargs["name"] = "_".join(cfg.get("model.pretrained_model_name_or_path").split("/")[-2:])
     run = wandb.init(
         **kwargs,
         config=cfg,
@@ -231,21 +260,20 @@ def build_wandb(cfg):
     )
     return run
 
+
 # ---------------------------------------------------------------------------
 #  Trainer class – orchestration only
 # ---------------------------------------------------------------------------
 
 
 class FinetuneRecipeForVLM(BaseRecipe):
-    """
-    Recipe for fine-tuning a model for VLM.
+    """Recipe for fine-tuning a model for VLM.
 
     This class orchestrates training, from setup to main training loop.
     """
 
     def __init__(self, cfg):
-        """
-        Initialize the recipe with configuration.
+        """Initialize the recipe with configuration.
 
         Args:
             cfg: Configuration dictionary/object for training.
@@ -269,15 +297,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.device_mesh = None
         self.model_wrapper = None
         if "distributed" in self.cfg:
-            self.model_wrapper = self.cfg.distributed.instantiate(
-                world_size=self.dist_env.world_size
-            )
+            self.model_wrapper = self.cfg.distributed.instantiate(world_size=self.dist_env.world_size)
             self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
 
-        if self.dist_env.is_main and hasattr(self.cfg, "logger"):
+        if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
             run = build_wandb(self.cfg)
-            print("🚀 View run at {}".format(run.url))
+            logging.info("🚀 View run at {}".format(run.url))
 
         # Build components
         self.model = build_model(
@@ -298,6 +324,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.cfg.dataset,
             self.cfg.dataloader,
             self.cfg.model,
+            self.cfg.get("processor", None),
             device_mesh=self.device_mesh,
             seed=self.cfg.get("seed", 42),
         )
@@ -309,6 +336,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 self.cfg.validation_dataset,
                 self.cfg.validation_dataloader,
                 self.cfg.model,
+                self.cfg.get("processor", None),
                 device_mesh=self.device_mesh,
                 seed=self.cfg.get("seed", 42),
             )
@@ -318,40 +346,43 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.forward_data_store = []
 
         # Scheduler
-        self.step_scheduler = build_step_scheduler(
-            self.cfg.get("step_scheduler", None), self.dataloader
+        self.step_scheduler = build_step_scheduler(self.cfg.get("step_scheduler", None), self.dataloader)
+
+        # Build checkpointing config
+        restore_from = self.cfg.get("checkpoint.restore_from", None)
+        self.checkpoint_config = build_checkpoint_config(
+            self.cfg.get("checkpoint", None),
+            self.cfg.get("model.cache_dir", None),
+            self.cfg.model.pretrained_model_name_or_path,
         )
 
         # Set up the stateful random number generator
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
         # Optionally resume
-        if (path := self.cfg.get("restore_from")) is not None:
-            raise NotImplemented("TODO resume from {}".format(path))
+        self.load_checkpoint(restore_from)
 
     # ------------------ main loop ------------------
     def run_train_validation_loop(self):
-        """
-        Run the training loop over all epochs and batches.
+        """Run the training loop over all epochs and batches.
 
         For each batch, perform a forward pass, compute loss, backpropagate,
         and update model parameters when necessary. Also prints loss every gradient step.
         """
         self.model.train()
         for epoch in self.step_scheduler.epochs:
+            self.step_scheduler.set_epoch(epoch)
             for batch_idx, batch in enumerate(self.step_scheduler):
                 self._run_train_step(batch, self.step_scheduler.is_optim_step, 1.0)
-                if self.step_scheduler.is_ckpt_step and self.dist_env.is_main:
-                    #     self._save_checkpoint()
-                    pass
+                if self.step_scheduler.is_ckpt_step:
+                    self.save_checkpoint(epoch, self.step_scheduler.step)
 
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     self._run_validation_epoch()
 
     # ------------------ helpers ------------------
     def _run_train_step(self, batch, is_optim_step, clip_norm=1.0):
-        """
-        Execute a single training step.
+        """Execute a single training step.
 
         Args:
             batch: Batch of training data.
@@ -362,9 +393,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         """
         self.model.train()
 
-        batch = {
-            k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()
-        }
+        batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
         labels = batch.pop("labels")
         loss_mask = batch.pop("loss_mask", None)
         if loss_mask is None:
@@ -374,18 +403,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # If 'position_ids' does not exist in batch already then override it. batch in case of Packed sequence
         # contains 'position_ids' and we don't want to override it.
         if "position_ids" not in batch and (
-            self.device_mesh["context_parallel"].size() > 1
-            or self.device_mesh["tensor_parallel"].size() > 1
+            self.device_mesh["context_parallel"].size() > 1 or self.device_mesh["tensor_parallel"].size() > 1
         ):
-            batch["position_ids"] = (
-                torch.arange(0, batch["input_ids"].shape[1])
-                .unsqueeze(0)
-                .to(self.model.device)
-            )
+            batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
 
         # based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/train.py#L336
         if self.device_mesh["context_parallel"].size() > 1:
-
             input_ids = batch["input_ids"].to(self.model.device)
             position_ids = batch["position_ids"].to(self.model.device)
 
@@ -418,9 +441,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 n_cls = logits.shape[-1]
                 logits = logits.view(-1, n_cls)
                 labels = labels.view(-1)
-                assert (
-                    logits.shape[-2] == labels.shape[-1]
-                ), "Expected logits & labels to have the same length"
+                assert logits.shape[-2] == labels.shape[-1], "Expected logits & labels to have the same length"
                 local_loss = self.loss_fn(logits, labels, loss_mask)
 
             # In the case where all labels are masked, the loss should be 0.
@@ -451,13 +472,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 self.device_mesh[
                     (
                         "dp_cp"
-                        if "dp_cp"
-                        in _mesh_resources.root_to_flatten_mapping.get(
-                            self.device_mesh, {}
-                        )
+                        if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(self.device_mesh, {})
                         else "data_parallel"
                     )
-                ].get_group() if self.device_mesh is not None else None,
+                ].get_group()
+                if self.device_mesh is not None
+                else None,
             )
 
             # Clip gradients **after** any rescaling.
@@ -468,7 +488,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 # TODO: TP WAR
                 grad_norm = 0.0
 
-            if isinstance(self.model, nvFSDP):
+            if HAVE_NVFSDP and isinstance(self.model, nvFSDP):
                 # If the model uses nvFSDP, wait for all sharded gradients to be reduced and unsharded.
                 # Necessary because the post-backward reduce-scatter is asynchronous, so gradients and backward
                 # computations are concurrent, but the gradients of the final layer may not be available yet.
@@ -477,7 +497,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.optimizer.step()
             self.optimizer.zero_grad()
 
-            if isinstance(self.model, nvFSDP):
+            if HAVE_NVFSDP and isinstance(self.model, nvFSDP):
                 # If custom FSDP2 is configured with "optim" (optimizer state / high-precision model weight sharding),
                 # then the optimizer step will be applied to the main high-precision model weights. Update the model
                 # weights after the optimizer step.
@@ -506,27 +526,20 @@ class FinetuneRecipeForVLM(BaseRecipe):
             total_tokens = 0
 
             for batch in self.val_dataloader:
-                batch = {
-                    k: v.to(self.dist_env.device, non_blocking=True)
-                    for k, v in batch.items()
-                }
+                batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
                 labels = batch.pop("labels")
                 loss_mask = batch.pop("loss_mask", None)
                 if loss_mask is None:
                     loss_mask = (labels.detach() != -100).to(torch.int)
 
                 if "position_ids" not in batch and (
-                    self.device_mesh["context_parallel"].size() > 1
-                    or self.device_mesh["tensor_parallel"].size() > 1
+                    self.device_mesh["context_parallel"].size() > 1 or self.device_mesh["tensor_parallel"].size() > 1
                 ):
                     batch["position_ids"] = (
-                        torch.arange(0, batch["input_ids"].shape[1])
-                        .unsqueeze(0)
-                        .to(self.model.device)
+                        torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
                     )
 
                 if self.device_mesh["context_parallel"].size() > 1:
-
                     input_ids = batch["input_ids"].to(self.model.device)
                     position_ids = batch["position_ids"].to(self.model.device)
 
@@ -557,9 +570,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         n_cls = logits.shape[-1]
                         logits = logits.view(-1, n_cls)
                         labels = labels.view(-1)
-                        assert (
-                            logits.shape[-2] == labels.shape[-1]
-                        ), "Expected logits & labels to have the same length"
+                        assert logits.shape[-2] == labels.shape[-1], "Expected logits & labels to have the same length"
                         local_loss = self.loss_fn(logits, labels, loss_mask)
 
                     # In the case where all labels are masked, the loss should be 0.
@@ -579,9 +590,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         # Aggregate across ranks if distributed is initialized
         if dist.is_initialized():
-            tensor = torch.tensor(
-                [total_loss, total_tokens], device=self.dist_env.device
-            )
+            tensor = torch.tensor([total_loss, total_tokens], device=self.dist_env.device)
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
             total_loss, total_tokens = tensor.tolist()
 
@@ -602,8 +611,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
 
     def log_train_metrics(self, grad_norm):
-        """
-        Log metrics to wandb.
+        """Log metrics to wandb.
 
         Args:
             grad_norm: Grad norm from the training step.
@@ -623,9 +631,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             dp_group=dp_group,
         )
         reporting_loss = (total_loss / total_num_tokens).item()
-        grad_norm = (
-            grad_norm.item() if not isinstance(grad_norm, float) else grad_norm
-        )  # TP WAR
+        grad_norm = grad_norm.item() if not isinstance(grad_norm, float) else grad_norm  # TP WAR
         self.total_num_tokens.zero_()
         self.forward_data_store = []
         log_data = {
@@ -650,8 +656,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
 
 def main():
-    """
-    Main entry point for the fine-tuning recipe.
+    """Main entry point for the fine-tuning recipe.
 
     Loads the configuration, sets up the trainer, and initiates the training loop.
     """
