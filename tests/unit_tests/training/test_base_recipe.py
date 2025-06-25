@@ -76,12 +76,21 @@ class _DummyStateful:
     """
 
     def __init__(self):
+        """
+        ctor
+        """
         self.foo = torch.tensor(0.)
 
     def state_dict(self):
+        """
+        retrieve state
+        """
         return {"foo": self.foo.clone()}
 
     def load_state_dict(self, state):
+        """
+        restore state
+        """
         self.foo = state["foo"].clone()
 
 
