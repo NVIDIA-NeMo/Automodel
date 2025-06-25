@@ -126,6 +126,8 @@ jobs:
       matrix:
         python-version: ["3.12"]
         extra-groups: ["", "vlm"]
+    env:
+      EXTRA: ${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
