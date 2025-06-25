@@ -223,7 +223,7 @@ runs:
           
             # Set up environment
             export UV_PROJECT_ENVIRONMENT=/opt/venv
-            export PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
+            export PATH="/opt/venv/bin:$PATH"
             export UV_LINK_MODE=copy
 
             uv pip install --no-deps -e .
