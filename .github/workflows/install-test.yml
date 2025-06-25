@@ -9,11 +9,11 @@ on:
 jobs:
   pip-test:
     runs-on: ${{ matrix.arch }}
-    name: (CPU) Python ${{ matrix.python-version }} on ${{ matrix.arch }}
+    name: Pip - Python${{ matrix.python-version }} - ${{ matrix.arch == 'ubuntu-latest' && 'AMD64/Linux' || (matrix.arch == 'ubuntu-24.04-arm' && 'ARM64/Linux' || 'ARM64/Darwin') }} - No CUDA
     strategy:
       fail-fast: false
       matrix:
-        arch: ["ubuntu-latest", "macos-latest"]
+        arch: ["ubuntu-latest", "macos-latest"] # After setting the repo to public: "ubuntu-24.04-arm"]
         python-version: ["3.10", "3.11", "3.12"]
     steps:
       - name: Checkout repository
@@ -45,9 +45,9 @@ jobs:
           package-name: nemo_automodel
           python-binary: python
 
-  ngc-cuda-test:
+  ngc-cuda-test-uv:
     runs-on: linux-amd64-cpu16
-    name: (GPU) Python ${{ matrix.python-version }}
+    name: UV - Python${{ matrix.python-version }} - AMD64/Linux - NGC CUDA
     container:
       image: nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
     environment: nemo-ci
@@ -115,9 +115,52 @@ jobs:
           package-name: nemo_automodel
           python-binary: ./venv/bin/python
 
+  ngc-cuda-test-pip:
+    runs-on: linux-amd64-cpu16
+    name: Pip - Python${{ matrix.python-version }}${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }} - AMD64/Linux - NGC CUDA
+    container:
+      image: nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+    environment: nemo-ci
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+        extra-groups: ["", "vlm"]
+    env:
+      EXTRA: ${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install automodel${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }}
+        shell: bash -x -e -u -o pipefail {0}
+        run: |
+          apt-get update
+          apt-get install -y python3 python3-pip python3-venv git
+          python3 -m venv ./venv
+
+          . ./venv/bin/activate
+
+          pip install --upgrade pip
+
+          pip install .$EXTRA
+
+      - name: Checkout check-imports
+        uses: actions/checkout@v4
+        with:
+          repository: NVIDIA-NeMo/FW-CI-templates
+          ref: v0.39.0
+          path: FW-CI-templates
+
+      - name: Check imports for nemo_automodel
+        uses: ./FW-CI-templates/.github/actions/check-imports
+        with:
+          package-name: nemo_automodel
+          python-binary: ./venv/bin/python
+
   uv-test:
     runs-on: ${{ matrix.arch }}
-    name: UV on ${{ matrix.arch }}
+    name: UV - Python ${{ matrix.python-version }} - ${{ matrix.arch == 'ubuntu-latest' && 'AMD64/Linux' || 'ARM64/Darwin' }} - No CUDA
     environment: nemo-ci
     strategy:
       fail-fast: false
@@ -161,7 +204,7 @@ jobs:
           python-binary: ./venv/bin/python
 
   install-test-summary:
-    needs: [pip-test, uv-test, ngc-cuda-test]
+    needs: [pip-test, uv-test, ngc-cuda-test-uv, ngc-cuda-test-pip]
     runs-on: ubuntu-latest
     name: Install test summary
     steps:
