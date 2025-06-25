@@ -216,11 +216,8 @@ runs:
         (
           set -e
 
-          docker exec -t nemo_container_${{ github.run_id }} bash -c '\
-            export UV_PROJECT_ENVIRONMENT=/opt/venv && \  
-            export PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH" && \
-            export UV_LINK_MODE=copy && \
-            uv pip install --no-deps -e . && \
+          docker exec -e export UV_PROJECT_ENVIRONMENT=/opt/venv -t nemo_container_${{ github.run_id }} bash -c '\
+            /root/.local/bin/uv pip install --no-deps -e . && \
             bash tests/${{ inputs.is_unit_test == 'true' && 'unit_tests' || 'functional_tests' }}/${{ inputs.script }}.sh && \
             echo "Finished successfully." || echo "Did not finish."'
         ) 2>&1 | tee err.log
