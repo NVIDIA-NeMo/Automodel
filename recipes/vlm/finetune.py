@@ -110,7 +110,7 @@ def build_model(device, cfg_model, cfg_freeze, cfg_peft, model_wrapper, seed) ->
             return model.to(device)
 
 
-def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id):
+def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
     """Build a checkpoint configuration."""
     from transformers.utils import TRANSFORMERS_CACHE
 
@@ -120,6 +120,8 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id):
         model_save_format="safetensors",
         model_repo_id=model_repo_id,
         model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
+        save_consolidated=False,
+        is_peft=is_peft,
     )
     if cfg_ckpt is not None:
         cfg_ckpt = cfg_ckpt.to_dict()
@@ -354,6 +356,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.cfg.get("checkpoint", None),
             self.cfg.get("model.cache_dir", None),
             self.cfg.model.pretrained_model_name_or_path,
+            True if self.cfg.get("peft", None) else False,
         )
 
         # Set up the stateful random number generator
@@ -402,13 +405,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # TODO(@boxiangw): Refractor. Needed for SP support
         # If 'position_ids' does not exist in batch already then override it. batch in case of Packed sequence
         # contains 'position_ids' and we don't want to override it.
-        if "position_ids" not in batch and (
-            self.device_mesh["context_parallel"].size() > 1 or self.device_mesh["tensor_parallel"].size() > 1
+        if (
+            "position_ids" not in batch
+            and self.device_mesh is not None
+            and (self.device_mesh["context_parallel"].size() > 1 or self.device_mesh["tensor_parallel"].size() > 1)
         ):
             batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
 
         # based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/train.py#L336
-        if self.device_mesh["context_parallel"].size() > 1:
+        if self.device_mesh is not None and self.device_mesh["context_parallel"].size() > 1:
             input_ids = batch["input_ids"].to(self.model.device)
             position_ids = batch["position_ids"].to(self.model.device)
 
@@ -482,7 +487,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
             # Clip gradients **after** any rescaling.
             # TODO(@boxiangw): Fix TP gradient clipping
-            if self.device_mesh["tensor_parallel"].size() == 1:
+            if not self.device_mesh or self.device_mesh["tensor_parallel"].size() == 1:
                 grad_norm = clip_gradients(self.model, clip_norm)
             else:
                 # TODO: TP WAR
@@ -532,8 +537,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if loss_mask is None:
                     loss_mask = (labels.detach() != -100).to(torch.int)
 
-                if "position_ids" not in batch and (
-                    self.device_mesh["context_parallel"].size() > 1 or self.device_mesh["tensor_parallel"].size() > 1
+                if (
+                    self.device_mesh
+                    and "position_ids" not in batch
+                    and (
+                        self.device_mesh["context_parallel"].size() > 1
+                        or self.device_mesh["tensor_parallel"].size() > 1
+                    )
                 ):
                     batch["position_ids"] = (
                         torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
@@ -619,7 +629,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         Returns:
             Reporting loss.
         """
-        if self.device_mesh["context_parallel"].size() > 1:
+        if not self.device_mesh:
+            dp_group = None
+        elif self.device_mesh["context_parallel"].size() > 1:
             dp_group = self.device_mesh["dp_cp"].get_group()
         else:
             dp_group = self.device_mesh["data_parallel"].get_group()
