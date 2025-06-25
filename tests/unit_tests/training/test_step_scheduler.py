@@ -19,9 +19,18 @@ from nemo_automodel.training.step_scheduler import StepScheduler
 class _DummySampler:
     """Mimics DistributedSampler API – only set_epoch is required."""
     def __init__(self):
+        """
+        ctor
+        """
         self.last_epoch = None
 
     def set_epoch(self, epoch: int):
+        """
+        set epoch
+
+        Args:
+            epoch (int): current epoch
+        """
         self.last_epoch = epoch
 
 
