@@ -24,7 +24,7 @@ try:
     if version.parse(triton.__version__) < version.parse("3.4.0") and not torch.cuda.is_available():
         HAVE_TRITON = False
     else:
-        HAVE_TRITON = version.parse(triton.__version__) >= version.parse("2.0.0")
+        HAVE_TRITON = tl.constexpr(version.parse(triton.__version__) >= version.parse("2.0.0"))
 except ImportError:
     HAVE_TRITON = False
 
