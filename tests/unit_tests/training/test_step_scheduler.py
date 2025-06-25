@@ -13,8 +13,6 @@
 # limitations under the License.
 
 import pytest
-from types import SimpleNamespace
-
 from nemo_automodel.training.step_scheduler import StepScheduler
 
 

@@ -13,15 +13,11 @@
 # limitations under the License.
 import os
 os.environ['TORCH_COMPILE_DISABLE'] = '1'
-import torch
 
 import importlib
 import logging
 import os
-import types
 from typing import List
-
-import pytest
 
 def make_log_record(level: int = logging.INFO, name: str = "test.logger"):
     """Return a dummy ``LogRecord`` suitable for filter unit-tests."""

@@ -14,10 +14,8 @@
 
 from __future__ import annotations
 
-import types
 from typing import Dict
 
-import torch
 import torch.nn as nn
 import pytest
 

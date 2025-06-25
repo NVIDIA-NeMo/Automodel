@@ -73,7 +73,7 @@ def patch_torch_distributed(monkeypatch):
 # Individual unit tests
 def test_dummy_timer_raises_on_elapsed():
     """DummyTimer.elapsed must raise to prevent accidental use."""
-    dummy = DummyTimer()
+    dummy = DummyTimer()  # noqa: F821
     with pytest.raises(Exception):
         _ = dummy.elapsed()
 
@@ -83,7 +83,7 @@ def test_timer_basic_start_stop_elapsed():
     Timer should accumulate elapsed time correctly between explicit
     start() and stop() calls.
     """
-    t = Timer("unit-test")
+    t = Timer("unit-test")  # noqa: F821
     t.start()
     time.sleep(0.02)
     t.stop()
@@ -96,7 +96,7 @@ def test_timer_basic_start_stop_elapsed():
 
 def test_timer_double_start_fails():
     """Calling start() twice without an intermediate stop() must assert."""
-    t = Timer("unit-test-double-start")
+    t = Timer("unit-test-double-start")  # noqa: F821
     t.start()
     with pytest.raises(AssertionError):
         t.start()
@@ -107,7 +107,7 @@ def test_timer_elapsed_resets_properly():
     elapsed(reset=True) should zero the internal counter while leaving
     _active_time untouched.
     """
-    t = Timer("reset-test")
+    t = Timer("reset-test")  # noqa: F821
     t.start()
     time.sleep(0.01)
     t.stop()
@@ -127,11 +127,10 @@ def test_timers_collection_and_logging(monkeypatch, capsys):
       * automatic DummyTimer routing based on log_level
       * string generation / stdout logging
     """
-    timers = Timers(log_level=1, log_option="max")
+    timers = Timers(log_level=1, log_option="max")  # noqa: F821
 
-    # log_level higher than container threshold → DummyTimer
     dummy = timers("foo", log_level=2)
-    assert isinstance(dummy, DummyTimer)
+    assert isinstance(dummy, DummyTimer)  # noqa: F821
 
     # log_level within threshold → real Timer
     real_timer = timers("bar", log_level=1)

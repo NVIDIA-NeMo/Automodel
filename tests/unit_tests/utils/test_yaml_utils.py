@@ -14,7 +14,6 @@
 
 import enum
 import functools
-import inspect
 
 import pytest
 import yaml

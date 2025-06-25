@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 import types
 import sys
 import pytest
@@ -64,8 +63,6 @@ def test_suppress_wandb_log_messages(monkeypatch):
     """
     End-to-end test verifying that all documented side effects take place.
     """
-    # Arrange ------------------------------------------------------------------.
-    from importlib import reload
     _build_fake_wandb_package()
 
     # Import *after* fake package is installed so that module under test
