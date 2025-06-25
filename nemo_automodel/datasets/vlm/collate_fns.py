@@ -12,13 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import torch
-from qwen_vl_utils import process_vision_info
 
 from nemo_automodel.datasets.vlm.utils import extract_skipped_token_ids
+from nemo_automodel.shared.import_utils import MISSING_QWEN_VL_UTILS_MSG
+
+try:
+    from qwen_vl_utils import process_vision_info
+
+    HAVE_QWEN_VL_UTILS = True
+except ImportError:
+    HAVE_QWEN_VL_UTILS = False
 
 
 def qwen2_5_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
     """Collate function for Qwen2.5 VL model."""
+    if not HAVE_QWEN_VL_UTILS:
+        raise ImportError(MISSING_QWEN_VL_UTILS_MSG)
+
     skipped_tokens = extract_skipped_token_ids(processor)
 
     texts = [processor.apply_chat_template(example["conversation"], tokenize=False) for example in examples]
@@ -41,6 +51,9 @@ def qwen2_5_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
 
 def default_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
     """Default collate function for VLM models."""
+    if not HAVE_QWEN_VL_UTILS:
+        raise ImportError(MISSING_QWEN_VL_UTILS_MSG)
+
     skipped_tokens = extract_skipped_token_ids(processor)
 
     batch = processor.apply_chat_template(

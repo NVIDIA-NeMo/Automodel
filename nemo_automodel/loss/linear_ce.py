@@ -62,49 +62,52 @@
 
 import torch
 
-from nemo_automodel.shared.import_utils import safe_import_from
+from nemo_automodel.shared.import_utils import MISSING_CUT_CROSS_ENTROPY_MSG
 
-
-HAVE_LINEAR_LOSS_CE, linear_cross_entropy = safe_import_from(
-    "cut_cross_entropy",
-    "linear_cross_entropy",
-)
-if HAVE_LINEAR_LOSS_CE:
-    # Get the module and patch triton version check
+try:
     import cut_cross_entropy.tl_utils as tl_utils
 
-    # Create replacement functions
-    def new_is_triton_greater_or_equal(version_str):
-        """
-        Check if pytorch-triton version is greater than or equal to the specified version.
+    from cut_cross_entropy import linear_cross_entropy
 
-        Args:
-            version_str: Version string to check
+    HAVE_CUT_CROSS_ENTROPY = True
+except ImportError:
+    HAVE_CUT_CROSS_ENTROPY = False
 
-        Returns:
-            bool: True if pytorch-triton version >= specified version
-        """
-        import pkg_resources
 
-        try:
-            pytorch_triton_version = pkg_resources.get_distribution("pytorch-triton").version
-            current = pkg_resources.parse_version(pytorch_triton_version)
-            required = pkg_resources.parse_version(version_str)
-            print(f"Current pytorch-triton version: {pytorch_triton_version}, Required triton version: {version_str}")
-            return current >= required
-        except pkg_resources.DistributionNotFound:
-            print("pytorch-triton not found")
-            return False
+def new_is_triton_greater_or_equal(version_str):
+    """
+    Check if pytorch-triton version is greater than or equal to the specified version.
 
-    def new_is_triton_greater_or_equal_3_2_0():
-        """
-        Check if pytorch-triton version is greater than or equal to 3.1.0.
+    Args:
+        version_str: Version string to check
 
-        Returns:
-            bool: True if pytorch-triton version >= 3.1.0
-        """
-        return new_is_triton_greater_or_equal("3.1.0")
+    Returns:
+        bool: True if pytorch-triton version >= specified version
+    """
+    import pkg_resources
 
+    try:
+        pytorch_triton_version = pkg_resources.get_distribution("pytorch-triton").version
+        current = pkg_resources.parse_version(pytorch_triton_version)
+        required = pkg_resources.parse_version(version_str)
+        print(f"Current pytorch-triton version: {pytorch_triton_version}, Required triton version: {version_str}")
+        return current >= required
+    except pkg_resources.DistributionNotFound:
+        print("pytorch-triton not found")
+        return False
+
+
+def new_is_triton_greater_or_equal_3_2_0():
+    """
+    Check if pytorch-triton version is greater than or equal to 3.1.0.
+
+    Returns:
+        bool: True if pytorch-triton version >= 3.1.0
+    """
+    return new_is_triton_greater_or_equal("3.1.0")
+
+
+if HAVE_CUT_CROSS_ENTROPY:
     # Apply the monkey patches
     tl_utils.is_triton_greater_or_equal = new_is_triton_greater_or_equal
     tl_utils.is_triton_greater_or_equal_3_2_0 = new_is_triton_greater_or_equal_3_2_0
@@ -133,6 +136,9 @@ def fused_linear_cross_entropy(
         logit_softcapping: Value for softcapping logits (0 means no capping)
         accuracy_threshold: Threshold for accuracy computation
     """
+    if not HAVE_CUT_CROSS_ENTROPY:
+        raise ImportError(MISSING_CUT_CROSS_ENTROPY_MSG)
+
     # First compute loss with sum reduction to handle normalization ourselves
     if logit_softcapping == 0:
         logit_softcapping = None

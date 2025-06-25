@@ -16,12 +16,12 @@ import torch
 import torch.nn.functional as F
 
 from nemo_automodel.loss.linear_ce import (
-    HAVE_LINEAR_LOSS_CE,
+    HAVE_CUT_CROSS_ENTROPY,
     fused_linear_cross_entropy,
 )
 
 
-@pytest.mark.skipif(not HAVE_LINEAR_LOSS_CE, reason="Linear loss CE is not installed")
+@pytest.mark.skipif(not HAVE_CUT_CROSS_ENTROPY, reason="Linear loss CE is not installed")
 def test_fused_cross_entropy():
     """Tests fused_linear_cross_entropy against PyTorch's CE.
 
@@ -31,7 +31,7 @@ def test_fused_cross_entropy():
     if not torch.cuda.is_available():
         pytest.skip("This test requires a GPU")
 
-    device = torch.device('cuda')
+    device = torch.device("cuda")
     batch_size = 8
     seq_length = 2048  # Added sequence length dimension
     hidden_dim = 4096
@@ -45,7 +45,7 @@ def test_fused_cross_entropy():
 
     # Measure memory for PyTorch implementation
     torch.cuda.reset_peak_memory_stats()
-    with torch.amp.autocast(device_type='cuda', dtype=dtype):
+    with torch.amp.autocast(device_type="cuda", dtype=dtype):
         # Reshape for matmul: [batch_size, seq_length, hidden_dim] -> [batch_size * seq_length, hidden_dim]
         hidden_states_reshaped = hidden_states.reshape(-1, hidden_dim)
         logits = torch.matmul(hidden_states_reshaped, weight.t())  # Use transpose for matmul
@@ -61,7 +61,7 @@ def test_fused_cross_entropy():
 
     # Measure memory for fused implementation
     torch.cuda.reset_peak_memory_stats()
-    with torch.amp.autocast(device_type='cuda', dtype=dtype):
+    with torch.amp.autocast(device_type="cuda", dtype=dtype):
         fused_loss = fused_linear_cross_entropy(hidden_states, weight, targets)
     fused_memory = torch.cuda.max_memory_allocated()
 
@@ -76,8 +76,8 @@ def test_fused_cross_entropy():
     fused_loss = fused_loss.float()
 
     # Check if the losses are close
-    assert torch.allclose(
-        fused_loss, pytorch_loss, rtol=1e-2, atol=1e-2
-    ), f"Loss mismatch: PyTorch={pytorch_loss.item()}, Fused={fused_loss.item()}"
+    assert torch.allclose(fused_loss, pytorch_loss, rtol=1e-2, atol=1e-2), (
+        f"Loss mismatch: PyTorch={pytorch_loss.item()}, Fused={fused_loss.item()}"
+    )
     # Check if the fused implementation uses less memory
     assert fused_memory < pytorch_memory, "Fused implementation should use less memory than PyTorch implementation"

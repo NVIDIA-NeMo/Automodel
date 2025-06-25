@@ -34,6 +34,11 @@ GPU_INSTALL_STRING = (
     """https://pypi.nvidia.com nemo-curator[cuda12x]`
 or use `pip install --extra-index-url https://pypi.nvidia.com ".[cuda12x]"` if installing from source"""
 )
+MISSING_TRITON_MSG = "triton is not installed. Please install it with `pip install triton`."
+MISSING_QWEN_VL_UTILS_MSG = "qwen_vl_utils is not installed. Please install it with `pip install qwen-vl-utils`."
+MISSING_CUT_CROSS_ENTROPY_MSG = (
+    "cut_cross_entropy is not installed. Please install it with `pip install cut-cross-entropy`."
+)
 
 
 class UnavailableError(Exception):
@@ -57,7 +62,7 @@ def null_decorator(*args, **kwargs):
         return inner
 
 
-class UnavailableMeta(type): # noqa D105
+class UnavailableMeta(type):  # noqa D105
     """
     A metaclass for generating placeholder objects for unavailable symbols.
 
@@ -81,148 +86,148 @@ class UnavailableMeta(type): # noqa D105
     TypeErrors) will be thrown instead.
     """
 
-    def __new__(meta, name, bases, dct): # noqa D105
+    def __new__(meta, name, bases, dct):  # noqa D105
         if dct.get("_msg", None) is None:
             dct["_msg"] = f"{name} could not be imported"
         name = f"MISSING{name}"
         return super(UnavailableMeta, meta).__new__(meta, name, bases, dct)
 
-    def __call__(cls, *args, **kwargs): # noqa D105
+    def __call__(cls, *args, **kwargs):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __getattr__(cls, name): # noqa D105
+    def __getattr__(cls, name):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __eq__(cls, other): # noqa D105
+    def __eq__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __lt__(cls, other): # noqa D105
+    def __lt__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __gt__(cls, other): # noqa D105
+    def __gt__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __le__(cls, other): # noqa D105
+    def __le__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __ge__(cls, other): # noqa D105
+    def __ge__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __ne__(cls, other): # noqa D105
+    def __ne__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __abs__(cls): # noqa D105
+    def __abs__(cls):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __add__(cls, other): # noqa D105
+    def __add__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __radd__(cls, other): # noqa D105
+    def __radd__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __iadd__(cls, other): # noqa D105
+    def __iadd__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __floordiv__(cls, other): # noqa D105
+    def __floordiv__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __rfloordiv__(cls, other): # noqa D105
+    def __rfloordiv__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __ifloordiv__(cls, other): # noqa D105
+    def __ifloordiv__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __lshift__(cls, other): # noqa D105
+    def __lshift__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __rlshift__(cls, other): # noqa D105
+    def __rlshift__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __mul__(cls, other): # noqa D105
+    def __mul__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __rmul__(cls, other): # noqa D105
+    def __rmul__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __imul__(cls, other): # noqa D105
+    def __imul__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __ilshift__(cls, other): # noqa D105
+    def __ilshift__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __pow__(cls, other): # noqa D105
+    def __pow__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __rpow__(cls, other): # noqa D105
+    def __rpow__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __ipow__(cls, other): # noqa D105
+    def __ipow__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __rshift__(cls, other): # noqa D105
+    def __rshift__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __rrshift__(cls, other): # noqa D105
+    def __rrshift__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __irshift__(cls, other): # noqa D105
+    def __irshift__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __sub__(cls, other): # noqa D105
+    def __sub__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __rsub__(cls, other): # noqa D105
+    def __rsub__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __isub__(cls, other): # noqa D105
+    def __isub__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __truediv__(cls, other): # noqa D105
+    def __truediv__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __rtruediv__(cls, other): # noqa D105
+    def __rtruediv__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __itruediv__(cls, other): # noqa D105
+    def __itruediv__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __divmod__(cls, other): # noqa D105
+    def __divmod__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __rdivmod__(cls, other): # noqa D105
+    def __rdivmod__(cls, other):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __neg__(cls): # noqa D105
+    def __neg__(cls):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __invert__(cls): # noqa D105
+    def __invert__(cls):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __hash__(cls): # noqa D105
+    def __hash__(cls):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __index__(cls): # noqa D105
+    def __index__(cls):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __iter__(cls): # noqa D105
+    def __iter__(cls):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __delitem__(cls, name): # noqa D105
+    def __delitem__(cls, name):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __setitem__(cls, name, value): # noqa D105
+    def __setitem__(cls, name, value):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __enter__(cls, *args, **kwargs): # noqa D105
+    def __enter__(cls, *args, **kwargs):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __get__(cls, *args, **kwargs): # noqa D105
+    def __get__(cls, *args, **kwargs):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __delete__(cls, *args, **kwargs): # noqa D105
+    def __delete__(cls, *args, **kwargs):  # noqa D105
         raise UnavailableError(cls._msg)
 
-    def __len__(cls): # noqa D105
+    def __len__(cls):  # noqa D105
         raise UnavailableError(cls._msg)
 
 

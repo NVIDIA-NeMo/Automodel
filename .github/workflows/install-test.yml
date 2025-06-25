@@ -1,0 +1,169 @@
+name: Installation Test
+
+on:
+  push:
+    branches:
+      - main
+      - "pull-request/[0-9]+"
+
+jobs:
+  pip-test:
+    runs-on: ${{ matrix.arch }}
+    name: (CPU) Python ${{ matrix.python-version }} on ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ["ubuntu-latest", "macos-latest"]
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Upgrade pip
+        run: |
+          python -m pip install --upgrade pip
+
+      - name: Install project
+        run: |
+          pip install "."
+
+      - name: Checkout check-imports
+        uses: actions/checkout@v4
+        with:
+          repository: NVIDIA-NeMo/FW-CI-templates
+          ref: v0.39.0
+          path: FW-CI-templates
+
+      - name: Check imports for nemo_automodel
+        uses: ./FW-CI-templates/.github/actions/check-imports
+        with:
+          package-name: nemo_automodel
+          python-binary: python
+
+  ngc-cuda-test:
+    runs-on: linux-amd64-cpu16
+    name: (GPU) Python ${{ matrix.python-version }}
+    container:
+      image: nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+    environment: nemo-ci
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install wget
+        run: |
+          apt-get update
+          apt-get install -y wget git
+
+      - name: Upgrade pip
+        run: |
+          python -m pip install --upgrade pip
+
+      - name: Set up UV
+        uses: astral-sh/setup-uv@v1
+        with:
+          version: 0.7.2
+
+      - name: Set up yq
+        shell: bash
+        run: |
+          wget https://github.com/mikefarah/yq/releases/download/v4.45.4/yq_linux_amd64.tar.gz
+          tar -xzf yq_linux_amd64.tar.gz
+          mkdir -p ./bin
+          mv yq_linux_amd64 ./bin/yq 
+          chmod +x ./bin/yq
+
+      - name: Install project
+        env:
+          PAT: ${{ secrets.PAT }}
+          UV_PROJECT_ENVIRONMENT: ./venv
+        shell: bash
+        run: |
+          echo -e "machine github.com\n  login token\n  password ${{ secrets.PAT }}" > ~/.netrc
+          chmod 600 ~/.netrc 
+          python -m venv ./venv
+          source ./venv/bin/activate
+
+          export PATH="./bin/:$PATH"
+
+          pip install "."
+
+      - name: Checkout check-imports
+        uses: actions/checkout@v4
+        with:
+          repository: NVIDIA-NeMo/FW-CI-templates
+          ref: v0.39.0
+          path: FW-CI-templates
+
+      - name: Check imports for nemo_automodel
+        uses: ./FW-CI-templates/.github/actions/check-imports
+        with:
+          package-name: nemo_automodel
+          python-binary: ./venv/bin/python
+
+  uv-test:
+    runs-on: ${{ matrix.arch }}
+    name: UV on ${{ matrix.arch }}
+    environment: nemo-ci
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ["ubuntu-latest", "macos-latest"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up UV
+        uses: astral-sh/setup-uv@v1
+        with:
+          version: 0.7.2
+
+      - name: Install dependencies with UV
+        env:
+          UV_PROJECT_ENVIRONMENT: ./venv
+          PAT: ${{ secrets.PAT }}
+        run: |
+
+          echo -e "machine github.com\n  login token\n  password ${{ secrets.PAT }}" > ~/.netrc
+          chmod 600 ~/.netrc 
+
+          export PATH=".bin/:$PATH"
+
+          uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+
+          uv sync --link-mode copy --locked --all-groups
+
+      - name: Checkout check-imports
+        uses: actions/checkout@v4
+        with:
+          repository: NVIDIA-NeMo/FW-CI-templates
+          ref: v0.39.0
+          path: FW-CI-templates
+
+      - name: Check imports for nemo_automodel
+        uses: ./FW-CI-templates/.github/actions/check-imports
+        with:
+          package-name: nemo_automodel
+          python-binary: ./venv/bin/python
+
+  install-test-summary:
+    needs: [pip-test, uv-test, ngc-cuda-test]
+    runs-on: ubuntu-latest
+    name: Install test summary
+    steps:
+      - name: Result
+        run: echo Install check successful
