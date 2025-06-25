@@ -54,7 +54,9 @@ inputs:
     description: "Has Azure credentials"
     required: false
     default: "false"
-
+  PAT:
+    description: "GitHub Personal Access Token"
+    required: true
 runs:
   using: "composite"
   steps:
@@ -180,8 +182,8 @@ runs:
       run: |
         docker exec nemo_container_${{ github.run_id }} bash -c '
           set -e
-          
-          echo -e "machine github.com\n  login token\n  password ${{ secrets.PAT }}" > ~/.netrc
+
+          echo -e "machine github.com\n  login token\n  password ${{ inputs.PAT }}" > ~/.netrc
           chmod 600 ~/.netrc
 
           apt-get update
