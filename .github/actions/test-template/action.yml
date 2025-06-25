@@ -180,10 +180,10 @@ runs:
     - name: Install dependencies
       shell: bash
       run: |
-        docker exec -t nemo_container_${{ github.run_id }} bash -c '
+        docker exec nemo_container_${{ github.run_id }} bash -c '
           set -e
 
-          echo -e "machine github.com\n  login token\n  password ${{ inputs.PAT }}" > ~/.netrc
+          echo -e "machine github.com\n  login token\n  password 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" > ~/.netrc
           chmod 600 ~/.netrc
 
           apt-get update
