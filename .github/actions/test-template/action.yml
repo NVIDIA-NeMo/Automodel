@@ -187,7 +187,7 @@ runs:
           chmod 600 ~/.netrc
 
           apt-get update
-          apt-get install -y curl
+          apt-get install -y curl git
           
           # Install uv
           curl -LsSf https://astral.sh/uv/0.7.2/install.sh | sh
