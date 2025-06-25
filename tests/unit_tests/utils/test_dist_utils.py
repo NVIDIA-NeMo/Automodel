@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import os
-import types
 from types import SimpleNamespace
 from pathlib import Path
 
