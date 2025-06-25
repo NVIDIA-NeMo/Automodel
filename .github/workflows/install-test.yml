@@ -117,7 +117,7 @@ jobs:
 
   ngc-cuda-test-pip:
     runs-on: linux-amd64-cpu16
-    name: UV - Python${{ matrix.python-version }}${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }} - AMD64/Linux - NGC CUDA
+    name: PIP - Python${{ matrix.python-version }}${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }} - AMD64/Linux - NGC CUDA
     container:
       image: nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
     environment: nemo-ci
@@ -136,7 +136,7 @@ jobs:
         shell: bash -x -e -u -o pipefail {0}
         run: |
           apt-get update
-          apt-get install -y python3 python3-pip python3-venv
+          apt-get install -y python3 python3-pip python3-venv git
           python3 -m venv ./venv
 
           . ./venv/bin/activate
