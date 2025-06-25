@@ -180,6 +180,9 @@ runs:
       run: |
         docker exec nemo_container_${{ github.run_id }} bash -c '
           set -e
+
+          apt-get update
+          apt-get install -y curl
           
           # Install uv
           curl -LsSf https://astral.sh/uv/0.7.2/install.sh | sh
