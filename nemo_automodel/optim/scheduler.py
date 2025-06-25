@@ -8,8 +8,6 @@ from typing import Optional
 
 from torch.optim.optimizer import Optimizer
 
-from nemo_automodel.utils.common_utils import log_single_rank
-
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +114,7 @@ class OptimizerParamScheduler:
 
         # Set the learning rate
         self.step(0)
-        log_single_rank(logger, logging.INFO, f"> learning rate decay style: {self.lr_decay_style}")
+        logger.info("learning rate decay style: {}".format(self.lr_decay_style))
 
     def get_wd(self) -> float:
         """
@@ -248,7 +246,7 @@ class OptimizerParamScheduler:
             name (str): name of the parameter
         """
         if self.override_opt_param_scheduler:
-            log_single_rank(logger, logging.INFO, f" > overriding {name} value to {cls_value}")
+            logger.info("overriding {} value to {}".format(name, cls_value))
             return cls_value
 
         if not self.use_checkpoint_opt_param_scheduler:
@@ -257,7 +255,7 @@ class OptimizerParamScheduler:
                 f"value {sd_value} for {name} do not match"
             )
 
-        log_single_rank(logger, logging.INFO, f" > using checkpoint value {sd_value} for {name}")
+        logger.info("using checkpoint value {} for {}".format(sd_value, name))
         return sd_value
 
     def load_state_dict(self, state_dict: dict) -> None:
