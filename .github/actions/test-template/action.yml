@@ -178,7 +178,7 @@ runs:
     - name: Install dependencies
       shell: bash
       run: |
-        docker exec nemo_container_${{ github.run_id }} bash -c <<'EOF'
+        docker exec nemo_container_${{ github.run_id }} bash -c '
           set -e
           
           # Install uv
@@ -193,7 +193,7 @@ runs:
           # Create virtual environment and install dependencies
           uv venv ${UV_PROJECT_ENVIRONMENT}
           uv sync
-        EOF
+        '
 
     - name: Create run-script
       id: create
