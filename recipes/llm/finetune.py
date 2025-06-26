@@ -42,11 +42,8 @@ from transformers import AutoTokenizer
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.config.cli import parse_args_and_load_config
 from nemo_automodel.datasets.llm.packed_sequence import PackedSequence
+from nemo_automodel.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.distributed.init_utils import initialize_distributed
-from nemo_automodel.distributed.parallelizer import (
-    create_context_parallel_ctx,
-    get_train_context,
-)
 from nemo_automodel.loggers.log_utils import setup_logging
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.rng import StatefulRNG
@@ -407,9 +404,6 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if loss_mask is None:
             loss_mask = (labels.detach() != -100).to(torch.int)
 
-        # TODO(@boxiangw): Refractor. Needed for SP support
-        # If 'position_ids' does not exist in batch already then override it. batch in case of Packed sequence
-        # contains 'position_ids' and we don't want to override it.
         if (
             "position_ids" not in batch
             and self.device_mesh is not None
@@ -417,43 +411,9 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         ):
             batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
 
-        # based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/train.py#L336
-        if self.device_mesh and self.device_mesh["context_parallel"].size() > 1:
-            input_ids = batch["input_ids"].to(self.model.device)
-            position_ids = batch["position_ids"].to(self.model.device)
-
-            if loss_mask is not None:
-                cp_buffers = [input_ids, labels, position_ids, loss_mask]
-                cp_seq_dims = [1, 1, 1, 1]
-                cp_no_restore_buffers = {input_ids, labels, loss_mask}
-            else:
-                cp_buffers = [input_ids, labels, position_ids]
-                cp_seq_dims = [1, 1, 1]
-                cp_no_restore_buffers = {input_ids, labels}
-
-            context_parallel_ctx = create_context_parallel_ctx(
-                cp_mesh=self.model_wrapper.device_mesh["context_parallel"],
-                cp_buffers=cp_buffers,
-                cp_seq_dims=cp_seq_dims,
-                cp_no_restore_buffers=cp_no_restore_buffers,
-                cp_rotate_method="allgather",  # TODO add "alltoall" option
-            )
-            train_context = get_train_context(
-                False,
-                False,
-            )
-
-            with train_context(context_parallel_ctx):
-                out = self.model(**batch)
-                local_loss = self.loss_fn(
-                    out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum"
-                )
-            # In the case where all labels are masked, the loss should be 0.
-            if loss_mask is not None and loss_mask.bool().sum() == 0:
-                local_loss.detach().copy_(torch.zeros_like(local_loss))
-
-        else:
-            out = self.model(**batch)
+        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels, loss_mask)
+        with train_ctx():
+            out  = self.model(**batch)
             local_loss = self.loss_fn(
                 out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum"
             )
@@ -546,41 +506,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
                     )
 
-                if self.device_mesh and self.device_mesh["context_parallel"].size() > 1:
-                    input_ids = batch["input_ids"].to(self.model.device)
-                    position_ids = batch["position_ids"].to(self.model.device)
-
-                    if loss_mask is not None:
-                        cp_buffers = [input_ids, labels, position_ids, loss_mask]
-                        cp_seq_dims = [1, 1, 1, 1]
-                        cp_no_restore_buffers = {input_ids, labels, loss_mask}
-                    else:
-                        cp_buffers = [input_ids, labels, position_ids]
-                        cp_seq_dims = [1, 1, 1]
-                        cp_no_restore_buffers = {input_ids, labels}
-
-                    context_parallel_ctx = create_context_parallel_ctx(
-                        cp_mesh=self.model_wrapper.device_mesh["context_parallel"],
-                        cp_buffers=cp_buffers,
-                        cp_seq_dims=cp_seq_dims,
-                        cp_no_restore_buffers=cp_no_restore_buffers,
-                        cp_rotate_method="allgather",  # TODO add "alltoall" option
-                    )
-                    train_context = get_train_context(
-                        False,
-                        False,
-                    )
-
-                    with train_context(context_parallel_ctx):
-                        out = self.model(**batch)
-                        local_loss = self.loss_fn(
-                            out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum"
-                        )
-
-                    # In the case where all labels are masked, the loss should be 0.
-                    if loss_mask is not None and loss_mask.bool().sum() == 0:
-                        local_loss.detach().copy_(torch.zeros_like(local_loss))
-                else:
+                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels, loss_mask)
+                with train_ctx():
                     out = self.model(**batch)
                     local_loss = self.loss_fn(
                         out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum"
