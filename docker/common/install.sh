@@ -30,16 +30,15 @@ if [[ "$BASE_IMAGE" != "pytorch" && "$BASE_IMAGE" != "cuda" ]]; then
 fi
 
 main() {
-    echo "Installing dependencies for base image: $BASE_IMAGE"
-
     if [[ -n "${PAT:-}" ]]; then
         echo -e "machine github.com\n  login token\n  password $PAT" >~/.netrc
         chmod 600 ~/.netrc
     fi
 
     # Install dependencies
+    export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y curl git
+    apt-get install -y curl git libopenmpi-dev libpython3.12
 
     # Install uv
     UV_VERSION="0.7.2"
@@ -48,9 +47,6 @@ main() {
     export UV_PROJECT_ENVIRONMENT=/opt/venv
     export PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
     export UV_LINK_MODE=copy
-
-    # Create virtual environment and install dependencies
-    uv venv ${UV_PROJECT_ENVIRONMENT}
 
     UV_ARGS=()
     if [[ "$BASE_IMAGE" == "pytorch" ]]; then
@@ -74,15 +70,20 @@ main() {
         )
     fi
 
+    # Create virtual environment and install dependencies
+    uv venv ${UV_PROJECT_ENVIRONMENT} $([[ "$BASE_IMAGE" == "pytorch" ]] && echo "--system-site-packages")
+
+    # Install dependencies
+    uv sync --only-group build ${UV_ARGS[@]}
     uv sync \
         --link-mode copy \
         --locked \
         --all-groups ${UV_ARGS[@]}
 
-    # Run install overrides if the file exists
-    echo "Running install conflicting dependencies..."
+    # Run install overrides
     bash docker/common/install_conflicting_deps.sh
 
+    # Install the package
     uv pip install --no-deps -e .
 
     # Write environment variables to a file for later sourcing
