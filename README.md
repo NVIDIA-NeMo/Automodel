@@ -58,7 +58,7 @@ NeMo AutoModel provides native support for a wide range of models available on t
 - **👁️ Vision-Language Model Ready**: Native support for VLMs (Qwen2-VL, Gemma-3-VL, etc)
 - **🧩 Advanced PEFT Methods**: LoRA and extensible PEFT system out of the box
 - **📦 Seamless HF Ecosystem**: Fine-tuned models work perfectly with Transformers pipeline, VLM, etc.
-- **⚙️ Production-Grade Infrastructure**: Checkpointing, logging and monitoring
+- **⚙️ Robust Infrastructure**: Distributed checkpointing with integrated logging and monitoring
 - **🎯 Optimized Recipes**: Pre-built configurations for common models and datasets
 - **🔧 Flexible Configuration**: YAML-based configuration system for reproducible experiments
 - **⚡ FP8 Precision**: Native FP8 training & inference for higher throughput and lower memory use
