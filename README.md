@@ -82,7 +82,7 @@ pip3 install nemo_automodel   # or: pip install --upgrade nemo_automodel
 pip3 install git+https://github.com/NVIDIA-NeMo/Automodel.git
 ```
 
-### 🐳 NeMo Container
+<!-- ### 🐳 NeMo Container
 ```bash
 # Pull the latest NeMo Framework container
 docker pull nvcr.io/nvidia/nemo:25.07
@@ -91,7 +91,7 @@ docker pull nvcr.io/nvidia/nemo:25.07
 docker run --gpus all -it --rm \
     -v $(pwd):/workspace \
     nvcr.io/nvidia/nemo:25.07 bash
-```
+``` -->
 
 #### Verify installation
 ```
