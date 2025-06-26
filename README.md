@@ -33,7 +33,7 @@ NeMo AutoModel delivers true **Day-0**, drop-in compatibility for Hugging Face m
 | **VLM** | `google/gemma-3-4b-it` | [CORD-v2 + LoRA](recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml) | [CORD-v2](recipes/vlm/gemma_3_vl_3b_cord_v2.yaml) | Coming Soon |
 
 
-## 🎛️ Supported Models
+### 🎛️ Supported Models
 
 ### Large Language Models
 - **LLaMA Family**: LLaMA 3, LLaMA 3.1, LLaMA 3.2, Code Llama
