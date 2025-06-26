@@ -12,16 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# MODEL=/home/TestData/akoumparouli/hf_mixtral_2l/
-MODEL=/home/TestData/akoumparouli/hf_gemma_38m/
-
 TRANSFORMERS_OFFLINE=1 coverage run -a --data-file=/workspace/.coverage --source=/workspace \
 recipes/llm/finetune.py \
   --config recipes/llm/llama_3_2_1b_squad.yaml \
-  --model.pretrained_model_name_or_path $MODEL \
+  --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
   --step_scheduler.max_steps 3 \
   --step_scheduler.grad_acc_steps 1 \
-  --dataset.tokenizer.pretrained_model_name_or_path $MODEL \
-  --validation_dataset.tokenizer.pretrained_model_name_or_path $MODEL \
+  --dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
+  --validation_dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
   --dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
   --dataset.limit_dataset_samples 10
