@@ -15,6 +15,7 @@ import torch
 
 from nemo_automodel.datasets.vlm.utils import extract_skipped_token_ids
 from nemo_automodel.shared.import_utils import MISSING_QWEN_VL_UTILS_MSG
+from unittest.mock import MagicMock
 
 try:
     from qwen_vl_utils import process_vision_info
@@ -22,6 +23,7 @@ try:
     HAVE_QWEN_VL_UTILS = True
 except ImportError:
     HAVE_QWEN_VL_UTILS = False
+    process_vision_info = MagicMock()
 
 
 def qwen2_5_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:

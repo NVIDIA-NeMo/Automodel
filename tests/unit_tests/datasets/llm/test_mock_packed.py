@@ -57,14 +57,18 @@ def test_basic_packing(seed):
     """Dataset has correct size and every block passes consistency check."""
     NUM_BLOCKS = 4
     BLOCK_SIZE = 32
+    VOCAB_SIZE = 100
 
-    ds, vocab = build_packed_dataset(
+    ds = build_packed_dataset(
         num_blocks=NUM_BLOCKS,
         block_size=BLOCK_SIZE,
         mean_len=10,
         std_len=3,
         seed=seed,
+        vocab_size=VOCAB_SIZE,
     )
+
+    vocab = make_vocab(VOCAB_SIZE)
 
     # correct number of rows
     assert len(ds) == NUM_BLOCKS
