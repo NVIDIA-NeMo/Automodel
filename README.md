@@ -12,7 +12,7 @@
 
 <!-- **Day-0 integration with Hugging Face models automating fine-tuning and pretraining with pytorch-native parallelism, custom-kernels and optimized recipes** -->
 
-[📖 Documentation](https://github.com/NVIDIA-NeMo/Automodel/) • [🔥 Quickstart](#quickstart) • [💡 Examples](#examples) • [🤝 Contributing](CONTRIBUTING.md)
+[📖 Documentation](https://github.com/NVIDIA-NeMo/Automodel/) • [🔥 Quickstart](#quickstart) • [💡 Examples](https://github.com/NVIDIA-NeMo/Automodel/tree/main/recipes) • [🤝 Contributing](CONTRIBUTING.md)
 
 </div>
 
