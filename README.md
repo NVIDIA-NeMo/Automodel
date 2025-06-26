@@ -72,7 +72,7 @@ NeMo AutoModel provides native support for a wide range of models available on t
 - **⚡ FP8 Precision**: Native FP8 training and inference for higher throughput and lower memory use
 - **🔢 INT4 / INT8 Quantization**: Turn-key quantization workflows for ultra-compact, low-memory training
 
-> ⚠️ Note: NeMo AutoModel is under active development-new features, improvements, and documentation updates land regularly. We are working toward a stable release, so expect the interface to solidify over time. Your feedback and contributions are welcome, and we recommend keeping an eye on updates.
+> ⚠️ Note: NeMo AutoModel is under active development. New features, improvements, and documentation updates are released regularly. We are working toward a stable release, so expect the interface to solidify over time. Your feedback and contributions are welcome, and we encourage you to follow along as new updates roll out.
 
 ---
 ## ✨ Install NeMo AutoModel
