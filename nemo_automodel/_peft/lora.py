@@ -37,6 +37,7 @@ MODEL_TYPE_TO_PEFT_TASK_TYPE = {
         "TokenClassification": "TOKEN_CLS",
         "QuestionAnswering": "QUESTION_ANS",
         "FeatureExtraction": "FEATURE_EXTRACTION",
+        "ConditionalGeneration": "CONDITIONAL_GENERATION",
     }
 
 class LinearLoRA(nn.Linear):
