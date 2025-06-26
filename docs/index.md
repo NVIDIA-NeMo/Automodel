@@ -1,7 +1,3 @@
-# NeMo-AutoModel Documentation
-
-```{toctree}
-:maxdepth: 2
-
-apidocs/index
+```{include} ../README.md
+:relative-docs: docs/
 ```
