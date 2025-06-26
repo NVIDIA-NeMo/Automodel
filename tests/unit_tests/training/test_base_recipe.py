@@ -144,6 +144,7 @@ def test_save_and_load_roundtrip(tmp_path):
 
     # Perform one training step so parameters / optimizer state differ from init.
     x = torch.randn(4, 2)
+    recipe_inst.model.train()
     loss = recipe_inst.model(x).sum()
     loss.backward()
     recipe_inst.optimizer.step()
