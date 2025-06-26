@@ -63,7 +63,14 @@ NeMo AutoModel provides native support for a wide range of models available on t
 - **🔧 Flexible Configuration**: YAML-based configuration system for reproducible experiments
 - **⚡ FP8 Precision**: Native FP8 training & inference for higher throughput and lower memory use
 - **🔢 INT4 / INT8 Quantization**: Turn-key quantization workflows for ultra-compact, low-memory training
-
+**👁️ Vision-Language Model Ready**: Out-of-the-box support for VLMs like Qwen2-VL and Gemma-3-VL
+- **🧩 Advanced PEFT Methods**: Includes LoRA and an extensible PEFT system for efficient adaptation
+- **📦 Seamless HF Ecosystem**: Fine-tuned models work perfectly with Transformers pipeline, VLM, etc.
+- **⚙️ Production-Grade Infrastructure**: Built-in support for checkpointing, logging, monitoring, and fault tolerance
+- **🎯 Optimized Recipes**: Preconfigured setups for popular models and datasets
+- **🔧 Flexible Configuration**: YAML-based configuration system for reproducible experiments
+- **⚡ FP8 Precision**: Native FP8 training and inference for higher throughput and lower memory use
+- **🔢 INT4 / INT8 Quantization**: Turn-key quantization workflows for ultra-compact, low-memory training
 
 > ⚠️ Note: NeMo AutoModel is under active development-new features, improvements, and documentation updates land regularly. We are working toward a stable release, so expect the interface to solidify over time. Your feedback and contributions are welcome, and we recommend keeping an eye on updates.
 
