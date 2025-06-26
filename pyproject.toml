@@ -168,7 +168,7 @@ lines-after-imports = 2
 # Ignore docstring requirements in test files
 "test_*.py" = ["D101", "D103"]
 "*_test.py" = ["D101", "D103"]
-"tests/*.py" = ["D101", "D103", "C0116", "C0115"]
+"tests/*.py" = ["D101", "D103"]
 "nemo_automodel/checkpoint/_backports/*.py" = ["D101", "D103", "D205", "D417", "D415"]
 
 [tool.ruff.format]
