@@ -78,6 +78,10 @@ main() {
         --locked \
         --all-groups ${UV_ARGS[@]}
 
+    # Run install overrides if the file exists
+    echo "Running install conflicting dependencies..."
+    bash docker/common/install_conflicting_deps.sh
+
     uv pip install --no-deps -e .
 
     # Write environment variables to a file for later sourcing
