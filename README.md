@@ -20,7 +20,7 @@
 
 ## ✨ What is NeMo AutoModel?
 
-NeMo AutoModel delivers true **Day-0**, drop-in compatibility for Hugging Face models. Start fine-tuning models instantly, scale effortlessly with built-in pytorch-native data/model parallelism, optimized custom kernels, and memory-efficient recipes-all while preserving the original checkpoint format for seamless use across the Hugging Face ecosystem.
+NeMo AutoModel delivers true **Day-0**, drop-in compatibility for Hugging Face models. Start fine-tuning models instantly, scale effortlessly with pytorch-native data/model parallelism, optimized custom kernels, and memory-efficient recipes-all while preserving the original checkpoint format for seamless use across the Hugging Face ecosystem.
 
 
 
