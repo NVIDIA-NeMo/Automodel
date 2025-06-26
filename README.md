@@ -93,9 +93,8 @@ docker run --gpus all -it --rm \
     nvcr.io/nvidia/nemo:25.07 bash
 ``` -->
 
-#### Verify installation
+### Verify the Installation
 ```
-# Verify the Installation
 python -c "import nemo_automodel; print('✅ NeMo AutoModel ready!')"
 ```
 
