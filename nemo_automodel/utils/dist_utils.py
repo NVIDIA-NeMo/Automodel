@@ -19,7 +19,7 @@ import os
 from contextlib import ContextDecorator, nullcontext
 from datetime import datetime
 import torch
-from types import Optional
+from typing import Optional
 import torch.distributed
 import torch.distributed as dist
 
