@@ -81,7 +81,7 @@ python -c "import nemo_automodel; print('✅  NeMo AutoModel ready!')"
 
 ### 🔧 Install from Source
 ```
-# 1. Install the latest stable release from PyPI
+# 1. Install the latest NeMo Automodel from the GitHub repo (best for development).
 pip3 install git+https://github.com/NVIDIA-NeMo/Automodel.git
 
 # 2. Verify the install
