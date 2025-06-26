@@ -44,6 +44,7 @@ def init_all_rng(seed: int, ranked: bool = False):
         torch.cuda.manual_seed_all(seed)
 
 
+
 class StatefulRNG:
     """Context manager for reproducible RNG states across random, NumPy, and PyTorch.
     """
@@ -55,10 +56,13 @@ class StatefulRNG:
             seed (int): Base seed for RNGs.
             ranked (bool): Adjust seed based on process rank.
         """
-        init_all_rng(seed, ranked)
+        self._init_state = self.state_dict()
+        self._saved_state = None
         self.seed = seed
         self.ranked = ranked
-        self._saved_state = None
+
+    def __del__(self):
+        self.load_state_dict(self._init_state)
 
     def state_dict(self):
         """Get current RNG states.

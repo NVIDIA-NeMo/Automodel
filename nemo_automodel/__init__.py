@@ -29,14 +29,16 @@ __all__ = [
     "__package_name__",
 ]
 
-# ==== Promote NeMoAutoModelForCausalLM into the top level ====
+# ==== Promote NeMoAutoModelForCausalLM, AutoModelForImageTextToText into the top level ====
 try:
     # adjust this import path if your class lives somewhere else
-    from ._transformers.auto_model import NeMoAutoModelForCausalLM
+    from ._transformers.auto_model import NeMoAutoModelForCausalLM, AutoModelForImageTextToText
 
     globals()["NeMoAutoModelForCausalLM"] = NeMoAutoModelForCausalLM
+    globals()["AutoModelForImageTextToText"] = AutoModelForImageTextToText
     __all__.append("NeMoAutoModelForCausalLM")
-except ImportError:
+    __all__.append("AutoModelForImageTextToText")
+except:
     # optional dependency might be missing,
     # leave the name off the module namespace so other imports still work
     pass
