@@ -187,18 +187,14 @@ runs:
         cmd=$(cat <<'RUN_TEST_EOF'
         #!/bin/bash
 
-        (
+        docker exec -t nemo_container_${{ github.run_id }} bash -c '
           set -e
+          
+          . /opt/venv/env.sh
 
-          docker exec -t nemo_container_${{ github.run_id }} bash -c '
-            set -e
-            
-            . /opt/venv/env.sh
-
-            bash tests/${{ inputs.is_unit_test == 'true' && 'unit_tests' || 'functional_tests' }}/${{ inputs.script }}.sh
-            
-          '
-        ) 2>&1 | tee err.log
+          bash tests/${{ inputs.is_unit_test == 'true' && 'unit_tests' || 'functional_tests' }}/${{ inputs.script }}.sh
+          
+        '
 
         RUN_TEST_EOF
         )
@@ -229,7 +225,8 @@ runs:
         coverage_report=coverage-${{ steps.create.outputs.coverage-prefix }}-${{ github.run_id }}-$(uuidgen)
         echo "coverage_report=$coverage_report" >> "$GITHUB_OUTPUT"
 
-        IS_SUCCESS=${{ steps.run-main-script.outputs.exit_code == '0' && 'true' || 'false' }}
+        EXIT_CODE=${{ steps.run-main-script.outputs.exit_code }}
+        IS_SUCCESS=$([[ "$EXIT_CODE" -eq 0 ]] && echo "true" || echo "false")
 
         if [[ "$IS_SUCCESS" == "false" && "${{ inputs.is_optional }}" == "true" ]]; then
           echo "::warning:: Test failed, but displayed as successful because it is marked as optional."
