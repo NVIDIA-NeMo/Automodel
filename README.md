@@ -68,7 +68,7 @@ NeMo AutoModel provides native support for a wide range of models available on t
 > ⚠️ Note: NeMo AutoModel is under active development-new features, improvements, and documentation updates land regularly. We are working toward a stable release, so expect the interface to solidify over time. Your feedback and contributions are welcome, and we recommend keeping an eye on updates.
 
 ---
-## ✨ Installation
+## ✨ Install NeMo AutoModel
 NeMo AutoModel is offered both as a standard Python package installable via pip and as a ready-to-run NeMo Framework Docker container.
 
 ### 📦 Install from a wheel package
