@@ -72,22 +72,15 @@ NeMo AutoModel is offered both as a standard Python package installable via pip 
 
 ### 📦 Python Package with Pip
 ```
-# 1. Install the latest stable release from PyPI
+# Install the latest stable release from PyPI
 pip3 install nemo_automodel   # or: pip install --upgrade nemo_automodel
-
-# 2. Verify the install
-python -c "import nemo_automodel; print('✅  NeMo AutoModel ready!')"
 ```
 
 ### 🔧 Install from Source
 ```
-# 1. Install the latest NeMo Automodel from the GitHub repo (best for development).
+# Install the latest NeMo Automodel from the GitHub repo (best for development).
 pip3 install git+https://github.com/NVIDIA-NeMo/Automodel.git
-
-# 2. Verify the install
-python -c "import nemo_automodel; print('✅  NeMo AutoModel ready!')"
 ```
-
 
 ### 🐳 NeMo Container
 ```bash
@@ -98,7 +91,10 @@ docker pull nvcr.io/nvidia/nemo:25.07
 docker run --gpus all -it --rm \
     -v $(pwd):/workspace \
     nvcr.io/nvidia/nemo:25.07 bash
+```
 
+#### Verify installation
+```
 # Verify installation
 python -c "import nemo_automodel; print('✅ NeMo AutoModel ready!')"
 ```
