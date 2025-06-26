@@ -84,7 +84,7 @@ NeMo AutoModel is offered both as a standard Python package installable via pip 
 pip3 install nemo_automodel   # or: pip install --upgrade nemo_automodel
 ```
 
-### 🔧 Install from source
+### 🔧 Install from Source
 ```
 # Install the latest NeMo Automodel from the GitHub repo (best for development).
 pip3 install git+https://github.com/NVIDIA-NeMo/Automodel.git
