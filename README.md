@@ -250,9 +250,10 @@ We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) f
 
 ## 📄 License
 
-<!-- This project is licensed under the ??? - see the [LICENSE](LICENSE) file for details. -->
+NVIDIA NeMo AutoModel is licensed under the [Apache License 2.0](https://github.com/NVIDIA-NeMo/Automodel/blob/main/LICENSE).
 
 ---
+
 
 ## 🔗 Links
 
