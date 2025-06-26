@@ -126,6 +126,7 @@ na.peft.lora(model, rank=16, alpha=32)
 ``` -->
 
 ## Run with Pre-built Recipes
+These YAML examples illustrate common configurations used with NeMo AutoModel recipes.
 
 ```bash
 # Fine-tune LLaMA on HellaSwag (single GPU)
@@ -180,20 +181,20 @@ peft:
   use_triton: True
 ```
 
-### 3. Vision-Language Model Fine-tuning
+### 3. Vision-Language Model Fine-Tuning
 ```yaml
 model:
   _target_: nemo_automodel._transformers.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
-  
+
 processor:
   _target_: transformers.AutoProcessor.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
   min_pixels: 200704
-  max_pixels: 1003520 
+  max_pixels: 1003520
 ```
 
-### 4. Checkpointing & Resume
+### 4. Checkpointing and Resume
 ```yaml
 checkpoint:
   enabled: true
