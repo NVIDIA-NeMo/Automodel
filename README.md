@@ -109,7 +109,7 @@ python -c "import nemo_automodel; print('✅ NeMo AutoModel ready!')"
 
 ---
 
-## 🔥 Quickstart
+<!-- ## 🔥 Quickstart -->
 
 <!-- ### 30-Second Fine-tuning
 
@@ -125,7 +125,7 @@ na.peft.lora(model, rank=16, alpha=32)
 # Your model is ready for training!
 ``` -->
 
-### Run with Pre-built Recipes
+## Run with Pre-built Recipes
 
 ```bash
 # Fine-tune LLaMA on HellaSwag (single GPU)
