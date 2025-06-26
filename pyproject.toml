@@ -107,7 +107,7 @@ source = [".", "/workspace", "/home/runner/work/NeMo-Automodel/NeMo-Automodel"]
 
 [tool.coverage.run]
 omit = [
-    "*nemo_automodel/checkpoint/_backports/*.py",
+    "nemo_automodel/checkpoint/_backports/*.py",
 ]
 
 [tool.ruff]
