@@ -64,7 +64,7 @@ NeMo AutoModel delivers true **Day-0**, drop-in compatibility for Hugging Face m
 - **🔢 INT4 / INT8 Quantization**: Turn-key quantization workflows for ultra-compact, low-memory training
 
 
-> ⚠️ Note: NeMo AutoModel is actively evolving—new features, refinements, and documentation updates land regularly, and the interface may change between releases. Your feedback and contributions are welcome, and we recommend keeping an eye on updates.
+> ⚠️ Note: NeMo AutoModel is under active development-new features, improvements, and documentation updates land regularly. We are working toward a stable release, so expect the interface to solidify over time. Your feedback and contributions are welcome, and we recommend keeping an eye on updates.
 
 ---
 ## ✨ Installation
