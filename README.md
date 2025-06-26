@@ -72,9 +72,9 @@ NeMo AutoModel delivers true **Day-0**, drop-in compatibility for Hugging Face m
 
 ## 🔧 Installation
 
-### 🐳 Recommended: NeMo Framework Container (Easiest)
+### 🐳 Recommended: NeMo Framework Container
 
-The fastest way to get started is using the pre-built NeMo Framework Training container with NeMo AutoModel already installed:
+The fastest way to get started is using the pre-built NeMo Framework container with NeMo AutoModel already installed:
 
 ```bash
 # Pull the latest NeMo Framework container
@@ -99,6 +99,8 @@ cd NeMo-Automodel
 # Install in development mode
 pip install -e .
 
+# Verify installation
+python -c "import nemo_automodel; print('✅ NeMo AutoModel ready!')"
 ```
 
 ---
