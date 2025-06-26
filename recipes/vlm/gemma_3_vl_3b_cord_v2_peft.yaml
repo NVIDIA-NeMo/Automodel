@@ -43,11 +43,12 @@ model:
 peft:
   peft_fn: nemo_automodel._peft.lora.apply_lora_to_linear_modules
   match_all_linear: False
-  exclude_modules:  # exclude all vision modules
-    - "vision_tower.*"
-    - "vision.*"
-    - "visual.*"
-    - "image_encoder.*"
+  exclude_modules:  # exclude all vision modules and lm_head
+    - "*vision_tower*"
+    - "*vision*"
+    - "*visual*"
+    - "*image_encoder*"
+    - "*lm_head*"
   dim: 8
   alpha: 32
   use_triton: True
@@ -88,7 +89,7 @@ validation_dataloader:
   batch_size: 1
   
 optimizer:
-  _target_: torch.optim.AdamW
+  _target_: torch.optim.Adam
   lr: 1e-5
   weight_decay: 0.01
   betas: [0.9, 0.95]
