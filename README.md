@@ -52,24 +52,16 @@ NeMo AutoModel provides native support for a wide range of models available on t
 
 ## 🚀 Key Features
 
-- **🔥 Day-0 Hugging Face Support**: Instantly fine-tune any model from the Hugging Face Hub with zero configuration
+- **🔥 Day-0 Hugging Face Support**: Instantly fine-tune any model from the Hugging Face Hub
 - **⚡ Lightning Fast Performance**: Custom CUDA kernels and memory optimizations deliver 2–5× speedups
 - **🌐 Large-Scale Distributed Training**: Built-in FSDP2 and nvFSDP for seamless multi-node scaling
 - **👁️ Vision-Language Model Ready**: Native support for VLMs (Qwen2-VL, Gemma-3-VL, etc)
 - **🧩 Advanced PEFT Methods**: LoRA and extensible PEFT system out of the box
 - **📦 Seamless HF Ecosystem**: Fine-tuned models work perfectly with Transformers pipeline, VLM, etc.
-- **⚙️ Production-Grade Infrastructure**: Checkpointing, logging, monitoring, and resiliency
+- **⚙️ Production-Grade Infrastructure**: Checkpointing, logging and monitoring
 - **🎯 Optimized Recipes**: Pre-built configurations for common models and datasets
 - **🔧 Flexible Configuration**: YAML-based configuration system for reproducible experiments
 - **⚡ FP8 Precision**: Native FP8 training & inference for higher throughput and lower memory use
-- **🔢 INT4 / INT8 Quantization**: Turn-key quantization workflows for ultra-compact, low-memory training
-**👁️ Vision-Language Model Ready**: Out-of-the-box support for VLMs like Qwen2-VL and Gemma-3-VL
-- **🧩 Advanced PEFT Methods**: Includes LoRA and an extensible PEFT system for efficient adaptation
-- **📦 Seamless HF Ecosystem**: Fine-tuned models work perfectly with Transformers pipeline, VLM, etc.
-- **⚙️ Production-Grade Infrastructure**: Built-in support for checkpointing, logging, monitoring, and fault tolerance
-- **🎯 Optimized Recipes**: Preconfigured setups for popular models and datasets
-- **🔧 Flexible Configuration**: YAML-based configuration system for reproducible experiments
-- **⚡ FP8 Precision**: Native FP8 training and inference for higher throughput and lower memory use
 - **🔢 INT4 / INT8 Quantization**: Turn-key quantization workflows for ultra-compact, low-memory training
 
 > ⚠️ Note: NeMo AutoModel is under active development. New features, improvements, and documentation updates are released regularly. We are working toward a stable release, so expect the interface to solidify over time. Your feedback and contributions are welcome, and we encourage you to follow along as new updates roll out.
