@@ -36,7 +36,7 @@ inputs:
   image:
     description: "Image to use for test"
     required: false
-    default: "nemo_automodel"
+    default: "nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04"
   cpu-only:
     description: "Run tests on CPU only"
     required: false
@@ -73,12 +73,6 @@ runs:
         client-id: ${{ inputs.azure-client-id }}
         tenant-id: ${{ inputs.azure-tenant-id }}
         subscription-id: ${{ inputs.azure-subscription-id }}
-
-    - name: Azure ACR Login
-      if: ${{ inputs.has-azure-credentials == 'true' }}
-      shell: bash
-      run: |
-        az acr login --name nemoci
 
     - name: Azure Fileshare
       if: ${{ inputs.has-azure-credentials == 'true' && inputs.is_unit_test == 'false' }}
@@ -137,7 +131,7 @@ runs:
     - name: Docker pull image
       shell: bash
       run: |
-        docker pull nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+        docker pull ${{ inputs.image }}
 
     - name: Checkout repository
       uses: actions/checkout@v2
@@ -169,7 +163,7 @@ runs:
           --volume $(pwd)/NeMo-Automodel:/workspace \
           --workdir /workspace \
           --volume $MNT_PATH/TestData:/home/TestData \
-          nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04 \
+          ${{ inputs.image }} \
           bash -c "sleep $(( ${{ inputs.timeout }} * 60 + 60 ))"
         RUN_TEST_EOF
         )
@@ -180,28 +174,8 @@ runs:
     - name: Install dependencies
       shell: bash
       run: |
-        docker exec nemo_container_${{ github.run_id }} bash -c '
-          set -e
-
-          echo -e "machine github.com\n  login token\n  password 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" > ~/.netrc
-          chmod 600 ~/.netrc
-
-          apt-get update
-          apt-get install -y curl git
-          
-          # Install uv
-          curl -LsSf https://astral.sh/uv/0.7.2/install.sh | sh
-          export PATH="/root/.local/bin:$PATH"
-          
-          # Set up environment
-          export UV_PROJECT_ENVIRONMENT=/opt/venv
-          export PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
-          export UV_LINK_MODE=copy
-          
-          # Create virtual environment and install dependencies
-          uv venv ${UV_PROJECT_ENVIRONMENT}
-          uv sync
-        '
+        docker exec -e PAT=${{ inputs.PAT }} nemo_container_${{ github.run_id }} \
+          bash docker/common/install.sh --base-image cuda
 
     - name: Create run-script
       id: create
@@ -219,14 +193,8 @@ runs:
           docker exec -t nemo_container_${{ github.run_id }} bash -c '
             set -e
             
-            export PATH="/root/.local/bin:$PATH"
-          
-            # Set up environment
-            export UV_PROJECT_ENVIRONMENT=/opt/venv
-            export PATH="/opt/venv/bin:$PATH"
-            export UV_LINK_MODE=copy
+            . /opt/venv/env.sh
 
-            uv pip install --no-deps -e .
             bash tests/${{ inputs.is_unit_test == 'true' && 'unit_tests' || 'functional_tests' }}/${{ inputs.script }}.sh
             echo "Finished successfully." || echo "Did not finish."
             

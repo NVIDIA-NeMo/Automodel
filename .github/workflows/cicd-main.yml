@@ -105,29 +105,6 @@ jobs:
         run: |
           echo "Running CI tests"
 
-  cicd-container-build:
-    uses: ./.github/workflows/_build_container.yml
-    needs: [pre-flight, cicd-wait-in-queue]
-    if: |
-      needs.pre-flight.outputs.test_to_run != '[]'
-      && needs.pre-flight.outputs.components_to_run != '[]'
-      && (
-        success()
-        || (
-          needs.cicd-wait-in-queue.result == 'skipped'
-          && needs.pre-flight.outputs.is_ci_workload == 'true'
-        )
-      )
-      && !cancelled()
-    with:
-      image-name: nemo_automodel
-      dockerfile: docker/Dockerfile.ci
-    secrets:
-      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-      PAT: ${{ secrets.PAT }}
-
   cicd-unit-tests:
     strategy:
       fail-fast: false
@@ -153,7 +130,7 @@ jobs:
           script: ${{ matrix.script }}
           timeout: ${{ matrix.timeout || 10 }}
           is_unit_test: "true"
-          image: nemo_automodel
+          image: nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
           cpu-only: ${{ matrix.cpu-only || false }}
           has-azure-credentials: "true"
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -191,12 +168,13 @@ jobs:
           runner: ${{ runner.name }}
           script: ${{ matrix.script }}
           is_unit_test: "false"
-          image: nemo_automodel
+          image: nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
           has-azure-credentials: "true"
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           PAT: ${{ secrets.PAT }}
+
   Nemo_CICD_Test:
     needs:
       - pre-flight
