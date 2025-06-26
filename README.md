@@ -34,6 +34,7 @@ NeMo AutoModel delivers true **Day-0**, drop-in compatibility for Hugging Face m
 
 
 ### 🎛️ Supported Models
+NeMo AutoModel provides native support for a wide range of models available on the Hugging Face Hub, enabling efficient fine-tuning for various domains.
 
 ### Large Language Models
 - **LLaMA Family**: LLaMA 3, LLaMA 3.1, LLaMA 3.2, Code Llama
