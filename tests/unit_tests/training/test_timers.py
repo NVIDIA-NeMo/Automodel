@@ -20,6 +20,10 @@ import importlib
 
 import pytest
 import torch
+try:
+    cuda_available = torch.cuda.is_available()
+except:
+    cuda_available = False
 
 
 @pytest.fixture(autouse=True)
@@ -119,7 +123,7 @@ def test_timer_elapsed_resets_properly():
     # active_time aggregates all usage and must still be >= first
     assert t.active_time() >= first
 
-
+@pytest.mark.skipif(not cuda_available, reason="CUDA not available")
 def test_timers_collection_and_logging(monkeypatch, capsys):
     """
     End-to-end test of the Timers container:
