@@ -195,8 +195,7 @@ runs:
             
             . /opt/venv/env.sh
 
-            bash tests/${{ inputs.is_unit_test == 'true' && 'unit_tests' || 'functional_tests' }}/${{ inputs.script }}.sh
-            echo "Finished successfully." || echo "Did not finish."
+            bash tests/${{ inputs.is_unit_test == 'true' && 'unit_tests' || 'functional_tests' }}/${{ inputs.script }}.sh && echo "Finished successfully." || echo "Did not finish."
             
           '
         ) 2>&1 | tee err.log
