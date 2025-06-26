@@ -135,6 +135,14 @@ class StepScheduler(Stateful):
             bool: if true, the checkpoint should run.
         """
         return self._ckpt_flag
+    @property
+    def epochs(self):
+        """
+        Epoch iterator.
+        Yields:
+            iterator: over epochs
+        """
+        yield from range(self.epoch, self.num_epochs)
 
     def _set_epoch_for_sampler(self, epoch) -> None:
         """
