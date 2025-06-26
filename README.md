@@ -70,11 +70,30 @@ NeMo AutoModel delivers true **Day-0**, drop-in compatibility for Hugging Face m
 ---
 
 
-## 🔧 Installation
+## ✨ Installation
+NeMo AutoModel is offered both as a standard Python package installable via pip and as a ready-to-run NeMo Framework Docker container.
 
-### 🐳 Recommended: NeMo Framework Container
+### 📦 Python Package with Pip
+```
+# 1. Install the latest stable release from PyPI
+pip3 install nemo_automodel   # or: pip install --upgrade nemo_automodel
 
-The fastest way to get started is using the pre-built NeMo Framework container with NeMo AutoModel already installed:
+# 2. Verify the install
+python -c "import nemo_automodel; print('✅  NeMo AutoModel ready!')"
+```
+
+### 🔧 Install from Source
+```
+# 1. Install the latest stable release from PyPI
+pip3 install git+https://github.com/NVIDIA-NeMo/Automodel.git
+
+# 2. Verify the install
+python -c "import nemo_automodel; print('✅  NeMo AutoModel ready!')"
+```
+
+
+### 🐳 NeMo Container
+
 
 ```bash
 # Pull the latest NeMo Framework container
@@ -84,20 +103,6 @@ docker pull nvcr.io/nvidia/nemo:25.07
 docker run --gpus all -it --rm \
     -v $(pwd):/workspace \
     nvcr.io/nvidia/nemo:25.07 bash
-
-# Verify installation
-python -c "import nemo_automodel; print('✅ NeMo AutoModel ready!')"
-```
-
-### 🔧 Install from Source (Development)
-
-```bash
-# Clone the repository
-git clone https://github.com/NVIDIA-NeMo/Automodel.git
-cd NeMo-Automodel
-
-# Install in development mode
-pip install -e .
 
 # Verify installation
 python -c "import nemo_automodel; print('✅ NeMo AutoModel ready!')"
