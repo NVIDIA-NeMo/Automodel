@@ -145,6 +145,7 @@ def test_save_and_load_roundtrip(tmp_path):
       5. Calls load_checkpoint() and asserts that everything was restored to
          the values existing *at save time*.
     """
+    print(expecttest)
     recipe_inst = _ToyRecipe(tmp_path)
 
     # Perform one training step so parameters / optimizer state differ from init.
