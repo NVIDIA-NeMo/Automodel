@@ -53,7 +53,7 @@ NeMo AutoModel provides native support for a wide range of models available on t
 ## 🚀 Key Features
 
 - **🔥 Day-0 Hugging Face Support**: Instantly fine-tune any model from the Hugging Face Hub with zero configuration
-- **⚡ Lightning Fast Performance**: Custom CUDA kernels deliver 2-5x speedups
+- **⚡ Lightning Fast Performance**: Custom CUDA kernels and memory optimizations deliver 2–5× speedups
 - **🌐 Large-Scale Distributed Training**: Built-in FSDP2 and nvFSDP for seamless multi-node scaling
 - **👁️ Vision-Language Model Ready**: Native support for VLMs (Qwen2-VL, Gemma-3-VL, etc)
 - **🧩 Advanced PEFT Methods**: LoRA and extensible PEFT system out of the box
