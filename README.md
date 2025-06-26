@@ -70,13 +70,13 @@ NeMo AutoModel delivers true **Day-0**, drop-in compatibility for Hugging Face m
 ## ✨ Installation
 NeMo AutoModel is offered both as a standard Python package installable via pip and as a ready-to-run NeMo Framework Docker container.
 
-### 📦 Python Package with Pip
+### 📦 Install with wheel package
 ```
 # Install the latest stable release from PyPI
 pip3 install nemo_automodel   # or: pip install --upgrade nemo_automodel
 ```
 
-### 🔧 Install from Source
+### 🔧 Install from source
 ```
 # Install the latest NeMo Automodel from the GitHub repo (best for development).
 pip3 install git+https://github.com/NVIDIA-NeMo/Automodel.git
