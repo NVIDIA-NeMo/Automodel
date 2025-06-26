@@ -61,7 +61,7 @@ class StepScheduler(Stateful):
         self.val_every_steps  = val_every_steps
 
         # counters
-        self.step: int        = start_step     # <- OPTIMIZER steps
+        self._step: int        = start_step     # <- OPTIMIZER steps
         self.batch_step: int  = start_step * grad_acc_steps  # raw batches so far
         self.epoch: int       = start_epoch
         self.num_epochs: int  = num_epochs
@@ -90,17 +90,14 @@ class StepScheduler(Stateful):
         if self.dataloader is None:
             return
 
-        for self.epoch in range(self.epoch, self.num_epochs):
-            self._set_epoch_for_sampler(self.epoch)
+        for batch in self.dataloader:
+            self.batch_step += 1
+            self._update_flags()
 
-            for batch in self.dataloader:
-                self.batch_step += 1
-                self._update_flags()
+            yield batch
 
-                yield batch
-
-                if self.max_steps is not None and self.step >= self.max_steps:
-                    return
+            if self.max_steps is not None and self._step >= self.max_steps:
+                return
 
     def set_epoch(self, epoch: int):
         """
@@ -108,6 +105,10 @@ class StepScheduler(Stateful):
         """
         self.epoch = epoch
         self._set_epoch_for_sampler(epoch)
+
+    @property
+    def step(self) -> int:
+        return self._step
 
     @property
     def is_optim_step(self) -> bool:
@@ -134,7 +135,18 @@ class StepScheduler(Stateful):
         Returns:
             bool: if true, the checkpoint should run.
         """
+
+        # checkpoint flag
+        last_batch_of_epoch = (
+            self.epoch_len is not None
+            and (self.batch_step % self.epoch_len) == (self.epoch_len - 1)
+        )
+        by_cadence = (
+            self.ckpt_every_steps > 0 and self._optim_flag and (self._step % self.ckpt_every_steps) == 0
+        )
+        self._ckpt_flag = by_cadence or last_batch_of_epoch
         return self._ckpt_flag
+
     @property
     def epochs(self):
         """
@@ -163,25 +175,16 @@ class StepScheduler(Stateful):
         # optimizer step
         self._optim_flag = (self.batch_step % self.grad_acc_steps) == 0
         if self._optim_flag:
-            self.step += 1
+            self._step += 1
 
         # validation flag
         self._val_flag = (
             self.val_every_steps is not None
             and self.val_every_steps > 0
             and self._optim_flag
-            and (self.step % self.val_every_steps) == 0
+            and (self._step % self.val_every_steps) == 0
         )
 
-        # checkpoint flag
-        last_batch_of_epoch = (
-            self.epoch_len is not None
-            and (self.batch_step % self.epoch_len) == (self.epoch_len - 1)
-        )
-        by_cadence = (
-            self.ckpt_every_steps > 0 and self._optim_flag and (self.step % self.ckpt_every_steps) == 0
-        )
-        self._ckpt_flag = by_cadence or last_batch_of_epoch
 
     def state_dict(self) -> dict[str, int]:
         """
@@ -191,7 +194,7 @@ class StepScheduler(Stateful):
             dict: Current state with 'step' and 'epoch' keys.
         """
         return {
-            "step": self.step,
+            "step": self._step,
             "batch_step": self.batch_step,
             "epoch": self.epoch,
         }
@@ -203,7 +206,7 @@ class StepScheduler(Stateful):
         Args:
             state (dict): Dictionary containing 'step' and 'epoch'.
         """
-        self.step       = int(state["step"])
+        self._step       = int(state["step"])
         self.batch_step = int(state.get("batch_step", self.step * self.grad_acc_steps))
         self.epoch      = int(state["epoch"])
 
@@ -215,6 +218,6 @@ class StepScheduler(Stateful):
             str: message with step/batch-step/epoch
         """
         return (
-            f"{self.__class__.__name__}(step={self.step}, batch_step={self.batch_step}, "
+            f"{self.__class__.__name__}(step={self._step}, batch_step={self.batch_step}, "
             f"epoch={self.epoch})"
         )
