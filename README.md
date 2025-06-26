@@ -129,15 +129,14 @@ python recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_hellaswag_peft.
 # Multi-GPU with FSDP2
 torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_hellaswag.yaml
 
-#Multi-GPU with nvFSDP
+# Multi-GPU with nvFSDP
 torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_hellaswag_nvfsdp.yaml
 
-# #Multi-Node training
+```
+<!-- # #Multi-Node training
 # torchrun --nproc-per-node=8 --nnodes=2 \
 #     recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_squad_nvfsdp.yaml
-```
-
-### Vision-Language Models
+### Vision-Language Models -->
 
 ```bash
 # Fine-tune Qwen2.5-VL
