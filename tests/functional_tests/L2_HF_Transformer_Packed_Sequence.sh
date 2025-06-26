@@ -12,16 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# MODEL=/home/TestData/akoumparouli/hf_mixtral_2l/
+MODEL=/home/TestData/akoumparouli/hf_gemma_38m/
+
 ## 12 packs get crated with 100 samples from squad dataset and packed sequence size 2048
 TRANSFORMERS_OFFLINE=1 coverage run -a --data-file=/workspace/.coverage --source=/workspace \
 recipes/llm/finetune.py \
   --config recipes/llm/llama_3_2_1b_squad.yaml \
-  --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
+  --model.pretrained_model_name_or_path $MODEL \
   --step_scheduler.max_steps 3 \
   --step_scheduler.grad_acc_steps 2 \
-  --dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
+  --dataset.tokenizer.pretrained_model_name_or_path $MODEL \
   --packed_sequence.packed_sequence_size 2048 \
   --dataloader.batch_size 2 \
-  --validation_dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
+  --validation_dataset.tokenizer.pretrained_model_name_or_path $MODEL \
   --dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
   --dataset.limit_dataset_samples 100
