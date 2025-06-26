@@ -30,10 +30,6 @@ inputs:
     description: "Upload coverage as unit test"
     required: false
     default: "false"
-  image:
-    description: "Image to use for test"
-    required: false
-    default: "nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04"
   cpu-only:
     description: "Run tests on CPU only"
     required: false
@@ -125,15 +121,17 @@ runs:
 
         ls -al $MNT_PATH/TestData
 
-    - name: Docker pull image
-      shell: bash
-      run: |
-        docker pull ${{ inputs.image }}
-
     - name: Checkout repository
       uses: actions/checkout@v2
       with:
         path: NeMo-Automodel
+
+    - name: Build container
+      shell: bash
+      env:
+        PAT: ${{ inputs.PAT }}
+      run: |
+        docker build -f docker/Dockerfile.ci -t --secret id=PAT automodel .
 
     - name: Start container
       shell: bash
@@ -160,19 +158,13 @@ runs:
           --volume $(pwd)/NeMo-Automodel:/workspace \
           --workdir /workspace \
           --volume $MNT_PATH/TestData:/home/TestData \
-          ${{ inputs.image }} \
+          automodel \
           bash -c "sleep $(( ${{ inputs.timeout }} * 60 + 60 ))"
         RUN_TEST_EOF
         )
 
         echo "$cmd" | tee "retry_job.sh"
         bash retry_job.sh
-
-    - name: Install dependencies
-      shell: bash
-      run: |
-        docker exec -e PAT=${{ inputs.PAT }} nemo_container_${{ github.run_id }} \
-          bash docker/common/install.sh --base-image cuda
 
     - name: Create run-script
       id: create

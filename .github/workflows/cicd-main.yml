@@ -129,7 +129,6 @@ jobs:
           script: ${{ matrix.script }}
           timeout: ${{ matrix.timeout || 10 }}
           is_unit_test: "true"
-          image: nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
           cpu-only: ${{ matrix.cpu-only || false }}
           has-azure-credentials: "true"
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -166,7 +165,6 @@ jobs:
         with:
           script: ${{ matrix.script }}
           is_unit_test: "false"
-          image: nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
           has-azure-credentials: "true"
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
