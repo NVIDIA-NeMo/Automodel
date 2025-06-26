@@ -25,9 +25,7 @@ NeMo AutoModel delivers true **Day-0**, drop-in compatibility for Hugging Face m
 
 
 
-
-
-### 📋 Ready-to-Use Recipes
+## 📋 Ready-to-Use Recipes
 
 | Domain | Model ID | Single-GPU | Single-Node | Multi-Node |
 |--------|----------|------------|-------------|------------|
@@ -35,7 +33,23 @@ NeMo AutoModel delivers true **Day-0**, drop-in compatibility for Hugging Face m
 | **VLM** | `google/gemma-3-4b-it` | [CORD-v2 + LoRA](recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml) | [CORD-v2](recipes/vlm/gemma_3_vl_3b_cord_v2.yaml) | Coming Soon |
 
 
-### 🚀 Key Features
+## 🎛️ Supported Models
+
+### Large Language Models
+- **LLaMA Family**: LLaMA 3, LLaMA 3.1, LLaMA 3.2, Code Llama
+- **And more**: Any causal LM on Hugging Face Hub!
+
+### Vision-Language Models
+- **Qwen2.5-VL**: All variants (3B, 7B, 72B)
+- **Gemma-3-VL**: 3B and other variants
+
+### PEFT Methods
+- **LoRA**: Low-Rank Adaptation
+<!-- - **DoRA**: Weight-Decomposed Low-Rank Adaptation   -->
+- **Custom**: Easy to implement new PEFT methods
+
+
+## 🚀 Key Features
 
 - **🔥 Day-0 Hugging Face Support**: Any model on Hugging Face Hub works instantly with zero configuration
 - **⚡ Lightning Fast Performance**: Custom CUDA kernels deliver 2-5x speedups
@@ -53,24 +67,6 @@ NeMo AutoModel delivers true **Day-0**, drop-in compatibility for Hugging Face m
 > ⚠️ Note: NeMo AutoModel is actively evolving—new features, refinements, and documentation updates land regularly, and the interface may change between releases. Your feedback and contributions are welcome, and we recommend keeping an eye on updates.
 
 ---
-
-## 🎛️ Supported Models
-
-### Large Language Models
-- **LLaMA Family**: LLaMA 3, LLaMA 3.1, LLaMA 3.2, Code Llama
-- **And more**: Any causal LM on Hugging Face Hub!
-
-### Vision-Language Models
-- **Qwen2.5-VL**: All variants (3B, 7B, 72B)
-- **Gemma-3-VL**: 3B and other variants
-
-### PEFT Methods
-- **LoRA**: Low-Rank Adaptation
-<!-- - **DoRA**: Weight-Decomposed Low-Rank Adaptation   -->
-- **Custom**: Easy to implement new PEFT methods
-
----
-
 ## ✨ Installation
 NeMo AutoModel is offered both as a standard Python package installable via pip and as a ready-to-run NeMo Framework Docker container.
 
