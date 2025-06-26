@@ -55,6 +55,7 @@ main() {
     UV_ARGS=()
     if [[ "$BASE_IMAGE" == "pytorch" ]]; then
         UV_ARGS=(
+            "--system-site-packages"
             "--no-install-package" "torch"
             "--no-install-package" "torchvision"
             "--no-install-package" "triton"
