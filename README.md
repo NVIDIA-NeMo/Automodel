@@ -10,7 +10,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/release/python-3100/)
 [![GitHub Stars](https://img.shields.io/github/stars/NVIDIA-NeMo/Automodel.svg?style=social&label=Star&maxAge=2592000)](https://github.com/NVIDIA-NeMo/Automodel/stargazers/)
 
-**Zero-day integration with Hugging Face models automating fine-tuning and pretraining with built-in parallelism, custom-kernels and optimized recipes**
+**Day-0 integration with Hugging Face models automating fine-tuning and pretraining with built-in parallelism, custom-kernels and optimized recipes**
 
 [📖 Documentation](https://github.com/NVIDIA-NeMo/Automodel/) • [🔥 Quickstart](#quickstart) • [💡 Examples](#examples) • [🤝 Contributing](CONTRIBUTING.md)
 
@@ -20,7 +20,7 @@
 
 ## ✨ What is NeMo AutoModel?
 
-NeMo AutoModel delivers true **zero-day**, drop-in compatibility for Hugging Face models. Start fine-tuning models instantly, scale effortlessly with built-in data/model parallelism, optimized custom kernels, and memory-efficient recipes-all while preserving the original checkpoint format for seamless use across the Hugging Face ecosystem.
+NeMo AutoModel delivers true **Day-0**, drop-in compatibility for Hugging Face models. Start fine-tuning models instantly, scale effortlessly with built-in data/model parallelism, optimized custom kernels, and memory-efficient recipes-all while preserving the original checkpoint format for seamless use across the Hugging Face ecosystem.
 
 
 
