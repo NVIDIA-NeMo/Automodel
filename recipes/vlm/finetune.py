@@ -41,10 +41,7 @@ from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.config.cli import parse_args_and_load_config
 from nemo_automodel.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.distributed.init_utils import initialize_distributed
-from nemo_automodel.distributed.parallelizer import (
-    create_context_parallel_ctx,
-    get_train_context,
-)
+from nemo_automodel.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.loggers.log_utils import setup_logging
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.rng import StatefulRNG
@@ -399,62 +396,18 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if loss_mask is None:
             loss_mask = (labels.detach() != -100).to(torch.int)
 
-        # TODO(@boxiangw): Refractor. Needed for SP support
-        # If 'position_ids' does not exist in batch already then override it. batch in case of Packed sequence
-        # contains 'position_ids' and we don't want to override it.
-        if "position_ids" not in batch and (
-            self.device_mesh["context_parallel"].size() > 1 or self.device_mesh["tensor_parallel"].size() > 1
+        if (
+            "position_ids" not in batch
+            and self.device_mesh is not None
+            and (self.device_mesh["context_parallel"].size() > 1 or self.device_mesh["tensor_parallel"].size() > 1)
         ):
             batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
 
-        # based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/train.py#L336
-        if self.device_mesh["context_parallel"].size() > 1:
-            input_ids = batch["input_ids"].to(self.model.device)
-            position_ids = batch["position_ids"].to(self.model.device)
-
-            if loss_mask is not None:
-                cp_buffers = [input_ids, labels, position_ids, loss_mask]
-                cp_seq_dims = [1, 1, 1, 1]
-                cp_no_restore_buffers = {input_ids, labels, loss_mask}
-            else:
-                cp_buffers = [input_ids, labels, position_ids]
-                cp_seq_dims = [1, 1, 1]
-                cp_no_restore_buffers = {input_ids, labels}
-
-            context_parallel_ctx = create_context_parallel_ctx(
-                cp_mesh=self.model_wrapper.device_mesh["context_parallel"],
-                cp_buffers=cp_buffers,
-                cp_seq_dims=cp_seq_dims,
-                cp_no_restore_buffers=cp_no_restore_buffers,
-                cp_rotate_method="allgather",  # TODO add "alltoall" option
-            )
-            train_context = get_train_context(
-                False,
-                False,
-            )
-
-            with train_context(context_parallel_ctx):
-                out = self.model(**batch)
-
-                # Prepare for loss calculation
-                logits = out.logits.float()
-                n_cls = logits.shape[-1]
-                logits = logits.view(-1, n_cls)
-                labels = labels.view(-1)
-                assert logits.shape[-2] == labels.shape[-1], "Expected logits & labels to have the same length"
-                local_loss = self.loss_fn(logits, labels, loss_mask)
-
-            # In the case where all labels are masked, the loss should be 0.
-            if loss_mask is not None and loss_mask.bool().sum() == 0:
-                local_loss.detach().copy_(torch.zeros_like(local_loss))
-
-        else:
-            out = self.model(**batch)
+        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels, loss_mask)
+        with train_ctx():
+            out  = self.model(**batch)
             local_loss = self.loss_fn(
-                out.logits.view(-1, out.logits.size(-1)),
-                labels.view(-1),
-                mask=loss_mask,
-                reduction="sum",
+                out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum"
             )
 
         local_num_tokens = loss_mask.sum().detach().to(torch.int)
@@ -482,7 +435,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
             # Clip gradients **after** any rescaling.
             # TODO(@boxiangw): Fix TP gradient clipping
-            if self.device_mesh["tensor_parallel"].size() == 1:
+            if not self.device_mesh or self.device_mesh["tensor_parallel"].size() == 1:
                 grad_norm = clip_gradients(self.model, clip_norm)
             else:
                 # TODO: TP WAR
@@ -522,6 +475,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         """Run one pass over `self.val_dataloader` and return average loss per token."""
         with StatefulRNG(seed=1, ranked=True):
             self.model.eval()
+
             total_loss = 0.0
             total_tokens = 0
 
@@ -532,57 +486,23 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if loss_mask is None:
                     loss_mask = (labels.detach() != -100).to(torch.int)
 
-                if "position_ids" not in batch and (
-                    self.device_mesh["context_parallel"].size() > 1 or self.device_mesh["tensor_parallel"].size() > 1
+                if (
+                    self.device_mesh
+                    and "position_ids" not in batch
+                    and (
+                        self.device_mesh["context_parallel"].size() > 1
+                        or self.device_mesh["tensor_parallel"].size() > 1
+                    )
                 ):
                     batch["position_ids"] = (
                         torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
                     )
 
-                if self.device_mesh["context_parallel"].size() > 1:
-                    input_ids = batch["input_ids"].to(self.model.device)
-                    position_ids = batch["position_ids"].to(self.model.device)
-
-                    if loss_mask is not None:
-                        cp_buffers = [input_ids, labels, position_ids, loss_mask]
-                        cp_seq_dims = [1, 1, 1, 1]
-                        cp_no_restore_buffers = {input_ids, labels, loss_mask}
-                    else:
-                        cp_buffers = [input_ids, labels, position_ids]
-                        cp_seq_dims = [1, 1, 1]
-                        cp_no_restore_buffers = {input_ids, labels}
-
-                    context_parallel_ctx = create_context_parallel_ctx(
-                        cp_mesh=self.model_wrapper.device_mesh["context_parallel"],
-                        cp_buffers=cp_buffers,
-                        cp_seq_dims=cp_seq_dims,
-                        cp_no_restore_buffers=cp_no_restore_buffers,
-                        cp_rotate_method="allgather",  # TODO add "alltoall" option
-                    )
-                    train_context = get_train_context(
-                        False,
-                        False,
-                    )
-                    with train_context(context_parallel_ctx):
-                        out = self.model(**batch)
-                        # Prepare for loss calculation
-                        logits = out.logits.float()
-                        n_cls = logits.shape[-1]
-                        logits = logits.view(-1, n_cls)
-                        labels = labels.view(-1)
-                        assert logits.shape[-2] == labels.shape[-1], "Expected logits & labels to have the same length"
-                        local_loss = self.loss_fn(logits, labels, loss_mask)
-
-                    # In the case where all labels are masked, the loss should be 0.
-                    if loss_mask is not None and loss_mask.bool().sum() == 0:
-                        local_loss.detach().copy_(torch.zeros_like(local_loss))
-                else:
+                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels, loss_mask)
+                with train_ctx():
                     out = self.model(**batch)
                     local_loss = self.loss_fn(
-                        out.logits.view(-1, out.logits.size(-1)),
-                        labels.view(-1),
-                        mask=loss_mask,
-                        reduction="sum",
+                        out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum"
                     )
 
                 total_loss += local_loss.item()
@@ -597,13 +517,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         val_loss = total_loss / max(total_tokens, 1e-8)
         if self.dist_env.is_main:
             if wandb.run is not None:
-                wandb.log(
-                    {
-                        "val_loss": val_loss,
-                        "step": self.step_scheduler.step,
-                        "epoch": self.step_scheduler.epoch,
-                    }
-                )
+                wandb.log({"val_loss": val_loss, "step": self.step_scheduler.step, "epoch": self.step_scheduler.epoch})
         logging.info(
             "[val] step {} | epoch {} | loss {:.4f}".format(
                 self.step_scheduler.step, self.step_scheduler.epoch, val_loss

@@ -31,13 +31,14 @@ rng:
 
 model:
   _target_: nemo_automodel._transformers.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: "" #HF model id or local path
+  pretrained_model_name_or_path: your_hf_model_id_or_path #HF model id or local path
 
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: torch_save
   save_consolidated: False
+  is_peft: false
 
 distributed:
   _target_: nemo_automodel.distributed.fsdp2.FSDP2Manager
