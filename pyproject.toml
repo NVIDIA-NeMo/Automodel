@@ -105,6 +105,11 @@ nvfsdp = { git = "https://github.com/NVIDIA-NeMo/nvFSDP.git", rev = "e48b3c62204
 [tool.coverage.paths]
 source = [".", "/workspace", "/home/runner/work/NeMo-Automodel/NeMo-Automodel"]
 
+[tool.coverage.run]
+omit = [
+    "*nemo_automodel/checkpoint/_backports/*.py",
+]
+
 [tool.ruff]
 
 # Match black's line length
