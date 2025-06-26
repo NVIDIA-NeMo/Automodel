@@ -52,6 +52,24 @@ NeMo AutoModel delivers true **Day-0**, drop-in compatibility for Hugging Face m
 
 ---
 
+## 🎛️ Supported Models
+
+### Large Language Models
+- **LLaMA Family**: LLaMA 3, LLaMA 3.1, LLaMA 3.2, Code Llama
+- **And more**: Any causal LM on Hugging Face Hub!
+
+### Vision-Language Models
+- **Qwen2.5-VL**: All variants (3B, 7B, 72B)
+- **Gemma-3-VL**: 3B and other variants
+
+### PEFT Methods
+- **LoRA**: Low-Rank Adaptation
+<!-- - **DoRA**: Weight-Decomposed Low-Rank Adaptation   -->
+- **Custom**: Easy to implement new PEFT methods
+
+---
+
+
 ## 🔧 Installation
 
 ### 🐳 Recommended: NeMo Framework Container (Easiest)
@@ -178,23 +196,6 @@ checkpoint:
   save_consolidated: true      # HF-compatible safetensors
   model_save_format: safetensors
 ```
-
----
-
-## 🎛️ Supported Models
-
-### Large Language Models
-- **LLaMA Family**: LLaMA 3, LLaMA 3.1, LLaMA 3.2, Code Llama
-- **And more**: Any causal LM on Hugging Face Hub!
-
-### Vision-Language Models  
-- **Qwen2.5-VL**: All variants (3B, 7B, 72B)
-- **Gemma-3-VL**: 3B and other variants
-
-### PEFT Methods
-- **LoRA**: Low-Rank Adaptation
-<!-- - **DoRA**: Weight-Decomposed Low-Rank Adaptation   -->
-- **Custom**: Easy to implement new PEFT methods
 
 ---
 
