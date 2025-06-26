@@ -129,9 +129,9 @@ runs:
     - name: Build container
       shell: bash
       env:
-        PAT: ${{ inputs.PAT }}
+        GH_TOKEN: ${{ inputs.PAT }}
       run: |
-        docker build -f docker/Dockerfile.ci  --secret id=PAT -t automodel .
+        docker build -f docker/Dockerfile.ci  --secret id=GH_TOKEN -t automodel .
 
     - name: Start container
       shell: bash
