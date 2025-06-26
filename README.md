@@ -50,6 +50,8 @@ NeMo AutoModel delivers true **Day-0**, drop-in compatibility for Hugging Face m
 - **🔢 INT4 / INT8 Quantization**: Turn-key quantization workflows for ultra-compact, low-memory training
 
 
+> ⚠️ Note: NeMo AutoModel is actively evolving—new features, refinements, and documentation updates land regularly, and the interface may change between releases. Your feedback and contributions are welcome, and we recommend keeping an eye on updates.
+
 ---
 
 ## 🎛️ Supported Models
@@ -68,7 +70,6 @@ NeMo AutoModel delivers true **Day-0**, drop-in compatibility for Hugging Face m
 - **Custom**: Easy to implement new PEFT methods
 
 ---
-
 
 ## ✨ Installation
 NeMo AutoModel is offered both as a standard Python package installable via pip and as a ready-to-run NeMo Framework Docker container.
@@ -93,8 +94,6 @@ python -c "import nemo_automodel; print('✅  NeMo AutoModel ready!')"
 
 
 ### 🐳 NeMo Container
-
-
 ```bash
 # Pull the latest NeMo Framework container
 docker pull nvcr.io/nvidia/nemo:25.07
