@@ -20,7 +20,11 @@ import pytest
 
 import nemo_automodel.training.base_recipe as base_recipe
 from nemo_automodel.training.base_recipe import BaseRecipe, _find_latest_checkpoint
-
+try:
+    import expecttest
+    HAS_ET = True
+except:
+    HAS_ET = False
 
 @pytest.fixture(autouse=True)
 def _mock_single_rank(monkeypatch):
@@ -128,6 +132,7 @@ def test_find_latest_checkpoint(tmp_path):
     assert latest.name == "step_20", "Did not pick the highest step directory"
 
 
+@pytest.mark.skipif(not HAS_ET, reason="expecttest required")
 def test_save_and_load_roundtrip(tmp_path):
     """
     End-to-end test for BaseRecipe.save_checkpoint/load_checkpoint.
