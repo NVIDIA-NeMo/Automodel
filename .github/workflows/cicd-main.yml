@@ -126,7 +126,6 @@ jobs:
       - name: main
         uses: ./.github/actions/test-template
         with:
-          runner: ${{ runner.name }}
           script: ${{ matrix.script }}
           timeout: ${{ matrix.timeout || 10 }}
           is_unit_test: "true"
@@ -165,7 +164,6 @@ jobs:
       - name: main
         uses: ./.github/actions/test-template
         with:
-          runner: ${{ runner.name }}
           script: ${{ matrix.script }}
           is_unit_test: "false"
           image: nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04

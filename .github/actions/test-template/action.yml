@@ -15,9 +15,6 @@ name: "Test Template"
 description: "Template for running NeMo tests in a containerized environment"
 
 inputs:
-  runner:
-    description: "Runner to use for test"
-    required: true
   timeout:
     description: "Max runtime of test in minutes"
     required: false
