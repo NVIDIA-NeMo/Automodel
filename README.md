@@ -26,7 +26,7 @@ NeMo AutoModel delivers true **Day-0**, drop-in compatibility for Hugging Face m
 
 
 ## 📋 Ready-to-Use Recipes
-
+To get started quickly, NeMo AutoModel provides a collection of ready-to-use recipes for common LLM and VLM fine-tuning tasks. Simply select the recipe that matches your model and training setup (e.g., single-GPU, multi-GPU, or multi-node). 
 | Domain | Model ID | Single-GPU | Single-Node | Multi-Node |
 |--------|----------|------------|-------------|------------|
 | **LLM** | `meta-llama/Llama-3.2-1B` | [HellaSwag + LoRA](recipes/llm/llama_3_2_1b_hellaswag_peft.yaml) |[HellaSwag](recipes/llm/llama_3_2_1b_hellaswag.yaml) • [SQuAD](recipes/llm/llama_3_2_1b_squad.yaml) |  [HellaSwag + nvFSDP](recipes/llm/llama_3_2_1b_hellaswag_nvfsdp.yaml) |
