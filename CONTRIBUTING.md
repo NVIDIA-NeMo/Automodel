@@ -1,5 +1,52 @@
 # Contributing To NeMo-Automodel
 
+## Building a dev container
+
+* We recommend to build a container that is close to GitHub's CI.
+
+* Run the following command to build your container:
+
+```bash
+docker build -f docker/Dockerfile.ci -t automodel .
+```
+
+* Run the following command to start your container:
+
+```bash
+docker run --rm -it --entrypoint bash --runtime nvidia --gpus all automodel
+```
+
+## Development Dependencies
+
+We use [uv](https://docs.astral.sh/uv/) for managing dependencies.
+
+New required dependencies can be added by `uv add $DEPENDENCY`.
+
+Adding a new dependency will update UV's lock-file. Please check this into your branch:
+
+```bash
+git add uv.lock pyproject.toml
+git commit -s -m "build: Adding dependencies"
+git push
+```
+
+## Linting and Formatting
+
+We use [ruff](https://docs.astral.sh/ruff/) for linting and formatting.
+
+Installation:
+
+```bash
+pip install ruff
+```
+
+Format:
+
+```bash
+ruff check --fix .
+ruff format .
+```
+
 ## Signing Your Work
 
 * We require that all contributors "sign-off" on their commits. This certifies that the contribution is your original work, or you have rights to submit it under the same license, or a compatible license.
@@ -7,10 +54,13 @@
   * Any contribution which contains commits that are not Signed-Off will not be accepted.
 
 * To sign off on a commit you simply use the `--signoff` (or `-s`) option when committing your changes:
+
   ```bash
-  $ git commit -s -m "Add cool feature."
+  git commit -s -m "Add cool feature."
   ```
+
   This will append the following to your commit message:
+
   ```
   Signed-off-by: Your Name <your@email.com>
   ```

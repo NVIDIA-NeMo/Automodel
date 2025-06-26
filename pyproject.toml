@@ -92,6 +92,7 @@ docs = [
     "myst_parser",         # For our markdown docs
     "nvidia-sphinx-theme", # Our NVIDIA theme
 ]
+build = []
 test = ["coverage", "pytest"]
 nvfsdp = ["nvfsdp"]
 
@@ -125,36 +126,40 @@ exclude = [
 ]
 
 # Files to completely ignore
-extend-exclude = [
-    "*.ipynb",
-]
+extend-exclude = ["*.ipynb"]
 
 [tool.ruff.lint]
 # Configure imports sorting to match isort
 select = [
-    "F541",  # f-string without any placeholders
-    "F841",  # local variable assigned but never used
-    "F401",  # imported but unused
-    "E741",  # ambiguous variable name
-    "F821",  # undefined name
-    "E266",  # too many leading '#' for block comment
-    "I",     # isort
-    "D101",  # docstring
-    "D212",  # first doc-string line is empty
+    "F541", # f-string without any placeholders
+    "F841", # local variable assigned but never used
+    "F401", # imported but unused
+    "E741", # ambiguous variable name
+    "F821", # undefined name
+    "E266", # too many leading '#' for block comment
+    "I",    # isort
+    "D101", # docstring
+    "D212", # first doc-string line is empty
     "D",
 ]
 
 # Additional rules can be added here
 ignore = [
-    "D100",  # Missing docstring in public module
-    "D200",  # one line doc-string shoudl fit in one line
-    "D212",  # doc-string starts with empty line
-    "E501",  # Line too long - handled by formatter
+    "D100", # Missing docstring in public module
+    "D200", # one line doc-string shoudl fit in one line
+    "D212", # doc-string starts with empty line
+    "E501", # Line too long - handled by formatter
 ]
 [tool.ruff.lint.isort]
 known-first-party = ["nvfsdp"]
 known-third-party = ["examples", "scripts"]
-section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
+section-order = [
+    "future",
+    "standard-library",
+    "third-party",
+    "first-party",
+    "local-folder",
+]
 lines-after-imports = 2
 
 [tool.ruff.lint.per-file-ignores]
@@ -164,7 +169,13 @@ lines-after-imports = 2
 "test_*.py" = ["D101", "D103"]
 "*_test.py" = ["D101", "D103"]
 "tests/*.py" = ["D101", "D103"]
-"nemo_automodel/checkpoint/_backports/*.py" = ["D101", "D103", "D205", "D417", "D415"]
+"nemo_automodel/checkpoint/_backports/*.py" = [
+    "D101",
+    "D103",
+    "D205",
+    "D417",
+    "D415",
+]
 
 [tool.ruff.format]
 # Match black configuration

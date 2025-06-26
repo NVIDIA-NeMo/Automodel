@@ -1028,6 +1028,7 @@ requires-dist = [
 provides-extras = ["vlm"]
 
 [package.metadata.requires-dev]
+build = []
 docs = [
     { name = "myst-parser" },
     { name = "nvidia-sphinx-theme" },
