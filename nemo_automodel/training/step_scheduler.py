@@ -108,6 +108,9 @@ class StepScheduler(Stateful):
 
     @property
     def step(self) -> int:
+        """
+        return the current step (optimizer domain)
+        """
         return self._step
 
     @property
