@@ -131,7 +131,7 @@ runs:
       env:
         PAT: ${{ inputs.PAT }}
       run: |
-        docker build -f docker/Dockerfile.ci -t --secret id=PAT automodel .
+        docker build -f docker/Dockerfile.ci  --secret id=PAT -t automodel .
 
     - name: Start container
       shell: bash
