@@ -32,21 +32,12 @@ fi
 main() {
     echo "Installing dependencies for base image: $BASE_IMAGE"
 
-    if [[ "$BASE_IMAGE" == "pytorch" ]]; then
-        echo "Installing PyTorch-specific dependencies..."
-        # Add PyTorch-specific installation commands here
-        # For example:
-        # pip install torch torchvision torchaudio
-    elif [[ "$BASE_IMAGE" == "cuda" ]]; then
-        echo "Installing CUDA-specific dependencies..."
-        # Add CUDA-specific installation commands here
-        # For example:
-        # pip install nvidia-cuda-runtime-cu12
+    if [[ -n "${PAT:-}" ]]; then
+        echo -e "machine github.com\n  login token\n  password $PAT" >~/.netrc
+        chmod 600 ~/.netrc
     fi
 
-    echo -e "machine github.com\n  login token\n  password $PAT" >~/.netrc
-    chmod 600 ~/.netrc
-
+    # Install dependencies
     apt-get update
     apt-get install -y curl git
 
@@ -54,8 +45,6 @@ main() {
     UV_VERSION="0.7.2"
     curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
     export PATH="/root/.local/bin:$PATH"
-
-    # Set up environment
     export UV_PROJECT_ENVIRONMENT=/opt/venv
     export PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
     export UV_LINK_MODE=copy
