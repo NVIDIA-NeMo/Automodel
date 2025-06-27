@@ -7,12 +7,14 @@
 <div align="center">
 
 <!-- [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) -->
+[![codecov](https://codecov.io/github/NVIDIA-NeMo/Automodel/graph/badge.svg?token=4NMKZVOW2Z)](https://codecov.io/github/NVIDIA-NeMo/Automodel)
+[![CICD NeMo](https://github.com/NVIDIA-NeMo/Automodel/actions/workflows/cicd-main.yml/badge.svg)](https://github.com/NVIDIA-NeMo/Automodel/actions/workflows/cicd-main.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/release/python-3100/)
 [![GitHub Stars](https://img.shields.io/github/stars/NVIDIA-NeMo/Automodel.svg?style=social&label=Star&maxAge=2592000)](https://github.com/NVIDIA-NeMo/Automodel/stargazers/)
 
 <!-- **Day-0 integration with Hugging Face models automating fine-tuning and pretraining with pytorch-native parallelism, custom-kernels and optimized recipes** -->
 
-[📖 Documentation](https://github.com/NVIDIA-NeMo/Automodel/) • [🔥 Quickstart](#quickstart) • [💡 Examples](https://github.com/NVIDIA-NeMo/Automodel/tree/main/recipes) • [🤝 Contributing](CONTRIBUTING.md)
+[📖 Documentation](https://github.com/NVIDIA-NeMo/Automodel/) • [🔥 Ready-to-Use Recipes](#-ready-to-use-recipes) • [💡 Examples](https://github.com/NVIDIA-NeMo/Automodel/tree/main/recipes) • [🤝 Contributing](CONTRIBUTING.md)
 
 </div>
 
@@ -20,17 +22,9 @@
 
 ## ✨ What is NeMo AutoModel?
 
-**NeMo AutoModel** is an NVIDIA-developed library that delivers a high-performance, easy-to-use solution for fine-tuning and pretraining large language models (LLMs) and vision-language models (VLMs) directly from the Hugging Face Hub. It delivers true **Day-0 compatibility** with any Hugging Face model, streamlining workflows and accelerating AI research and development.
+**NeMo AutoModel** is an NVIDIA-developed library that delivers a high-performance, easy-to-use solution for fine-tuning and pretraining large language models (LLMs) and vision-language models (VLMs) directly from the Hugging Face Hub. It provides true **Day-0 compatibility** with any Hugging Face model, so you can start using models immediately without conversion or setup delays.
 
-Start fine-tuning models instantly, scale effortlessly with Pytorch-native data/model parallelism, optimized custom kernels, and memory-efficient recipes-all while preserving the original checkpoint format for seamless use across the Hugging Face ecosystem.
-
-
-## 📋 Ready-to-Use Recipes
-To get started quickly, NeMo AutoModel provides a collection of ready-to-use recipes for common LLM and VLM fine-tuning tasks. Simply select the recipe that matches your model and training setup (e.g., single-GPU, multi-GPU, or multi-node). 
-| Domain | Model ID | Single-GPU | Single-Node | Multi-Node |
-|--------|----------|------------|-------------|------------|
-| **LLM** | `meta-llama/Llama-3.2-1B` | [HellaSwag + LoRA](recipes/llm/llama_3_2_1b_hellaswag_peft.yaml) |[HellaSwag](recipes/llm/llama_3_2_1b_hellaswag.yaml) • [SQuAD](recipes/llm/llama_3_2_1b_squad.yaml) |  [HellaSwag + nvFSDP](recipes/llm/llama_3_2_1b_hellaswag_nvfsdp.yaml) |
-| **VLM** | `google/gemma-3-4b-it` | [CORD-v2 + LoRA](recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml) | [CORD-v2](recipes/vlm/gemma_3_vl_3b_cord_v2.yaml) | Coming Soon |
+Start fine-tuning models instantly, scale effortlessly with PyTorch-native data/model parallelism, optimized custom kernels, and memory-efficient recipes-all while preserving the original checkpoint format for seamless use across the Hugging Face ecosystem.
 
 
 ## 🎛️ Supported Models
@@ -38,11 +32,37 @@ NeMo AutoModel provides native support for a wide range of models available on t
 
 ### Large Language Models
 - **LLaMA Family**: LLaMA 3, LLaMA 3.1, LLaMA 3.2, Code Llama
+- **QWen Family**: QWen3, QWen2.5, Qwen2
+- **Gemma Family**: Gemma2, Gemma3
+- **Phi Family**: Phi2, Phi3, Phi4
 - **And more**: Any causal LM on Hugging Face Hub!
 
 ### Vision-Language Models
 - **Qwen2.5-VL**: All variants (3B, 7B, 72B)
 - **Gemma-3-VL**: 3B and other variants
+
+### 📋 Ready-to-Use Recipes
+To get started quickly, NeMo AutoModel provides a collection of ready-to-use recipes for common LLM and VLM fine-tuning tasks. Simply select the recipe that matches your model and training setup (e.g., single-GPU, multi-GPU, or multi-node).
+| Domain | Model ID | Single-GPU | Single-Node | Multi-Node |
+|--------|----------|------------|-------------|------------|
+| [**LLM**](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/llm/finetune.py) | [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B) | [HellaSwag + LoRA](recipes/llm/llama_3_2_1b_hellaswag_peft.yaml) |[HellaSwag](recipes/llm/llama_3_2_1b_hellaswag.yaml) • [SQuAD](recipes/llm/llama_3_2_1b_squad.yaml) |  [HellaSwag + nvFSDP](recipes/llm/llama_3_2_1b_hellaswag_nvfsdp.yaml) |
+| [**VLM**](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/vlm/finetune.py) | [`google/gemma-3-4b-it`](https://huggingface.co/google/gemma-3-4b-it) | [CORD-v2 + LoRA](recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml) | [CORD-v2](recipes/vlm/gemma_3_vl_3b_cord_v2.yaml) | Coming Soon |
+
+
+### Run a Recipe
+To run a NeMo AutoModel recipe, you need a recipe script (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/llm/finetune.py), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/vlm/finetune.py)) and a YAML config file (e.g., [LLM](recipes/llm/llama_3_2_1b_squad.yaml), [VLM](recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml)):
+```
+# Command invocation format:
+python3 <recipe_script_path> --config <yaml_config_path>
+
+# LLM example: multi-GPU with FSDP2
+torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_hellaswag.yaml
+
+# VLM example: Single GPU fine-tuning (Gemma-3-VL) with LoRA
+python3 recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml
+```
+
+
 <!-- 
 ### PEFT Methods
 - **LoRA**: Low-Rank Adaptation
@@ -116,7 +136,7 @@ na.peft.lora(model, rank=16, alpha=32)
 # Your model is ready for training!
 ``` -->
 
-## Run with Pre-built Recipes
+<!-- ## Run with Pre-built Recipes
 These YAML examples illustrate common configurations used with NeMo AutoModel recipes.
 
 ```bash
@@ -136,19 +156,21 @@ torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/llama_3
 <!-- # #Multi-Node training
 # torchrun --nproc-per-node=8 --nnodes=2 \
 #     recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_squad_nvfsdp.yaml
-### Vision-Language Models -->
+### Vision-Language Models 
+- ->
 
 ```bash
 # Fine-tune Qwen2.5-VL
 python recipes/vlm/finetune.py --config recipes/vlm/qwen2_5_vl_3b_rdr.yaml
 
-# Fine-tune Gemma-3-VL with LoRA
+# Fine-tune Gemma-3-VL with LoRA on a single GPU
 python recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml
 ```
 
 ---
+ -->
 
-## 📋 Examples
+## 📋 YAML Configuration Examples
 
 
 ### 1. Distributed Training Configuration
@@ -253,7 +275,6 @@ NVIDIA NeMo AutoModel is licensed under the [Apache License 2.0](https://github.
 ## 🔗 Links
 
 - **Documentation**: https://docs.nvidia.com/nemo-framework/user-guide/latest/automodel/index.html
-- **NVIDIA NeMo Framework**: https://github.com/NVIDIA/NeMo
 - **Hugging Face Hub**: https://huggingface.co/models
 - **Issues**: https://github.com/NVIDIA-NeMo/Automodel/issues
 - **Discussions**: https://github.com/NVIDIA-NeMo/Automodel/discussions
