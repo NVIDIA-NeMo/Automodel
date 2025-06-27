@@ -98,12 +98,21 @@ pip3 install uv
 # If you cannot install at the system level, you can install for your user with
 # pip3 install --user uv
 ```
-Run every command with `uv run`. It auto-installs the virtual environment from the lock file and keeps it up to date, so you never need to activate a venv manually. Example: `uv run recipes/llm/finetune.py`
+Run every command with `uv run`. It auto-installs the virtual environment from the lock file and keeps it up to date, so you never need to activate a venv manually. Example: `uv run recipes/llm/finetune.py`. If you prefer to install NeMo Automodel explicitly, please follow the instructions below.
+
+### 📦 Install from a Wheel Package
+```
+# Install the latest stable release from PyPI
+# We first need to initialize the virtual environment using uv
+uv venv
+
+uv pip install nemo_automodel   # or: uv pip install --upgrade nemo_automodel
+```
 
 ### 🔧 Install from Source
 ```
 # Install the latest NeMo Automodel from the GitHub repo (best for development).
-# In this case, we first need to initialize the virtual environment using uv
+# We first need to initialize the virtual environment using uv
 uv venv
 
 # We can now install from source
