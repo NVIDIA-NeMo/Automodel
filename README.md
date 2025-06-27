@@ -96,7 +96,7 @@ NeMo AutoModel is offered both as a standard Python package installable via pip 
 pip3 install uv
 
 # If you cannot install at the system level, you can install for your user with
-# pip install --user uv
+# pip3 install --user uv
 ```
 Run every command with `uv run`. It auto-installs the virtual environment from the lock file and keeps it up to date, so you never need to activate a venv manually. Example: `uv run recipes/llm/finetune.py`
 
