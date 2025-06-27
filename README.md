@@ -93,7 +93,7 @@ NeMo AutoModel is offered both as a standard Python package installable via pip 
 ### Prerequisites
 ```
 # We use `uv` for package management and environment isolation.
-pip install uv
+pip3 install uv
 
 # If you cannot install at the system level, you can install for your user with
 # pip install --user uv
