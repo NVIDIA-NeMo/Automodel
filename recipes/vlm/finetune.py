@@ -399,13 +399,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if loss_mask is None:
             loss_mask = (labels.detach() != -100).to(torch.int)
 
-        # TODO(@boxiangw): Refractor. Needed for SP support
-        # If 'position_ids' does not exist in batch already then override it. batch in case of Packed sequence
-        # contains 'position_ids' and we don't want to override it.
-        if (
-            "position_ids" not in batch
-            and self.device_mesh is not None
-            and (self.device_mesh["context_parallel"].size() > 1 or self.device_mesh["tensor_parallel"].size() > 1)
         if (
             "position_ids" not in batch
             and self.device_mesh is not None
@@ -479,6 +472,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 )
             )
             torch.cuda.reset_peak_memory_stats()
+
 
     @torch.no_grad()
     def _run_validation_epoch(self) -> float:
