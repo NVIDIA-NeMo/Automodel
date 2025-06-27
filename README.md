@@ -136,7 +136,7 @@ docker run --gpus all -it --rm \
 
 ### Verify the Installation
 ```
-python -c "import nemo_automodel; print('✅ NeMo AutoModel ready!')"
+uv run python -c "import nemo_automodel; print('✅ NeMo AutoModel ready')"
 ```
 
 ---
