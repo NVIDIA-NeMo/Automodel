@@ -51,7 +51,7 @@ To run a NeMo AutoModel recipe, you need a Python script and a YAML config file:
 ```
 python3 <recipe_script_path> --config <yaml_config_path>
 ```
-
+Examples:
 ```bash
 # Multi-GPU with FSDP2
 torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_hellaswag.yaml
