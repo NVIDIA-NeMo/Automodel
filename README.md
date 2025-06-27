@@ -165,7 +165,7 @@ python recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_3b_cord_v2_peft.y
 ---
  -->
 
-## 📋 Examples
+## 📋 YAML Configuration Examples
 
 
 ### 1. Distributed Training Configuration
