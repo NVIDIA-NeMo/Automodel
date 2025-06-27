@@ -46,6 +46,15 @@ def _add_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX) -> None:
             sd[prefix + k] = sd.pop(k)
 
 
+def _get_lm_head_weight_and_name(model: torch.nn.Module) -> Optional[tuple[torch.Tensor, str]]:
+
+    for name, param in model.named_parameters(remove_duplicate=False):
+        if "lm_head" in name and name.endswith(".weight"):
+            return param, name
+    
+    return None, None
+
+
 # modified from pytorch tutorial https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html
 class ModelState(Stateful):
     """
@@ -130,13 +139,15 @@ class ModelState(Stateful):
             # set_model_state_dict can match parameters correctly. This is not needed
             # for torch serialization.
             _add_outer_prefix(state_dict)
-
+            
         # If we intentionally skipped saving "lm_head.weight" (tied embeddings)
         # PyTorch will complain during load even with strict=False.
         # To be fully compatible we inject a reference tensor so the key exists.
-        if self.is_tied_lm_head and "lm_head.weight" not in state_dict and not self.is_peft:
-            # weight tying guarantees this is identical to the embedding weight
-            state_dict["lm_head.weight"] = self.model.lm_head.weight.detach()
+        if self.is_tied_lm_head and not self.is_peft:
+            lm_head_weight, lm_head_param_name = _get_lm_head_weight_and_name(self.model)
+            if lm_head_param_name not in state_dict:
+                # weight tying guarantees this is identical to the embedding weight
+                state_dict[lm_head_param_name] = lm_head_weight.detach()
 
         set_model_state_dict(
             self.model,
