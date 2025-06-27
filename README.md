@@ -25,14 +25,6 @@
 Start fine-tuning models instantly, scale effortlessly with Pytorch-native data/model parallelism, optimized custom kernels, and memory-efficient recipes-all while preserving the original checkpoint format for seamless use across the Hugging Face ecosystem.
 
 
-## 📋 Ready-to-Use Recipes
-To get started quickly, NeMo AutoModel provides a collection of ready-to-use recipes for common LLM and VLM fine-tuning tasks. Simply select the recipe that matches your model and training setup (e.g., single-GPU, multi-GPU, or multi-node). 
-| Domain | Model ID | Single-GPU | Single-Node | Multi-Node |
-|--------|----------|------------|-------------|------------|
-| **LLM** | `meta-llama/Llama-3.2-1B` | [HellaSwag + LoRA](recipes/llm/llama_3_2_1b_hellaswag_peft.yaml) |[HellaSwag](recipes/llm/llama_3_2_1b_hellaswag.yaml) • [SQuAD](recipes/llm/llama_3_2_1b_squad.yaml) |  [HellaSwag + nvFSDP](recipes/llm/llama_3_2_1b_hellaswag_nvfsdp.yaml) |
-| **VLM** | `google/gemma-3-4b-it` | [CORD-v2 + LoRA](recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml) | [CORD-v2](recipes/vlm/gemma_3_vl_3b_cord_v2.yaml) | Coming Soon |
-
-
 ## 🎛️ Supported Models
 NeMo AutoModel provides native support for a wide range of models available on the Hugging Face Hub, enabling efficient fine-tuning for various domains.
 
@@ -43,6 +35,15 @@ NeMo AutoModel provides native support for a wide range of models available on t
 ### Vision-Language Models
 - **Qwen2.5-VL**: All variants (3B, 7B, 72B)
 - **Gemma-3-VL**: 3B and other variants
+
+### 📋 Ready-to-Use Recipes
+To get started quickly, NeMo AutoModel provides a collection of ready-to-use recipes for common LLM and VLM fine-tuning tasks. Simply select the recipe that matches your model and training setup (e.g., single-GPU, multi-GPU, or multi-node). 
+| Domain | Model ID | Single-GPU | Single-Node | Multi-Node |
+|--------|----------|------------|-------------|------------|
+| **LLM** | `meta-llama/Llama-3.2-1B` | [HellaSwag + LoRA](recipes/llm/llama_3_2_1b_hellaswag_peft.yaml) |[HellaSwag](recipes/llm/llama_3_2_1b_hellaswag.yaml) • [SQuAD](recipes/llm/llama_3_2_1b_squad.yaml) |  [HellaSwag + nvFSDP](recipes/llm/llama_3_2_1b_hellaswag_nvfsdp.yaml) |
+| **VLM** | `google/gemma-3-4b-it` | [CORD-v2 + LoRA](recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml) | [CORD-v2](recipes/vlm/gemma_3_vl_3b_cord_v2.yaml) | Coming Soon |
+
+
 <!-- 
 ### PEFT Methods
 - **LoRA**: Low-Rank Adaptation
@@ -253,7 +254,6 @@ NVIDIA NeMo AutoModel is licensed under the [Apache License 2.0](https://github.
 ## 🔗 Links
 
 - **Documentation**: https://docs.nvidia.com/nemo-framework/user-guide/latest/automodel/index.html
-- **NVIDIA NeMo Framework**: https://github.com/NVIDIA/NeMo
 - **Hugging Face Hub**: https://huggingface.co/models
 - **Issues**: https://github.com/NVIDIA-NeMo/Automodel/issues
 - **Discussions**: https://github.com/NVIDIA-NeMo/Automodel/discussions
