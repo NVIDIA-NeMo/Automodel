@@ -45,6 +45,18 @@ To get started quickly, NeMo AutoModel provides a collection of ready-to-use rec
 | **VLM** | `google/gemma-3-4b-it` | [CORD-v2 + LoRA](recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml) | [CORD-v2](recipes/vlm/gemma_3_vl_3b_cord_v2.yaml) | Coming Soon |
 
 
+### Running a Recipe
+These YAML examples illustrate common configurations used with NeMo AutoModel recipes.
+
+```bash
+# Multi-GPU with FSDP2
+torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_hellaswag.yaml
+
+# Fine-tune Gemma-3-VL with LoRA
+python recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml
+```
+
+
 <!-- 
 ### PEFT Methods
 - **LoRA**: Low-Rank Adaptation
@@ -118,7 +130,7 @@ na.peft.lora(model, rank=16, alpha=32)
 # Your model is ready for training!
 ``` -->
 
-## Run with Pre-built Recipes
+<!-- ## Run with Pre-built Recipes
 These YAML examples illustrate common configurations used with NeMo AutoModel recipes.
 
 ```bash
@@ -138,7 +150,8 @@ torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/llama_3
 <!-- # #Multi-Node training
 # torchrun --nproc-per-node=8 --nnodes=2 \
 #     recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_squad_nvfsdp.yaml
-### Vision-Language Models -->
+### Vision-Language Models 
+- ->
 
 ```bash
 # Fine-tune Qwen2.5-VL
@@ -149,6 +162,7 @@ python recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_3b_cord_v2_peft.y
 ```
 
 ---
+ -->
 
 ## 📋 Examples
 
