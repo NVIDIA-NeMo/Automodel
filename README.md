@@ -58,7 +58,7 @@ uv run <recipe_script_path> --config <yaml_config_path>
 # LLM example: multi-GPU with FSDP2
 uv run torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_hellaswag.yaml
 
-# VLM example: Single GPU fine-tuning (Gemma-3-VL) with LoRA
+# VLM example: single GPU fine-tuning (Gemma-3-VL) with LoRA
 uv run recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml
 ```
 
@@ -92,34 +92,23 @@ NeMo AutoModel is offered both as a standard Python package installable via pip 
 
 ### Prerequisites
 ```
-# For faster setup and environment isolation, we use `uv`
+# We use `uv` for package management and environment isolation.
 pip install uv
-
-# Initialize NeMo Automodel project virtual environment
-# NOTE: Please do not use -p/--python and instead allow uv venv to read it from .python-version
-#       This ensures that the version of python used is always what we prescribe.
-uv venv
 
 # If you cannot install at the system level, you can install for your user with
 # pip install --user uv
-
-# Use `uv run` to launch all commands. It handles pip installing implicitly and
-# ensures your environment is up to date with our lock file.
-
-# Note that it is not recommended to activate the venv and instead use `uv run` since
-# it ensures consistent environment usage across different shells and sessions.
-# Example: uv run recipes/llm/finetune.py
 ```
+Use `uv run` to launch all commands. It handles pip installing implicitly and ensures your environment is up to date with our lock file. The first time `uv run` is executed, it will install the virtual environment.
 
-### 📦 Install from a Wheel Package
-```
-# Install the latest stable release from PyPI
-uv pip install nemo_automodel   # or: uv pip install --upgrade nemo_automodel
-```
+> **_Note:_** It is not recommended to activate the venv and instead use `uv run` since it ensures consistent environment usage across different shells and sessions. Example: `uv run recipes/llm/finetune.py`
 
 ### 🔧 Install from Source
 ```
 # Install the latest NeMo Automodel from the GitHub repo (best for development).
+# In this case, we first need to initialize the virtual environment using uv
+uv venv
+
+# We can now install from source
 uv pip install git+https://github.com/NVIDIA-NeMo/Automodel.git
 ```
 
