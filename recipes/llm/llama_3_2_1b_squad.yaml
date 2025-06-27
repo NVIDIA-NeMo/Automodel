@@ -1,3 +1,23 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+# To run this recipe, please use the following command:
+# torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_squad.yaml
+# Adjust --nproc-per-node to the number of GPUs available on your host machine.
+
+
 step_scheduler:
   grad_acc_steps: 4
   ckpt_every_steps: 1000
@@ -25,7 +45,6 @@ distributed:
   sequence_parallel: false
 
 loss_fn: nemo_automodel.loss.masked_ce.masked_cross_entropy
-
 
 dataset:
   _target_: nemo_automodel.datasets.llm.squad.make_squad_dataset
@@ -59,7 +78,7 @@ optimizer:
   lr: 1.0e-5
   weight_decay: 0
   # min_lr: 1.0e-5
-  
+
 # Uncomment and configure for W&B logging
 # wandb:
 #   project: <your_wandb_project>

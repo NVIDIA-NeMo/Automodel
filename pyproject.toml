@@ -23,7 +23,7 @@ include-package-data = true
 include = ["nemo_automodel", "nemo_automodel.*"]
 
 [project]
-description = "NeMo Automodel - Delivers zero-day integration with Hugging Face models automating fine-tuning and pretraining with built-in parallelism, custom-kernels and optimized recipes"
+description = "NeMo Automodel - Provides Day-0 support for any Hugging Face model leveraging PyTorch native functionalities while providing performance and memory optimized training and inference recipes."
 name = "nemo-automodel"
 dynamic = ["version"]
 readme = "README.md"
