@@ -39,7 +39,7 @@ NeMo AutoModel provides native support for a wide range of models available on t
 - **Gemma-3-VL**: 3B and other variants
 
 ### 📋 Ready-to-Use Recipes
-To get started quickly, NeMo AutoModel provides a collection of ready-to-use recipes for common LLM and VLM fine-tuning tasks. Simply select the recipe that matches your model and training setup (e.g., single-GPU, multi-GPU, or multi-node). 
+To get started quickly, NeMo AutoModel provides a collection of ready-to-use recipes for common LLM and VLM fine-tuning tasks. Simply select the recipe that matches your model and training setup (e.g., single-GPU, multi-GPU, or multi-node).
 | Domain | Model ID | Single-GPU | Single-Node | Multi-Node |
 |--------|----------|------------|-------------|------------|
 | [**LLM**](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/llm/finetune.py) | [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B) | [HellaSwag + LoRA](recipes/llm/llama_3_2_1b_hellaswag_peft.yaml) |[HellaSwag](recipes/llm/llama_3_2_1b_hellaswag.yaml) • [SQuAD](recipes/llm/llama_3_2_1b_squad.yaml) |  [HellaSwag + nvFSDP](recipes/llm/llama_3_2_1b_hellaswag_nvfsdp.yaml) |
@@ -47,7 +47,7 @@ To get started quickly, NeMo AutoModel provides a collection of ready-to-use rec
 
 
 ### Running a Recipe
-To run a NeMo AutoModel recipe, you need a Python script and a YAML config file:
+To run a NeMo AutoModel recipe, you need a Python script (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/llm/finetune.py), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/vlm/finetune.py) recipe) and a YAML config file:
 ```
 python3 <recipe_script_path> --config <yaml_config_path>
 ```
