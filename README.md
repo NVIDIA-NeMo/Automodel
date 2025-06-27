@@ -32,6 +32,9 @@ NeMo AutoModel provides native support for a wide range of models available on t
 
 ### Large Language Models
 - **LLaMA Family**: LLaMA 3, LLaMA 3.1, LLaMA 3.2, Code Llama
+- **QWen Family**: QWen3, QWen2.5, Qwen2
+- **Gemma Family**: Gemma2, Gemma3
+- **Phi Family**: Phi2, Phi3, Phi4
 - **And more**: Any causal LM on Hugging Face Hub!
 
 ### Vision-Language Models
