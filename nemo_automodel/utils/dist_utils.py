@@ -18,14 +18,10 @@ import logging
 import os
 from contextlib import ContextDecorator, nullcontext
 from datetime import datetime
-from typing import Any, Optional
-
 import torch
+from typing import Optional
 import torch.distributed
 import torch.distributed as dist
-import yaml
-
-from nemo_automodel.utils.yaml_utils import safe_yaml_representers
 
 
 logger = logging.getLogger(__name__)
@@ -170,18 +166,6 @@ def get_local_rank_preinit() -> int:
     return int(os.getenv("LOCAL_RANK", "0"))
 
 
-
-def is_last_rank() -> bool:
-    """
-    Check if the current rank is the last rank in the default process group.
-
-    Returns:
-        True if the current rank is the last one, False otherwise.
-    """
-    return torch.distributed.get_rank() == (torch.distributed.get_world_size() - 1)
-
-
-
 def append_to_progress_log(save_dir: str, string: str, barrier: bool = True) -> None:
     """
     Append a formatted string to the progress log file (rank 0 only).
@@ -219,29 +203,6 @@ def barrier_and_log(string: str) -> None:
         torch.distributed.barrier()
     time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     logger.info("[{}] datetime: {} ".format(string, time_str))
-
-
-def dump_dataclass_to_yaml(obj: Any, filename: Optional[str] = None) -> Optional[str]:
-    """
-    Dump a dataclass object or other Python object to a YAML file or string.
-
-    Uses safe representers to handle common types.
-
-    Args:
-        obj: The object to dump.
-        filename: If provided, the path to the file where YAML should be written.
-                  If None, returns the YAML string directly.
-
-    Returns:
-        If filename is None, returns the YAML string representation of the object.
-        Otherwise, returns None.
-    """
-    with safe_yaml_representers():
-        if filename is not None:
-            with open(filename, "w+") as f:
-                yaml.safe_dump(obj, f)
-        else:
-            return yaml.safe_dump(obj)
 
 
 def reduce_loss(
