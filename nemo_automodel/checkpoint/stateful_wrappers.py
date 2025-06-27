@@ -139,10 +139,14 @@ class ModelState(Stateful):
             # set_model_state_dict can match parameters correctly. This is not needed
             # for torch serialization.
             _add_outer_prefix(state_dict)
-
+            
+        # If we intentionally skipped saving "lm_head.weight" (tied embeddings)
+        # PyTorch will complain during load even with strict=False.
+        # To be fully compatible we inject a reference tensor so the key exists.
         if self.is_tied_lm_head and not self.is_peft:
             lm_head_weight, lm_head_param_name = _get_lm_head_weight_and_name(self.model)
             if lm_head_param_name not in state_dict:
+                # weight tying guarantees this is identical to the embedding weight
                 state_dict[lm_head_param_name] = lm_head_weight.detach()
 
         set_model_state_dict(
