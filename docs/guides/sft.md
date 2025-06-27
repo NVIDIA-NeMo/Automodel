@@ -1,4 +1,4 @@
-# Supervised Fine-Tuning on HellaSwag
+# Full Model Fine-Tuning on HellaSwag
 
 This document explains how to perform SFT on HellaSwag in NeMo Automodel, the default finetuning recipe. It outlines key operations, including initiating SFT runs and managing experiment configurations using YAML.
 
@@ -20,8 +20,8 @@ NeMo Automodel allows users to configure experiments using `yaml` config files. 
 
 ```bash
 uv run recipes/llm/finetune.py \
-    step_scheduler.ckpt_every_steps 50 \
-    rng.seed 1234
+    --step_scheduler.ckpt_every_steps 50 \
+    --rng.seed 1234
 ```
 
 ## Logging
@@ -37,4 +37,15 @@ The default execution is for the training to be launched on a single GPU. If you
 uv run torchrun --nproc-per-node=2 recipes/llm/finetune.py
 ```
 
+We also allow for tensor-parallel and context-parallel training strategies. These can also be passed through the command-line interface. For example, to use tensor-parallel on 2 GPUs you can run
+
+```bash
+uv run torchrun --nproc-per-node=2 recipes/llm/finetune.py \
+    --distributed.tp_size 2
+```
+
 TODO: include screenshots of training metrics, wandb loss curve
+
+## Checkpointing
+
+We allow training state checkpointing to be done in either [Safetensors](https://huggingface.co/docs/safetensors/en/index) or [PyTorch DCP](https://docs.pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html) format.
