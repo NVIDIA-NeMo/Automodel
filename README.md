@@ -98,9 +98,7 @@ pip install uv
 # If you cannot install at the system level, you can install for your user with
 # pip install --user uv
 ```
-Use `uv run` to launch all commands. It handles pip installing implicitly and ensures your environment is up to date with our lock file. The first time `uv run` is executed, it will install the virtual environment.
-
-> **_Note:_** It is not recommended to activate the venv and instead use `uv run` since it ensures consistent environment usage across different shells and sessions. Example: `uv run recipes/llm/finetune.py`
+Run every command with `uv run`. It auto-installs the virtual environment from the lock file and keeps it up to date, so you never need to activate a venv manually. Example: `uv run recipes/llm/finetune.py`
 
 ### 🔧 Install from Source
 ```
