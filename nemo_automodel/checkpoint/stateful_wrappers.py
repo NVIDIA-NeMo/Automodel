@@ -47,22 +47,10 @@ def _add_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX) -> None:
 
 
 def _get_lm_head_weight_and_name(model: torch.nn.Module) -> Optional[tuple[torch.Tensor, str]]:
-    # Common patterns for language modeling heads in vlm models s
-    possible_paths = [
-        "lm_head.weight",
-        "language_model.lm_head.weight", 
-        "text_model.lm_head.weight",
-        "decoder.lm_head.weight",
-        "model.lm_head.weight"
-    ]
-    for path in possible_paths:
-        try:
-            obj = model
-            for attr in path.split('.'):
-                obj = getattr(obj, attr)
-            return obj, path
-        except AttributeError:
-            continue
+
+    for name, param in model.named_parameters(remove_duplicate=False):
+        if "lm_head" in name and name.endswith(".weight"):
+            return param, name
     
     return None, None
 
