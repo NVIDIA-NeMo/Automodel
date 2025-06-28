@@ -107,11 +107,13 @@ jobs:
 
       - name: Upgrade lock file
         run: |
+          docker build -f docker/Dockerfile.ci --secret id=GH_TOKEN -t automodel .
+
           docker run \
           --rm \
           -v $(pwd):/workspace \
           -w /workspace \
-          nemoci.azurecr.io/nemo_container_export_deploy_trtllm:main \
+          automdoel \
           bash -c 'uv lock --upgrade'
 
       - name: Upload lock file
