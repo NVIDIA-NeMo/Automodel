@@ -30,6 +30,19 @@ import functools
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 logger = logging.getLogger(__name__)
 
+def _assert_same_signature(original, patched):
+    """
+    Raise AssertionError if the two call signatures differ.
+    """
+    sig_orig  = inspect.signature(original)
+    sig_patch = inspect.signature(patched)
+
+    if sig_orig != sig_patch:
+        raise AssertionError(
+            f"Signature mismatch:\n"
+            f"  original: {sig_orig}\n"
+            f"  patched : {sig_patch}"
+        )
 
 def patch_attention(obj, sdpa_method=None):
     """
@@ -53,27 +66,19 @@ def patch_attention(obj, sdpa_method=None):
         ]
     orig_forward = obj.forward
 
-    def patch_method(obj, method):
-        sig = inspect.signature(method)
-        params = ", ".join(sig.parameters)
-        body = textwrap.dedent(f"""
-            def wrapper(self, {params}):
-                with sdpa_kernel(sdpa_method):
-                    return orig_forward({params})
-        """)
-        namespace = {"sdpa_method": sdpa_method, "sdpa_kernel": sdpa_kernel, "self": obj}
-        exec(body, {'orig_forward': method}, namespace)
-        wrapper = namespace['wrapper']
-        functools.update_wrapper(wrapper, method)
-        wrapper.__signature__ = sig
-        wrapper.__annotations__ = method.__annotations__
-        wrapper.__defaults__ = method.__defaults__
-        wrapper.__kwdefaults__ = method.__kwdefaults__
+    def patch_method(method):
+        func = method.__func__
+        @functools.wraps(func)
+        def wrapper(self, *args, **kwargs):
+            with sdpa_kernel(sdpa_method):
+                return func(self, *args, **kwargs)
         wrapper.__doc__ = "SDPA kernel patch\n" + inspect.getdoc(method)
-        return wrapper
+        return types.MethodType(wrapper, method.__self__)  # re-bind
 
-    wrapper = patch_method(obj, orig_forward)
-    obj.forward = types.MethodType(wrapper, obj)   # bind manually
+    obj.forward = patch_method(obj.forward)
+    # runtime check
+    _assert_same_signature(orig_forward, obj.forward)
+
     return obj
 
 
@@ -89,7 +94,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
     functional model.
 
 
-    @akoumpa: currently only supporting liger_kernel for demonstration purposes.
+    TODO(@akoumpa): extend this beyond liger_kernel.
 
     Notes:
     -----
