@@ -21,6 +21,7 @@ from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 
 from nemo_automodel import __version__
 from nemo_automodel.shared.import_utils import safe_import
+import types
 
 
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
@@ -49,11 +50,27 @@ def patch_attention(obj, sdpa_method=None):
         ]
     orig_forward = obj.forward
 
-    def patched_forward(self, *args, **kwargs):
-        with sdpa_kernel(sdpa_method):
-            return orig_forward(*args, **kwargs)
+    def patch_method(obj, method):
+        sig = inspect.signature(method)
+        params = ", ".join(sig.parameters)
+        body = textwrap.dedent(f"""
+            def wrapper(self, {params}):
+                with sdpa_kernel(sdpa_method):
+                    return orig_forward({params})
+        """)
+        namespace = {"sdpa_method": sdpa_method, "sdpa_kernel": sdpa_kernel, "self": obj}
+        exec(body, {'orig_forward': method}, namespace)
+        wrapper = namespace['wrapper']
+        functools.update_wrapper(wrapper, method)
+        wrapper.__signature__ = sig
+        wrapper.__annotations__ = method.__annotations__
+        wrapper.__defaults__ = method.__defaults__
+        wrapper.__kwdefaults__ = method.__kwdefaults__
+        wrapper.__doc__ = "SDPA kernel patch\n" + inspect.getdoc(method)
+        return wrapper
 
-    obj.forward = types.MethodType(patched_forward, obj)
+    wrapper = patch_method(obj, obj.forward)
+    obj.forward = types.MethodType(wrapper, obj)   # bind manually
     return obj
 
 
