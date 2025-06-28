@@ -104,6 +104,8 @@ jobs:
 
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.update-branch.outputs.source-branch }}
 
       - name: Upgrade lock file
         env:
