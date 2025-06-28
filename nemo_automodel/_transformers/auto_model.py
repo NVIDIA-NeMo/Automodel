@@ -23,7 +23,6 @@ from nemo_automodel import __version__
 from nemo_automodel.shared.import_utils import safe_import
 import types
 import inspect
-import textwrap
 import functools
 
 
