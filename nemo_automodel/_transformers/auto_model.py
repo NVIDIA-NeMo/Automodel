@@ -24,6 +24,7 @@ from nemo_automodel.shared.import_utils import safe_import
 import types
 import inspect
 import textwrap
+import functools
 
 
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
@@ -71,7 +72,7 @@ def patch_attention(obj, sdpa_method=None):
         wrapper.__doc__ = "SDPA kernel patch\n" + inspect.getdoc(method)
         return wrapper
 
-    wrapper = patch_method(obj, obj.forward)
+    wrapper = patch_method(obj, orig_forward)
     obj.forward = types.MethodType(wrapper, obj)   # bind manually
     return obj
 
