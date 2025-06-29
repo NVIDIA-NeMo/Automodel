@@ -1,0 +1,160 @@
+name: ~Update dependencies template
+on:
+  workflow_call:
+    inputs:
+      target-branch:
+        required: true
+        type: string
+        description: "The target branch to bump"
+      nvfsdp-target-branch:
+        required: true
+        type: string
+        description: "The target branch to bump"
+    secrets:
+      PAT:
+        required: true
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+      SSH_KEY:
+        required: true
+      SSH_PWD:
+        required: true
+
+jobs:
+  update-branch:
+    runs-on: ubuntu-latest
+    outputs:
+      source-branch: ${{ steps.merge-branch.outputs.source-branch }}
+      bump-branch: bump-ci-container-${{ steps.ref.outputs.date }}-${{ steps.merge-branch.outputs.source-branch }}
+      date: ${{ steps.ref.outputs.date }}
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          ref: ${{ inputs.target-branch }}
+
+      - name: Set Git config
+        run: |
+          git config --local user.email "actions@github.com"
+          git config --local user.name "Github Actions"
+
+      - name: Get latest source commit
+        id: ref
+        run: echo "date=$(date +%F)" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Merge weekly-bump-${{ inputs.target-branch }} back to base branch
+        env:
+          SOURCE_BRANCH: weekly-bump-${{ inputs.target-branch }}
+          TARGET_BRANCH: ${{ inputs.target-branch }}
+        id: merge-branch
+        run: |
+          # Sanitize SOURCE_BRANCH by replacing slashes with dashes and removing any special characters
+          SOURCE_BRANCH=$(echo "$SOURCE_BRANCH" | sed 's/\//-/g' | sed 's/[^a-zA-Z0-9_-]//g')
+
+          echo "source-branch=$SOURCE_BRANCH" | tee -a $GITHUB_OUTPUT
+
+          if git ls-remote --exit-code origin $SOURCE_BRANCH; then
+            git fetch --unshallow
+            git checkout $SOURCE_BRANCH
+            git pull
+            git merge --no-ff $TARGET_BRANCH -m "chore: Auto-merge $TARGET_BRANCH into $SOURCE_BRANCH"
+          else
+            git checkout -b $SOURCE_BRANCH $TARGET_BRANCH
+          fi
+          git push -u origin $SOURCE_BRANCH
+
+  nvfsdp:
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_bump_tomlfile.yml@v0.40.0
+    needs: [update-branch]
+    name: Bump nvFSDP
+    with:
+      source-repository: NVIDIA-NeMo/NVFSDP
+      source-ref: ${{ inputs.nvfsdp-target-branch }}
+      toml-path: tool.uv.sources.nvfsdp.rev
+      file: pyproject.toml
+      base-branch: ${{ needs.update-branch.outputs.source-branch }}
+      pr-branch: ${{ needs.update-branch.outputs.bump-branch }}
+      pr-title: "chore(🤖): Bump dependencies (${{ needs.update-branch.outputs.date }})"
+      use-gpgkey: true
+    secrets:
+      PAT: ${{ secrets.PAT }}
+      GPG_KEY: ${{ secrets.SSH_KEY }}
+      GPG_PASSPHRASE: ${{ secrets.SSH_PWD }}
+
+  update-lockfile:
+    environment: nemo-ci
+    runs-on: linux-amd64-cpu16
+    needs: [mcore, update-branch]
+    steps:
+      - name: Install Azure CLI
+        run: curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Azure ACR Login
+        run: az acr login --name nemoci
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.update-branch.outputs.bump-branch }}
+
+      - name: Upgrade lock file
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          docker build -f docker/Dockerfile.ci --secret id=GH_TOKEN -t automodel .
+
+          docker run \
+          --rm \
+          -v $(pwd):/workspace \
+          -w /workspace \
+          automdoel \
+          bash -c 'uv lock --upgrade'
+
+      - name: Upload lock file
+        uses: actions/upload-artifact@v4
+        with:
+          name: lock-file-${{ needs.update-branch.outputs.bump-branch }}
+          path: uv.lock
+
+  create-pr:
+    needs: [update-lockfile, update-branch]
+    runs-on: ubuntu-latest
+    environment: main
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT }}
+          ref: ${{ needs.update-branch.outputs.bump-branch }}
+
+      - name: Install GPG
+        run: sudo apt-get install -y gnupg2
+
+      - name: Import GPG key
+        uses: crazy-max/ghaction-import-gpg@e89d40939c28e39f97cf32126055eeae86ba74ec
+        with:
+          gpg_private_key: ${{ secrets.SSH_KEY }}
+          passphrase: ${{ secrets.SSH_PWD }}
+          git_user_signingkey: true
+          git_commit_gpgsign: true
+
+      - name: Download lock file
+        uses: actions/download-artifact@v4
+        with:
+          name: lock-file-${{ needs.update-branch.outputs.bump-branch }}
+
+      - name: Commit changes
+        run: |
+          git add uv.lock
+          git commit -S -m "build: uv.lock"
+          git push
