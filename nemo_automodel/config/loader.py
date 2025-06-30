@@ -120,15 +120,26 @@ class ConfigNode:
     This class allows nested dictionaries and lists to be accessed as attributes and
     provides functionality to instantiate objects from configuration.
     """
-    def __init__(self, d):
+    def __init__(self, d, raise_on_missing_attr=False):
         """Initialize the ConfigNode.
 
         Args:
             d (dict): A dictionary representing configuration options.
+            raise_on_missing_attr (bool): if True, it will return `None` on a missing attr.
         """
         self.__dict__ = {
             k: self._wrap(k, v) for k, v in d.items()
         }
+        self.raise_on_missing_attr = raise_on_missing_attr
+
+    def __getattr__(self, key):
+        try:
+            return self.__dict__[key]
+        except AttributeError as e:
+            if self.raise_on_missing_attr:
+                raise e
+            else:
+                return None
 
     def _wrap(self, k, v):
         """Wrap a configuration value based on its type.
