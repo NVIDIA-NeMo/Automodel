@@ -113,6 +113,15 @@ jobs:
         run: |
           docker build -f docker/Dockerfile.ci --secret id=GH_TOKEN -t automodel .
 
+      - name: Create bump branch if not exists
+        env:
+          SOURCE_BRANCH: weekly-bump-${{ inputs.target-branch }}
+          TARGET_BRANCH: ${{ inputs.target-branch }}
+        run: |
+          if ! git ls-remote --exit-code origin $SOURCE_BRANCH; then
+            git checkout -b $SOURCE_BRANCH $TARGET_BRANCH
+          fi
+
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
@@ -127,6 +136,7 @@ jobs:
           -v $(pwd):/workspace \
           -w /workspace \
           automodel \
+          -e GH_TOKEN=${{ secrets.PAT }} \
           bash -c 'uv lock --upgrade'
 
       - name: Upload lock file
