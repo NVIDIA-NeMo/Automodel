@@ -411,7 +411,6 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         loss_mask = batch.pop("loss_mask", None)
         if loss_mask is None:
             loss_mask = (labels.detach() != -100).to(torch.int)
-        self.num_tokens += count_tail_padding(labels)
 
         if (
             "position_ids" not in batch
@@ -428,6 +427,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
 
         local_num_tokens = loss_mask.sum().detach().to(torch.int)
+        self.num_tokens += local_num_tokens - count_tail_padding(labels)
         self.total_num_tokens += local_num_tokens
         self.forward_data_store.append(local_loss.detach())
 
