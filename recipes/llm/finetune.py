@@ -594,13 +594,14 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 # ---------------------------------------------------------------------------
 
 
-def main():
+def main(config_path=None):
     """Main entry point for the fine-tuning recipe.
 
     Loads the configuration, sets up the trainer, and initiates the training loop.
     """
-    script_path = pathlib.Path(__file__).parent.resolve()
-    cfg = parse_args_and_load_config(script_path / "llama_3_2_1b_hellaswag.yaml")
+    if config_path is None:
+        config_path = pathlib.Path(__file__).parent.resolve()  / "llama_3_2_1b_hellaswag.yaml"
+    cfg = parse_args_and_load_config(config_path)
     trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()

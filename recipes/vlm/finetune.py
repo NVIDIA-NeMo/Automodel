@@ -667,12 +667,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
 # ---------------------------------------------------------------------------
 
 
-def main():
+def main(config_path=None):
     """Main entry point for the fine-tuning recipe.
 
     Loads the configuration, sets up the trainer, and initiates the training loop.
     """
-    cfg = parse_args_and_load_config("qwen2_5_vl_3b_rdr.yaml")
+    if config_path is None:
+        config_path = pathlib.Path(__file__).parent.resolve() / "qwen2_5_vl_3b_rdr.yaml"
+    cfg = parse_args_and_load_config(config_path)
     trainer = FinetuneRecipeForVLM(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
