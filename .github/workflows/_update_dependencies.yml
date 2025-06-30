@@ -150,5 +150,5 @@ jobs:
       - name: Commit changes
         run: |
           git add uv.lock
-          git commit -S -m "build: uv.lock"
+          git commit -s -S -m "build: uv.lock"
           git push
