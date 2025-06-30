@@ -97,22 +97,34 @@ def build_model_and_optimizer(
             peft_fn = opts.pop("peft_fn")
             peft_fn(model, **opts)
 
-        trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
-        assert len(trainable_params) > 0, "trainable_params cannot be empty"
-        if tp_size > 1:
-            # TP does not support foreach
-            cfg_opt.foreach = False
-        optimizer = cfg_opt.instantiate(params=trainable_params)
+    if callable(getattr(model_wrapper, 'parallelize', None)):
+        # FSDP2 and nvFSDP should already be on the correct device
+        if isinstance(model_wrapper, NVFSDPManager):
+            # nvFSDP instantiate optimizer inside parallelize_function
+            trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
+            assert len(trainable_params) > 0, "trainable_params cannot be empty"
+            if tp_size > 1:
+                # TP does not support foreach
+                cfg_opt.foreach = False
+            optimizer = cfg_opt.instantiate(params=trainable_params)
 
-        if callable(getattr(model_wrapper, 'parallelize', None)):
-            if isinstance(model_wrapper, NVFSDPManager):
-                model, optimizer = model_wrapper.parallelize(model, optimizer)
-            else:
-                model = model_wrapper.parallelize(model)
-            # FSDP2 and nvFSDP should already be on the correct device
+            model, optimizer = model_wrapper.parallelize(model, optimizer)
+
+            return model, optimizer
+
         else:
-            model = model.to(device)
-        return model, optimizer
+            model = model_wrapper.parallelize(model)
+    else:
+        model = model.to(device)
+
+    trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
+    assert len(trainable_params) > 0, "trainable_params cannot be empty"
+    if tp_size > 1:
+        # TP does not support foreach
+        cfg_opt.foreach = False
+    optimizer = cfg_opt.instantiate(params=trainable_params)
+    
+    return model, optimizer
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
@@ -564,7 +576,7 @@ def main():
     Loads the configuration, sets up the trainer, and initiates the training loop.
     """
     script_path = pathlib.Path(__file__).parent.resolve()
-    cfg = parse_args_and_load_config(script_path / "llama_3_2_1b_hellaswag.yaml")
+    cfg = parse_args_and_load_config(script_path / "llama_3_2_1b_hellaswag_nvfsdp.yaml")
     trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
