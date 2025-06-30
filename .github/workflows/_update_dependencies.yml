@@ -137,7 +137,7 @@ jobs:
           -w /workspace \
           -e GH_TOKEN=${{ secrets.PAT }} \
           automodel \
-          bash -c 'source /opt/venv/bin/activate && uv lock --upgrade'
+          bash -c 'source /opt/venv/env.sh && uv lock --upgrade'
 
       - name: Upload lock file
         uses: actions/upload-artifact@v4
