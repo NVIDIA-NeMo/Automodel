@@ -304,7 +304,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             run = build_wandb(self.cfg)
             logging.info("🚀 View run at {}".format(run.url))
 
-       # Build components
+        # Build components
         self.model, self.optimizer = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
