@@ -20,15 +20,16 @@ and use it for image-text generation tasks.
 
 Usage:
     # Method 1: Load from HuggingFace-compatible consolidated checkpoint
-    python generate.py --checkpoint_path /path/to/checkpoint/epoch_X_step_Y/model/consolidated --prompt <prompt> --image_url <image_url or local path>
+    python generate.py --checkpoint-path /path/to/checkpoint/epoch_X_step_Y/model/consolidated --prompt <prompt> --image <image_url or local path>
 
     # Method 2: Load from distributed checkpoint
-    python generate.py --checkpoint_path /path/to/checkpoint/epoch_X_step_Y --base_model google/gemma-3-4b-it --prompt <prompt> --image_url <image_url or local path>
+    python generate.py --checkpoint-path /path/to/checkpoint/epoch_X_step_Y --base-model google/gemma-3-4b-it --prompt <prompt> --image <image_url or local path>
 """
 
 import argparse
 from pathlib import Path
 from typing import Optional
+import json
 
 import torch
 import torch.distributed
@@ -42,6 +43,8 @@ from nemo_automodel.checkpoint.checkpointing import load_model, CheckpointingCon
 import logging
 
 from nemo_automodel.loggers.log_utils import setup_logging
+
+# TODO: Parse config from YAML and run generate with FSDP2/distributed in general
 
 
 def load_model_from_checkpoint(
@@ -131,18 +134,38 @@ def main():
     setup_logging()
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint_path", type=str, required=True)
-    parser.add_argument("--base_model", type=str, default=None)
-    parser.add_argument("--is_peft", action="store_true")
+    parser.add_argument("--checkpoint-path", type=str, required=True)
+    parser.add_argument("--base-model", type=str, default=None)
+    parser.add_argument("--is-peft", action="store_true")
     parser.add_argument(
-        "--model_save_format",
+        "--model-save-format",
         type=str,
         default="torch_save",
         choices=["torch_save", "safetensors"],
     )
-    parser.add_argument("--image_url", type=str, default=None)
+    parser.add_argument(
+        "--image",
+        "--image-path",
+        "--image-url",
+        dest="image_url",
+        type=str,
+        default=None,
+    )
     parser.add_argument("--prompt", type=str, required=True)
-    parser.add_argument("--max_new_tokens", type=int, default=100)
+    parser.add_argument("--max-new-tokens", type=int, default=100)
+    parser.add_argument(
+        "--output-format",
+        type=str,
+        default="text",
+        choices=["text", "json"],
+        help="Output format: 'text' for plain text or 'json' for JSON format",
+    )
+    parser.add_argument(
+        "--output-file",
+        type=str,
+        default=None,
+        help="Optional file path to write the output to",
+    )
 
     args = parser.parse_args()
 
@@ -162,7 +185,24 @@ def main():
     response = generate_response(
         model, processor, args.image_url, args.prompt, args.max_new_tokens
     )
-    logging.info(f"Response: {response}")
+
+    # Format and output response
+    if args.output_format == "json":
+        output = {
+            "prompt": args.prompt,
+            "image_url": args.image_url,
+            "response": response,
+        }
+        output_text = json.dumps(output, indent=2)
+    else:
+        output_text = response
+
+    if args.output_file:
+        with open(args.output_file, "w") as f:
+            f.write(output_text)
+        logging.info(f"Output written to {args.output_file}")
+    else:
+        print(output_text)
 
 
 if __name__ == "__main__":
