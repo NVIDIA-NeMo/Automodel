@@ -80,7 +80,7 @@ def load_model_from_checkpoint(
             is_peft=is_peft,
         )
         load_model(model, str(checkpoint_path), checkpoint_config)
-    logging.info("✅ Model loaded successfully from {checkpoint_path}")
+    logging.info(f"✅ Model loaded successfully from {checkpoint_path}")
     return model
 
 
