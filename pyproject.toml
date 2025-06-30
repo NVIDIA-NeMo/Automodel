@@ -100,7 +100,7 @@ nvfsdp = ["nvfsdp"]
 default-groups = ["docs", "test", "nvfsdp"]
 
 [tool.uv.sources]
-nvfsdp = { git = "https://github.com/NVIDIA-NeMo/nvFSDP.git", rev = "e48b3c622040b05a5ab4b27eb68a2ec598a985a3" }
+nvfsdp = { git = "https://github.com/NVIDIA-NeMo/nvFSDP.git", rev = "d97136886a65d70f298a4b361571ac75c20198af" }
 
 [tool.coverage.paths]
 source = [".", "/workspace", "/home/runner/work/Automodel/Automodel"]
