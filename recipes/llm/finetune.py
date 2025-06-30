@@ -34,7 +34,6 @@ try:
 except:
     HAVE_NVFSDP = False
 
-from nemo_automodel.distributed.parallelizer import create_context_parallel_ctx, get_train_context
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.step_scheduler import StepScheduler
 from nemo_automodel.training.utils import count_tail_padding
