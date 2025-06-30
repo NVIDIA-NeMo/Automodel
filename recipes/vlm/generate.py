@@ -20,10 +20,12 @@ and use it for image-text generation tasks.
 
 Usage:
     # Method 1: Load from HuggingFace-compatible consolidated checkpoint
-    python generate.py --checkpoint-path /path/to/checkpoint/epoch_X_step_Y/model/consolidated --prompt <prompt> --image <image_url or local path>
+    python generate.py --checkpoint-path /path/to/checkpoint/epoch_X_step_Y/model/consolidated \
+        --prompt <prompt> --image <image_url or local path>
 
     # Method 2: Load from distributed checkpoint
-    python generate.py --checkpoint-path /path/to/checkpoint/epoch_X_step_Y --base-model google/gemma-3-4b-it --prompt <prompt> --image <image_url or local path>
+    python generate.py --checkpoint-path /path/to/checkpoint/epoch_X_step_Y \
+        --base-model google/gemma-3-4b-it --prompt <prompt> --image <image_url or local path>
 """
 
 import argparse
@@ -54,6 +56,18 @@ def load_model_from_checkpoint(
     model_save_format: str = "torch_save",
     use_liger_kernel: bool = False,
 ) -> NeMoAutoModelForImageTextToText:
+    """Load a VLM model from a checkpoint.
+    
+    Args:
+        checkpoint_path: Path to the checkpoint directory
+        base_model: Base model name for distributed checkpoints
+        is_peft: Whether the checkpoint is a PEFT checkpoint
+        model_save_format: Format of the saved model ("torch_save" or "safetensors")
+        use_liger_kernel: Whether to use Liger kernel optimizations 
+        
+    Returns:
+        Loaded NeMoAutoModelForImageTextToText model
+    """
     checkpoint_path = Path(checkpoint_path)
     device_map = "cuda" if torch.cuda.is_available() else "cpu"
     model = None
@@ -94,6 +108,18 @@ def generate_response(
     prompt: str,
     max_new_tokens: int = 32,
 ) -> str:
+    """Generate a text response from an image and text prompt.
+    
+    Args:
+        model: The loaded VLM model
+        processor: The model's processor for tokenization
+        image_url: URL or local path to the image
+        prompt: Text prompt for the model
+        max_new_tokens: Maximum number of new tokens to generate
+        
+    Returns:
+        Generated text response
+    """
 
     if image_url.startswith("http"):
         image = Image.open(requests.get(image_url, stream=True).raw)
@@ -131,6 +157,7 @@ def generate_response(
 
 
 def main():
+    """Main function to run VLM generation from command line arguments."""
     setup_logging()
 
     parser = argparse.ArgumentParser()
