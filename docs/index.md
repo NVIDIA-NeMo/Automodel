@@ -7,8 +7,10 @@
 :hidden:
 
 environment/local-workstation.md
-environment/cluster.md
 ```
+<!--
+environment/cluster.md
+-->
 
 ```{toctree}
 :caption: 🚀 E2E Examples
