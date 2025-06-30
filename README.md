@@ -14,7 +14,7 @@
 
 <!-- **Day-0 integration with Hugging Face models automating fine-tuning and pretraining with pytorch-native parallelism, custom-kernels and optimized recipes** -->
 
-[📖 Documentation](https://github.com/NVIDIA-NeMo/Automodel/) • [🔥 Ready-to-Use Recipes](#-ready-to-use-recipes) • [💡 Examples](https://github.com/NVIDIA-NeMo/Automodel/tree/main/recipes) • [🤝 Contributing](CONTRIBUTING.md)
+[📖 Documentation](https://github.com/NVIDIA-NeMo/Automodel/) • [🔥 Ready-to-Use Recipes](https://github.com/NVIDIA-NeMo/Automodel/#-ready-to-use-recipes) • [💡 Examples](https://github.com/NVIDIA-NeMo/Automodel/tree/main/recipes) • [🤝 Contributing](https://github.com/NVIDIA-NeMo/Automodel/blob/main/CONTRIBUTING.md)
 
 </div>
 
@@ -45,12 +45,13 @@ NeMo AutoModel provides native support for a wide range of models available on t
 To get started quickly, NeMo AutoModel provides a collection of ready-to-use recipes for common LLM and VLM fine-tuning tasks. Simply select the recipe that matches your model and training setup (e.g., single-GPU, multi-GPU, or multi-node).
 | Domain | Model ID | Single-GPU | Single-Node | Multi-Node |
 |--------|----------|------------|-------------|------------|
-| [**LLM**](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/llm/finetune.py) | [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B) | [HellaSwag + LoRA](recipes/llm/llama_3_2_1b_hellaswag_peft.yaml) |[HellaSwag](recipes/llm/llama_3_2_1b_hellaswag.yaml) • [SQuAD](recipes/llm/llama_3_2_1b_squad.yaml) |  [HellaSwag + nvFSDP](recipes/llm/llama_3_2_1b_hellaswag_nvfsdp.yaml) |
-| [**VLM**](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/vlm/finetune.py) | [`google/gemma-3-4b-it`](https://huggingface.co/google/gemma-3-4b-it) | [CORD-v2 + LoRA](recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml) | [CORD-v2](recipes/vlm/gemma_3_vl_3b_cord_v2.yaml) | Coming Soon |
+| [**LLM**](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/llm/finetune.py) | [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B) | [HellaSwag + LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/llm/llama_3_2_1b_hellaswag_peft.yaml) |[HellaSwag](
+  https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/llm/llama_3_2_1b_hellaswag.yaml) • [SQuAD](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/llm/llama_3_2_1b_squad.yaml) |  [HellaSwag + nvFSDP](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/llm/llama_3_2_1b_hellaswag_nvfsdp.yaml) |
+| [**VLM**](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/vlm/finetune.py) | [`google/gemma-3-4b-it`](https://huggingface.co/google/gemma-3-4b-it) | [CORD-v2 + LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml) | [CORD-v2](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/vlm/gemma_3_vl_3b_cord_v2.yaml) | Coming Soon |
 
 
 ### Run a Recipe
-To run a NeMo AutoModel recipe, you need a recipe script (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/llm/finetune.py), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/vlm/finetune.py)) and a YAML config file (e.g., [LLM](recipes/llm/llama_3_2_1b_squad.yaml), [VLM](recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml)):
+To run a NeMo AutoModel recipe, you need a recipe script (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/llm/finetune.py), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/vlm/finetune.py)) and a YAML config file (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/llm/llama_3_2_1b_squad.yaml), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml)):
 ```
 # Command invocation format:
 uv run <recipe_script_path> --config <yaml_config_path>
@@ -278,7 +279,7 @@ NeMo-Automodel/
 
 ## 🤝 Contributing
 
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
+We welcome contributions! Please see our [Contributing Guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/CONTRIBUTING.md) for details.
 
 ---
 
