@@ -15,10 +15,9 @@
 name: Build docs
 
 on:
-  push:
-    branches:
-      - main
-      - "pull-request/[0-9]+"
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_call:
 
 jobs:
   build-docs:
