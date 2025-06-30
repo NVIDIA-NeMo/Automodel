@@ -14,12 +14,13 @@
 import pytest
 import torch
 import torch.nn.functional as F
+
 from nemo_automodel.loss.masked_ce import masked_cross_entropy
 
 
 def test_masked_cross_entropy_no_mask():
     """
-    Tests masked_cross_entropy with no mask against baseline
+    Tests masked_cross_entropy with no mask against baseline.
     """
     # Create dummy data
     batch_size = 4
@@ -42,7 +43,7 @@ def test_masked_cross_entropy_no_mask():
 
 def test_masked_cross_entropy_with_mask():
     """
-    Tests masked_cross_entropy with mask against baseline
+    Tests masked_cross_entropy with mask against baseline.
     """
     # Create dummy data
     batch_size = 4
@@ -68,7 +69,7 @@ def test_masked_cross_entropy_with_mask():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_masked_cross_entropy_gpu():
     """
-    Tests masked_cross_entropy with mask against baseline on GPU
+    Tests masked_cross_entropy with mask against baseline on GPU.
     """
     # Same test as above, but on GPU
     device = torch.device("cuda")

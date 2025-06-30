@@ -19,11 +19,8 @@ from __future__ import annotations
 import importlib
 import logging
 
-logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-#  Public API
-# ---------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
 
 def apply_patches() -> None:
     """

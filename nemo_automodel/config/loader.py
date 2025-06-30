@@ -13,11 +13,13 @@
 # limitations under the License.
 
 import ast
-import yaml
 import importlib
 import importlib.util
 import os
 import sys
+
+import yaml
+
 
 def translate_value(v):
     """
@@ -28,8 +30,7 @@ def translate_value(v):
     string if parsing fails.
 
     Args:
-        v (str):
-            The raw string value to translate.
+        v (str): The raw string value to translate.
 
     Returns:
         The translated Python value, which may be:
@@ -58,6 +59,7 @@ def translate_value(v):
 def _resolve_target(dotted_path: str):
     """
     Resolve a dotted path to a Python object.
+
     1) Find the longest importable module prefix.
     2) getattr() the rest.
     3) If that fails, fall back to scanning sys.path for .py or package dirs.
@@ -119,8 +121,7 @@ class ConfigNode:
     provides functionality to instantiate objects from configuration.
     """
     def __init__(self, d):
-        """
-        Initialize the ConfigNode.
+        """Initialize the ConfigNode.
 
         Args:
             d (dict): A dictionary representing configuration options.
@@ -130,8 +131,7 @@ class ConfigNode:
         }
 
     def _wrap(self, k, v):
-        """
-        Wrap a configuration value based on its type.
+        """Wrap a configuration value based on its type.
 
         Args:
             k (str): The key corresponding to the value.
@@ -150,8 +150,7 @@ class ConfigNode:
             return translate_value(v)
 
     def instantiate(self, *args, **kwargs):
-        """
-        Instantiate the target object specified in the configuration.
+        """Instantiate the target object specified in the configuration.
 
         This method looks for the "_target_" attribute in the configuration and resolves
         it to a callable function or class which is then instantiated.
@@ -270,6 +269,7 @@ class ConfigNode:
     def set_by_dotted(self, dotted_key: str, value):
         """
         Set (or append) a value in the config using a dotted key.
+
         e.g. set_by_dotted("foo.bar.abc", 1) will ensure self.foo.bar.abc == 1
         """
         parts = dotted_key.split(".")

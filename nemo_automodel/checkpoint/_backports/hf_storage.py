@@ -1,5 +1,19 @@
-# taken and edited from https://github.com/pytorch/pytorch/blob/6ebe9a4f47e9cd1c9ccd467bcdfdea9445fd98d6/torch/distributed/checkpoint/hf_storage.py  # pylint: disable=line-too-long
-# pylint: disable=missing-function-docstring
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# taken and edited from
+# https://github.com/pytorch/pytorch/blob/6ebe9a4f47e9cd1c9ccd467bcdfdea9445fd98d6/torch/distributed/checkpoint/hf_storage.py
+# pylint: disable=missing-function-docstring,line-too-long
 
 import dataclasses
 import json
@@ -8,8 +22,6 @@ from typing import Any, Optional
 
 import torch
 from torch.distributed._shard._utils import narrow_tensor_by_index
-from nemo_automodel.checkpoint._backports._fsspec_filesystem import FsspecReader, FsspecWriter
-from nemo_automodel.checkpoint._backports.consolidate_hf_safetensors import consolidate_safetensors_files
 from torch.distributed.checkpoint.metadata import (
     ChunkStorageMetadata,
     Metadata,
@@ -29,11 +41,10 @@ from torch.distributed.checkpoint.planner import (
 from torch.distributed.checkpoint.storage import WriteResult
 from torch.futures import Future
 
+from nemo_automodel.checkpoint._backports._fsspec_filesystem import FsspecReader, FsspecWriter
+from nemo_automodel.checkpoint._backports.consolidate_hf_safetensors import consolidate_safetensors_files
 from nemo_automodel.checkpoint._backports.filesystem import SerializationFormat
-
 from nemo_automodel.checkpoint._backports.hf_utils import (
-    _metadata_fn,
-    _HFStorageInfo,
     CUSTOM_METADATA_KEY,
     DATA_KEY,
     DATA_OFFSETS_KEY,
@@ -43,9 +54,12 @@ from nemo_automodel.checkpoint._backports.hf_utils import (
     SHAPE_KEY,
     SUFFIX,
     _gen_file_name,
-    _get_safetensors_file_metadata,
     _get_dtype,
+    _get_safetensors_file_metadata,
+    _HFStorageInfo,
+    _metadata_fn,
 )
+
 
 __all__ = ["_HuggingFaceStorageWriter", "_HuggingFaceStorageReader"]
 
@@ -85,7 +99,6 @@ class _HuggingFaceStorageWriter(FsspecWriter):
             consolidated_output_path: If provided, the output path where the consolidated files will be written in the finish step. This needs to be a local fs path right now.
             num_threads_consolidation: Number of threads to use for parallel processing of saving data to output files. If not provided, the default value is the number of output files.
         """
-
         if token is not None:
             super().__init__(
                 path=path,
@@ -149,9 +162,7 @@ class _HuggingFaceStorageWriter(FsspecWriter):
         file_queue: queue.Queue = queue.Queue()
         for file_index, write_items in buckets.items():
             file_name = _gen_file_name(file_index, highest_index, shard_index)
-            file_queue.put(
-                (self.fs.concat_path(self.path, file_name), file_name, write_items)
-            )
+            file_queue.put((self.fs.concat_path(self.path, file_name), file_name, write_items))
 
         return super()._write_data(planner, file_queue)
 
@@ -163,16 +174,14 @@ class _HuggingFaceStorageWriter(FsspecWriter):
                 input_dir=self.path,
                 output_dir=self._consolidated_output_path,
                 num_threads=self._num_threads_consolidation,
-                fqn_to_index_mapping=self._fqn_to_index_mapping
+                fqn_to_index_mapping=self._fqn_to_index_mapping,
             )
 
         metadata_to_write = {}
         storage_md = {}
         total_size = 0
         for wr_list in results:
-            storage_md.update(
-                {wr.index.fqn: wr.storage_data.relative_path for wr in wr_list}
-            )
+            storage_md.update({wr.index.fqn: wr.storage_data.relative_path for wr in wr_list})
             total_size += sum([wr.storage_data.length for wr in wr_list])
         metadata_to_write["metadata"] = {"total_size": total_size}
         metadata_to_write["weight_map"] = storage_md
@@ -222,7 +231,6 @@ class _HuggingFaceStorageReader(FsspecReader):
             including localFS and hf://.
             token: The token to use to authenticate with huggingface hub.
         """
-
         if token is not None:
             super().__init__(path=path, token=token)
         else:
@@ -257,9 +265,7 @@ class _HuggingFaceStorageReader(FsspecReader):
                         dtype=item_md.dtype,
                     )
                     tensor = tensor.reshape(item_md.shape)
-                    tensor = narrow_tensor_by_index(
-                        tensor, req.storage_offsets, req.lengths
-                    )
+                    tensor = narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
                     target_tensor = planner.resolve_tensor(req).detach()
 
                     assert target_tensor.size() == tensor.size(), (
@@ -289,9 +295,7 @@ class _HuggingFaceStorageReader(FsspecReader):
 
                 dcp_sharding_info = None
                 if custom_metadata and custom_metadata.get(CUSTOM_METADATA_KEY):
-                    dcp_sharding_info = json.loads(
-                        custom_metadata.get(CUSTOM_METADATA_KEY)
-                    )
+                    dcp_sharding_info = json.loads(custom_metadata.get(CUSTOM_METADATA_KEY))
 
                 for key, val in safetensors_metadata.items():
                     if key == DEFAULT_EXTRA_METADATA_KEY:
@@ -305,15 +309,8 @@ class _HuggingFaceStorageReader(FsspecReader):
 
                     if key not in state_dict_metadata:
                         state_dict_metadata[key] = TensorStorageMetadata(
-                            properties=TensorProperties(
-                                dtype=_get_dtype(val[DTYPE_KEY])
-                            ),
-                            size=torch.Size(
-                                [
-                                    saved + offset
-                                    for saved, offset in zip(val[SHAPE_KEY], offset)
-                                ]
-                            ),
+                            properties=TensorProperties(dtype=_get_dtype(val[DTYPE_KEY])),
+                            size=torch.Size([saved + offset for saved, offset in zip(val[SHAPE_KEY], offset)]),
                             chunks=[
                                 ChunkStorageMetadata(
                                     offsets=torch.Size(offset),
@@ -323,9 +320,7 @@ class _HuggingFaceStorageReader(FsspecReader):
                         )
                     else:
                         state_dict_metadata[key].chunks.append(
-                            ChunkStorageMetadata(
-                                torch.Size(offset), sizes=torch.Size(val[SHAPE_KEY])
-                            )
+                            ChunkStorageMetadata(torch.Size(offset), sizes=torch.Size(val[SHAPE_KEY]))
                         )
                         size = list(state_dict_metadata[key].size)
                         for i in range(len(size)):
@@ -334,13 +329,9 @@ class _HuggingFaceStorageReader(FsspecReader):
 
                     # construct storage data
                     if dcp_sharding_info is not None:
-                        metadata_index = MetadataIndex(
-                            fqn=key, offset=dcp_sharding_info[key][SAVED_OFFSETS_KEY]
-                        )
+                        metadata_index = MetadataIndex(fqn=key, offset=dcp_sharding_info[key][SAVED_OFFSETS_KEY])
                     else:
-                        metadata_index = MetadataIndex(
-                            fqn=key, offset=[0] * len(val[SHAPE_KEY])
-                        )
+                        metadata_index = MetadataIndex(fqn=key, offset=[0] * len(val[SHAPE_KEY]))
                     storage_data[metadata_index] = _HFStorageInfo(
                         relative_path=safetensor_file,
                         offset=val[DATA_OFFSETS_KEY][0],
@@ -377,7 +368,6 @@ def _extract_file_index(filename: str) -> int:
         The numeric shard index, defaulting to ``1`` when no explicit index is
         present or when the filename cannot be parsed.
     """
-
     # Strip any leading directory components so we only deal with the basename.
     basename = filename.split("/")[-1]
 

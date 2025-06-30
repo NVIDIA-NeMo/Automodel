@@ -12,16 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch.nn as nn
 import logging
+
+import torch.nn as nn
+
 from nemo_automodel.utils.dist_utils import get_rank_safe
+
 
 logger = logging.getLogger(__name__)
 
 
 def print_trainable_parameters(model):
-    """
-    Print the number of trainable parameters in the model.
+    """Print the number of trainable parameters in the model.
 
     Args:
         model: Model to analyze
@@ -46,9 +48,28 @@ def print_trainable_parameters(model):
     return trainable_params, all_param
 
 
-def apply_parameter_freezing(model, freeze_config):
+def _freeze_module_by_attribute_and_patterns(model, attribute_name, name_patterns):
+    """Helper function to freeze parameters by attribute name and name patterns.
+    
+    Args:
+        model: The model to apply freezing to.
+        attribute_name: Name of the model attribute to freeze (e.g., 'vision_tower').
+        name_patterns: List of patterns to match in module names.
     """
-    Apply parameter freezing based on configuration.
+    # Freeze by attribute name
+    if hasattr(model, attribute_name):
+        for param in getattr(model, attribute_name).parameters():
+            param.requires_grad = False
+    
+    # Freeze by name patterns
+    for name, module in model.named_modules():
+        if any(pattern in name.lower() for pattern in name_patterns):
+            for param in module.parameters():
+                param.requires_grad = False
+
+
+def apply_parameter_freezing(model, freeze_config):
+    """Apply parameter freezing based on configuration.
 
     Args:
         model: The model to apply freezing to.
@@ -61,6 +82,7 @@ def apply_parameter_freezing(model, freeze_config):
     """
     freeze_embeddings = freeze_config.get("freeze_embeddings", True)
     freeze_vision_tower = freeze_config.get("freeze_vision_tower", True)
+    freeze_audio_tower = freeze_config.get("freeze_audio_tower", False)
     freeze_language_model = freeze_config.get("freeze_language_model", False)
 
     # Freeze embeddings
@@ -71,28 +93,25 @@ def apply_parameter_freezing(model, freeze_config):
 
     # Freeze vision tower
     if freeze_vision_tower:
-        if hasattr(model, "vision_tower"):
-            for param in model.vision_tower.parameters():
-                param.requires_grad = False
-        # Alternative patterns for different VLM architectures
-        for name, module in model.named_modules():
-            if any(
-                pattern in name.lower()
-                for pattern in ["vision", "visual", "image_encoder"]
-            ):
-                for param in module.parameters():
-                    param.requires_grad = False
+        _freeze_module_by_attribute_and_patterns(
+            model, 
+            "vision_tower", 
+            ["vision", "visual", "image_encoder"]
+        )
+    
+    # Freeze audio tower
+    if freeze_audio_tower:
+        _freeze_module_by_attribute_and_patterns(
+            model, 
+            "audio_tower", 
+            ["audio", "audio_encoder"]
+        )
 
     # Freeze language model backbone
     if freeze_language_model:
-        if hasattr(model, "language_model"):
-            for param in model.language_model.parameters():
-                param.requires_grad = False
-        # Alternative patterns
-        for name, module in model.named_modules():
-            if any(pattern in name.lower() for pattern in ["language", "text", "llm"]):
-                for param in module.parameters():
-                    param.requires_grad = False
+        _freeze_module_by_attribute_and_patterns(
+            model, 
+            "language_model", 
+            ["language", "text", "llm"]
+        )
 
-    # Log freezing info
-    print_trainable_parameters(model)

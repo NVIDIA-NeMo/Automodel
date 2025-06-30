@@ -17,7 +17,7 @@ import os
 from functools import partial
 from logging import Filter, LogRecord
 from typing import Callable, Optional, Union
-import os
+
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +28,7 @@ class RankFilter(logging.Filter):
     This filter allows log messages only for rank 0 by default.
     """
     def filter(self, record):
-        """
-        Decide whether to log the provided record.
+        """Decide whether to log the provided record.
 
         Args:
             record (logging.LogRecord): The log record to be evaluated.
@@ -47,7 +46,8 @@ class RankFilter(logging.Filter):
         return True
 
 def warning_filter(record: LogRecord) -> bool:
-    """Logging filter to exclude WARNING level messages.
+    """
+    Logging filter to exclude WARNING level messages.
 
     Args:
         record: The logging record to check.
@@ -59,7 +59,8 @@ def warning_filter(record: LogRecord) -> bool:
 
 
 def module_filter(record: LogRecord, modules_to_filter: list[str]) -> bool:
-    """Logging filter to exclude messages from specific modules.
+    """
+    Logging filter to exclude messages from specific modules.
 
     Args:
         record: The logging record to check.
@@ -76,7 +77,8 @@ def module_filter(record: LogRecord, modules_to_filter: list[str]) -> bool:
 
 
 def add_filter_to_all_loggers(filter: Union[Filter, Callable[[LogRecord], bool]]) -> None:
-    """Add a filter to the root logger and all existing loggers.
+    """
+    Add a filter to the root logger and all existing loggers.
 
     Args:
         filter: A logging filter instance or callable to add.
@@ -97,7 +99,8 @@ def setup_logging(
     modules_to_filter: Optional[list[str]] = None,
     set_level_for_all_loggers: bool = False,
 ) -> None:
-    """Set up logging level and filters for the application.
+    """
+    Set up logging level and filters for the application.
 
     Configures the logging level based on arguments, environment variables,
     or defaults. Optionally adds filters to suppress warnings or messages

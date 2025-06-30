@@ -1,4 +1,18 @@
-# taken from https://github.com/pytorch/pytorch/blob/c13e725edd8dd21406c629bf625f2d6c59ceedd1/torch/distributed/checkpoint/filesystem.py # pylint: disable=line-too-long
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# taken from
+# https://github.com/pytorch/pytorch/blob/c13e725edd8dd21406c629bf625f2d6c59ceedd1/torch/distributed/checkpoint/filesystem.py
 # pylint: disable=missing-function-docstring, missing-class-docstring
 import collections
 import dataclasses
@@ -18,10 +32,7 @@ from dataclasses import dataclass
 from enum import Enum
 from io import UnsupportedOperation
 from pathlib import Path
-from typing import Any, Callable, cast, IO, Optional, Union
-
-# introduced as collections.abc.Buffer in Python 3.12
-from typing_extensions import Buffer
+from typing import IO, Any, Callable, Optional, Union, cast
 
 import torch
 from torch import Tensor
@@ -31,12 +42,7 @@ from torch.distributed.checkpoint._extension import (
     ExtensionRegistry,
     StreamTransformExtension,
 )
-from nemo_automodel.checkpoint._backports.hf_utils import (
-    CUSTOM_METADATA_KEY,
-    DCP_VERSION_KEY,
-    HF_DCP_VERSION,
-)
-from torch.distributed.checkpoint.metadata import Metadata, STATE_DICT_TYPE, StorageMeta
+from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata, StorageMeta
 from torch.distributed.checkpoint.planner import (
     LoadItemType,
     LoadPlan,
@@ -56,6 +62,15 @@ from torch.distributed.checkpoint.storage import (
 from torch.distributed.checkpoint.utils import _create_file_view
 from torch.futures import Future
 
+# introduced as collections.abc.Buffer in Python 3.12
+from typing_extensions import Buffer
+
+from nemo_automodel.checkpoint._backports.hf_utils import (
+    CUSTOM_METADATA_KEY,
+    DCP_VERSION_KEY,
+    HF_DCP_VERSION,
+)
+
 
 __all__ = [
     "FileSystemWriter",
@@ -65,6 +80,7 @@ __all__ = [
 ]
 
 _metadata_fn: str = ".metadata"
+
 
 class SerializationFormat(Enum):
     """Enumeration of supported on-disk checkpoint formats."""
@@ -149,13 +165,9 @@ class _OverlappingCpuLoader(_TensorLoader):
         self.current_items: collections.deque = collections.deque()
         self.idx = 0
         self.started = False
-        self.device_type = (
-            stream.device_type if stream else _get_available_device_type()
-        )
+        self.device_type = stream.device_type if stream else _get_available_device_type()
         self.device_module = _get_device_module(self.device_type)
-        self.stream = cast(
-            torch.cuda.Stream, stream or self.device_module.current_stream()
-        )
+        self.stream = cast(torch.cuda.Stream, stream or self.device_module.current_stream())
         if self.stream != self.device_module.current_stream():
             self.stream.wait_stream(self.device_module.current_stream())
 
@@ -182,10 +194,7 @@ class _OverlappingCpuLoader(_TensorLoader):
                 if tensor.device.type == self.device_type:
                     tensor = tensor.to(device="cpu", non_blocking=True)
                 elif tensor.device == torch.device("cpu"):
-                    if (
-                        tensor.untyped_storage().size()
-                        != tensor.numel() * tensor.itemsize
-                    ):
+                    if tensor.untyped_storage().size() != tensor.numel() * tensor.itemsize:
                         # this forces the tensor to be both contiguous and with minimal storage
                         tensor = tensor.clone()
 
@@ -232,9 +241,7 @@ class _StorageWriterTransforms:
     learning and gathering feedback.
     """
 
-    def __init__(
-        self, extensions: Optional[Sequence[StreamTransformExtension]] = None
-    ) -> None:
+    def __init__(self, extensions: Optional[Sequence[StreamTransformExtension]] = None) -> None:
         """
         If the extensions arg is None, this means the implementation
         should provide whatever defaults it chooses.  An empty
@@ -243,9 +250,7 @@ class _StorageWriterTransforms:
         """
         self.extensions = () if extensions is None else extensions
 
-    def transform_save_stream(
-        self, write_item: WriteItem, raw_stream: io.IOBase
-    ) -> tuple[IO[bytes], list[str]]:
+    def transform_save_stream(self, write_item: WriteItem, raw_stream: io.IOBase) -> tuple[IO[bytes], list[str]]:
         # In order to avoid leaking fds, transformers' close must
         # cascade to wrapped streams, but since this function can
         # append to the raw stream, we can't close the actual stream.
@@ -321,9 +326,7 @@ def _write_item(
 ) -> WriteResult:
     offset = stream.tell()
 
-    (transform_to, transform_descriptors) = transforms.transform_save_stream(
-        write_item, stream
-    )
+    (transform_to, transform_descriptors) = transforms.transform_save_stream(write_item, stream)
 
     if write_item.type == WriteItemType.BYTE_IO:
         assert isinstance(data, io.BytesIO)
@@ -336,18 +339,14 @@ def _write_item(
 
     transform_to.close()
 
-    if serialization_format == SerializationFormat.TORCH_SAVE or isinstance(
-        data, io.BytesIO
-    ):
+    if serialization_format == SerializationFormat.TORCH_SAVE or isinstance(data, io.BytesIO):
         length = stream.tell() - offset
     else:
         length = data.numel() * data.element_size()
 
     # For consistency with earlier versions, leave this field out of the
     # metadata if there are no extensions.
-    info_transform_descriptors = (
-        None if len(transform_descriptors) == 0 else transform_descriptors
-    )
+    info_transform_descriptors = None if len(transform_descriptors) == 0 else transform_descriptors
 
     return WriteResult(
         index=write_item.index,
@@ -393,10 +392,7 @@ def _write_files_from_queue(
             # should try to fix this and use _OverlappingCpuLoader for all threaded cases
             if (
                 thread_count == 1
-                and (
-                    torch.cuda.is_available()
-                    or (custom_device_mod and custom_device_mod.is_available())
-                )
+                and (torch.cuda.is_available() or (custom_device_mod and custom_device_mod.is_available()))
                 and inflight_threshhold > 0
             ):
                 loader = _OverlappingCpuLoader(
@@ -445,9 +441,7 @@ def _write_files_from_queue(
                         )
                     )
                     tensor_dict[write_item.index.fqn] = tensor
-                    metadata_dict[write_item.index.fqn] = {
-                        "saved_offsets": write_item.tensor_data.chunk.offsets
-                    }
+                    metadata_dict[write_item.index.fqn] = {"saved_offsets": write_item.tensor_data.chunk.offsets}
 
                 if serialization_format == SerializationFormat.SAFETENSORS:
                     from safetensors.torch import save  # type: ignore[import-not-found]
@@ -473,22 +467,17 @@ def _write_files_from_queue(
     except queue.Empty:
         pass
 
+
 class FileSystemBase(ABC):
     @contextmanager
     @abstractmethod
-    def create_stream(
-        self, path: Union[str, os.PathLike], mode: str
-    ) -> Generator[io.IOBase, None, None]: ...
+    def create_stream(self, path: Union[str, os.PathLike], mode: str) -> Generator[io.IOBase, None, None]: ...
 
     @abstractmethod
-    def concat_path(
-        self, path: Union[str, os.PathLike], suffix: str
-    ) -> Union[str, os.PathLike]: ...
+    def concat_path(self, path: Union[str, os.PathLike], suffix: str) -> Union[str, os.PathLike]: ...
 
     @abstractmethod
-    def rename(
-        self, path: Union[str, os.PathLike], new_path: Union[str, os.PathLike]
-    ) -> None: ...
+    def rename(self, path: Union[str, os.PathLike], new_path: Union[str, os.PathLike]) -> None: ...
 
     @abstractmethod
     def init_path(self, path: Union[str, os.PathLike]) -> Union[str, os.PathLike]: ...
@@ -509,17 +498,13 @@ class FileSystemBase(ABC):
 
 class FileSystem(FileSystemBase):
     @contextmanager
-    def create_stream(
-        self, path: Union[str, os.PathLike], mode: str
-    ) -> Generator[io.IOBase, None, None]:
+    def create_stream(self, path: Union[str, os.PathLike], mode: str) -> Generator[io.IOBase, None, None]:
         if not isinstance(path, Path):
             path = Path(path)
         with path.open(mode) as stream:
             yield cast(io.IOBase, stream)
 
-    def concat_path(
-        self, path: Union[str, os.PathLike], suffix: str
-    ) -> Union[str, os.PathLike]:
+    def concat_path(self, path: Union[str, os.PathLike], suffix: str) -> Union[str, os.PathLike]:
         if not isinstance(path, Path):
             path = Path(path)
         return path / suffix
@@ -529,9 +514,7 @@ class FileSystem(FileSystemBase):
             path = Path(path)
         return path
 
-    def rename(
-        self, path: Union[str, os.PathLike], new_path: Union[str, os.PathLike]
-    ) -> None:
+    def rename(self, path: Union[str, os.PathLike], new_path: Union[str, os.PathLike]) -> None:
         if not isinstance(path, Path):
             path = Path(path)
 
@@ -660,10 +643,7 @@ class _FileSystemWriter(StorageWriter):
         return plan
 
     def prepare_global_plan(self, plans: list[SavePlan]) -> list[SavePlan]:
-        new_plans = [
-            dataclasses.replace(plan, storage_data=_StoragePrefix(f"__{i}_"))
-            for i, plan in enumerate(plans)
-        ]
+        new_plans = [dataclasses.replace(plan, storage_data=_StoragePrefix(f"__{i}_")) for i, plan in enumerate(plans)]
         return new_plans
 
     def write_data(
@@ -794,9 +774,7 @@ class _StorageReaderTransforms:
     """
 
     def __init__(self, extension_registry: Optional[ExtensionRegistry] = None) -> None:
-        self.extension_registry = (
-            ExtensionRegistry() if extension_registry is None else extension_registry
-        )
+        self.extension_registry = ExtensionRegistry() if extension_registry is None else extension_registry
 
     def transform_load_stream(
         self,
@@ -878,9 +856,7 @@ class FileSystemReader(StorageReader):
                                 weights_only=True,
                             ),
                         )
-                        tensor = narrow_tensor_by_index(
-                            tensor, req.storage_offsets, req.lengths
-                        )
+                        tensor = narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
                         target_tensor = planner.resolve_tensor(req).detach()
 
                         assert target_tensor.size() == tensor.size(), (

@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
 import importlib
 import signal
 from functools import lru_cache
-from typing import Dict, Generator, List, Optional, Set, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 from torch import Tensor, nn
@@ -29,6 +28,7 @@ from torch.distributed.tensor.parallel import (
     SequenceParallel,
     parallelize_module,
 )
+
 
 # TODO(boxiangw): Change to nvFSDP once it got published
 HAVE_NVFSDP = False
@@ -50,7 +50,8 @@ def fsdp2_strategy_parallelize(
     ] = None,
     offload_policy: "CPUOffloadPolicy" = None,
 ):
-    """Apply parallelisms and activation checkpointing to the model.
+    """
+    Apply parallelisms and activation checkpointing to the model.
 
     Args:
         model: The model to be parallelized.
@@ -67,7 +68,6 @@ def fsdp2_strategy_parallelize(
     because the model parallel strategy does not respect all settings of `Fabric(precision=...)` at the moment.
     NOTE: Currently, the user should make sure that custom_tp_plan is compatible with the model architecture.
     """
-
     if not mp_policy:
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16, reduce_dtype=torch.float32
@@ -168,22 +168,56 @@ def nvfsdp_strategy_parallelize(
     nccl_ub: bool = False,
     fsdp_double_buffer: bool = False,
 ):
-    """Apply parallelisms and activation checkpointing to the model.
+    """
+    Apply tensor/data parallelism (nvFSDP) and optional activation-checkpointing to the model.
 
     Args:
         model: The model to be parallelized.
-        device_mesh (DeviceMesh): The device mesh for distributed training.
-        nvfsdp_config (DistributedDataParallelConfig): The distributed data parallel config.
-        nvfsdp_unit_modules (Optional[List[str]]): The nvFSDP unit modules.
-        init_nvfsdp_with_meta_device (bool): Whether to initialize the model with meta device.
+        device_mesh (DeviceMesh): The device mesh describing the physical devices
+            used for distributed training.
+        nvfsdp_unit_modules (Optional[List[str]]): Names of sub-modules that should
+            become individual nvFSDP units. If None, the full model is wrapped as
+            a single unit.
         tp_shard_plan (Optional[Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]]):
-            A tensor parallel sharding plan. The keys should be the module names and the values should be the
-            corresponding parallel styles (e.g., RowwiseParallel, ColwiseParallel, SequenceParallel).
-    NOTE: The passed-in model preferably should be on meta device. Otherwise,
-    the model must fit on GPU or CPU memory.
-    NOTE: Currently, the user should make sure that custom_tp_plan is compatible with the model architecture.
-    """
+            A tensor-parallel sharding plan.
+            Keys are module names; values specify the parallel style to apply
+            (e.g., RowwiseParallel, ColwiseParallel, SequenceParallel).
+        data_parallel_sharding_strategy (str): Strategy for sharding parameters,
+            gradients, and optimizer states across data-parallel ranks.
+            Valid options include "params", "grads_params", and
+            "optim_grads_params" (default).
+        init_nvfsdp_with_meta_device (bool): If True, construct the model on a
+            meta device first and materialize weights lazily to reduce memory
+            fragmentation.
+        grad_reduce_in_fp32 (bool): Reduce gradients in FP32 irrespective of the
+            parameter precision to improve numerical stability.
+        preserve_fp32_weights (bool): Keep a master FP32 copy of weights when
+            training in reduced precision (e.g., FP16/BF16).
+        overlap_grad_reduce (bool): If True, overlap gradient reduction with
+            backward computation.
+        overlap_param_gather (bool): If True, overlap parameter gathering with
+            forward computation.
+        check_for_nan_in_grad (bool): Whether to check gradients for NaNs/Infs
+            before applying the optimizer step.
+        average_in_collective (bool): Perform gradient averaging inside the
+            collective operation instead of dividing afterward.
+        disable_bucketing (bool): Disable gradient bucketing; gradients are
+            reduced immediately as they are produced.
+        calculate_per_token_loss (bool): Compute loss normalized by the number of
+            tokens instead of the number of sequences.
+        keep_fp8_transpose_cache_when_using_custom_fsdp (bool): Retain the FP8
+            transpose cache when using a custom nvFSDP wrapper.
+        nccl_ub (bool): Enable NCCL user-buffer API (experimental) for reduced
+            latency on some networks.
+        fsdp_double_buffer (bool): Enable double buffering of parameters to
+            overlap communication and computation in nvFSDP.
 
+    NOTE: The passed-in model should preferably reside on the meta device.
+    Otherwise, ensure the model fits into available GPU or CPU memory.
+
+    NOTE: The user must ensure that the provided tp_shard_plan is compatible
+    with the model architecture.
+    """
     assert HAVE_NVFSDP, "nvFSDP is not installed, please visit \
         https://github.com/NVIDIA-NeMo/nvFSDP for more information"
 
@@ -251,6 +285,8 @@ def get_hf_tp_shard_plan(model):
 @lru_cache
 def translate_to_torch_parallel_style(style: str):
     """
+    Translates string descriptions to parallelism plans.
+
     In model configurations, we use a neutral type (string) to specify parallel
     styles, here we translate them into torch.distributed tensor-parallel
     types.
@@ -314,78 +350,12 @@ def to_cpu(v):
 
 
 def _destroy_dist_connection() -> None:
-    """Destroy process group."""
+    """
+    Destroy process group.
+    """
     # Don't allow Ctrl+C to interrupt this handler
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
     signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-
-# based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/utils.py#L113
-def create_context_parallel_ctx(
-    cp_mesh: DeviceMesh,
-    cp_buffers: List[torch.Tensor],
-    cp_seq_dims: List[int],
-    cp_no_restore_buffers: Set[torch.Tensor],
-    cp_rotate_method: str,
-):
-    """
-    Create a context parallel context.
-
-    Args:
-        cp_mesh (DeviceMesh): The device mesh for context parallel.
-        cp_buffers (List[torch.Tensor]): The buffers for context parallel.
-        cp_seq_dims (List[int]): The sequence dimensions for context parallel.
-        cp_no_restore_buffers (Set[torch.Tensor]): The no restore buffers for context parallel.
-        cp_rotate_method (str): The rotation method for context parallel, such as "allgather" or "addtoall".
-    """
-    from torch.distributed.tensor.experimental import context_parallel
-
-    # TODO: uncomment this when torch.distributed.tensor.experimental._attention.set_rotate_method is available
-    # from torch.distributed.tensor.experimental._attention import set_rotate_method
-    # set_rotate_method(cp_rotate_method)
-    return context_parallel(
-        cp_mesh,
-        buffers=cp_buffers,
-        buffer_seq_dims=cp_seq_dims,
-        no_restore_buffers=cp_no_restore_buffers,
-    )
-
-
-# based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/utils.py#L138
-def get_train_context(enable_loss_parallel: bool, enable_compiled_autograd: bool):
-    """
-    Create a train context.
-
-    Args:
-        enable_loss_parallel (bool): Whether to enable loss parallelism.
-        enable_compiled_autograd (bool): Whether to enable compiled autograd.
-    """
-
-    @contextlib.contextmanager
-    def context(cp_context: Optional[Generator[None, None, None]] = None):
-        with contextlib.ExitStack() as stack:
-            if enable_loss_parallel:
-                stack.enter_context(torch.distributed.tensor.parallel.loss_parallel())
-
-            if enable_compiled_autograd:
-                stack.enter_context(
-                    torch._dynamo.utils.maybe_enable_compiled_autograd(True)
-                )
-
-            if cp_context is not None:
-                from torch.nn.attention import SDPBackend, sdpa_kernel
-
-                # currently we only support these two SDP backends.
-                # SDPBackend.MATH is not currently compatible with DTensor
-                stack.enter_context(
-                    sdpa_kernel(
-                        [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
-                    )
-                )
-                stack.enter_context(cp_context)
-
-            yield
-
-    return context

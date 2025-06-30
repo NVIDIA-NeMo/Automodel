@@ -13,14 +13,13 @@
 # limitations under the License.
 
 import random
+
 import numpy as np
 import torch
 
 
-
 def init_all_rng(seed: int, ranked: bool = False):
-    """
-    Initialize RNGs for Python, NumPy, and PyTorch (incl. CUDA) with a seed.
+    """Initialize RNGs for Python, NumPy, and PyTorch (incl. CUDA) with a seed.
 
     Args:
         seed (int): Base seed value.
@@ -45,27 +44,28 @@ def init_all_rng(seed: int, ranked: bool = False):
         torch.cuda.manual_seed_all(seed)
 
 
+
 class StatefulRNG:
-    """
-    Context manager for reproducible RNG states across random, NumPy, and PyTorch.
+    """Context manager for reproducible RNG states across random, NumPy, and PyTorch.
     """
 
     def __init__(self, seed: int, ranked: bool = False):
-        """
-        Initialize and optionally rank-adjust RNGs with a given seed.
+        """Initialize and optionally rank-adjust RNGs with a given seed.
 
         Args:
             seed (int): Base seed for RNGs.
             ranked (bool): Adjust seed based on process rank.
         """
-        init_all_rng(seed, ranked)
+        self._init_state = self.state_dict()
+        self._saved_state = None
         self.seed = seed
         self.ranked = ranked
-        self._saved_state = None
+
+    def __del__(self):
+        self.load_state_dict(self._init_state)
 
     def state_dict(self):
-        """
-        Get current RNG states.
+        """Get current RNG states.
 
         Returns:
             dict: RNG states for random, NumPy, and PyTorch.
@@ -78,8 +78,7 @@ class StatefulRNG:
         }
 
     def load_state_dict(self, state):  # pragma: no cover
-        """
-        Restore RNG states from a saved state.
+        """Restore RNG states from a saved state.
 
         Args:
             state (dict): RNG states as returned by state_dict().
@@ -90,16 +89,14 @@ class StatefulRNG:
         torch.cuda.set_rng_state_all(state["cuda_rng_state"])
 
     def __enter__(self):
-        """
-        Save current RNG states.
+        """Save current RNG states.
         """
         assert self._saved_state is None
         self._saved_state = self.state_dict()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        """
-        Restore RNG states on context exit.
+        """Restore RNG states on context exit.
         """
         self.load_state_dict(self._saved_state)
         self._saved_state = None
