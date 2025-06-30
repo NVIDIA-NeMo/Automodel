@@ -135,8 +135,8 @@ jobs:
           --rm \
           -v $(pwd):/workspace \
           -w /workspace \
-          automodel \
           -e GH_TOKEN=${{ secrets.PAT }} \
+          automodel \
           bash -c 'uv lock --upgrade'
 
       - name: Upload lock file
