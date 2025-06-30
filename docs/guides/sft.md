@@ -4,7 +4,8 @@ This document explains how to perform SFT on HellaSwag in NeMo Automodel, the de
 
 ## Launch an SFT Run
 
-The script, [recipes/llm/finetune.py](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/llm/finetune.py), can be used to launch an experiment. This script can be launched either locally or on a cluster. For details on how to launch a job on a cluster, refer to the [cluster documentation](../environment/cluster.md).
+The script, [recipes/llm/finetune.py](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/llm/finetune.py), can be used to launch an experiment. This script can be launched either locally or on a cluster (TODO).
+<!-- For details on how to launch a job on a cluster, refer to the [cluster documentation](../environment/cluster.md). -->
 
 Be sure to launch the job using `uv`. The command to launch an SFT job is as follows:
 
