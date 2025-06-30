@@ -1,0 +1,73 @@
+name: Dependabot
+on:
+  schedule:
+    - cron: 0 0 * * 1 # Run at midnight UTC on Mondays
+  workflow_dispatch: # Allow manual triggering
+
+permissions:
+  id-token: write
+  contents: write
+
+jobs:
+  get-release-branch-names:
+    runs-on: ubuntu-latest
+    environment: nemo-ci
+    outputs:
+      nvfsdp: ${{ steps.get-branch.outputs.nvfsdp_release_branch }}
+      automodel: ${{ steps.get-branch.outputs.automodel_release_branch }}
+    steps:
+      - name: Get release branch names
+        id: get-branch
+        env:
+          PAT: ${{ secrets.PAT }}
+        run: |
+          latest_branch=$(git ls-remote --heads https://token:${PAT}@github.com/NVIDIA-NeMo/NVFSDP.git 'refs/heads/r*' | 
+            grep -o 'r[0-9]\+\.[0-9]\+\.[0-9]\+' | 
+            sort -V | 
+            tail -n1)
+          echo "nvfsdp_release_branch=$latest_branch" >> $GITHUB_OUTPUT
+
+          latest_branch=$(git ls-remote --heads https://token:${PAT}@github.com/NVIDIA-NeMo/automodel.git 'refs/heads/r*' | 
+            grep -o 'r[0-9]\+\.[0-9]\+\.[0-9]\+' | 
+            sort -V | 
+            tail -n1)
+          echo "automodel_release_branch=$latest_branch" >> $GITHUB_OUTPUT
+
+  bump-tags:
+    needs: [get-release-branch-names]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - nvfsdp-target-branch: ${{ needs.get-release-branch-names.outputs.nvfsdp }}
+            target-branch: ${{ needs.get-release-branch-names.outputs.automodel }}
+          - nvfsdp-target-branch: main
+            target-branch: main
+    uses: ./.github/workflows/_update_dependencies.yml
+    with:
+      nvfsdp-target-branch: ${{ matrix.nvfsdp-target-branch }}
+      target-branch: ${{ matrix.target-branch }}
+    secrets:
+      PAT: ${{ secrets.PAT }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      SSH_KEY: ${{ secrets.SSH_KEY }}
+      SSH_PWD: ${{ secrets.SSH_PWD }}
+
+  notify:
+    if: failure()
+    runs-on: ubuntu-latest
+    needs: [bump-tags]
+    steps:
+      - name: Notify
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_WEBHOOK_ADMIN: <!subteam^${{ secrets.SLACK_WEBHOOK_ADMIN }}>
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          curl -X POST \
+            -H 'Content-type: application/json' \
+            --data "{\"text\":\":robot_joy: <https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}|Mcore-bump-bot workflow> failed. Please fix manually.\n\ncc ${SLACK_WEBHOOK_ADMIN}\"}" \
+            $SLACK_WEBHOOK

@@ -53,13 +53,13 @@ To get started quickly, NeMo AutoModel provides a collection of ready-to-use rec
 To run a NeMo AutoModel recipe, you need a recipe script (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/llm/finetune.py), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/vlm/finetune.py)) and a YAML config file (e.g., [LLM](recipes/llm/llama_3_2_1b_squad.yaml), [VLM](recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml)):
 ```
 # Command invocation format:
-python3 <recipe_script_path> --config <yaml_config_path>
+uv run <recipe_script_path> --config <yaml_config_path>
 
 # LLM example: multi-GPU with FSDP2
-torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_hellaswag.yaml
+uv run torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_hellaswag.yaml
 
-# VLM example: Single GPU fine-tuning (Gemma-3-VL) with LoRA
-python3 recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml
+# VLM example: single GPU fine-tuning (Gemma-3-VL) with LoRA
+uv run recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml
 ```
 
 
@@ -90,16 +90,33 @@ python3 recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_3b_cord_v2_peft.
 ## ✨ Install NeMo AutoModel
 NeMo AutoModel is offered both as a standard Python package installable via pip and as a ready-to-run NeMo Framework Docker container.
 
+### Prerequisites
+```
+# We use `uv` for package management and environment isolation.
+pip3 install uv
+
+# If you cannot install at the system level, you can install for your user with
+# pip3 install --user uv
+```
+Run every command with `uv run`. It auto-installs the virtual environment from the lock file and keeps it up to date, so you never need to activate a venv manually. Example: `uv run recipes/llm/finetune.py`. If you prefer to install NeMo Automodel explicitly, please follow the instructions below.
+
 ### 📦 Install from a Wheel Package
 ```
 # Install the latest stable release from PyPI
-pip3 install nemo_automodel   # or: pip install --upgrade nemo_automodel
+# We first need to initialize the virtual environment using uv
+uv venv
+
+uv pip install nemo_automodel   # or: uv pip install --upgrade nemo_automodel
 ```
 
 ### 🔧 Install from Source
 ```
 # Install the latest NeMo Automodel from the GitHub repo (best for development).
-pip3 install git+https://github.com/NVIDIA-NeMo/Automodel.git
+# We first need to initialize the virtual environment using uv
+uv venv
+
+# We can now install from source
+uv pip install git+https://github.com/NVIDIA-NeMo/Automodel.git
 ```
 
 <!-- ### 🐳 NeMo Container
@@ -115,7 +132,7 @@ docker run --gpus all -it --rm \
 
 ### Verify the Installation
 ```
-python -c "import nemo_automodel; print('✅ NeMo AutoModel ready!')"
+uv run python -c "import nemo_automodel; print('✅ NeMo AutoModel ready')"
 ```
 
 ---
