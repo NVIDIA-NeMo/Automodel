@@ -12,44 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    python3-pip \
-    python3-venv \
-    git \
-    libopenmpi-dev \
-    vim \
-    curl \
-    && rm -rf /var/lib/apt/lists/* && \
-    python3 -m venv /opt/venv && \
-    /opt/venv/bin/pip install --no-cache-dir -U pip setuptools
-
-# Install uv and python
-ARG UV_VERSION=0.7.2
-ENV PATH="/root/.local/bin:$PATH"
-RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
-ENV UV_PROJECT_ENVIRONMENT=/opt/venv
-ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
-ENV UV_LINK_MODE=copy
-
-
-# Set venv as default
-ENV PATH="/opt/venv/bin:$PATH"
-
-# Install all
-COPY nemo_automodel/__init__.py /workspace/nemo_automodel/__init__.py
-COPY nemo_automodel/package_info.py /workspace/nemo_automodel/package_info.py
-COPY README.md /workspace/README.md
-COPY uv.lock /workspace/uv.lock
-COPY pyproject.toml /workspace/pyproject.toml
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
 WORKDIR /workspace
+COPY . .
 RUN --mount=type=secret,id=GH_TOKEN bash -ex <<"EOF"
-    PAT=$(cat /run/secrets/GH_TOKEN)
-    echo -e "machine github.com\n  login token\n  password $PAT" > ~/.netrc
-    chmod 600 ~/.netrc
-    uv venv ${UV_PROJECT_ENVIRONMENT}
-    uv sync
-    rm ~/.netrc
+    export PAT=$(cat /run/secrets/GH_TOKEN)
+    bash docker/common/install.sh --base-image cuda
 EOF
