@@ -229,7 +229,7 @@ def main():
             f.write(output_text)
         logging.info(f"Output written to {args.output_file}")
     else:
-        print(output_text)
+        logging.info(output_text)
 
 
 if __name__ == "__main__":
