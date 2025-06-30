@@ -21,11 +21,27 @@ from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 
 from nemo_automodel import __version__
 from nemo_automodel.shared.import_utils import safe_import
+import types
+import inspect
+import functools
 
 
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 logger = logging.getLogger(__name__)
 
+def _assert_same_signature(original, patched):
+    """
+    Raise AssertionError if the two call signatures differ.
+    """
+    sig_orig  = inspect.signature(original)
+    sig_patch = inspect.signature(patched)
+
+    if sig_orig != sig_patch:
+        raise AssertionError(
+            f"Signature mismatch:\n"
+            f"  original: {sig_orig}\n"
+            f"  patched : {sig_patch}"
+        )
 
 def patch_attention(obj, sdpa_method=None):
     """
@@ -49,11 +65,19 @@ def patch_attention(obj, sdpa_method=None):
         ]
     orig_forward = obj.forward
 
-    def patched_forward(self, *args, **kwargs):
-        with sdpa_kernel(sdpa_method):
-            return orig_forward(*args, **kwargs)
+    def patch_method(method):
+        func = method.__func__
+        @functools.wraps(func)
+        def wrapper(self, *args, **kwargs):
+            with sdpa_kernel(sdpa_method):
+                return func(self, *args, **kwargs)
+        wrapper.__doc__ = "SDPA kernel patch\n" + inspect.getdoc(method)
+        return types.MethodType(wrapper, method.__self__)  # re-bind
 
-    obj.forward = types.MethodType(patched_forward, obj)
+    obj.forward = patch_method(obj.forward)
+    # runtime check
+    _assert_same_signature(orig_forward, obj.forward)
+
     return obj
 
 
@@ -69,7 +93,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
     functional model.
 
 
-    @akoumpa: currently only supporting liger_kernel for demonstration purposes.
+    TODO(@akoumpa): extend this beyond liger_kernel.
 
     Notes:
     -----
