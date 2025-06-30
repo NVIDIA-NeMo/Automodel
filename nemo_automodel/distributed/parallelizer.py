@@ -224,6 +224,7 @@ def nvfsdp_strategy_parallelize(
     # DP_CP ranks are sharded by FSDP.
     dp_mesh = device_mesh["data_parallel"]
     tp_mesh = device_mesh["tensor_parallel"]
+    cp_mesh = device_mesh["context_parallel"]
 
     if dp_mesh.size() > 1:
         # TODO(boxiangw): remove this once HSDP is supported.
@@ -232,6 +233,11 @@ def nvfsdp_strategy_parallelize(
     # TP sharding.
     if tp_mesh.size() > 1:
         parallelize_module(model, tp_mesh, tp_shard_plan)
+    
+    if cp_mesh.size() > 1:
+        dp_cp_mesh_name = "dp_cp"
+    else:
+        dp_cp_mesh_name = "data_parallel"
 
     # Import nvFSDP unit modules specified by the user.
     nvfsdp_unit_modules = import_classes_from_paths(nvfsdp_unit_modules)
@@ -245,7 +251,7 @@ def nvfsdp_strategy_parallelize(
         dp_mesh_name="data_parallel",
         cp_mesh_name="context_parallel",
         tp_mesh_name="tensor_parallel",
-        dp_cp_mesh_name="dp_cp",
+        dp_cp_mesh_name=dp_cp_mesh_name,
         data_parallel_sharding_strategy=data_parallel_sharding_strategy,
         init_model_with_meta_device=init_nvfsdp_with_meta_device,
         grad_reduce_in_fp32=grad_reduce_in_fp32,
