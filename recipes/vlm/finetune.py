@@ -90,6 +90,14 @@ def build_model(device, cfg_model, cfg_freeze, cfg_peft, model_wrapper, seed) ->
                 if isinstance(m, nn.Embedding):
                     m.weight.requires_grad = False
 
+        for i, layer in enumerate(model.language_model.layers):
+            v_proj_weight = layer.self_attn.v_proj.weight
+            k_proj_weight = layer.self_attn.k_proj.weight
+
+            if i>=20:
+                v_proj_weight.requires_grad = False
+                k_proj_weight.requires_grad = False
+
         # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
         if cfg_peft is not None:
             opts = cfg_peft.to_dict()
@@ -580,7 +588,7 @@ def main():
 
     Loads the configuration, sets up the trainer, and initiates the training loop.
     """
-    cfg = parse_args_and_load_config("qwen2_5_vl_3b_rdr.yaml")
+    cfg = parse_args_and_load_config("recipes/vlm/gemma_3n_vl_4b_cord_v2.yaml")
     trainer = FinetuneRecipeForVLM(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()

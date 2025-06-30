@@ -65,6 +65,9 @@ def default_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
         return_tensors="pt",
         return_dict=True,
     )
+    if "position_ids" not in batch:
+        batch_size, seq_len = batch["input_ids"].shape
+        batch["position_ids"] = torch.arange(seq_len, device=batch["input_ids"].device).unsqueeze(0).expand(batch_size, -1)
 
     batch["pixel_values"] = batch["pixel_values"].to(torch.bfloat16)
     labels = batch["input_ids"].clone()[:, 1:]
