@@ -87,7 +87,7 @@ jobs:
   update-lockfile:
     environment: nemo-ci
     runs-on: linux-amd64-cpu16
-    needs: [mcore, update-branch]
+    needs: [nvfsdp, update-branch]
     steps:
       - name: Install Azure CLI
         run: curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
