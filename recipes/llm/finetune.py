@@ -427,7 +427,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
 
         local_num_tokens = loss_mask.sum().detach().to(torch.int)
-        self.num_tokens += local_num_tokens - count_tail_padding(labels)
+        self.num_tokens += labels.numel() - count_tail_padding(labels)
         self.total_num_tokens += local_num_tokens
         self.forward_data_store.append(local_loss.detach())
 
