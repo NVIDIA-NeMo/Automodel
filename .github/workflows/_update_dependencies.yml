@@ -105,14 +105,23 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.target-branch }}
+
+      - name: Build container
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          docker build -f docker/Dockerfile.ci --secret id=GH_TOKEN -t automodel .
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
           ref: ${{ needs.update-branch.outputs.bump-branch }}
 
       - name: Upgrade lock file
         env:
           GH_TOKEN: ${{ secrets.PAT }}
         run: |
-          docker build -f docker/Dockerfile.ci --secret id=GH_TOKEN -t automodel .
-
           docker run \
           --rm \
           -v $(pwd):/workspace \
