@@ -46,7 +46,7 @@ import time
 import logging
 
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
-from nemo_automodel.config.cli import parse_args_and_load_config
+from nemo_automodel.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.datasets.llm.packed_sequence import PackedSequence
 from nemo_automodel.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.distributed.init_utils import initialize_distributed

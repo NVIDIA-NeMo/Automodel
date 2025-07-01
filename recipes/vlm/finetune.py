@@ -39,7 +39,7 @@ import logging
 from transformers import AutoProcessor
 
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
-from nemo_automodel.config.cli import parse_args_and_load_config
+from nemo_automodel.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.distributed.init_utils import initialize_distributed
 from nemo_automodel.distributed.parallelizer import (
