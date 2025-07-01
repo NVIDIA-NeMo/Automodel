@@ -148,8 +148,22 @@ jobs:
         with:
           name: lock-file-${{ env.SOURCE_BRANCH }}
 
-      - name: Commit changes
-        run: |
-          git add uv.lock
-          git commit -s -S -m "build: uv.lock"
-          git push
+      - name: Create Bump PR
+        uses: peter-evans/create-pull-request@v6
+        id: create-pull-request
+        env:
+          title: "chore(beep boop 🤖): Bump `uv.lock` (${{ inputs.target-branch}}) (${{ needs.pre-flight.outputs.date }})"
+        with:
+          branch: ${{ env.SOURCE_BRANCH }}
+          base: ${{ env.TARGET_BRANCH }}
+          title: ${{ env.title }}
+          token: ${{ secrets.PAT }}
+          body: |
+            🚀 PR to bump `uv.lock` in `${{ inputs.target-branch }}`.  
+
+            📝 Please remember the following to-do's before merge: 
+            - [ ] Verify the presubmit CI  
+
+            🙏 Please merge this PR only if the CI workflow completed successfully.
+          commit-message: ${{ env.title }}
+          signoff: true
