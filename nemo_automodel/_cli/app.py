@@ -162,19 +162,21 @@ def main():
     script_path = Path(__file__).parents[2] / "recipes" / args.domain / f'{args.command}.py'
 
     if 'slurm' in config:
-        # launch job on kubernetes
+        # launch job on kubernetes.
         launch_with_slurm(config['slurm'], script_path, config_path)
     elif 'k8s' in config or 'kubernetes' in config:
+        # launch job on kubernetes.
         raise NotImplementedError("WIP")
-        # launch job on kubernetes
     else:
+        # launch job on this node
         num_devices = determine_local_world_size(nproc_per_node="gpu")
         assert num_devices > 0, "Expected num-devices to be > 0"
         if args.nproc_per_node == 1 or num_devices == 1:
-            # run the training job with this process
+            # run the job with a single rank on this process.
             recipe_main = load_function(script_path, "main")
             return recipe_main(config_path)
         else:
+            # run the job on multiple ranks on this node.
             torchrun_parser = get_args_parser()
             torchrun_args = torchrun_parser.parse_args()
             # overwrite the training script with the actual recipe path
