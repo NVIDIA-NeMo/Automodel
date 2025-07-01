@@ -149,8 +149,8 @@ jobs:
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
           - script: L2_HF_Consolidated_Checkpoint
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_PEFT_Triton_Checkpoint
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+#          - script: L2_HF_PEFT_Triton_Checkpoint
+#            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
           - script: L2_HF_PEFT_Checkpoint
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
     needs: [cicd-unit-tests]

@@ -25,59 +25,28 @@ on:
         required: true
 
 jobs:
-  update-branch:
+  pre-flight:
     runs-on: ubuntu-latest
     outputs:
-      source-branch: ${{ steps.merge-branch.outputs.source-branch }}
-      bump-branch: bump-ci-container-${{ steps.ref.outputs.date }}-${{ steps.merge-branch.outputs.source-branch }}
+      bump-branch: bump-ci-container-${{ steps.ref.outputs.date }}-${{ inputs.target-branch }}
       date: ${{ steps.ref.outputs.date }}
     steps:
-      - uses: actions/checkout@v2
-        with:
-          ref: ${{ inputs.target-branch }}
-
-      - name: Set Git config
-        run: |
-          git config --local user.email "actions@github.com"
-          git config --local user.name "Github Actions"
-
-      - name: Get latest source commit
+      - name: Get date
         id: ref
         run: echo "date=$(date +%F)" | tee -a "$GITHUB_OUTPUT"
 
-      - name: Merge weekly-bump-${{ inputs.target-branch }} back to base branch
-        env:
-          SOURCE_BRANCH: weekly-bump-${{ inputs.target-branch }}
-          TARGET_BRANCH: ${{ inputs.target-branch }}
-        id: merge-branch
-        run: |
-          # Sanitize SOURCE_BRANCH by replacing slashes with dashes and removing any special characters
-          SOURCE_BRANCH=$(echo "$SOURCE_BRANCH" | sed 's/\//-/g' | sed 's/[^a-zA-Z0-9_-]//g')
-
-          echo "source-branch=$SOURCE_BRANCH" | tee -a $GITHUB_OUTPUT
-
-          if git ls-remote --exit-code origin $SOURCE_BRANCH; then
-            git fetch --unshallow
-            git checkout $SOURCE_BRANCH
-            git pull
-            git merge --no-ff $TARGET_BRANCH -m "chore: Auto-merge $TARGET_BRANCH into $SOURCE_BRANCH"
-          else
-            git checkout -b $SOURCE_BRANCH $TARGET_BRANCH
-          fi
-          git push -u origin $SOURCE_BRANCH
-
   nvfsdp:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_bump_tomlfile.yml@v0.40.0
-    needs: [update-branch]
+    needs: [pre-flight]
     name: Bump nvFSDP
     with:
       source-repository: NVIDIA-NeMo/NVFSDP
       source-ref: ${{ inputs.nvfsdp-target-branch }}
       toml-path: tool.uv.sources.nvfsdp.rev
       file: pyproject.toml
-      base-branch: ${{ needs.update-branch.outputs.source-branch }}
-      pr-branch: ${{ needs.update-branch.outputs.bump-branch }}
-      pr-title: "chore(🤖): Bump dependencies (${{ needs.update-branch.outputs.date }})"
+      base-branch: ${{ inputs.target-branch }}
+      pr-branch: ${{ needs.pre-flight.outputs.bump-branch }}
+      pr-title: "chore(🤖): Bump dependencies (${{ needs.pre-flight.outputs.date }})"
       use-gpgkey: true
     secrets:
       PAT: ${{ secrets.PAT }}
@@ -87,7 +56,10 @@ jobs:
   update-lockfile:
     environment: nemo-ci
     runs-on: linux-amd64-cpu16
-    needs: [nvfsdp, update-branch]
+    needs: [nvfsdp, pre-flight]
+    env:
+      SOURCE_BRANCH: ${{ needs.pre-flight.outputs.bump-branch }}
+      TARGET_BRANCH: ${{ inputs.target-branch }}
     steps:
       - name: Install Azure CLI
         run: curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
@@ -105,37 +77,60 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.update-branch.outputs.bump-branch }}
+          ref: ${{ env.TARGET_BRANCH }}
 
-      - name: Upgrade lock file
+      - name: Build container
         env:
           GH_TOKEN: ${{ secrets.PAT }}
         run: |
           docker build -f docker/Dockerfile.ci --secret id=GH_TOKEN -t automodel .
 
+      - name: Create bump branch if not exists
+        env:
+          SOURCE_BRANCH: ${{ needs.pre-flight.outputs.bump-branch }}
+          TARGET_BRANCH: ${{ inputs.target-branch }}
+        run: |
+          if ! git ls-remote --exit-code origin $SOURCE_BRANCH; then
+            git checkout -b $SOURCE_BRANCH $TARGET_BRANCH
+            git push origin $SOURCE_BRANCH
+          fi
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_BRANCH }}
+
+      - name: Upgrade lock file
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
           docker run \
           --rm \
           -v $(pwd):/workspace \
           -w /workspace \
-          automdoel \
-          bash -c 'uv lock --upgrade'
+          -e GH_TOKEN=${{ secrets.PAT }} \
+          automodel \
+          bash -c 'source /opt/venv/env.sh && uv lock --upgrade'
 
       - name: Upload lock file
         uses: actions/upload-artifact@v4
         with:
-          name: lock-file-${{ needs.update-branch.outputs.bump-branch }}
+          name: lock-file-${{ env.SOURCE_BRANCH }}
           path: uv.lock
 
   create-pr:
-    needs: [update-lockfile, update-branch]
+    needs: [update-lockfile, pre-flight]
     runs-on: ubuntu-latest
     environment: main
+    env:
+      SOURCE_BRANCH: ${{ needs.pre-flight.outputs.bump-branch }}
+      TARGET_BRANCH: ${{ inputs.target-branch }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.PAT }}
-          ref: ${{ needs.update-branch.outputs.bump-branch }}
+          ref: ${{ env.TARGET_BRANCH }}
 
       - name: Install GPG
         run: sudo apt-get install -y gnupg2
@@ -151,10 +146,24 @@ jobs:
       - name: Download lock file
         uses: actions/download-artifact@v4
         with:
-          name: lock-file-${{ needs.update-branch.outputs.bump-branch }}
+          name: lock-file-${{ env.SOURCE_BRANCH }}
 
-      - name: Commit changes
-        run: |
-          git add uv.lock
-          git commit -S -m "build: uv.lock"
-          git push
+      - name: Create Bump PR
+        uses: peter-evans/create-pull-request@v6
+        id: create-pull-request
+        env:
+          title: "chore(beep boop 🤖): Bump `uv.lock` (${{ inputs.target-branch}}) (${{ needs.pre-flight.outputs.date }})"
+        with:
+          branch: ${{ env.SOURCE_BRANCH }}
+          base: ${{ env.TARGET_BRANCH }}
+          title: ${{ env.title }}
+          token: ${{ secrets.PAT }}
+          body: |
+            🚀 PR to bump `uv.lock` in `${{ inputs.target-branch }}`.  
+
+            📝 Please remember the following to-do's before merge: 
+            - [ ] Verify the presubmit CI  
+
+            🙏 Please merge this PR only if the CI workflow completed successfully.
+          commit-message: ${{ env.title }}
+          signoff: true
