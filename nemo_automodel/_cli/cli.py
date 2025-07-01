@@ -76,16 +76,7 @@ def launch_with_slurm(slurm_config, script_path, config_file, container_env=None
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="automodel",
-        description="""CLI for NeMo AutoModel
-        Finetune any HF model
-
-        Usage:
-        automodel <domain> <command> --config /path/to/conf.yaml"
-
-        where:
-        - domain: llm, vlm, etc
-        - command: finetune
-        """
+        description="CLI for NeMo AutoModel recipes"
     )
 
     # Two required positionals (cannot start with "--")
@@ -94,7 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
         "domain",
         metavar="<domain>",
         choices=domain_choices,
-        help="Model domain to operate on (e.g., LLM, VLM, etc)",
+        help="Domain to operate on (e.g., LLM, VLM, etc)",
     )
     parser.add_argument(
         "command",
