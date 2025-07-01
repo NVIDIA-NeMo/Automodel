@@ -13,11 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
-import sys
 from pathlib import Path
 import yaml
-import os
-import logging
 
 from pathlib import Path
 import importlib.util
@@ -46,18 +43,16 @@ def load_function(file_path: str | Path, func_name: str):
         raise ImportError(f"{func_name} not found in {file_path}")
 
 
-def load_yaml(path):
+def load_yaml(file_path):
     try:
-        with open(path, 'r') as file:
-            data = yaml.safe_load(file)
-        return data
-
+        with open(file_path, 'r') as file:
+            return yaml.safe_load(file)
     except FileNotFoundError:
         print(f"Error: The file '{file_path}' was not found.")
     except yaml.YAMLError as exc:
         print(f"Error parsing YAML file: {exc}")
 
-def launch_with_slurm(slurm_config, script_path, config_file):
+def launch_with_slurm(slurm_config, script_path, config_file, container_env=None):
     import nemo_run as run
     executor = run.SlurmExecutor(**slurm_config, tunnel=run.LocalTunnel())
     with run.Experiment('aaa') as exp:
