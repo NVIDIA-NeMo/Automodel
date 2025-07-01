@@ -15,7 +15,7 @@
 import argparse
 from pathlib import Path
 import yaml
-
+import os
 from pathlib import Path
 import importlib.util
 from torch.distributed.run import determine_local_world_size, get_args_parser, run as thrun
@@ -86,7 +86,7 @@ def load_yaml(file_path):
         print(f"Error parsing YAML file: {e}")
         raise e
 
-def launch_with_slurm(slurm_config, script_path, config_file, container_env=None):
+def launch_with_slurm(slurm_config, script_path, config_file, job_dir=None, container_env=None):
     """
     Launches a Slurm job using NeMo-Run's SlurmExecutor
 
@@ -96,9 +96,14 @@ def launch_with_slurm(slurm_config, script_path, config_file, container_env=None
         config_file (str): the path to the config yaml (e.g., recipes/llm/llama_3_2_1b_squad.yaml)
         container_env (str, optional): The container env. Defaults to None.
     """
+    assert isinstance(job_dir, str), "Expected job_dir to be a string"
     import nemo_run as run
-    executor = run.SlurmExecutor(**slurm_config, tunnel=run.LocalTunnel())
-    with run.Experiment('aaa') as exp:
+    if not 'mem' in slurm_config:
+        slurm_config['mem'] = '0'
+    if not 'exclusive' in slurm_config:
+        slurm_config['exclusive'] = True
+    executor = run.SlurmExecutor(**slurm_config, tunnel=run.LocalTunnel(job_dir=job_dir))
+    with run.Experiment('aaa', goodbye_message=False) as exp:
         run_name = 'exp_name'
         exp.add(
             run.Script(
@@ -112,7 +117,7 @@ def launch_with_slurm(slurm_config, script_path, config_file, container_env=None
             ),
             executor=executor,
             name=run_name[:37],  # DGX-C run name length limit
-            tail_logs=False
+            tail_logs=False,
         )
         exp.run(sequential=True, detach=True, tail_logs=False)
 
@@ -185,7 +190,9 @@ def main():
 
     if 'slurm' in config:
         # launch job on kubernetes.
-        launch_with_slurm(config['slurm'], script_path, config_path)
+        # if there's no `job_dir` in the slurm section, use cwd/slurm_job
+        job_dir = config['slurm'].pop('job_dir', os.path.join(os.getcwd(), 'slurm_job'))
+        launch_with_slurm(config['slurm'], str(script_path), str(config_path), job_dir)
     elif 'k8s' in config or 'kubernetes' in config:
         # launch job on kubernetes.
         raise NotImplementedError("WIP")
