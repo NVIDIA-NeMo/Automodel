@@ -34,6 +34,7 @@ model:
   pretrained_model_name_or_path: google/gemma-3n-e4b-it #HF model id or local path
   torch_dtype: auto
   use_liger_kernel: false
+  attn_implementation: eager
   text_config:
     use_cache: true
 
@@ -78,11 +79,30 @@ optimizer:
   weight_decay: 0.01
   betas: [0.9, 0.95]
 
+peft:
+  peft_fn: nemo_automodel._peft.lora.apply_lora_to_linear_modules
+  match_all_linear: True
+  # target_modules:
+  #   - "*self_attn.q_proj*"
+  #   - "*self_attn.k_proj*"
+  #   - "*self_attn.v_proj*"
+
+  # exclude_modules:  # exclude all vision modules and lm_head
+  #   - "*vision_tower*"
+  #   - "*vision*"
+  #   - "*visual*"
+  #   - "*audio*"
+  #   - "*image_encoder*"
+  #   - "*lm_head*"
+  dim: 8
+  alpha: 32
+  use_triton: True
+
 freeze_config:
-  freeze_embeddings: false
+  freeze_embeddings: true
   freeze_vision_tower: true
   freeze_audio_tower: true
-  freeze_language_model: false
+  freeze_language_model: true
 
 # Uncomment and configure for W&B logging
 # logger:
