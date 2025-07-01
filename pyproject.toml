@@ -90,7 +90,7 @@ Repository = "https://github.com/NVIDIA/NeMo-Automodel"
 Download = "https://github.com/NVIDIA/NeMo-Automodel/releases"
 
 [project.scripts]
-automodel = "nemo_automodel._cli.cli:main"
+automodel = "nemo_automodel._cli.app:main"
 
 [dependency-groups]
 docs = [
