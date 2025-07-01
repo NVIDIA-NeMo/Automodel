@@ -18,7 +18,6 @@ import yaml
 
 from pathlib import Path
 import importlib.util
-import types
 
 def load_function(file_path: str | Path, func_name: str):
     """
@@ -44,15 +43,37 @@ def load_function(file_path: str | Path, func_name: str):
 
 
 def load_yaml(file_path):
+    """Loads a yaml file.
+
+    Args:
+        file_path (str): Path to yaml file.
+
+    Returns:
+        dict: the yaml file's contents
+
+    Raise:
+        FileNotFoundError: if the file does not exist
+        yaml.YAMLError: if the file is incorrectly formatted.
+    """
     try:
         with open(file_path, 'r') as file:
             return yaml.safe_load(file)
-    except FileNotFoundError:
+    except FileNotFoundError as e:
         print(f"Error: The file '{file_path}' was not found.")
-    except yaml.YAMLError as exc:
-        print(f"Error parsing YAML file: {exc}")
+        raise e
+    except yaml.YAMLError as e:
+        print(f"Error parsing YAML file: {e}")
+        raise e
 
 def launch_with_slurm(slurm_config, script_path, config_file, container_env=None):
+    """Launches a Slurm job using NeMo-Run's SlurmExecutor
+
+    Args:
+        slurm_config (dict): the slurm config
+        script_path (str): the path to the recipe script (e.g., recipes/llm/finetune.py)
+        config_file (str): the path to the config yaml (e.g., recipes/llm/llama_3_2_1b_squad.yaml)
+        container_env (str, optional): The container env. Defaults to None.
+    """
     import nemo_run as run
     executor = run.SlurmExecutor(**slurm_config, tunnel=run.LocalTunnel())
     with run.Experiment('aaa') as exp:
@@ -74,6 +95,11 @@ def launch_with_slurm(slurm_config, script_path, config_file, container_env=None
         exp.run(sequential=True, detach=True, tail_logs=False)
 
 def build_parser() -> argparse.ArgumentParser:
+    """Builds a parser with automodel's app options
+
+    Returns:
+        argparse.ArgumentParser: the parser.
+    """
     parser = argparse.ArgumentParser(
         prog="automodel",
         description="CLI for NeMo AutoModel recipes"
@@ -108,6 +134,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main():
+    """_summary_
+
+    Raises:
+        NotImplementedError: if yaml has a k8s section (support is WIP).
+
+    Returns:
+        int: Job's status code
+    """
     args = build_parser().parse_args()
     print(f"Domain:  {args.domain}")
     print(f"Command: {args.command}")
