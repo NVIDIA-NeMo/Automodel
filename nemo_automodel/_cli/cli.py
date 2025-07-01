@@ -18,6 +18,7 @@ import yaml
 
 from pathlib import Path
 import importlib.util
+from torch.distributed.run import determine_local_world_size, get_args_parser, run as thrun
 
 def load_function(file_path: str | Path, func_name: str):
     """
@@ -43,7 +44,8 @@ def load_function(file_path: str | Path, func_name: str):
 
 
 def load_yaml(file_path):
-    """Loads a yaml file.
+    """
+    Loads a yaml file.
 
     Args:
         file_path (str): Path to yaml file.
@@ -66,7 +68,8 @@ def load_yaml(file_path):
         raise e
 
 def launch_with_slurm(slurm_config, script_path, config_file, container_env=None):
-    """Launches a Slurm job using NeMo-Run's SlurmExecutor
+    """
+    Launches a Slurm job using NeMo-Run's SlurmExecutor
 
     Args:
         slurm_config (dict): the slurm config
@@ -95,7 +98,8 @@ def launch_with_slurm(slurm_config, script_path, config_file, container_env=None
         exp.run(sequential=True, detach=True, tail_logs=False)
 
 def build_parser() -> argparse.ArgumentParser:
-    """Builds a parser with automodel's app options
+    """
+    Builds a parser with automodel's app options
 
     Returns:
         argparse.ArgumentParser: the parser.
@@ -130,6 +134,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to YAML configuration file",
     )
 
+    parser.add_argument(
+        "--nproc-per-node",
+        "--nproc_per_node",
+        type=int,
+        default=None,
+        help="Number of workers per node; supported values: [auto, cpu, gpu, int].",
+    )
     return parser
 
 
@@ -157,8 +168,27 @@ def main():
         raise NotImplementedError("WIP")
         # launch job on kubernetes
     else:
-        recipe_main = load_function(script_path, "main")
-        return recipe_main(config_path)
+        num_devices = determine_local_world_size(nproc_per_node="gpu")
+        assert num_devices > 0, "Expected num-devices to be > 0"
+        if args.nproc_per_node == 1 or num_devices == 1:
+            # run the training job with this process
+            recipe_main = load_function(script_path, "main")
+            return recipe_main(config_path)
+        else:
+            torchrun_parser = get_args_parser()
+            torchrun_args = torchrun_parser.parse_args()
+            # overwrite the training script with the actual recipe path
+            torchrun_args.training_script = str(script_path)
+            # training_script_args=['finetune', '--config', 'recipes/llm/llama_3_2_1b_squad.yaml']
+            # remove the command (i.e., "finetune") part.
+            torchrun_args.training_script_args.pop(0)
+            for i in range(len(torchrun_args.training_script_args)):
+                if torchrun_args.training_script_args[i] == str(args.config):
+                    torchrun_args.training_script_args[i] = str(config_path)
+                    break
+            if args.nproc_per_node is None:
+                torchrun_args.nproc_per_node = num_devices
+            return thrun(torchrun_args)
 
 if __name__ == "__main__":
     main()
