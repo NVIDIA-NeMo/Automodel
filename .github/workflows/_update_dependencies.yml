@@ -92,6 +92,7 @@ jobs:
         run: |
           if ! git ls-remote --exit-code origin $SOURCE_BRANCH; then
             git checkout -b $SOURCE_BRANCH $TARGET_BRANCH
+            git push origin $SOURCE_BRANCH
           fi
 
       - name: Checkout repo
