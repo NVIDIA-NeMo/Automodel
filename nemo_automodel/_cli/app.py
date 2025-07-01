@@ -153,8 +153,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to YAML configuration file",
     )
     # This is defined in torch.distributed.run's parser, but we also define it here.
-    # We want to determine if the user passes this in the CLI, for example, they may be running on
-    # a node with multiple devices but want to utilize a subset of these.
+    # We want to determine if the user passes `--nproc-per-node` via CLI. In particular, we
+    # want to use this information to determine whether they want to utilize a subset of the
+    # currently available devices in their job, otherwise it'll automatically opt to use all devices
     parser.add_argument(
         "--nproc-per-node",
         "--nproc_per_node",
