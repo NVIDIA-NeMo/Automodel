@@ -184,8 +184,9 @@ def main():
             # training_script_args=['finetune', '--config', 'recipes/llm/llama_3_2_1b_squad.yaml']
             # remove the command (i.e., "finetune") part.
             torchrun_args.training_script_args.pop(0)
+            tmp = str(args.config)
             for i in range(len(torchrun_args.training_script_args)):
-                if torchrun_args.training_script_args[i] == str(args.config):
+                if torchrun_args.training_script_args[i] == tmp:
                     torchrun_args.training_script_args[i] = str(config_path)
                     break
             if args.nproc_per_node is None:
