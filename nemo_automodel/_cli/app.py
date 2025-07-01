@@ -20,6 +20,25 @@ from pathlib import Path
 import importlib.util
 from torch.distributed.run import determine_local_world_size, get_args_parser, run as thrun
 
+# Here we assume the following directory structure and expect it to remain unchanged.
+#
+# ├── nemo_automodel
+# │   ├── __init__.py
+# │   ├── _cli
+# │   │   └── app.py
+# ├── recipes
+#     ├── llm
+#     │   ├── finetune.py
+#     │   ├── llama_3_2_1b_hellaswag.yaml
+#     │   ├── ...
+#     │   └── llama_3_2_1b_squad_slurm.yaml
+#     └── vlm
+#         ├── finetune.py
+#         ├── gemma_3_vl_3b_cord_v2.yaml
+#         ├── ...
+#         └── qwen2_5_vl_3b_rdr.yaml
+
+
 def load_function(file_path: str | Path, func_name: str):
     """
     Dynamically import `func_name` from the file at `file_path`
