@@ -130,7 +130,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.PAT }}
-          ref: ${{ env.SOURCE_BRANCH }}
+          ref: ${{ env.TARGET_BRANCH }}
 
       - name: Install GPG
         run: sudo apt-get install -y gnupg2
