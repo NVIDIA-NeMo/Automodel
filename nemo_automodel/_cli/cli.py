@@ -91,7 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
         "command",
         metavar="<command>",
         choices=['finetune'],
-        help="Command within the domain (e.g., finetune, deploy, etc)",
+        help="Command within the domain (e.g., finetune, generate, etc)",
     )
 
     # Optional/required flag
