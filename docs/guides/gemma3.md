@@ -53,7 +53,28 @@ conversation = [
 
 NeMo Automodel provides specialized collate functions for different VLM processors. The collate function is responsible for batching examples and preparing them for model input.
 
-Gemma3 models work seamlessly with HuggingFace's `AutoProcessor` and use the default collate function. The system automatically detects the processor type and applies the appropriate collation:
+Gemma3 models work seamlessly with HuggingFace's `AutoProcessor` and use the default collate function:
+
+```python
+processor = AutoProcessor.from_pretrained("google/gemma-3-4b-it")
+
+# For Gemma3, this uses the default collate function
+def default_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
+    batch = processor.apply_chat_template(
+        [example["conversation"] for example in examples],
+        tokenize=True,
+        add_generation_prompt=False,
+        return_tensors="pt",
+        return_dict=True,
+    )
+    
+    # Create labels for training
+    labels = batch["input_ids"].clone()[:, 1:]
+    labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
+    batch["labels"] = labels
+    
+    return batch
+```
 
 The default collate function:
 - Applies the processor's chat template to format conversations
