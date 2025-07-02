@@ -81,19 +81,9 @@ optimizer:
 
 peft:
   peft_fn: nemo_automodel._peft.lora.apply_lora_to_linear_modules
-  match_all_linear: True
-  # target_modules:
-  #   - "*self_attn.q_proj*"
-  #   - "*self_attn.k_proj*"
-  #   - "*self_attn.v_proj*"
+  #match_all_linear: True
+  target_modules: "*language_model\\.layers\\.([0-9]|1[0-9])\\.self_attn\\.[qkv]_proj"
 
-  # exclude_modules:  # exclude all vision modules and lm_head
-  #   - "*vision_tower*"
-  #   - "*vision*"
-  #   - "*visual*"
-  #   - "*audio*"
-  #   - "*image_encoder*"
-  #   - "*lm_head*"
   dim: 8
   alpha: 32
   use_triton: True

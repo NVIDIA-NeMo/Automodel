@@ -302,7 +302,7 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
                     use_liger_kernel=False,
                     torch_dtype=torch_dtype,
                 )
-        model = patch_attention(model, sdpa_method)
+        #model = patch_attention(model, sdpa_method)
         model.config.update({"nemo_version": __version__})
         return model
 
@@ -347,6 +347,6 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
                 return cls.from_config(
                     config, **kwargs, use_liger_kernel=False, torch_dtype=torch_dtype
                 )
-        model = patch_attention(model, sdpa_method)
+        #model = patch_attention(model, sdpa_method)
         model.config.update({"nemo_version": __version__})
         return model
