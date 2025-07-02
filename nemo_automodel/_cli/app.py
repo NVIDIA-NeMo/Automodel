@@ -191,12 +191,18 @@ def main():
     print(f"Config:  {args.config.resolve()}")
     config_path = args.config.resolve()
     config = load_yaml(config_path)
+    repo_root = Path(__file__).parents[2]
     script_path = Path(__file__).parents[2] / "recipes" / args.domain / f'{args.command}.py'
 
     if 'slurm' in config:
         # launch job on kubernetes.
         # if there's no `job_dir` in the slurm section, use cwd/slurm_job
         job_dir = config['slurm'].pop('job_dir', os.path.join(os.getcwd(), 'slurm_job'))
+        if not 'container_mounts:' in config:
+            config['container_mounts'] = []
+        # we need to mount the repo_root since we use the absolute path to the recipe
+        # TODO(@akoumparouli): this wouldn't work if you pip-install the package on the head-node?
+        config['container_mounts'].append(f'{repo_root}:{repo_root}')
         launch_with_slurm(config['slurm'], str(script_path), str(config_path), job_dir)
     elif 'k8s' in config or 'kubernetes' in config:
         # launch job on kubernetes.
