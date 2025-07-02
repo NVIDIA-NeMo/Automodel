@@ -483,7 +483,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             tps = self.num_tokens / time_delta
             self.num_tokens = 0
             # log
-            reporting_loss = self.log_train_metrics(grad_norm)
+            reporting_loss = self.log_train_metrics(grad_norm, tps)
             logging.info(
                 "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | mem: {:.2f} GiB | tps {:.2f}".format(
                     self.step_scheduler.step,
@@ -550,7 +550,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
         )
 
-    def log_train_metrics(self, grad_norm):
+    def log_train_metrics(self, grad_norm, tps):
         """Log metrics to wandb.
 
         Args:
@@ -580,6 +580,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             "epoch": self.step_scheduler.epoch,
             "grad_norm": grad_norm,
             "num_tokens_per_step": total_num_tokens,
+            "tps": tps,
         }
         if self.optimizer.param_groups:
             log_data["learning_rate"] = self.optimizer.param_groups[0]["lr"]
