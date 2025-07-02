@@ -149,6 +149,7 @@ def import_classes_from_paths(class_paths: List[str]):
 def nvfsdp_strategy_parallelize(
     model,
     device_mesh: DeviceMesh,
+    optimizer = None,
     nvfsdp_unit_modules: Optional[List[str]] = None,
     tp_shard_plan: Optional[
         Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]
@@ -221,14 +222,9 @@ def nvfsdp_strategy_parallelize(
         https://github.com/NVIDIA-NeMo/nvFSDP for more information"
 
     # DP_CP ranks are sharded by FSDP.
-    dp_mesh = device_mesh[
-        (
-            "dp_cp"
-            if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(device_mesh, {})
-            else "data_parallel"
-        )
-    ]
+    dp_mesh = device_mesh["data_parallel"]
     tp_mesh = device_mesh["tensor_parallel"]
+    cp_mesh = device_mesh["context_parallel"]
 
     if dp_mesh.size() > 1:
         # TODO(boxiangw): remove this once HSDP is supported.
@@ -237,22 +233,32 @@ def nvfsdp_strategy_parallelize(
     # TP sharding.
     if tp_mesh.size() > 1:
         parallelize_module(model, tp_mesh, tp_shard_plan)
+    
+    if cp_mesh.size() > 1:
+        dp_cp_mesh_name = "dp_cp"
+    else:
+        dp_cp_mesh_name = "data_parallel"
 
     # Import nvFSDP unit modules specified by the user.
     nvfsdp_unit_modules = import_classes_from_paths(nvfsdp_unit_modules)
 
     # Wrap model with nvFSDP.
-    model = nvfsdp_fully_shard(
+    model, optimizer = nvfsdp_fully_shard(
         module=model,
+        optimizer=optimizer,
         fsdp_unit_modules=nvfsdp_unit_modules,
-        dp_cp_group=dp_mesh.get_group(),
-        init_model_with_meta_device=init_nvfsdp_with_meta_device,
+        device_mesh=device_mesh,
+        dp_mesh_name="data_parallel",
+        cp_mesh_name="context_parallel",
+        tp_mesh_name="tensor_parallel",
+        dp_cp_mesh_name=dp_cp_mesh_name,
         data_parallel_sharding_strategy=data_parallel_sharding_strategy,
-        init_nvfsdp_with_meta_device=init_nvfsdp_with_meta_device,
+        init_model_with_meta_device=init_nvfsdp_with_meta_device,
         grad_reduce_in_fp32=grad_reduce_in_fp32,
         preserve_fp32_weights=preserve_fp32_weights,
         overlap_grad_reduce=overlap_grad_reduce,
         overlap_param_gather=overlap_param_gather,
+        sync_grads_each_step=False, # For better performance, avoid sync every step
         check_for_nan_in_grad=check_for_nan_in_grad,
         average_in_collective=average_in_collective,
         disable_bucketing=disable_bucketing,
@@ -262,7 +268,7 @@ def nvfsdp_strategy_parallelize(
         fsdp_double_buffer=fsdp_double_buffer,
     )
 
-    return model
+    return model, optimizer
 
 
 def get_hf_tp_shard_plan(model):

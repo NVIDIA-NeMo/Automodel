@@ -188,7 +188,7 @@ class NVFSDPManager:
             )
         return self
 
-    def parallelize(self, model, use_hf_tp_plan=False):
+    def parallelize(self, model, optimizer=None, use_hf_tp_plan=False):
         """
         Parallelizes the given model using FSDP2 and TP sharding strategies.
 
@@ -198,6 +198,9 @@ class NVFSDPManager:
 
         Args:
             model: The model to be parallelized.
+            optimizer: The optimizer for the model. If None, user need to call model.finish_grad_sync() 
+                before optimizer.step(), model.install_optimized_model_weights() and model.zero_grad_buffer()
+                after optimizer.zero_grad()
             use_hf_tp_plan (bool): if true, will query the model for the TP plan.
 
         Returns:
@@ -248,6 +251,7 @@ class NVFSDPManager:
         model = nvfsdp_strategy_parallelize(
             model,
             device_mesh=self.device_mesh,
+            optimizer=optimizer,
             nvfsdp_unit_modules=self.nvfsdp_unit_modules,
             tp_shard_plan=tp_shard_plan,
             data_parallel_sharding_strategy=self.data_parallel_sharding_strategy,
