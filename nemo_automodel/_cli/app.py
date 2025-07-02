@@ -86,7 +86,7 @@ def load_yaml(file_path):
         print(f"Error parsing YAML file: {e}")
         raise e
 
-def launch_with_slurm(slurm_config, script_path, config_file, job_dir=None, container_env=None):
+def launch_with_slurm(slurm_config, script_path, config_file, job_dir=None, container_env={}):
     """
     Launches a Slurm job using NeMo-Run's SlurmExecutor
 
@@ -102,9 +102,14 @@ def launch_with_slurm(slurm_config, script_path, config_file, job_dir=None, cont
         slurm_config['mem'] = '0'
     if not 'exclusive' in slurm_config:
         slurm_config['exclusive'] = True
-    executor = run.SlurmExecutor(**slurm_config, tunnel=run.LocalTunnel(job_dir=job_dir))
-    with run.Experiment('aaa', goodbye_message=False) as exp:
-        run_name = 'exp_name'
+
+    from nemo_run.config import set_nemorun_home
+    set_nemorun_home(job_dir)
+    executor = run.SlurmExecutor(**slurm_config, tunnel=run.LocalTunnel(job_dir=''))
+    # @akoumparouli: uncomment once nemo-run updates its package.
+    # with run.Experiment('exp_ts_', enable_goodbye_message=False) as exp:
+    with run.Experiment('exp_ts_') as exp:
+        run_name = ''
         exp.add(
             run.Script(
                 path=script_path,
@@ -172,7 +177,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main():
-    """_summary_
+    """CLI for running finetune jobs with NeMo-Automodel, supporting torchrun, Slurm & Kubernetes.
 
     Raises:
         NotImplementedError: if yaml has a k8s section (support is WIP).
