@@ -37,6 +37,15 @@ model:
   _target_: nemo_automodel._transformers.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
 
+# Compile configuration
+compile:
+  enabled: true
+  mode: "default"  # More conservative mode for selective compilation
+  fullgraph: false
+  dynamic: true
+  # backend will use TORCH_COMPILE_BACKEND env var (defaults to "inductor")
+  options: {}  # No debug options - they're not valid torch.compile arguments
+
 distributed:
   _target_: nemo_automodel.distributed.fsdp2.FSDP2Manager
   dp_size: none
@@ -70,6 +79,7 @@ validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.datasets.utils.default_collater
   batch_size: 8
+  shuffle: false
 
 optimizer:
   _target_: torch.optim.Adam
@@ -85,4 +95,3 @@ optimizer:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
-

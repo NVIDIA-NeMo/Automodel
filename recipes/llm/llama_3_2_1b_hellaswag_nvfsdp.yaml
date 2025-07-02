@@ -54,7 +54,7 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.datasets.utils.default_collater
   batch_size: 8
-  shuffle: false
+  shuffle: true
 
 validation_dataset:
   _target_: nemo_automodel.datasets.llm.hellaswag.HellaSwag
@@ -66,6 +66,7 @@ validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.datasets.utils.default_collater
   batch_size: 8
+  shuffle: false
 
 optimizer:
   _target_: torch.optim.Adam
