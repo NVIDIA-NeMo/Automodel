@@ -332,7 +332,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.cfg.dataset,
             self.cfg.dataloader,
             self.cfg.model,
-            self.cfg.packed_sequence,
+            self.cfg.get('packed_sequence', None),
             device_mesh=self.device_mesh,
             seed=self.cfg.get("seed", 42),
         )
