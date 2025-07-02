@@ -17,6 +17,7 @@ from __future__ import annotations
 import time
 import types
 import importlib
+import sys
 
 import pytest
 import torch
@@ -43,11 +44,13 @@ def patch_torch_distributed(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0, raising=False)
 
     # Distributed stubs
-    dist_stub = types.SimpleNamespace()
+    dist_stub = types.ModuleType("torch.distributed")
 
+    # Minimal API surface that NeMo timers touch
     dist_stub.get_world_size = lambda: 1
     dist_stub.get_rank = lambda: 0
     dist_stub.barrier = lambda group=None: None
+    dist_stub.is_initialized = lambda: False   # helps _get_default_group check
 
     def _all_gather(dest: torch.Tensor, src: torch.Tensor):  # noqa: D401
         """
@@ -60,6 +63,7 @@ def patch_torch_distributed(monkeypatch):
     dist_stub._all_gather_base = _all_gather
 
     monkeypatch.setattr(torch, "distributed", dist_stub, raising=False)
+    sys.modules["torch.distributed"] = dist_stub
 
     # Import the module *after* stubs are in place so it picks them up.
     global timers_mod
