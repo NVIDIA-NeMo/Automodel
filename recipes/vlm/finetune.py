@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict
+import pathlib
 
 import torch
 import torch.distributed as dist
@@ -38,7 +39,7 @@ import logging
 from transformers import AutoProcessor
 
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
-from nemo_automodel.config.cli import parse_args_and_load_config
+from nemo_automodel.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.distributed.init_utils import initialize_distributed
 from nemo_automodel.distributed.parallelizer import (
@@ -667,12 +668,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
 # ---------------------------------------------------------------------------
 
 
-def main():
+def main(config_path=None):
     """Main entry point for the fine-tuning recipe.
 
     Loads the configuration, sets up the trainer, and initiates the training loop.
     """
-    cfg = parse_args_and_load_config("qwen2_5_vl_3b_rdr.yaml")
+    if config_path is None:
+        config_path = pathlib.Path(__file__).parent.resolve() / "qwen2_5_vl_3b_rdr.yaml"
+    cfg = parse_args_and_load_config(config_path)
     trainer = FinetuneRecipeForVLM(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()

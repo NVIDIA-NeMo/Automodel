@@ -46,7 +46,7 @@ import time
 import logging
 
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
-from nemo_automodel.config.cli import parse_args_and_load_config
+from nemo_automodel.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.datasets.llm.packed_sequence import PackedSequence
 from nemo_automodel.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.distributed.init_utils import initialize_distributed
@@ -595,13 +595,14 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 # ---------------------------------------------------------------------------
 
 
-def main():
+def main(config_path=None):
     """Main entry point for the fine-tuning recipe.
 
     Loads the configuration, sets up the trainer, and initiates the training loop.
     """
-    script_path = pathlib.Path(__file__).parent.resolve()
-    cfg = parse_args_and_load_config(script_path / "llama_3_2_1b_hellaswag.yaml")
+    if config_path is None:
+        config_path = pathlib.Path(__file__).parent.resolve()  / "llama_3_2_1b_hellaswag.yaml"
+    cfg = parse_args_and_load_config(config_path)
     trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()

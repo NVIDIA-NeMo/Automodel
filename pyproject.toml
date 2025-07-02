@@ -13,8 +13,12 @@
 # limitations under the License.
 
 [build-system]
-requires = ["setuptools >= 61.0"]
+requires = [
+    "setuptools >= 64.0",   # PEP 660 support
+    "wheel"                 # always good to have
+]
 build-backend = "setuptools.build_meta"
+
 
 [tool.setuptools]
 include-package-data = true
@@ -68,6 +72,7 @@ classifiers = [
     'Natural Language :: English',
     'Operating System :: OS Independent',
 ]
+
 dependencies = [
     "bitsandbytes==0.45.5; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@87a86ab",
@@ -78,8 +83,9 @@ dependencies = [
     "torchdata",
     "transformers",
     "wandb",
-
+    "nemo-run==0.4.0",
 ]
+
 [project.optional-dependencies]
 vlm = ["qwen-vl-utils[decord]"]
 
@@ -87,6 +93,9 @@ vlm = ["qwen-vl-utils[decord]"]
 Homepage = "https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/stable/"
 Repository = "https://github.com/NVIDIA/NeMo-Automodel"
 Download = "https://github.com/NVIDIA/NeMo-Automodel/releases"
+
+[project.scripts]
+automodel = "nemo_automodel._cli.app:main"
 
 [dependency-groups]
 docs = [
