@@ -37,11 +37,20 @@ import logging
 
 from transformers import AutoProcessor
 
+import logging
+from nemo_automodel.training.base_recipe import BaseRecipe
+from nemo_automodel.training.step_scheduler import StepScheduler
+from nemo_automodel.training.utils import count_tail_padding
+
+from nemo_automodel.loggers.log_utils import setup_logging
+import time
+import logging
+
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.config.cli import parse_args_and_load_config
-from nemo_automodel.datasets.vlm.collate_fns import COLLATE_FNS
-from nemo_automodel.distributed.init_utils import initialize_distributed
+from nemo_automodel.datasets.llm.packed_sequence import PackedSequence
 from nemo_automodel.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.distributed.init_utils import initialize_distributed
 from nemo_automodel.loggers.log_utils import setup_logging
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.rng import StatefulRNG
@@ -52,12 +61,10 @@ from nemo_automodel.utils.dist_utils import (
     reduce_loss,
     rescale_gradients,
 )
-from nemo_automodel.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
+
 from nemo_automodel.loggers.log_utils import setup_logging
 from transformers import AutoProcessor
 from nemo_automodel.datasets.vlm.collate_fns import COLLATE_FNS
-from nemo_automodel.training.rng import StatefulRNG
-from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 
 import logging
 from nemo_automodel.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
@@ -370,6 +377,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         and update model parameters when necessary. Also prints loss every gradient step.
         """
         self.model.train()
+        self.timestamp = time.perf_counter()
+        self.num_tokens = 0
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
             for batch_idx, batch in enumerate(self.step_scheduler):
@@ -414,6 +423,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             )
 
         local_num_tokens = loss_mask.sum().detach().to(torch.int)
+        self.num_tokens += labels.numel() - count_tail_padding(labels)
         self.total_num_tokens += local_num_tokens
         self.forward_data_store.append(local_loss.detach())
 
@@ -460,15 +470,24 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 self.model.install_optimized_model_weights()
                 self.model.zero_grad_buffer()
 
+            # TPS is calculated as follows (assuming grad-accumulation-steps=2):
+            # fwd 0 | bwd 0 | fwd 1 | bwd 1 | opt 0 | fwd 2 | bwd 2 | ...
+            # ^                                     ^
+            t = time.perf_counter()
+            time_delta = t - self.timestamp
+            self.timestamp = t
+            tps = self.num_tokens / time_delta
+            self.num_tokens = 0
             # log
-            reporting_loss = self.log_train_metrics(grad_norm)
+            reporting_loss = self.log_train_metrics(grad_norm, tps)
             logging.info(
-                "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | mem: {:.2f} GiB".format(
+                "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | mem: {:.2f} GiB | tps {:.2f}".format(
                     self.step_scheduler.step,
                     self.step_scheduler.epoch,
                     reporting_loss,
                     grad_norm,
                     torch.cuda.max_memory_allocated() / 1024**3,
+                    tps,
                 )
             )
             torch.cuda.reset_peak_memory_stats()
@@ -476,7 +495,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
     @torch.no_grad()
     def _run_validation_epoch(self) -> float:
-        """Run one pass over `self.val_dataloader` and return average loss per token."""
         with StatefulRNG(seed=1, ranked=True):
             self.model.eval()
 
@@ -528,7 +546,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             )
         )
 
-    def log_train_metrics(self, grad_norm):
+    def log_train_metrics(self, grad_norm, tps):
         """Log metrics to wandb.
 
         Args:
@@ -545,10 +563,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             dp_group = self.device_mesh["data_parallel"].get_group()
 
         total_loss, total_num_tokens = reduce_loss(
-            self.forward_data_store,
-            self.total_num_tokens,
-            per_token_loss=True,
-            dp_group=dp_group,
+            self.forward_data_store, self.total_num_tokens, per_token_loss=True, dp_group=dp_group
         )
         reporting_loss = (total_loss / total_num_tokens).item()
         grad_norm = grad_norm.item() if not isinstance(grad_norm, float) else grad_norm  # TP WAR
@@ -561,6 +576,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             "epoch": self.step_scheduler.epoch,
             "grad_norm": grad_norm,
             "num_tokens_per_step": total_num_tokens,
+            "tps": tps,
         }
         if self.optimizer.param_groups:
             log_data["learning_rate"] = self.optimizer.param_groups[0]["lr"]
