@@ -458,15 +458,20 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.optimizer.step()
             self.optimizer.zero_grad()
 
-            if HAVE_NVFSDP and isinstance(self.model, nvFSDP):
-                # If custom FSDP2 is configured with "optim" (optimizer state / high-precision model weight sharding),
-                # then the optimizer step will be applied to the main high-precision model weights. Update the model
-                # weights after the optimizer step.
-                self.model.install_optimized_model_weights()
-                self.model.zero_grad_buffer()
+            # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
+            # self.model.install_optimized_model_weights()
+            # self.model.zero_grad_buffer()
 
+            # TPS is calculated as follows (assuming grad-accumulation-steps=2):
+            # fwd 0 | bwd 0 | fwd 1 | bwd 1 | opt 0 | fwd 2 | bwd 2 | ...
+            # ^                                     ^
+            t = time.perf_counter()
+            time_delta = t - self.timestamp
+            self.timestamp = t
+            tps = self.num_tokens / time_delta
+            self.num_tokens = 0
             # log
-            reporting_loss = self.log_train_metrics(grad_norm)
+            reporting_loss = self.log_train_metrics(grad_norm, tps)
             logging.info(
                 "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | mem: {:.2f} GiB | tps {:.2f}".format(
                     self.step_scheduler.step,
@@ -482,6 +487,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
     @torch.no_grad()
     def _run_validation_epoch(self) -> float:
+        """Run one pass over `self.val_dataloader` and return average loss per token."""
         with StatefulRNG(seed=1, ranked=True):
             self.model.eval()
 
