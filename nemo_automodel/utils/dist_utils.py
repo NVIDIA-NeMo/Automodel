@@ -285,7 +285,7 @@ def rescale_gradients(model, num_tokens_for_grad_scaling, dp_group=None):
 
 # based on: https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/utils.py#L278
 @torch.no_grad()
-def clip_gradients(model, clip_norm, foreach=False):
+def clip_gradients(model, clip_norm, foreach=True):
     """
     Clip gradients across the DP group.
 

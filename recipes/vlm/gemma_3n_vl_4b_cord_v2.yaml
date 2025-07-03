@@ -64,6 +64,9 @@ dataloader:
   batch_size: 1
   num_workers: 0
   pin_memory: true
+  collate_fn:
+    _target_: nemo_automodel.datasets.vlm.collate_fns.default_collate_fn
+    start_of_response_token: "<start_of_turn>model\n"
 
 validation_dataset:
   _target_: nemo_automodel.datasets.vlm.datasets.make_cord_v2_dataset

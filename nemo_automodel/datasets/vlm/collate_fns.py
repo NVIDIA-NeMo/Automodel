@@ -38,7 +38,6 @@ def create_loss_mask_with_start_of_response_token(input_ids, processor, start_of
     Returns:
         loss_mask: List of 0/1 flags where 0 = masked (prompt), 1 = unmasked (response)
     """
-    import pdb; pdb.set_trace()
     tokenizer = getattr(processor, "tokenizer", processor)
     input_ids = input_ids.tolist()
     if isinstance(start_of_response_token, str):
