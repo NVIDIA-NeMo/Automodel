@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import logging
-import pathlib
 import time
 from typing import Any, Dict
 
