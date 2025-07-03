@@ -44,7 +44,10 @@ def create_loss_mask_with_start_of_response_token(input_ids, processor, start_of
         start_of_response_token_id = tokenizer(start_of_response_token, add_special_tokens=False)["input_ids"]
         start_of_turn_token_id = start_of_response_token_id[0]
         first_start_of_turn_token_id = input_ids.index(start_of_turn_token_id)
-        response_start = input_ids.index(start_of_turn_token_id, first_start_of_turn_token_id + 1) + len(start_of_response_token_id) - 1
+        response_start = (
+            input_ids.index(start_of_turn_token_id, first_start_of_turn_token_id + 1) 
+            + len(start_of_response_token_id) - 1
+        )
     else:
         response_start = 0
     
@@ -83,7 +86,9 @@ def create_batch_loss_masks(batch_input_ids, processor, start_of_response_token=
     return torch.tensor(loss_masks, dtype=torch.float, device=batch_input_ids.device)
 
 
-def qwen2_5_collate_fn(examples: list, processor, start_of_response_token="<|im_start|>assistant\n") -> dict[str, torch.Tensor]:
+def qwen2_5_collate_fn(
+    examples: list, processor, start_of_response_token="<|im_start|>assistant\n"
+) -> dict[str, torch.Tensor]:
     """Collate function for Qwen2.5 VL model."""
     if not HAVE_QWEN_VL_UTILS:
         raise ImportError(MISSING_QWEN_VL_UTILS_MSG)
@@ -104,9 +109,10 @@ def qwen2_5_collate_fn(examples: list, processor, start_of_response_token="<|im_
     labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
     labels[torch.isin(labels, skipped_tokens)] = -100
     batch["labels"] = labels
-    loss_mask = create_batch_loss_masks(batch["input_ids"], processor, start_of_response_token=start_of_response_token)
+    loss_mask = create_batch_loss_masks(
+        batch["input_ids"], processor, start_of_response_token=start_of_response_token
+    )
     batch["loss_mask"] = loss_mask
-
 
     return batch
 
@@ -127,14 +133,20 @@ def default_collate_fn(examples: list, processor, start_of_response_token=None) 
     )
     if "position_ids" not in batch:
         batch_size, seq_len = batch["input_ids"].shape
-        batch["position_ids"] = torch.arange(seq_len, device=batch["input_ids"].device).unsqueeze(0).expand(batch_size, -1)
+        batch["position_ids"] = (
+            torch.arange(seq_len, device=batch["input_ids"].device)
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+        )
 
     batch["pixel_values"] = batch["pixel_values"].to(torch.bfloat16)
     labels = batch["input_ids"].clone()[:, 1:]
     labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
     labels[torch.isin(labels, skipped_tokens)] = -100
     batch["labels"] = labels
-    loss_mask = create_batch_loss_masks(batch["input_ids"], processor, start_of_response_token=start_of_response_token)
+    loss_mask = create_batch_loss_masks(
+        batch["input_ids"], processor, start_of_response_token=start_of_response_token
+    )
     batch["loss_mask"] = loss_mask
     # To check the unmasked tokens
     # print(processor.tokenizer.decode(batch['input_ids'][loss_mask == 1], skip_special_tokens=True))
