@@ -26,7 +26,65 @@ except ImportError:
     process_vision_info = MagicMock()
 
 
-def qwen2_5_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
+def create_loss_mask_with_start_of_response_token(input_ids, processor, start_of_response_token=None):
+    """
+    Create loss mask by finding start of turn token positions, similar to squad.py approach.
+    
+    Args:
+        input_ids: List or tensor of token IDs for a single example
+        processor: Processor/tokenizer to convert token string to ID
+        start_of_response_token: String token that marks the start of turns (e.g., "<start_of_turn>model\n")
+        
+    Returns:
+        loss_mask: List of 0/1 flags where 0 = masked (prompt), 1 = unmasked (response)
+    """
+    import pdb; pdb.set_trace()
+    tokenizer = getattr(processor, "tokenizer", processor)
+    input_ids = input_ids.tolist()
+    if isinstance(start_of_response_token, str):
+        start_of_response_token_id = tokenizer(start_of_response_token, add_special_tokens=False)["input_ids"]
+        start_of_turn_token_id = start_of_response_token_id[0]
+        first_start_of_turn_token_id = input_ids.index(start_of_turn_token_id)
+        response_start = input_ids.index(start_of_turn_token_id, first_start_of_turn_token_id + 1) + len(start_of_response_token_id) - 1
+    else:
+        response_start = 0
+    
+    loss_mask = [0] * response_start + [1] * (len(input_ids) - response_start)
+    return loss_mask
+
+
+def create_batch_loss_masks(batch_input_ids, processor, start_of_response_token=None):
+    """
+    Create loss masks for a batch of input_ids.
+    
+    Args:
+        batch_input_ids: Tensor of shape (batch_size, seq_len)
+        processor: Processor/tokenizer to convert token string to ID
+        start_of_response_token: String token that marks the start of turns
+        
+    Returns:
+        loss_mask: Tensor of shape (batch_size, seq_len) where 0 = masked, 1 = unmasked
+    """
+    batch_size, seq_len = batch_input_ids.shape
+    loss_masks = []
+    
+    for i in range(batch_size):
+        single_input_ids = batch_input_ids[i]
+        loss_mask = create_loss_mask_with_start_of_response_token(
+            single_input_ids, processor, start_of_response_token
+        )
+        # Pad or truncate to seq_len
+        if len(loss_mask) < seq_len:
+            loss_mask.extend([0] * (seq_len - len(loss_mask)))
+        elif len(loss_mask) > seq_len:
+            loss_mask = loss_mask[:seq_len]
+        
+        loss_masks.append(loss_mask)
+    
+    return torch.tensor(loss_masks, dtype=torch.float, device=batch_input_ids.device)
+
+
+def qwen2_5_collate_fn(examples: list, processor, start_of_response_token="<|im_start|>assistant\n") -> dict[str, torch.Tensor]:
     """Collate function for Qwen2.5 VL model."""
     if not HAVE_QWEN_VL_UTILS:
         raise ImportError(MISSING_QWEN_VL_UTILS_MSG)
@@ -47,11 +105,14 @@ def qwen2_5_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
     labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
     labels[torch.isin(labels, skipped_tokens)] = -100
     batch["labels"] = labels
+    loss_mask = create_batch_loss_masks(batch["input_ids"], processor, start_of_response_token=start_of_response_token)
+    batch["loss_mask"] = loss_mask
+
 
     return batch
 
 
-def default_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
+def default_collate_fn(examples: list, processor, start_of_response_token=None) -> dict[str, torch.Tensor]:
     """Default collate function for VLM models."""
     if not HAVE_QWEN_VL_UTILS:
         raise ImportError(MISSING_QWEN_VL_UTILS_MSG)
@@ -74,6 +135,10 @@ def default_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
     labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
     labels[torch.isin(labels, skipped_tokens)] = -100
     batch["labels"] = labels
+    loss_mask = create_batch_loss_masks(batch["input_ids"], processor, start_of_response_token=start_of_response_token)
+    batch["loss_mask"] = loss_mask
+    # To check the unmasked tokens
+    # print(processor.tokenizer.decode(batch['input_ids'][loss_mask == 1], skip_special_tokens=True))
 
     return batch
 

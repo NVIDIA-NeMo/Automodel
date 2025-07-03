@@ -288,7 +288,6 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
         constructed model and recursively reloads it once with
         ``use_liger_kernel=False``.
         """
-        import pdb; pdb.set_trace()
         torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
         use_liger_kernel = kwargs.pop("use_liger_kernel", True)
         use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
