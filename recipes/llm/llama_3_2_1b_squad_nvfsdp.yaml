@@ -14,13 +14,13 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_hellaswag_nvfsdp.yaml
+# torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_squad.yaml
 # Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
 
 step_scheduler:
   grad_acc_steps: 4
-  ckpt_every_steps: 20
+  ckpt_every_steps: 1000
   val_every_steps: 10  # will run every x number of gradient steps
   num_epochs: 1
 
@@ -36,14 +36,6 @@ rng:
 model:
   _target_: nemo_automodel._transformers.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
-  cache_dir: /opt/models/
-  torch_dtype: auto
-
-checkpoint:
-  enabled: false
-  checkpoint_dir: checkpoints/
-  model_save_format: torch_save # torch_save or safetensors
-  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 distributed:
   _target_: nemo_automodel.distributed.nvfsdp.NVFSDPManager
@@ -54,14 +46,12 @@ distributed:
 loss_fn: nemo_automodel.loss.masked_ce.masked_cross_entropy
 
 dataset:
-  _target_: nemo_automodel.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: train
 
 packed_sequence:
-  # Set packed_sequence_size > 0 to run with packed sequences
   packed_sequence_size: 0
-  split_across_pack: False
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -70,10 +60,10 @@ dataloader:
   shuffle: false
 
 validation_dataset:
-  _target_: nemo_automodel.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: validation
-  num_samples_limit: 64
+  limit_dataset_samples: 64
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -94,3 +84,4 @@ optimizer:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
+

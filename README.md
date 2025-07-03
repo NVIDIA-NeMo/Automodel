@@ -10,11 +10,11 @@
 [![codecov](https://codecov.io/github/NVIDIA-NeMo/Automodel/graph/badge.svg?token=4NMKZVOW2Z)](https://codecov.io/github/NVIDIA-NeMo/Automodel)
 [![CICD NeMo](https://github.com/NVIDIA-NeMo/Automodel/actions/workflows/cicd-main.yml/badge.svg)](https://github.com/NVIDIA-NeMo/Automodel/actions/workflows/cicd-main.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/release/python-3100/)
-[![GitHub Stars](https://img.shields.io/github/stars/NVIDIA-NeMo/Automodel.svg?style=social&label=Star&maxAge=2592000)](https://github.com/NVIDIA-NeMo/Automodel/stargazers/)
+[![GitHub Stars](https://img.shields.io/github/stars/NVIDIA-NeMo/Automodel.svg?style=social&label=Star)](https://github.com/NVIDIA-NeMo/Automodel/stargazers/)
 
 <!-- **Day-0 integration with Hugging Face models automating fine-tuning and pretraining with pytorch-native parallelism, custom-kernels and optimized recipes** -->
 
-[📖 Documentation](https://github.com/NVIDIA-NeMo/Automodel/) • [🔥 Ready-to-Use Recipes](https://github.com/NVIDIA-NeMo/Automodel/#-ready-to-use-recipes) • [💡 Examples](https://github.com/NVIDIA-NeMo/Automodel/tree/main/recipes) • [🤝 Contributing](https://github.com/NVIDIA-NeMo/Automodel/blob/main/CONTRIBUTING.md)
+[📖 Documentation](https://docs.nvidia.com/nemo/automodel/latest/index.html) • [🔥 Ready-to-Use Recipes](https://github.com/NVIDIA-NeMo/Automodel/#-ready-to-use-recipes) • [💡 Examples](https://github.com/NVIDIA-NeMo/Automodel/tree/main/recipes) • [🤝 Contributing](https://github.com/NVIDIA-NeMo/Automodel/blob/main/CONTRIBUTING.md)
 
 </div>
 
@@ -26,6 +26,7 @@
 
 Start fine-tuning models instantly, scale effortlessly with PyTorch-native data/model parallelism, optimized custom kernels, and memory-efficient recipes-all while preserving the original checkpoint format for seamless use across the Hugging Face ecosystem.
 
+> ⚠️ Note: NeMo AutoModel is under active development. New features, improvements, and documentation updates are released regularly. We are working toward a stable release, so expect the interface to solidify over time. Your feedback and contributions are welcome, and we encourage you to follow along as new updates roll out.
 
 ## 🎛️ Supported Models
 NeMo AutoModel provides native support for a wide range of models available on the Hugging Face Hub, enabling efficient fine-tuning for various domains.
@@ -72,19 +73,18 @@ uv run recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_3b_cord_v2_peft.y
 
 ## 🚀 Key Features
 
-- **🔥 Day-0 Hugging Face Support**: Instantly fine-tune any model from the Hugging Face Hub
-- **⚡ Lightning Fast Performance**: Custom CUDA kernels and memory optimizations deliver 2–5× speedups
-- **🌐 Large-Scale Distributed Training**: Built-in FSDP2 and nvFSDP for seamless multi-node scaling
-- **👁️ Vision-Language Model Ready**: Native support for VLMs (Qwen2-VL, Gemma-3-VL, etc)
-- **🧩 Advanced PEFT Methods**: LoRA and extensible PEFT system out of the box
-- **📦 Seamless HF Ecosystem**: Fine-tuned models work perfectly with Transformers pipeline, VLM, etc.
-- **⚙️ Robust Infrastructure**: Distributed checkpointing with integrated logging and monitoring
-- **🎯 Optimized Recipes**: Pre-built configurations for common models and datasets
-- **🔧 Flexible Configuration**: YAML-based configuration system for reproducible experiments
-- **⚡ FP8 Precision**: Native FP8 training & inference for higher throughput and lower memory use
-- **🔢 INT4 / INT8 Quantization**: Turn-key quantization workflows for ultra-compact, low-memory training
+- **Day-0 Hugging Face Support**: Instantly fine-tune any model from the Hugging Face Hub
+- **Lightning Fast Performance**: Custom CUDA kernels and memory optimizations deliver 2–5× speedups
+- **Large-Scale Distributed Training**: Built-in FSDP2 and nvFSDP for seamless multi-node scaling
+- **Vision-Language Model Ready**: Native support for VLMs (Qwen2-VL, Gemma-3-VL, etc)
+- **Advanced PEFT Methods**: LoRA and extensible PEFT system out of the box
+- **Seamless HF Ecosystem**: Fine-tuned models work perfectly with Transformers pipeline, VLM, etc.
+- **Robust Infrastructure**: Distributed checkpointing with integrated logging and monitoring
+- **Optimized Recipes**: Pre-built configurations for common models and datasets
+- **Flexible Configuration**: YAML-based configuration system for reproducible experiments
+- **FP8 Precision**: Native FP8 training & inference for higher throughput and lower memory use
+- **INT4 / INT8 Quantization**: Turn-key quantization workflows for ultra-compact, low-memory training
 
-> ⚠️ Note: NeMo AutoModel is under active development. New features, improvements, and documentation updates are released regularly. We are working toward a stable release, so expect the interface to solidify over time. Your feedback and contributions are welcome, and we encourage you to follow along as new updates roll out.
 
 ---
 ## ✨ Install NeMo AutoModel
