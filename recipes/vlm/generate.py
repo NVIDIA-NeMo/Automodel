@@ -32,6 +32,7 @@ import argparse
 from pathlib import Path
 from typing import Optional
 import json
+import os
 
 import torch
 import torch.distributed
@@ -41,6 +42,7 @@ import requests
 
 from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 from nemo_automodel.checkpoint.checkpointing import load_model, CheckpointingConfig
+from nemo_automodel._peft.lora import apply_lora_to_linear_modules
 
 import logging
 
@@ -55,6 +57,9 @@ def load_model_from_checkpoint(
     is_peft: bool = False,
     model_save_format: str = "torch_save",
     use_liger_kernel: bool = False,
+    peft_target_modules: list[str] = [],
+    peft_exclude_modules: list[str] = [],
+    peft_dropout_position: str = "post",
 ) -> NeMoAutoModelForImageTextToText:
     """Load a VLM model from a checkpoint.
     
@@ -69,39 +74,57 @@ def load_model_from_checkpoint(
         Loaded NeMoAutoModelForImageTextToText model
     """
     # initialize distributed
-
     from nemo_automodel.distributed.init_utils import initialize_distributed
     initialize_distributed(backend="nccl", timeout_minutes=10)
 
-    checkpoint_path = Path(checkpoint_path)
-    device_map = "cuda" if torch.cuda.is_available() else "cpu"
-    model = None
-    if (checkpoint_path / "config.json").exists():
-        model = NeMoAutoModelForImageTextToText.from_pretrained(
-            checkpoint_path,
-            torch_dtype=torch.bfloat16,
-            device_map=device_map,
-            use_liger_kernel=use_liger_kernel,
-        )
+    safetensor_checkpoint = False
+    if os.path.exists(os.path.join(checkpoint_path, "model", "config.json")):
+        model_path = os.path.join(checkpoint_path, "model")
+        safetensor_checkpoint = True
     else:
         if base_model is None:
-            raise ValueError("base_model required for distributed checkpoint")
-        config = AutoConfig.from_pretrained(base_model)
-        with torch.device(device_map):
-            model = NeMoAutoModelForImageTextToText.from_config(
-                config, torch_dtype=torch.bfloat16, use_liger_kernel=False
-            )
+            raise ValueError("base_model required for distributed or PEFT checkpoint")
+        model_path = base_model
 
-        checkpoint_config = CheckpointingConfig(
-            enabled=True,
-            checkpoint_dir=checkpoint_path.parent,
-            model_save_format=model_save_format,
-            model_cache_dir="",
-            model_repo_id="",
-            save_consolidated=False,
-            is_peft=is_peft,
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = NeMoAutoModelForImageTextToText.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16,
+        use_liger_kernel=use_liger_kernel,
+    ).to(device)
+
+    if safetensor_checkpoint:
+        return model
+    
+    if is_peft:
+        adapter_config_path = os.path.join(checkpoint_path, "model", "adapter_config.json")
+        if not os.path.exists(adapter_config_path):
+            raise FileNotFoundError(
+                f"PEFT checkpoint must contain adapter_config.json at {adapter_config_path}"
+            )
+        with open(adapter_config_path, "r") as f:
+            adapter_config = json.load(f)
+        apply_lora_to_linear_modules(
+            model,
+            target_modules=peft_target_modules,
+            exclude_modules=peft_exclude_modules,
+            dim=adapter_config["r"],
+            alpha=adapter_config["lora_alpha"],
+            dropout=adapter_config["lora_dropout"],
+            dropout_position=peft_dropout_position,
         )
-        load_model(model, str(checkpoint_path), checkpoint_config)
+
+    # PEFT checkpoints will always be loaded from safetensors format.
+    checkpoint_config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=checkpoint_path,
+        model_save_format=model_save_format,
+        model_cache_dir="", # placeholder
+        model_repo_id=base_model if base_model else "", # placeholder
+        save_consolidated=False, # placeholder
+        is_peft=is_peft,
+    )
+    load_model(model, str(checkpoint_path), checkpoint_config)
     logging.info(f"✅ Model loaded successfully from {checkpoint_path}")
     return model
 
@@ -198,7 +221,27 @@ def main():
         default=None,
         help="Optional file path to write the output to",
     )
-
+    parser.add_argument(
+        "--peft-target-modules",
+        nargs="+",
+        type=str,
+        default=[],
+        help="List of target module names for PEFT (space-separated)",
+    )
+    parser.add_argument(
+        "--peft-exclude-modules",
+        nargs="+",
+        type=str,
+        default=[],
+        help="List of module names to exclude from PEFT (space-separated)",
+    )
+    parser.add_argument(
+        "--peft-dropout-position",
+        type=str,
+        default="post",
+        choices=["pre", "post"],
+        help="Dropout position for PEFT",
+    )
     args = parser.parse_args()
 
     logging.info(
@@ -211,6 +254,9 @@ def main():
         args.is_peft,
         args.model_save_format,
         use_liger_kernel=False,
+        peft_target_modules=args.peft_target_modules,
+        peft_exclude_modules=args.peft_exclude_modules,
+        peft_dropout_position=args.peft_dropout_position,
     )
     processor_path = args.base_model if args.base_model else args.checkpoint_path
     processor = AutoProcessor.from_pretrained(processor_path)
