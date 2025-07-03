@@ -34,6 +34,7 @@ model:
   pretrained_model_name_or_path: google/gemma-3n-e4b-it #HF model id or local path
   torch_dtype: auto
   use_liger_kernel: false
+  use_sdpa_patching: false # gemma-3n-e4b-it does not work with sdpa patching
   attn_implementation: eager
   text_config:
     use_cache: true
