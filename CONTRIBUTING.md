@@ -47,6 +47,10 @@ ruff check --fix .
 ruff format .
 ```
 
+## Adding Documentation
+
+If your contribution involves documentation changes, please refer to the [Documentation Development](docs/documentation.md) guide for detailed instructions on building and serving the documentation.
+
 ## Signing Your Work
 
 * We require that all contributors "sign-off" on their commits. This certifies that the contribution is your original work, or you have rights to submit it under the same license, or a compatible license.

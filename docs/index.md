@@ -30,6 +30,5 @@ guides/dataset.md
 :caption: 🛠️ Development
 :hidden:
 
-documentation.md
 apidocs/index.rst
 ```
