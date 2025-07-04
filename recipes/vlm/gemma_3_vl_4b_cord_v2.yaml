@@ -12,18 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Configuration for fine-tuning Qwen2.5-VL-3B with RDR dataset for image description
+# Configuration for fine-tuning Gemma 3 VL 4B for image description
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_3b_cord_v2.yaml
+# torchrun --nproc-per-node=8 recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_4b_cord_v2.yaml
 # Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
 
 step_scheduler:
   grad_acc_steps: 8
   ckpt_every_steps: 100
-  val_every_steps: 1000  # will run every x number of gradient steps
+  val_every_steps: 100  # will run every x number of gradient steps
   max_steps: 1000
 
 dist_env:
@@ -38,6 +38,8 @@ rng:
 model:
   _target_: nemo_automodel._transformers.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: google/gemma-3-4b-it
+  torch_dtype: auto
+  use_liger_kernel: false
 # pretrained_model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
 
 # processor:
@@ -48,8 +50,9 @@ model:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: checkpoints/
+  checkpoint_dir: vlm_checkpoints/
   model_save_format: torch_save
+  save_consolidated: false
 
 distributed:
   _target_: nemo_automodel.distributed.fsdp2.FSDP2Manager
@@ -68,9 +71,8 @@ dataset:
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   batch_size: 1
-  num_workers: 1
+  num_workers: 0
   pin_memory: true
-  persistent_workers: true
 
 validation_dataset:
   _target_: nemo_automodel.datasets.vlm.datasets.make_cord_v2_dataset
