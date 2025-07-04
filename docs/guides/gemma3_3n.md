@@ -150,6 +150,12 @@ uv run recipes/vlm/finetune.py --config recipes/vlm/gemma_3n_vl_4b_cord_v2.yaml
 uv run torchrun --nproc-per-node=2 --config recipes/vlm/gemma_3n_vl_4b_cord_v2.yaml
 ```
 
+The training loss should look similar to below:
+
+<img src="gemma3_3n_trainloss.png" alt="Training Loss Curve" width="400">
+
+*Figure: Training loss curve showing convergence during VLM fine-tuning.*
+
 #### Command Line Overrides
 
 You can override any configuration parameter using dot-notation without modifying the YAML file:
