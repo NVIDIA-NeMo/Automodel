@@ -1,6 +1,10 @@
-# Finetune Gemma3
+# Finetune Gemma3 and Gemma 3n
 
-This document explains how to finetune Gemma3 using NeMo Automodel. It outlines key operations, including initiating SFT and PEFT-LoRA runs and managing experiment configurations using YAML.
+This document explains how to finetune Gemma3 and Gemma3n using NeMo Automodel. It outlines key operations, including initiating SFT and PEFT-LoRA runs and managing experiment configurations using YAML.
+
+## Setup Environment
+
+NeMo Automodel 
 
 ## Data
 
@@ -28,7 +32,7 @@ The preprocessing pipeline performs the following steps:
 
 1. **Load the dataset** using HuggingFace's `datasets` library
 2. **Parse JSON ground truth** - Extract structured data from the `ground_truth` field
-3. **Convert to conversation format** - Transform the data into a chat-like format suitable for Huggingface Autoprocessor's `apply_chat_template` function:
+3. **Convert to Huggingface message list format** - Transform the data into a chat-like format suitable for Huggingface Autoprocessor's `apply_chat_template` function:
 
 ```python
 # Example of the conversation format created
@@ -47,18 +51,20 @@ conversation = [
 ]
 ```
 
-**Note**: If you have your own custom dataset, you need to format it to be HuggingFace compatible with the same conversation structure shown above.
+**Note**: If you have your own custom dataset, you need to format it to the format shown above before passing to collate function.
 
 ### Collate Functions
 
 NeMo Automodel provides specialized collate functions for different VLM processors. The collate function is responsible for batching examples and preparing them for model input.
 
-Gemma3 models work seamlessly with HuggingFace's `AutoProcessor` and use the default collate function:
+Both Gemma3 and Gemma3n models work seamlessly with HuggingFace's `AutoProcessor` and use the default collate function:
 
 ```python
 processor = AutoProcessor.from_pretrained("google/gemma-3-4b-it")
+# For Gemma3n: 
+# processor = AutoProcessor.from_pretrained("google/gemma-3n-e4b-it")
 
-# For Gemma3, this uses the default collate function
+# For Gemma3 and Gemma3n, use the default collate function
 def default_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
     batch = processor.apply_chat_template(
         [example["conversation"] for example in examples],
@@ -72,6 +78,10 @@ def default_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
     labels = batch["input_ids"].clone()[:, 1:]
     labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
     batch["labels"] = labels
+    loss_mask = create_batch_loss_masks(
+        batch["input_ids"], processor, start_of_response_token=start_of_response_token
+    )
+    batch["loss_mask"] = loss_mask
     
     return batch
 ```
@@ -81,7 +91,7 @@ The default collate function:
 - Tokenizes the text with proper padding
 - Processes images and converts them to the appropriate tensor format
 - Creates labels for training by shifting input tokens
-- Masks special tokens (like image tokens, padding tokens) in the loss calculation
+- Masks special tokens (like image tokens, padding tokens) and prompts, only answer tokens are taken into loss calculation
 
 Some models like [Qwen2.5 VL](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct) have their own preprocessing requirements and need custom collate functions. For example, Qwen2.5-VL requires the `qwen_vl_utils.process_vision_info` function for proper image processing:
 
@@ -98,7 +108,7 @@ batch = processor(
 )
 
 ```
-
+If you have custom preprocessing logic, you can create a custom collate function.
 To use a custom collate function, specify it in your YAML configuration:
 
 ```yaml
@@ -117,12 +127,29 @@ The VLM fine-tuning functionality is provided through [`recipes/vlm/finetune.py`
 
 NeMo Automodel uses a flexible configuration system that combines YAML configuration files with command-line overrides. This allows you to maintain base configurations while easily experimenting with different parameters.
 
-#### Basic Usage
+The simplest way to run fine-tuning is with a YAML configuration file. We provide configs for both Gemma3 and Gemma3n.
 
-The simplest way to run fine-tuning is with a YAML configuration file:
+#### Run Gemma3 single GPU
 
 ```bash
 uv run recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_3b_cord_v2.yaml
+```
+#### Run Gemma3 multi GPU
+
+```
+uv run torchrun --nproc-per-node=2 recipes/vlm/finetune.py \
+    --config recipes/vlm/gemma_3_vl_3b_cord_v2.yaml
+```
+#### To run Gemma3n single GPU
+
+```bash
+uv run recipes/vlm/finetune.py --config recipes/vlm/gemma_3n_vl_4b_cord_v2.yaml
+```
+
+#### Run Gemma3 multi GPU
+
+```bash
+uv run torchrun --nproc-per-node=2 --config recipes/vlm/gemma_3n_vl_4b_cord_v2.yaml
 ```
 
 #### Command Line Overrides
@@ -132,8 +159,8 @@ You can override any configuration parameter using dot-notation without modifyin
 ```bash
 uv run recipes/vlm/finetune.py \
     --config recipes/vlm/gemma_3_vl_3b_cord_v2.yaml \
-    --step_scheduler.ckpt_every_steps 50 \
-    --step_scheduler.max_steps 2000 \
+    --step_scheduler.ckpt_every_steps 100 \
+    --step_scheduler.max_steps 1000 \
     --optimizer.lr 2e-5 \
     --rng.seed 1234
 ```
@@ -146,7 +173,7 @@ The freezing configuration allows you to selectively freeze different model comp
 
 ```yaml
 freeze_config:
-  freeze_embeddings: true        # Freeze token embeddings
+  freeze_embeddings: true        # Freeze embeddings
   freeze_vision_tower: true      # Freeze vision encoder (recommended for VLMs)
   freeze_audio_tower: true       # Freeze audio encoder (for multimodal models)
   freeze_language_model: false   # Allow language model adaptation
@@ -156,48 +183,27 @@ freeze_config:
 
 For memory-efficient training, you can use LoRA (Low-Rank Adaptation) instead of full fine-tuning. NeMo Automodel provides a dedicated PEFT configuration:
 
+To run PEFT with Gemma3:
 ```bash
 uv run recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml
 ```
 
-The LoRA configuration excludes vision components from adaptation to preserve pre-trained visual representations:
+The LoRA configuration excludes vision and audio components from adaptation to preserve pre-trained visual representations:
 
 ```yaml
 peft:
   peft_fn: nemo_automodel._peft.lora.apply_lora_to_linear_modules
   match_all_linear: False
-  exclude_modules:  # exclude all vision modules and lm_head
+  exclude_modules:  # exclude all vision and audio modules and lm_head
     - "*vision_tower*"
     - "*vision*" 
     - "*visual*"
+    - "*audio*"
     - "*image_encoder*"
     - "*lm_head*"
   dim: 8
   alpha: 32
   use_triton: True
-```
-
-### Single GPU Training
-
-For single GPU training, simply run the script directly:
-
-```bash
-uv run recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_3b_cord_v2.yaml
-```
-
-The script will automatically:
-- Load the specified model (e.g., `google/gemma-3-4b-it`)
-- Apply the configured dataset preprocessing
-- Set up the optimizer and loss function
-- Begin training with the specified parameters
-
-### Multi-GPU Training
-
-For multi-GPU training, use `torchrun` to launch distributed training:
-
-```bash
-uv run torchrun --nproc-per-node=2 recipes/vlm/finetune.py \
-    --config recipes/vlm/gemma_3_vl_3b_cord_v2.yaml
 ```
 
 ### Checkpointing
@@ -230,7 +236,7 @@ wandb:
 
 ## Prediction
 
-After fine-tuning your Gemma3 model, you can use it for inference on new image-text tasks.
+After fine-tuning your Gemma3 or Gemma3n model, you can use it for inference on new image-text tasks.
 
 ### Generation Script
 
@@ -247,7 +253,7 @@ uv run recipes/vlm/generate.py \
 
 The output can be `text`(default) or `json`, optionally writing to file.
 
-For models trained on CORD-V2, you can perform structured document analysis.
+For models trained on CORD-V2, you can load the trained checkpoint and generate output using the following command.
 
 ```bash
 uv run recipes/vlm/generate.py \
@@ -256,13 +262,4 @@ uv run recipes/vlm/generate.py \
     --image receipt.png \
     --max-new-tokens 200 \
     --output-format json
-```
-For input image as below
-
-<img src="receipt.png" alt="Receipt Example" width="400">
-
-You should be able to see model output similar to the following:
-
-```
-<s_total><s_total_price>1,591,600</s_total_price></s_total><s_sub_total><s_subtotal_price>1,346,000</s_subtotal_price><s_service_price>100,950</s_service_price><s_tax_price>144,695</s_tax_price><s_subtotal_price>-45</s_subtotal_price></s_sub_total><s_menu><s_unitprice>75,000</s_unitprice><s_price>75,000</s_price><s_nm>Nasi Campur Bali</s_nm><s_cnt>1x</s_cnt>
 ```
