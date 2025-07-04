@@ -138,7 +138,7 @@ uv run recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_3b_cord_v2.yaml
 uv run torchrun --nproc-per-node=2 recipes/vlm/finetune.py \
     --config recipes/vlm/gemma_3_vl_3b_cord_v2.yaml
 ```
-#### To run Gemma3n single GPU
+#### Run Gemma3n single GPU
 
 ```bash
 uv run recipes/vlm/finetune.py --config recipes/vlm/gemma_3n_vl_4b_cord_v2.yaml
