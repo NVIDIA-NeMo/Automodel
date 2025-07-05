@@ -82,10 +82,8 @@ def default_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
 ```
 
 The default collate function:
-- Applies the processor's chat template to format conversations
-- Tokenizes the text with proper padding
-- Processes images and converts them to the appropriate tensor format
-- Creates labels for training by shifting input tokens
+- Applies the processor's chat template to turn message lists into inputs
+- Creates labels for training
 - Masks special tokens and prompts, only answer tokens are taken into loss calculation
 
 ### Custom Datasets and Preprocessing
