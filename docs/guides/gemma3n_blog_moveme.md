@@ -8,7 +8,7 @@ Gemma 3n is designed for efficient resource usage and fast inference, and offers
 
 - **Optimized architecture** featuring MatFormer's nested transformers, per-layer embeddings, and KV cache sharing. These enable sub-model extraction, reduced GPU memory usage, and faster prefill speeds.
 - **Multimodal capabilities** with integrated image and audio encoders alongside the language model, enabling diverse tasks across modalities.  
-- Pretrained checkpoints are available under the [Gemma 3N releases on Hugging Face](https://huggingface.co/collections/google/gemma-3n-685065323f5984ef315c93f4).
+- Pretrained checkpoints are available under the [Gemma 3n releases on Hugging Face](https://huggingface.co/collections/google/gemma-3n-685065323f5984ef315c93f4).
 
 Today, we are excited to announce that NeMo Automodel now supports Gemma 3n, making it easier than ever to load, train, and inference with Gemma 3n models.
 
@@ -17,14 +17,14 @@ Today, we are excited to announce that NeMo Automodel now supports Gemma 3n, mak
 
 ## ⚡ Fine-tuning Gemma 3n with NeMo Automodel
 
-[NeMo Automodel](https://github.com/NVIDIA-NeMo/Automodel) offers a unified interface to load and finetune diverse models across modalities, abstracting away backend complexity. With Gemma 3N support:
+[NeMo Automodel](https://github.com/NVIDIA-NeMo/Automodel) offers a unified interface to load and finetune diverse models across modalities, abstracting away backend complexity. With Gemma 3n support:
 
 - Load models with a single `from_pretrained` call  
 - Finetune models using full parameter training or PEFT(LoRA) with predefined recipes
 - Accelerate training with kernel optimizations
 - Leverage FSDP2/nvFSDP for efficient distributed training
 
-Check out our tutorial for SFT/PEFT for Gemma3 and Gemma3n model!
+Check out our [tutorial]() on SFT and PEFT for both Gemma 3 and Gemma 3n models!
 
 ## 🔍 Observations
 
@@ -34,11 +34,13 @@ We observed **lower overall accuracy on vision and audio tasks** with the pre-tr
 ### Training Dynamics
 We noticed **large gradients during initial training steps** that quickly stabilize within the first hundred steps, but overall training convergence remain worse than Gemma 3.
 
+<img src="gemma3_3n_trainloss.png" alt="Training Loss Curve" width="400">
+
 This appears to be due to:
 
-- **Shared KV Cache Issues**: Gemma 3n checkpoints contain **empty (all-zero) weights** for KV cache shared layers, causing instability during early training phases when cache is not enabled during training
-- **Vision Component Weakness**: As our benchmarking suggests, the vision component in Gemma 3n could limit the overall model performance
-- **Architecture Misalignment**: The optimization-focused design may sacrifice some capability for efficiency, resulting in reduced performance compared to Gemma 3
+- **Shared KV Cache Issues**: Gemma 3n checkpoints contain **empty (all-zero) weights** for KV cache shared layers, causing instability during early training phases when cache is not enabled in training.
+- **Vision Component Weakness**: As our benchmarking suggests, the vision component in Gemma 3n could limit the overall model performance.
+- **Architecture**: The optimization-focused design may sacrifice some capability for efficiency, resulting in reduced performance compared to Gemma 3.
 
 
 
@@ -52,4 +54,4 @@ We look forward to seeing what you build with Gemma 3n and NeMo Automodel. Check
 
 [NeMo Automodel](https://github.com/NVIDIA-NeMo/Automodel)
 
-NeMo Automodel Gemma 3 Guide
+[NeMo Automodel Gemma 3 Guide]()
