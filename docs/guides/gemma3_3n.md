@@ -49,8 +49,6 @@ conversation = [
 ]
 ```
 
-**Note**: If you have your own custom dataset, you need to format it to the format shown above before passing to collate function.
-
 ### Collate Functions
 
 NeMo Automodel provides specialized collate functions for different VLM processors. The collate function is responsible for batching examples and preparing them for model input.
@@ -59,7 +57,7 @@ Both Gemma3 and Gemma3n models work seamlessly with HuggingFace's `AutoProcessor
 
 ```python
 processor = AutoProcessor.from_pretrained("google/gemma-3-4b-it")
-# For Gemma3n: 
+# For Gemma3n, get processor: 
 # processor = AutoProcessor.from_pretrained("google/gemma-3n-e4b-it")
 
 # For Gemma3 and Gemma3n, use the default collate function
@@ -72,7 +70,6 @@ def default_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
         return_dict=True,
     )
     
-    # Create labels for training
     labels = batch["input_ids"].clone()[:, 1:]
     labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
     batch["labels"] = labels
@@ -89,9 +86,14 @@ The default collate function:
 - Tokenizes the text with proper padding
 - Processes images and converts them to the appropriate tensor format
 - Creates labels for training by shifting input tokens
-- Masks special tokens (like image tokens, padding tokens) and prompts, only answer tokens are taken into loss calculation
+- Masks special tokens and prompts, only answer tokens are taken into loss calculation
 
-Some models like [Qwen2.5 VL](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct) have their own preprocessing requirements and need custom collate functions. For example, Qwen2.5-VL requires the `qwen_vl_utils.process_vision_info` function for proper image processing:
+### Custom Datasets and Preprocessing
+
+If you are using a custom dataset with a model that has an Hugging Face `AutoProcessor` supporting the `apply_chat_template` method, you will need to convert your data into the Hugging Face message list format expected by `apply_chat_template`.
+We provide [examples](../../nemo_automodel/datasets/vlm/datasets.py) demonstrating how to perform this conversion.
+
+Some models, such as [Qwen2.5 VL](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct) have specific preprocessing requirements and require custom collate functions. For instance, Qwen2.5-VL uses the `qwen_vl_utils.process_vision_info` function to process images:
 
 ```python
 
@@ -106,8 +108,7 @@ batch = processor(
 )
 
 ```
-If you have custom preprocessing logic, you can create a custom collate function.
-To use a custom collate function, specify it in your YAML configuration:
+If your dataset requires custom preprocessing logic, you can define a custom collate function. To use it, specify the function in your YAML configuration:
 
 ```yaml
 dataloader:
@@ -116,6 +117,8 @@ dataloader:
   collate_fn:
     _target_: nemo_automodel.datasets.vlm.collate_fns.qwen2_5_collate_fn
 ```
+
+We provide [example custom collate functions](../../nemo_automodel/datasets/vlm/collate_fns.py) that you can use as references for your implementation.
 
 ## Run Finetune Script
 
@@ -127,34 +130,36 @@ NeMo Automodel uses a flexible configuration system that combines YAML configura
 
 The simplest way to run fine-tuning is with a YAML configuration file. We provide configs for both Gemma3 and Gemma3n.
 
-#### Run Gemma3 single GPU
+#### Run Gemma3 finetuning
+* **single GPU**
 
 ```bash
 uv run recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_3b_cord_v2.yaml
 ```
-#### Run Gemma3 multi GPU
+* **Multi GPU**
 
 ```
 uv run torchrun --nproc-per-node=2 recipes/vlm/finetune.py \
     --config recipes/vlm/gemma_3_vl_3b_cord_v2.yaml
 ```
-#### Run Gemma3n single GPU
+#### Run Gemma3n finetuning
+* **Single GPU**
 
 ```bash
 uv run recipes/vlm/finetune.py --config recipes/vlm/gemma_3n_vl_4b_cord_v2.yaml
 ```
 
-#### Run Gemma3 multi GPU
+* **Multi GPU**
 
 ```bash
 uv run torchrun --nproc-per-node=2 --config recipes/vlm/gemma_3n_vl_4b_cord_v2.yaml
 ```
 
-The training loss should look similar to below:
+The training loss should look similar to the example below:
 
 <img src="gemma3_3n_trainloss.png" alt="Training Loss Curve" width="400">
 
-*Figure: Training loss curve showing convergence during VLM fine-tuning.*
+*Figure: Training loss curve showing convergence during finetuning.*
 
 #### Command Line Overrides
 
@@ -171,9 +176,9 @@ uv run recipes/vlm/finetune.py \
 
 ### Model Freezing Configuration
 
-NeMo Automodel provides parameter freezing to control which parts of the model are trainable during fine-tuning. This is particularly important for VLMs where you may want to preserve pre-trained visual representations while adapting the language model.
+NeMo Automodel supports parameter freezing to control which parts of a model remain trainable during fine-tuning. This is especially useful for VLMs, where you may want to retain the pre-trained visual and audio encoder while adapting only the language model components.
 
-The freezing configuration allows you to selectively freeze different model components:
+With the freezing configuration, you can selectively freeze specific parts of the model to suit your training objectives:
 
 ```yaml
 freeze_config:
@@ -185,7 +190,7 @@ freeze_config:
 
 ### Parameter Efficient Fine-Tuning
 
-For memory-efficient training, you can use LoRA (Low-Rank Adaptation) instead of full fine-tuning. NeMo Automodel provides a dedicated PEFT configuration:
+For memory-efficient training, you can use LoRA (Low-Rank Adaptation) instead of full finetuning. NeMo Automodel provides a dedicated PEFT recipe for gemma3:
 
 To run PEFT with Gemma3:
 ```bash
@@ -238,7 +243,7 @@ wandb:
   save_dir: ./wandb_logs
 ```
 
-## Prediction
+## Inference
 
 After fine-tuning your Gemma3 or Gemma3n model, you can use it for inference on new image-text tasks.
 
@@ -252,6 +257,7 @@ The inference functionality is provided through [`recipes/vlm/generate.py`](../.
 uv run recipes/vlm/generate.py \
     --checkpoint-path /path/to/checkpoint \
     --prompt "Describe this image." \
+    --base-model google/gemma-3-4b-it \
     --image /path/to/image.jpg
 ```
 
@@ -263,7 +269,19 @@ For models trained on CORD-V2, you can load the trained checkpoint and generate 
 uv run recipes/vlm/generate.py \
     --checkpoint-path vlm_checkpoints/epoch_0_step_200 \
     --prompt "Describe the image" \
-    --image receipt.png \
-    --max-new-tokens 200 \
-    --output-format json
+    --base-model google/gemma-3-4b-it
+    --image receipt.png
+```
+
+When checkpoints are saved from PEFT training, they contain only the adapter weights. To use them for generation, you need to specify the PEFT configuration.
+Run the following command to load and generate from adapters trained on CORD-V2:
+
+```bash
+uv run recipes/vlm/generate.py \
+    --checkpoint-path peft_vlm_checkpoints/epoch_0_step_200/ \
+    --prompt="describe this image" \
+    --image-url=receipt.png \
+    --base-model google/gemma-3-4b-it \
+    --is-peft \
+    --peft-exclude-modules *vision_tower* *vision* *visual* *audio* *image_encoder* *lm_head*
 ```
