@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# taken from
-# https://github.com/pytorch/pytorch/blob/c13e725edd8dd21406c629bf625f2d6c59ceedd1/torch/distributed/checkpoint/filesystem.py
+# taken and edited from
+# https://github.com/pytorch/pytorch/pull/155707
 # pylint: disable=missing-function-docstring, missing-class-docstring
 import collections
 import dataclasses
