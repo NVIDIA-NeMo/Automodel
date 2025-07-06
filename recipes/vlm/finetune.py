@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import pathlib
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -29,13 +30,14 @@ from nemo_automodel.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.training.rng import StatefulRNG
 from nemo_automodel.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
 from recipes.llm.finetune import (
-    build_checkpoint_config, 
-    build_loss_fn, 
-    build_distributed, 
-    build_step_scheduler, 
+    FinetuneRecipeForNextTokenPrediction,
+    build_checkpoint_config,
+    build_distributed,
+    build_loss_fn,
+    build_step_scheduler,
     build_wandb,
-    FinetuneRecipeForNextTokenPrediction
 )
+
 
 logger = logging.getLogger(__name__)
 
@@ -45,15 +47,15 @@ logger = logging.getLogger(__name__)
 
 
 def build_model_and_optimizer(
-        device, 
-        cfg_model, 
-        cfg_opt, 
-        cfg_freeze, 
-        cfg_peft, 
-        model_wrapper, 
-        seed, 
-        tp_size=1,
-    ) -> tuple[nn.Module, 'Optimizer']: # noqa: F821
+    device,
+    cfg_model,
+    cfg_opt,
+    cfg_freeze,
+    cfg_peft,
+    model_wrapper,
+    seed,
+    tp_size=1,
+) -> tuple[nn.Module, "Optimizer"]:  # noqa: F821
     """Build and initialize a model for VLM."""
     with StatefulRNG(seed=seed, ranked=True):
         model = cfg_model.instantiate()
@@ -73,7 +75,7 @@ def build_model_and_optimizer(
 
         print_trainable_parameters(model)
 
-        if callable(getattr(model_wrapper, 'parallelize', None)):
+        if callable(getattr(model_wrapper, "parallelize", None)):
             if isinstance(model_wrapper, NVFSDPManager):
                 trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
                 assert len(trainable_params) > 0, "trainable_params cannot be empty"
@@ -86,7 +88,7 @@ def build_model_and_optimizer(
                 model = model_wrapper.parallelize(model)
         else:
             model = model.to(device)
-        
+
         trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         if tp_size > 1:
@@ -132,7 +134,7 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed
 
 class FinetuneRecipeForVLM(FinetuneRecipeForNextTokenPrediction):
     """VLM Recipe that inherits from LLM Recipe and overrides specific VLM behavior."""
-    
+
     def setup(self):
         """Override setup to use VLM-specific builders."""
         torch.cuda.reset_peak_memory_stats()
@@ -156,7 +158,7 @@ class FinetuneRecipeForVLM(FinetuneRecipeForNextTokenPrediction):
             self.cfg.model,
             self.cfg.optimizer,
             self.cfg.get("freeze_config", None),  # VLM-specific
-            self.cfg.get('peft', None),
+            self.cfg.get("peft", None),
             self.model_wrapper,
             seed=self.cfg.get("seed", 42),
             tp_size=self.cfg.get("distributed.tp_size", 1),
