@@ -12,13 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Configuration for fine-tuning Qwen2.5-VL-3B with RDR dataset for image description
+# Configuration for fine-tuning Gemma 3 VL 4B for image description
+
+
+# To run this recipe, please use the following command:
+# torchrun --nproc-per-node=8 recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_4b_cord_v2.yaml
+# Adjust --nproc-per-node to the number of GPUs available on your host machine.
+
 
 step_scheduler:
   grad_acc_steps: 8
   ckpt_every_steps: 100
-  val_every_steps: 1000  # will run every x number of gradient steps
-  max_steps: 500
+  val_every_steps: 100  # will run every x number of gradient steps
+  max_steps: 1000
 
 dist_env:
   backend: nccl
@@ -31,19 +37,22 @@ rng:
 
 model:
   _target_: nemo_automodel._transformers.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: google/gemma-3n-e4b-it #HF model id or local path
+  pretrained_model_name_or_path: google/gemma-3-4b-it
   torch_dtype: auto
   use_liger_kernel: false
-  use_sdpa_patching: false # gemma-3n-e4b-it does not work with sdpa patching
-  attn_implementation: eager
-  text_config:
-    use_cache: true
+# pretrained_model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
+
+# processor:
+#   _target_: transformers.AutoProcessor.from_pretrained
+#   pretrained_model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
+#   min_pixels: 200704  # 256*28*28
+#   max_pixels: 1003520  # 1280*28*28
 
 checkpoint:
   enabled: true
   checkpoint_dir: vlm_checkpoints/
   model_save_format: torch_save
-  save_consolidated: False
+  save_consolidated: false
 
 distributed:
   _target_: nemo_automodel.distributed.fsdp2.FSDP2Manager
@@ -55,23 +64,20 @@ distributed:
 loss_fn: nemo_automodel.loss.masked_ce.masked_cross_entropy
 
 dataset:
-  _target_: nemo_automodel.datasets.vlm.datasets.make_cord_v2_dataset
-  path_or_dataset: naver-clova-ix/cord-v2
-  split: train
+  _target_: nemo_automodel.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train[:1000]
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   batch_size: 1
   num_workers: 0
   pin_memory: true
-  collate_fn:
-    _target_: nemo_automodel.datasets.vlm.collate_fns.default_collate_fn
-    start_of_response_token: "<start_of_turn>model\n"
 
 validation_dataset:
-  _target_: nemo_automodel.datasets.vlm.datasets.make_cord_v2_dataset
-  path_or_dataset: naver-clova-ix/cord-v2
-  split: validation
+  _target_: nemo_automodel.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: validation[:500]
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -86,12 +92,16 @@ optimizer:
 freeze_config:
   freeze_embeddings: true
   freeze_vision_tower: true
-  freeze_audio_tower: true
   freeze_language_model: false
-
+  
 # Uncomment and configure for W&B logging
 # logger:
-#   wandb_project:
-#   wandb_entity: 
-#   wandb_exp_name:
-#   wandb_save_dir:
+#   wandb_project: nemo_automodel_vlm
+#   wandb_entity: nvidia
+#   wandb_exp_name: qwen2_5_vl_3b_rdr
+#   wandb_save_dir: ./wandb_logs 
+
+wandb:
+  project: automodel-convergence-validation
+  entity: lihuiying-personal
+  name: gemma3_vl_4b_sft_medpix
