@@ -156,10 +156,6 @@ uv run recipes/vlm/finetune.py --config recipes/vlm/gemma_3n_vl_4b_medpix_vqa.ya
 uv run torchrun --nproc-per-node=2 --config recipes/vlm/gemma_3n_vl_4b_medpix_vqa.yaml
 ```
 
-The training loss should look similar to the example below:
-
-<img src="gemma3_3n_trainloss.png" alt="Training Loss Curve" width="400">
-
 *Figure: Training loss curve showing convergence during finetuning.*
 
 #### Command Line Overrides
@@ -216,6 +212,10 @@ peft:
   use_triton: True
 ```
 
+The training loss should look similar to the example below:
+
+<img src="medpix_peft.png" alt="Training Loss Curve" width="400">
+
 ### Checkpointing
 
 We allow training state checkpointing to be done in either [Safetensors](https://huggingface.co/docs/safetensors/en/index) or [PyTorch DCP](https://docs.pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html) format.
@@ -264,7 +264,7 @@ uv run recipes/vlm/generate.py \
 
 The output can be `text`(default) or `json`, optionally writing to file.
 
-For models trained on MedPix-VQA, you can load the trained checkpoint and generate output using the following command.
+For models trained on MedPix-VQA, you can load the trained checkpoint and generate outputs using the following command. Make sure to specify the base model that matches what you used during training.
 
 ```bash
 uv run recipes/vlm/generate.py \
@@ -285,4 +285,22 @@ uv run recipes/vlm/generate.py \
     --base-model google/gemma-3-4b-it \
     --is-peft \
     --peft-exclude-modules *vision_tower* *vision* *visual* *audio* *image_encoder* *lm_head*
+```
+
+Given the following image:
+
+<img src="medpix.jpg" width="400">
+And the prompt: 
+```
+How does the interhemispheric fissure appear in this image?
+```
+
+Example Gemma 3 response:
+```
+The interhemispheric fissure appears as a dark streak, indicating significant tissue loss.
+```
+
+Example Gemma 3n response:
+```
+INFO:root:The interhemispheric fissure appears somewhat obscured by the fluid-filled mass.
 ```
