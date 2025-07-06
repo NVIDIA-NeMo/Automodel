@@ -100,8 +100,3 @@ freeze_config:
 #   wandb_entity: nvidia
 #   wandb_exp_name: qwen2_5_vl_3b_rdr
 #   wandb_save_dir: ./wandb_logs 
-
-wandb:
-  project: automodel-convergence-validation
-  entity: lihuiying-personal
-  name: gemma3_vl_4b_sft_medpix

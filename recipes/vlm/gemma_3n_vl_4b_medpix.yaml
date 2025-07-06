@@ -95,8 +95,3 @@ freeze_config:
 #   wandb_entity: 
 #   wandb_exp_name:
 #   wandb_save_dir:
-
-wandb:
-  project: automodel-convergence-validation
-  entity: lihuiying-personal
-  name: gemma3n_it_4b_sft_medpix
