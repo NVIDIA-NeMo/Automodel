@@ -29,24 +29,21 @@ Usage:
 """
 
 import argparse
-from pathlib import Path
-from typing import Optional
 import json
-import os
-
-import torch
-import torch.distributed
-from transformers import AutoProcessor, AutoConfig
-from PIL import Image
-import requests
-
-from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-from nemo_automodel.checkpoint.checkpointing import load_model, CheckpointingConfig
-from nemo_automodel._peft.lora import apply_lora_to_linear_modules
-
 import logging
+import os
+from typing import Optional
 
+import requests
+import torch
+from PIL import Image
+from transformers import AutoProcessor
+
+from nemo_automodel._peft.lora import apply_lora_to_linear_modules
+from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig, load_model
 from nemo_automodel.loggers.log_utils import setup_logging
+
 
 # TODO: Parse config from YAML and run generate with FSDP2/distributed in general
 
@@ -62,19 +59,23 @@ def load_model_from_checkpoint(
     peft_dropout_position: str = "post",
 ) -> NeMoAutoModelForImageTextToText:
     """Load a VLM model from a checkpoint.
-    
+
     Args:
         checkpoint_path: Path to the checkpoint directory
         base_model: Base model name for distributed checkpoints
         is_peft: Whether the checkpoint is a PEFT checkpoint
         model_save_format: Format of the saved model ("torch_save" or "safetensors")
-        use_liger_kernel: Whether to use Liger kernel optimizations 
-        
+        use_liger_kernel: Whether to use Liger kernel optimizations
+        peft_target_modules: List of target module names for PEFT
+        peft_exclude_modules: List of module names to exclude from PEFT
+        peft_dropout_position: Dropout position for PEFT
+
     Returns:
         Loaded NeMoAutoModelForImageTextToText model
     """
     # initialize distributed
     from nemo_automodel.distributed.init_utils import initialize_distributed
+
     initialize_distributed(backend="nccl", timeout_minutes=10)
 
     safetensor_checkpoint = False
@@ -95,13 +96,11 @@ def load_model_from_checkpoint(
 
     if safetensor_checkpoint:
         return model
-    
+
     if is_peft:
         adapter_config_path = os.path.join(checkpoint_path, "model", "adapter_config.json")
         if not os.path.exists(adapter_config_path):
-            raise FileNotFoundError(
-                f"PEFT checkpoint must contain adapter_config.json at {adapter_config_path}"
-            )
+            raise FileNotFoundError(f"PEFT checkpoint must contain adapter_config.json at {adapter_config_path}")
         with open(adapter_config_path, "r") as f:
             adapter_config = json.load(f)
         apply_lora_to_linear_modules(
@@ -119,9 +118,9 @@ def load_model_from_checkpoint(
         enabled=True,
         checkpoint_dir=checkpoint_path,
         model_save_format=model_save_format,
-        model_cache_dir="", # placeholder
-        model_repo_id=base_model if base_model else "", # placeholder
-        save_consolidated=False, # placeholder
+        model_cache_dir="",  # placeholder
+        model_repo_id=base_model if base_model else "",  # placeholder
+        save_consolidated=False,  # placeholder
         is_peft=is_peft,
     )
     load_model(model, str(checkpoint_path), checkpoint_config)
@@ -137,18 +136,17 @@ def generate_response(
     max_new_tokens: int = 32,
 ) -> str:
     """Generate a text response from an image and text prompt.
-    
+
     Args:
         model: The loaded VLM model
         processor: The model's processor for tokenization
         image_url: URL or local path to the image
         prompt: Text prompt for the model
         max_new_tokens: Maximum number of new tokens to generate
-        
+
     Returns:
         Generated text response
     """
-
     if image_url.startswith("http"):
         image = Image.open(requests.get(image_url, stream=True).raw)
     else:
@@ -173,14 +171,10 @@ def generate_response(
     ).to(model.device)
 
     with torch.inference_mode():
-        outputs = model.generate(
-            **inputs, max_new_tokens=max_new_tokens, do_sample=False
-        )
+        outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
 
     generated_text = processor.decode(outputs[0], skip_special_tokens=True)
-    prompt_length = len(
-        processor.decode(inputs["input_ids"][0], skip_special_tokens=True)
-    )
+    prompt_length = len(processor.decode(inputs["input_ids"][0], skip_special_tokens=True))
     return generated_text[prompt_length:].strip()
 
 
@@ -244,9 +238,7 @@ def main():
     )
     args = parser.parse_args()
 
-    logging.info(
-        f"Loading model type base_model:{args.base_model} from checkpoint_path:{args.checkpoint_path}"
-    )
+    logging.info(f"Loading model type base_model:{args.base_model} from checkpoint_path:{args.checkpoint_path}")
 
     model = load_model_from_checkpoint(
         args.checkpoint_path,
@@ -260,9 +252,7 @@ def main():
     )
     processor_path = args.base_model if args.base_model else args.checkpoint_path
     processor = AutoProcessor.from_pretrained(processor_path)
-    response = generate_response(
-        model, processor, args.image_url, args.prompt, args.max_new_tokens
-    )
+    response = generate_response(model, processor, args.image_url, args.prompt, args.max_new_tokens)
 
     # Format and output response
     if args.output_format == "json":
