@@ -6,22 +6,25 @@ To set up your environment to run NeMo Automodel, follow the [installatallation 
 
 ## Data
 
-### CordV2 Dataset
+### MedPix-VQA Dataset
 
-The [CORD-V2](https://huggingface.co/datasets/naver-clova-ix/cord-v2) (Consolidated Receipt Dataset for Document understanding) is a dataset designed for receipt understanding tasks. It contains receipt images paired with structured JSON ground truth data that includes key-value pairs for various receipt fields like menu items, prices, addresses, and other receipt information.
+The [MedPix-VQA](https://huggingface.co/datasets/mmoukouba/MedPix-VQA) dataset is a comprehensive medical Visual Question Answering dataset designed for training and evaluating VQA models in the medical domain. It contains medical images from MedPix, a well-known medical image database, paired with questions and answers that focus on medical image interpretation.
 
-The dataset is particularly useful for training vision-language models to understand and extract structured information from document images, making it ideal for document parsing and optical character recognition (OCR) tasks.
+The dataset consists of 20,500 examples with the following structure:
+- **Training Set**: 17,420 examples (85%)
+- **Validation Set**: 3,080 examples (15%)
+- **Columns**: `image_id`, `mode`, `case_id`, `question`, `answer`
 
 ### Dataset Preprocessing
 
-NeMo Automodel provides built-in preprocessing for the CORD-V2 dataset through the `make_cord_v2_dataset` function. Here's how the preprocessing works:
+NeMo Automodel provides built-in preprocessing for the MedPix-VQA dataset through the `make_medpix_vqa_dataset` function. Here's how the preprocessing works:
 
 ```python
-from nemo_automodel.datasets.vlm.datasets import make_cord_v2_dataset
+from nemo_automodel.datasets.vlm.datasets import make_medpix_vqa_dataset
 
 # Load and preprocess the dataset
-dataset = make_cord_v2_dataset(
-    path_or_dataset="naver-clova-ix/cord-v2", 
+dataset = make_medpix_vqa_dataset(
+    path_or_dataset="mmoukouba/MedPix-VQA", 
     split="train"
 )
 ```
@@ -29,7 +32,7 @@ dataset = make_cord_v2_dataset(
 The preprocessing pipeline performs the following steps:
 
 1. **Load the dataset** using HuggingFace's `datasets` library
-2. **Parse JSON ground truth** - Extract structured data from the `ground_truth` field
+2. **Extract question-answer pairs** - Process the `question` and `answer` fields from the dataset
 3. **Convert to Huggingface message list format** - Transform the data into a chat-like format suitable for Huggingface Autoprocessor's `apply_chat_template` function:
 
 ```python
@@ -38,13 +41,13 @@ conversation = [
     {
         "role": "user",
         "content": [
-            {"type": "image", "image": example["image"]},
-            {"type": "text", "text": "Describe this image."},
+            {"type": "image", "image": example["image_id"]},
+            {"type": "text", "text": example["question"]},
         ],
     },
     {
         "role": "assistant", 
-        "content": [{"type": "text", "text": structured_text}]
+        "content": [{"type": "text", "text": example["answer"]}]
     },
 ]
 ```
@@ -132,25 +135,25 @@ The simplest way to run fine-tuning is with a YAML configuration file. We provid
 * **single GPU**
 
 ```bash
-uv run recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_3b_cord_v2.yaml
+uv run recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_3b_medpix_vqa.yaml
 ```
 * **Multi GPU**
 
 ```
 uv run torchrun --nproc-per-node=2 recipes/vlm/finetune.py \
-    --config recipes/vlm/gemma_3_vl_3b_cord_v2.yaml
+    --config recipes/vlm/gemma_3_vl_3b_medpix_vqa.yaml
 ```
 #### Run Gemma3n finetuning
 * **Single GPU**
 
 ```bash
-uv run recipes/vlm/finetune.py --config recipes/vlm/gemma_3n_vl_4b_cord_v2.yaml
+uv run recipes/vlm/finetune.py --config recipes/vlm/gemma_3n_vl_4b_medpix_vqa.yaml
 ```
 
 * **Multi GPU**
 
 ```bash
-uv run torchrun --nproc-per-node=2 --config recipes/vlm/gemma_3n_vl_4b_cord_v2.yaml
+uv run torchrun --nproc-per-node=2 --config recipes/vlm/gemma_3n_vl_4b_medpix_vqa.yaml
 ```
 
 The training loss should look similar to the example below:
@@ -165,7 +168,7 @@ You can override any configuration parameter using dot-notation without modifyin
 
 ```bash
 uv run recipes/vlm/finetune.py \
-    --config recipes/vlm/gemma_3_vl_3b_cord_v2.yaml \
+    --config recipes/vlm/gemma_3_vl_3b_medpix_vqa.yaml \
     --step_scheduler.ckpt_every_steps 100 \
     --step_scheduler.max_steps 1000 \
     --optimizer.lr 2e-5 \
@@ -192,7 +195,7 @@ For memory-efficient training, you can use LoRA (Low-Rank Adaptation) instead of
 
 To run PEFT with Gemma3:
 ```bash
-uv run recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml
+uv run recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_3b_medpix_vqa_peft.yaml
 ```
 
 The LoRA configuration excludes vision and audio components from adaptation to preserve pre-trained visual representations:
@@ -237,7 +240,7 @@ Then add W&B configuration to your YAML file:
 wandb:
   project: nemo_automodel_vlm
   entity: your_entity
-  name: gemma3_cord_v2_experiment
+  name: gemma3_medpix_vqa_experiment
   save_dir: ./wandb_logs
 ```
 
@@ -261,24 +264,24 @@ uv run recipes/vlm/generate.py \
 
 The output can be `text`(default) or `json`, optionally writing to file.
 
-For models trained on CORD-V2, you can load the trained checkpoint and generate output using the following command.
+For models trained on MedPix-VQA, you can load the trained checkpoint and generate output using the following command.
 
 ```bash
 uv run recipes/vlm/generate.py \
     --checkpoint-path vlm_checkpoints/epoch_0_step_200 \
-    --prompt "Describe the image" \
+    --prompt "What medical condition is shown in this image?" \
     --base-model google/gemma-3-4b-it
-    --image receipt.png
+    --image medical_image.jpg
 ```
 
 When checkpoints are saved from PEFT training, they contain only the adapter weights. To use them for generation, you need to specify the PEFT configuration.
-Run the following command to load and generate from adapters trained on CORD-V2:
+Run the following command to load and generate from adapters trained on MedPix-VQA:
 
 ```bash
 uv run recipes/vlm/generate.py \
     --checkpoint-path peft_vlm_checkpoints/epoch_0_step_200/ \
-    --prompt="describe this image" \
-    --image-url=receipt.png \
+    --prompt="What medical condition is shown in this image?" \
+    --image-url=medical_image.jpg \
     --base-model google/gemma-3-4b-it \
     --is-peft \
     --peft-exclude-modules *vision_tower* *vision* *visual* *audio* *image_encoder* *lm_head*
