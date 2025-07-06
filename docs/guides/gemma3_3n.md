@@ -289,8 +289,10 @@ uv run recipes/vlm/generate.py \
 
 Given the following image:
 
-<img src="medpix.jpg" width="400">
+<img src="medpix.jpg" width="200">
+
 And the prompt: 
+
 ```
 How does the interhemispheric fissure appear in this image?
 ```
