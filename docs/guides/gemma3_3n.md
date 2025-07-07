@@ -2,7 +2,7 @@
 
 This document explains how to finetune Gemma3 and Gemma3n using NeMo Automodel. It outlines key operations, including initiating SFT and PEFT-LoRA runs and managing experiment configurations using YAML. 
 
-To set up your environment to run NeMo Automodel, follow the [installation guide](../../README.md#install-nemo-automodel).
+To set up your environment to run NeMo Automodel, follow the [installation guide](../../README.md).
 
 ## Data
 
