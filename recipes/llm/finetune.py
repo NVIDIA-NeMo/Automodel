@@ -27,23 +27,23 @@ import wandb
 from nemo_automodel.loggers.wandb_utils import suppress_wandb_log_messages
 from wandb import Settings
 
-try:
-    from nvfsdp import nvFSDP
-
-    HAVE_NVFSDP = True
-except:
-    HAVE_NVFSDP = False
-
 import logging
+from nemo_automodel.training.base_recipe import BaseRecipe
+from nemo_automodel.training.step_scheduler import StepScheduler
+from nemo_automodel.training.utils import count_tail_padding
 
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoTokenizer
+from nemo_automodel.loggers.log_utils import setup_logging
+import time
+import logging
 
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.config.cli import parse_args_and_load_config
 from nemo_automodel.datasets.llm.packed_sequence import PackedSequence
 from nemo_automodel.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.distributed.init_utils import initialize_distributed
+from nemo_automodel.distributed.nvfsdp import NVFSDPManager
 from nemo_automodel.loggers.log_utils import setup_logging
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.rng import StatefulRNG
@@ -61,8 +61,16 @@ logger = logging.getLogger(__name__)
 #  Stateless helper functions
 # ---------------------------
 
-
-def build_model(device, cfg_model, use_hf_fa2, cfg_peft, model_wrapper, seed) -> nn.Module:
+def build_model_and_optimizer(
+        device,
+        cfg_model,
+        cfg_opt,
+        use_hf_fa2,
+        cfg_peft,
+        model_wrapper,
+        seed, 
+        tp_size=1,
+    ) -> tuple[nn.Module, 'Optimizer']: # noqa: F821
     """Build and initialize a model.
 
     Args:
@@ -95,13 +103,34 @@ def build_model(device, cfg_model, use_hf_fa2, cfg_peft, model_wrapper, seed) ->
             peft_fn = opts.pop("peft_fn")
             peft_fn(model, **opts)
 
-        if callable(getattr(model_wrapper, "parallelize", None)):
-            model = model_wrapper.parallelize(model)
+    if callable(getattr(model_wrapper, 'parallelize', None)):
+        # FSDP2 and nvFSDP should already be on the correct device
+        if isinstance(model_wrapper, NVFSDPManager):
+            # nvFSDP instantiate optimizer inside parallelize_function
+            trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
+            assert len(trainable_params) > 0, "trainable_params cannot be empty"
+            if tp_size > 1:
+                # TP does not support foreach
+                cfg_opt.foreach = False
+            optimizer = cfg_opt.instantiate(params=trainable_params)
 
-            # FSDP2 and nvFSDP should already be on the correct device
-            return model
+            model, optimizer = model_wrapper.parallelize(model, optimizer)
+
+            return model, optimizer
+
         else:
-            return model.to(device)
+            model = model_wrapper.parallelize(model)
+    else:
+        model = model.to(device)
+
+    trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
+    assert len(trainable_params) > 0, "trainable_params cannot be empty"
+    if tp_size > 1:
+        # TP does not support foreach
+        cfg_opt.foreach = False
+    optimizer = cfg_opt.instantiate(params=trainable_params)
+    
+    return model, optimizer
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
@@ -122,26 +151,6 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
         cfg_ckpt.pop("restore_from", None)
         ckpt_kwargs |= cfg_ckpt
     return CheckpointingConfig(**ckpt_kwargs)
-
-
-def build_optimizer(cfg_opt, model, tp_size) -> "Optimizer":  # noqa: F821
-    """Build an optimizer for the model.
-
-    Args:
-        cfg_opt: Configuration for optimizer instantiation.
-        model: The model whose parameters will be optimized.
-        tp_size: The size of the tensor parallel group.
-
-    Returns:
-        The instantiated optimizer.
-    """
-    trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
-    assert len(trainable_params) > 0, "trainable_params cannot be empty"
-    if tp_size > 1:
-        # TP does not support foreach
-        cfg_opt.foreach = False
-    return cfg_opt.instantiate(params=trainable_params)
-
 
 def build_loss_fn(device, cfg_loss):
     """Build a loss function.
@@ -308,25 +317,22 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         use_hf_fa2 = self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
 
         # Build components
-        self.model = build_model(
+        self.model, self.optimizer = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
+            self.cfg.optimizer,
             use_hf_fa2,
-            self.cfg.get("peft", None),
+            self.cfg.get('peft', None),
             self.model_wrapper,
             seed=self.cfg.get("seed", 42),
-        )
-        self.optimizer = build_optimizer(
-            self.cfg.optimizer,
-            self.model,
-            self.cfg.get("distributed.tp_size", 1),
+            tp_size=self.cfg.get("distributed.tp_size", 1),
         )
         self.loss_fn = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
         self.dataloader = build_dataloader(
             self.cfg.dataset,
             self.cfg.dataloader,
             self.cfg.model,
-            self.cfg.packed_sequence,
+            self.cfg.get("packed_sequence", None),
             device_mesh=self.device_mesh,
             seed=self.cfg.get("seed", 42),
         )
@@ -375,6 +381,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         and update model parameters when necessary. Also prints loss every gradient step.
         """
         self.model.train()
+        self.timestamp = time.perf_counter()
+        self.num_tokens = 0
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
             for batch_idx, batch in enumerate(self.step_scheduler):
@@ -419,6 +427,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
 
         local_num_tokens = loss_mask.sum().detach().to(torch.int)
+        self.num_tokens += labels.numel() - count_tail_padding(labels)
         self.total_num_tokens += local_num_tokens
         self.forward_data_store.append(local_loss.detach())
 
@@ -449,31 +458,34 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # TODO: TP WAR
                 grad_norm = 0.0
 
-            if HAVE_NVFSDP and isinstance(self.model, nvFSDP):
-                # If the model uses nvFSDP, wait for all sharded gradients to be reduced and unsharded.
-                # Necessary because the post-backward reduce-scatter is asynchronous, so gradients and backward
-                # computations are concurrent, but the gradients of the final layer may not be available yet.
-                self.model.finish_grad_sync()
+            # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
+            # self.model.finish_grad_sync()
 
             self.optimizer.step()
             self.optimizer.zero_grad()
 
-            if HAVE_NVFSDP and isinstance(self.model, nvFSDP):
-                # If custom FSDP2 is configured with "optim" (optimizer state / high-precision model weight sharding),
-                # then the optimizer step will be applied to the main high-precision model weights. Update the model
-                # weights after the optimizer step.
-                self.model.install_optimized_model_weights()
-                self.model.zero_grad_buffer()
+            # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
+            # self.model.install_optimized_model_weights()
+            # self.model.zero_grad_buffer()
 
+            # TPS is calculated as follows (assuming grad-accumulation-steps=2):
+            # fwd 0 | bwd 0 | fwd 1 | bwd 1 | opt 0 | fwd 2 | bwd 2 | ...
+            # ^                                     ^
+            t = time.perf_counter()
+            time_delta = t - self.timestamp
+            self.timestamp = t
+            tps = self.num_tokens / time_delta
+            self.num_tokens = 0
             # log
-            reporting_loss = self.log_train_metrics(grad_norm)
+            reporting_loss = self.log_train_metrics(grad_norm, tps)
             logging.info(
-                "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | mem: {:.2f} GiB".format(
+                "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | mem: {:.2f} GiB | tps {:.2f}".format(
                     self.step_scheduler.step,
                     self.step_scheduler.epoch,
                     reporting_loss,
                     grad_norm,
                     torch.cuda.max_memory_allocated() / 1024**3,
+                    tps,
                 )
             )
             torch.cuda.reset_peak_memory_stats()
@@ -532,7 +544,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
         )
 
-    def log_train_metrics(self, grad_norm):
+    def log_train_metrics(self, grad_norm, tps):
         """Log metrics to wandb.
 
         Args:
@@ -562,6 +574,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             "epoch": self.step_scheduler.epoch,
             "grad_norm": grad_norm,
             "num_tokens_per_step": total_num_tokens,
+            "tps": tps,
         }
         if self.optimizer.param_groups:
             log_data["learning_rate"] = self.optimizer.param_groups[0]["lr"]
