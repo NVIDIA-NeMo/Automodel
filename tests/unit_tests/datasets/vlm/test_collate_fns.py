@@ -21,6 +21,15 @@ import torch
 SKIP_TOKEN = 99  # token that must be masked with -100 in labels
 
 
+class DummyTokenizer:
+    """
+    Mimics the tokenizer API used by create_loss_mask_with_start_of_response_token
+    """
+    def __call__(self, text, add_special_tokens=True):
+        # Return a simple tokenization - for the test we just need consistent behavior
+        return {"input_ids": [10, 20, 30]}  # dummy token IDs
+
+
 class DummyQwen25Processor:
     """
     Mimics the public API used by qwen2_5_collate_fn:
@@ -30,6 +39,7 @@ class DummyQwen25Processor:
 
     def __init__(self):
         self.call_counter = 0  # handy for assertions if you like
+        self.tokenizer = DummyTokenizer()  # Add tokenizer attribute
 
     # Called with tokenize=False (single example) in qwen2_5_collate_fn
     def apply_chat_template(self, conversation, *, tokenize=False, **kwargs):
@@ -38,7 +48,7 @@ class DummyQwen25Processor:
         return "dummy chat string"
 
     # Called by processor(...) in qwen2_5_collate_fn
-    def __call__(self, *, text: List[str], images: List[torch.Tensor], padding: bool, return_tensors: str, add_special_tokens: bool):
+    def __call__(self, *, text: List[str], images: List[torch.Tensor], padding: bool, return_tensors: str):
         self.call_counter += 1
         bs = len(text)
         # Produce a deterministic fake sequence that includes the SKIP_TOKEN so
