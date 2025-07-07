@@ -26,20 +26,12 @@ Check out our [tutorial]() on SFT and PEFT for both Gemma 3 and Gemma 3n models!
 
 ## 🔍 Observations
 
-### Accuracy
-We observed **lower overall accuracy on vision and audio tasks** with the pre-trained HuggingFace checkpoints. The model appears to underperform compared to expectations for general multimodal understanding tasks.
-
 ### Training Dynamics
-We noticed **large gradients during initial training steps** that quickly stabilize within the first hundred steps, but overall training convergence remain worse than Gemma 3.
+We noticed **large gradients during initial training steps** that quickly stabilize within the first hundred steps, but overall training convergence didn't reach the same level as Gemma 3.
 
-<img src="gemma3_3n_trainloss.png" alt="Training Loss Curve" width="400">
+<img src="medpix_peft.jpg" width="400">
 
-This appears to be due to:
-
-- **Shared KV Cache Issues**: Gemma 3n checkpoints contain **empty (all-zero) weights** for KV cache shared layers, causing instability during early training phases when cache is not enabled in training.
-- **Vision Component Weakness**: As our benchmarking suggests, the vision component in Gemma 3n could limit the overall model performance.
-- **Architecture**: The focus on fast and resource-efficient inference may sacrifice some accuracies, making it worse compared to Gemma 3.
-
+This might be due to the shared KV Cache. Gemma 3n checkpoints contain **empty (all-zero) weights** for KV cache shared layers, causing instability during early training phases when cache is not enabled in training.
 
 
 ## ✨ Conclusion
