@@ -33,6 +33,9 @@ rng:
 model:
   _target_: nemo_automodel._transformers.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: google/gemma-3-4b-it
+  torch_dtype: auto
+  use_liger_kernel: false
+  attn_implementation: eager
 
 peft:
   peft_fn: nemo_automodel._peft.lora.apply_lora_to_linear_modules
