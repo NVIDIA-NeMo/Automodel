@@ -237,7 +237,7 @@ class ConfigNode:
                 pprint.pformat(config_kwargs, compact=True, indent=4),
                 )
             )
-            raise  # re-raise so the original traceback is preserved
+            raise e # re-raise so the original traceback is preserved
 
     def _instantiate_value(self, v):
         """
