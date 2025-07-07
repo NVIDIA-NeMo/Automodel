@@ -235,7 +235,8 @@ class ConfigNode:
                 sig,
                 args,
                 pprint.pformat(config_kwargs, compact=True, indent=4),
-                )
+                ),
+                file=sys.stderr
             )
             raise e # re-raise so the original traceback is preserved
 
