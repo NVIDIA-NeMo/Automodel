@@ -38,7 +38,7 @@ class DummyQwen25Processor:
         return "dummy chat string"
 
     # Called by processor(...) in qwen2_5_collate_fn
-    def __call__(self, *, text: List[str], images: List[torch.Tensor], padding: bool, return_tensors: str):
+    def __call__(self, *, text: List[str], images: List[torch.Tensor], padding: bool, return_tensors: str, add_special_tokens: bool):
         self.call_counter += 1
         bs = len(text)
         # Produce a deterministic fake sequence that includes the SKIP_TOKEN so
