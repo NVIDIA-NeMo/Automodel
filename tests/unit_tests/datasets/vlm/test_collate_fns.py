@@ -26,8 +26,12 @@ class DummyTokenizer:
     Mimics the tokenizer API used by create_loss_mask_with_start_of_response_token
     """
     def __call__(self, text, add_special_tokens=True):
-        # Return a simple tokenization - for the test we just need consistent behavior
-        return {"input_ids": [10, 20, 30]}  # dummy token IDs
+        if text == "<start_of_turn>":
+            return {"input_ids": [100]}  # single token for start of turn
+        elif text == "<start_of_turn>model\n":
+            return {"input_ids": [100, 101, 102]}  # multi-token response marker
+        else:
+            return {"input_ids": [10, 20, 30]}  # dummy token IDs
 
 
 class DummyQwen25Processor:
@@ -192,3 +196,204 @@ def test_import_error_when_qwen_utils_missing(collate_mod, fn_name, monkeypatch)
 
     with pytest.raises(ImportError):
         func([], None)
+
+class TestCreateLossMaskWithStartOfResponseToken:
+    """Test cases for create_loss_mask_with_start_of_response_token function."""
+
+    def test_no_start_of_response_token(self, collate_mod):
+        """Test when start_of_response_token is None."""
+        processor = DummyQwen25Processor()
+        input_ids = torch.tensor([1, 2, 3, 4, 5])
+        
+        result = collate_mod.create_loss_mask_with_start_of_response_token(
+            input_ids, processor, start_of_response_token=None
+        )
+        
+        # Should return all 1s (no masking) when no start token is provided
+        expected = [1, 1, 1, 1, 1]
+        assert result == expected
+
+    def test_start_of_response_token_found_twice(self, collate_mod):
+        """Test when start_of_response_token is found twice (normal case)."""
+        processor = DummyQwen25Processor()
+        # Create input_ids with start_of_turn token (100) appearing twice
+        # [0, 100, 1, 2, 100, 101, 102, 3, 4]
+        input_ids = torch.tensor([0, 100, 1, 2, 100, 101, 102, 3, 4])
+        result = collate_mod.create_loss_mask_with_start_of_response_token(
+            input_ids, processor, start_of_response_token="<start_of_turn>model\n"
+        )
+        
+        # First occurrence at index 1, second occurrence at index 4
+        # Response starts at index 4 + 3 - 1 = 6 (after the response token sequence)
+        expected = [0, 0, 0, 0, 0, 0, 0, 1, 1]
+        assert result == expected
+
+    def test_start_of_response_token_found_only_once(self, collate_mod):
+        """Test when start_of_response_token is found only once."""
+        processor = DummyQwen25Processor()
+        input_ids = torch.tensor([0, 100, 1, 2, 3])
+        
+        result = collate_mod.create_loss_mask_with_start_of_response_token(
+            input_ids, processor, start_of_response_token="<start_of_turn>model\n"
+        )
+        
+        # Should return all 1s when token is found less than twice
+        expected = [1, 1, 1, 1, 1]
+        assert result == expected
+
+    def test_start_of_response_token_not_found(self, collate_mod):
+        """Test when start_of_response_token is not found in input_ids."""
+        processor = DummyQwen25Processor()
+        input_ids = torch.tensor([1, 2, 3, 4, 5])
+        
+        result = collate_mod.create_loss_mask_with_start_of_response_token(
+            input_ids, processor, start_of_response_token="<start_of_turn>model\n"
+        )
+        
+        # Should return all 1s when token is not found
+        expected = [1, 1, 1, 1, 1]
+        assert result == expected
+
+    def test_with_tensor_input(self, collate_mod):
+        """Test that function works with tensor input."""
+        processor = DummyQwen25Processor()
+        input_ids = torch.tensor([0, 100, 1, 2, 100, 101, 102, 3, 4])
+        
+        result = collate_mod.create_loss_mask_with_start_of_response_token(
+            input_ids, processor, start_of_response_token="<start_of_turn>model\n"
+        )
+        
+        expected = [0, 0, 0, 0, 0, 0, 0, 1, 1]
+        assert result == expected
+
+    def test_single_token_response_marker(self, collate_mod):
+        """Test with single token response marker."""
+        processor = DummyQwen25Processor()
+        input_ids = torch.tensor([0, 100, 1, 2, 100, 3, 4])
+        
+        result = collate_mod.create_loss_mask_with_start_of_response_token(
+            input_ids, processor, start_of_response_token="<start_of_turn>"
+        )
+        
+        # Response starts at index 4 + 1 - 1 = 4
+        expected = [0, 0, 0, 0, 0, 1, 1]
+        assert result == expected
+
+
+class TestCreateBatchLossMasks:
+    """Test cases for create_batch_loss_masks function."""
+
+    def test_batch_basic_functionality(self, collate_mod):
+        """Test basic batch processing."""
+        processor = DummyQwen25Processor()
+        batch_input_ids = torch.tensor([
+            [0, 100, 1, 2, 100, 101, 102, 3, 4],
+            [5, 100, 6, 7, 100, 101, 102, 8, 9]
+        ])
+        
+        result = collate_mod.create_batch_loss_masks(
+            batch_input_ids, processor, start_of_response_token="<start_of_turn>model\n"
+        )
+        
+        expected = torch.tensor([
+            [0, 0, 0, 0, 0, 0, 0, 1, 1],
+            [0, 0, 0, 0, 0, 0, 0, 1, 1]
+        ], dtype=torch.float, device=batch_input_ids.device)
+        
+        assert torch.equal(result, expected)
+        assert result.dtype == torch.float
+        assert result.device == batch_input_ids.device
+
+    def test_batch_with_padding(self, collate_mod):
+        """Test batch processing with padding needed."""
+        processor = DummyQwen25Processor()
+        # Create input where sequences are shorter than the batch sequence length
+        batch_input_ids = torch.tensor([
+            [0, 100, 1, 2, 100, 101, 102, 3, 4, 5],  # 10 tokens
+            [6, 100, 7, 8, 100, 101, 102, 9, 0, 0]   # 10 tokens
+        ])
+        
+        result = collate_mod.create_batch_loss_masks(
+            batch_input_ids, processor, start_of_response_token="<start_of_turn>model\n"
+        )
+        
+        expected = torch.tensor([
+            [0, 0, 0, 0, 0, 0, 0, 1, 1, 1],
+            [0, 0, 0, 0, 0, 0, 0, 1, 0, 0]
+        ], dtype=torch.float, device=batch_input_ids.device)
+        
+        assert torch.equal(result, expected)
+
+    def test_batch_with_truncation(self, collate_mod):
+        """Test batch processing with truncation needed."""
+        processor = DummyQwen25Processor()
+        batch_input_ids = torch.tensor([
+            [0, 100, 1, 2, 100],  # 5 tokens
+            [6, 100, 7, 8, 100]   # 5 tokens
+        ])
+        
+        result = collate_mod.create_batch_loss_masks(
+            batch_input_ids, processor, start_of_response_token="<start_of_turn>model\n"
+        )
+        
+        # Both sequences should be truncated to match seq_len (5)
+        expected = torch.tensor([
+            [1, 1, 1, 1, 1],  # No valid response start found, so all 1s
+            [1, 1, 1, 1, 1]   # No valid response start found, so all 1s
+        ], dtype=torch.float, device=batch_input_ids.device)
+        
+        assert torch.equal(result, expected)
+
+    def test_batch_mixed_sequences(self, collate_mod):
+        """Test batch with mixed sequence types."""
+        processor = DummyQwen25Processor()
+        batch_input_ids = torch.tensor([
+            [0, 100, 1, 2, 100, 101, 102, 3, 4],  # Has valid response start
+            [5, 6, 7, 8, 9, 10, 11, 12, 13]       # No start token
+        ])
+        
+        result = collate_mod.create_batch_loss_masks(
+            batch_input_ids, processor, start_of_response_token="<start_of_turn>model\n"
+        )
+        
+        expected = torch.tensor([
+            [0, 0, 0, 0, 0, 0, 0, 1, 1],  # Valid response start
+            [1, 1, 1, 1, 1, 1, 1, 1, 1]   # No masking (all 1s)
+        ], dtype=torch.float, device=batch_input_ids.device)
+        
+        assert torch.equal(result, expected)
+
+    def test_batch_no_start_token(self, collate_mod):
+        """Test batch processing when start_of_response_token is None."""
+        processor = DummyQwen25Processor()
+        batch_input_ids = torch.tensor([
+            [0, 1, 2, 3, 4],
+            [5, 6, 7, 8, 9]
+        ])
+        
+        result = collate_mod.create_batch_loss_masks(
+            batch_input_ids, processor, start_of_response_token=None
+        )
+        
+        # Should return all 1s when no start token is provided
+        expected = torch.tensor([
+            [1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 1]
+        ], dtype=torch.float, device=batch_input_ids.device)
+        
+        assert torch.equal(result, expected)
+
+    def test_batch_device_preservation(self, collate_mod):
+        """Test that the output tensor is on the same device as input."""
+        processor = DummyQwen25Processor()
+        batch_input_ids = torch.tensor([
+            [0, 100, 1, 2, 100, 101, 102, 3, 4],
+            [5, 100, 6, 7, 100, 101, 102, 8, 9]
+        ])
+        
+        result = collate_mod.create_batch_loss_masks(
+            batch_input_ids, processor, start_of_response_token="<start_of_turn>model\n"
+        )
+        
+        assert result.device == batch_input_ids.device
+        assert result.dtype == torch.float

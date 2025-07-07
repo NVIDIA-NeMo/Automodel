@@ -47,7 +47,7 @@ def create_loss_mask_with_start_of_response_token(input_ids, processor, start_of
         first_start_of_turn_token_id = input_ids.index(start_of_turn_token_id)
         response_start = (
             input_ids.index(start_of_turn_token_id, first_start_of_turn_token_id + 1) 
-            + len(start_of_response_token_id) - 1
+            + len(start_of_response_token_id)
         )
     else:
         response_start = 0
