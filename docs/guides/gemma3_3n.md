@@ -2,7 +2,7 @@
 
 This document explains how to finetune Gemma3 and Gemma3n using NeMo Automodel. It outlines key operations, including initiating SFT and PEFT-LoRA runs and managing experiment configurations using YAML. 
 
-To set up your environment to run NeMo Automodel, follow the [installatallation guide](../../README.md#-install-nemo-automodel).
+To set up your environment to run NeMo Automodel, follow the [installation guide](../../README.md#install-nemo-automodel).
 
 ## Data
 
@@ -304,5 +304,5 @@ The interhemispheric fissure appears as a dark streak, indicating significant ti
 
 Example Gemma 3n response:
 ```
-INFO:root:The interhemispheric fissure appears somewhat obscured by the fluid-filled mass.
+The interhemispheric fissure appears somewhat obscured by the fluid-filled mass.
 ```
