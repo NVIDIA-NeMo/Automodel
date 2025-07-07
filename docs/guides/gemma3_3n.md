@@ -2,7 +2,7 @@
 
 This document explains how to finetune Gemma3 and Gemma3n using NeMo Automodel. It outlines key operations, including initiating SFT and PEFT-LoRA runs and managing experiment configurations using YAML. 
 
-To set up your environment to run NeMo Automodel, follow the [installation guide](../../README.md).
+To set up your environment to run NeMo Automodel, follow the [installation guide](https://github.com/NVIDIA-NeMo/Automodel#-install-nemo-automodel).
 
 ## Data
 
@@ -92,7 +92,7 @@ The default collate function:
 ### Custom Datasets and Preprocessing
 
 If you are using a custom dataset with a model that has an Hugging Face `AutoProcessor` supporting the `apply_chat_template` method, you will need to convert your data into the Hugging Face message list format expected by `apply_chat_template`.
-We provide [examples](../../nemo_automodel/datasets/vlm/datasets.py) demonstrating how to perform this conversion.
+We provide [examples](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/datasets/vlm/datasets.py) demonstrating how to perform this conversion.
 
 Some models, such as [Qwen2.5 VL](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct) have specific preprocessing requirements and require custom collate functions. For instance, Qwen2.5-VL uses the `qwen_vl_utils.process_vision_info` function to process images:
 
@@ -119,11 +119,11 @@ dataloader:
     _target_: nemo_automodel.datasets.vlm.collate_fns.qwen2_5_collate_fn
 ```
 
-We provide [example custom collate functions](../../nemo_automodel/datasets/vlm/collate_fns.py) that you can use as references for your implementation.
+We provide [example custom collate functions](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/datasets/vlm/collate_fns.py) that you can use as references for your implementation.
 
 ## Run Finetune Script
 
-The VLM fine-tuning functionality is provided through [`recipes/vlm/finetune.py`](../../recipes/vlm/finetune.py).
+The VLM fine-tuning functionality is provided through [`recipes/vlm/finetune.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/vlm/finetune.py).
 
 ### Configuration System
 
