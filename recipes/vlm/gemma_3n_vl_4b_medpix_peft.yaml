@@ -41,7 +41,7 @@ model:
 checkpoint:
   enabled: true
   checkpoint_dir: vlm_checkpoints/
-  model_save_format: torch_save
+  model_save_format: safetensors
   save_consolidated: False
 
 distributed:

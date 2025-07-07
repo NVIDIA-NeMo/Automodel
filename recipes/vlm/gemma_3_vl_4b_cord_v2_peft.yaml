@@ -52,7 +52,7 @@ peft:
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
-  model_save_format: torch_save
+  model_save_format: safetensors
 
 distributed:
   _target_: nemo_automodel.distributed.fsdp2.FSDP2Manager
