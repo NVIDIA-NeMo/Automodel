@@ -214,7 +214,7 @@ peft:
 
 The training loss should look similar to the example below:
 
-<img src="medpix_peft.png" alt="Training Loss Curve" width="400">
+<img src="medpix_peft.jpg" alt="Training Loss Curve" width="400">
 
 ### Checkpointing
 
