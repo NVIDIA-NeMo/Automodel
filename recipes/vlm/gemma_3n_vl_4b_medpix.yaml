@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Configuration for fine-tuning Qwen2.5-VL-3B with RDR dataset for image description
+  # Configuration for fine-tuning Gemma 3n VL 4B with MedPix dataset for image description
 
 step_scheduler:
   grad_acc_steps: 8
