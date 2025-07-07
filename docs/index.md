@@ -17,7 +17,7 @@ environment/cluster.md
 :hidden:
 
 guides/sft.md
-guides/gemma3.md
+guides/gemma3_3n.md
 ```
 
 ```{toctree}
