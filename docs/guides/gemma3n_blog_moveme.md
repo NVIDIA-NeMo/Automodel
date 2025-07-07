@@ -1,10 +1,8 @@
-# 🚀 NeMo Automodel Now Supports Google Gemma 3n: Efficient Multimodal Fine-tuning Made Simple
+# 🚀 NeMo Framework Now Supports Google Gemma 3n: Efficient Multimodal Fine-tuning Made Simple
 
 ## Introduction
 
-These are **multimodal models** capable of understanding images and audio, and they are optimized to run efficiently on everyday devices. They introduce innovations such as Per-Layer Embedding parameter caching and the MatFormer architecture, which help reduce compute and memory demands.
-
-Gemma 3n is designed for efficient resource usage and fast inference, and offers full multimodal support with both vision and audio inputs. Some key highlights:
+Gemma 3n is a generative AI model that takes inputs from a variety modalities, including images and audio, and is optimized for efficient resource usage and fast inference on everyday devices. It introduces innovations such as Per-Layer Embedding parameter caching and the MatFormer architecture, which help reduce compute and memory demands. Some key highlights:
 
 - **Optimized architecture** featuring MatFormer's nested transformers, per-layer embeddings, and KV cache sharing. These enable sub-model extraction, reduced GPU memory usage, and faster prefill speeds.
 - **Multimodal capabilities** with integrated image and audio encoders alongside the language model, enabling diverse tasks across modalities.  
@@ -17,7 +15,7 @@ Today, we are excited to announce that NeMo Automodel now supports Gemma 3n, mak
 
 ## ⚡ Fine-tuning Gemma 3n with NeMo Automodel
 
-[NeMo Automodel](https://github.com/NVIDIA-NeMo/Automodel) offers a unified interface to load and finetune diverse models across modalities, abstracting away backend complexity. With Gemma 3n support:
+[NeMo Framework's Automodel path ("Nemo AutoModel")](https://github.com/NVIDIA-NeMo/Automodel) offers day-0 support for :hugs:Hugging Face models via a unified interface to load and finetune models across modalities, abstracting away backend complexity. With Gemma 3n support:
 
 - Load models with a single `from_pretrained` call  
 - Finetune models using full parameter training or PEFT(LoRA) with predefined recipes
@@ -40,7 +38,7 @@ This appears to be due to:
 
 - **Shared KV Cache Issues**: Gemma 3n checkpoints contain **empty (all-zero) weights** for KV cache shared layers, causing instability during early training phases when cache is not enabled in training.
 - **Vision Component Weakness**: As our benchmarking suggests, the vision component in Gemma 3n could limit the overall model performance.
-- **Architecture**: The optimization-focused design may sacrifice some capability for efficiency, resulting in reduced performance compared to Gemma 3.
+- **Architecture**: The focus on fast and resource-efficient inference may sacrifice some accuracies, making it worse compared to Gemma 3.
 
 
 
