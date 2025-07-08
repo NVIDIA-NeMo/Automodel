@@ -22,7 +22,7 @@ Today, we are excited to announce that NeMo Automodel now supports Gemma 3n, mak
 - Accelerate training with kernel optimizations
 - Leverage FSDP2/nvFSDP for efficient distributed training
 
-Check out our [tutorial]() on SFT and PEFT for both Gemma 3 and Gemma 3n models!
+Check out our [tutorial](https://github.com/NVIDIA-NeMo/Automodel/blob/huiyingl/gemma3n_sup_blog/docs/guides/gemma3_3n.md) on SFT and PEFT for both Gemma 3 and Gemma 3n models!
 
 ## 🔍 Observations
 
@@ -44,4 +44,4 @@ We look forward to seeing what you build with Gemma 3n and NeMo Automodel. Check
 
 [NeMo Automodel](https://github.com/NVIDIA-NeMo/Automodel)
 
-[NeMo Automodel Gemma 3 Guide]()
+[NeMo Automodel Gemma 3 Guide](https://github.com/NVIDIA-NeMo/Automodel/blob/huiyingl/gemma3n_sup_blog/docs/guides/gemma3_3n.md)
