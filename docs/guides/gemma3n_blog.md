@@ -27,7 +27,7 @@ Check out our [tutorial](https://github.com/NVIDIA-NeMo/Automodel/blob/huiyingl/
 ## 🔍 Observations
 
 ### Training Dynamics
-We noticed **large gradients during initial training steps** that quickly stabilize within the first hundred steps, but overall training convergence didn't reach the same level as Gemma 3.
+During the first hundred optimization steps we observed suspiciously large gradients that quickly stabilize. While the run remains numerically stable after this "warm-up," overall convergence still lags behind Gemma-3. We continue to investigate the source of this discrepancy.
 
 <img src="medpix_peft.jpg" width="400">
 
