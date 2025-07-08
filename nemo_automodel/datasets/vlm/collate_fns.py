@@ -131,8 +131,6 @@ def default_collate_fn(examples: list, processor, start_of_response_token=None) 
         for input_ids in batch["input_ids"]
     ]
     batch["loss_mask"] = torch.tensor(loss_masks, dtype=torch.float, device=batch["input_ids"].device)
-    # To check the unmasked tokens
-    # print("unmasked tokens:", processor.tokenizer.decode(batch['input_ids'][batch["loss_mask"] == 1], skip_special_tokens=True))
     return batch
 
 
