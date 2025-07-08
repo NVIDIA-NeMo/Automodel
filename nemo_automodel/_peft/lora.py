@@ -41,6 +41,14 @@ MODEL_TYPE_TO_PEFT_TASK_TYPE = {
 }
 
 def dtype_from_str(val):
+    """
+    Translate a str val of a dtype into the corresponding torch.dtype
+    Args:
+        val (str): the dotted path of the dtype (e.g., "torch.bfloat16").
+
+    Returns:
+        torch.dtype: the actual dtype (e.g., torch.bfloat16)
+    """
     lut = {
         'torch.float': torch.float,
         'torch.float32': torch.float,
@@ -52,7 +60,7 @@ def dtype_from_str(val):
         'torch.half': torch.float16,
         'torch.bfloat16': torch.bfloat16,
     }
-    return lut[val]
+    return lut[val.float()]
 
 class LinearLoRA(nn.Linear):
     """
