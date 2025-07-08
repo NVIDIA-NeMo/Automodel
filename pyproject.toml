@@ -74,6 +74,7 @@ dependencies = [
     "datasets",
     "liger-kernel==0.5.8; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "pyyaml",
+    "flash-attn",
     "torch",
     "torchdata",
     "transformers",
