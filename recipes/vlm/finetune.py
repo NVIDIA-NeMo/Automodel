@@ -110,7 +110,13 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed
         }
 
     with StatefulRNG(seed=seed, ranked=True):
-        if hasattr(cfg_ds, "_target_") and "vlm" in cfg_ds._target_:
+        if cfg_processor is not None:
+            if hasattr(cfg_processor, 'instantiate'):
+                processor = cfg_processor.instantiate()
+            else:
+                processor_kwargs = cfg_processor.to_dict()
+                processor = AutoProcessor.from_pretrained(cfg_model.pretrained_model_name_or_path, **processor_kwargs)
+        else:
             processor = AutoProcessor.from_pretrained(cfg_model.pretrained_model_name_or_path)
 
         ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
