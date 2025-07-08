@@ -24,6 +24,7 @@ guides/sft.md
 :hidden:
 
 guides/dataset.md
+guides/gemma3n_blog.md
 ```
 
 ```{toctree}
