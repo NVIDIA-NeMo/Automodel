@@ -31,14 +31,28 @@ from nemo_automodel.shared.import_utils import safe_import
 HAS_BNB, bitsandbytes = safe_import("bitsandbytes")
 
 MODEL_TYPE_TO_PEFT_TASK_TYPE = {
-        "SequenceClassification": "SEQ_CLS",
-        "Seq2SeqLM": "SEQ_2_SEQ_LM", 
-        "CausalLM": "CAUSAL_LM",
-        "TokenClassification": "TOKEN_CLS",
-        "QuestionAnswering": "QUESTION_ANS",
-        "FeatureExtraction": "FEATURE_EXTRACTION",
-        "ConditionalGeneration": "CONDITIONAL_GENERATION",
+    "SequenceClassification": "SEQ_CLS",
+    "Seq2SeqLM": "SEQ_2_SEQ_LM",
+    "CausalLM": "CAUSAL_LM",
+    "TokenClassification": "TOKEN_CLS",
+    "QuestionAnswering": "QUESTION_ANS",
+    "FeatureExtraction": "FEATURE_EXTRACTION",
+    "ConditionalGeneration": "CONDITIONAL_GENERATION",
+}
+
+def dtype_from_str(val):
+    lut = {
+        'torch.float': torch.float,
+        'torch.float32': torch.float,
+        'torch.float64': torch.float64,
+        'torch.double': torch.float64,
+        'torch.complex64': torch.complex,
+        'torch.cfloat': torch.complex,
+        'torch.float16': torch.float16,
+        'torch.half': torch.float16,
+        'torch.bfloat16': torch.bfloat16,
     }
+    return lut[val]
 
 class LinearLoRA(nn.Linear):
     """
@@ -130,6 +144,9 @@ class LinearLoRA(nn.Linear):
 
         in_features = obj.in_features
         out_features = obj.out_features
+        if isinstance(lora_dtype, str):
+            lora_dtype = dtype_from_str(lora_dtype)
+        assert lora_dtype is None or isinstance(lora_dtype, torch.dtype)
         dtype = lora_dtype or obj.weight.dtype
 
         obj.lora_A = nn.Linear(in_features, dim, bias=False, dtype=dtype, device=device)
