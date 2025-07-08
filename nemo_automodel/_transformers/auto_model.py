@@ -112,6 +112,7 @@ def patch_attention(obj, sdpa_method=None):
     # runtime check
     _assert_same_signature(orig_forward, obj.forward)
 
+    logging.info("Patched model with SDPA method= {}".format(sdpa_method))
     return obj
 
 def patch_model(model, use_liger_kernel=True, use_sdpa_patching=True, sdpa_method=None):
@@ -139,8 +140,8 @@ def patch_model(model, use_liger_kernel=True, use_sdpa_patching=True, sdpa_metho
                 logging.warning("Failed to apply liger-kernels to model; falling back to eager")
                 del model
                 raise RuntimeError("Failed to patch model")
-    if use_sdpa_patching:
-        model = patch_attention(model, sdpa_method)
+    # if use_sdpa_patching:
+    #     model = patch_attention(model, sdpa_method)
     model.config.update({"nemo_version": __version__})
     return model
 
