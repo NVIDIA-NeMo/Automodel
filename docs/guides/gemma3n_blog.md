@@ -2,9 +2,9 @@
 
 ## Introduction
 
-Gemma 3n is a generative AI model that takes inputs from a variety modalities, including images and audio, and is optimized for efficient resource usage and fast inference on everyday devices. It introduces innovations such as Per-Layer Embedding parameter caching and the MatFormer architecture, which help reduce compute and memory demands. Some key highlights:
+Gemma 3n is a generative AI model that takes inputs from a variety of modalities, including images and audio, and is optimized for efficient resource usage and fast inference on everyday devices. It introduces innovations such as Per-Layer Embedding parameter caching and the MatFormer architecture, which help reduce compute and memory demands. Some key highlights:
 
-- **Optimized architecture** featuring MatFormer's nested transformers, per-layer embeddings, and KV cache sharing. These enable sub-model extraction, reduced GPU memory usage, and faster prefill speeds.
+- **Optimized architecture** featuring MatFormer's nested transformers, Per-Layer Embeddings (PLE), and KV cache sharing. These enable sub-model extraction, reduced GPU memory usage, and faster prefill speeds.
 - **Multimodal capabilities** with integrated image and audio encoders alongside the language model, enabling diverse tasks across modalities.  
 - Pretrained checkpoints are available under the [Gemma 3n releases on Hugging Face](https://huggingface.co/collections/google/gemma-3n-685065323f5984ef315c93f4).
 
@@ -35,7 +35,7 @@ This might be due to the shared KV Cache. Gemma 3n checkpoints contain **empty (
 
 
 ## ✨ Conclusion
-Gemma 3n brings impressive efficiency and opens up new possibilities for multimodal tasks on devices. With NeMo Automodel, getting started requires only a few commands!
+Gemma 3n brings impressive efficiency and opens up new possibilities for multimodal tasks on devices. With NeMo Automodel, getting started and fine-tuning these efficient models require only a few commands!
 
 We look forward to seeing what you build with Gemma 3n and NeMo Automodel. Check out the documentation guide for a full walkthrough, and reach out on GitHub Discussions if you have questions.
 
