@@ -114,7 +114,7 @@ def patch_attention(obj, sdpa_method=None):
 
     return obj
 
-def patch_model(model, use_liger_kernel, use_sdpa_patching=True, sdpa_method=None):
+def patch_model(model, use_liger_kernel=True, use_sdpa_patching=True, sdpa_method=None):
     """
     Patches a model with liger-kernel and sdpa_kernel
 
