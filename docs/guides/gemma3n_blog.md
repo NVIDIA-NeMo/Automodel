@@ -31,7 +31,7 @@ We noticed **large gradients during initial training steps** that quickly stabil
 
 <img src="medpix_peft.jpg" width="400">
 
-This might be due to the shared KV Cache. Gemma 3n checkpoints contain **empty (all-zero) weights** for KV cache shared layers, causing instability during early training phases when cache is not enabled in training.
+This might be due to the shared KV Cache. Gemma 3n checkpoints contain **empty (all-zero) weights** for KV cache shared layers, causing instability during early training phases when cache is not enabled in training. Our preliminary benchmark on vision and audio capabilities show some gap between Gemma 3n and existing alternatives. We will follow up with more concrete results later.
 
 
 ## ✨ Conclusion
