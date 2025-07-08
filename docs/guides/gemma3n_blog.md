@@ -2,7 +2,7 @@
 
 ## Introduction
 
-Gemma 3n is a generative AI model that takes inputs from a variety of modalities, including images and audio, and is optimized for efficient resource usage and fast inference on everyday devices. It introduces innovations such as Per-Layer Embedding parameter caching and the MatFormer architecture, which help reduce compute and memory demands. Some key highlights:
+[Gemma 3n](https://ai.google.dev/gemma/docs/gemma-3n) is a generative AI model that takes inputs from a variety of modalities, including images and audio, and is optimized for efficient resource usage and fast inference on everyday devices. It introduces innovations such as Per-Layer Embedding parameter caching and the [MatFormer](https://arxiv.org/pdf/2310.07707) architecture, which help reduce compute and memory demands, making it ideal for lightweight deployments. Some key highlights:
 
 - **Optimized architecture** featuring MatFormer's nested transformers, Per-Layer Embeddings (PLE), and KV cache sharing. These enable sub-model extraction, reduced GPU memory usage, and faster prefill speeds.
 - **Multimodal capabilities** with integrated image and audio encoders alongside the language model, enabling diverse tasks across modalities.  
