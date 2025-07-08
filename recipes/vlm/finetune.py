@@ -16,27 +16,25 @@ from __future__ import annotations
 
 import logging
 import pathlib
+import time
 from typing import Any, Dict
 
 import torch
-import torch.nn as nn
 import torch.distributed as dist
+import torch.nn as nn
 from torch.distributed.device_mesh import _mesh_resources
 from torch.utils.data import DataLoader
 from transformers import AutoProcessor
-from nemo_automodel.loggers.log_utils import setup_logging
-import time
-import logging
 
 import wandb
-from nemo_automodel.loggers.wandb_utils import suppress_wandb_log_messages
-from wandb import Settings
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.config.cli import parse_args_and_load_config
+from nemo_automodel.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.distributed.init_utils import initialize_distributed
 from nemo_automodel.distributed.nvfsdp import NVFSDPManager
 from nemo_automodel.loggers.log_utils import setup_logging
+from nemo_automodel.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.rng import StatefulRNG
 from nemo_automodel.training.step_scheduler import StepScheduler
@@ -47,9 +45,8 @@ from nemo_automodel.utils.dist_utils import (
     reduce_loss,
     rescale_gradients,
 )
-
-from nemo_automodel.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
+from wandb import Settings
 
 
 logger = logging.getLogger(__name__)
@@ -110,6 +107,7 @@ def build_model_and_optimizer(
 
         return model, optimizer
 
+
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
     """Build a checkpoint configuration."""
     from transformers.utils import TRANSFORMERS_CACHE
@@ -129,6 +127,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
         ckpt_kwargs |= cfg_ckpt
     return CheckpointingConfig(**ckpt_kwargs)
 
+
 def build_loss_fn(device, cfg_loss):
     """Build a loss function.
 
@@ -144,6 +143,7 @@ def build_loss_fn(device, cfg_loss):
     else:
         return cfg_loss.instantiate().to(device)
 
+
 def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed) -> DataLoader:
     """Build a VLM dataloader."""
     dist_sampler_kwargs = {
@@ -157,7 +157,7 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed
 
     with StatefulRNG(seed=seed, ranked=True):
         if cfg_processor is not None:
-            if hasattr(cfg_processor, 'instantiate'):
+            if hasattr(cfg_processor, "instantiate"):
                 processor = cfg_processor.instantiate()
             else:
                 processor_kwargs = cfg_processor.to_dict()
@@ -182,6 +182,7 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed
             collate_fn = lambda examples: COLLATE_FNS[processor_type](examples, processor)
 
         return cfg_dl.instantiate(dataset=ds, sampler=sampler, collate_fn=collate_fn)
+
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
     """Build and initialize distributed training resources.
@@ -221,7 +222,8 @@ def build_step_scheduler(cfg, dataloader):
 
 def build_wandb(cfg):
     """Instantiates wandb and returns the instance.
-    If no name is given, it will use the model name
+
+    If no name is given, it will use the model name.
     """
     assert cfg.get("wandb", None) is not None
     kwargs = cfg.wandb.to_dict()
@@ -238,6 +240,7 @@ def build_wandb(cfg):
 # ---------------------------------------------------------------------------
 #  Trainer class – orchestration only
 # ---------------------------------------------------------------------------
+
 
 class FinetuneRecipeForVLM(BaseRecipe):
     """Recipe for fine-tuning a VLM model."""
@@ -322,7 +325,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Optionally resume
         self.load_checkpoint(restore_from)
 
-
     # ------------------ main loop ------------------
     def run_train_validation_loop(self):
         """Run the training loop over all epochs and batches.
@@ -350,6 +352,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         Args:
             batch: Batch of training data.
             is_optim_step: Flag indicating if a gradient step should be applied.
+            clip_norm: Gradient clipping norm value.
 
         Returns:
             Grad norm from the training step.
@@ -371,7 +374,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels, loss_mask)
         with train_ctx():
-            out  = self.model(**batch)
+            out = self.model(**batch)
             local_loss = self.loss_fn(
                 out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum"
             )
@@ -499,6 +502,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         Args:
             grad_norm: Grad norm from the training step.
+            tps: Tokens per second throughput metric.
 
         Returns:
             Reporting loss.
