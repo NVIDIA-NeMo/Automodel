@@ -68,6 +68,11 @@ def load_model_from_checkpoint(
     Returns:
         Loaded NeMoAutoModelForImageTextToText model
     """
+    # initialize distributed
+
+    from nemo_automodel.distributed.init_utils import initialize_distributed
+    initialize_distributed(backend="nccl", timeout_minutes=10)
+
     checkpoint_path = Path(checkpoint_path)
     device_map = "cuda" if torch.cuda.is_available() else "cpu"
     model = None

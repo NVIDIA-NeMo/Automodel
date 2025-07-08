@@ -123,6 +123,8 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
             Positional arguments forwarded verbatim to the superclass.
         use_liger_kernel : bool, default True
             Whether to attempt patching the loaded model with Liger kernels.
+        use_sdpa_patching : bool, default True
+            Whether to patch the model with SDPA kernel optimizations.
         **kwargs
             Keyword arguments forwarded verbatim to the superclass.
 
@@ -144,6 +146,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
         """
         torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
         use_liger_kernel = kwargs.pop("use_liger_kernel", True)
+        use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
         sdpa_method = kwargs.pop("sdpa_method", None)
         model = super().from_pretrained(
             pretrained_model_name_or_path,
@@ -166,8 +169,10 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
                     **kwargs,
                     torch_dtype=torch_dtype,
                     use_liger_kernel=False,
+                    use_sdpa_patching=use_sdpa_patching,
                 )
-        model = patch_attention(model, sdpa_method)
+        if use_sdpa_patching:
+            model = patch_attention(model, sdpa_method)
         model.config.update({"nemo_version": __version__})
         return model
 
@@ -183,6 +188,8 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
         use_liger_kernel : bool, default True
             Whether to attempt patching the instantiated model with Liger
             kernels.
+        use_sdpa_patching : bool, default True
+            Whether to patch the model with SDPA kernel optimizations.
         **kwargs
             Additional keyword arguments forwarded to the superclass.
 
@@ -198,6 +205,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
         """
         torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
         use_liger_kernel = kwargs.pop("use_liger_kernel", True)
+        use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
         sdpa_method = kwargs.pop("sdpa_method", None)
         model = super().from_config(config, **kwargs, torch_dtype=torch_dtype)
         if use_liger_kernel:
@@ -210,9 +218,14 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
                 del model
                 # If patching failed, retry
                 return cls.from_config(
-                    config, **kwargs, use_liger_kernel=False, torch_dtype=torch_dtype
+                    config,
+                    **kwargs,
+                    use_liger_kernel=False,
+                    torch_dtype=torch_dtype,
+                    use_sdpa_patching=use_sdpa_patching
                 )
-        model = patch_attention(model, sdpa_method)
+        if use_sdpa_patching:
+            model = patch_attention(model, sdpa_method)
         model.config.update({"nemo_version": __version__})
         return model
 
@@ -247,17 +260,19 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
         """
-        Load a pretrained causal-language-model and (optionally) patch it with custom kernels.
+        Load a pretrained image-text-to-text model and (optionally) patch it with custom kernels.
 
         Parameters
         ----------
         pretrained_model_name_or_path : str or os.PathLike
             Repository ID or local path accepted by
-            ``transformers.AutoModelForCausalLM.from_pretrained``.
+            ``transformers.AutoModelForImageTextToText.from_pretrained``.
         *model_args
             Positional arguments forwarded verbatim to the superclass.
         use_liger_kernel : bool, default True
             Whether to attempt patching the loaded model with Liger kernels.
+        use_sdpa_patching : bool, default True
+            Whether to patch the model with SDPA kernel optimizations.
         **kwargs
             Keyword arguments forwarded verbatim to the superclass.
 
@@ -279,6 +294,7 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
         """
         torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
         use_liger_kernel = kwargs.pop("use_liger_kernel", True)
+        use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
         sdpa_method = kwargs.pop("sdpa_method", None)
         model = super().from_pretrained(
             pretrained_model_name_or_path,
@@ -294,15 +310,17 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
                 liger_kernel_trf._apply_liger_kernel_to_instance(model=model)
             except Exception:
                 del model
-                # If patching failed, retryd
+                # If patching failed, retry
                 return cls.from_pretrained(
                     pretrained_model_name_or_path,
                     *model_args,
                     **kwargs,
-                    use_liger_kernel=False,
                     torch_dtype=torch_dtype,
+                    use_liger_kernel=False,
+                    use_sdpa_patching=use_sdpa_patching,
                 )
-        model = patch_attention(model, sdpa_method)
+        if use_sdpa_patching:
+            model = patch_attention(model, sdpa_method)
         model.config.update({"nemo_version": __version__})
         return model
 
@@ -318,6 +336,8 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
         use_liger_kernel : bool, default True
             Whether to attempt patching the instantiated model with Liger
             kernels.
+        use_sdpa_patching : bool, default True
+            Whether to patch the model with SDPA kernel optimizations.
         **kwargs
             Additional keyword arguments forwarded to the superclass.
 
@@ -333,6 +353,7 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
         """
         torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
         use_liger_kernel = kwargs.pop("use_liger_kernel", True)
+        use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
         sdpa_method = kwargs.pop("sdpa_method", None)
         model = super().from_config(config, **kwargs, torch_dtype=torch_dtype)
         if use_liger_kernel:
@@ -345,8 +366,13 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
                 del model
                 # If patching failed, retry
                 return cls.from_config(
-                    config, **kwargs, use_liger_kernel=False, torch_dtype=torch_dtype
+                    config,
+                    **kwargs,
+                    use_liger_kernel=False,
+                    torch_dtype=torch_dtype,
+                    use_sdpa_patching=use_sdpa_patching
                 )
-        model = patch_attention(model, sdpa_method)
+        if use_sdpa_patching:
+            model = patch_attention(model, sdpa_method)
         model.config.update({"nemo_version": __version__})
         return model

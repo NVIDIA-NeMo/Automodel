@@ -40,7 +40,14 @@ LLAMA_TOKENS = [
 ]
 GEMMA_TOKENS = ["<image_soft_token>"]
 
-PAD_TOKENS = set(QWEN_TOKENS + LLAVA_TOKENS + LLAMA_TOKENS + GEMMA_TOKENS)
+GEMMA_3N_TOKENS = ["<image_soft_token>",
+                   "<audio_soft_token>",
+                   "<start_of_audio>",
+                   "<start_of_image>",
+                   "<end_of_audio>",
+                   "<end_of_image>"]
+
+PAD_TOKENS = set(QWEN_TOKENS + LLAVA_TOKENS + LLAMA_TOKENS + GEMMA_TOKENS + GEMMA_3N_TOKENS)
 
 
 def extract_skipped_token_ids(processor):

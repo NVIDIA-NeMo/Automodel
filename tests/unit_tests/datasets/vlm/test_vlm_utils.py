@@ -72,6 +72,33 @@ def _make_tokenizer_with_pads():
     return DummyTokenizer(mapping)
 
 
+def test_extract_skipped_token_ids_with_gemma_3n_tokens():
+    """Test that extract_skipped_token_ids correctly identifies GEMMA_3N_TOKENS."""
+    # Create a tokenizer with some GEMMA_3N_TOKENS
+    mapping = {
+        1000: "<image_soft_token>",   # from GEMMA_3N_TOKENS
+        1001: "<audio_soft_token>",   # from GEMMA_3N_TOKENS
+        1002: "<start_of_audio>",     # from GEMMA_3N_TOKENS
+        1003: "some_random_token",    # not a pad token
+        1004: "<end_of_image>",       # from GEMMA_3N_TOKENS
+    }
+    tokenizer = DummyTokenizer(mapping)
+    
+    ids = extract_skipped_token_ids(tokenizer)
+    
+    # Expected ids are the keys whose value is in PAD_TOKENS (which includes GEMMA_3N_TOKENS)
+    expected = {k for k, v in mapping.items() if v in PAD_TOKENS}
+    
+    assert set(ids.tolist()) == expected
+    # Should include all the GEMMA_3N_TOKENS we added
+    assert 1000 in ids.tolist()  # <image_soft_token>
+    assert 1001 in ids.tolist()  # <audio_soft_token>
+    assert 1002 in ids.tolist()  # <start_of_audio>
+    assert 1004 in ids.tolist()  # <end_of_image>
+    # Should NOT include the random token
+    assert 1003 not in ids.tolist()
+
+
 @pytest.mark.parametrize("wrap_in_processor", [True, False])
 def test_extract_skipped_token_ids(wrap_in_processor):
     tokenizer = _make_tokenizer_with_pads()
