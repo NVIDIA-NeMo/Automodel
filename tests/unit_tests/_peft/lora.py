@@ -25,6 +25,7 @@ class DummyModel(nn.Module):
         super().__init__()
         self.linear1 = nn.Linear(16, 16)
         self.linear2 = nn.Linear(16, 16)
+        self.config = {}
 
     def forward(self, x):
         """Forward pass through two linear layers with ReLU activation in between."""
@@ -51,6 +52,14 @@ def test_lora_patch_applies_to_selected_module(model):
     assert isinstance(model.linear1, LinearLoRA)
     assert not isinstance(model.linear2, LinearLoRA)
 
+
+def test_lora_patch_applies_to_selected_module_with_str_dtype(model):
+    """Tests that LoRA is only applied to specified target modules."""
+    apply_lora_to_linear_modules(model, target_modules=["linear1"], dim=4, alpha=8, lora_dtype='torch.bfloat16')
+    assert isinstance(model.linear1, LinearLoRA)
+    assert model.linear1.lora_A.weight.dtype == torch.bfloat16
+    assert model.linear1.lora_B.weight.dtype == torch.bfloat16
+    assert not isinstance(model.linear2, LinearLoRA)
 
 def test_forward_output_consistency(dummy_input):
     """Verifies that model output shape remains the same after LoRA patching,
