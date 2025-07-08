@@ -78,6 +78,7 @@ main() {
     uv sync \
         --link-mode copy \
         --locked \
+        --extra fa \
         --all-groups ${UV_ARGS[@]}
 
     # Run install overrides

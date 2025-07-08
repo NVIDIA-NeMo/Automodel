@@ -95,12 +95,15 @@ jobs:
         run: |
           echo -e "machine github.com\n  login token\n  password ${{ secrets.PAT }}" > ~/.netrc
           chmod 600 ~/.netrc 
-          python -m venv ./venv
+
+          uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
           source ./venv/bin/activate
 
           export PATH="./bin/:$PATH"
 
-          pip install "."
+          uv sync --link-mode copy --locked --all-groups
+
+          uv pip install --no-deps -e .
 
       - name: Checkout check-imports
         uses: actions/checkout@v4
@@ -125,7 +128,7 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.12"]
-        extra-groups: ["", "vlm"]
+        extra-groups: ["", "vlm", "fa"]
     env:
       EXTRA: ${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }}
     steps:
@@ -143,7 +146,14 @@ jobs:
 
           pip install --upgrade pip
 
-          pip install .$EXTRA
+          PIP_ARGS=()
+
+          if [[ $EXTRA == *"fa"* ]]; then
+            pip install torch setuptools psutil
+            PIP_ARGS=(--no-build-isolation)
+          fi
+
+          pip install ${PIP_ARGS[@]} .$EXTRA
 
       - name: Checkout check-imports
         uses: actions/checkout@v4
@@ -184,11 +194,15 @@ jobs:
           echo -e "machine github.com\n  login token\n  password ${{ secrets.PAT }}" > ~/.netrc
           chmod 600 ~/.netrc 
 
-          export PATH=".bin/:$PATH"
+          export PATH="${UV_PROJECT_ENVIRONMENT}/bin/:$PATH"
 
           uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
 
+          uv sync --link-mode copy --locked --only-group build
+
           uv sync --link-mode copy --locked --all-groups
+
+          uv pip install --no-deps -e .
 
       - name: Checkout check-imports
         uses: actions/checkout@v4
