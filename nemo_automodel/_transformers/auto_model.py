@@ -160,7 +160,9 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
                 return model
             try:
                 liger_kernel_trf._apply_liger_kernel_to_instance(model=model)
-            except Exception:
+                logging.info("Applied liger-kernel to model")
+            except Exception as e:
+                logging.warning("Failed to apply liger-kernels to model; falling back to eager")
                 del model
                 # If patching failed, retry
                 return cls.from_pretrained(
