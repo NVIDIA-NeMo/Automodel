@@ -60,7 +60,7 @@ def dtype_from_str(val):
         'torch.half': torch.float16,
         'torch.bfloat16': torch.bfloat16,
     }
-    return lut[val.float()]
+    return lut[val.lower()]
 
 class LinearLoRA(nn.Linear):
     """
