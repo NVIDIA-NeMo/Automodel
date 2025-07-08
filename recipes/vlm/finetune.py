@@ -114,7 +114,7 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed
             if hasattr(cfg_processor, 'instantiate'):
                 processor = cfg_processor.instantiate()
             else:
-                processor_kwargs = cfg_processor.to_dict() if hasattr(cfg_processor, 'to_dict') else dict(cfg_processor)
+                processor_kwargs = cfg_processor.to_dict()
                 processor = AutoProcessor.from_pretrained(cfg_model.pretrained_model_name_or_path, **processor_kwargs)
         else:
             processor = AutoProcessor.from_pretrained(cfg_model.pretrained_model_name_or_path)
