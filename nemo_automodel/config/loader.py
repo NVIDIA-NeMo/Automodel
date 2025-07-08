@@ -87,7 +87,7 @@ def _resolve_target(dotted_path: str):
         parts = dotted_path.split(':')
         assert parts[0].endswith('.py'), "Expected first part to be a python script"
         assert Path(parts[0]).exists(), "Expected python script to exist"
-        module = load_module_from_file(parts[0])
+        module = load_module_from_file(str(Path(parts[0]).resolve()))
         return getattr(module, parts[1])
 
     parts = dotted_path.split(".")
