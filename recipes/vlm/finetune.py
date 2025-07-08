@@ -16,6 +16,11 @@ from __future__ import annotations
 
 import logging
 import pathlib
+import sys
+
+_script_dir = pathlib.Path(__file__).parent.resolve()
+_project_root = _script_dir.parent.parent
+sys.path.insert(0, str(_project_root))
 
 import torch
 import torch.nn as nn
