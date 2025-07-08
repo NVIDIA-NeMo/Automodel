@@ -329,7 +329,7 @@ def apply_lora_to_linear_modules(
     dropout_position: Literal["pre", "post"] = "post",
     lora_A_init: str = "xavier",
     lora_dtype: Optional[torch.dtype] = None,
-    use_triton: bool = True
+    use_triton: bool = False
 ):
     """
     Replace selected nn.Linear layers with LinearLoRA layers (in-place).
@@ -343,11 +343,14 @@ def apply_lora_to_linear_modules(
     # Freeze base model parameters
     for w in model.parameters():
         w.requires_grad_(False)
-    
+
     is_causal_lm = False
-    if hasattr(model, "config") and "CausalLM" in model.config.architectures[0]:
-        # for example, LlamaForCausalLM
-        is_causal_lm = True
+    try:
+        if hasattr(model, "config") and "CausalLM" in model.config.architectures[0]:
+            # for example, LlamaForCausalLM
+            is_causal_lm = True
+    except AttributeError:
+        is_causal_lm = False
 
     matcher = ModuleMatcher(target_modules, exclude_modules, match_all_linear, is_causal_lm)
     num_modules_matched = 0
@@ -368,8 +371,17 @@ def apply_lora_to_linear_modules(
            )
 
     # finalize the peft config
-    model_task = model.config.architectures[0].split("For")[-1]
-    task_type = MODEL_TYPE_TO_PEFT_TASK_TYPE[model_task]
+    try:
+        model_task = model.config.architectures[0].split("For")[-1]
+    except AttributeError:
+        model_task = "N/A"
+    try:
+        name_or_path = model.config.name_or_path
+        task_type = MODEL_TYPE_TO_PEFT_TASK_TYPE[model_task]
+    except AttributeError:
+        name_or_path = "N/A"
+        task_type = "CAUSAL_LM"
+
     model._automodel_peft_config = {
         "task_type": task_type,
         "peft_type": "LORA",
@@ -377,10 +389,10 @@ def apply_lora_to_linear_modules(
         "lora_alpha": alpha,
         "target_modules": list(final_target_modules),
         "bias": "none",
-        "base_model_name_or_path": model.config.name_or_path,
+        "base_model_name_or_path": name_or_path,
         "lora_dropout": dropout,
     }
-    
+
     return num_modules_matched
 
 
