@@ -49,6 +49,8 @@ def dtype_from_str(val):
     Returns:
         torch.dtype: the actual dtype (e.g., torch.bfloat16)
     """
+    if isinstance(val, torch.dtype):
+        return val
     lut = {
         'torch.float': torch.float,
         'torch.float32': torch.float,
@@ -59,8 +61,18 @@ def dtype_from_str(val):
         'torch.float16': torch.float16,
         'torch.half': torch.float16,
         'torch.bfloat16': torch.bfloat16,
+        'torch.uint8': torch.uint8,
+        'torch.int8': torch.int8,
+        'torch.int16': torch.int16,
+        'torch.short': torch.short,
+        'torch.int32': torch.int32,
+        'torch.int': torch.int,
+        'torch.int64': torch.int64,
+        'torch.long': torch.long,
+        'torch.bool': torch.bool,
     }
     return lut[val.lower()]
+
 
 class LinearLoRA(nn.Linear):
     """
