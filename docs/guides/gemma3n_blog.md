@@ -6,7 +6,7 @@
 
 - **Optimized architecture** featuring MatFormer's nested transformers, Per-Layer Embeddings (PLE), and KV cache sharing. These enable sub-model extraction, reduced GPU memory usage, and faster prefill speeds.
 
-<img src="gemma-3n-parameters.png" width="600"> 
+<img src="gemma-3n-parameters.png" width="600" alt="Gemma 3n E2B model parameters running in standard execution versus an effectively lower parameter load using PLE caching and parameter skipping techniques. Adapted from https://ai.google.dev/gemma/docs/gemma-3n"> 
 
 
 - **Multimodal capabilities** with integrated image and audio encoders alongside the language model, enabling diverse tasks across modalities.  
