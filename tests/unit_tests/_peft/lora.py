@@ -33,6 +33,17 @@ class DummyModel(nn.Module):
         x = self.linear2(x)
         return x
 
+class DummyModelNoConfig(nn.Module):
+    """Same as DummyModel but without a `config` attribute."""
+    def __init__(self):
+        super().__init__()
+        self.linear1 = nn.Linear(16, 16)
+        self.linear2 = nn.Linear(16, 16)
+
+    def forward(self, x):
+        x = self.linear1(x).relu()
+        x = self.linear2(x)
+        return x
 
 @pytest.fixture
 def dummy_input():
@@ -45,6 +56,36 @@ def model():
     """Instantiates and returns a DummyModel instance."""
     return DummyModel()
 
+
+@pytest.fixture
+def model_no_config():
+    """Instantiates a model that has no `config` attr."""
+    return DummyModelNoConfig()
+
+
+def test_lora_patch_on_model_without_config(model_no_config):
+    """LoRA should still patch correctly even if the model lacks `config`."""
+    apply_lora_to_linear_modules(model_no_config,
+                                 target_modules=["linear1"],
+                                 dim=4,
+                                 alpha=8)
+    assert isinstance(model_no_config.linear1, LinearLoRA)
+    assert not isinstance(model_no_config.linear2, LinearLoRA)
+
+
+def test_backward_pass_without_config(dummy_input, model_no_config):
+    """Backward pass must succeed on a model without `config`."""
+    apply_lora_to_linear_modules(model_no_config,
+                                 target_modules=["linear1"],
+                                 dim=4,
+                                 alpha=8)
+    out = model_no_config(dummy_input)
+    loss = out.sum()
+    loss.backward()
+
+    grads = [p.grad for p in model_no_config.parameters() if p.requires_grad]
+    assert any(g is not None for g in grads)
+    assert all(torch.isfinite(g).all() for g in grads if g is not None)
 
 def test_lora_patch_applies_to_selected_module(model):
     """Tests that LoRA is only applied to specified target modules."""
