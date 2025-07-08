@@ -153,7 +153,7 @@ jobs:
             PIP_ARGS=(--no-build-isolation)
           fi
 
-          pip install .$EXTRA
+          pip install ${PIP_ARGS[@]} .$EXTRA
 
       - name: Checkout check-imports
         uses: actions/checkout@v4
@@ -194,7 +194,7 @@ jobs:
           echo -e "machine github.com\n  login token\n  password ${{ secrets.PAT }}" > ~/.netrc
           chmod 600 ~/.netrc 
 
-          export PATH=".bin/:$PATH"
+          export PATH="${UV_PROJECT_ENVIRONMENT}/bin/:$PATH"
 
           uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
 
