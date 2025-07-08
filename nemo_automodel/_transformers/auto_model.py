@@ -92,7 +92,7 @@ def patch_attention(obj, sdpa_method=None):
     """
     if sdpa_method is None:
         sdpa_method = [
-            # SDPBackend.CUDNN_ATTENTION,
+            SDPBackend.CUDNN_ATTENTION,
             SDPBackend.FLASH_ATTENTION,
             SDPBackend.EFFICIENT_ATTENTION,
             SDPBackend.MATH,
