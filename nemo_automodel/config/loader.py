@@ -17,9 +17,10 @@ import importlib
 import importlib.util
 import os
 import sys
-
+from pathlib import Path
 import yaml
-
+import inspect
+import pprint
 
 def translate_value(v):
     """
@@ -56,6 +57,21 @@ def translate_value(v):
             # fallback to raw string
             return v
 
+def load_module_from_file(file_path):
+    """Dynamically imports a module from a given file path."""
+
+    # Create a module specification object from the file location
+    name = file_path.replace('/', '.').replace('.py', '')
+    spec = importlib.util.spec_from_file_location(name, file_path)
+
+    # Create a module object from the specification
+    module = importlib.util.module_from_spec(spec)
+
+    # Execute the module's code
+    spec.loader.exec_module(module)
+
+    return module
+
 def _resolve_target(dotted_path: str):
     """
     Resolve a dotted path to a Python object.
@@ -64,6 +80,16 @@ def _resolve_target(dotted_path: str):
     2) getattr() the rest.
     3) If that fails, fall back to scanning sys.path for .py or package dirs.
     """
+    if not isinstance(dotted_path, str):
+        return dotted_path
+
+    if ':' in dotted_path:
+        parts = dotted_path.split(':')
+        assert parts[0].endswith('.py'), "Expected first part to be a python script"
+        assert Path(parts[0]).exists(), "Expected python script to exist"
+        module = load_module_from_file(str(Path(parts[0]).resolve()))
+        return getattr(module, parts[1])
+
     parts = dotted_path.split(".")
 
     # 1) Try longest‐prefix module import + getattr the rest
@@ -157,6 +183,8 @@ class ConfigNode:
             return [self._wrap('', i) for i in v]
         elif k.endswith('_fn'):
             return _resolve_target(v)
+        elif k == '_target_':
+            return _resolve_target(v)
         else:
             return translate_value(v)
 
@@ -194,7 +222,23 @@ class ConfigNode:
         # Override/add with passed kwargs
         config_kwargs.update(kwargs)
 
-        return func(*args, **config_kwargs)
+        try:
+            return func(*args, **config_kwargs)
+        except Exception as e:
+            sig = inspect.signature(func)
+            print(
+                "Instantiation failed for `{}`\n"\
+                "Accepted signature : {}\n" \
+                "Positional args    : {}\n" \
+                "Keyword args       : {}\n".format(
+                func.__name__,
+                sig,
+                args,
+                pprint.pformat(config_kwargs, compact=True, indent=4),
+                ),
+                file=sys.stderr
+            )
+            raise e # re-raise so the original traceback is preserved
 
     def _instantiate_value(self, v):
         """
