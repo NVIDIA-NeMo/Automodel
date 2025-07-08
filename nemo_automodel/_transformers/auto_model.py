@@ -92,7 +92,7 @@ def patch_attention(obj, sdpa_method=None):
     """
     if sdpa_method is None:
         sdpa_method = [
-            SDPBackend.CUDNN_ATTENTION,
+            # SDPBackend.CUDNN_ATTENTION,
             SDPBackend.FLASH_ATTENTION,
             SDPBackend.EFFICIENT_ATTENTION,
             SDPBackend.MATH,
@@ -140,8 +140,8 @@ def patch_model(model, use_liger_kernel=True, use_sdpa_patching=True, sdpa_metho
                 logging.warning("Failed to apply liger-kernels to model; falling back to eager")
                 del model
                 raise RuntimeError("Failed to patch model")
-    # if use_sdpa_patching:
-    #     model = patch_attention(model, sdpa_method)
+    if use_sdpa_patching:
+        model = patch_attention(model, sdpa_method)
     model.config.update({"nemo_version": __version__})
     return model
 
@@ -213,10 +213,12 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
         use_liger_kernel = kwargs.pop("use_liger_kernel", True)
         use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
         sdpa_method = kwargs.pop("sdpa_method", None)
+        attn_implementation = kwargs.pop("attn_implementation", "flash_attention_2")
         model = super().from_pretrained(
             pretrained_model_name_or_path,
             *model_args,
             **kwargs,
+            attn_implementation=attn_implementation,
             torch_dtype=torch_dtype,
         )
         try:
@@ -263,7 +265,13 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
         use_liger_kernel = kwargs.pop("use_liger_kernel", True)
         use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
         sdpa_method = kwargs.pop("sdpa_method", None)
-        model = super().from_config(config, **kwargs, torch_dtype=torch_dtype)
+        attn_implementation = kwargs.pop("attn_implementation", "flash_attention_2")
+        model = super().from_config(
+            config,
+            **kwargs,
+            attn_implementation=attn_implementation,
+            torch_dtype=torch_dtype
+        )
         try:
             return patch_model(model, use_liger_kernel, use_sdpa_patching, sdpa_method)
         except RuntimeError:
@@ -343,10 +351,12 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
         use_liger_kernel = kwargs.pop("use_liger_kernel", True)
         use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
         sdpa_method = kwargs.pop("sdpa_method", None)
+        attn_implementation = kwargs.pop("attn_implementation", "flash_attention_2")
         model = super().from_pretrained(
             pretrained_model_name_or_path,
             *model_args,
             **kwargs,
+            attn_implementation=attn_implementation,
             torch_dtype=torch_dtype,
         )
         try:
@@ -394,7 +404,12 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
         use_liger_kernel = kwargs.pop("use_liger_kernel", True)
         use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
         sdpa_method = kwargs.pop("sdpa_method", None)
-        model = super().from_config(config, **kwargs, torch_dtype=torch_dtype)
+        attn_implementation = kwargs.pop("attn_implementation", "flash_attention_2")
+        model = super().from_config(
+            config,
+            **kwargs,
+            attn_implementation=attn_implementation,
+            torch_dtype=torch_dtype)
         try:
             return patch_model(model, use_liger_kernel, use_sdpa_patching, sdpa_method)
         except RuntimeError:
