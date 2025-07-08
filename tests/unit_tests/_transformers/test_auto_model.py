@@ -220,8 +220,6 @@ def prepare_env(monkeypatch, target_mod, *,
     liger_stub = types.SimpleNamespace(_apply_liger_kernel_to_instance=apply_mock)
     monkeypatch.setattr(target_mod, "liger_kernel_trf", liger_stub, raising=False)
 
-    # patch_attn_mock = MagicMock(side_effect=lambda m, _: m)
-    # monkeypatch.setattr(target_mod, "patch_attention", patch_attn_mock, raising=False)
     patch_attn_mock = MagicMock(side_effect=lambda *args, **kwargs: args[0])
     monkeypatch.setattr(target_mod, "patch_attention", patch_attn_mock, raising=True)
 
