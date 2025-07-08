@@ -409,7 +409,8 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
             config,
             **kwargs,
             attn_implementation=attn_implementation,
-            torch_dtype=torch_dtype)
+            torch_dtype=torch_dtype
+        )
         try:
             return patch_model(model, use_liger_kernel, use_sdpa_patching, sdpa_method)
         except RuntimeError:
