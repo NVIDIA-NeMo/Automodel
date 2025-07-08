@@ -93,3 +93,24 @@ def make_cord_v2_dataset(
 
     return [format(example) for example in dataset]
     # return dataset.map(format, batched=False, num_proc=8,remove_columns=["ground_truth"])
+
+def make_medpix_dataset(path_or_dataset="medpix-dataset/medpix-dataset", split="train", **kwargs):
+    """Load and preprocess the MedPix dataset for image-to-text fine-tuning.
+    """
+    dataset = load_dataset(path_or_dataset, split=split)
+
+    def format(example):
+        return {
+            "conversation": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": example["image_id"]},
+                        {"type": "text", "text": example["question"]},
+                    ],
+                },
+                {"role": "assistant", "content": [{"type": "text", "text": example["answer"]}]},
+            ],
+        }
+    
+    return [format(example) for example in dataset]
