@@ -397,7 +397,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
         self.model.train()
         self.timestamp = time.perf_counter()
-        self.num_valid_tokens = 0
+        self.num_nonpad_tokens = 0
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
             for batch_idx, batch in enumerate(self.step_scheduler):
@@ -443,8 +443,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # in pretraining, this excludes padding tokens. In SFT, this additionally
         # excludes the context tokens.
         local_num_loss_tokens = loss_mask.sum().detach().to(torch.int)
-        # num_valid_tokens are the number of non-padding tokens
-        self.num_valid_tokens += labels.numel() - count_tail_padding(labels)
+        # num_nonpad_tokens are the number of non-padding tokens
+        self.num_nonpad_tokens += labels.numel() - count_tail_padding(labels)
         self.total_local_num_loss_tokens += local_num_loss_tokens
         self.forward_data_store.append(local_loss.detach())
 
@@ -491,8 +491,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             t = time.perf_counter()
             time_delta = t - self.timestamp
             self.timestamp = t
-            tps = self.num_valid_tokens / time_delta
-            self.num_valid_tokens = 0
+            tps = self.num_nonpad_tokens / time_delta
+            self.num_nonpad_tokens = 0
             # log
             reporting_loss = self.log_train_metrics(grad_norm, tps)
             logging.info(
