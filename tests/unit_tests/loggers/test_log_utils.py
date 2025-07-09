@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-os.environ['TORCH_COMPILE_DISABLE'] = '1'
+
+os.environ["TORCH_COMPILE_DISABLE"] = "1"
 
 import importlib
 import logging
 import os
 from typing import List
+
 
 def make_log_record(level: int = logging.INFO, name: str = "test.logger"):
     """Return a dummy ``LogRecord`` suitable for filter unit-tests."""
@@ -100,6 +102,7 @@ def test_module_filter_name_prefix_matching():
     assert filt(rec_block) is False
     assert filt(rec_pass) is True
 
+
 # setup_logging – integration
 def test_setup_logging_full(monkeypatch, caplog):
     """
@@ -121,7 +124,7 @@ def test_setup_logging_full(monkeypatch, caplog):
     # Configure logging
     caplog.set_level(logging.DEBUG)
     mod.setup_logging(
-        logging_level=logging.INFO,            # should be overridden by env
+        logging_level=logging.INFO,  # should be overridden by env
         filter_warning=True,
         modules_to_filter=["secret"],
         set_level_for_all_loggers=True,

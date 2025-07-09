@@ -32,6 +32,7 @@ def init_all_rng(seed: int, ranked: bool = False):
         # Example: use PyTorch's distributed rank if available
         try:
             import torch.distributed as dist
+
             if dist.is_initialized():
                 seed += dist.get_rank()
         except ImportError:
@@ -44,10 +45,8 @@ def init_all_rng(seed: int, ranked: bool = False):
         torch.cuda.manual_seed_all(seed)
 
 
-
 class StatefulRNG:
-    """Context manager for reproducible RNG states across random, NumPy, and PyTorch.
-    """
+    """Context manager for reproducible RNG states across random, NumPy, and PyTorch."""
 
     def __init__(self, seed: int, ranked: bool = False):
         """Initialize and optionally rank-adjust RNGs with a given seed.
@@ -89,14 +88,12 @@ class StatefulRNG:
         torch.cuda.set_rng_state_all(state["cuda_rng_state"])
 
     def __enter__(self):
-        """Save current RNG states.
-        """
+        """Save current RNG states."""
         assert self._saved_state is None
         self._saved_state = self.state_dict()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        """Restore RNG states on context exit.
-        """
+        """Restore RNG states on context exit."""
         self.load_state_dict(self._saved_state)
         self._saved_state = None

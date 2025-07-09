@@ -32,7 +32,6 @@ from nemo_automodel.checkpoint._backports.filesystem import (
     SerializationFormat,
 )
 
-
 if TYPE_CHECKING:
     from fsspec import AbstractFileSystem
 

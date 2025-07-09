@@ -10,7 +10,6 @@ import torch
 
 from nemo_automodel.shared.import_utils import is_torch_min_version
 
-
 if is_torch_min_version("1.13.0"):
     dist_all_gather_func = torch.distributed.all_gather_into_tensor
 else:
@@ -22,7 +21,7 @@ class TimerBase(ABC):
     Timer base class.
     """
 
-    def __init__(self, name : str):
+    def __init__(self, name: str):
         """
         Base class for Timers.
 
@@ -136,8 +135,7 @@ class DummyTimer(TimerBase):
         Dummy timer elapsed time.
         """
         raise Exception(
-            "dummy timer should not be used to calculate elapsed time, "
-            "check if timer's log_level <= self._log_level."
+            "dummy timer should not be used to calculate elapsed time, check if timer's log_level <= self._log_level."
         )
 
     def active_time(self):
@@ -147,8 +145,7 @@ class DummyTimer(TimerBase):
         Note: Not supported for DummyTimer.
         """
         raise Exception(
-            "active timer should not be used to calculate elapsed time, "
-            "check if timer's log_level <= self._log_level."
+            "active timer should not be used to calculate elapsed time, check if timer's log_level <= self._log_level."
         )
 
 
@@ -308,7 +305,7 @@ class Timers:
         if name in self._timers:
             if log_level is not None:
                 assert log_level == self._log_levels[name], (
-                    "input log level {} does not match already existing " "log level {} for {} timer".format(
+                    "input log level {} does not match already existing log level {} for {} timer".format(
                         log_level, self._log_levels[name], name
                     )
                 )
@@ -361,9 +358,7 @@ class Timers:
         # pytorch yet. It is simpler to deal with a single tensor
         # and since we are only gathering a small amount of data,
         # it should be ok to use all-gather instead of gather.
-        rank_name_to_time = torch.zeros(
-            (world_size, len(names)), dtype=torch.float, device=torch.cuda.current_device()
-        )
+        rank_name_to_time = torch.zeros((world_size, len(names)), dtype=torch.float, device=torch.cuda.current_device())
         for i, name in enumerate(names):
             if name in self._timers:
                 # Here we don't need to pass the barrier flag as all

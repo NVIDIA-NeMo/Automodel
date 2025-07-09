@@ -91,6 +91,43 @@ jobs:
 
           echo "main=$no_fail_fast" | tee -a "$GITHUB_OUTPUT"
 
+  linting:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install ruff
+        run: |
+          pip install ruff
+
+      - name: Run ruff
+        run: |
+          ruff check .
+          ruff format --check .
+
+  Nemo_Linting_Test:
+    needs: linting
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Main
+        env:
+          RESULTS: ${{ toJson(needs.linting) }}
+        run: |
+          RESULT=$(echo "$RESULTS" | jq -r '.result')
+
+          if [[ "$RESULT" == "success" ]]; then
+            echo "All passed."
+            exit 0
+          else
+            echo "Some linting domains failed."
+            exit 1
+          fi
+
   cicd-wait-in-queue:
     needs: [pre-flight]
     runs-on: ubuntu-latest

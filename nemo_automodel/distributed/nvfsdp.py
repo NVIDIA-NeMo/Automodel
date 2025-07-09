@@ -71,13 +71,9 @@ class NVFSDPManager:
     )
     sequence_parallel: Optional[bool] = field(
         default=False,
-        metadata={
-            "help": "Enable sequence parallelism in TP plan if True. Not supported with nvFSDP right now."
-        },
+        metadata={"help": "Enable sequence parallelism in TP plan if True. Not supported with nvFSDP right now."},
     )
-    backend: Optional[str] = field(
-        default="nccl", metadata={"help": "Distributed backend, e.g. 'nccl' or 'gloo'."}
-    )
+    backend: Optional[str] = field(default="nccl", metadata={"help": "Distributed backend, e.g. 'nccl' or 'gloo'."})
     world_size: Optional[int] = field(
         default=None,
         # init=False,
@@ -98,39 +94,25 @@ class NVFSDPManager:
     init_nvfsdp_with_meta_device: Optional[bool] = field(
         default=False, metadata={"help": "Initialize nvFSDP with meta device if True."}
     )
-    grad_reduce_in_fp32: Optional[bool] = field(
-        default=False, metadata={"help": "Reduce gradients in fp32 if True."}
-    )
-    preserve_fp32_weights: Optional[bool] = field(
-        default=False, metadata={"help": "Preserve fp32 weights if True."}
-    )
-    overlap_grad_reduce: Optional[bool] = field(
-        default=True, metadata={"help": "Overlap gradient reduction if True."}
-    )
+    grad_reduce_in_fp32: Optional[bool] = field(default=False, metadata={"help": "Reduce gradients in fp32 if True."})
+    preserve_fp32_weights: Optional[bool] = field(default=False, metadata={"help": "Preserve fp32 weights if True."})
+    overlap_grad_reduce: Optional[bool] = field(default=True, metadata={"help": "Overlap gradient reduction if True."})
     overlap_param_gather: Optional[bool] = field(
         default=True, metadata={"help": "Overlap parameter gathering if True."}
     )
     check_for_nan_in_grad: Optional[bool] = field(
         default=True, metadata={"help": "Check for NaN in gradients if True."}
     )
-    average_in_collective: Optional[bool] = field(
-        default=False, metadata={"help": "Average in collective if True."}
-    )
-    disable_bucketing: Optional[bool] = field(
-        default=False, metadata={"help": "Disable bucketing if True."}
-    )
+    average_in_collective: Optional[bool] = field(default=False, metadata={"help": "Average in collective if True."})
+    disable_bucketing: Optional[bool] = field(default=False, metadata={"help": "Disable bucketing if True."})
     calculate_per_token_loss: Optional[bool] = field(
         default=False, metadata={"help": "Calculate per token loss if True."}
     )
     keep_fp8_transpose_cache_when_using_custom_fsdp: Optional[bool] = field(
         default=False, metadata={"help": "Keep fp8 transpose cache when using custom FSDP if True."}
     )
-    nccl_ub: Optional[bool] = field(
-        default=False, metadata={"help": "Use NCCL UBs if True."}
-    )
-    fsdp_double_buffer: Optional[bool] = field(
-        default=False, metadata={"help": "Use double buffer if True."}
-    )
+    nccl_ub: Optional[bool] = field(default=False, metadata={"help": "Use NCCL UBs if True."})
+    fsdp_double_buffer: Optional[bool] = field(default=False, metadata={"help": "Use double buffer if True."})
 
     def __post_init__(self):
         """
@@ -170,9 +152,7 @@ class NVFSDPManager:
         mesh_shape = (self.dp_size, self.cp_size, self.tp_size)
         mesh_names = ("data_parallel", "context_parallel", "tensor_parallel")
         for shape, name in zip(mesh_shape, mesh_names):
-            assert isinstance(
-                shape, int
-            ), "Expected {} to be an int, but got {}".format(name, type(shape))
+            assert isinstance(shape, int), "Expected {} to be an int, but got {}".format(name, type(shape))
             assert shape > 0, "Expected {} > 0, {}".format(name, shape)
 
         # build mesh [dp, cp, tp]
@@ -183,9 +163,7 @@ class NVFSDPManager:
         )
         # flatten dp+cp if cp>1
         if self.cp_size > 1:
-            self.device_mesh[("data_parallel", "context_parallel")]._flatten(
-                mesh_dim_name="dp_cp"
-            )
+            self.device_mesh[("data_parallel", "context_parallel")]._flatten(mesh_dim_name="dp_cp")
         return self
 
     def parallelize(self, model, optimizer=None, use_hf_tp_plan=False):
@@ -198,7 +176,7 @@ class NVFSDPManager:
 
         Args:
             model: The model to be parallelized.
-            optimizer: The optimizer for the model. If None, user need to call model.finish_grad_sync() 
+            optimizer: The optimizer for the model. If None, user need to call model.finish_grad_sync()
                 before optimizer.step(), model.install_optimized_model_weights() and model.zero_grad_buffer()
                 after optimizer.zero_grad()
             use_hf_tp_plan (bool): if true, will query the model for the TP plan.
@@ -234,9 +212,7 @@ class NVFSDPManager:
                 # TODO(boxiangw): investigate SP
                 if self.sequence_parallel and self.device_mesh.get_rank() == 0:
                     # TODO(boxiangw): Change this to a log
-                    print(
-                        "Sequence parallelism is disabled. It is not compatible with nvFSDP."
-                    )
+                    print("Sequence parallelism is disabled. It is not compatible with nvFSDP.")
 
                 tp_shard_plan = base_model_tp_plan
                 # TODO(boxiangw): Change this to a log

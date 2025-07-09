@@ -12,14 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
-import builtins
 import pytest
-import importlib
-from datasets import Dataset, Features, Value
 from datasets import Dataset
+
 import nemo_automodel.datasets.llm.squad as mqd
+
 make_squad_dataset = mqd.make_squad_dataset
+
 
 class DummyTokenizer:
     """
@@ -98,6 +97,7 @@ def patch_load_dataset(monkeypatch, tiny_hf_dataset):
     Monkey-patch datasets.load_dataset so no network call happens and emulate
     slice syntax like "train[:1]".
     """
+
     def _fake_load_dataset(name, split=None, **kw):
         if isinstance(split, str) and "[" in split:
             # e.g. "train[:3]"  → keep upper bound 3

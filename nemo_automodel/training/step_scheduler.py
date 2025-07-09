@@ -21,15 +21,18 @@ class StepScheduler(Stateful):
     """
     Scheduler for managing gradient accumulation and checkpointing steps.
     """
-    def __init__(self,
-                 grad_acc_steps: int,
-                 ckpt_every_steps: int,
-                 dataloader: Optional[int],
-                 val_every_steps: Optional[int] = None,
-                 start_step: int = 0,
-                 start_epoch: int = 0,
-                 num_epochs: int = 10,
-                 max_steps: Optional[int] = None):
+
+    def __init__(
+        self,
+        grad_acc_steps: int,
+        ckpt_every_steps: int,
+        dataloader: Optional[int],
+        val_every_steps: Optional[int] = None,
+        start_step: int = 0,
+        start_epoch: int = 0,
+        num_epochs: int = 10,
+        max_steps: Optional[int] = None,
+    ):
         """
         Initialize the StepScheduler.
 
@@ -43,17 +46,16 @@ class StepScheduler(Stateful):
             num_epochs (int): Total number of epochs.
             max_steps (int): Total number of steps to run.
         """
-        self.grad_acc_steps   = grad_acc_steps
+        self.grad_acc_steps = grad_acc_steps
         self.ckpt_every_steps = ckpt_every_steps
-        self.dataloader        = dataloader
-        self.step   = start_step
-        self.epoch  = start_epoch
+        self.dataloader = dataloader
+        self.step = start_step
+        self.epoch = start_epoch
         self.num_epochs = num_epochs
         self.epoch_len = len(dataloader)
-        self.grad_step = 0        # number of optimizer steps taken
+        self.grad_step = 0  # number of optimizer steps taken
         self.val_every_steps = val_every_steps
         self.max_steps = max_steps
-
 
     def __iter__(self):
         """

@@ -14,29 +14,20 @@
 
 from __future__ import annotations
 
+import logging
 import pathlib
+import time
 from typing import Any, Dict
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import wandb
 from torch.distributed.device_mesh import _mesh_resources
 from torch.utils.data import DataLoader
-
-import wandb
-from nemo_automodel.loggers.wandb_utils import suppress_wandb_log_messages
-from wandb import Settings
-
-import logging
-from nemo_automodel.training.base_recipe import BaseRecipe
-from nemo_automodel.training.step_scheduler import StepScheduler
-from nemo_automodel.training.utils import count_tail_padding
-
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoTokenizer
-from nemo_automodel.loggers.log_utils import setup_logging
-import time
-import logging
+from wandb import Settings
 
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.config.cli import parse_args_and_load_config
@@ -45,9 +36,11 @@ from nemo_automodel.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.distributed.init_utils import initialize_distributed
 from nemo_automodel.distributed.nvfsdp import NVFSDPManager
 from nemo_automodel.loggers.log_utils import setup_logging
+from nemo_automodel.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.rng import StatefulRNG
 from nemo_automodel.training.step_scheduler import StepScheduler
+from nemo_automodel.training.utils import count_tail_padding
 from nemo_automodel.utils.dist_utils import (
     clip_gradients,
     get_sync_ctx,
@@ -61,16 +54,17 @@ logger = logging.getLogger(__name__)
 #  Stateless helper functions
 # ---------------------------
 
+
 def build_model_and_optimizer(
-        device,
-        cfg_model,
-        cfg_opt,
-        use_hf_fa2,
-        cfg_peft,
-        model_wrapper,
-        seed, 
-        tp_size=1,
-    ) -> tuple[nn.Module, 'Optimizer']: # noqa: F821
+    device,
+    cfg_model,
+    cfg_opt,
+    use_hf_fa2,
+    cfg_peft,
+    model_wrapper,
+    seed,
+    tp_size=1,
+) -> tuple[nn.Module, "Optimizer"]:  # noqa: F821
     """Build and initialize a model.
 
     Args:
@@ -103,7 +97,7 @@ def build_model_and_optimizer(
             peft_fn = opts.pop("peft_fn")
             peft_fn(model, **opts)
 
-    if callable(getattr(model_wrapper, 'parallelize', None)):
+    if callable(getattr(model_wrapper, "parallelize", None)):
         # FSDP2 and nvFSDP should already be on the correct device
         if isinstance(model_wrapper, NVFSDPManager):
             # nvFSDP instantiate optimizer inside parallelize_function
@@ -129,7 +123,7 @@ def build_model_and_optimizer(
         # TP does not support foreach
         cfg_opt.foreach = False
     optimizer = cfg_opt.instantiate(params=trainable_params)
-    
+
     return model, optimizer
 
 
@@ -151,6 +145,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
         cfg_ckpt.pop("restore_from", None)
         ckpt_kwargs |= cfg_ckpt
     return CheckpointingConfig(**ckpt_kwargs)
+
 
 def build_loss_fn(device, cfg_loss):
     """Build a loss function.
@@ -322,7 +317,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.cfg.model,
             self.cfg.optimizer,
             use_hf_fa2,
-            self.cfg.get('peft', None),
+            self.cfg.get("peft", None),
             self.model_wrapper,
             seed=self.cfg.get("seed", 42),
             tp_size=self.cfg.get("distributed.tp_size", 1),
@@ -421,7 +416,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels, loss_mask)
         with train_ctx():
-            out  = self.model(**batch)
+            out = self.model(**batch)
             local_loss = self.loss_fn(
                 out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum"
             )

@@ -16,8 +16,8 @@ from __future__ import annotations
 
 from typing import Dict
 
-import torch.nn as nn
 import pytest
+import torch.nn as nn
 
 import nemo_automodel.utils.model_utils as model_utils
 
@@ -32,10 +32,11 @@ def dummy_model() -> nn.Module:
     - A `language_model` backbone
     - An additional unfrozen Linear layer (“other”) for sanity checks
     """
+
     class DummyModel(nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.token_embed = nn.Embedding(10, 3)              # embeddings
+            self.token_embed = nn.Embedding(10, 3)  # embeddings
             self.vision_tower = nn.Sequential(nn.Linear(4, 4))  # vision tower attr
             self.visual_extra = nn.Sequential(nn.Linear(5, 5))  # triggers "visual" name pattern
             self.language_model = nn.Sequential(nn.Linear(6, 6))
@@ -93,14 +94,22 @@ def test_print_trainable_parameters_non_zero_rank(dummy_model, capsys, monkeypat
 @pytest.mark.parametrize(
     "freeze_cfg, expect",
     [
-        ({"freeze_embeddings": True, "freeze_vision_tower": False, "freeze_language_model": False},
-         {"emb": False, "vision": True, "lang": True, "other": True}),
-        ({"freeze_embeddings": False, "freeze_vision_tower": True, "freeze_language_model": False},
-         {"emb": True, "vision": False, "lang": True, "other": True}),
-        ({"freeze_embeddings": False, "freeze_vision_tower": False, "freeze_language_model": True},
-         {"emb": True, "vision": True, "lang": False, "other": True}),
-        ({},  # rely on in-code defaults: embeddings=True, vision=True, language=False
-         {"emb": False, "vision": False, "lang": True, "other": True}),
+        (
+            {"freeze_embeddings": True, "freeze_vision_tower": False, "freeze_language_model": False},
+            {"emb": False, "vision": True, "lang": True, "other": True},
+        ),
+        (
+            {"freeze_embeddings": False, "freeze_vision_tower": True, "freeze_language_model": False},
+            {"emb": True, "vision": False, "lang": True, "other": True},
+        ),
+        (
+            {"freeze_embeddings": False, "freeze_vision_tower": False, "freeze_language_model": True},
+            {"emb": True, "vision": True, "lang": False, "other": True},
+        ),
+        (
+            {},  # rely on in-code defaults: embeddings=True, vision=True, language=False
+            {"emb": False, "vision": False, "lang": True, "other": True},
+        ),
     ],
 )
 def test_apply_parameter_freezing(dummy_model, freeze_cfg: Dict, expect: Dict):

@@ -14,13 +14,14 @@
 
 from __future__ import annotations
 
-import time
-import types
 import importlib
 import sys
+import time
+import types
 
 import pytest
 import torch
+
 try:
     cuda_available = torch.cuda.is_available()
 except:
@@ -50,7 +51,7 @@ def patch_torch_distributed(monkeypatch):
     dist_stub.get_world_size = lambda: 1
     dist_stub.get_rank = lambda: 0
     dist_stub.barrier = lambda group=None: None
-    dist_stub.is_initialized = lambda: False   # helps _get_default_group check
+    dist_stub.is_initialized = lambda: False  # helps _get_default_group check
 
     def _all_gather(dest: torch.Tensor, src: torch.Tensor):  # noqa: D401
         """
@@ -126,6 +127,7 @@ def test_timer_elapsed_resets_properly():
     assert second == 0.0
     # active_time aggregates all usage and must still be >= first
     assert t.active_time() >= first
+
 
 @pytest.mark.skipif(not cuda_available, reason="CUDA not available")
 def test_timers_collection_and_logging(monkeypatch, capsys):

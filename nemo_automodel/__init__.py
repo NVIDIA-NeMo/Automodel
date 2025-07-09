@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
+
 from .package_info import __package_name__, __version__
 
 __all__ = [
@@ -32,7 +33,7 @@ __all__ = [
 # ==== Promote NeMoAutoModelForCausalLM, AutoModelForImageTextToText into the top level ====
 try:
     # adjust this import path if your class lives somewhere else
-    from ._transformers.auto_model import NeMoAutoModelForCausalLM, AutoModelForImageTextToText
+    from ._transformers.auto_model import AutoModelForImageTextToText, NeMoAutoModelForCausalLM
 
     globals()["NeMoAutoModelForCausalLM"] = NeMoAutoModelForCausalLM
     globals()["AutoModelForImageTextToText"] = AutoModelForImageTextToText

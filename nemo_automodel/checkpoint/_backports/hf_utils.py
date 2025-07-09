@@ -22,7 +22,6 @@ from typing import Any, Optional
 
 import torch
 
-
 _metadata_fn: str = "model.safetensors.index.json"
 
 FILE_NAME = "model-{cpt_idx}-of-{num_files}"

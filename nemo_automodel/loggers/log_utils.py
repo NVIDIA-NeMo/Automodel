@@ -18,8 +18,8 @@ from functools import partial
 from logging import Filter, LogRecord
 from typing import Callable, Optional, Union
 
-
 logger = logging.getLogger(__name__)
+
 
 class RankFilter(logging.Filter):
     """
@@ -27,6 +27,7 @@ class RankFilter(logging.Filter):
 
     This filter allows log messages only for rank 0 by default.
     """
+
     def filter(self, record):
         """Decide whether to log the provided record.
 
@@ -37,13 +38,14 @@ class RankFilter(logging.Filter):
             bool: True if the log record should be logged, False otherwise.
         """
         # TODO(@akoumparouli): make this PP aware.
-        if 'RANK' in os.environ:
-            rank = int(os.environ.get('RANK'))
+        if "RANK" in os.environ:
+            rank = int(os.environ.get("RANK"))
             # permantly disable logging for rank != 0
             if rank > 0:
                 logging.disable(logging.CRITICAL)
                 return False
         return True
+
 
 def warning_filter(record: LogRecord) -> bool:
     """

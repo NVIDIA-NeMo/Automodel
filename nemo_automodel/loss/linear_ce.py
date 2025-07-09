@@ -66,7 +66,6 @@ from nemo_automodel.shared.import_utils import MISSING_CUT_CROSS_ENTROPY_MSG
 
 try:
     import cut_cross_entropy.tl_utils as tl_utils
-
     from cut_cross_entropy import linear_cross_entropy
 
     HAVE_CUT_CROSS_ENTROPY = True

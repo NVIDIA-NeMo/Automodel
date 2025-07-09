@@ -25,11 +25,11 @@ def pytest_addoption(parser):
         --use_local_test_data: use local test data/skip downloading from URL/GitHub (DEFAULT: False)
     """
     parser.addoption(
-        '--cpu', action='store_true', help="pass that argument to use CPU during testing (DEFAULT: False = GPU)"
+        "--cpu", action="store_true", help="pass that argument to use CPU during testing (DEFAULT: False = GPU)"
     )
     parser.addoption(
-        '--with_downloads',
-        action='store_true',
+        "--with_downloads",
+        action="store_true",
         help="pass this argument to active tests which download models from the cloud.",
     )
 
@@ -46,18 +46,18 @@ def device(request):
 @pytest.fixture(autouse=True)
 def run_only_on_device_fixture(request, device):
     """Fixture to skip tests based on the device"""
-    if request.node.get_closest_marker('run_only_on'):
-        if request.node.get_closest_marker('run_only_on').args[0] != device:
-            pytest.skip('skipped on this device: {}'.format(device))
+    if request.node.get_closest_marker("run_only_on"):
+        if request.node.get_closest_marker("run_only_on").args[0] != device:
+            pytest.skip("skipped on this device: {}".format(device))
 
 
 @pytest.fixture(autouse=True)
 def downloads_weights(request, device):
     """Fixture to validate if the with_downloads flag is passed if necessary"""
-    if request.node.get_closest_marker('with_downloads'):
+    if request.node.get_closest_marker("with_downloads"):
         if not request.config.getoption("--with_downloads"):
             pytest.skip(
-                'To run this test, pass --with_downloads option. It will download (and cache) models from cloud.'
+                "To run this test, pass --with_downloads option. It will download (and cache) models from cloud."
             )
 
 
@@ -71,9 +71,9 @@ def cleanup_local_folder():
     yield
 
     if Path("./NeMo_experiments").exists():
-        rmtree('./NeMo_experiments', ignore_errors=True)
+        rmtree("./NeMo_experiments", ignore_errors=True)
     if Path("./nemo_experiments").exists():
-        rmtree('./nemo_experiments', ignore_errors=True)
+        rmtree("./nemo_experiments", ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)

@@ -12,12 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import types
-import builtins
 import pytest
 
 cli = __import__("nemo_automodel.config.cli", fromlist=["dummy"])
-
 
 
 class DummyConfig:
@@ -25,6 +22,7 @@ class DummyConfig:
     Simple stand-in for the NeMo ConfigNode.
     It records every call to set_by_dotted so that the test can assert on them.
     """
+
     def __init__(self):
         self._calls = []
 
@@ -40,10 +38,7 @@ class DummyConfig:
     "argv, expected_cfg, expected_overrides",
     [
         (
-            ["prog", "--config", "model.yaml",
-             "--trainer.max_epochs", "10",
-             "--precision=bf16",
-             "--fast"],
+            ["prog", "--config", "model.yaml", "--trainer.max_epochs", "10", "--precision=bf16", "--fast"],
             "model.yaml",
             ["trainer.max_epochs=10", "precision=bf16", "fast=True"],
         ),
@@ -82,6 +77,7 @@ def test_parse_cli_argv_missing_path(monkeypatch):
     with pytest.raises(ValueError, match="Expected a path after --config"):
         cli.parse_cli_argv()
 
+
 def test_parse_args_and_load_config(monkeypatch):
     """
     Full end-to-end check with mocked YAML loader, translate_value,
@@ -100,7 +96,6 @@ def test_parse_args_and_load_config(monkeypatch):
     dummy_cfg = DummyConfig()
     monkeypatch.setattr(cli, "load_yaml_config", lambda path: dummy_cfg, raising=True)
 
-    captured_pairs = []                       # (val_str)
     monkeypatch.setattr(
         cli,
         "translate_value",

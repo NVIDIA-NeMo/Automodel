@@ -15,20 +15,19 @@
 """Checkpoint management utilities for HF models."""
 
 import glob
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
-import json
 
 import torch
 import torch.distributed
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
-
-from transformers import PreTrainedModel
-from safetensors.torch import save_file
 from safetensors import safe_open
+from safetensors.torch import save_file
+from transformers import PreTrainedModel
 
 from nemo_automodel.checkpoint._backports.filesystem import SerializationFormat
 from nemo_automodel.checkpoint._backports.hf_storage import (
@@ -44,6 +43,7 @@ class CheckpointingConfig:
     """
     Configuration for checkpointing.
     """
+
     enabled: bool
     checkpoint_dir: str | Path
     model_save_format: SerializationFormat | str
@@ -57,15 +57,13 @@ class CheckpointingConfig:
         Convert a raw string such as "safetensors" into the right Enum.
         """
         if isinstance(self.model_save_format, str):
-            self.model_save_format = SerializationFormat[
-                self.model_save_format.upper()
-            ]
+            self.model_save_format = SerializationFormat[self.model_save_format.upper()]
 
 
 def save_model(
-        model: nn.Module | PreTrainedModel,
-        weights_path: str,
-        checkpoint_config: CheckpointingConfig,
+    model: nn.Module | PreTrainedModel,
+    weights_path: str,
+    checkpoint_config: CheckpointingConfig,
 ):
     """
     Save a model state dictionary to a weights path.
@@ -94,7 +92,7 @@ def save_model(
         os.makedirs(model_path, exist_ok=True)
 
         if (
-            checkpoint_config.save_consolidated 
+            checkpoint_config.save_consolidated
             and checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS
             and not checkpoint_config.is_peft
         ):
@@ -113,8 +111,10 @@ def save_model(
         if not isinstance(model, PreTrainedModel):
             raise ValueError("PEFT checkpointing is only supported for PreTrainedModel")
         if not hasattr(model, "_automodel_peft_config"):
-            raise ValueError("PEFT checkpointing is only supported for models that have been trained with PEFT. "
-                             "Please use the `apply_lora_to_linear_modules` function to apply LoRA to the model.")
+            raise ValueError(
+                "PEFT checkpointing is only supported for models that have been trained with PEFT. "
+                "Please use the `apply_lora_to_linear_modules` function to apply LoRA to the model."
+            )
         peft_config = model._automodel_peft_config
         state_dict = model_state.state_dict()
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
@@ -276,7 +276,7 @@ def _get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
 
     Returns:
         Path to the directory containing the index file.
-    
+
     Raises:
         FileNotFoundError: If the index file is not found.
     """

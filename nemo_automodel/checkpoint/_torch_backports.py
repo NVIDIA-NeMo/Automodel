@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Runtime back-ports for old PyTorch versions. Will be deleted in future stable PyTorch versions.
-"""
+"""Runtime back-ports for old PyTorch versions. Will be deleted in future stable PyTorch versions."""
+
 from __future__ import annotations
 
 import importlib
 import logging
 
-
 logger = logging.getLogger(__name__)
+
 
 def apply_patches() -> None:
     """

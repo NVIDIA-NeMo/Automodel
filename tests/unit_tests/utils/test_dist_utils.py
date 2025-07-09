@@ -15,8 +15,8 @@
 from __future__ import annotations
 
 import os
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -39,9 +39,7 @@ class _FakeDist(SimpleNamespace):
         self.ReduceOp = SimpleNamespace(SUM="sum")
         # Fabricate FSDP type hierarchy deep enough for isinstance checks
         fsdp_mod = SimpleNamespace(
-            _fully_shard=SimpleNamespace(
-                _fully_shard=SimpleNamespace(FSDPModule=type("DummyFSDP", (), {}))
-            )
+            _fully_shard=SimpleNamespace(_fully_shard=SimpleNamespace(FSDPModule=type("DummyFSDP", (), {})))
         )
         self.fsdp = fsdp_mod
         self._initialised = True
@@ -127,6 +125,7 @@ def test_append_to_progress_log(tmp_path: Path, monkeypatch, patch_dist):
     assert "424242" in content
     assert "# GPUs: 4" in content
 
+
 def test_reduce_loss_no_dp(monkeypatch):
     """
     With dp_group=None the routine must simply sum the supplied tensors and
@@ -154,6 +153,7 @@ def test_get_sync_ctx(monkeypatch, patch_dist):
     with ctx:
         pass
 
+
 def test_rescale_gradients_with_dp_group(monkeypatch, patch_dist):
     """
     Verify that `rescale_gradients` uses the size reported for the *given*
@@ -164,7 +164,7 @@ def test_rescale_gradients_with_dp_group(monkeypatch, patch_dist):
     dp_group = object()  # any unique sentinel is fine
 
     # Report a group size of 3 for *this* handle.
-    def _fake_get_ws(group=None):           # noqa: D401
+    def _fake_get_ws(group=None):  # noqa: D401
         return 3 if group is dp_group else 1
 
     monkeypatch.setattr(patch_dist, "get_world_size", _fake_get_ws, raising=False)
@@ -202,9 +202,7 @@ def test_clip_gradients(monkeypatch):
             p.grad.mul_(min(1.0, factor))
 
     monkeypatch.setattr(torch.nn.utils, "get_total_norm", _get_total_norm, raising=False)
-    monkeypatch.setattr(
-        torch.nn.utils, "clip_grads_with_norm_", _clip_grads_with_norm_, raising=False
-    )
+    monkeypatch.setattr(torch.nn.utils, "clip_grads_with_norm_", _clip_grads_with_norm_, raising=False)
 
     # Build a toy model with exaggerated gradient values.
     model = torch.nn.Linear(2, 2, bias=False)

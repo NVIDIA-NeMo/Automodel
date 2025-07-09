@@ -14,7 +14,6 @@
 
 import torch
 
-
 # Common special tokens across VLM models
 QWEN_TOKENS = [
     "<|im_start|>",
@@ -40,12 +39,14 @@ LLAMA_TOKENS = [
 ]
 GEMMA_TOKENS = ["<image_soft_token>"]
 
-GEMMA_3N_TOKENS = ["<image_soft_token>",
-                   "<audio_soft_token>",
-                   "<start_of_audio>",
-                   "<start_of_image>",
-                   "<end_of_audio>",
-                   "<end_of_image>"]
+GEMMA_3N_TOKENS = [
+    "<image_soft_token>",
+    "<audio_soft_token>",
+    "<start_of_audio>",
+    "<start_of_image>",
+    "<end_of_audio>",
+    "<end_of_image>",
+]
 
 PAD_TOKENS = set(QWEN_TOKENS + LLAVA_TOKENS + LLAMA_TOKENS + GEMMA_TOKENS + GEMMA_3N_TOKENS)
 
@@ -86,7 +87,9 @@ def json2token(obj, sort_json_key: bool = True):
 
 
 def process_text_batch(
-    processor, texts: list[str], images: list | None = None,
+    processor,
+    texts: list[str],
+    images: list | None = None,
 ) -> dict[str, torch.Tensor]:
     """
     Process a batch of texts and optionally images.
@@ -116,4 +119,3 @@ def process_text_batch(
         )
 
     return batch
-

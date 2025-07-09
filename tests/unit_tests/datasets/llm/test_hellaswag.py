@@ -12,22 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import types
 import pytest
 from datasets import Dataset
+
 
 def _build_tiny_dataset():
     return Dataset.from_dict(
         {
-            "ctx":      ["ctx 1", "ctx 2"],
-            "endings":  [
+            "ctx": ["ctx 1", "ctx 2"],
+            "endings": [
                 ["e1_a", "e1_b", "e1_c", "e1_d"],
                 ["e2_a", "e2_b", "e2_c", "e2_d"],
             ],
-            "label":           [2, 0],        # → e1_c, e2_a
-            "attention_mask":  [[1, 1], [1, 1]],
+            "label": [2, 0],  # → e1_c, e2_a
+            "attention_mask": [[1, 1], [1, 1]],
         }
     )
+
 
 @pytest.fixture(autouse=True)
 def _patch_external_libs(monkeypatch):
@@ -88,7 +89,7 @@ def test_sample_limiting():
     ds = HellaSwag(
         path_or_dataset="ignored",
         tokenizer=dummy_tokenizer,
-        num_samples_limit=1,       # forces split 'train[:1]'
+        num_samples_limit=1,  # forces split 'train[:1]'
     )
     # Our stub still returns the same two rows
     assert len(ds) == 2

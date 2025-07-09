@@ -22,10 +22,10 @@ import torch
 
 import nemo_automodel.utils.sig_utils as sutils
 
-
 # ---------------------------------------------------------------------------
 # get_device
 # ---------------------------------------------------------------------------
+
 
 def test_get_device_nccl_cpu(monkeypatch):
     """
@@ -65,6 +65,7 @@ def test_get_device_unknown_backend(monkeypatch):
 # all_gather_item
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def fake_distributed(monkeypatch):
     """
@@ -77,9 +78,7 @@ def fake_distributed(monkeypatch):
     monkeypatch.setattr(torch.distributed, "get_backend", lambda: "gloo")  # re-used by get_device
 
     # A no-op all_gather that simply copies the input tensor into every output slot
-    def _fake_all_gather(out_list: list[torch.Tensor],
-                         in_tensor: torch.Tensor,
-                         *_args: Any, **_kw: Any) -> None:
+    def _fake_all_gather(out_list: list[torch.Tensor], in_tensor: torch.Tensor, *_args: Any, **_kw: Any) -> None:
         for out in out_list:
             out.copy_(in_tensor)
 
@@ -110,6 +109,7 @@ def test_all_gather_item_falls_back_when_not_initialised(monkeypatch):
 # ---------------------------------------------------------------------------
 # DistributedSignalHandler
 # ---------------------------------------------------------------------------
+
 
 def test_signal_handler_installs_and_restores(monkeypatch):
     """
