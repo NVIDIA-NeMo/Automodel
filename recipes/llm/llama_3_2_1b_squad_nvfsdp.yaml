@@ -34,7 +34,7 @@ rng:
   ranked: true
 
 model:
-  _target_: nemo_automodel._transformers.NeMoAutoModelForCausalLM.from_pretrained
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
 
 distributed:

@@ -16,7 +16,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel._peft.lora import LinearLoRA, apply_lora_to_linear_modules, dtype_from_str
+from nemo_automodel._peft.lora import LinearLoRA, apply_lora_to_linear_modules
 
 
 class DummyModel(nn.Module):
@@ -183,27 +183,3 @@ def test_no_patch_on_non_matching_module(model):
     apply_lora_to_linear_modules(model, target_modules=["nonexistent_module"], dim=4, alpha=8)
     assert not isinstance(model.linear1, LinearLoRA)
     assert not isinstance(model.linear2, LinearLoRA)
-
-
-def test_dtype_from_str_raises():
-    """
-    ensure dtype_from_str raises KeyError on non-dtype input
-    """
-    with pytest.raises(KeyError):
-        dtype_from_str("abc")
-
-
-def test_dtype_from_str_not_raises():
-    """
-    ensure dtype_from_str not raises KeyError on non-dtype input
-    """
-    res = dtype_from_str("torch.bfloat16")
-    assert res == torch.bfloat16
-
-
-def test_dtype_from_str_bypass():
-    """
-    ensure dtype_from_str bypasses lut on non-dtype input
-    """
-    res = dtype_from_str(torch.bfloat16)
-    assert res == torch.bfloat16
