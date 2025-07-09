@@ -28,7 +28,6 @@ import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 from safetensors import safe_open
 from safetensors.torch import save_file
-from transformers import PreTrainedModel
 
 from nemo_automodel._peft.lora import PeftConfig
 from nemo_automodel.checkpoint._backports.filesystem import SerializationFormat
@@ -62,7 +61,7 @@ class CheckpointingConfig:
             self.model_save_format = SerializationFormat[self.model_save_format.upper()]
 
     def to_dict(self):
-        return self.__dict__
+        return self.__dict__.copy()
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]):
@@ -78,7 +77,7 @@ class CheckpointingConfig:
 
 
 def save_model(
-    model: nn.Module | PreTrainedModel,
+    model: nn.Module,
     weights_path: str,
     checkpoint_config: CheckpointingConfig,
     peft_config: PeftConfig | None = None,
@@ -178,7 +177,7 @@ def save_model(
 
 
 def load_model(
-    model: torch.nn.Module | PreTrainedModel,
+    model: torch.nn.Module,
     weights_path: str,
     checkpoint_config: CheckpointingConfig,
 ):
@@ -205,8 +204,6 @@ def load_model(
     model_state = ModelState(model, checkpoint_config.model_save_format, checkpoint_config.is_peft)
 
     if checkpoint_config.is_peft:
-        if not isinstance(model, PreTrainedModel):
-            raise ValueError("PEFT checkpointing is only supported for PreTrainedModel")
         state_dict = model.state_dict()
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             with safe_open(os.path.join(model_path, "adapter_model.safetensors"), framework="pt") as f:
