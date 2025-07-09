@@ -31,14 +31,48 @@ from nemo_automodel.shared.import_utils import safe_import
 HAS_BNB, bitsandbytes = safe_import("bitsandbytes")
 
 MODEL_TYPE_TO_PEFT_TASK_TYPE = {
-        "SequenceClassification": "SEQ_CLS",
-        "Seq2SeqLM": "SEQ_2_SEQ_LM", 
-        "CausalLM": "CAUSAL_LM",
-        "TokenClassification": "TOKEN_CLS",
-        "QuestionAnswering": "QUESTION_ANS",
-        "FeatureExtraction": "FEATURE_EXTRACTION",
-        "ConditionalGeneration": "CONDITIONAL_GENERATION",
+    "SequenceClassification": "SEQ_CLS",
+    "Seq2SeqLM": "SEQ_2_SEQ_LM",
+    "CausalLM": "CAUSAL_LM",
+    "TokenClassification": "TOKEN_CLS",
+    "QuestionAnswering": "QUESTION_ANS",
+    "FeatureExtraction": "FEATURE_EXTRACTION",
+    "ConditionalGeneration": "CONDITIONAL_GENERATION",
+}
+
+def dtype_from_str(val):
+    """
+    Translate a str val of a dtype into the corresponding torch.dtype
+    Args:
+        val (str): the dotted path of the dtype (e.g., "torch.bfloat16").
+
+    Returns:
+        torch.dtype: the actual dtype (e.g., torch.bfloat16)
+    """
+    if isinstance(val, torch.dtype):
+        return val
+    lut = {
+        'torch.float': torch.float,
+        'torch.float32': torch.float,
+        'torch.float64': torch.float64,
+        'torch.double': torch.float64,
+        'torch.complex64': torch.complex,
+        'torch.cfloat': torch.complex,
+        'torch.float16': torch.float16,
+        'torch.half': torch.float16,
+        'torch.bfloat16': torch.bfloat16,
+        'torch.uint8': torch.uint8,
+        'torch.int8': torch.int8,
+        'torch.int16': torch.int16,
+        'torch.short': torch.short,
+        'torch.int32': torch.int32,
+        'torch.int': torch.int,
+        'torch.int64': torch.int64,
+        'torch.long': torch.long,
+        'torch.bool': torch.bool,
     }
+    return lut[val.lower()]
+
 
 class LinearLoRA(nn.Linear):
     """
@@ -130,6 +164,9 @@ class LinearLoRA(nn.Linear):
 
         in_features = obj.in_features
         out_features = obj.out_features
+        if isinstance(lora_dtype, str):
+            lora_dtype = dtype_from_str(lora_dtype)
+        assert lora_dtype is None or isinstance(lora_dtype, torch.dtype)
         dtype = lora_dtype or obj.weight.dtype
 
         obj.lora_A = nn.Linear(in_features, dim, bias=False, dtype=dtype, device=device)
@@ -292,7 +329,7 @@ def apply_lora_to_linear_modules(
     dropout_position: Literal["pre", "post"] = "post",
     lora_A_init: str = "xavier",
     lora_dtype: Optional[torch.dtype] = None,
-    use_triton: bool = True
+    use_triton: bool = False
 ):
     """
     Replace selected nn.Linear layers with LinearLoRA layers (in-place).
@@ -306,11 +343,14 @@ def apply_lora_to_linear_modules(
     # Freeze base model parameters
     for w in model.parameters():
         w.requires_grad_(False)
-    
+
     is_causal_lm = False
-    if hasattr(model, "config") and "CausalLM" in model.config.architectures[0]:
-        # for example, LlamaForCausalLM
-        is_causal_lm = True
+    try:
+        if hasattr(model, "config") and "CausalLM" in model.config.architectures[0]:
+            # for example, LlamaForCausalLM
+            is_causal_lm = True
+    except AttributeError:
+        is_causal_lm = False
 
     matcher = ModuleMatcher(target_modules, exclude_modules, match_all_linear, is_causal_lm)
     num_modules_matched = 0
@@ -331,8 +371,17 @@ def apply_lora_to_linear_modules(
            )
 
     # finalize the peft config
-    model_task = model.config.architectures[0].split("For")[-1]
-    task_type = MODEL_TYPE_TO_PEFT_TASK_TYPE[model_task]
+    try:
+        model_task = model.config.architectures[0].split("For")[-1]
+    except AttributeError:
+        model_task = "N/A"
+    try:
+        name_or_path = model.config.name_or_path
+        task_type = MODEL_TYPE_TO_PEFT_TASK_TYPE[model_task]
+    except AttributeError:
+        name_or_path = "N/A"
+        task_type = "CAUSAL_LM"
+
     model._automodel_peft_config = {
         "task_type": task_type,
         "peft_type": "LORA",
@@ -340,10 +389,10 @@ def apply_lora_to_linear_modules(
         "lora_alpha": alpha,
         "target_modules": list(final_target_modules),
         "bias": "none",
-        "base_model_name_or_path": model.config.name_or_path,
+        "base_model_name_or_path": name_or_path,
         "lora_dropout": dropout,
     }
-    
+
     return num_modules_matched
 
 
