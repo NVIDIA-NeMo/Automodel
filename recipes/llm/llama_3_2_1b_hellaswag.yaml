@@ -36,7 +36,6 @@ rng:
 model:
   _target_: nemo_automodel._transformers.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
-  torch_dtype: auto
 
 checkpoint:
   enabled: true
