@@ -109,6 +109,25 @@ jobs:
           ruff check .
           ruff format --check .
 
+  Nemo_Linting_Test:
+    needs: linting
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Main
+        env:
+          RESULTS: ${{ toJson(needs.linting) }}
+        run: |
+          RESULT=$(echo "$RESULTS" | jq -r '.result')
+
+          if [[ "$RESULT" == "success" ]]; then
+            echo "All passed."
+            exit 0
+          else
+            echo "Some linting domains failed."
+            exit 1
+          fi
+
   cicd-wait-in-queue:
     needs: [pre-flight]
     runs-on: ubuntu-latest
