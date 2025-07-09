@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+import inspect
 import logging
 import types
 
@@ -27,6 +29,7 @@ import inspect
 import functools
 
 
+
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 logger = logging.getLogger(__name__)
 
@@ -35,15 +38,12 @@ def _assert_same_signature(original, patched):
     """
     Raise AssertionError if the two call signatures differ.
     """
-    sig_orig  = inspect.signature(original)
+    sig_orig = inspect.signature(original)
     sig_patch = inspect.signature(patched)
 
     if sig_orig != sig_patch:
-        raise AssertionError(
-            f"Signature mismatch:\n"
-            f"  original: {sig_orig}\n"
-            f"  patched : {sig_patch}"
-        )
+        raise AssertionError(f"Signature mismatch:\n  original: {sig_orig}\n  patched : {sig_patch}")
+
 
 def patch_attention(obj, sdpa_method=None):
     """
@@ -69,10 +69,12 @@ def patch_attention(obj, sdpa_method=None):
 
     def patch_method(method):
         func = method.__func__
+
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs):
             with sdpa_kernel(sdpa_method):
                 return func(self, *args, **kwargs)
+
         wrapper.__doc__ = "SDPA kernel patch\n" + inspect.getdoc(method)
         return types.MethodType(wrapper, method.__self__)  # re-bind
 
@@ -82,6 +84,7 @@ def patch_attention(obj, sdpa_method=None):
 
     logging.info("Patched model with SDPA method= {}".format(sdpa_method))
     return obj
+
 
 def patch_model(model, use_liger_kernel=True, use_sdpa_patching=True, sdpa_method=None):
     """
@@ -234,24 +237,16 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
         use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
         sdpa_method = kwargs.pop("sdpa_method", None)
         attn_implementation = kwargs.pop("attn_implementation", "flash_attention_2")
-        model = super().from_config(
-            config,
-            **kwargs,
-            attn_implementation=attn_implementation,
-            torch_dtype=torch_dtype
-        )
+        model = super().from_config(config, **kwargs, attn_implementation=attn_implementation, torch_dtype=torch_dtype)
         try:
             return patch_model(model, use_liger_kernel, use_sdpa_patching, sdpa_method)
         except RuntimeError:
             del model
             # If patching failed, retry
             return cls.from_config(
-                config,
-                **kwargs,
-                use_liger_kernel=False,
-                torch_dtype=torch_dtype,
-                use_sdpa_patching=use_sdpa_patching
+                config, **kwargs, use_liger_kernel=False, torch_dtype=torch_dtype, use_sdpa_patching=use_sdpa_patching
             )
+
 
 class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
     """Drop-in replacement for ``transformers.AutoModelForImageTextToText`` with custom-kernels.
@@ -373,21 +368,12 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
         use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
         sdpa_method = kwargs.pop("sdpa_method", None)
         attn_implementation = kwargs.pop("attn_implementation", "flash_attention_2")
-        model = super().from_config(
-            config,
-            **kwargs,
-            attn_implementation=attn_implementation,
-            torch_dtype=torch_dtype
-        )
+        model = super().from_config(config, **kwargs, attn_implementation=attn_implementation, torch_dtype=torch_dtype)
         try:
             return patch_model(model, use_liger_kernel, use_sdpa_patching, sdpa_method)
         except RuntimeError:
             del model
             # If patching failed, retry
             return cls.from_config(
-                config,
-                **kwargs,
-                use_liger_kernel=False,
-                torch_dtype=torch_dtype,
-                use_sdpa_patching=use_sdpa_patching
+                config, **kwargs, use_liger_kernel=False, torch_dtype=torch_dtype, use_sdpa_patching=use_sdpa_patching
             )

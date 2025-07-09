@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import math
-import types
 from typing import Any
 
 import pytest
@@ -43,9 +42,7 @@ class DummyTokenizer:
 
     def _encode_single(self, text: str) -> list[int]:
         # 0, 1 and 2 are reserved; normal chars start at 10 for readability
-        return [self.bos_token_id] + [ord(c) % 100 + 10 for c in text] + [
-            self.eos_token_id
-        ]
+        return [self.bos_token_id] + [ord(c) % 100 + 10 for c in text] + [self.eos_token_id]
 
     def __call__(self, text: list[str] | str) -> dict[str, list[list[int]]]:
         if isinstance(text, str):
@@ -82,6 +79,7 @@ def _make_dummy_example(seq_len_ctx: int, seq_len_tgt: int) -> dict[str, Any]:
     context = "C" * seq_len_ctx
     target = "T" * seq_len_tgt
     return {"context": context, "target": target}
+
 
 def test_batchify_adds_batch_dimension() -> None:
     """`batchify` must insert dim-0 in-place when given a 1-D tensor."""
@@ -157,7 +155,7 @@ def test_default_collater_shapes() -> None:
     # Same seq length for all keys
     lens = {v.shape[1] for v in collated.values()}
     assert len(lens) == 1
-    seq_len = lens.pop()
+    lens.pop()
 
     # Verify padded values
     assert collated["input_ids"][1, 1:].eq(0).all()
@@ -169,6 +167,7 @@ def test_default_collater_shapes() -> None:
     # Sanity on dtype
     for tensor in collated.values():
         assert tensor.dtype == torch.long
+
 
 def test_tokenize_function_strips_special_tokens(dummy_tokenizer: DummyTokenizer) -> None:
     """
@@ -193,7 +192,7 @@ def test_tokenize_function_strips_special_tokens(dummy_tokenizer: DummyTokenizer
     lbl = out["labels"][0]
 
     assert len(ids) == len(lbl)  # same length by construction
-    assert lbl.count(-100) >= len(ids) - len("BBB") - 1 # at least context masked
+    assert lbl.count(-100) >= len(ids) - len("BBB") - 1  # at least context masked
 
     # Ensure context's final token is *not* a special token (eos stripped)
     ctx_len = len(dummy_tokenizer._encode_single("AAA")) - 1  # eos removed
@@ -241,6 +240,7 @@ def test_pad_function_behaviour(dummy_tokenizer: DummyTokenizer, max_len: int) -
         if key == "attention_mask":
             # Padding token for attention_mask is 0
             assert seq[0][-1] in (0, 1)
+
 
 @pytest.mark.skipif(
     pytest.importorskip("datasets", reason="datasets not installed") is None

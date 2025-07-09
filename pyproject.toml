@@ -99,6 +99,7 @@ docs = [
     "myst_parser",         # For our markdown docs
     "nvidia-sphinx-theme", # Our NVIDIA theme
 ]
+linting = ["ruff~=0.9.0"]
 test = ["coverage", "pytest"]
 nvfsdp = ["nvfsdp"]
 
@@ -119,30 +120,16 @@ omit = [
 ]
 
 [tool.ruff]
-
-# Match black's line length
 line-length = 120
-target-version = "py310"
 
-# Exclude common directories that shouldn't be linted
-exclude = [
-    ".git",
-    ".github",
-    ".venv",
-    "venv",
-    "__pycache__",
-    "*.egg",
-    "build",
-    "dist",
-    "docs/source/conf.py",
-    "setup.py",
-]
-
-# Files to completely ignore
-extend-exclude = ["*.ipynb"]
+[tool.ruff.format]
+quote-style = "double"
+skip-magic-trailing-comma = false
+line-ending = "auto"
 
 [tool.ruff.lint]
-# Configure imports sorting to match isort
+# Enable all `pydocstyle` rules, limiting to those that adhere to the
+# Google convention via `convention = "google"`, below.
 select = [
     "F541", # f-string without any placeholders
     "F841", # local variable assigned but never used
@@ -152,49 +139,23 @@ select = [
     "E266", # too many leading '#' for block comment
     "I",    # isort
     "D101", # docstring
-    "D212", # first doc-string line is empty
-    "D",
+    "D103",
 ]
 
-# Additional rules can be added here
 ignore = [
-    "D100", # Missing docstring in public module
-    "D200", # one line doc-string shoudl fit in one line
-    "D212", # doc-string starts with empty line
     "E501", # Line too long - handled by formatter
-]
-[tool.ruff.lint.isort]
-known-first-party = ["nvfsdp"]
-known-third-party = ["examples", "scripts"]
-section-order = [
-    "future",
-    "standard-library",
-    "third-party",
-    "first-party",
-    "local-folder",
-]
-lines-after-imports = 2
-
-[tool.ruff.lint.per-file-ignores]
-# Ignore import violations in __init__ files
-"__init__.py" = ["F401", "F403", "D104"]
-# Ignore docstring requirements in test files
-"test_*.py" = ["D101", "D103"]
-"*_test.py" = ["D101", "D103"]
-"tests/*.py" = ["D101", "D103"]
-"nemo_automodel/checkpoint/_backports/*.py" = [
     "D101",
     "D103",
-    "D205",
-    "D417",
-    "D415",
 ]
-
-[tool.ruff.format]
-# Match black configuration
-quote-style = "double"
-skip-magic-trailing-comma = false
-line-ending = "auto"
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
+
+# Section to exclude errors for different file types
+[tool.ruff.lint.per-file-ignores]
+# Ignore all directories named `tests`.
+"tests/**" = ["D"]
+# Ignore all files that end in `_test.py`.
+"*_test.py" = ["D"]
+# Ignore F401 (import but unused) in __init__.py
+"__init__.py" = ["F401"]

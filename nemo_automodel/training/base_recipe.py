@@ -40,15 +40,14 @@ def has_load_restore_state(object):
     Returns:
         bool: returns True if has callable load_state_dict and state_dict
     """
-    return all(
-        callable(getattr(object, attr, None))
-        for attr in ('load_state_dict', 'state_dict')
-    )
+    return all(callable(getattr(object, attr, None)) for attr in ("load_state_dict", "state_dict"))
+
 
 class BaseRecipe:
     """
     BaseRecipe provides checkpoint load/save functionality for recipes.
     """
+
     def __setattr__(self, key, value):
         """
         Overriden __setattr__ to keep track of stateful classes.
@@ -62,18 +61,16 @@ class BaseRecipe:
 
         """
         # assuming no one will do recipe.__dict__['__state_tracked'] = None
-        if key == '__state_tracked':
+        if key == "__state_tracked":
             raise ValueError("cannot set __state_tracked")
-        if '__state_tracked' not in self.__dict__:
-            self.__dict__['__state_tracked'] = set()
+        if "__state_tracked" not in self.__dict__:
+            self.__dict__["__state_tracked"] = set()
         # Track stateful objects unless they are validation/eval components.
-        should_track = (
-            isinstance(value, (nn.Module, Optimizer)) or has_load_restore_state(value)
-        )
+        should_track = isinstance(value, (nn.Module, Optimizer)) or has_load_restore_state(value)
 
         if should_track and not any(substr in key.lower() for substr in ("val", "eval", "test")):
-            assert key not in self.__dict__['__state_tracked']
-            self.__dict__['__state_tracked'].add(key)
+            assert key not in self.__dict__["__state_tracked"]
+            self.__dict__["__state_tracked"].add(key)
         super().__setattr__(key, value)
 
     def save_checkpoint(self, epoch: int, step: int):
@@ -99,7 +96,7 @@ class BaseRecipe:
         # TODO(@adil-a): Change this when we create a LR scheduler class
         model, optimizer = None, None
 
-        for key in self.__dict__['__state_tracked']:
+        for key in self.__dict__["__state_tracked"]:
             if isinstance(getattr(self, key), nn.Module):
                 model = getattr(self, key)
             elif isinstance(getattr(self, key), Optimizer):
@@ -122,10 +119,8 @@ class BaseRecipe:
         """
         if not self.checkpoint_config.enabled:
             if (
-                (
-                    not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-                ) and restore_from is not None
-            ):
+                not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+            ) and restore_from is not None:
                 print("Enable checkpointing to resume from a checkpoint, skipping...", flush=True)
             return
 
@@ -143,17 +138,13 @@ class BaseRecipe:
         # TODO(@adil-a): Change this when we create a LR scheduler class
         model, optimizer = None, None
 
-        for key in self.__dict__['__state_tracked']:
+        for key in self.__dict__["__state_tracked"]:
             if isinstance(getattr(self, key), nn.Module):
                 model = getattr(self, key)
             elif isinstance(getattr(self, key), Optimizer):
                 optimizer = getattr(self, key)
             else:
-                getattr(self, key).load_state_dict(
-                    torch.load(
-                        os.path.join(ckpt_dir, f"{key}.pt"), weights_only=False
-                    )
-                )
+                getattr(self, key).load_state_dict(torch.load(os.path.join(ckpt_dir, f"{key}.pt"), weights_only=False))
 
         load_model(model, ckpt_dir, self.checkpoint_config)
         load_optimizer(optimizer, model, ckpt_dir)

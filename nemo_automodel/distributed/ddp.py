@@ -30,22 +30,13 @@ class DDPManager:
         rank (int): Global rank of this process. This is set during distributed setup.
         world_size (int): Total number of processes in the distributed group. Set at distributed setup.
     """
-    backend: str = field(
-        default="nccl",
-        metadata={"help": "Distributed backend, e.g. 'nccl' or 'gloo'."}
-    )
 
-    world_size: int = field(
-        default_factory=lambda: int,
-        metadata={"help": "Total number of distributed processes."}
-    )
+    backend: str = field(default="nccl", metadata={"help": "Distributed backend, e.g. 'nccl' or 'gloo'."})
+
+    world_size: int = field(default_factory=lambda: int, metadata={"help": "Total number of distributed processes."})
 
     # This is populated in setup_distributed(), not by user:
-    rank: int = field(
-        init=False,
-        default_factory=lambda: int,
-        metadata={"help": "Global rank of this process."}
-    )
+    rank: int = field(init=False, default_factory=lambda: int, metadata={"help": "Global rank of this process."})
 
     def setup_distributed(self):
         """
@@ -91,10 +82,7 @@ class DDPManager:
         Returns:
             torch.nn.parallel.DistributedDataParallel: The DDP-wrapped model.
         """
-        return DDP(
-            model.to(self.device),
-            device_ids=[self.device] if self.device.type == "cuda" else None
-        )
+        return DDP(model.to(self.device), device_ids=[self.device] if self.device.type == "cuda" else None)
 
     # @contextmanager
     # def no_sync(self):
