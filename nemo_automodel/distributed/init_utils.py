@@ -38,14 +38,17 @@ class DistInfo:
         device (torch.device): The device assigned to the current process.
         is_main (bool): True if the process is the main process (rank 0).
     """
+
     backend: str
     rank: int
     world_size: int
     device: torch.device
     is_main: bool
 
+
 def initialize_distributed(
-    backend, timeout_minutes=1,
+    backend,
+    timeout_minutes=1,
 ):
     """Initialize the torch.distributed environment and core model parallel infrastructure.
 
@@ -101,7 +104,7 @@ def initialize_distributed(
         atexit.register(destroy_global_state)
         torch.distributed.barrier(device_ids=[get_local_rank_preinit()])
 
-    rank  = torch.distributed.get_rank()
+    rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
     device = torch.device("cuda", rank % torch.cuda.device_count())
     return DistInfo(backend, rank, world_size, device, rank == 0)
