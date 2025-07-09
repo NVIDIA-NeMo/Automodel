@@ -17,7 +17,7 @@ import random
 from datasets import Dataset, Features, Sequence, Value
 
 
-def make_vocab(vocab_size:int=100):
+def make_vocab(vocab_size: int = 100):
     """
     Build a trivial vocab; index 0=<pad>, 1=<eos>, rest = word_i.
     """
@@ -26,14 +26,16 @@ def make_vocab(vocab_size:int=100):
         vocab[f"tok_{i}"] = i
     return vocab
 
-def gen_sentence_ids(vocab, mean_len:float, std_len:float, max_len:int):
+
+def gen_sentence_ids(vocab, mean_len: float, std_len: float, max_len: int):
     """
     Sentence generator with Gaussian length control.
     """
-    words = list(vocab.values())[2:]     # exclude <pad>, <eos>
+    words = list(vocab.values())[2:]  # exclude <pad>, <eos>
     # truncated Gaussian
     L = max(1, min(max_len, int(random.gauss(mean_len, std_len))))
     return random.choices(words, k=L) + [vocab["<eos>"]]
+
 
 def flush_block(block, block_size):
     """
@@ -42,23 +44,24 @@ def flush_block(block, block_size):
     pos, pos_ids = 0, []
     for tid in block:
         pos_ids.append(pos)
-        pos = 0 if tid == 1 else pos + 1          # 1 == <eos>
+        pos = 0 if tid == 1 else pos + 1  # 1 == <eos>
     return {
         "input_ids": block,
-        "attention_mask": [1]*block_size,
+        "attention_mask": [1] * block_size,
         "labels": block.copy(),
         "position_ids": pos_ids,
     }
 
+
 def build_packed_dataset(
-        *,
-        num_blocks:int          = 10,
-        block_size:int          = 128,
-        mean_len:float          = 20.0,
-        std_len:float           = 6.0,
-        vocab_size:int          = 100,
-        max_sentence_len:int    = 64,
-        seed:int                = 0,
+    *,
+    num_blocks: int = 10,
+    block_size: int = 128,
+    mean_len: float = 20.0,
+    std_len: float = 6.0,
+    vocab_size: int = 100,
+    max_sentence_len: int = 64,
+    seed: int = 0,
 ):
     """
     Dataset builder.
@@ -82,13 +85,16 @@ def build_packed_dataset(
     if len(current) == block_size and len(examples) < num_blocks:
         examples.append(flush_block(current, block_size))
 
-    features = Features({
-        "input_ids":     Sequence(Value("int64")),
-        "attention_mask":Sequence(Value("int8")),
-        "labels":        Sequence(Value("int64")),
-        "position_ids":  Sequence(Value("int64")),
-    })
+    features = Features(
+        {
+            "input_ids": Sequence(Value("int64")),
+            "attention_mask": Sequence(Value("int8")),
+            "labels": Sequence(Value("int64")),
+            "position_ids": Sequence(Value("int64")),
+        }
+    )
     return Dataset.from_list(examples[:num_blocks], features=features)
+
 
 if __name__ == "__main__":
     ds = build_packed_dataset(
@@ -99,5 +105,5 @@ if __name__ == "__main__":
         vocab_size=50,
     )
     print(ds)
-    print("Row-0 lengths:", {k: len(v) for k,v in ds[0].items()})
+    print("Row-0 lengths:", {k: len(v) for k, v in ds[0].items()})
     print("Row-0 position_ids:", ds[0]["position_ids"])

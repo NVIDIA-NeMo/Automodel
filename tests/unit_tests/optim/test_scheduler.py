@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
+import logging
 import math
+
+import pytest
 import torch
 from torch.optim import Adam
+
 from nemo_automodel.optim.scheduler import OptimizerParamScheduler
-import logging
+
 
 @pytest.fixture
 def dummy_optimizer():
@@ -352,8 +355,7 @@ def test_get_lr_linear_decay(dummy_optimizer, num_steps, expected_lr):
         (100, 1e-3),  # End of warmup
         (
             550,
-            1e-6
-            + (1e-3 - 1e-6) * 0.5 * (math.cos(math.pi * ((550 - 100) / (1000 - 100))) + 1.0),
+            1e-6 + (1e-3 - 1e-6) * 0.5 * (math.cos(math.pi * ((550 - 100) / (1000 - 100))) + 1.0),
         ),  # Mid cosine decay
         (1000, 1e-6),  # End of decay
         (1100, 1e-6),  # Beyond decay steps, should be min_lr
@@ -487,7 +489,7 @@ def test_get_lr_wsd_linear_decay(dummy_optimizer, num_steps, expected_lr_wsd):
         (100, 1e-3),  # Still constant LR before WSD annealing starts
         (
             850,
-            0.0005005000000000001
+            0.0005005000000000001,
             # 1e-6 + (1e-3 - 1e-6) * 0.5 * (math.cos(math.pi * (50 / 300)) + 1.0),
         ),  # Cosine WSD decay
         (1000, 1e-6),  # End of WSD decay
@@ -590,7 +592,7 @@ def test_get_lr_wsd_minus_sqrt_decay(dummy_optimizer, num_steps, expected_lr_wsd
     scheduler.num_steps = num_steps
     param_group = dummy_optimizer.param_groups[0]
     lr = scheduler.get_lr(param_group)
-    assert math.isclose(lr, expected_lr_wsd, rel_tol=1e-6), (lr)
+    assert math.isclose(lr, expected_lr_wsd, rel_tol=1e-6), lr
 
 
 def test_get_lr_unsupported_style(dummy_optimizer):
@@ -792,7 +794,10 @@ def test_load_state_dict_use_checkpoint_false_mismatch(dummy_optimizer, caplog):
         "wd_incr_style": "linear",
     }
 
-    with pytest.raises(AssertionError, match="OptimizerParamScheduler: class input value 0.001 and checkpointvalue 0.002 for learning rate do not match"):
+    with pytest.raises(
+        AssertionError,
+        match="OptimizerParamScheduler: class input value 0.001 and checkpointvalue 0.002 for learning rate do not match",
+    ):
         scheduler.load_state_dict(checkpoint_state)
 
 
@@ -804,7 +809,7 @@ def test_load_state_dict_override_true(dummy_optimizer, caplog):
     caplog.set_level(logging.INFO)
 
     with pytest.raises(AssertionError, match="both override and use-checkpoint are set"):
-        scheduler = OptimizerParamScheduler(
+        scheduler = OptimizerParamScheduler(  # noqa: F841
             optimizer=dummy_optimizer,
             init_lr=1e-5,
             max_lr=1e-3,
@@ -819,6 +824,7 @@ def test_load_state_dict_override_true(dummy_optimizer, caplog):
             use_checkpoint_opt_param_scheduler=True,  # This will be ignored due to override
             override_opt_param_scheduler=True,
         )
+
 
 def test_load_state_dict_backward_compatibility(dummy_optimizer, caplog):
     """

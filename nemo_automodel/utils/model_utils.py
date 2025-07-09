@@ -18,7 +18,6 @@ import torch.nn as nn
 
 from nemo_automodel.utils.dist_utils import get_rank_safe
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -40,9 +39,7 @@ def print_trainable_parameters(model):
         print("--------------------------------")
         print(f"Trainable parameters: {trainable_params:,}")
         print(f"Total parameters: {all_param:,}")
-        print(
-            f"Trainable parameters percentage: {100 * trainable_params / all_param:.2f}%"
-        )
+        print(f"Trainable parameters percentage: {100 * trainable_params / all_param:.2f}%")
         print("--------------------------------")
 
     return trainable_params, all_param
@@ -50,7 +47,7 @@ def print_trainable_parameters(model):
 
 def _freeze_module_by_attribute_and_patterns(model, attribute_name, name_patterns):
     """Helper function to freeze parameters by attribute name and name patterns.
-    
+
     Args:
         model: The model to apply freezing to.
         attribute_name: Name of the model attribute to freeze (e.g., 'vision_tower').
@@ -60,7 +57,7 @@ def _freeze_module_by_attribute_and_patterns(model, attribute_name, name_pattern
     if hasattr(model, attribute_name):
         for param in getattr(model, attribute_name).parameters():
             param.requires_grad = False
-    
+
     # Freeze by name patterns
     for name, module in model.named_modules():
         if any(pattern in name.lower() for pattern in name_patterns):
@@ -93,25 +90,12 @@ def apply_parameter_freezing(model, freeze_config):
 
     # Freeze vision tower
     if freeze_vision_tower:
-        _freeze_module_by_attribute_and_patterns(
-            model, 
-            "vision_tower", 
-            ["vision", "visual", "image_encoder"]
-        )
-    
+        _freeze_module_by_attribute_and_patterns(model, "vision_tower", ["vision", "visual", "image_encoder"])
+
     # Freeze audio tower
     if freeze_audio_tower:
-        _freeze_module_by_attribute_and_patterns(
-            model, 
-            "audio_tower", 
-            ["audio", "audio_encoder"]
-        )
+        _freeze_module_by_attribute_and_patterns(model, "audio_tower", ["audio", "audio_encoder"])
 
     # Freeze language model backbone
     if freeze_language_model:
-        _freeze_module_by_attribute_and_patterns(
-            model, 
-            "language_model", 
-            ["language", "text", "llm"]
-        )
-
+        _freeze_module_by_attribute_and_patterns(model, "language_model", ["language", "text", "llm"])

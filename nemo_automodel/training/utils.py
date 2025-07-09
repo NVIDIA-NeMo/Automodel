@@ -14,6 +14,7 @@
 
 import torch
 
+
 @torch.no_grad()
 def count_tail_padding(labels, ignore_label=-100):
     """Counts the total number of padding token in the tail of labels

@@ -14,10 +14,9 @@
 from __future__ import annotations
 
 import json
-from typing import List, Dict
+from typing import Dict, List
 
 import pytest
-from unittest.mock import patch
 
 import nemo_automodel.datasets.vlm.datasets as ds
 
@@ -125,7 +124,6 @@ def test_make_cord_v2_dataset(monkeypatch, stub_json2token, ground_key, wrapper)
 
     # The assistant text must be exactly what json2token produced
     assistant_payload = assistant_turn["content"][0]
-    expected_text = stub_json2token[0]["value"]  # first (and only) call argument
     assert assistant_payload["text"].startswith("TOK::")
 
     # Called exactly once per GT-json, always with sort_json_key=True
@@ -136,3 +134,43 @@ def test_make_cord_v2_dataset(monkeypatch, stub_json2token, ground_key, wrapper)
     assert len(stub_json2token) == expected_calls
     for call in stub_json2token:
         assert call["sort_json_key"] is True
+
+
+def test_make_medpix_dataset(monkeypatch):
+    """End-to-end sanity check for `make_medpix_dataset`."""
+    fake_ds = [
+        {
+            "image_id": "medpix_001.jpg",
+            "question": "What is shown in this medical image?",
+            "answer": "This is a chest X-ray showing normal lung fields.",
+        },
+        {
+            "image_id": "medpix_002.jpg",
+            "question": "Describe the findings in this image.",
+            "answer": "The image shows a fracture in the left femur.",
+        },
+    ]
+
+    # Patch `load_dataset` so no network call is issued.
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: fake_ds)
+
+    result = ds.make_medpix_dataset()
+
+    assert len(result) == len(fake_ds)
+    for sample, src in zip(result, fake_ds, strict=True):
+        assert list(sample) == ["conversation"]
+
+        conversation = sample["conversation"]
+        assert len(conversation) == 2
+
+        # user turn
+        user_turn = conversation[0]
+        assert user_turn["role"] == "user"
+        assert user_turn["content"][0] == {"type": "image", "image": src["image_id"]}
+        assert user_turn["content"][1] == {"type": "text", "text": src["question"]}
+
+        # assistant turn
+        assistant_turn = conversation[1]
+        assert assistant_turn["role"] == "assistant"
+        assistant_payload = assistant_turn["content"][0]
+        assert assistant_payload == {"type": "text", "text": src["answer"]}

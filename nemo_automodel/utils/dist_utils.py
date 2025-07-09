@@ -18,11 +18,11 @@ import logging
 import os
 from contextlib import ContextDecorator, nullcontext
 from datetime import datetime
-import torch
 from typing import Optional
+
+import torch
 import torch.distributed
 import torch.distributed as dist
-
 
 logger = logging.getLogger(__name__)
 
@@ -187,9 +187,7 @@ def append_to_progress_log(save_dir: str, string: str, barrier: bool = True) -> 
         with open(progress_log_filename, "a+") as f:
             job_id = os.getenv("SLURM_JOB_ID", "")
             num_gpus = get_world_size_safe()
-            f.write(
-                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\tJob ID: {job_id}\t# GPUs: {num_gpus}\t{string}\n"
-            )
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\tJob ID: {job_id}\t# GPUs: {num_gpus}\t{string}\n")
 
 
 def barrier_and_log(string: str) -> None:
@@ -262,6 +260,7 @@ def get_sync_ctx(model, is_optim_step):
         sync_ctx = nullcontext()
     return sync_ctx
 
+
 @torch.no_grad()
 def rescale_gradients(model, num_tokens_for_grad_scaling, dp_group=None):
     """
@@ -275,13 +274,14 @@ def rescale_gradients(model, num_tokens_for_grad_scaling, dp_group=None):
     num_tokens_for_grad_scaling = num_tokens_for_grad_scaling.clone().detach()
     dp_group_size = 1
     if dp_group is not None:
-       dist.all_reduce(num_tokens_for_grad_scaling, group=dp_group)
-       dp_group_size = dist.get_world_size(group=dp_group)
+        dist.all_reduce(num_tokens_for_grad_scaling, group=dp_group)
+        dp_group_size = dist.get_world_size(group=dp_group)
     # DDP/FSDP reduces gradients across ranks, so we need to scale by the world size to inverse it
     scaling_factor = dp_group_size / num_tokens_for_grad_scaling
     for param in model.parameters():
         if param.grad is not None:
             param.grad.data.mul_(scaling_factor)
+
 
 # based on: https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/utils.py#L278
 @torch.no_grad()

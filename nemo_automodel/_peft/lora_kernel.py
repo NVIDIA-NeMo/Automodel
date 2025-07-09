@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.shared.import_utils import MISSING_TRITON_MSG, null_decorator
+from unittest.mock import MagicMock
+
 import torch
 from packaging import version
-from unittest.mock import MagicMock
+
+from nemo_automodel.shared.import_utils import MISSING_TRITON_MSG, null_decorator
 
 try:
     import triton

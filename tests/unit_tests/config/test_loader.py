@@ -14,18 +14,17 @@
 from __future__ import annotations
 
 import importlib
-import os
 import sys
 import textwrap
 from pathlib import Path
 from typing import Any
 
 import pytest
-import yaml
 
 from nemo_automodel.config.loader import (
     ConfigNode,
     _resolve_target,
+    load_module_from_file,
     load_yaml_config,
     translate_value,
 )
@@ -38,6 +37,7 @@ def tmp_module(tmp_path: Path, monkeypatch):
     imports and yields it.  Each test using this fixture receives an independent
     module namespace.
     """
+
     def _factory(name: str, source: str) -> Any:
         mod_path = tmp_path / f"{name}.py"
         mod_path.write_text(textwrap.dedent(source))
@@ -57,8 +57,8 @@ def tmp_module(tmp_path: Path, monkeypatch):
         ("True", True),
         ("false", False),
         ("False", False),
-        ("123", 123),            # int via literal_eval
-        ("3.14", 3.14),          # float via literal_eval
+        ("123", 123),  # int via literal_eval
+        ("3.14", 3.14),  # float via literal_eval
         ("{'a': 1}", {"a": 1}),  # dict via literal_eval
         ("[1, 2, 3]", [1, 2, 3]),
         ("not_a_number", "not_a_number"),  # fall-back → original string
@@ -165,9 +165,30 @@ def test_instantiate_simple(tmp_module):
     assert (obj.x, obj.y) == (1, 2)
 
 
+def test_instantiate_simple_raises(tmp_module):
+    """
+    Instantiate a simple object with scalar arguments supplied as strings
+    that must be translated to int.
+    """
+    mod = tmp_module(  # noqa: F841
+        "factory_mod",
+        """
+        class Point:
+            def __init__(self, x=0, y=0):
+                self.x = x
+                self.y = y
+        """,
+    )
+    cfg = ConfigNode(
+        {"_target_": "factory_mod.Point", "x1": "1", "y": "2"},
+    )
+    with pytest.raises(TypeError, match=r"Point.__init__.. got an unexpected keyword argument 'x1'"):
+        obj = cfg.instantiate()  # noqa: F841
+
+
 def test_instantiate_nested(tmp_module):
     """Nested ConfigNodes with their own _target_ must be instantiated first."""
-    mod = tmp_module(
+    mod = tmp_module(  # noqa: F841
         "nested_mod",
         """
         def to_int(value):
@@ -195,7 +216,7 @@ def test_instantiate_nested(tmp_module):
 
 def test_instantiate_with_overrides(tmp_module):
     """Keyword overrides passed to instantiate() must take precedence."""
-    mod = tmp_module(
+    mod = tmp_module(  # noqa: F841
         "override_mod",
         """
         class Pair:
@@ -249,3 +270,62 @@ def test_load_yaml_config(tmp_path):
     assert cfg.learning_rate == 0.001
     assert cfg.scheduler.step_size == 10
     assert cfg.scheduler.gamma == 0.5
+
+
+def test_load_module_from_file(tmp_path):
+    """Module is imported, its globals are accessible, and it gets a unique name."""
+    py_file = tmp_path / "plugin.py"
+    py_file.write_text(
+        textwrap.dedent(
+            """
+            FOO = 123
+            def bar():
+                return "bar"
+            """
+        )
+    )
+
+    mod = load_module_from_file(py_file.as_posix())
+
+    assert mod.__name__.endswith("plugin")  # dynamic name was created
+    assert mod.FOO == 123
+    assert mod.bar() == "bar"
+
+
+def test_resolve_target_non_string_passthrough():
+    """If the input is already an object, it is returned unchanged."""
+    assert _resolve_target(len) is len
+    assert _resolve_target(42) == 42
+
+
+def test_resolve_target_file_colon(tmp_path):
+    """`path/to/file.py:object_name` is resolved correctly."""
+    script = tmp_path / "tools.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            def meaning():
+                return 42
+            """
+        )
+    )
+    target = _resolve_target(f"{script}:{'meaning'}")
+
+    # We get back the function object itself
+    assert callable(target)
+    assert target() == 42
+
+
+def test_resolve_target_asserts_on_non_py_suffix(tmp_path):
+    """When the left part before ':' does not end in .py an AssertionError is raised."""
+    bad = tmp_path / "data.txt"
+    bad.write_text("x = 1")
+    with pytest.raises(AssertionError):
+        _resolve_target(f"{bad}:x")
+
+
+def test_resolve_target_asserts_on_missing_file(tmp_path):
+    """Missing script should raise AssertionError."""
+    missing = tmp_path / "ghost.py"  # file is NOT created
+    with pytest.raises(AssertionError):
+        _resolve_target(f"{missing}:nothing")

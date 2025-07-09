@@ -29,11 +29,11 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 
-
 # TODO(boxiangw): Change to nvFSDP once it got published
 HAVE_NVFSDP = False
 try:
     from nvfsdp import fully_shard as nvfsdp_fully_shard
+
     HAVE_NVFSDP = True
 except:
     pass
@@ -45,9 +45,7 @@ def fsdp2_strategy_parallelize(
     model,
     device_mesh: DeviceMesh,
     mp_policy: MixedPrecisionPolicy = None,
-    tp_shard_plan: Optional[
-        Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]
-    ] = None,
+    tp_shard_plan: Optional[Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]] = None,
     offload_policy: "CPUOffloadPolicy" = None,
 ):
     """
@@ -69,9 +67,7 @@ def fsdp2_strategy_parallelize(
     NOTE: Currently, the user should make sure that custom_tp_plan is compatible with the model architecture.
     """
     if not mp_policy:
-        mp_policy = MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16, reduce_dtype=torch.float32
-        )
+        mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
 
     def parallelize_helper(module, mesh, mp_policy):
         if isinstance(module, nn.ModuleList):
@@ -95,11 +91,7 @@ def fsdp2_strategy_parallelize(
 
     # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
     dp_mesh = device_mesh[
-        (
-            "dp_cp"
-            if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(device_mesh, {})
-            else "data_parallel"
-        )
+        ("dp_cp" if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(device_mesh, {}) else "data_parallel")
     ]
 
     if dp_mesh.size() > 1:
@@ -149,11 +141,9 @@ def import_classes_from_paths(class_paths: List[str]):
 def nvfsdp_strategy_parallelize(
     model,
     device_mesh: DeviceMesh,
-    optimizer = None,
+    optimizer=None,
     nvfsdp_unit_modules: Optional[List[str]] = None,
-    tp_shard_plan: Optional[
-        Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]
-    ] = None,
+    tp_shard_plan: Optional[Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]] = None,
     data_parallel_sharding_strategy: str = "optim_grads_params",
     init_nvfsdp_with_meta_device: bool = False,
     grad_reduce_in_fp32: bool = False,
@@ -218,8 +208,10 @@ def nvfsdp_strategy_parallelize(
     NOTE: The user must ensure that the provided tp_shard_plan is compatible
     with the model architecture.
     """
-    assert HAVE_NVFSDP, "nvFSDP is not installed, please visit \
+    assert HAVE_NVFSDP, (
+        "nvFSDP is not installed, please visit \
         https://github.com/NVIDIA-NeMo/nvFSDP for more information"
+    )
 
     # DP_CP ranks are sharded by FSDP.
     dp_mesh = device_mesh["data_parallel"]
@@ -233,7 +225,7 @@ def nvfsdp_strategy_parallelize(
     # TP sharding.
     if tp_mesh.size() > 1:
         parallelize_module(model, tp_mesh, tp_shard_plan)
-    
+
     if cp_mesh.size() > 1:
         dp_cp_mesh_name = "dp_cp"
     else:
@@ -258,7 +250,7 @@ def nvfsdp_strategy_parallelize(
         preserve_fp32_weights=preserve_fp32_weights,
         overlap_grad_reduce=overlap_grad_reduce,
         overlap_param_gather=overlap_param_gather,
-        sync_grads_each_step=False, # For better performance, avoid sync every step
+        sync_grads_each_step=False,  # For better performance, avoid sync every step
         check_for_nan_in_grad=check_for_nan_in_grad,
         average_in_collective=average_in_collective,
         disable_bucketing=disable_bucketing,
@@ -279,13 +271,9 @@ def get_hf_tp_shard_plan(model):
     if hasattr(model, "_tp_plan") and model._tp_plan is not None:
         hf_tp_shard_plan.update(model._tp_plan)
     if hasattr(model.model, "_tp_plan") and model.model._tp_plan is not None:
-        hf_tp_shard_plan.update(
-            {f"model.{k}": v for k, v in model.model._tp_plan.items()}
-        )
+        hf_tp_shard_plan.update({f"model.{k}": v for k, v in model.model._tp_plan.items()})
 
-    hf_tp_shard_plan = {
-        k: translate_to_torch_parallel_style(v) for k, v in hf_tp_shard_plan.items()
-    }
+    hf_tp_shard_plan = {k: translate_to_torch_parallel_style(v) for k, v in hf_tp_shard_plan.items()}
     return hf_tp_shard_plan
 
 
@@ -365,4 +353,3 @@ def _destroy_dist_connection() -> None:
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
     signal.signal(signal.SIGINT, signal.SIG_DFL)
-

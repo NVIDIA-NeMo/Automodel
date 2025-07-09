@@ -29,21 +29,19 @@ Usage:
 """
 
 import argparse
+import json
+import logging
 from pathlib import Path
 from typing import Optional
-import json
 
+import requests
 import torch
 import torch.distributed
-from transformers import AutoProcessor, AutoConfig
 from PIL import Image
-import requests
+from transformers import AutoConfig, AutoProcessor
 
 from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-from nemo_automodel.checkpoint.checkpointing import load_model, CheckpointingConfig
-
-import logging
-
+from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig, load_model
 from nemo_automodel.loggers.log_utils import setup_logging
 
 # TODO: Parse config from YAML and run generate with FSDP2/distributed in general
@@ -57,17 +55,23 @@ def load_model_from_checkpoint(
     use_liger_kernel: bool = False,
 ) -> NeMoAutoModelForImageTextToText:
     """Load a VLM model from a checkpoint.
-    
+
     Args:
         checkpoint_path: Path to the checkpoint directory
         base_model: Base model name for distributed checkpoints
         is_peft: Whether the checkpoint is a PEFT checkpoint
         model_save_format: Format of the saved model ("torch_save" or "safetensors")
-        use_liger_kernel: Whether to use Liger kernel optimizations 
-        
+        use_liger_kernel: Whether to use Liger kernel optimizations
+
     Returns:
         Loaded NeMoAutoModelForImageTextToText model
     """
+    # initialize distributed
+
+    from nemo_automodel.distributed.init_utils import initialize_distributed
+
+    initialize_distributed(backend="nccl", timeout_minutes=10)
+
     checkpoint_path = Path(checkpoint_path)
     device_map = "cuda" if torch.cuda.is_available() else "cpu"
     model = None
@@ -109,14 +113,14 @@ def generate_response(
     max_new_tokens: int = 32,
 ) -> str:
     """Generate a text response from an image and text prompt.
-    
+
     Args:
         model: The loaded VLM model
         processor: The model's processor for tokenization
         image_url: URL or local path to the image
         prompt: Text prompt for the model
         max_new_tokens: Maximum number of new tokens to generate
-        
+
     Returns:
         Generated text response
     """
@@ -145,14 +149,10 @@ def generate_response(
     ).to(model.device)
 
     with torch.inference_mode():
-        outputs = model.generate(
-            **inputs, max_new_tokens=max_new_tokens, do_sample=False
-        )
+        outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
 
     generated_text = processor.decode(outputs[0], skip_special_tokens=True)
-    prompt_length = len(
-        processor.decode(inputs["input_ids"][0], skip_special_tokens=True)
-    )
+    prompt_length = len(processor.decode(inputs["input_ids"][0], skip_special_tokens=True))
     return generated_text[prompt_length:].strip()
 
 
@@ -196,9 +196,7 @@ def main():
 
     args = parser.parse_args()
 
-    logging.info(
-        f"Loading model type base_model:{args.base_model} from checkpoint_path:{args.checkpoint_path}"
-    )
+    logging.info(f"Loading model type base_model:{args.base_model} from checkpoint_path:{args.checkpoint_path}")
 
     model = load_model_from_checkpoint(
         args.checkpoint_path,
@@ -209,9 +207,7 @@ def main():
     )
     processor_path = args.base_model if args.base_model else args.checkpoint_path
     processor = AutoProcessor.from_pretrained(processor_path)
-    response = generate_response(
-        model, processor, args.image_url, args.prompt, args.max_new_tokens
-    )
+    response = generate_response(model, processor, args.image_url, args.prompt, args.max_new_tokens)
 
     # Format and output response
     if args.output_format == "json":

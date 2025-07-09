@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
-
-# pyre-strict
+# taken and edited from
+# https://github.com/pytorch/pytorch/pull/154743
+# pylint: disable=missing-function-docstring,line-too-long
 
 import concurrent.futures
 import json

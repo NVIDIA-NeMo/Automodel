@@ -12,18 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
 import pytest
+import torch
 
 from nemo_automodel.training.utils import count_tail_padding
 
 
 def test_docstring_example():
-    labels = torch.tensor([
-        [-100,   1,   1, -100, -100],   # 2 tail -100s
-        [-100, -100,  2,    3,    4],   # 0 tail -100s
-        [   5,   6, -100, -100, -100],  # 3 tail -100s
-    ])
+    labels = torch.tensor(
+        [
+            [-100, 1, 1, -100, -100],  # 2 tail -100s
+            [-100, -100, 2, 3, 4],  # 0 tail -100s
+            [5, 6, -100, -100, -100],  # 3 tail -100s
+        ]
+    )
     assert count_tail_padding(labels) == 5
 
 
@@ -32,10 +34,8 @@ def test_docstring_example():
     [
         # No padding at all
         (torch.tensor([[1, 2, 3], [4, 5, 6]]), 0),
-
         # Entire sequence is padding
         (torch.full((2, 4), -100), 8),
-
         # Different ignore label
         (torch.tensor([[9, 0, 0], [0, 0, 0]]), 5),
     ],
@@ -58,8 +58,14 @@ def test_random_shapes():
     """
     torch.manual_seed(0)
     for _ in range(10):
-        batch = torch.randint(1, 8, size=(torch.randint(1, 5, ()).item(),  # batch size
-                                          torch.randint(1, 10, ()).item()))  # seq len
+        batch = torch.randint(
+            1,
+            8,
+            size=(
+                torch.randint(1, 5, ()).item(),  # batch size
+                torch.randint(1, 10, ()).item(),
+            ),
+        )  # seq len
         # randomly sprinkle ignore tokens
         mask = torch.rand_like(batch.float()) < 0.3
         batch[mask] = -100
@@ -71,6 +77,6 @@ def test_random_shapes():
             if len(idx) == 0:
                 ref += row.numel()
             else:
-                ref += (row[idx[-1] + 1:] == -100).sum().item()
+                ref += (row[idx[-1] + 1 :] == -100).sum().item()
 
         assert count_tail_padding(batch) == ref
