@@ -28,13 +28,14 @@ from nemo_automodel.checkpoint._backports.filesystem import SerializationFormat
 
 _PREFIX = "model."
 
+
 def _drop_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX) -> None:
     """
     Remove the *first* occurrence of `prefix` on every key in-place.
     """
     for k in list(sd.keys()):
         if k.startswith(prefix):
-            sd[k[len(prefix):]] = sd.pop(k)
+            sd[k[len(prefix) :]] = sd.pop(k)
 
 
 def _add_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX) -> None:
@@ -47,11 +48,10 @@ def _add_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX) -> None:
 
 
 def _get_lm_head_weight_and_name(model: torch.nn.Module) -> Optional[tuple[torch.Tensor, str]]:
-
     for name, param in model.named_parameters(remove_duplicate=False):
         if "lm_head" in name and name.endswith(".weight"):
             return param, name
-    
+
     return None, None
 
 
@@ -84,7 +84,7 @@ class ModelState(Stateful):
             is_peft (bool): Whether the model is PEFT.
         """
         self.model = model
-        self.is_tied_lm_head = getattr(getattr(model, 'config', {}), 'tie_word_embeddings', False)
+        self.is_tied_lm_head = getattr(getattr(model, "config", {}), "tie_word_embeddings", False)
         self.serialization_format = serialization_format
         self.is_peft = is_peft
 
@@ -97,11 +97,7 @@ class ModelState(Stateful):
         """
         options = None
         if self.is_peft:
-            options = StateDictOptions(
-                full_state_dict=True,
-                cpu_offload=True,
-                ignore_frozen_params=True
-            )
+            options = StateDictOptions(full_state_dict=True, cpu_offload=True, ignore_frozen_params=True)
         model_state_dict = get_model_state_dict(self.model, options=options)
         if self.is_tied_lm_head:
             model_state_dict.pop("model.lm_head.weight", None)
@@ -139,7 +135,7 @@ class ModelState(Stateful):
             # set_model_state_dict can match parameters correctly. This is not needed
             # for torch serialization.
             _add_outer_prefix(state_dict)
-            
+
         # If we intentionally skipped saving "lm_head.weight" (tied embeddings)
         # PyTorch will complain during load even with strict=False.
         # To be fully compatible we inject a reference tensor so the key exists.

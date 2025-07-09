@@ -61,7 +61,6 @@ from nemo_automodel.checkpoint._backports.hf_utils import (
     _metadata_fn,
 )
 
-
 __all__ = ["_HuggingFaceStorageWriter", "_HuggingFaceStorageReader"]
 
 
