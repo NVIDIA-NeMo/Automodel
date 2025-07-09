@@ -12,15 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import ModuleType
-import sys
 import random
+import sys
+from types import ModuleType
 
 import numpy as np
 import pytest
 import torch
 
-from nemo_automodel.training.rng import init_all_rng, StatefulRNG
+from nemo_automodel.training.rng import StatefulRNG, init_all_rng
+
 
 def _next_values():
     """Return a tuple with one sample from each RNG backend."""
@@ -38,8 +39,8 @@ def test_init_all_rng_reproducibility():
     """
     init_all_rng(123)
 
-    ref_vals = _next_values()          # reference sequence
-    init_all_rng(123)                  # reset with the same seed
+    ref_vals = _next_values()  # reference sequence
+    init_all_rng(123)  # reset with the same seed
     new_vals = _next_values()
 
     assert ref_vals == new_vals
@@ -77,7 +78,7 @@ def test_init_all_rng_ranked(monkeypatch):
 
     base_seed = 10
     init_all_rng(base_seed, ranked=True)
-    expected = random.Random(base_seed + rank).random()   # local reference
+    expected = random.Random(base_seed + rank).random()  # local reference
     actual = random.random()
 
     assert pytest.approx(expected) == actual
