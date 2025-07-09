@@ -24,7 +24,6 @@ from contextlib import contextmanager
 import torch
 from packaging.version import Version as PkgVersion
 
-
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 logger.addHandler(logging.StreamHandler())
