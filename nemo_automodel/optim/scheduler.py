@@ -8,7 +8,6 @@ from typing import Optional
 
 from torch.optim.optimizer import Optimizer
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -110,7 +109,7 @@ class OptimizerParamScheduler:
         self.override_opt_param_scheduler = override_opt_param_scheduler
         self.use_checkpoint_opt_param_scheduler = use_checkpoint_opt_param_scheduler
         if self.override_opt_param_scheduler:
-            assert not self.use_checkpoint_opt_param_scheduler, "both override and " "use-checkpoint are set."
+            assert not self.use_checkpoint_opt_param_scheduler, "both override and use-checkpoint are set."
 
         # Set the learning rate
         self.step(0)
