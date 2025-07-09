@@ -60,7 +60,9 @@ class CheckpointingConfig:
             self.model_save_format = SerializationFormat[self.model_save_format.upper()]
 
     def to_dict(self):
-        return self.__dict__.copy()
+        cfg = self.__dict__.copy()
+        cfg["model_save_format"] = cfg["model_save_format"].value
+        return cfg
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]):
