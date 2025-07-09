@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import pathlib
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 import torch.distributed as dist
@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoProcessor
 from wandb import Settings
 
+from nemo_automodel._peft.lora import PeftConfig
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.config.cli import parse_args_and_load_config
 from nemo_automodel.datasets.vlm.collate_fns import COLLATE_FNS
@@ -64,7 +65,7 @@ def build_model_and_optimizer(
     model_wrapper,
     seed,
     tp_size=1,
-) -> tuple[nn.Module, "Optimizer"]:  # noqa: F821
+) -> tuple[nn.Module, "Optimizer", Optional[PeftConfig]]:  # noqa: F821
     """Build and initialize a model for VLM."""
     with StatefulRNG(seed=seed, ranked=True):
         model = cfg_model.instantiate()
@@ -77,10 +78,10 @@ def build_model_and_optimizer(
                     m.weight.requires_grad = False
 
         # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
+        peft_config = None
         if cfg_peft is not None:
-            opts = cfg_peft.to_dict()
-            peft_fn = opts.pop("peft_fn")
-            peft_fn(model, **opts)
+            peft_config = cfg_peft.peft_params.instantiate()
+            cfg_peft.peft_fn(model, peft_config)
 
         print_trainable_parameters(model)
 
@@ -92,7 +93,7 @@ def build_model_and_optimizer(
                     cfg_opt.foreach = False
                 optimizer = cfg_opt.instantiate(params=trainable_params)
                 model, optimizer = model_wrapper.parallelize(model, optimizer)
-                return model, optimizer
+                return model, optimizer, peft_config
             else:
                 model = model_wrapper.parallelize(model)
         else:
@@ -104,7 +105,7 @@ def build_model_and_optimizer(
             cfg_opt.foreach = False
         optimizer = cfg_opt.instantiate(params=trainable_params)
 
-        return model, optimizer
+        return model, optimizer, peft_config
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
@@ -270,7 +271,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             logging.info("🚀 View run at {}".format(run.url))
 
         # Build components with VLM-specific functions
-        self.model, self.optimizer = build_model_and_optimizer(
+        self.model, self.optimizer, self.peft_config = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
             self.cfg.optimizer,

@@ -110,7 +110,7 @@ class BaseRecipe:
                 if torch.distributed.is_initialized():
                     torch.distributed.barrier()
 
-        save_model(model, path, self.checkpoint_config)
+        save_model(model, path, self.checkpoint_config, peft_config=self.peft_config)
         save_optimizer(optimizer, model, path)
 
     def load_checkpoint(self, restore_from: str | None = None):

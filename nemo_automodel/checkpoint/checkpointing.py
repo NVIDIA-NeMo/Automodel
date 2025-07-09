@@ -30,6 +30,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from transformers import PreTrainedModel
 
+from nemo_automodel._peft.lora import PeftConfig
 from nemo_automodel.checkpoint._backports.filesystem import SerializationFormat
 from nemo_automodel.checkpoint._backports.hf_storage import (
     _HuggingFaceStorageReader,
@@ -60,11 +61,27 @@ class CheckpointingConfig:
         if isinstance(self.model_save_format, str):
             self.model_save_format = SerializationFormat[self.model_save_format.upper()]
 
+    def to_dict(self):
+        return self.__dict__
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]):
+        return cls(
+            enabled=d.get("enabled", False),
+            checkpoint_dir=d.get("checkpoint_dir", None),
+            model_save_format=d.get("model_save_format", None),
+            model_cache_dir=d.get("model_cache_dir", None),
+            model_repo_id=d.get("model_repo_id", None),
+            save_consolidated=d.get("save_consolidated", False),
+            is_peft=d.get("is_peft", False),
+        )
+
 
 def save_model(
     model: nn.Module | PreTrainedModel,
     weights_path: str,
     checkpoint_config: CheckpointingConfig,
+    peft_config: PeftConfig | None = None,
 ):
     """
     Save a model state dictionary to a weights path.
@@ -104,6 +121,10 @@ def save_model(
             with open(os.path.join(consolidated_model_path, "config.json"), "w") as f:
                 f.write(model.config.to_json_string())
 
+        # save the checkpoint config for inference loading
+        with open(os.path.join(model_path, "checkpoint_config.json"), "w") as f:
+            json.dump(checkpoint_config.to_dict(), f, indent=2, sort_keys=True)
+
     # Ensure all ranks wait for rank 0 to handle directories
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
@@ -111,19 +132,9 @@ def save_model(
     model_state = ModelState(model, checkpoint_config.model_save_format, checkpoint_config.is_peft)
 
     if checkpoint_config.is_peft:
-        if not isinstance(model, PreTrainedModel):
-            raise ValueError("PEFT checkpointing is only supported for PreTrainedModel")
-        if not hasattr(model, "_automodel_peft_config"):
-            raise ValueError(
-                "PEFT checkpointing is only supported for models that have been trained with PEFT. "
-                "Please use the `apply_lora_to_linear_modules` function to apply LoRA to the model."
-            )
-        peft_config = model._automodel_peft_config
-        state_dict = model_state.state_dict()
-        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-            with open(os.path.join(model_path, "adapter_config.json"), "w") as f:
-                json.dump(peft_config, f, indent=2, sort_keys=True)
-            save_file(state_dict, os.path.join(model_path, "adapter_model.safetensors"))
+        assert peft_config is not None, "PEFT config needs to be provided when checkpointing PEFT models."
+        _save_peft_adapters(model_state, peft_config, model_path)
+
     elif checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
         fqn_to_file_index_mapping = None
         if checkpoint_config.save_consolidated:
@@ -308,3 +319,59 @@ def _get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
             return snapshot_dirs[0]
         except IndexError:
             raise FileNotFoundError(f"No snapshot directories found in {snapshots_root}")
+
+
+def _save_peft_adapters(
+    model_state: ModelState,
+    peft_config: PeftConfig,
+    model_path: str,
+):
+    """
+    Save PEFT adapters to a weights path.
+    """
+    hf_peft_config = _get_hf_peft_config(peft_config, model_state)
+    state_dict = model_state.state_dict()
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        # save in HF format. Only keys that are needed for PEFT module loading will be saved here.
+        with open(os.path.join(model_path, "adapter_config.json"), "w") as f:
+            json.dump(hf_peft_config, f, indent=2, sort_keys=True)
+        # save the full PEFT config for inference loading inside Automodel.
+        with open(os.path.join(model_path, "automodel_peft_config.json"), "w") as f:
+            json.dump(peft_config.to_dict(), f, indent=2, sort_keys=True)
+        save_file(state_dict, os.path.join(model_path, "adapter_model.safetensors"))
+
+
+def _get_hf_peft_config(peft_config: PeftConfig, model_state: ModelState) -> dict:
+    """
+    Get the PEFT config in the format expected by Hugging Face.
+    """
+    MODEL_TYPE_TO_PEFT_TASK_TYPE = {
+        "SequenceClassification": "SEQ_CLS",
+        "Seq2SeqLM": "SEQ_2_SEQ_LM",
+        "CausalLM": "CAUSAL_LM",
+        "TokenClassification": "TOKEN_CLS",
+        "QuestionAnswering": "QUESTION_ANS",
+        "FeatureExtraction": "FEATURE_EXTRACTION",
+        "ConditionalGeneration": "CONDITIONAL_GENERATION",
+    }
+    try:
+        model_task = model_state.model.config.architectures[0].split("For")[-1]
+    except AttributeError:
+        model_task = "N/A"
+    try:
+        name_or_path = model_state.model.config.name_or_path
+        task_type = MODEL_TYPE_TO_PEFT_TASK_TYPE[model_task]
+    except (KeyError, AttributeError):
+        name_or_path = "N/A"
+        task_type = "CAUSAL_LM"
+
+    return {
+        "task_type": task_type,
+        "peft_type": "LORA",
+        "r": peft_config.dim,
+        "lora_alpha": peft_config.alpha,
+        "target_modules": peft_config.target_modules,
+        "bias": "none",
+        "base_model_name_or_path": name_or_path,
+        "lora_dropout": peft_config.dropout,
+    }
