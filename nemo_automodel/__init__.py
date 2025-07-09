@@ -33,7 +33,7 @@ __all__ = [
 # ==== Promote NeMoAutoModelForCausalLM, AutoModelForImageTextToText into the top level ====
 try:
     # adjust this import path if your class lives somewhere else
-    from ._transformers.auto_model import NeMoAutoModelForImageTextToText, NeMoAutoModelForCausalLM
+    from ._transformers.auto_model import NeMoAutoModelForCausalLM, NeMoAutoModelForImageTextToText
 
     globals()["NeMoAutoModelForCausalLM"] = NeMoAutoModelForCausalLM
     globals()["NeMoAutoModelForImageTextToText"] = NeMoAutoModelForImageTextToText

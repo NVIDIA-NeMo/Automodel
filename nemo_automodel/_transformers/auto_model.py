@@ -24,11 +24,6 @@ from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 from nemo_automodel import __version__
 from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
-import types
-import inspect
-import functools
-
-
 
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 logger = logging.getLogger(__name__)
