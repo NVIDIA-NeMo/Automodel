@@ -22,11 +22,12 @@ from typing import Any, Dict
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import wandb
 from torch.distributed.device_mesh import _mesh_resources
 from torch.utils.data import DataLoader
 from transformers import AutoProcessor
+from wandb import Settings
 
-import wandb
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.config.cli import parse_args_and_load_config
 from nemo_automodel.datasets.vlm.collate_fns import COLLATE_FNS
@@ -46,8 +47,6 @@ from nemo_automodel.utils.dist_utils import (
     rescale_gradients,
 )
 from nemo_automodel.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
-from wandb import Settings
-
 
 logger = logging.getLogger(__name__)
 
