@@ -45,7 +45,7 @@ class PeftConfig:
     use_triton: bool = False
 
     def to_dict(self):
-        return self.__dict__
+        return self.__dict__.copy()
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]):
