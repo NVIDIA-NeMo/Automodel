@@ -16,7 +16,6 @@
 
 import glob
 import json
-import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,13 +93,6 @@ def save_model(
         weights_path: Path to save model weights
         checkpoint_config: Checkpointing configuration
     """
-    if checkpoint_config.is_peft and checkpoint_config.model_save_format == SerializationFormat.TORCH_SAVE:
-        logger = logging.getLogger(__name__)
-        logger.warning(
-            "PEFT checkpointing is not supported for torch_save format. "
-            "Saving PEFT adapters in consolidated safetensors format instead."
-        )
-
     # We also need to eventually add suport for HSDP, so we only save on non-duplicate ranks.
     model_path = os.path.join(weights_path, "model")
     consolidated_model_path = None
@@ -189,13 +181,6 @@ def load_model(
         weights_path: Path to load model weights from
         checkpoint_config: Checkpointing configuration
     """
-    if checkpoint_config.is_peft and checkpoint_config.model_save_format == SerializationFormat.TORCH_SAVE:
-        logger = logging.getLogger(__name__)
-        logger.warning(
-            "PEFT checkpointing is not supported for torch_save format. "
-            "Loading PEFT adapters from safetensors format instead."
-        )
-
     model_path = os.path.join(weights_path, "model")
 
     # Validate checkpoint directory
