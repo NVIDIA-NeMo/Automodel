@@ -12,20 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
 import contextlib
 from typing import List, Set
+
+import torch
 from torch.distributed.device_mesh import DeviceMesh
+
 
 def _build_position_ids(batch, device):
     """Add position_ids to the batch only if they are missing."""
     # TODO(@boxiangw): Refractor. Needed for SP support
     # If 'position_ids' does not exist in batch already then override it.
     # In case of Packed sequence contains 'position_ids' and we don't want to override it.
-    if 'position_ids' not in batch:
-        seq_len = batch['input_ids'].shape[1]
-        batch['position_ids'] = torch.arange(seq_len, device=device).unsqueeze(0)
+    if "position_ids" not in batch:
+        seq_len = batch["input_ids"].shape[1]
+        batch["position_ids"] = torch.arange(seq_len, device=device).unsqueeze(0)
     return batch
+
 
 # based on https://github.com/pytorch/torchtitan/blob/0b44d4c437c424b6bf719661c0eb4283dc4068bc/torchtitan/distributed/utils.py#L180  # pylint: disable=C0301
 def get_train_context(enable_loss_parallel: bool, enable_compiled_autograd: bool, cp_context=None):
@@ -44,20 +47,14 @@ def get_train_context(enable_loss_parallel: bool, enable_compiled_autograd: bool
                 stack.enter_context(torch.distributed.tensor.parallel.loss_parallel())
 
             if enable_compiled_autograd:
-                stack.enter_context(
-                    torch._dynamo.utils.maybe_enable_compiled_autograd(True)
-                )
+                stack.enter_context(torch._dynamo.utils.maybe_enable_compiled_autograd(True))
 
             if cp_context is not None:
                 from torch.nn.attention import SDPBackend, sdpa_kernel
 
                 # currently we only support these two SDP backends.
                 # SDPBackend.MATH is not currently compatible with DTensor
-                stack.enter_context(
-                    sdpa_kernel(
-                        [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
-                    )
-                )
+                stack.enter_context(sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]))
                 stack.enter_context(cp_context)
 
             yield
@@ -97,6 +94,7 @@ def create_context_parallel_ctx(
         no_restore_buffers=cp_no_restore_buffers,
     )
 
+
 def make_cp_batch_and_ctx(device_mesh, batch, labels, loss_mask):
     """
     Build a CP context manager and shards a batch. If the input device_mesh is None or the size
@@ -113,6 +111,7 @@ def make_cp_batch_and_ctx(device_mesh, batch, labels, loss_mask):
         `create_context_parallel_ctx` and is accordingly sharded.
     """
     from contextlib import nullcontext
+
     if device_mesh is None:
         cp_mesh = None
     else:
@@ -138,7 +137,7 @@ def make_cp_batch_and_ctx(device_mesh, batch, labels, loss_mask):
         cp_buffers=cp_buffers,
         cp_seq_dims=cp_seq_dims,
         cp_no_restore_buffers=cp_no_restore_buffers,
-        cp_rotate_method="allgather",   # TODO: expose through cfg
+        cp_rotate_method="allgather",  # TODO: expose through cfg
     )
     # TODO(@akoumparouli): surface these in the future.
     enable_loss_parallel: bool = False

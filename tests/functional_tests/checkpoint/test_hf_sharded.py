@@ -19,13 +19,15 @@ import os
 import shutil
 from pathlib import Path
 
-from recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction
-from nemo_automodel.config.cli import parse_args_and_load_config
-from nemo_automodel.checkpoint.stateful_wrappers import ModelState, OptimizerState
-from nemo_automodel.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 import torch
-import torch.distributed.tensor
 import torch.distributed.checkpoint as dcp
+import torch.distributed.tensor
+
+from nemo_automodel.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
+from nemo_automodel.checkpoint.stateful_wrappers import ModelState, OptimizerState
+from nemo_automodel.config.cli import parse_args_and_load_config
+from recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction
+
 
 def load_dcp(ckpt_dir: Path | str) -> dict[str, torch.Tensor]:
     """
@@ -46,7 +48,7 @@ def load_dcp(ckpt_dir: Path | str) -> dict[str, torch.Tensor]:
     state_dict = {
         k: torch.empty(tp.size, dtype=tp.properties.dtype)
         for k, tp in metadata.state_dict_metadata.items()
-        if type(tp).__name__ == 'TensorStorageMetadata'
+        if type(tp).__name__ == "TensorStorageMetadata"
     }
 
     dcp.load(
@@ -55,13 +57,15 @@ def load_dcp(ckpt_dir: Path | str) -> dict[str, torch.Tensor]:
     )
     return state_dict
 
+
 def to_cpu(
-        state_dict: dict[str, torch.Tensor | dict[str, torch.Tensor]],
-    ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
+    state_dict: dict[str, torch.Tensor | dict[str, torch.Tensor]],
+) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
     """
     Converts a state dictionary to CPU.
     """
     return {k: v.cpu() if isinstance(v, torch.Tensor) else to_cpu(v) for k, v in state_dict.items()}
+
 
 def test_hf_sharded_checkpoint():
     """
@@ -151,77 +155,269 @@ def test_hf_sharded_checkpoint():
         "optim.optim.state.model.layers.0.block_sparse_moe.gate.weight.exp_avg": ([4, 512], torch.bfloat16, "cpu"),
         "optim.optim.state.model.layers.0.block_sparse_moe.gate.weight.exp_avg_sq": ([4, 512], torch.bfloat16, "cpu"),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.0.w1.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.0.w1.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.0.w1.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.0.w1.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.0.w1.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.0.w2.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.0.w2.weight.exp_avg": ([256, 448], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.0.w2.weight.exp_avg_sq": ([256, 448], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.0.w2.weight.exp_avg": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.0.w2.weight.exp_avg_sq": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.0.w3.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.0.w3.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.0.w3.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.0.w3.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.0.w3.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.1.w1.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.1.w1.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.1.w1.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.1.w1.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.1.w1.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.1.w2.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.1.w2.weight.exp_avg": ([256, 448], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.1.w2.weight.exp_avg_sq": ([256, 448], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.1.w2.weight.exp_avg": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.1.w2.weight.exp_avg_sq": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.1.w3.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.1.w3.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.1.w3.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.1.w3.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.1.w3.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.2.w1.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.2.w1.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.2.w1.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.2.w1.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.2.w1.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.2.w2.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.2.w2.weight.exp_avg": ([256, 448], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.2.w2.weight.exp_avg_sq": ([256, 448], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.2.w2.weight.exp_avg": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.2.w2.weight.exp_avg_sq": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.2.w3.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.2.w3.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.2.w3.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.2.w3.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.2.w3.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.3.w1.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.3.w1.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.3.w1.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.3.w1.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.3.w1.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.3.w2.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.3.w2.weight.exp_avg": ([256, 448], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.3.w2.weight.exp_avg_sq": ([256, 448], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.3.w2.weight.exp_avg": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.3.w2.weight.exp_avg_sq": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.3.w3.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.3.w3.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.3.w3.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.3.w3.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.3.w3.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.4.w1.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.4.w1.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.4.w1.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.4.w1.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.4.w1.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.4.w2.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.4.w2.weight.exp_avg": ([256, 448], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.4.w2.weight.exp_avg_sq": ([256, 448], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.4.w2.weight.exp_avg": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.4.w2.weight.exp_avg_sq": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.4.w3.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.4.w3.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.4.w3.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.4.w3.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.4.w3.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.5.w1.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.5.w1.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.5.w1.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.5.w1.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.5.w1.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.5.w2.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.5.w2.weight.exp_avg": ([256, 448], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.5.w2.weight.exp_avg_sq": ([256, 448], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.5.w2.weight.exp_avg": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.5.w2.weight.exp_avg_sq": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.5.w3.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.5.w3.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.5.w3.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.5.w3.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.5.w3.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.6.w1.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.6.w1.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.6.w1.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.6.w1.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.6.w1.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.6.w2.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.6.w2.weight.exp_avg": ([256, 448], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.6.w2.weight.exp_avg_sq": ([256, 448], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.6.w2.weight.exp_avg": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.6.w2.weight.exp_avg_sq": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.6.w3.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.6.w3.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.6.w3.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.6.w3.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.6.w3.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.7.w1.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.7.w1.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.7.w1.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.7.w1.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.7.w1.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.7.w2.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.7.w2.weight.exp_avg": ([256, 448], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.7.w2.weight.exp_avg_sq": ([256, 448], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.7.w2.weight.exp_avg": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.7.w2.weight.exp_avg_sq": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.block_sparse_moe.experts.7.w3.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.7.w3.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.0.block_sparse_moe.experts.7.w3.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.7.w3.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.0.block_sparse_moe.experts.7.w3.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.0.input_layernorm.weight.step": ([], torch.float32, "cpu"),
         "optim.optim.state.model.layers.0.input_layernorm.weight.exp_avg": ([256], torch.bfloat16, "cpu"),
         "optim.optim.state.model.layers.0.input_layernorm.weight.exp_avg_sq": ([256], torch.bfloat16, "cpu"),
@@ -244,77 +440,269 @@ def test_hf_sharded_checkpoint():
         "optim.optim.state.model.layers.1.block_sparse_moe.gate.weight.exp_avg": ([4, 512], torch.bfloat16, "cpu"),
         "optim.optim.state.model.layers.1.block_sparse_moe.gate.weight.exp_avg_sq": ([4, 512], torch.bfloat16, "cpu"),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.0.w1.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.0.w1.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.0.w1.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.0.w1.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.0.w1.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.0.w2.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.0.w2.weight.exp_avg": ([256, 448], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.0.w2.weight.exp_avg_sq": ([256, 448], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.0.w2.weight.exp_avg": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.0.w2.weight.exp_avg_sq": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.0.w3.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.0.w3.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.0.w3.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.0.w3.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.0.w3.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.1.w1.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.1.w1.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.1.w1.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.1.w1.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.1.w1.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.1.w2.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.1.w2.weight.exp_avg": ([256, 448], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.1.w2.weight.exp_avg_sq": ([256, 448], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.1.w2.weight.exp_avg": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.1.w2.weight.exp_avg_sq": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.1.w3.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.1.w3.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.1.w3.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.1.w3.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.1.w3.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.2.w1.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.2.w1.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.2.w1.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.2.w1.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.2.w1.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.2.w2.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.2.w2.weight.exp_avg": ([256, 448], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.2.w2.weight.exp_avg_sq": ([256, 448], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.2.w2.weight.exp_avg": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.2.w2.weight.exp_avg_sq": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.2.w3.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.2.w3.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.2.w3.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.2.w3.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.2.w3.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.3.w1.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.3.w1.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.3.w1.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.3.w1.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.3.w1.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.3.w2.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.3.w2.weight.exp_avg": ([256, 448], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.3.w2.weight.exp_avg_sq": ([256, 448], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.3.w2.weight.exp_avg": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.3.w2.weight.exp_avg_sq": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.3.w3.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.3.w3.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.3.w3.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.3.w3.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.3.w3.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.4.w1.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.4.w1.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.4.w1.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.4.w1.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.4.w1.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.4.w2.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.4.w2.weight.exp_avg": ([256, 448], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.4.w2.weight.exp_avg_sq": ([256, 448], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.4.w2.weight.exp_avg": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.4.w2.weight.exp_avg_sq": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.4.w3.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.4.w3.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.4.w3.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.4.w3.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.4.w3.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.5.w1.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.5.w1.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.5.w1.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.5.w1.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.5.w1.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.5.w2.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.5.w2.weight.exp_avg": ([256, 448], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.5.w2.weight.exp_avg_sq": ([256, 448], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.5.w2.weight.exp_avg": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.5.w2.weight.exp_avg_sq": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.5.w3.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.5.w3.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.5.w3.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.5.w3.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.5.w3.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.6.w1.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.6.w1.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.6.w1.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.6.w1.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.6.w1.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.6.w2.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.6.w2.weight.exp_avg": ([256, 448], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.6.w2.weight.exp_avg_sq": ([256, 448], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.6.w2.weight.exp_avg": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.6.w2.weight.exp_avg_sq": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.6.w3.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.6.w3.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.6.w3.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.6.w3.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.6.w3.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.7.w1.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.7.w1.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.7.w1.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.7.w1.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.7.w1.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.7.w2.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.7.w2.weight.exp_avg": ([256, 448], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.7.w2.weight.exp_avg_sq": ([256, 448], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.7.w2.weight.exp_avg": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.7.w2.weight.exp_avg_sq": (
+            [256, 448],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.block_sparse_moe.experts.7.w3.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.7.w3.weight.exp_avg": ([224, 512], torch.bfloat16, "cpu"),
-        "optim.optim.state.model.layers.1.block_sparse_moe.experts.7.w3.weight.exp_avg_sq": ([224, 512], torch.bfloat16, "cpu"),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.7.w3.weight.exp_avg": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.optim.state.model.layers.1.block_sparse_moe.experts.7.w3.weight.exp_avg_sq": (
+            [224, 512],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.optim.state.model.layers.1.input_layernorm.weight.step": ([], torch.float32, "cpu"),
         "optim.optim.state.model.layers.1.input_layernorm.weight.exp_avg": ([256], torch.bfloat16, "cpu"),
         "optim.optim.state.model.layers.1.input_layernorm.weight.exp_avg_sq": ([256], torch.bfloat16, "cpu"),
@@ -337,15 +725,19 @@ def test_hf_sharded_checkpoint():
 
     # checkpoint is saved at this point
     # first extract the in-memory checkpoint
-    model_state_dict = to_cpu(ModelState(
-        trainer.model,
-        trainer.checkpoint_config.model_save_format,
-    ).state_dict())
-    optimizer_state_dict = to_cpu(OptimizerState(
-        trainer.model,
-        trainer.optimizer,
-        trainer.step_scheduler,
-    ).state_dict()["optim"]["state"])
+    model_state_dict = to_cpu(
+        ModelState(
+            trainer.model,
+            trainer.checkpoint_config.model_save_format,
+        ).state_dict()
+    )
+    optimizer_state_dict = to_cpu(
+        OptimizerState(
+            trainer.model,
+            trainer.optimizer,
+            trainer.step_scheduler,
+        ).state_dict()["optim"]["state"]
+    )
 
     # assert the correct paths exist
     output_files = [
@@ -433,7 +825,8 @@ def test_hf_sharded_checkpoint():
             v = v.to_local()
         assert k in restored_model_dict, f"Key {k} not found in restored model state"
         assert isinstance(
-            restored_model_dict[k], torch.Tensor,
+            restored_model_dict[k],
+            torch.Tensor,
         ), f"Value for key {k} is not a tensor"
 
         # Get expected shape, dtype, device from expected_model_keys
@@ -444,21 +837,15 @@ def test_hf_sharded_checkpoint():
             restored_model_dict[k].shape[0] // 2,
         )[torch.distributed.get_rank()]
         assert list(curr_shard.shape) == expected_shape, (
-            f"Shape mismatch for key {k}. "
-            f"Expected shape {expected_shape} but got {curr_shard.shape}"
+            f"Shape mismatch for key {k}. Expected shape {expected_shape} but got {curr_shard.shape}"
         )
         assert curr_shard.dtype == expected_dtype, (
-            f"Dtype mismatch for key {k}. "
-            f"Expected dtype {expected_dtype} but got {curr_shard.dtype}"
+            f"Dtype mismatch for key {k}. Expected dtype {expected_dtype} but got {curr_shard.dtype}"
         )
         assert str(curr_shard.device) == expected_device, (
-            f"Device mismatch for key {k}. "
-            f"Expected device {expected_device} but got {curr_shard.device}"
+            f"Device mismatch for key {k}. Expected device {expected_device} but got {curr_shard.device}"
         )
-        assert torch.allclose(v, curr_shard), (
-            f"Value mismatch for key {k}. "
-            f"Tensors are not numerically close"
-        )
+        assert torch.allclose(v, curr_shard), f"Value mismatch for key {k}. Tensors are not numerically close"
 
     # Compare the values, shapes, dtype, and device of the in-memory and on-disk optimizer state
     for k, v in flattened_optim_dict.items():
@@ -466,7 +853,8 @@ def test_hf_sharded_checkpoint():
             v = v.to_local()
         assert k in restored_optim_dict, f"Key {k} not found in restored optimizer state"
         assert isinstance(
-            restored_optim_dict[k], torch.Tensor,
+            restored_optim_dict[k],
+            torch.Tensor,
         ), f"Value for key {k} is not a tensor"
 
         # Get expected shape, dtype, device from expected_optim_keys
@@ -481,21 +869,15 @@ def test_hf_sharded_checkpoint():
             # this can be the parameter step which is a scalar Tensor
             curr_shard = restored_optim_dict[k]
         assert list(curr_shard.shape) == expected_shape, (
-            f"Shape mismatch for key {k}. "
-            f"Expected shape {expected_shape} but got {curr_shard.shape}"
+            f"Shape mismatch for key {k}. Expected shape {expected_shape} but got {curr_shard.shape}"
         )
         assert curr_shard.dtype == expected_dtype, (
-            f"Dtype mismatch for key {k}. "
-            f"Expected dtype {expected_dtype} but got {curr_shard.dtype}"
+            f"Dtype mismatch for key {k}. Expected dtype {expected_dtype} but got {curr_shard.dtype}"
         )
         assert str(curr_shard.device) == expected_device, (
-            f"Device mismatch for key {k}. "
-            f"Expected device {expected_device} but got {curr_shard.device}"
+            f"Device mismatch for key {k}. Expected device {expected_device} but got {curr_shard.device}"
         )
-        assert torch.allclose(v, curr_shard), (
-            f"Value mismatch for key {k}. "
-            f"Tensors are not numerically close"
-        )
+        assert torch.allclose(v, curr_shard), f"Value mismatch for key {k}. Tensors are not numerically close"
     if torch.distributed.get_rank() == 0:
         # delete the checkpoint directory
         if Path(trainer.checkpoint_config.checkpoint_dir).exists():

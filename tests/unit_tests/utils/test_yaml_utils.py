@@ -34,6 +34,7 @@ class SampleClass:
     def __init__(self, value: int):
         self.value = value
 
+
 def _roundtrip(obj):
     """
     Dump `obj` to YAML inside the context manager and immediately load it back.
@@ -44,6 +45,7 @@ def _roundtrip(obj):
         dumped = yaml.safe_dump(obj)
         loaded = yaml.safe_load(dumped)
     return dumped, loaded
+
 
 def test_function_representer():
     dumped, loaded = _roundtrip(some_func)

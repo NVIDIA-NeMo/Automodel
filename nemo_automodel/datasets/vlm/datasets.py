@@ -55,22 +55,22 @@ def make_rdr_dataset(path_or_dataset="quintend/rdr-items", split="train", **kwar
 
 
 def make_cord_v2_dataset(
-    path_or_dataset="naver-clova-ix/cord-v2", split="train", **kwargs,
+    path_or_dataset="naver-clova-ix/cord-v2",
+    split="train",
+    **kwargs,
 ):
-    """Load and preprocess the CORD-V2 dataset for image-to-text fine-tuning.
-    """
+    """Load and preprocess the CORD-V2 dataset for image-to-text fine-tuning."""
     dataset = load_dataset(path_or_dataset, split=split)
 
     def format(example):
         ground_truth = json.loads(example["ground_truth"])
-        if (
-            "gt_parses" in ground_truth
-        ):  # when multiple ground truths are available, e.g., docvqa
+        if "gt_parses" in ground_truth:  # when multiple ground truths are available, e.g., docvqa
             assert isinstance(ground_truth["gt_parses"], list)
             gt_jsons = ground_truth["gt_parses"]
         else:
             assert "gt_parse" in ground_truth and isinstance(
-                ground_truth["gt_parse"], dict,
+                ground_truth["gt_parse"],
+                dict,
             )
             gt_jsons = [ground_truth["gt_parse"]]
 
@@ -93,3 +93,24 @@ def make_cord_v2_dataset(
 
     return [format(example) for example in dataset]
     # return dataset.map(format, batched=False, num_proc=8,remove_columns=["ground_truth"])
+
+
+def make_medpix_dataset(path_or_dataset="medpix-dataset/medpix-dataset", split="train", **kwargs):
+    """Load and preprocess the MedPix dataset for image-to-text fine-tuning."""
+    dataset = load_dataset(path_or_dataset, split=split)
+
+    def format(example):
+        return {
+            "conversation": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": example["image_id"]},
+                        {"type": "text", "text": example["question"]},
+                    ],
+                },
+                {"role": "assistant", "content": [{"type": "text", "text": example["answer"]}]},
+            ],
+        }
+
+    return [format(example) for example in dataset]

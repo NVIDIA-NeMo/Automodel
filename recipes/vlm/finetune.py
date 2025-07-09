@@ -14,49 +14,38 @@
 
 from __future__ import annotations
 
+import logging
+import pathlib
+import time
 from typing import Any, Dict
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import wandb
 from torch.distributed.device_mesh import _mesh_resources
 from torch.utils.data import DataLoader
-
-import wandb
-from nemo_automodel.loggers.wandb_utils import suppress_wandb_log_messages
-from wandb import Settings
-
-import logging
-
 from transformers import AutoProcessor
+from wandb import Settings
 
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.config.cli import parse_args_and_load_config
 from nemo_automodel.datasets.vlm.collate_fns import COLLATE_FNS
+from nemo_automodel.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.distributed.init_utils import initialize_distributed
 from nemo_automodel.distributed.nvfsdp import NVFSDPManager
-from nemo_automodel.distributed.parallelizer import (
-    create_context_parallel_ctx,
-    get_train_context,
-)
 from nemo_automodel.loggers.log_utils import setup_logging
+from nemo_automodel.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.training.base_recipe import BaseRecipe
 from nemo_automodel.training.rng import StatefulRNG
 from nemo_automodel.training.step_scheduler import StepScheduler
+from nemo_automodel.training.utils import count_tail_padding
 from nemo_automodel.utils.dist_utils import (
     clip_gradients,
     get_sync_ctx,
     reduce_loss,
     rescale_gradients,
 )
-from nemo_automodel.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
-from nemo_automodel.loggers.log_utils import setup_logging
-from transformers import AutoProcessor
-from nemo_automodel.datasets.vlm.collate_fns import COLLATE_FNS
-from nemo_automodel.training.rng import StatefulRNG
-from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
-
-import logging
 from nemo_automodel.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
 
 logger = logging.getLogger(__name__)
@@ -67,29 +56,16 @@ logger = logging.getLogger(__name__)
 
 
 def build_model_and_optimizer(
-        device, 
-        cfg_model, 
-        cfg_opt, 
-        cfg_freeze, 
-        cfg_peft, 
-        model_wrapper, 
-        seed, 
-        tp_size=1,
-    ) -> tuple[nn.Module, 'Optimizer']: # noqa: F821
-    """Build and initialize a model.
-
-    Args:
-        device: The target device.
-        model_wrapper: Optional parallelism wrapper.
-        cfg_model: Configuration for model instantiation.
-        use_hf_fa2: Whether to use HF's flash_attention_2. This takes precedence over Pytorch's sdpa_methods for attn.
-        cfg_peft: Configuration for PEFT.
-        model_wrapper: Optional parallelism wrapper.
-        seed: Random seed.
-
-    Returns:
-        The instantiated model on the specified device.
-    """
+    device,
+    cfg_model,
+    cfg_opt,
+    cfg_freeze,
+    cfg_peft,
+    model_wrapper,
+    seed,
+    tp_size=1,
+) -> tuple[nn.Module, "Optimizer"]:  # noqa: F821
+    """Build and initialize a model for VLM."""
     with StatefulRNG(seed=seed, ranked=True):
         model = cfg_model.instantiate()
 
@@ -108,21 +84,26 @@ def build_model_and_optimizer(
 
         print_trainable_parameters(model)
 
+        if callable(getattr(model_wrapper, "parallelize", None)):
+            if isinstance(model_wrapper, NVFSDPManager):
+                trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
+                assert len(trainable_params) > 0, "trainable_params cannot be empty"
+                if tp_size > 1:
+                    cfg_opt.foreach = False
+                optimizer = cfg_opt.instantiate(params=trainable_params)
+                model, optimizer = model_wrapper.parallelize(model, optimizer)
+                return model, optimizer
+            else:
+                model = model_wrapper.parallelize(model)
+        else:
+            model = model.to(device)
+
         trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         if tp_size > 1:
-            # TP does not support foreach
             cfg_opt.foreach = False
         optimizer = cfg_opt.instantiate(params=trainable_params)
 
-        if callable(getattr(model_wrapper, 'parallelize', None)):
-            if isinstance(model_wrapper, NVFSDPManager):
-                model, optimizer = model_wrapper.parallelize(model, optimizer)
-            else:
-                model = model_wrapper.parallelize(model)
-            # FSDP2 and nvFSDP should already be on the correct device
-        else:
-            model = model.to(device)
         return model, optimizer
 
 
@@ -163,18 +144,7 @@ def build_loss_fn(device, cfg_loss):
 
 
 def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed) -> DataLoader:
-    """Build a distributed dataloader.
-
-    Args:
-        cfg_ds: Dataset configuration.
-        cfg_dl: DataLoader configuration.
-        cfg_model: Model configuration.
-        cfg_processor: Processor configuration.
-        distributed_sampler_kwargs: Additional arguments for the DistributedSampler.
-
-    Returns:
-        The instantiated DataLoader.
-    """
+    """Build a VLM dataloader."""
     dist_sampler_kwargs = {
         "shuffle": cfg_dl.get("shuffle", True),
     }
@@ -185,7 +155,13 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed
         }
 
     with StatefulRNG(seed=seed, ranked=True):
-        if hasattr(cfg_ds, "_target_") and "vlm" in cfg_ds._target_:
+        if cfg_processor is not None:
+            if hasattr(cfg_processor, "instantiate"):
+                processor = cfg_processor.instantiate()
+            else:
+                processor_kwargs = cfg_processor.to_dict()
+                processor = AutoProcessor.from_pretrained(cfg_model.pretrained_model_name_or_path, **processor_kwargs)
+        else:
             processor = AutoProcessor.from_pretrained(cfg_model.pretrained_model_name_or_path)
 
         ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
@@ -198,7 +174,6 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed
         if collate_cfg:
             collate_fn = lambda examples: collate_cfg.instantiate(examples=examples, processor=processor)
         else:
-            # Get the appropriate collate function
             processor_type = type(processor).__name__
             if processor_type not in COLLATE_FNS:
                 processor_type = "default"
@@ -246,7 +221,8 @@ def build_step_scheduler(cfg, dataloader):
 
 def build_wandb(cfg):
     """Instantiates wandb and returns the instance.
-    If no name is given, it will use the model name
+
+    If no name is given, it will use the model name.
     """
     assert cfg.get("wandb", None) is not None
     kwargs = cfg.wandb.to_dict()
@@ -266,10 +242,7 @@ def build_wandb(cfg):
 
 
 class FinetuneRecipeForVLM(BaseRecipe):
-    """Recipe for fine-tuning a model for VLM.
-
-    This class orchestrates training, from setup to main training loop.
-    """
+    """Recipe for fine-tuning a VLM model."""
 
     def __init__(self, cfg):
         """Initialize the recipe with configuration.
@@ -279,18 +252,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
         """
         self.cfg = cfg
 
-    # ------------------ build phase ------------------
     def setup(self):
-        """Builds all components needed for training/validation/logging/checkpointing/etc.
-
-        This is the last place where self.cfg should be referenced.
-
-        Raises:
-            NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
-        """
+        """Override setup to use VLM-specific builders."""
         torch.cuda.reset_peak_memory_stats()
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
-        # setups logging and adds the rankfilter to logging
         setup_logging()
 
         self.device_mesh = None
@@ -304,19 +269,19 @@ class FinetuneRecipeForVLM(BaseRecipe):
             run = build_wandb(self.cfg)
             logging.info("🚀 View run at {}".format(run.url))
 
-        # Build components
+        # Build components with VLM-specific functions
         self.model, self.optimizer = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
             self.cfg.optimizer,
-            self.cfg.get("freeze_config", None),
-            self.cfg.get('peft', None),
+            self.cfg.get("freeze_config", None),  # VLM-specific
+            self.cfg.get("peft", None),
             self.model_wrapper,
             seed=self.cfg.get("seed", 42),
             tp_size=self.cfg.get("distributed.tp_size", 1),
         )
         self.loss_fn = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
-        self.dataloader = build_dataloader(
+        self.dataloader = build_dataloader(  # VLM-specific
             self.cfg.dataset,
             self.cfg.dataloader,
             self.cfg.model,
@@ -328,7 +293,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Build validation dataloader if the config provides it
         self.val_dataloader = None
         if "validation_dataset" in self.cfg:
-            self.val_dataloader = build_dataloader(
+            self.val_dataloader = build_dataloader(  # VLM-specific
                 self.cfg.validation_dataset,
                 self.cfg.validation_dataloader,
                 self.cfg.model,
@@ -367,6 +332,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         and update model parameters when necessary. Also prints loss every gradient step.
         """
         self.model.train()
+        self.timestamp = time.perf_counter()
+        self.num_tokens = 0
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
             for batch_idx, batch in enumerate(self.step_scheduler):
@@ -384,6 +351,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         Args:
             batch: Batch of training data.
             is_optim_step: Flag indicating if a gradient step should be applied.
+            clip_norm: Gradient clipping norm value.
 
         Returns:
             Grad norm from the training step.
@@ -396,9 +364,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if loss_mask is None:
             loss_mask = (labels.detach() != -100).to(torch.int)
 
-        # TODO(@boxiangw): Refractor. Needed for SP support
-        # If 'position_ids' does not exist in batch already then override it. batch in case of Packed sequence
-        # contains 'position_ids' and we don't want to override it.
         if (
             "position_ids" not in batch
             and self.device_mesh is not None
@@ -406,57 +371,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
         ):
             batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
 
-        # based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/train.py#L336
-        if self.device_mesh is not None and self.device_mesh["context_parallel"].size() > 1:
-            input_ids = batch["input_ids"].to(self.model.device)
-            position_ids = batch["position_ids"].to(self.model.device)
-
-            if loss_mask is not None:
-                cp_buffers = [input_ids, labels, position_ids, loss_mask]
-                cp_seq_dims = [1, 1, 1, 1]
-                cp_no_restore_buffers = {input_ids, labels, loss_mask}
-            else:
-                cp_buffers = [input_ids, labels, position_ids]
-                cp_seq_dims = [1, 1, 1]
-                cp_no_restore_buffers = {input_ids, labels}
-
-            context_parallel_ctx = create_context_parallel_ctx(
-                cp_mesh=self.model_wrapper.device_mesh["context_parallel"],
-                cp_buffers=cp_buffers,
-                cp_seq_dims=cp_seq_dims,
-                cp_no_restore_buffers=cp_no_restore_buffers,
-                cp_rotate_method="allgather",  # TODO add "alltoall" option
-            )
-            train_context = get_train_context(
-                False,
-                False,
-            )
-
-            with train_context(context_parallel_ctx):
-                out = self.model(**batch)
-
-                # Prepare for loss calculation
-                logits = out.logits.float()
-                n_cls = logits.shape[-1]
-                logits = logits.view(-1, n_cls)
-                labels = labels.view(-1)
-                assert logits.shape[-2] == labels.shape[-1], "Expected logits & labels to have the same length"
-                local_loss = self.loss_fn(logits, labels, loss_mask)
-
-            # In the case where all labels are masked, the loss should be 0.
-            if loss_mask is not None and loss_mask.bool().sum() == 0:
-                local_loss.detach().copy_(torch.zeros_like(local_loss))
-
-        else:
+        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels, loss_mask)
+        with train_ctx():
             out = self.model(**batch)
             local_loss = self.loss_fn(
-                out.logits.view(-1, out.logits.size(-1)),
-                labels.view(-1),
-                mask=loss_mask,
-                reduction="sum",
+                out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum"
             )
 
         local_num_tokens = loss_mask.sum().detach().to(torch.int)
+        self.num_tokens += labels.numel() - count_tail_padding(labels)
         self.total_num_tokens += local_num_tokens
         self.forward_data_store.append(local_loss.detach())
 
@@ -497,15 +420,24 @@ class FinetuneRecipeForVLM(BaseRecipe):
             # self.model.install_optimized_model_weights()
             # self.model.zero_grad_buffer()
 
+            # TPS is calculated as follows (assuming grad-accumulation-steps=2):
+            # fwd 0 | bwd 0 | fwd 1 | bwd 1 | opt 0 | fwd 2 | bwd 2 | ...
+            # ^                                     ^
+            t = time.perf_counter()
+            time_delta = t - self.timestamp
+            self.timestamp = t
+            tps = self.num_tokens / time_delta
+            self.num_tokens = 0
             # log
-            reporting_loss = self.log_train_metrics(grad_norm)
+            reporting_loss = self.log_train_metrics(grad_norm, tps)
             logging.info(
-                "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | mem: {:.2f} GiB".format(
+                "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | mem: {:.2f} GiB | tps {:.2f}".format(
                     self.step_scheduler.step,
                     self.step_scheduler.epoch,
                     reporting_loss,
                     grad_norm,
                     torch.cuda.max_memory_allocated() / 1024**3,
+                    tps,
                 )
             )
             torch.cuda.reset_peak_memory_stats()
@@ -515,6 +447,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         """Run one pass over `self.val_dataloader` and return average loss per token."""
         with StatefulRNG(seed=1, ranked=True):
             self.model.eval()
+
             total_loss = 0.0
             total_tokens = 0
 
@@ -537,50 +470,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
                     )
 
-                if self.device_mesh["context_parallel"].size() > 1:
-                    input_ids = batch["input_ids"].to(self.model.device)
-                    position_ids = batch["position_ids"].to(self.model.device)
-
-                    if loss_mask is not None:
-                        cp_buffers = [input_ids, labels, position_ids, loss_mask]
-                        cp_seq_dims = [1, 1, 1, 1]
-                        cp_no_restore_buffers = {input_ids, labels, loss_mask}
-                    else:
-                        cp_buffers = [input_ids, labels, position_ids]
-                        cp_seq_dims = [1, 1, 1]
-                        cp_no_restore_buffers = {input_ids, labels}
-
-                    context_parallel_ctx = create_context_parallel_ctx(
-                        cp_mesh=self.model_wrapper.device_mesh["context_parallel"],
-                        cp_buffers=cp_buffers,
-                        cp_seq_dims=cp_seq_dims,
-                        cp_no_restore_buffers=cp_no_restore_buffers,
-                        cp_rotate_method="allgather",  # TODO add "alltoall" option
-                    )
-                    train_context = get_train_context(
-                        False,
-                        False,
-                    )
-                    with train_context(context_parallel_ctx):
-                        out = self.model(**batch)
-                        # Prepare for loss calculation
-                        logits = out.logits.float()
-                        n_cls = logits.shape[-1]
-                        logits = logits.view(-1, n_cls)
-                        labels = labels.view(-1)
-                        assert logits.shape[-2] == labels.shape[-1], "Expected logits & labels to have the same length"
-                        local_loss = self.loss_fn(logits, labels, loss_mask)
-
-                    # In the case where all labels are masked, the loss should be 0.
-                    if loss_mask is not None and loss_mask.bool().sum() == 0:
-                        local_loss.detach().copy_(torch.zeros_like(local_loss))
-                else:
+                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels, loss_mask)
+                with train_ctx():
                     out = self.model(**batch)
                     local_loss = self.loss_fn(
-                        out.logits.view(-1, out.logits.size(-1)),
-                        labels.view(-1),
-                        mask=loss_mask,
-                        reduction="sum",
+                        out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum"
                     )
 
                 total_loss += local_loss.item()
@@ -595,24 +489,19 @@ class FinetuneRecipeForVLM(BaseRecipe):
         val_loss = total_loss / max(total_tokens, 1e-8)
         if self.dist_env.is_main:
             if wandb.run is not None:
-                wandb.log(
-                    {
-                        "val_loss": val_loss,
-                        "step": self.step_scheduler.step,
-                        "epoch": self.step_scheduler.epoch,
-                    }
-                )
+                wandb.log({"val_loss": val_loss, "step": self.step_scheduler.step, "epoch": self.step_scheduler.epoch})
         logging.info(
             "[val] step {} | epoch {} | loss {:.4f}".format(
                 self.step_scheduler.step, self.step_scheduler.epoch, val_loss
             )
         )
 
-    def log_train_metrics(self, grad_norm):
+    def log_train_metrics(self, grad_norm, tps):
         """Log metrics to wandb.
 
         Args:
             grad_norm: Grad norm from the training step.
+            tps: Tokens per second throughput metric.
 
         Returns:
             Reporting loss.
@@ -625,10 +514,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             dp_group = self.device_mesh["data_parallel"].get_group()
 
         total_loss, total_num_tokens = reduce_loss(
-            self.forward_data_store,
-            self.total_num_tokens,
-            per_token_loss=True,
-            dp_group=dp_group,
+            self.forward_data_store, self.total_num_tokens, per_token_loss=True, dp_group=dp_group
         )
         reporting_loss = (total_loss / total_num_tokens).item()
         grad_norm = grad_norm.item() if not isinstance(grad_norm, float) else grad_norm  # TP WAR
@@ -641,6 +527,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             "epoch": self.step_scheduler.epoch,
             "grad_norm": grad_norm,
             "num_tokens_per_step": total_num_tokens,
+            "tps": tps,
         }
         if self.optimizer.param_groups:
             log_data["learning_rate"] = self.optimizer.param_groups[0]["lr"]
@@ -660,7 +547,8 @@ def main():
 
     Loads the configuration, sets up the trainer, and initiates the training loop.
     """
-    cfg = parse_args_and_load_config("qwen2_5_vl_3b_rdr.yaml")
+    script_path = pathlib.Path(__file__).parent.resolve()
+    cfg = parse_args_and_load_config(script_path / "gemma_3_vl_4b_cord_v2.yaml")
     trainer = FinetuneRecipeForVLM(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()

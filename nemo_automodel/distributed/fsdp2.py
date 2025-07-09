@@ -88,19 +88,13 @@ class FSDP2Manager:
             output_dtype=torch.bfloat16,
             cast_forward_inputs=True,
         ),
-        metadata={
-            "help": "MixedPrecisionPolicy for FSDP2 (param/reduce/output dtypes)."
-        },
+        metadata={"help": "MixedPrecisionPolicy for FSDP2 (param/reduce/output dtypes)."},
     )
     offload_policy: Optional[CPUOffloadPolicy] = field(
         default=None,
-        metadata={
-            "help": "CPUOffloadPolicy to offload parameters/optim states to CPU."
-        },
+        metadata={"help": "CPUOffloadPolicy to offload parameters/optim states to CPU."},
     )
-    backend: Optional[str] = field(
-        default="nccl", metadata={"help": "Distributed backend, e.g. 'nccl' or 'gloo'."}
-    )
+    backend: Optional[str] = field(default="nccl", metadata={"help": "Distributed backend, e.g. 'nccl' or 'gloo'."})
     world_size: Optional[int] = field(
         default=None,
         # init=False,
@@ -145,9 +139,7 @@ class FSDP2Manager:
         mesh_shape = (self.dp_size, self.cp_size, self.tp_size)
         mesh_names = ("data_parallel", "context_parallel", "tensor_parallel")
         for shape, name in zip(mesh_shape, mesh_names):
-            assert isinstance(
-                shape, int
-            ), "Expected {} to be an int, but got {}".format(name, type(shape))
+            assert isinstance(shape, int), "Expected {} to be an int, but got {}".format(name, type(shape))
             assert shape > 0, "Expected {} > 0, {}".format(name, shape)
 
         # build mesh [dp, cp, tp]
@@ -158,9 +150,7 @@ class FSDP2Manager:
         )
         # flatten dp+cp if cp>1
         if self.cp_size > 1:
-            self.device_mesh[("data_parallel", "context_parallel")]._flatten(
-                mesh_dim_name="dp_cp"
-            )
+            self.device_mesh[("data_parallel", "context_parallel")]._flatten(mesh_dim_name="dp_cp")
         return self
 
     def parallelize(self, model, use_hf_tp_plan=False):
@@ -199,21 +189,13 @@ class FSDP2Manager:
                 }
 
                 base_model_sp_plan = {
-                    "model.embed_tokens": RowwiseParallel(
-                        input_layouts=Replicate(), output_layouts=Shard(1)
-                    ),
+                    "model.embed_tokens": RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1)),
                     "model.norm": SequenceParallel(),
                     "model.layers.*.input_layernorm": SequenceParallel(),
-                    "model.layers.*.self_attn.o_proj": RowwiseParallel(
-                        output_layouts=Shard(1)
-                    ),
+                    "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
                     "model.layers.*.post_attention_layernorm": SequenceParallel(),
-                    "model.layers.*.mlp.down_proj": RowwiseParallel(
-                        output_layouts=Shard(1)
-                    ),
-                    "lm_head": ColwiseParallel(
-                        input_layouts=Shard(1), output_layouts=Replicate()
-                    ),
+                    "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
+                    "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate()),
                 }
 
                 if self.sequence_parallel:
