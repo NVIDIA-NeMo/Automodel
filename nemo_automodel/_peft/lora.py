@@ -41,7 +41,6 @@ MODEL_TYPE_TO_PEFT_TASK_TYPE = {
 }
 
 
-
 class LinearLoRA(nn.Linear):
     """
     Linear + LoRA, maintains ckpts structure (i.e. Linear's weight/bias remain at the same FQN).
