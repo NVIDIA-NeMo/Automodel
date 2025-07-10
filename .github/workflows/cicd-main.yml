@@ -157,6 +157,13 @@ jobs:
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.script }}
     environment: nemo-ci
+    if: |
+      (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && !cancelled()
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -200,6 +207,13 @@ jobs:
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.script }}
     environment: nemo-ci
+    if: |
+      (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && !cancelled()
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -219,7 +233,12 @@ jobs:
       - pre-flight
       - cicd-unit-tests
       - cicd-e2e-tests
-    if: always()
+    if: |
+      (
+        needs.pre-flight.outputs.docs_only == 'true'
+        || success()
+      )
+      && !cancelled()
     runs-on: ubuntu-latest
     permissions: write-all
     steps:
