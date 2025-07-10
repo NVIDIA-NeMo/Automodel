@@ -355,6 +355,6 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
     """
     final_target_modules = set()
     for name, _ in model.named_modules():
-        if "lora" in name:
-            final_target_modules.add(name)
-    return list(final_target_modules)
+        if "lora" in name.lower():
+            final_target_modules.add(name.rsplit(".", 1)[0])
+    return sorted(list(final_target_modules))

@@ -351,10 +351,6 @@ def apply_lora_to_linear_modules(
 
     target_modules accepts wildcard fragments, e.g. ["q_proj", "k_proj", ".*fc.*"].
     """
-    # To make our PeftConfig compatible with HF, we need to keep track of the
-    # final target modules, without the wildcard fragments.
-    final_target_modules = set()
-
     # Freeze base model parameters
     for w in model.parameters():
         w.requires_grad_(False)
@@ -373,8 +369,6 @@ def apply_lora_to_linear_modules(
     num_modules_matched = 0
     for name, module in list(model.named_modules()):
         if matcher.match(module, name):
-            final_target_modules.add(name.split(".")[-1])
-
             num_modules_matched += 1
             patch_linear_module(
                 module,

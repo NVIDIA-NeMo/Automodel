@@ -1769,6 +1769,7 @@ def test_hf_peft_checkpoint():
         "dataloader.pt",
         "model/adapter_model.safetensors",
         "model/adapter_config.json",
+        "model/automodel_peft_config.json",
         "optim/__0_0.distcp",
         "optim/__1_0.distcp",
         "optim/.metadata",
