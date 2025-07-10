@@ -1864,7 +1864,9 @@ def test_hf_peft_checkpoint():
         open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "model" / "adapter_config.json"),
     )
     restored_automodel_peft_config = json.load(
-        open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "model" / "automodel_peft_config.json"),
+        open(
+            Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "model" / "automodel_peft_config.json"
+        ),
     )
     _compare_dicts(expected_config, restored_config)
     _compare_dicts(expected_automodel_peft_config, restored_automodel_peft_config)
