@@ -30,9 +30,9 @@ rng:
   ranked: true
 
 model:
-  _target_: nemo_automodel._transformers.NeMoAutoModelForImageTextToText.from_pretrained
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: google/gemma-3n-e4b-it #HF model id or local path
-  torch_dtype: auto
+  torch_dtype: torch.bfloat16
   use_liger_kernel: false
   use_sdpa_patching: false # gemma-3n-e4b-it does not work with sdpa patching
   attn_implementation: eager

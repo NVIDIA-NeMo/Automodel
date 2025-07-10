@@ -34,8 +34,9 @@ rng:
   ranked: true
 
 model:
-  _target_: transformers.AutoModelForCausalLM.from_pretrained
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+  torch_dtype: bf16
 
 checkpoint:
   enabled: true

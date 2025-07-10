@@ -23,43 +23,10 @@ from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 
 from nemo_automodel import __version__
 from nemo_automodel.shared.import_utils import safe_import
+from nemo_automodel.shared.utils import dtype_from_str
 
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 logger = logging.getLogger(__name__)
-
-
-def dtype_from_str(val):
-    """
-    Translate a str val of a dtype into the corresponding torch.dtype
-    Args:
-        val (str): the dotted path of the dtype (e.g., "torch.bfloat16").
-
-    Returns:
-        torch.dtype: the actual dtype (e.g., torch.bfloat16)
-    """
-    if isinstance(val, torch.dtype):
-        return val
-    lut = {
-        "torch.float": torch.float,
-        "torch.float32": torch.float,
-        "torch.float64": torch.float64,
-        "torch.double": torch.float64,
-        "torch.complex64": torch.complex,
-        "torch.cfloat": torch.complex,
-        "torch.float16": torch.float16,
-        "torch.half": torch.float16,
-        "torch.bfloat16": torch.bfloat16,
-        "torch.uint8": torch.uint8,
-        "torch.int8": torch.int8,
-        "torch.int16": torch.int16,
-        "torch.short": torch.short,
-        "torch.int32": torch.int32,
-        "torch.int": torch.int,
-        "torch.int64": torch.int64,
-        "torch.long": torch.long,
-        "torch.bool": torch.bool,
-    }
-    return lut[val.lower()]
 
 
 def _assert_same_signature(original, patched):

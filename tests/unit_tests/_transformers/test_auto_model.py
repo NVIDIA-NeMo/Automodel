@@ -441,33 +441,3 @@ def test_liger_apply_failure_raises(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Failed to patch model"):
         tgt.patch_model(DummyModel(), use_liger_kernel=True, use_sdpa_patching=False)
-
-
-def test_dtype_from_str_raises():
-    """
-    ensure dtype_from_str raises KeyError on non-dtype input
-    """
-    import nemo_automodel._transformers.auto_model as tgt
-
-    with pytest.raises(KeyError):
-        tgt.dtype_from_str("abc")
-
-
-def test_dtype_from_str_not_raises():
-    """
-    ensure dtype_from_str not raises KeyError on non-dtype input
-    """
-    import nemo_automodel._transformers.auto_model as tgt
-
-    res = tgt.dtype_from_str("torch.bfloat16")
-    assert res == torch.bfloat16
-
-
-def test_dtype_from_str_bypass():
-    """
-    ensure dtype_from_str bypasses lut on non-dtype input
-    """
-    import nemo_automodel._transformers.auto_model as tgt
-
-    res = tgt.dtype_from_str(torch.bfloat16)
-    assert res == torch.bfloat16
