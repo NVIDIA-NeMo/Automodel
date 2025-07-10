@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import pathlib
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import torch
 import torch.distributed as dist
@@ -29,7 +29,7 @@ from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoTokenizer
 from wandb import Settings
 
-from nemo_automodel._peft.lora import PeftConfig, apply_lora_to_linear_modules
+from nemo_automodel._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.config.cli import parse_args_and_load_config
 from nemo_automodel.datasets.llm.packed_sequence import PackedSequence

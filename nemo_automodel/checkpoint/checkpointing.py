@@ -27,7 +27,6 @@ import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 from safetensors import safe_open
 from safetensors.torch import save_file
-import re
 
 from nemo_automodel._peft.lora import PeftConfig
 from nemo_automodel.checkpoint._backports.filesystem import SerializationFormat
@@ -341,12 +340,14 @@ def _get_hf_peft_config(peft_config: PeftConfig, model_state: ModelState) -> dic
         "base_model_name_or_path": name_or_path,
     }
 
+
 def _get_automodel_peft_metadata(peft_config: PeftConfig) -> dict:
     """
     Get the PEFT metadata in the format expected by Automodel.
     """
-    PEFT_KEYS = ("dim", "alpha")
+    PEFT_KEYS = {"dim", "alpha"}
     return {k: v for k, v in peft_config.to_dict().items() if k not in PEFT_KEYS}
+
 
 def _extract_target_modules(model: nn.Module) -> list[str]:
     """

@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import pathlib
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import torch
 import torch.distributed as dist
@@ -28,7 +28,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoProcessor
 from wandb import Settings
 
-from nemo_automodel._peft.lora import PeftConfig, apply_lora_to_linear_modules
+from nemo_automodel._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.config.cli import parse_args_and_load_config
 from nemo_automodel.datasets.vlm.collate_fns import COLLATE_FNS
@@ -65,7 +65,7 @@ def build_model_and_optimizer(
     model_wrapper,
     seed,
     tp_size=1,
-) -> tuple[nn.Module, "Optimizer", Optional[PeftConfig]]:  # noqa: F821
+) -> tuple[nn.Module, "Optimizer"]:  # noqa: F821
     """Build and initialize a model for VLM."""
     with StatefulRNG(seed=seed, ranked=True):
         model = cfg_model.instantiate()
@@ -91,7 +91,7 @@ def build_model_and_optimizer(
                     cfg_opt.foreach = False
                 optimizer = cfg_opt.instantiate(params=trainable_params)
                 model, optimizer = model_wrapper.parallelize(model, optimizer)
-                return model, optimizer, peft_config
+                return model, optimizer
             else:
                 model = model_wrapper.parallelize(model)
         else:
@@ -103,7 +103,7 @@ def build_model_and_optimizer(
             cfg_opt.foreach = False
         optimizer = cfg_opt.instantiate(params=trainable_params)
 
-        return model, optimizer, peft_config
+        return model, optimizer
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
