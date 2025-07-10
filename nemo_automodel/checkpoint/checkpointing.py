@@ -27,6 +27,7 @@ import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 from safetensors import safe_open
 from safetensors.torch import save_file
+import re
 
 from nemo_automodel._peft.lora import PeftConfig
 from nemo_automodel.checkpoint._backports.filesystem import SerializationFormat
@@ -58,23 +59,6 @@ class CheckpointingConfig:
         """
         if isinstance(self.model_save_format, str):
             self.model_save_format = SerializationFormat[self.model_save_format.upper()]
-
-    def to_dict(self):
-        cfg = self.__dict__.copy()
-        cfg["model_save_format"] = cfg["model_save_format"].value
-        return cfg
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]):
-        return cls(
-            enabled=d.get("enabled", False),
-            checkpoint_dir=d.get("checkpoint_dir", None),
-            model_save_format=d.get("model_save_format", None),
-            model_cache_dir=d.get("model_cache_dir", None),
-            model_repo_id=d.get("model_repo_id", None),
-            save_consolidated=d.get("save_consolidated", False),
-            is_peft=d.get("is_peft", False),
-        )
 
 
 def save_model(
@@ -113,10 +97,6 @@ def save_model(
             # save the config.json file
             with open(os.path.join(consolidated_model_path, "config.json"), "w") as f:
                 f.write(model.config.to_json_string())
-
-        # save the checkpoint config for inference loading
-        with open(os.path.join(model_path, "checkpoint_config.json"), "w") as f:
-            json.dump(checkpoint_config.to_dict(), f, indent=2, sort_keys=True)
 
     # Ensure all ranks wait for rank 0 to handle directories
     if torch.distributed.is_initialized():
@@ -314,6 +294,7 @@ def _save_peft_adapters(
     Save PEFT adapters to a weights path.
     """
     hf_peft_config = _get_hf_peft_config(peft_config, model_state)
+    automodel_peft_metadata = _get_automodel_peft_metadata(peft_config)
     state_dict = model_state.state_dict()
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         # save in HF format. Only keys that are needed for PEFT module loading will be saved here.
@@ -321,7 +302,7 @@ def _save_peft_adapters(
             json.dump(hf_peft_config, f, indent=2, sort_keys=True)
         # save the full PEFT config for inference loading inside Automodel.
         with open(os.path.join(model_path, "automodel_peft_config.json"), "w") as f:
-            json.dump(peft_config.to_dict(), f, indent=2, sort_keys=True)
+            json.dump(automodel_peft_metadata, f, indent=2, sort_keys=True)
         save_file(state_dict, os.path.join(model_path, "adapter_model.safetensors"))
 
 
@@ -338,6 +319,7 @@ def _get_hf_peft_config(peft_config: PeftConfig, model_state: ModelState) -> dic
         "FeatureExtraction": "FEATURE_EXTRACTION",
         "ConditionalGeneration": "CONDITIONAL_GENERATION",
     }
+    target_modules = _extract_target_modules(model_state.model)
     try:
         model_task = model_state.model.config.architectures[0].split("For")[-1]
     except AttributeError:
@@ -354,8 +336,24 @@ def _get_hf_peft_config(peft_config: PeftConfig, model_state: ModelState) -> dic
         "peft_type": "LORA",
         "r": peft_config.dim,
         "lora_alpha": peft_config.alpha,
-        "target_modules": peft_config.target_modules,
+        "target_modules": target_modules,
         "bias": "none",
         "base_model_name_or_path": name_or_path,
-        "lora_dropout": peft_config.dropout,
     }
+
+def _get_automodel_peft_metadata(peft_config: PeftConfig) -> dict:
+    """
+    Get the PEFT metadata in the format expected by Automodel.
+    """
+    PEFT_KEYS = ("dim", "alpha")
+    return {k: v for k, v in peft_config.to_dict().items() if k not in PEFT_KEYS}
+
+def _extract_target_modules(model: nn.Module) -> list[str]:
+    """
+    Extract the target modules from the model.
+    """
+    final_target_modules = set()
+    for name, _ in model.named_modules():
+        if "lora" in name:
+            final_target_modules.add(name)
+    return list(final_target_modules)

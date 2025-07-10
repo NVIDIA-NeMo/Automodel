@@ -44,15 +44,13 @@ checkpoint:
   save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 peft:
-  peft_fn: nemo_automodel._peft.lora.apply_lora_to_linear_modules
-  peft_params:
-    _target_: nemo_automodel._peft.lora.PeftConfig
-    match_all_linear: True
-    dim: 8
-    alpha: 32
-    use_triton: True
-    # dtype needs a fix to resolve to type instead of string
-    # lora_dtype: torch.bfloat16
+  _target_: nemo_automodel._peft.lora.PeftConfig
+  match_all_linear: True
+  dim: 8
+  alpha: 32
+  use_triton: True
+  # dtype needs a fix to resolve to type instead of string
+  # lora_dtype: torch.bfloat16
 
 distributed:
   _target_: nemo_automodel.distributed.fsdp2.FSDP2Manager

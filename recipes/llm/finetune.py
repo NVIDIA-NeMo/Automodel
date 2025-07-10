@@ -29,7 +29,7 @@ from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoTokenizer
 from wandb import Settings
 
-from nemo_automodel._peft.lora import PeftConfig
+from nemo_automodel._peft.lora import PeftConfig, apply_lora_to_linear_modules
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.config.cli import parse_args_and_load_config
 from nemo_automodel.datasets.llm.packed_sequence import PackedSequence
@@ -65,7 +65,7 @@ def build_model_and_optimizer(
     model_wrapper,
     seed,
     tp_size=1,
-) -> tuple[nn.Module, "Optimizer", Optional[PeftConfig]]:  # noqa: F821
+) -> tuple[nn.Module, "Optimizer"]:  # noqa: F821
     """Build and initialize a model.
 
     Args:
@@ -93,10 +93,8 @@ def build_model_and_optimizer(
             if isinstance(m, nn.Embedding):
                 m.weight.requires_grad_(False)
         # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
-        peft_config = None
         if cfg_peft is not None:
-            peft_config = cfg_peft.peft_params.instantiate()
-            cfg_peft.peft_fn(model, peft_config)
+            apply_lora_to_linear_modules(model, cfg_peft)
 
     if callable(getattr(model_wrapper, "parallelize", None)):
         # FSDP2 and nvFSDP should already be on the correct device
@@ -111,7 +109,7 @@ def build_model_and_optimizer(
 
             model, optimizer = model_wrapper.parallelize(model, optimizer)
 
-            return model, optimizer, peft_config
+            return model, optimizer
 
         else:
             model = model_wrapper.parallelize(model)
@@ -125,7 +123,7 @@ def build_model_and_optimizer(
         cfg_opt.foreach = False
     optimizer = cfg_opt.instantiate(params=trainable_params)
 
-    return model, optimizer, peft_config
+    return model, optimizer
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
@@ -318,12 +316,15 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         use_hf_fa2 = self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
 
         # Build components
-        self.model, self.optimizer, self.peft_config = build_model_and_optimizer(
+        self.peft_config = None
+        if self.cfg.get("peft", None) is not None:
+            self.peft_config = self.cfg.peft.instantiate()
+        self.model, self.optimizer = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
             self.cfg.optimizer,
             use_hf_fa2,
-            self.cfg.get("peft", None),
+            self.peft_config,
             self.model_wrapper,
             seed=self.cfg.get("seed", 42),
             tp_size=self.cfg.get("distributed.tp_size", 1),
