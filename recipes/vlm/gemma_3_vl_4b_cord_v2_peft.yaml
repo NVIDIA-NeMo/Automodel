@@ -37,7 +37,7 @@ model:
   attn_implementation: eager
 
 peft:
-  peft_fn: nemo_automodel._peft.lora.apply_lora_to_linear_modules
+  _target_: nemo_automodel._peft.lora.PeftConfig
   match_all_linear: False
   exclude_modules:  # exclude all vision modules and lm_head
     - "*vision_tower*"

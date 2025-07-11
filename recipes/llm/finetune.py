@@ -29,6 +29,7 @@ from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoTokenizer
 from wandb import Settings
 
+from nemo_automodel._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.config.cli import parse_args_and_load_config
 from nemo_automodel.datasets.llm.packed_sequence import PackedSequence
@@ -93,9 +94,7 @@ def build_model_and_optimizer(
                 m.weight.requires_grad_(False)
         # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
         if cfg_peft is not None:
-            opts = cfg_peft.to_dict()
-            peft_fn = opts.pop("peft_fn")
-            peft_fn(model, **opts)
+            apply_lora_to_linear_modules(model, cfg_peft)
 
     if callable(getattr(model_wrapper, "parallelize", None)):
         # FSDP2 and nvFSDP should already be on the correct device
@@ -144,7 +143,12 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
         cfg_ckpt = cfg_ckpt.to_dict()
         cfg_ckpt.pop("restore_from", None)
         ckpt_kwargs |= cfg_ckpt
-    return CheckpointingConfig(**ckpt_kwargs)
+    if ckpt_kwargs.get("is_peft", False) and ckpt_kwargs.get("model_save_format") == "torch_save":
+        raise ValueError(
+            "PEFT checkpointing is not supported for torch_save format. Save using `safetensors` format instead."
+        )
+    checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
+    return checkpoint_config
 
 
 def build_loss_fn(device, cfg_loss):
@@ -312,12 +316,15 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         use_hf_fa2 = self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
 
         # Build components
+        self.peft_config = None
+        if self.cfg.get("peft", None) is not None:
+            self.peft_config = self.cfg.peft.instantiate()
         self.model, self.optimizer = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
             self.cfg.optimizer,
             use_hf_fa2,
-            self.cfg.get("peft", None),
+            self.peft_config,
             self.model_wrapper,
             seed=self.cfg.get("seed", 42),
             tp_size=self.cfg.get("distributed.tp_size", 1),

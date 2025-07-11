@@ -100,7 +100,8 @@ class ModelState(Stateful):
             options = StateDictOptions(full_state_dict=True, cpu_offload=True, ignore_frozen_params=True)
         model_state_dict = get_model_state_dict(self.model, options=options)
         if self.is_tied_lm_head:
-            model_state_dict.pop("model.lm_head.weight", None)
+            _, lm_head_param_name = _get_lm_head_weight_and_name(self.model)
+            model_state_dict.pop(lm_head_param_name, None)
 
         if self.is_peft:
             # HF PEFT models are saved with a "base.model." prefix. This is so they can be loaded

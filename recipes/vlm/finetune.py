@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoProcessor
 from wandb import Settings
 
+from nemo_automodel._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.config.cli import parse_args_and_load_config
 from nemo_automodel.datasets.vlm.collate_fns import COLLATE_FNS
@@ -78,9 +79,7 @@ def build_model_and_optimizer(
 
         # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
         if cfg_peft is not None:
-            opts = cfg_peft.to_dict()
-            peft_fn = opts.pop("peft_fn")
-            peft_fn(model, **opts)
+            apply_lora_to_linear_modules(model, cfg_peft)
 
         print_trainable_parameters(model)
 
@@ -270,12 +269,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
             logging.info("🚀 View run at {}".format(run.url))
 
         # Build components with VLM-specific functions
+        self.peft_config = None
+        if self.cfg.get("peft", None) is not None:
+            self.peft_config = self.cfg.peft.instantiate()
         self.model, self.optimizer = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
             self.cfg.optimizer,
             self.cfg.get("freeze_config", None),  # VLM-specific
-            self.cfg.get("peft", None),
+            self.peft_config,
             self.model_wrapper,
             seed=self.cfg.get("seed", 42),
             tp_size=self.cfg.get("distributed.tp_size", 1),

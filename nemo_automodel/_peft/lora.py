@@ -13,7 +13,8 @@
 # limitations under the License.
 
 import math
-from typing import Literal, Optional
+from dataclasses import dataclass, field
+from typing import Any, Literal, Optional
 
 import torch
 import torch.nn.functional as F
@@ -30,15 +31,37 @@ from nemo_automodel.shared.utils import dtype_from_str
 
 HAS_BNB, bitsandbytes = safe_import("bitsandbytes")
 
-MODEL_TYPE_TO_PEFT_TASK_TYPE = {
-    "SequenceClassification": "SEQ_CLS",
-    "Seq2SeqLM": "SEQ_2_SEQ_LM",
-    "CausalLM": "CAUSAL_LM",
-    "TokenClassification": "TOKEN_CLS",
-    "QuestionAnswering": "QUESTION_ANS",
-    "FeatureExtraction": "FEATURE_EXTRACTION",
-    "ConditionalGeneration": "CONDITIONAL_GENERATION",
-}
+
+@dataclass
+class PeftConfig:
+    target_modules: list = field(default_factory=list)
+    exclude_modules: list = field(default_factory=list)
+    match_all_linear: bool = False
+    dim: int = 8
+    alpha: int = 32
+    dropout: float = 0.0
+    dropout_position: Literal["pre", "post"] = "post"
+    lora_A_init: str = "xavier"
+    lora_dtype: Optional[torch.dtype] = None
+    use_triton: bool = False
+
+    def to_dict(self):
+        return self.__dict__.copy()
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]):
+        return cls(
+            target_modules=d.get("target_modules", []),
+            exclude_modules=d.get("exclude_modules", []),
+            match_all_linear=d.get("match_all_linear", False),
+            dim=d.get("dim", 8),
+            alpha=d.get("alpha", 32),
+            dropout=d.get("dropout", 0.0),
+            dropout_position=d.get("dropout_position", "post"),
+            lora_A_init=d.get("lora_A_init", "xavier"),
+            lora_dtype=d.get("lora_dtype", None),
+            use_triton=d.get("use_triton", False),
+        )
 
 
 class LinearLoRA(nn.Linear):
@@ -288,26 +311,13 @@ def patch_linear_module(
 # -----------------------------------------------------------------------------#
 def apply_lora_to_linear_modules(
     model: nn.Module,
-    target_modules=[],
-    exclude_modules=[],
-    match_all_linear=False,
-    dim: int = 8,
-    alpha: int = 32,
-    dropout: float = 0.0,
-    dropout_position: Literal["pre", "post"] = "post",
-    lora_A_init: str = "xavier",
-    lora_dtype: Optional[torch.dtype] = None,
-    use_triton: bool = False,
-):
+    peft_config: PeftConfig,
+) -> int:
     """
     Replace selected nn.Linear layers with LinearLoRA layers (in-place).
 
     target_modules accepts wildcard fragments, e.g. ["q_proj", "k_proj", ".*fc.*"].
     """
-    # To make our PeftConfig compatible with HF, we need to keep track of the
-    # final target modules, without the wildcard fragments.
-    final_target_modules = set()
-
     # Freeze base model parameters
     for w in model.parameters():
         w.requires_grad_(False)
@@ -320,46 +330,23 @@ def apply_lora_to_linear_modules(
     except AttributeError:
         is_causal_lm = False
 
-    matcher = ModuleMatcher(target_modules, exclude_modules, match_all_linear, is_causal_lm)
+    matcher = ModuleMatcher(
+        peft_config.target_modules, peft_config.exclude_modules, peft_config.match_all_linear, is_causal_lm
+    )
     num_modules_matched = 0
     for name, module in list(model.named_modules()):
         if matcher.match(module, name):
-            final_target_modules.add(name.split(".")[-1])
-
             num_modules_matched += 1
             patch_linear_module(
                 module,
-                dim=dim,
-                alpha=alpha,
-                dropout=dropout,
-                dropout_position=dropout_position,
-                lora_A_init_method=lora_A_init,
-                lora_dtype=lora_dtype,
-                use_triton=use_triton,
+                dim=peft_config.dim,
+                alpha=peft_config.alpha,
+                dropout=peft_config.dropout,
+                dropout_position=peft_config.dropout_position,
+                lora_A_init_method=peft_config.lora_A_init,
+                lora_dtype=peft_config.lora_dtype,
+                use_triton=peft_config.use_triton,
             )
-
-    # finalize the peft config
-    try:
-        model_task = model.config.architectures[0].split("For")[-1]
-    except AttributeError:
-        model_task = "N/A"
-    try:
-        name_or_path = model.config.name_or_path
-        task_type = MODEL_TYPE_TO_PEFT_TASK_TYPE[model_task]
-    except AttributeError:
-        name_or_path = "N/A"
-        task_type = "CAUSAL_LM"
-
-    model._automodel_peft_config = {
-        "task_type": task_type,
-        "peft_type": "LORA",
-        "r": dim,
-        "lora_alpha": alpha,
-        "target_modules": list(final_target_modules),
-        "bias": "none",
-        "base_model_name_or_path": name_or_path,
-        "lora_dropout": dropout,
-    }
 
     return num_modules_matched
 

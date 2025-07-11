@@ -1733,11 +1733,80 @@ def test_hf_peft_checkpoint():
         "base_model_name_or_path": "/home/TestData/akoumparouli/hf_mixtral_2l/",
         "bias": "none",
         "lora_alpha": 32,
-        "lora_dropout": 0.0,
         "peft_type": "LORA",
         "r": 8,
-        "target_modules": ["q_proj", "gate", "w3", "o_proj", "w1", "v_proj", "w2", "k_proj"],
+        "target_modules": [
+            "model.layers.0.block_sparse_moe.experts.0.w1",
+            "model.layers.0.block_sparse_moe.experts.0.w2",
+            "model.layers.0.block_sparse_moe.experts.0.w3",
+            "model.layers.0.block_sparse_moe.experts.1.w1",
+            "model.layers.0.block_sparse_moe.experts.1.w2",
+            "model.layers.0.block_sparse_moe.experts.1.w3",
+            "model.layers.0.block_sparse_moe.experts.2.w1",
+            "model.layers.0.block_sparse_moe.experts.2.w2",
+            "model.layers.0.block_sparse_moe.experts.2.w3",
+            "model.layers.0.block_sparse_moe.experts.3.w1",
+            "model.layers.0.block_sparse_moe.experts.3.w2",
+            "model.layers.0.block_sparse_moe.experts.3.w3",
+            "model.layers.0.block_sparse_moe.experts.4.w1",
+            "model.layers.0.block_sparse_moe.experts.4.w2",
+            "model.layers.0.block_sparse_moe.experts.4.w3",
+            "model.layers.0.block_sparse_moe.experts.5.w1",
+            "model.layers.0.block_sparse_moe.experts.5.w2",
+            "model.layers.0.block_sparse_moe.experts.5.w3",
+            "model.layers.0.block_sparse_moe.experts.6.w1",
+            "model.layers.0.block_sparse_moe.experts.6.w2",
+            "model.layers.0.block_sparse_moe.experts.6.w3",
+            "model.layers.0.block_sparse_moe.experts.7.w1",
+            "model.layers.0.block_sparse_moe.experts.7.w2",
+            "model.layers.0.block_sparse_moe.experts.7.w3",
+            "model.layers.0.block_sparse_moe.gate",
+            "model.layers.0.self_attn.k_proj",
+            "model.layers.0.self_attn.o_proj",
+            "model.layers.0.self_attn.q_proj",
+            "model.layers.0.self_attn.v_proj",
+            "model.layers.1.block_sparse_moe.experts.0.w1",
+            "model.layers.1.block_sparse_moe.experts.0.w2",
+            "model.layers.1.block_sparse_moe.experts.0.w3",
+            "model.layers.1.block_sparse_moe.experts.1.w1",
+            "model.layers.1.block_sparse_moe.experts.1.w2",
+            "model.layers.1.block_sparse_moe.experts.1.w3",
+            "model.layers.1.block_sparse_moe.experts.2.w1",
+            "model.layers.1.block_sparse_moe.experts.2.w2",
+            "model.layers.1.block_sparse_moe.experts.2.w3",
+            "model.layers.1.block_sparse_moe.experts.3.w1",
+            "model.layers.1.block_sparse_moe.experts.3.w2",
+            "model.layers.1.block_sparse_moe.experts.3.w3",
+            "model.layers.1.block_sparse_moe.experts.4.w1",
+            "model.layers.1.block_sparse_moe.experts.4.w2",
+            "model.layers.1.block_sparse_moe.experts.4.w3",
+            "model.layers.1.block_sparse_moe.experts.5.w1",
+            "model.layers.1.block_sparse_moe.experts.5.w2",
+            "model.layers.1.block_sparse_moe.experts.5.w3",
+            "model.layers.1.block_sparse_moe.experts.6.w1",
+            "model.layers.1.block_sparse_moe.experts.6.w2",
+            "model.layers.1.block_sparse_moe.experts.6.w3",
+            "model.layers.1.block_sparse_moe.experts.7.w1",
+            "model.layers.1.block_sparse_moe.experts.7.w2",
+            "model.layers.1.block_sparse_moe.experts.7.w3",
+            "model.layers.1.block_sparse_moe.gate",
+            "model.layers.1.self_attn.k_proj",
+            "model.layers.1.self_attn.o_proj",
+            "model.layers.1.self_attn.q_proj",
+            "model.layers.1.self_attn.v_proj",
+        ],
         "task_type": "CAUSAL_LM",
+    }
+
+    expected_automodel_peft_config = {
+        "dropout": 0.0,
+        "dropout_position": "post",
+        "exclude_modules": [],
+        "lora_A_init": "xavier",
+        "lora_dtype": None,
+        "match_all_linear": True,
+        "target_modules": [],
+        "use_triton": False,
     }
 
     script_path = Path(__file__).parent.resolve()
@@ -1769,6 +1838,7 @@ def test_hf_peft_checkpoint():
         "dataloader.pt",
         "model/adapter_model.safetensors",
         "model/adapter_config.json",
+        "model/automodel_peft_config.json",
         "optim/__0_0.distcp",
         "optim/__1_0.distcp",
         "optim/.metadata",
@@ -1793,18 +1863,13 @@ def test_hf_peft_checkpoint():
     restored_config = json.load(
         open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "model" / "adapter_config.json"),
     )
-
-    assert len(restored_config) == len(expected_config), (
-        f"Mismatch between in-memory and on-disk config. Expected length {len(expected_config)} but got {len(restored_config)}"
+    restored_automodel_peft_config = json.load(
+        open(
+            Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "model" / "automodel_peft_config.json"
+        ),
     )
-
-    for k, v in expected_config.items():
-        assert k in restored_config, "Key {} not found in restored config".format(k)
-        error_msg = "Mismatch between in-memory and on-disk config. Expected {{}} but got {{}}"
-        if isinstance(v, list):
-            assert sorted(restored_config[k]) == sorted(v), error_msg.format(sorted(v), sorted(restored_config[k]))
-        else:
-            assert restored_config[k] == v, error_msg.format(v, restored_config[k])
+    _compare_dicts(expected_config, restored_config)
+    _compare_dicts(expected_automodel_peft_config, restored_automodel_peft_config)
 
     # at save time, the model is saved in a dictionary formatted as:
     # {
@@ -1930,3 +1995,17 @@ def _flatten(d: dict, parent_key: str | None = None):
         else:
             flat[key] = v
     return flat
+
+
+def _compare_dicts(expected: dict, restored: dict):
+    assert len(restored) == len(expected), (
+        f"Mismatch between in-memory and on-disk config. Expected length {len(expected)} but got {len(restored)}"
+    )
+
+    for k, v in expected.items():
+        assert k in restored, "Key {} not found in restored config".format(k)
+        error_msg = "Mismatch between in-memory and on-disk config. Expected {{}} but got {{}}"
+        if isinstance(v, list):
+            assert sorted(restored[k]) == sorted(v), error_msg.format(sorted(v), sorted(restored[k]))
+        else:
+            assert restored[k] == v, error_msg.format(v, restored[k])

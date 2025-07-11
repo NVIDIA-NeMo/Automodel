@@ -37,5 +37,5 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --peft.dim 8 \
     --peft.alpha 32 \
     --peft.use_triton false \
-    --peft.peft_fn nemo_automodel._peft.lora.apply_lora_to_linear_modules
+    --peft._target_ nemo_automodel._peft.lora.PeftConfig
 coverage combine
