@@ -35,12 +35,14 @@ import os
 from typing import Optional
 
 import requests
+import requests
 import torch
 from PIL import Image
 from transformers import AutoProcessor
 
 from nemo_automodel._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig, load_model
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig, load_model
 from nemo_automodel.loggers.log_utils import setup_logging
 
@@ -59,6 +61,7 @@ def load_model_from_checkpoint(
     peft_dropout_position: str = "post",
 ) -> NeMoAutoModelForImageTextToText:
     """Load a VLM model from a checkpoint.
+
 
     Args:
         checkpoint_path: Path to the checkpoint directory
@@ -137,12 +140,14 @@ def generate_response(
 ) -> str:
     """Generate a text response from an image and text prompt.
 
+
     Args:
         model: The loaded VLM model
         processor: The model's processor for tokenization
         image_url: URL or local path to the image
         prompt: Text prompt for the model
         max_new_tokens: Maximum number of new tokens to generate
+
 
     Returns:
         Generated text response
@@ -172,8 +177,10 @@ def generate_response(
 
     with torch.inference_mode():
         outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
 
     generated_text = processor.decode(outputs[0], skip_special_tokens=True)
+    prompt_length = len(processor.decode(inputs["input_ids"][0], skip_special_tokens=True))
     prompt_length = len(processor.decode(inputs["input_ids"][0], skip_special_tokens=True))
     return generated_text[prompt_length:].strip()
 
@@ -239,6 +246,7 @@ def main():
     args = parser.parse_args()
 
     logging.info(f"Loading model type base_model:{args.base_model} from checkpoint_path:{args.checkpoint_path}")
+    logging.info(f"Loading model type base_model:{args.base_model} from checkpoint_path:{args.checkpoint_path}")
 
     model = load_model_from_checkpoint(
         args.checkpoint_path,
@@ -252,6 +260,7 @@ def main():
     )
     processor_path = args.base_model if args.base_model else args.checkpoint_path
     processor = AutoProcessor.from_pretrained(processor_path)
+    response = generate_response(model, processor, args.image_url, args.prompt, args.max_new_tokens)
     response = generate_response(model, processor, args.image_url, args.prompt, args.max_new_tokens)
 
     # Format and output response

@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import types
 import sys
+import types
+
 import pytest
+
 
 def _build_fake_wandb_package() -> None:
     """
@@ -68,11 +70,12 @@ def test_suppress_wandb_log_messages(monkeypatch):
     # Import *after* fake package is installed so that module under test
     # uses the stub.
     import logging
-    import nemo_automodel.loggers.wandb_utils as suppress_wandb
 
     # Pre-conditions: functions return non-None, log-level is NOT CRITICAL
     import wandb.sdk.internal.file_pusher as fp
     import wandb.sdk.internal.run as run_mod
+
+    import nemo_automodel.loggers.wandb_utils as suppress_wandb
 
     assert fp._footer_alpha() == "alpha"
     assert fp._footer_bravo() == "bravo"

@@ -87,9 +87,9 @@ def default_collater(batch, pad_token_id=0, pad_seq_len_divisible=None):
                 pad_within_micro(
                     extract_key_from_dicts(batch, key),
                     (
-                        0 if key == "attention_mask" or key == "loss_mask" else (
-                            -100 if key == "labels" else pad_token_id
-                        )
+                        0
+                        if key == "attention_mask" or key == "loss_mask"
+                        else (-100 if key == "labels" else pad_token_id)
                     ),
                     pad_seq_len_divisible,
                 ),
@@ -127,35 +127,29 @@ class SFTSingleTurnPreprocessor:
         tgt_tok = self.tokenizer(tgt)
 
         # strip trailing special token from context
-        if len(ctx_tok["input_ids"][0]) > 0 and \
-           ctx_tok["input_ids"][0][-1] in self.tokenizer.all_special_ids:
+        if len(ctx_tok["input_ids"][0]) > 0 and ctx_tok["input_ids"][0][-1] in self.tokenizer.all_special_ids:
             ctx_tok["input_ids"] = [ids[:-1] for ids in ctx_tok["input_ids"]]
             ctx_tok["attention_mask"] = [m[:-1] for m in ctx_tok["attention_mask"]]
 
         # strip leading special token from target
-        if len(tgt_tok["input_ids"][0]) > 0 and \
-           tgt_tok["input_ids"][0][0] in self.tokenizer.all_special_ids:
+        if len(tgt_tok["input_ids"][0]) > 0 and tgt_tok["input_ids"][0][0] in self.tokenizer.all_special_ids:
             tgt_tok["input_ids"] = [ids[1:] for ids in tgt_tok["input_ids"]]
             tgt_tok["attention_mask"] = [m[1:] for m in tgt_tok["attention_mask"]]
 
         out = {}
         out["input_ids"] = [
-            c_ids + t_ids for c_ids, t_ids in zip(ctx_tok["input_ids"],
-                                                  tgt_tok["input_ids"], strict=False)
+            c_ids + t_ids for c_ids, t_ids in zip(ctx_tok["input_ids"], tgt_tok["input_ids"], strict=False)
         ]
         out["attention_mask"] = [
-            c_m + t_m for c_m, t_m in zip(ctx_tok["attention_mask"],
-                                          tgt_tok["attention_mask"], strict=False)
+            c_m + t_m for c_m, t_m in zip(ctx_tok["attention_mask"], tgt_tok["attention_mask"], strict=False)
         ]
         # label: -100 for ctx, true ids for tgt
         out["labels"] = [
-            [-100] * (len(c_ids)-1) + t_ids + [-100]
+            [-100] * (len(c_ids) - 1) + t_ids + [-100]
             for c_ids, t_ids in zip(ctx_tok["input_ids"], tgt_tok["input_ids"], strict=False)
         ]
 
-        out["loss_mask"] = [
-            [1 if t != -100 else 0 for t in lbl] for lbl in out["labels"]
-        ]
+        out["loss_mask"] = [[1 if t != -100 else 0 for t in lbl] for lbl in out["labels"]]
         return out
 
     def _compute_dataset_max_len(self, tokenized_ds):
@@ -173,21 +167,13 @@ class SFTSingleTurnPreprocessor:
         def _pad(examples):
             pad_id = tk.pad_token_id or 0
             examples["input_ids"] = [
-                (ids[:max_len] + [pad_id] * max(0, max_len - len(ids)))
-                for ids in examples["input_ids"]
+                (ids[:max_len] + [pad_id] * max(0, max_len - len(ids))) for ids in examples["input_ids"]
             ]
             examples["attention_mask"] = [
-                ([1] * min(len(ids), max_len) + [0] * max(0, max_len - len(ids)))
-                for ids in examples["attention_mask"]
+                ([1] * min(len(ids), max_len) + [0] * max(0, max_len - len(ids))) for ids in examples["attention_mask"]
             ]
-            examples["labels"] = [
-                (lbl[:max_len] + [-100] * max(0, max_len - len(lbl)))
-                for lbl in examples["labels"]
-            ]
-            examples["loss_mask"] = [
-                (lm[:max_len] + [0] * max(0, max_len - len(lm)))
-                for lm in examples["loss_mask"]
-            ]
+            examples["labels"] = [(lbl[:max_len] + [-100] * max(0, max_len - len(lbl))) for lbl in examples["labels"]]
+            examples["loss_mask"] = [(lm[:max_len] + [0] * max(0, max_len - len(lm))) for lm in examples["loss_mask"]]
             # return dictionary with sequences all exactly `max_len` long
             return examples
 
@@ -231,4 +217,3 @@ class SFTSingleTurnPreprocessor:
         )
 
         return tokenized
-

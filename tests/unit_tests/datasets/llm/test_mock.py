@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import numpy as np
 import pytest
 from datasets import Dataset
 
@@ -38,7 +37,7 @@ def test_gen_sentence_ids_returns_ints_and_ends_with_eos():
     assert sent[-1] == vocab["<eos>"]
 
     # sentence length within the requested range (1-max_len + eos)
-    assert 2 <= len(sent) <= 9        # at least one word + eos
+    assert 2 <= len(sent) <= 9  # at least one word + eos
 
     # All tokens must exist in the vocab values
     assert all(tok in vocab.values() for tok in sent)

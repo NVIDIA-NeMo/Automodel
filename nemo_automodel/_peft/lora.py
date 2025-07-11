@@ -13,7 +13,8 @@
 # limitations under the License.
 
 import math
-from typing import Literal, Optional
+from dataclasses import dataclass, field
+from typing import Any, Literal, Optional
 
 import torch
 import torch.nn.functional as F
@@ -26,19 +27,42 @@ from nemo_automodel._peft.lora_kernel import (
 )
 from nemo_automodel._peft.module_matcher import ModuleMatcher
 from nemo_automodel.shared.import_utils import safe_import
-
+from nemo_automodel.shared.utils import dtype_from_str
 
 HAS_BNB, bitsandbytes = safe_import("bitsandbytes")
 
-MODEL_TYPE_TO_PEFT_TASK_TYPE = {
-        "SequenceClassification": "SEQ_CLS",
-        "Seq2SeqLM": "SEQ_2_SEQ_LM", 
-        "CausalLM": "CAUSAL_LM",
-        "TokenClassification": "TOKEN_CLS",
-        "QuestionAnswering": "QUESTION_ANS",
-        "FeatureExtraction": "FEATURE_EXTRACTION",
-        "ConditionalGeneration": "CONDITIONAL_GENERATION",
-    }
+
+@dataclass
+class PeftConfig:
+    target_modules: list = field(default_factory=list)
+    exclude_modules: list = field(default_factory=list)
+    match_all_linear: bool = False
+    dim: int = 8
+    alpha: int = 32
+    dropout: float = 0.0
+    dropout_position: Literal["pre", "post"] = "post"
+    lora_A_init: str = "xavier"
+    lora_dtype: Optional[torch.dtype] = None
+    use_triton: bool = False
+
+    def to_dict(self):
+        return self.__dict__.copy()
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]):
+        return cls(
+            target_modules=d.get("target_modules", []),
+            exclude_modules=d.get("exclude_modules", []),
+            match_all_linear=d.get("match_all_linear", False),
+            dim=d.get("dim", 8),
+            alpha=d.get("alpha", 32),
+            dropout=d.get("dropout", 0.0),
+            dropout_position=d.get("dropout_position", "post"),
+            lora_A_init=d.get("lora_A_init", "xavier"),
+            lora_dtype=d.get("lora_dtype", None),
+            use_triton=d.get("use_triton", False),
+        )
+
 
 class LinearLoRA(nn.Linear):
     """
@@ -55,8 +79,8 @@ class LinearLoRA(nn.Linear):
         dim=8,
         alpha=32,
         dropout=0.0,
-        dropout_position='post',
-        lora_A_init_method='xavier',
+        dropout_position="post",
+        lora_A_init_method="xavier",
         lora_dtype=None,
     ):
         """
@@ -102,8 +126,8 @@ class LinearLoRA(nn.Linear):
         dim=8,
         alpha=32,
         dropout=0.0,
-        dropout_position='post',
-        lora_A_init_method='xavier',
+        dropout_position="post",
+        lora_A_init_method="xavier",
         lora_dtype=None,
     ):
         """
@@ -130,17 +154,20 @@ class LinearLoRA(nn.Linear):
 
         in_features = obj.in_features
         out_features = obj.out_features
+        if isinstance(lora_dtype, str):
+            lora_dtype = dtype_from_str(lora_dtype)
+        assert lora_dtype is None or isinstance(lora_dtype, torch.dtype)
         dtype = lora_dtype or obj.weight.dtype
 
         obj.lora_A = nn.Linear(in_features, dim, bias=False, dtype=dtype, device=device)
         obj.lora_B = nn.Linear(dim, out_features, bias=False, dtype=dtype, device=device)
-        if lora_A_init_method == 'xavier':
+        if lora_A_init_method == "xavier":
             torch.nn.init.uniform_(obj.lora_A.weight.data)
         else:
             nn.init.kaiming_uniform_(obj.lora_A.weight.data, a=math.sqrt(5))
         obj.lora_B.weight.data.fill_(0)
         obj.dropout = nn.Dropout(p=dropout)
-        assert dropout_position in ['pre', 'post'], ('dropout position can only be pre/post', dropout_position)
+        assert dropout_position in ["pre", "post"], ("dropout position can only be pre/post", dropout_position)
         obj.dropout_position = dropout_position
 
     def forward(self, x):
@@ -160,17 +187,17 @@ class LinearLoRA(nn.Linear):
         # If LinearLoRA is used to monkey-patch a nn.Linear module, we want to use nn.Linear's
         # forward in the case where it uses quantized weights. We store a reference to nn.Linear's
         # forward in `super_fwd` attribute. If the attribute does not exist we do the usual linear.
-        if (fwd := getattr(self, 'super_fwd', None)) is not None:
+        if (fwd := getattr(self, "super_fwd", None)) is not None:
             assert fwd != self.forward
             res = fwd(x)
         else:
             res = F.linear(x, self.weight, self.bias)
 
-        if self.dropout_position == 'pre':
+        if self.dropout_position == "pre":
             x = self.dropout(x)
         lora_res = self.lora_B(self.lora_A(x))
         lora_res = lora_res * self.scale
-        if self.dropout_position == 'post':
+        if self.dropout_position == "post":
             lora_res = self.dropout(lora_res)
         return res + lora_res
 
@@ -189,6 +216,7 @@ class TritonLinearLoRA(LinearLoRA):
         lora_dtype (torch.dtype): weight's dtype, by default will use orig_linear's but if they
         are quantized weights (e.g. 4bit) needs to be specified explicitly.
     """
+
     def forward(self, x):
         """
         Forward function for LoRA with triton kernels.
@@ -202,13 +230,13 @@ class TritonLinearLoRA(LinearLoRA):
         # If LinearLoRA is used to monkey-patch a nn.Linear module, we want to use nn.Linear's
         # forward in the case where it uses quantized weights. We store a reference to nn.Linear's
         # forward in `super_fwd` attribute. If the attribute does not exist we do the usual linear.
-        if (fwd := getattr(self, 'super_fwd', None)) is not None:
+        if (fwd := getattr(self, "super_fwd", None)) is not None:
             assert fwd != self.forward
             res = fwd(x)
         else:
             res = F.linear(x, self.weight, self.bias)
 
-        if self.dropout_position == 'pre':
+        if self.dropout_position == "pre":
             x = self.dropout(x)
         lora_res = LoRATritonFunction.apply(x, self.lora_A.weight, self.lora_B.weight, self.scale, x.dtype)
         if self.dropout_position == "post":
@@ -222,10 +250,10 @@ def patch_linear_module(
     dim=8,
     alpha=32,
     dropout=0.0,
-    dropout_position='post',
-    lora_A_init_method='xavier',
+    dropout_position="post",
+    lora_A_init_method="xavier",
     lora_dtype=None,
-    use_triton=True
+    use_triton=True,
 ):
     """
     Monkey-patches a nn.Linear (orig_linear param) to be a LinearLoRA.
@@ -255,21 +283,21 @@ def patch_linear_module(
         (nn.Module): the monkey-patched (nn.Linear + LoRA) nn.Module
     """
     assert isinstance(orig_linear, nn.Linear), type(orig_linear)
-    assert not hasattr(orig_linear, 'super_fwd'), orig_linear.super_fwd
+    assert not hasattr(orig_linear, "super_fwd"), orig_linear.super_fwd
 
     if isinstance(orig_linear, nn.Linear):
         linear_lora_cls = TritonLinearLoRA if use_triton else LinearLoRA
         linear_lora_cls._init_adapter(
-            orig_linear, dim, alpha, dropout, dropout_position, lora_A_init_method,
-            lora_dtype)
+            orig_linear, dim, alpha, dropout, dropout_position, lora_A_init_method, lora_dtype
+        )
         cls = orig_linear.__class__
-        new_cls = type('PatchedLinearLoRA', (linear_lora_cls, cls), {})
+        new_cls = type("PatchedLinearLoRA", (linear_lora_cls, cls), {})
     else:
         raise NotImplementedError("Expected isinstance(orig_linear, nn.Linear)")
 
     # If the model uses quantized weights, we want to use orig_linear's forward
     if (
-        getattr(orig_linear, 'quant_state', None) is not None
+        getattr(orig_linear, "quant_state", None) is not None
         and orig_linear.quant_state.__class__ == bitsandbytes.functional.QuantState
     ):
         orig_linear.super_fwd = orig_linear.forward
@@ -283,67 +311,43 @@ def patch_linear_module(
 # -----------------------------------------------------------------------------#
 def apply_lora_to_linear_modules(
     model: nn.Module,
-    target_modules = [],
-    exclude_modules = [],
-    match_all_linear = False,
-    dim: int = 8,
-    alpha: int = 32,
-    dropout: float = 0.0,
-    dropout_position: Literal["pre", "post"] = "post",
-    lora_A_init: str = "xavier",
-    lora_dtype: Optional[torch.dtype] = None,
-    use_triton: bool = True
-):
+    peft_config: PeftConfig,
+) -> int:
     """
     Replace selected nn.Linear layers with LinearLoRA layers (in-place).
 
     target_modules accepts wildcard fragments, e.g. ["q_proj", "k_proj", ".*fc.*"].
     """
-    # To make our PeftConfig compatible with HF, we need to keep track of the
-    # final target modules, without the wildcard fragments.
-    final_target_modules = set()
-
     # Freeze base model parameters
     for w in model.parameters():
         w.requires_grad_(False)
-    
-    is_causal_lm = False
-    if hasattr(model, "config") and "CausalLM" in model.config.architectures[0]:
-        # for example, LlamaForCausalLM
-        is_causal_lm = True
 
-    matcher = ModuleMatcher(target_modules, exclude_modules, match_all_linear, is_causal_lm)
+    is_causal_lm = False
+    try:
+        if hasattr(model, "config") and "CausalLM" in model.config.architectures[0]:
+            # for example, LlamaForCausalLM
+            is_causal_lm = True
+    except AttributeError:
+        is_causal_lm = False
+
+    matcher = ModuleMatcher(
+        peft_config.target_modules, peft_config.exclude_modules, peft_config.match_all_linear, is_causal_lm
+    )
     num_modules_matched = 0
     for name, module in list(model.named_modules()):
         if matcher.match(module, name):
-            final_target_modules.add(name.split(".")[-1])
-
             num_modules_matched += 1
             patch_linear_module(
                 module,
-                dim=dim,
-                alpha=alpha,
-                dropout=dropout,
-                dropout_position=dropout_position,
-                lora_A_init_method=lora_A_init,
-                lora_dtype=lora_dtype,
-                use_triton=use_triton
-           )
+                dim=peft_config.dim,
+                alpha=peft_config.alpha,
+                dropout=peft_config.dropout,
+                dropout_position=peft_config.dropout_position,
+                lora_A_init_method=peft_config.lora_A_init,
+                lora_dtype=peft_config.lora_dtype,
+                use_triton=peft_config.use_triton,
+            )
 
-    # finalize the peft config
-    model_task = model.config.architectures[0].split("For")[-1]
-    task_type = MODEL_TYPE_TO_PEFT_TASK_TYPE[model_task]
-    model._automodel_peft_config = {
-        "task_type": task_type,
-        "peft_type": "LORA",
-        "r": dim,
-        "lora_alpha": alpha,
-        "target_modules": list(final_target_modules),
-        "bias": "none",
-        "base_model_name_or_path": model.config.name_or_path,
-        "lora_dropout": dropout,
-    }
-    
     return num_modules_matched
 
 
@@ -351,6 +355,7 @@ class LoRATritonFunction(torch.autograd.Function):
     """
     Autograd function that calls the triton kernel wrappers for the LoRA forward and backward passes.
     """
+
     @staticmethod
     def setup_context(ctx, inputs, output):
         """

@@ -17,6 +17,7 @@ environment/cluster.md
 :hidden:
 
 guides/sft.md
+guides/gemma3_3n.md
 ```
 
 ```{toctree}
@@ -30,6 +31,5 @@ guides/dataset.md
 :caption: 🛠️ Development
 :hidden:
 
-documentation.md
 apidocs/index.rst
 ```

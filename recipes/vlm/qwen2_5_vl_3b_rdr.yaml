@@ -36,7 +36,7 @@ rng:
   ranked: true
 
 model:
-  _target_: nemo_automodel._transformers.NeMoAutoModelForImageTextToText.from_pretrained
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
   
 processor:
@@ -68,8 +68,8 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   num_workers: 0
   pin_memory: true
-  # collate_fn:
-  #   _target_: nemo_automodel.datasets.vlm.collate_fns.qwen2_5_collate_fn
+  collate_fn:
+    _target_: nemo_automodel.datasets.vlm.collate_fns.qwen2_5_collate_fn
 
     
 optimizer:
@@ -85,7 +85,7 @@ freeze_config:
 
 # Uncomment and configure for W&B logging
 # wandb:
-#   project: nemo_automodel_vlm
-#   entity: nvidia
-#   name: qwen2_5_vl_3b_rdr
-#   save_dir: ./wandb_logs 
+#   project:
+#   entity:
+#   name:
+#   save_dir:

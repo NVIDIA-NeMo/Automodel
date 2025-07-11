@@ -36,6 +36,7 @@ def wildcard_match(pattern, key):
     match = regex_pattern.match(key)
     return match is not None
 
+
 @dataclass
 class ModuleMatcher:
     """
@@ -57,9 +58,7 @@ class ModuleMatcher:
         is_causal_lm (bool, optional): Whether the model is a causal language model.
     """
 
-    target_modules: List[str] = field(
-        default_factory=lambda: ['linear_qkv', 'linear_proj', 'linear_fc1', 'linear_fc2']
-    )
+    target_modules: List[str] = field(default_factory=lambda: ["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"])
     exclude_modules: List[str] = field(default_factory=list)
     match_all_linear: bool = field(default=False)
     is_causal_lm: bool = field(default=False)
@@ -72,13 +71,12 @@ class ModuleMatcher:
             self.target_modules = [self.target_modules]
         if isinstance(self.exclude_modules, str):
             self.exclude_modules = [self.exclude_modules]
-        if self.match_all_linear is False and (
-            not isinstance(self.target_modules, list) or len(self.target_modules) == 0
-        ) and (
-            not isinstance(self.exclude_modules, list) or len(self.exclude_modules) == 0
+        if (
+            self.match_all_linear is False
+            and (not isinstance(self.target_modules, list) or len(self.target_modules) == 0)
+            and (not isinstance(self.exclude_modules, list) or len(self.exclude_modules) == 0)
         ):
-            raise ValueError("Expected match_all_linear to be true or "\
-                "target_modules/exclude_modules to be non-empty")
+            raise ValueError("Expected match_all_linear to be true or target_modules/exclude_modules to be non-empty")
 
     # --------------------------------------------------------------------- #
     # Public API                                                            #
@@ -99,9 +97,7 @@ class ModuleMatcher:
 
         # 2. target_modules is the next most-specific rule set
         elif self.target_modules:
-            assert not self.exclude_modules, (
-                "`exclude_modules` must be empty when `target_modules` is used."
-            )
+            assert not self.exclude_modules, "`exclude_modules` must be empty when `target_modules` is used."
             for pattern in self.target_modules:
                 if name == pattern or wildcard_match(pattern, full_name):
                     return True

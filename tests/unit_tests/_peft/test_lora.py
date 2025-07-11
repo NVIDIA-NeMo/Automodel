@@ -16,18 +16,34 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel._peft.lora import LinearLoRA, apply_lora_to_linear_modules
+from nemo_automodel._peft.lora import LinearLoRA, PeftConfig, apply_lora_to_linear_modules
 
 
 class DummyModel(nn.Module):
     """A dummy neural network model with two linear layers used for testing LoRA injection."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear1 = nn.Linear(16, 16)
+        self.linear2 = nn.Linear(16, 16)
+        self.config = {}
+
+    def forward(self, x):
+        """Forward pass through two linear layers with ReLU activation in between."""
+        x = self.linear1(x).relu()
+        x = self.linear2(x)
+        return x
+
+
+class DummyModelNoConfig(nn.Module):
+    """Same as DummyModel but without a `config` attribute."""
+
     def __init__(self):
         super().__init__()
         self.linear1 = nn.Linear(16, 16)
         self.linear2 = nn.Linear(16, 16)
 
     def forward(self, x):
-        """Forward pass through two linear layers with ReLU activation in between."""
         x = self.linear1(x).relu()
         x = self.linear2(x)
         return x
@@ -45,10 +61,46 @@ def model():
     return DummyModel()
 
 
+@pytest.fixture
+def model_no_config():
+    """Instantiates a model that has no `config` attr."""
+    return DummyModelNoConfig()
+
+
+def test_lora_patch_on_model_without_config(model_no_config):
+    """LoRA should still patch correctly even if the model lacks `config`."""
+    apply_lora_to_linear_modules(model_no_config, PeftConfig(target_modules=["linear1"], dim=4, alpha=8))
+    assert isinstance(model_no_config.linear1, LinearLoRA)
+    assert not isinstance(model_no_config.linear2, LinearLoRA)
+
+
+def test_backward_pass_without_config(dummy_input, model_no_config):
+    """Backward pass must succeed on a model without `config`."""
+    apply_lora_to_linear_modules(model_no_config, PeftConfig(target_modules=["linear1"], dim=4, alpha=8))
+    out = model_no_config(dummy_input)
+    loss = out.sum()
+    loss.backward()
+
+    grads = [p.grad for p in model_no_config.parameters() if p.requires_grad]
+    assert any(g is not None for g in grads)
+    assert all(torch.isfinite(g).all() for g in grads if g is not None)
+
+
 def test_lora_patch_applies_to_selected_module(model):
     """Tests that LoRA is only applied to specified target modules."""
-    apply_lora_to_linear_modules(model, target_modules=["linear1"], dim=4, alpha=8)
+    apply_lora_to_linear_modules(model, PeftConfig(target_modules=["linear1"], dim=4, alpha=8))
     assert isinstance(model.linear1, LinearLoRA)
+    assert not isinstance(model.linear2, LinearLoRA)
+
+
+def test_lora_patch_applies_to_selected_module_with_str_dtype(model):
+    """Tests that LoRA is only applied to specified target modules."""
+    apply_lora_to_linear_modules(
+        model, PeftConfig(target_modules=["linear1"], dim=4, alpha=8, lora_dtype="torch.bfloat16")
+    )
+    assert isinstance(model.linear1, LinearLoRA)
+    assert model.linear1.lora_A.weight.dtype == torch.bfloat16
+    assert model.linear1.lora_B.weight.dtype == torch.bfloat16
     assert not isinstance(model.linear2, LinearLoRA)
 
 
@@ -58,7 +110,7 @@ def test_forward_output_consistency(dummy_input):
     """
     base = DummyModel()
     model = DummyModel()
-    apply_lora_to_linear_modules(model, target_modules=["linear1"], dim=4, alpha=8)
+    apply_lora_to_linear_modules(model, PeftConfig(target_modules=["linear1"], dim=4, alpha=8))
 
     base.eval()
     model.eval()
@@ -76,7 +128,7 @@ def test_backward_pass(dummy_input):
     when LoRA is applied.
     """
     model = DummyModel()
-    apply_lora_to_linear_modules(model, target_modules=["linear1"], dim=4, alpha=8)
+    apply_lora_to_linear_modules(model, PeftConfig(target_modules=["linear1"], dim=4, alpha=8))
     output = model(dummy_input)
     loss = output.sum()
     loss.backward()
@@ -101,8 +153,8 @@ def test_lora_layers_are_trainable():
 def test_dropout_pre_post_effects(dummy_input):
     """Tests that different dropout positions ('pre' vs 'post') lead to different outputs."""
     base = nn.Linear(16, 16)
-    lora_pre = LinearLoRA(base, dim=4, alpha=8, dropout=0.5, dropout_position='pre')
-    lora_post = LinearLoRA(base, dim=4, alpha=8, dropout=0.5, dropout_position='post')
+    lora_pre = LinearLoRA(base, dim=4, alpha=8, dropout=0.5, dropout_position="pre")
+    lora_post = LinearLoRA(base, dim=4, alpha=8, dropout=0.5, dropout_position="post")
 
     with torch.no_grad():
         lora_pre.lora_A.weight.uniform_()
@@ -123,13 +175,13 @@ def test_dropout_pre_post_effects(dummy_input):
 
 def test_apply_lora_respects_wildcard(model):
     """Validates that wildcard matching correctly applies LoRA to all matching modules."""
-    apply_lora_to_linear_modules(model, target_modules=[".*"], dim=4, alpha=8)
+    apply_lora_to_linear_modules(model, PeftConfig(target_modules=[".*"], dim=4, alpha=8))
     assert isinstance(model.linear1, LinearLoRA)
     assert isinstance(model.linear2, LinearLoRA)
 
 
 def test_no_patch_on_non_matching_module(model):
     """Confirms that no modules are patched if target pattern doesn't match any names."""
-    apply_lora_to_linear_modules(model, target_modules=["nonexistent_module"], dim=4, alpha=8)
+    apply_lora_to_linear_modules(model, PeftConfig(target_modules=["nonexistent_module"], dim=4, alpha=8))
     assert not isinstance(model.linear1, LinearLoRA)
     assert not isinstance(model.linear2, LinearLoRA)

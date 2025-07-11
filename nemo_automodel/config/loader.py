@@ -15,8 +15,11 @@
 import ast
 import importlib
 import importlib.util
+import inspect
 import os
+import pprint
 import sys
+from pathlib import Path
 
 import yaml
 
@@ -39,12 +42,12 @@ def translate_value(v):
           - the original string `v` if all parsing attempts fail
     """
     special_symbols = {
-        'none': None,
-        'None': None,
-        'true': True,
-        'True': True,
-        'false': False,
-        'False': False,
+        "none": None,
+        "None": None,
+        "true": True,
+        "True": True,
+        "false": False,
+        "False": False,
     }
     if v in special_symbols:
         return special_symbols[v]
@@ -56,6 +59,23 @@ def translate_value(v):
             # fallback to raw string
             return v
 
+
+def load_module_from_file(file_path):
+    """Dynamically imports a module from a given file path."""
+
+    # Create a module specification object from the file location
+    name = file_path.replace("/", ".").replace(".py", "")
+    spec = importlib.util.spec_from_file_location(name, file_path)
+
+    # Create a module object from the specification
+    module = importlib.util.module_from_spec(spec)
+
+    # Execute the module's code
+    spec.loader.exec_module(module)
+
+    return module
+
+
 def _resolve_target(dotted_path: str):
     """
     Resolve a dotted path to a Python object.
@@ -64,6 +84,16 @@ def _resolve_target(dotted_path: str):
     2) getattr() the rest.
     3) If that fails, fall back to scanning sys.path for .py or package dirs.
     """
+    if not isinstance(dotted_path, str):
+        return dotted_path
+
+    if ":" in dotted_path:
+        parts = dotted_path.split(":")
+        assert parts[0].endswith(".py"), "Expected first part to be a python script"
+        assert Path(parts[0]).exists(), "Expected python script to exist"
+        module = load_module_from_file(str(Path(parts[0]).resolve()))
+        return getattr(module, parts[1])
+
     parts = dotted_path.split(".")
 
     # 1) Try longest‐prefix module import + getattr the rest
@@ -105,9 +135,7 @@ def _resolve_target(dotted_path: str):
             try:
                 return getattr(mod, parts[-1])
             except AttributeError:
-                raise ImportError(
-                    f"Loaded '{cand}' as module but no attribute '{parts[-1]}'"
-                )
+                raise ImportError(f"Loaded '{cand}' as module but no attribute '{parts[-1]}'")
 
     # 3) Give up
     raise ImportError(f"Cannot resolve target: {dotted_path}")
@@ -120,6 +148,7 @@ class ConfigNode:
     This class allows nested dictionaries and lists to be accessed as attributes and
     provides functionality to instantiate objects from configuration.
     """
+
     def __init__(self, d, raise_on_missing_attr=True):
         """Initialize the ConfigNode.
 
@@ -127,9 +156,7 @@ class ConfigNode:
             d (dict): A dictionary representing configuration options.
             raise_on_missing_attr (bool): if True, it will return `None` on a missing attr.
         """
-        self.__dict__ = {
-            k: self._wrap(k, v) for k, v in d.items()
-        }
+        self.__dict__ = {k: self._wrap(k, v) for k, v in d.items()}
         self.raise_on_missing_attr = raise_on_missing_attr
 
     def __getattr__(self, key):
@@ -154,8 +181,10 @@ class ConfigNode:
         if isinstance(v, dict):
             return ConfigNode(v)
         elif isinstance(v, list):
-            return [self._wrap('', i) for i in v]
-        elif k.endswith('_fn'):
+            return [self._wrap("", i) for i in v]
+        elif k.endswith("_fn"):
+            return _resolve_target(v)
+        elif k == "_target_":
             return _resolve_target(v)
         else:
             return translate_value(v)
@@ -184,9 +213,9 @@ class ConfigNode:
         # Prepare kwargs from config
         config_kwargs = {}
         for k, v in self.__dict__.items():
-            if k == '_target_' or k == 'raise_on_missing_attr':
+            if k == "_target_" or k == "raise_on_missing_attr":
                 continue
-            if k.endswith('_fn'):
+            if k.endswith("_fn"):
                 config_kwargs[k] = v
             else:
                 config_kwargs[k] = self._instantiate_value(v)
@@ -194,7 +223,23 @@ class ConfigNode:
         # Override/add with passed kwargs
         config_kwargs.update(kwargs)
 
-        return func(*args, **config_kwargs)
+        try:
+            return func(*args, **config_kwargs)
+        except Exception as e:
+            sig = inspect.signature(func)
+            print(
+                "Instantiation failed for `{}`\n"
+                "Accepted signature : {}\n"
+                "Positional args    : {}\n"
+                "Keyword args       : {}\n".format(
+                    func.__name__,
+                    sig,
+                    args,
+                    pprint.pformat(config_kwargs, compact=True, indent=4),
+                ),
+                file=sys.stderr,
+            )
+            raise e  # re-raise so the original traceback is preserved
 
     def _instantiate_value(self, v):
         """
@@ -222,9 +267,7 @@ class ConfigNode:
         Returns:
             dict: A dictionary representation of the configuration node.
         """
-        return {
-            k: self._unwrap(v) for k, v in self.__dict__.items() if k != 'raise_on_missing_attr'
-        }
+        return {k: self._unwrap(v) for k, v in self.__dict__.items() if k != "raise_on_missing_attr"}
 
     def _unwrap(self, v):
         """
@@ -321,9 +364,11 @@ class ConfigNode:
         if isinstance(value, ConfigNode):
             return value.__repr__(level + 1)
         elif isinstance(value, list):
-            return "[\n" + \
-                "\n".join([f"{'  ' * (level + 1)}{self._repr_value(i, level + 1)}" for i in value]) \
+            return (
+                "[\n"
+                + "\n".join([f"{'  ' * (level + 1)}{self._repr_value(i, level + 1)}" for i in value])
                 + f"\n{'  ' * level}]"
+            )
         else:
             return repr(value)
 
@@ -346,7 +391,7 @@ class ConfigNode:
         Returns:
             bool: True if the key exists, False otherwise.
         """
-        parts = key.split('.')
+        parts = key.split(".")
         current = self
         for p in parts:
             if isinstance(current, ConfigNode):
@@ -355,6 +400,7 @@ class ConfigNode:
                 else:
                     return False
         return current != self
+
 
 def load_yaml_config(path):
     """

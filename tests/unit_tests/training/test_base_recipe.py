@@ -12,29 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
 import os
+from types import SimpleNamespace
+
+import pytest
 import torch
 import torch.nn as nn
-import pytest
 
 import nemo_automodel.training.base_recipe as base_recipe
 from nemo_automodel.training.base_recipe import BaseRecipe, _find_latest_checkpoint
+
 try:
     import expecttest
+
     HAS_ET = True
 except:
     HAS_ET = False
+
 
 @pytest.fixture(autouse=True)
 def _mock_single_rank(monkeypatch):
     """
     Pretend we are running in a single-process, non-distributed setup.
     """
-    monkeypatch.setattr(torch.distributed, "is_initialized",
-                        lambda: False, raising=False)
-    monkeypatch.setattr(torch.distributed, "get_rank",
-                        lambda: 0, raising=False)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False, raising=False)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0, raising=False)
     yield
 
 
@@ -44,6 +46,7 @@ def _patch_checkpoint_ops(monkeypatch):
     Replace load_/save_model|optimizer with minimal torch.save/torch.load
     wrappers so that BaseRecipe can operate without the real NeMo helpers.
     """
+
     def _save_model(model, path, _cfg):
         if model is None:
             return
@@ -66,9 +69,10 @@ def _patch_checkpoint_ops(monkeypatch):
 
     monkeypatch.setattr(base_recipe, "save_model", _save_model)
     monkeypatch.setattr(base_recipe, "load_model", _load_model)
-    monkeypatch.setattr(base_recipe, "save_optimizer",
-        _save_optimizer := _save_optimizer
-        if 'save_optimizer' in locals() else _save_optimizer
+    monkeypatch.setattr(
+        base_recipe,
+        "save_optimizer",
+        _save_optimizer := _save_optimizer if "save_optimizer" in locals() else _save_optimizer,
     )
     monkeypatch.setattr(base_recipe, "load_optimizer", _load_optimizer)
     yield
@@ -83,7 +87,7 @@ class _DummyStateful:
         """
         ctor
         """
-        self.foo = torch.tensor(0.)
+        self.foo = torch.tensor(0.0)
 
     def state_dict(self):
         """
@@ -107,14 +111,12 @@ class _ToyRecipe(BaseRecipe):
         super().__init__()
 
         # The config object only needs the two attributes used by BaseRecipe.
-        self.checkpoint_config = SimpleNamespace(
-            enabled=True,
-            checkpoint_dir=str(checkpoint_dir)
-        )
+        self.checkpoint_config = SimpleNamespace(enabled=True, checkpoint_dir=str(checkpoint_dir))
 
         self.model = nn.Linear(2, 2, bias=False)
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.1)
         self.custom_state = _DummyStateful()
+
 
 def test_find_latest_checkpoint(tmp_path):
     """

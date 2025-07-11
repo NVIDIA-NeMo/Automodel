@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import signal
 import types
 from typing import Any, Optional
-import logging
 
 import torch
 import torch.distributed
@@ -147,8 +147,8 @@ class DistributedSignalHandler:
 
         return self
 
-    def __exit__(self, exc_type: Optional[type],
-        exc_val: BaseException | None, exc_tb: types.TracebackType | None
+    def __exit__(
+        self, exc_type: Optional[type], exc_val: BaseException | None, exc_tb: types.TracebackType | None
     ) -> None:  # noqa: E501
         """
         Release the signal handler and restore the original handler.

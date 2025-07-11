@@ -34,6 +34,7 @@ def suppress_wandb_log_messages():
     # Depending on your wandb version these lives under sdk.internal.file_pusher
     try:
         import wandb.sdk.internal.file_pusher as _fp
+
         for name in dir(_fp):
             if name.startswith("_footer"):
                 setattr(_fp, name, _suppress_footer)
@@ -44,6 +45,7 @@ def suppress_wandb_log_messages():
     # wandb.sdk.internal.run._footer_single_run_status_info
     try:
         import wandb.sdk.internal.run as _run
+
         if hasattr(_run, "_footer_single_run_status_info"):
             _run._footer_single_run_status_info = _suppress_footer
     except ImportError:

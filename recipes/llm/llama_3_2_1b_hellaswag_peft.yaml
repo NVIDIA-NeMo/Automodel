@@ -34,17 +34,18 @@ rng:
   ranked: true
 
 model:
-  _target_: transformers.AutoModelForCausalLM.from_pretrained
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+  torch_dtype: bf16
 
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
-  model_save_format: torch_save # torch_save or safetensors
+  model_save_format: safetensors # torch_save or safetensors
   save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 peft:
-  peft_fn: nemo_automodel._peft.lora.apply_lora_to_linear_modules
+  _target_: nemo_automodel._peft.lora.PeftConfig
   match_all_linear: True
   dim: 8
   alpha: 32
