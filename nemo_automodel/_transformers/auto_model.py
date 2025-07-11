@@ -175,7 +175,9 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
         constructed model and recursively reloads it once with
         ``use_liger_kernel=False``.
         """
-        torch_dtype = dtype_from_str(kwargs.pop("torch_dtype", torch.bfloat16))
+        torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
+        if torch_dtype != "auto":
+            torch_dtype = dtype_from_str(torch_dtype)
         use_liger_kernel = kwargs.pop("use_liger_kernel", True)
         use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
         sdpa_method = kwargs.pop("sdpa_method", None)
@@ -227,7 +229,9 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
         NeMoAutoModelForCausalLM.from_pretrained : Same logic for checkpoint
         loading.
         """
-        torch_dtype = dtype_from_str(kwargs.pop("torch_dtype", torch.bfloat16))
+        torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
+        if torch_dtype != "auto":
+            torch_dtype = dtype_from_str(torch_dtype)
         use_liger_kernel = kwargs.pop("use_liger_kernel", True)
         use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
         sdpa_method = kwargs.pop("sdpa_method", None)
@@ -305,7 +309,9 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
         constructed model and recursively reloads it once with
         ``use_liger_kernel=False``.
         """
-        torch_dtype = dtype_from_str(kwargs.pop("torch_dtype", torch.bfloat16))
+        torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
+        if torch_dtype != "auto":
+            torch_dtype = dtype_from_str(torch_dtype)
         use_liger_kernel = kwargs.pop("use_liger_kernel", True)
         use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
         sdpa_method = kwargs.pop("sdpa_method", None)
@@ -358,7 +364,9 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
         NeMoAutoModelForImageTextToText.from_pretrained : Same logic for checkpoint
         loading.
         """
-        torch_dtype = dtype_from_str(kwargs.pop("torch_dtype", torch.bfloat16))
+        torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
+        if torch_dtype != "auto":
+            torch_dtype = dtype_from_str(torch_dtype)
         use_liger_kernel = kwargs.pop("use_liger_kernel", True)
         use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
         sdpa_method = kwargs.pop("sdpa_method", None)
