@@ -33,45 +33,90 @@ import json
 import logging
 import os
 from typing import Optional
-
+import glob
 import requests
 import requests
 import torch
 from PIL import Image
 from transformers import AutoProcessor
 
-from nemo_automodel._peft.lora import apply_lora_to_linear_modules
+from nemo_automodel._peft.lora import apply_lora_to_linear_modules, PeftConfig
 from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig, load_model
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig, load_model
 from nemo_automodel.loggers.log_utils import setup_logging
 
 
 # TODO: Parse config from YAML and run generate with FSDP2/distributed in general
 
+def get_checkpoint_type(checkpoint_path: str) -> str:
+    """Get the type of the checkpoint.
+    
+    Args:
+        checkpoint_path: Path to the checkpoint directory
+    
+    Returns:
+        'torch_save' if the checkpoint is a DCP checkpoint or 'safetensors' if the checkpoint is a safetensors checkpoint
+    """
+    safetensors = glob.glob(os.path.join(checkpoint_path, "model", "*.safetensors"))
+    if len(safetensors) > 0:
+        return "safetensors"
+    else:
+        return "torch_save"
+
+def is_peft_checkpoint(checkpoint_path: str) -> bool:
+    """Check if the checkpoint is a PEFT checkpoint.
+    
+    Args:
+        checkpoint_path: Path to the checkpoint directory
+
+    Returns:
+        True if the checkpoint is a PEFT checkpoint, False otherwise
+    """
+    return os.path.exists(os.path.join(checkpoint_path, "model", "adapter_model.safetensors"))
+
+def is_consolidated_safetensors_checkpoint(checkpoint_path: str) -> bool:
+    """Check if the checkpoint is a consolidated safetensors checkpoint.
+    
+    Args:
+        checkpoint_path: Path to the checkpoint directory
+
+    Returns:
+        True if the checkpoint is a consolidated safetensors checkpoint, False otherwise
+    """
+    return os.path.exists(os.path.join(checkpoint_path, "model", "model.safetensors.index.json"))
+
+def apply_peft_to_model(model: NeMoAutoModelForImageTextToText, checkpoint_path: str):
+    """Apply PEFT to the model.
+    
+    Args:
+        model: The model to apply PEFT to
+        checkpoint_path: Path to the checkpoint directory
+    """
+    peft_dict = {}
+    peft_config_path = os.path.join(checkpoint_path, "model", "adapter_config.json")
+    automodel_peft_config_path = os.path.join(checkpoint_path, "model", "automodel_peft_config.json")
+    with open(peft_config_path, "r") as f:
+        restored_peft_config = json.load(f)
+        peft_dict["dim"] = restored_peft_config["r"]
+        peft_dict["alpha"] = restored_peft_config["lora_alpha"]
+    with open(automodel_peft_config_path, "r") as f:
+        automodel_peft_dict = json.load(f)
+        peft_dict |= automodel_peft_dict
+    peft_config = PeftConfig.from_dict(peft_dict)
+    apply_lora_to_linear_modules(model, peft_config)
 
 def load_model_from_checkpoint(
     checkpoint_path: str,
-    base_model: Optional[str] = None,
-    is_peft: bool = False,
-    model_save_format: str = "torch_save",
+    base_model_path: Optional[str] = None,
     use_liger_kernel: bool = False,
-    peft_target_modules: list[str] = [],
-    peft_exclude_modules: list[str] = [],
-    peft_dropout_position: str = "post",
 ) -> NeMoAutoModelForImageTextToText:
     """Load a VLM model from a checkpoint.
 
 
     Args:
         checkpoint_path: Path to the checkpoint directory
-        base_model: Base model name for distributed checkpoints
-        is_peft: Whether the checkpoint is a PEFT checkpoint
-        model_save_format: Format of the saved model ("torch_save" or "safetensors")
+        base_model_path: Base model name for distributed checkpoints
         use_liger_kernel: Whether to use Liger kernel optimizations
-        peft_target_modules: List of target module names for PEFT
-        peft_exclude_modules: List of module names to exclude from PEFT
-        peft_dropout_position: Dropout position for PEFT
 
     Returns:
         Loaded NeMoAutoModelForImageTextToText model
@@ -80,51 +125,33 @@ def load_model_from_checkpoint(
     from nemo_automodel.distributed.init_utils import initialize_distributed
 
     initialize_distributed(backend="nccl", timeout_minutes=10)
-
-    safetensor_checkpoint = False
-    if os.path.exists(os.path.join(checkpoint_path, "model", "config.json")):
-        model_path = os.path.join(checkpoint_path, "model")
-        safetensor_checkpoint = True
-    else:
-        if base_model is None:
-            raise ValueError("base_model required for distributed or PEFT checkpoint")
-        model_path = base_model
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    model_path = os.path.join(checkpoint_path, "model")
+    if is_consolidated_safetensors_checkpoint(checkpoint_path):
+        model = NeMoAutoModelForImageTextToText.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            use_liger_kernel=use_liger_kernel,
+        ).to(device)
+        return model
+
     model = NeMoAutoModelForImageTextToText.from_pretrained(
-        model_path,
+        base_model_path,
         torch_dtype=torch.bfloat16,
         use_liger_kernel=use_liger_kernel,
     ).to(device)
 
-    if safetensor_checkpoint:
-        return model
+    if is_peft_checkpoint(checkpoint_path):
+        apply_peft_to_model(model, checkpoint_path)
 
-    if is_peft:
-        adapter_config_path = os.path.join(checkpoint_path, "model", "adapter_config.json")
-        if not os.path.exists(adapter_config_path):
-            raise FileNotFoundError(f"PEFT checkpoint must contain adapter_config.json at {adapter_config_path}")
-        with open(adapter_config_path, "r") as f:
-            adapter_config = json.load(f)
-        apply_lora_to_linear_modules(
-            model,
-            target_modules=peft_target_modules,
-            exclude_modules=peft_exclude_modules,
-            dim=adapter_config["r"],
-            alpha=adapter_config["lora_alpha"],
-            dropout=adapter_config["lora_dropout"],
-            dropout_position=peft_dropout_position,
-        )
-
-    # PEFT checkpoints will always be loaded from safetensors format.
     checkpoint_config = CheckpointingConfig(
         enabled=True,
         checkpoint_dir=checkpoint_path,
-        model_save_format=model_save_format,
-        model_cache_dir="",  # placeholder
-        model_repo_id=base_model if base_model else "",  # placeholder
-        save_consolidated=False,  # placeholder
-        is_peft=is_peft,
+        model_save_format=get_checkpoint_type(checkpoint_path),
+        model_cache_dir="",
+        model_repo_id=base_model_path,
+        save_consolidated=False,
+        is_peft=is_peft_checkpoint(checkpoint_path),
     )
     load_model(model, str(checkpoint_path), checkpoint_config)
     logging.info(f"✅ Model loaded successfully from {checkpoint_path}")
@@ -192,13 +219,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint-path", type=str, required=True)
     parser.add_argument("--base-model", type=str, default=None)
-    parser.add_argument("--is-peft", action="store_true")
-    parser.add_argument(
-        "--model-save-format",
-        type=str,
-        default="torch_save",
-        choices=["torch_save", "safetensors"],
-    )
     parser.add_argument(
         "--image",
         "--image-path",
@@ -222,45 +242,17 @@ def main():
         default=None,
         help="Optional file path to write the output to",
     )
-    parser.add_argument(
-        "--peft-target-modules",
-        nargs="+",
-        type=str,
-        default=[],
-        help="List of target module names for PEFT (space-separated)",
-    )
-    parser.add_argument(
-        "--peft-exclude-modules",
-        nargs="+",
-        type=str,
-        default=[],
-        help="List of module names to exclude from PEFT (space-separated)",
-    )
-    parser.add_argument(
-        "--peft-dropout-position",
-        type=str,
-        default="post",
-        choices=["pre", "post"],
-        help="Dropout position for PEFT",
-    )
     args = parser.parse_args()
 
-    logging.info(f"Loading model type base_model:{args.base_model} from checkpoint_path:{args.checkpoint_path}")
     logging.info(f"Loading model type base_model:{args.base_model} from checkpoint_path:{args.checkpoint_path}")
 
     model = load_model_from_checkpoint(
         args.checkpoint_path,
         args.base_model,
-        args.is_peft,
-        args.model_save_format,
         use_liger_kernel=False,
-        peft_target_modules=args.peft_target_modules,
-        peft_exclude_modules=args.peft_exclude_modules,
-        peft_dropout_position=args.peft_dropout_position,
     )
     processor_path = args.base_model if args.base_model else args.checkpoint_path
     processor = AutoProcessor.from_pretrained(processor_path)
-    response = generate_response(model, processor, args.image_url, args.prompt, args.max_new_tokens)
     response = generate_response(model, processor, args.image_url, args.prompt, args.max_new_tokens)
 
     # Format and output response
