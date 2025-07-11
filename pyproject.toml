@@ -99,7 +99,10 @@ docs = [
     "myst_parser",         # For our markdown docs
     "nvidia-sphinx-theme", # Our NVIDIA theme
 ]
-linting = ["ruff~=0.9.0"]
+linting = [
+    "pre-commit>=4.2.0",
+    "ruff~=0.9.0",
+]
 test = ["coverage", "pytest"]
 nvfsdp = ["nvfsdp"]
 

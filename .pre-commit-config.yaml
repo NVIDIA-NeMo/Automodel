@@ -1,0 +1,51 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.4.0
+    hooks:
+    - id: end-of-file-fixer
+      # only include python files
+      files: \.py$
+    - id: trailing-whitespace
+      # only include python files
+      files: \.py$
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: "v0.9.9" # Use the appropriate version
+    hooks:
+    - id: ruff
+      args: ["--fix"]
+    - id: ruff
+      args: ["check", "--select", "I", "--fix"]
+    - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: no-underscore-md
+        name: "Disallow '_' in Markdown filenames"
+        language: system
+        entry: |
+          bash -c '
+            # Report the offending files
+            echo "[pre-commit] ERROR: Found Markdown files with underscores:" >&2
+            for file in "$@"; do
+              echo "  - $file (use hyphens instead)" >&2
+            done
+            exit 1
+          '
+        files: '.*\/[^\/]*_[^\/]*\.md$'
+        exclude: '^\.github/'
+        types: [file]
