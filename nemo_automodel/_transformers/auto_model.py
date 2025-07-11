@@ -176,7 +176,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
         ``use_liger_kernel=False``.
         """
         torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
-        if torch_dtype != 'auto':
+        if torch_dtype != "auto":
             torch_dtype = dtype_from_str(torch_dtype)
         use_liger_kernel = kwargs.pop("use_liger_kernel", True)
         use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
@@ -230,7 +230,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
         loading.
         """
         torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
-        if torch_dtype != 'auto':
+        if torch_dtype != "auto":
             torch_dtype = dtype_from_str(torch_dtype)
         use_liger_kernel = kwargs.pop("use_liger_kernel", True)
         use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
@@ -310,7 +310,7 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
         ``use_liger_kernel=False``.
         """
         torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
-        if torch_dtype != 'auto':
+        if torch_dtype != "auto":
             torch_dtype = dtype_from_str(torch_dtype)
         use_liger_kernel = kwargs.pop("use_liger_kernel", True)
         use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
@@ -365,7 +365,7 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
         loading.
         """
         torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
-        if torch_dtype != 'auto':
+        if torch_dtype != "auto":
             torch_dtype = dtype_from_str(torch_dtype)
         use_liger_kernel = kwargs.pop("use_liger_kernel", True)
         use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
