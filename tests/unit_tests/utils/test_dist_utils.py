@@ -66,6 +66,10 @@ class _FakeDist(SimpleNamespace):
     def destroy_process_group(self):  # noqa: D401
         self._initialised = False
 
+    def init_process_group(self, *_, **__):  # noqa: D401
+        """Initialize the process group (no-op for tests)."""
+        self._initialised = True
+
 
 @pytest.fixture()
 def patch_dist(monkeypatch):

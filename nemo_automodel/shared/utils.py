@@ -19,13 +19,15 @@ def dtype_from_str(val):
     """
     Translate a str val of a dtype into the corresponding torch.dtype
     Args:
-        val (str): the dotted path of the dtype (e.g., "torch.bfloat16").
+        val (str): the dotted path of the dtype (e.g., "torch.bfloat16") or "auto".
 
     Returns:
-        torch.dtype: the actual dtype (e.g., torch.bfloat16)
+        torch.dtype or str: the actual dtype (e.g., torch.bfloat16) or "auto"
     """
     if isinstance(val, torch.dtype):
         return val
+    if val == "auto":
+        return "auto"
     lut = {
         "torch.float": torch.float,
         "torch.float32": torch.float,

@@ -192,7 +192,7 @@ class Timer(TimerBase):
             barrier (bool, optional): Synchronizes ranks before starting. Defaults to False.
         """
         assert not self._started, "timer has already been started"
-        if barrier:
+        if barrier and torch.distributed.is_initialized():
             torch.distributed.barrier(group=self._barrier_group)
         torch.cuda.synchronize()
         self._start_time = time.time()
@@ -206,7 +206,7 @@ class Timer(TimerBase):
             barrier (bool, optional): Synchronizes ranks before stopping. Defaults to False.
         """
         assert self._started, "timer is not started"
-        if barrier:
+        if barrier and torch.distributed.is_initialized():
             torch.distributed.barrier(group=self._barrier_group)
         torch.cuda.synchronize()
         elapsed = time.time() - self._start_time
@@ -346,19 +346,26 @@ class Timers:
         Returns:
             torch.tensor: Tensor of size [world_size, len(names)] with times in float.
         """
-        # First make sure all the callers are in sync.
-        if barrier:
-            torch.distributed.barrier()
+        # Check if distributed is initialized
+        if not torch.distributed.is_initialized():
+            # Fall back to single-process behavior
+            world_size = 1
+            rank = 0
+        else:
+            # First make sure all the callers are in sync.
+            if barrier:
+                torch.distributed.barrier()
 
-        world_size = torch.distributed.get_world_size()
-        rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+            rank = torch.distributed.get_rank()
 
         # Here we can use gather on the rank we want to print the
         # timing, however, there is no gather_base support in
         # pytorch yet. It is simpler to deal with a single tensor
         # and since we are only gathering a small amount of data,
         # it should be ok to use all-gather instead of gather.
-        rank_name_to_time = torch.zeros((world_size, len(names)), dtype=torch.float, device=torch.cuda.current_device())
+        device = torch.cuda.current_device() if torch.cuda.is_available() else torch.device("cpu")
+        rank_name_to_time = torch.zeros((world_size, len(names)), dtype=torch.float, device=device)
         for i, name in enumerate(names):
             if name in self._timers:
                 # Here we don't need to pass the barrier flag as all
@@ -368,7 +375,9 @@ class Timers:
                 rank_name_to_time[rank, i] = self._timers[name].elapsed(reset=reset)
 
         # See the note above for why we are not using gather.
-        dist_all_gather_func(rank_name_to_time.view(-1), rank_name_to_time[rank, :].view(-1))
+        if torch.distributed.is_initialized():
+            dist_all_gather_func(rank_name_to_time.view(-1), rank_name_to_time[rank, :].view(-1))
+        # If not distributed, rank_name_to_time already has the right values for single process
 
         return rank_name_to_time
 
@@ -419,7 +428,8 @@ class Timers:
         no_reported_timing = True
         for i, name in enumerate(names):
             not_yet_found = True
-            for rank in range(torch.distributed.get_world_size()):
+            world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            for rank in range(world_size):
                 if rank_name_to_time[rank, i] > 0:
                     no_reported_timing = False
                     if not_yet_found:
@@ -497,8 +507,13 @@ class Timers:
         output_string = self.get_all_timers_string(names, normalizer, reset, barrier)
         # If no input rank is provided, log on last rank.
         if rank is None:
-            rank = torch.distributed.get_world_size() - 1
-        if rank == torch.distributed.get_rank() and output_string is not None:
+            if torch.distributed.is_initialized():
+                rank = torch.distributed.get_world_size() - 1
+            else:
+                rank = 0
+
+        current_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if rank == current_rank and output_string is not None:
             print(output_string, flush=True)
 
     def write(
