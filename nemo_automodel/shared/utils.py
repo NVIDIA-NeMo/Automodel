@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
-
 
 def dtype_from_str(val):
     """
@@ -24,6 +22,8 @@ def dtype_from_str(val):
     Returns:
         torch.dtype: the actual dtype (e.g., torch.bfloat16)
     """
+    import torch
+
     if isinstance(val, torch.dtype):
         return val
     lut = {

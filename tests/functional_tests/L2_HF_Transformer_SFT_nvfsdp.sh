@@ -13,8 +13,8 @@
 # limitations under the License.
 
 TRANSFORMERS_OFFLINE=1 coverage run -a --data-file=/workspace/.coverage --source=/workspace \
-recipes/llm/finetune.py \
-  --config recipes/llm/llama_3_2_1b_squad_nvfsdp.yaml \
+examples/llm/finetune.py \
+  --config examples/llm/llama_3_2_1b_squad_nvfsdp.yaml \
   --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
   --step_scheduler.max_steps 3 \
   --step_scheduler.grad_acc_steps 1 \

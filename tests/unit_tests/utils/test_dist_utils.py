@@ -21,7 +21,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import nemo_automodel.utils.dist_utils as du
+import nemo_automodel.components.utils.dist_utils as du
 
 
 class _FakeDist(SimpleNamespace):

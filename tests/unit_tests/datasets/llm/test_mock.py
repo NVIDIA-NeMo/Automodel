@@ -14,7 +14,7 @@
 import pytest
 from datasets import Dataset
 
-import nemo_automodel.datasets.llm.mock as mock
+import nemo_automodel.components.datasets.llm.mock as mock
 
 
 # ---------- make_vocab --------------------------------------------------------
