@@ -210,10 +210,8 @@ def generate_response(
 
     with torch.inference_mode():
         outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
-        outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
 
     generated_text = processor.decode(outputs[0], skip_special_tokens=True)
-    prompt_length = len(processor.decode(inputs["input_ids"][0], skip_special_tokens=True))
     prompt_length = len(processor.decode(inputs["input_ids"][0], skip_special_tokens=True))
     return generated_text[prompt_length:].strip()
 
