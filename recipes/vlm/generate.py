@@ -29,31 +29,31 @@ Usage:
 """
 
 import argparse
+import glob
 import json
 import logging
 import os
 from typing import Optional
-import glob
-import requests
+
 import requests
 import torch
 from PIL import Image
 from transformers import AutoProcessor
 
-from nemo_automodel._peft.lora import apply_lora_to_linear_modules, PeftConfig
+from nemo_automodel._peft.lora import PeftConfig, apply_lora_to_linear_modules
 from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig, load_model
 from nemo_automodel.loggers.log_utils import setup_logging
 
-
 # TODO: Parse config from YAML and run generate with FSDP2/distributed in general
+
 
 def get_checkpoint_type(checkpoint_path: str) -> str:
     """Get the type of the checkpoint.
-    
+
     Args:
         checkpoint_path: Path to the checkpoint directory
-    
+
     Returns:
         'torch_save' if the checkpoint is a DCP checkpoint or 'safetensors' if the checkpoint is a safetensors checkpoint
     """
@@ -63,9 +63,10 @@ def get_checkpoint_type(checkpoint_path: str) -> str:
     else:
         return "torch_save"
 
+
 def is_peft_checkpoint(checkpoint_path: str) -> bool:
     """Check if the checkpoint is a PEFT checkpoint.
-    
+
     Args:
         checkpoint_path: Path to the checkpoint directory
 
@@ -74,9 +75,10 @@ def is_peft_checkpoint(checkpoint_path: str) -> bool:
     """
     return os.path.exists(os.path.join(checkpoint_path, "model", "adapter_model.safetensors"))
 
+
 def is_consolidated_safetensors_checkpoint(checkpoint_path: str) -> bool:
     """Check if the checkpoint is a consolidated safetensors checkpoint.
-    
+
     Args:
         checkpoint_path: Path to the checkpoint directory
 
@@ -85,9 +87,10 @@ def is_consolidated_safetensors_checkpoint(checkpoint_path: str) -> bool:
     """
     return os.path.exists(os.path.join(checkpoint_path, "model", "model.safetensors.index.json"))
 
+
 def apply_peft_to_model(model: NeMoAutoModelForImageTextToText, checkpoint_path: str):
     """Apply PEFT to the model.
-    
+
     Args:
         model: The model to apply PEFT to
         checkpoint_path: Path to the checkpoint directory
@@ -105,6 +108,7 @@ def apply_peft_to_model(model: NeMoAutoModelForImageTextToText, checkpoint_path:
     peft_config = PeftConfig.from_dict(peft_dict)
     apply_lora_to_linear_modules(model, peft_config)
 
+
 def load_model_from_checkpoint(
     checkpoint_path: str,
     base_model_path: Optional[str] = None,
@@ -112,10 +116,9 @@ def load_model_from_checkpoint(
 ) -> NeMoAutoModelForImageTextToText:
     """Load a VLM model from a checkpoint.
 
-
     Args:
         checkpoint_path: Path to the checkpoint directory
-        base_model_path: Base model name for distributed checkpoints
+        base_model_path: Path to the base model checkpoint. This can either be something like 'google/gemma-3-4b-it' or a local path to the base model. This is not required if restoring from a consolidated HF checkpoint.
         use_liger_kernel: Whether to use Liger kernel optimizations
 
     Returns:
@@ -134,6 +137,9 @@ def load_model_from_checkpoint(
             use_liger_kernel=use_liger_kernel,
         ).to(device)
         return model
+
+    if base_model_path is None:
+        raise ValueError("base_model_path is required if not restoring from a consolidated HF checkpoint.")
 
     model = NeMoAutoModelForImageTextToText.from_pretrained(
         base_model_path,
@@ -217,8 +223,13 @@ def main():
     setup_logging()
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint-path", type=str, required=True)
-    parser.add_argument("--base-model", type=str, default=None)
+    parser.add_argument("--checkpoint-path", type=str, default=None)
+    parser.add_argument(
+        "--base-model-path",
+        type=str,
+        required=False,
+        help="The path to the base model checkpoint. This can either be something like 'google/gemma-3-4b-it' or a local path to the base model. This is not required if restoring from a consolidated HF checkpoint.",
+    )
     parser.add_argument(
         "--image",
         "--image-path",
@@ -244,14 +255,14 @@ def main():
     )
     args = parser.parse_args()
 
-    logging.info(f"Loading model type base_model:{args.base_model} from checkpoint_path:{args.checkpoint_path}")
+    logging.info(f"Loading model type base_model:{args.base_model_path} from checkpoint_path:{args.checkpoint_path}")
 
     model = load_model_from_checkpoint(
-        args.checkpoint_path,
-        args.base_model,
+        checkpoint_path=args.checkpoint_path,
+        base_model_path=args.base_model_path,
         use_liger_kernel=False,
     )
-    processor_path = args.base_model if args.base_model else args.checkpoint_path
+    processor_path = args.base_model_path if args.base_model_path else args.checkpoint_path
     processor = AutoProcessor.from_pretrained(processor_path)
     response = generate_response(model, processor, args.image_url, args.prompt, args.max_new_tokens)
 
