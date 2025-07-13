@@ -18,7 +18,5 @@ recipes/vlm/finetune.py \
   --model.pretrained_model_name_or_path /home/TestData/huiyingl/hf_gemma3_2l/ \
   --step_scheduler.max_steps 3 \
   --step_scheduler.grad_acc_steps 1 \
-  --dataset.tokenizer.pretrained_model_name_or_path /home/TestData/huiyingl/hf_gemma3_2l/ \
-  --validation_dataset.tokenizer.pretrained_model_name_or_path /home/TestData/huiyingl/hf_gemma3_2l/ \
-  --dataset.dataset_name /home/TestData/lite/hf_cache/rdr/ \
+  --dataset.path_or_dataset /home/TestData/lite/hf_cache/rdr/ \
   --dataset.limit_dataset_samples 10
