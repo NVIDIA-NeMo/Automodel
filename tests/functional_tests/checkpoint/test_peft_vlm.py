@@ -554,7 +554,7 @@ def test_hf_peft_checkpoint():
         ),
     }
     expected_config = {
-        "base_model_name_or_path": "/lustre/fsw/portfolios/coreai/users/huiyingl/auto/transformers_4_53_0_origin/hf_gemma3_vlm_2l/",
+        "base_model_name_or_path": "/home/TestData/huiyingl/hf_gemma3_2l/",
         "bias": "none",
         "lora_alpha": 32,
         "peft_type": "LORA",
