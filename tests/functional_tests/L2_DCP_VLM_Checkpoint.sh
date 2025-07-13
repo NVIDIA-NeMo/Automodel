@@ -34,16 +34,3 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --checkpoint.checkpoint_dir checkpoints/ \
     --checkpoint.model_save_format torch_save
 coverage combine
-
-# torchrun --nproc_per_node=2 tests/functional_tests/checkpoint/test_dcp_vlm.py \
-#   --config recipes/vlm/gemma_3_vl_4b_cord_v2.yaml \
-#   --model.pretrained_model_name_or_path /lustre/fsw/portfolios/coreai/users/huiyingl/auto/transformers_4_53_0_origin/hf_gemma3_vlm_2l/ \
-#   --step_scheduler.max_steps 10 \
-#   --step_scheduler.grad_acc_steps 4 \
-#   --dataset.dataset_name /lustre/fsw/portfolios/coreai/users/huiyingl/auto/NeMo-Automodel/my/rdr/ \
-#   --validation_dataset.dataset_name /lustre/fsw/portfolios/coreai/users/huiyingl/auto/NeMo-Automodel/my/rdr/ \
-#   --dataset.limit_dataset_samples 1000 \
-#   --step_scheduler.ckpt_every_steps 10 \
-#   --checkpoint.enabled true \
-#   --checkpoint.checkpoint_dir checkpoints/ \
-#   --checkpoint.model_save_format torch_save
