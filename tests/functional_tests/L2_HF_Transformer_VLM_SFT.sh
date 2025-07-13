@@ -18,5 +18,6 @@ recipes/vlm/finetune.py \
   --model.pretrained_model_name_or_path /home/TestData/huiyingl/hf_gemma3_2l/ \
   --step_scheduler.max_steps 3 \
   --step_scheduler.grad_acc_steps 1 \
+  --dataset._target_=nemo_automodel.datasets.vlm.datasets.make_rdr_dataset \
   --dataset.path_or_dataset /home/TestData/lite/hf_cache/rdr/ \
   --dataset.limit_dataset_samples 10

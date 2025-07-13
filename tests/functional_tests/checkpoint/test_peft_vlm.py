@@ -609,10 +609,6 @@ def test_hf_peft_checkpoint():
         ).state_dict()["optim"]["state"]
     )
 
-    if torch.distributed.get_rank() == 0:
-        print("=" * 80)
-        print("IN-MEMORY VLM MODEL KEYS FIXTURE:")
-        print("=" * 80)
     model_keys_fixture = {}
     for k, v in model_state_dict.items():
         if isinstance(v, torch.distributed.tensor.DTensor):
@@ -620,12 +616,6 @@ def test_hf_peft_checkpoint():
         # PEFT model state is consolidated - use FULL tensor shape (no splitting)
         curr_shard = v
         model_keys_fixture[k] = (list(curr_shard.shape), curr_shard.dtype, str(curr_shard.device))
-    if torch.distributed.get_rank() == 0:
-        print(repr(model_keys_fixture))
-
-        print("\n" + "=" * 80)
-        print("IN-MEMORY VLM OPTIMIZER KEYS FIXTURE:")
-        print("=" * 80)
     flattened_optim_dict = _flatten(optimizer_state_dict, parent_key="optim.optim.state")
     optim_keys_fixture = {}
     for k, v in flattened_optim_dict.items():
@@ -636,9 +626,6 @@ def test_hf_peft_checkpoint():
         else:
             curr_shard = v
         optim_keys_fixture[k] = (list(curr_shard.shape), curr_shard.dtype, str(curr_shard.device))
-    if torch.distributed.get_rank() == 0:
-        print(repr(optim_keys_fixture))
-        print("=" * 80)
     # assert the correct paths exist
     output_files = [
         "model",
