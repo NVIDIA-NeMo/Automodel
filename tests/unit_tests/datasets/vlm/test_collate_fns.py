@@ -104,7 +104,7 @@ def collate_mod():
     Import the module under test fresh for every test so monkey-patching of
     module-level variables does not leak between tests.
     """
-    import nemo_automodel.datasets.vlm.collate_fns as _m
+    import nemo_automodel.components.datasets.vlm.collate_fns as _m
 
     # Always reload so each test starts from a clean module object.
     return importlib.reload(_m)
@@ -120,7 +120,7 @@ def patch_skipped(monkeypatch):
         return torch.tensor([SKIP_TOKEN])
 
     monkeypatch.setattr(
-        "nemo_automodel.datasets.vlm.collate_fns.extract_skipped_token_ids",
+        "nemo_automodel.components.datasets.vlm.collate_fns.extract_skipped_token_ids",
         _fake_skip_fn,
         raising=True,
     )

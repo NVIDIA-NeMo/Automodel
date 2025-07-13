@@ -15,7 +15,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.loss.linear_ce import (
+from nemo_automodel.components.loss.linear_ce import (
     HAVE_CUT_CROSS_ENTROPY,
     fused_linear_cross_entropy,
 )

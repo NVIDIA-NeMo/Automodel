@@ -15,7 +15,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.loss.masked_ce import masked_cross_entropy
+from nemo_automodel.components.loss.masked_ce import masked_cross_entropy
 
 
 def test_masked_cross_entropy_no_mask():

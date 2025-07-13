@@ -18,7 +18,7 @@ import functools
 import pytest
 import yaml
 
-from nemo_automodel.utils.yaml_utils import safe_yaml_representers
+from nemo_automodel.components.utils.yaml_utils import safe_yaml_representers
 
 
 class Colour(enum.Enum):
