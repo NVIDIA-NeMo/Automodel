@@ -96,7 +96,7 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
     from nemo_automodel.components.launcher.slurm.utils import submit_slurm_job
 
     last_dir = Path(job_dir).parts[-1]
-    assert len(last_dir) == 10 and last_dir.isdigit(), "Expected last dir to be unix timestamp"
+    assert len(last_dir) == 10 and last_dir.isdigit(), ("Expected last dir to be unix timestamp", job_dir)
     # hf_home needs to be on shared shorage for multinode jobs.
     if not "hf_home" in slurm_config:
         # we'll assume that job_dir is on shared storage (visible by all SLURM workers).
@@ -132,6 +132,8 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
         )
     )
     # Add extra mounts
+    if not 'extra_mounts' in slurm_config:
+        slurm_config["extra_mounts"] = []
     slurm_config["extra_mounts"].append(VolumeMapping(Path(repo_root), Path(repo_root)))
     return submit_slurm_job(SlurmConfig(**slurm_config, command=command, chdir=repo_root), job_dir)
 

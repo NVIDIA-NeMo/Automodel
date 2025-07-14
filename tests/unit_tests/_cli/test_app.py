@@ -99,7 +99,10 @@ def test_launch_with_slurm(monkeypatch):
 
     fake_executor = mock.MagicMock()
     fake_exp = mock.MagicMock()
-
+    dummy_args = SimpleNamespace(
+        command="finetune",
+        domain="llm",
+    )
     monkeypatch.setattr(module, "load_yaml", lambda x: {"slurm": mock_slurm_config})
     monkeypatch.setitem(
         sys.modules,
@@ -118,10 +121,30 @@ def test_launch_with_slurm(monkeypatch):
             job_dir='',
         )
     )
-    # def launch_with_slurm(slurm_config, script_path, config_file, job_dir=None, container_env={}):
+    # fake implementation
+    def fake_submit_slurm_job(cfg, job_dir):
+        parts = cfg.command.split()
+        assert len(parts) == 5
+        assert parts[0].startswith("PYTHONPATH=")
+        assert parts[0].endswith(":$PYTHONPATH")
+        assert parts[1] == "python3"
+        assert parts[2].endswith("recipes/llm/finetune.py")
+        assert parts[3] == "-c"
+        assert parts[4] == "/tmp/a/0123456789/y.conf"
 
-    module.launch_with_slurm(mock_slurm_config, mock_script, mock_config, '')
 
+        # whatever you want to check
+        return "FAKE_JOB_ID"
+
+    import nemo_automodel.components.launcher.slurm.utils as slurm_utils
+    monkeypatch.setattr(slurm_utils, "submit_slurm_job", fake_submit_slurm_job)
+    job_dir = '/tmp/a/0123456789/'
+    module.launch_with_slurm(dummy_args, job_dir +'y.conf', job_dir, slurm_config={})
+
+    # maybe separate test?
+    with pytest.raises(AssertionError, match='Expected last dir to be unix timestamp'):
+        job_dir = '/tmp/a/123456789/'
+        module.launch_with_slurm(dummy_args, job_dir +'y.conf', job_dir, slurm_config={})
 
 def test_main_single_node(monkeypatch, tmp_yaml_file):
     config_path = tmp_yaml_file
