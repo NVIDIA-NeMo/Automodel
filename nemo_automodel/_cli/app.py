@@ -115,6 +115,10 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
             repo_root = '/opt/Automodel'
     logging.info(f"Using {repo_root} as code repo")
 
+    # Make default name
+    if slurm_config.get('job_name', '') == '':
+        slurm_config['job_name'] = f'{args.domain}_{args.command}'
+
     # create the command
     command = ' '.join(
         (
@@ -127,8 +131,6 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
     )
     # Add extra mounts
     slurm_config['extra_mounts'].append(VolumeMapping(Path(repo_root), Path(repo_root)))
-    if slurm_config.get('job_name', '') == '':
-        slurm_config['job_name'] = f'{args.domain}_{args.command}'
     return submit_slurm_job(
         SlurmConfig(**slurm_config, command=command, chdir=repo_root), job_dir)
 
