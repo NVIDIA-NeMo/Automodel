@@ -96,14 +96,13 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
     last_dir = Path(job_dir).parts[-1]
     assert len(last_dir) == 10 and last_dir.isdigit(), "Expected last dir to be unix timestamp"
     # hf_home needs to be on shared shorage for multinode jobs.
-    if (num_nodes := slurm_config.get('nodes', 1)) == 1:
-        if not 'hf_home' in slurm_config:
-            # we'll assume that job_dir is on shared storage (visible by all SLURM workers).
-            slurm_config['hf_home'] = str(Path(job_dir).parent / ".hf_home")
-            os.makedirs(slurm_config['hf_home'], exist_ok=True)
+    if not 'hf_home' in slurm_config:
+        # we'll assume that job_dir is on shared storage (visible by all SLURM workers).
+        slurm_config['hf_home'] = str(Path(job_dir).parent / ".hf_home")
+        os.makedirs(slurm_config['hf_home'], exist_ok=True)
 
-        # log HF_HOME used.
-        logging.info(f"Using HF_HOME= `{slurm_config['hf_home']}`")
+    # log HF_HOME used.
+    logging.info(f"Using HF_HOME= `{slurm_config['hf_home']}`")
 
     # Determine the code repo root
     if 'repo_root' in slurm_config:
