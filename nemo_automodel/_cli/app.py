@@ -132,7 +132,7 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
         )
     )
     # Add extra mounts
-    if not 'extra_mounts' in slurm_config:
+    if not "extra_mounts" in slurm_config:
         slurm_config["extra_mounts"] = []
     slurm_config["extra_mounts"].append(VolumeMapping(Path(repo_root), Path(repo_root)))
     return submit_slurm_job(SlurmConfig(**slurm_config, command=command, chdir=repo_root), job_dir)
