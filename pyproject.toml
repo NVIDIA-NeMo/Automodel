@@ -103,7 +103,7 @@ linting = [
     "pre-commit>=4.2.0",
     "ruff~=0.9.0",
 ]
-test = ["coverage", "pytest"]
+test = ["coverage", "pytest", "peft"]
 nvfsdp = ["nvfsdp"]
 
 [tool.uv]

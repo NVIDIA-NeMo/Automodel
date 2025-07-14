@@ -29,17 +29,18 @@ Usage:
 """
 
 import argparse
+import glob
 import json
 import logging
-from pathlib import Path
+import os
 from typing import Optional
 
 import requests
 import torch
-import torch.distributed
 from PIL import Image
-from transformers import AutoConfig, AutoProcessor
+from transformers import AutoProcessor
 
+from nemo_automodel._peft.lora import PeftConfig, apply_lora_to_linear_modules
 from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig, load_model
 from nemo_automodel.loggers.log_utils import setup_logging
@@ -47,60 +48,118 @@ from nemo_automodel.loggers.log_utils import setup_logging
 # TODO: Parse config from YAML and run generate with FSDP2/distributed in general
 
 
+def get_checkpoint_type(checkpoint_path: str) -> str:
+    """Get the type of the checkpoint.
+
+    Args:
+        checkpoint_path: Path to the checkpoint directory
+
+    Returns:
+        'torch_save' if the checkpoint is a DCP checkpoint or 'safetensors' if the checkpoint is a safetensors checkpoint
+    """
+    safetensors = glob.glob(os.path.join(checkpoint_path, "model", "*.safetensors"))
+    if len(safetensors) > 0:
+        return "safetensors"
+    else:
+        return "torch_save"
+
+
+def is_peft_checkpoint(checkpoint_path: str) -> bool:
+    """Check if the checkpoint is a PEFT checkpoint.
+
+    Args:
+        checkpoint_path: Path to the checkpoint directory
+
+    Returns:
+        True if the checkpoint is a PEFT checkpoint, False otherwise
+    """
+    return os.path.exists(os.path.join(checkpoint_path, "model", "adapter_model.safetensors"))
+
+
+def is_consolidated_safetensors_checkpoint(checkpoint_path: str) -> bool:
+    """Check if the checkpoint is a consolidated safetensors checkpoint.
+
+    Args:
+        checkpoint_path: Path to the checkpoint directory
+
+    Returns:
+        True if the checkpoint is a consolidated safetensors checkpoint, False otherwise
+    """
+    return os.path.exists(os.path.join(checkpoint_path, "model", "model.safetensors.index.json"))
+
+
+def apply_peft_to_model(model: NeMoAutoModelForImageTextToText, checkpoint_path: str):
+    """Apply PEFT to the model.
+
+    Args:
+        model: The model to apply PEFT to
+        checkpoint_path: Path to the checkpoint directory
+    """
+    peft_dict = {}
+    peft_config_path = os.path.join(checkpoint_path, "model", "adapter_config.json")
+    automodel_peft_config_path = os.path.join(checkpoint_path, "model", "automodel_peft_config.json")
+    with open(peft_config_path, "r") as f:
+        restored_peft_config = json.load(f)
+        peft_dict["dim"] = restored_peft_config["r"]
+        peft_dict["alpha"] = restored_peft_config["lora_alpha"]
+    with open(automodel_peft_config_path, "r") as f:
+        automodel_peft_dict = json.load(f)
+        peft_dict |= automodel_peft_dict
+    peft_config = PeftConfig.from_dict(peft_dict)
+    apply_lora_to_linear_modules(model, peft_config)
+
+
 def load_model_from_checkpoint(
     checkpoint_path: str,
-    base_model: Optional[str] = None,
-    is_peft: bool = False,
-    model_save_format: str = "torch_save",
+    base_model_path: Optional[str] = None,
     use_liger_kernel: bool = False,
 ) -> NeMoAutoModelForImageTextToText:
     """Load a VLM model from a checkpoint.
 
     Args:
         checkpoint_path: Path to the checkpoint directory
-        base_model: Base model name for distributed checkpoints
-        is_peft: Whether the checkpoint is a PEFT checkpoint
-        model_save_format: Format of the saved model ("torch_save" or "safetensors")
+        base_model_path: Path to the base model checkpoint. This can either be something like 'google/gemma-3-4b-it' or a local path to the base model. This is not required if restoring from a consolidated HF checkpoint.
         use_liger_kernel: Whether to use Liger kernel optimizations
 
     Returns:
         Loaded NeMoAutoModelForImageTextToText model
     """
     # initialize distributed
-
     from nemo_automodel.distributed.init_utils import initialize_distributed
 
     initialize_distributed(backend="nccl", timeout_minutes=10)
-
-    checkpoint_path = Path(checkpoint_path)
-    device_map = "cuda" if torch.cuda.is_available() else "cpu"
-    model = None
-    if (checkpoint_path / "config.json").exists():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model_path = os.path.join(checkpoint_path, "model")
+    if is_consolidated_safetensors_checkpoint(checkpoint_path):
         model = NeMoAutoModelForImageTextToText.from_pretrained(
-            checkpoint_path,
+            model_path,
             torch_dtype=torch.bfloat16,
-            device_map=device_map,
             use_liger_kernel=use_liger_kernel,
-        )
-    else:
-        if base_model is None:
-            raise ValueError("base_model required for distributed checkpoint")
-        config = AutoConfig.from_pretrained(base_model)
-        with torch.device(device_map):
-            model = NeMoAutoModelForImageTextToText.from_config(
-                config, torch_dtype=torch.bfloat16, use_liger_kernel=False
-            )
+        ).to(device)
+        return model
 
-        checkpoint_config = CheckpointingConfig(
-            enabled=True,
-            checkpoint_dir=checkpoint_path.parent,
-            model_save_format=model_save_format,
-            model_cache_dir="",
-            model_repo_id="",
-            save_consolidated=False,
-            is_peft=is_peft,
-        )
-        load_model(model, str(checkpoint_path), checkpoint_config)
+    if base_model_path is None:
+        raise ValueError("base_model_path is required if not restoring from a consolidated HF checkpoint.")
+
+    model = NeMoAutoModelForImageTextToText.from_pretrained(
+        base_model_path,
+        torch_dtype=torch.bfloat16,
+        use_liger_kernel=use_liger_kernel,
+    ).to(device)
+
+    if is_peft_checkpoint(checkpoint_path):
+        apply_peft_to_model(model, checkpoint_path)
+
+    checkpoint_config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=checkpoint_path,
+        model_save_format=get_checkpoint_type(checkpoint_path),
+        model_cache_dir="",
+        model_repo_id=base_model_path,
+        save_consolidated=False,
+        is_peft=is_peft_checkpoint(checkpoint_path),
+    )
+    load_model(model, str(checkpoint_path), checkpoint_config)
     logging.info(f"✅ Model loaded successfully from {checkpoint_path}")
     return model
 
@@ -114,6 +173,7 @@ def generate_response(
 ) -> str:
     """Generate a text response from an image and text prompt.
 
+
     Args:
         model: The loaded VLM model
         processor: The model's processor for tokenization
@@ -121,10 +181,10 @@ def generate_response(
         prompt: Text prompt for the model
         max_new_tokens: Maximum number of new tokens to generate
 
+
     Returns:
         Generated text response
     """
-
     if image_url.startswith("http"):
         image = Image.open(requests.get(image_url, stream=True).raw)
     else:
@@ -161,14 +221,12 @@ def main():
     setup_logging()
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint-path", type=str, required=True)
-    parser.add_argument("--base-model", type=str, default=None)
-    parser.add_argument("--is-peft", action="store_true")
+    parser.add_argument("--checkpoint-path", type=str, default=None)
     parser.add_argument(
-        "--model-save-format",
+        "--base-model-path",
         type=str,
-        default="torch_save",
-        choices=["torch_save", "safetensors"],
+        required=False,
+        help="The path to the base model checkpoint. This can either be something like 'google/gemma-3-4b-it' or a local path to the base model. This is not required if restoring from a consolidated HF checkpoint.",
     )
     parser.add_argument(
         "--image",
@@ -193,19 +251,16 @@ def main():
         default=None,
         help="Optional file path to write the output to",
     )
-
     args = parser.parse_args()
 
-    logging.info(f"Loading model type base_model:{args.base_model} from checkpoint_path:{args.checkpoint_path}")
+    logging.info(f"Loading model type base_model:{args.base_model_path} from checkpoint_path:{args.checkpoint_path}")
 
     model = load_model_from_checkpoint(
-        args.checkpoint_path,
-        args.base_model,
-        args.is_peft,
-        args.model_save_format,
+        checkpoint_path=args.checkpoint_path,
+        base_model_path=args.base_model_path,
         use_liger_kernel=False,
     )
-    processor_path = args.base_model if args.base_model else args.checkpoint_path
+    processor_path = args.base_model_path if args.base_model_path else args.checkpoint_path
     processor = AutoProcessor.from_pretrained(processor_path)
     response = generate_response(model, processor, args.image_url, args.prompt, args.max_new_tokens)
 
