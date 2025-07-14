@@ -200,6 +200,7 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
                 torch_dtype=torch_dtype,
                 use_liger_kernel=False,
                 use_sdpa_patching=use_sdpa_patching,
+                attn_implementation=attn_implementation,
             )
 
     @classmethod
@@ -243,7 +244,12 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
             del model
             # If patching failed, retry
             return cls.from_config(
-                config, **kwargs, use_liger_kernel=False, torch_dtype=torch_dtype, use_sdpa_patching=use_sdpa_patching
+                config,
+                **kwargs,
+                use_liger_kernel=False,
+                torch_dtype=torch_dtype,
+                attn_implementation=attn_implementation,
+                use_sdpa_patching=use_sdpa_patching,
             )
 
 
@@ -334,6 +340,7 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
                 **kwargs,
                 torch_dtype=torch_dtype,
                 use_liger_kernel=False,
+                attn_implementation=attn_implementation,
                 use_sdpa_patching=use_sdpa_patching,
             )
 
@@ -378,5 +385,10 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
             del model
             # If patching failed, retry
             return cls.from_config(
-                config, **kwargs, use_liger_kernel=False, torch_dtype=torch_dtype, use_sdpa_patching=use_sdpa_patching
+                config,
+                **kwargs,
+                use_liger_kernel=False,
+                torch_dtype=torch_dtype,
+                attn_implementation=attn_implementation,
+                use_sdpa_patching=use_sdpa_patching,
             )
