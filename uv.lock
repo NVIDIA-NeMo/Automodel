@@ -1065,6 +1065,7 @@ fa = [
     { name = "flash-attn" },
 ]
 vlm = [
+    { name = "pillow" },
     { name = "qwen-vl-utils", extra = ["decord"] },
     { name = "timm" },
     { name = "transformers" },
@@ -1104,6 +1105,7 @@ requires-dist = [
     { name = "datasets" },
     { name = "flash-attn", marker = "extra == 'fa'" },
     { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", specifier = "==0.5.8" },
+    { name = "pillow", marker = "extra == 'vlm'" },
     { name = "pyyaml" },
     { name = "qwen-vl-utils", extras = ["decord"], marker = "extra == 'vlm'" },
     { name = "timm", marker = "extra == 'vlm'", specifier = "==1.0.16" },

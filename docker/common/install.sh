@@ -79,6 +79,7 @@ main() {
         --link-mode copy \
         --locked \
         --extra fa \
+        --extra vlm \
         --all-groups ${UV_ARGS[@]}
 
     # Run install overrides
