@@ -64,7 +64,6 @@ export HF_TOKEN={hf_token}
 
 # User command
 read -r -d '' CMD <<'EOF'
-pip3 install -U datasets;
 cd {chdir}; whoami; date; pwd;
 {command}
 EOF
