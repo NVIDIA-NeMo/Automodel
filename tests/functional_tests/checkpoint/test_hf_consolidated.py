@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # pylint: disable=line-too-long
-"""Tests for DCP checkpointing."""
+"""Tests for consolidated HF safetensors checkpointing."""
 
 import os
 import shutil
@@ -22,12 +22,15 @@ from pathlib import Path
 import torch
 import torch.distributed.checkpoint as dcp
 import torch.distributed.tensor
+import torch.nn as nn
 from safetensors import safe_open
+from transformers import AutoModelForCausalLM
 
 from nemo_automodel.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
+from nemo_automodel.checkpoint.checkpointing import load_model
 from nemo_automodel.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.config.cli import parse_args_and_load_config
-from recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction
+from recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction, build_model_and_optimizer
 
 
 def load_dcp(ckpt_dir: Path | str) -> dict[str, torch.Tensor]:
@@ -79,6 +82,38 @@ def to_cpu(
     Converts a state dictionary to CPU.
     """
     return {k: v.cpu() if isinstance(v, torch.Tensor) else to_cpu(v) for k, v in state_dict.items()}
+
+
+def get_validation_loss(
+    model: nn.Module, val_batch: dict[str, torch.Tensor], loss_fn: nn.Module, device: torch.device
+) -> torch.Tensor:
+    """Gets the validation loss for a model."""
+    val_batch = {k: v.to(device, non_blocking=True) for k, v in val_batch.items()}
+    model.eval()
+    labels = val_batch.pop("labels")
+    loss_mask = val_batch.pop("loss_mask", None)
+    if loss_mask is None:
+        loss_mask = (labels.detach() != -100).to(torch.int)
+
+    with torch.no_grad():
+        out = model(**val_batch)
+        loss = loss_fn(out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum")
+        return loss
+
+
+def get_new_model(trainer: FinetuneRecipeForNextTokenPrediction) -> nn.Module:
+    """Gets a new model."""
+    use_hf_fa2 = trainer.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
+    return build_model_and_optimizer(
+        trainer.dist_env.device,
+        trainer.cfg.model,
+        trainer.cfg.optimizer,
+        use_hf_fa2,
+        trainer.peft_config,
+        trainer.model_wrapper,
+        trainer.cfg.get("seed", 42),
+        trainer.cfg.get("distributed.tp_size", 1),
+    )[0]
 
 
 def test_hf_sharded_checkpoint():
@@ -759,6 +794,7 @@ def test_hf_sharded_checkpoint():
         "dataloader.pt",
         "model/shard-00001-model-00001-of-00001.safetensors",
         "model/shard-00002-model-00001-of-00001.safetensors",
+        "model/consolidated/model-00001-of-00001.safetensors",
         "optim/__0_0.distcp",
         "optim/__1_0.distcp",
         "optim/.metadata",
@@ -787,6 +823,33 @@ def test_hf_sharded_checkpoint():
         / "consolidated"
         / "model-00001-of-00001.safetensors",
     )
+
+    # check if newly restored model and current model give the same CE loss
+    val_batch = next(iter(trainer.val_dataloader))
+    restored_model = get_new_model(trainer)
+    load_model(
+        restored_model,
+        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10",
+        trainer.checkpoint_config,
+    )
+    source_model_loss = get_validation_loss(trainer.model, val_batch, trainer.loss_fn, trainer.dist_env.device)
+    restored_model_loss = get_validation_loss(restored_model, val_batch, trainer.loss_fn, trainer.dist_env.device)
+    assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
+
+    # load consolidated model using HF API and verify it's the same as the trained model
+    consolidated_model = (
+        AutoModelForCausalLM.from_pretrained(
+            Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "model" / "consolidated"
+        )
+        .to(trainer.model.dtype)
+        .to(trainer.dist_env.device)
+    )
+    for source_key, source_param in model_state_dict.items():
+        for consolidated_key, consolidated_param in consolidated_model.named_parameters():
+            if source_key in consolidated_key:
+                assert torch.allclose(source_param.full_tensor(), consolidated_param), (
+                    "Parameter values are different when they should be the same"
+                )
 
     # at save time, the model is saved in a dictionary formatted as:
     # {
@@ -827,9 +890,11 @@ def test_hf_sharded_checkpoint():
     assert set(expected_model_keys.keys()) == set(restored_model_dict.keys()), (
         "Mismatch between in-memory and on-disk model keys."
     )
-    assert set(expected_model_keys.keys()) == set(restored_model_dict_consolidated.keys()), (
-        "Mismatch between in-memory and on-disk consolidated model keys."
-    )
+    for key in restored_model_dict_consolidated:
+        if "lm_head" in key:
+            assert f"model.{key}" in expected_model_keys, (
+                "Mismatch between in-memory and on-disk consolidated model keys."
+            )
 
     # ---------------------------------------------------------------------
     # Compare the flattened in-memory optimizer state with the on-disk view
@@ -874,9 +939,11 @@ def test_hf_sharded_checkpoint():
         v = model_state_dict[k.split(".", 1)[1]]
         if isinstance(v, torch.distributed.tensor.DTensor):
             v = v.full_tensor().cpu()
-        assert k in restored_model_dict_consolidated, f"Key {k} not found in restored model state"
+        assert k.replace("model.", "") if "lm_head" in k else k in restored_model_dict_consolidated, (
+            f"Key {k} not found in restored model state"
+        )
         assert isinstance(
-            restored_model_dict_consolidated[k],
+            restored_model_dict_consolidated[k.replace("model.", "") if "lm_head" in k else k],
             torch.Tensor,
         ), f"Value for key {k} is not a tensor"
 
@@ -884,7 +951,7 @@ def test_hf_sharded_checkpoint():
         expected_shape, expected_dtype, expected_device = expected_model_keys[k]
         expected_shape[0] *= 2  # since the hardcoded shapes are for sharded Tensors
 
-        full_shard = restored_model_dict_consolidated[k]
+        full_shard = restored_model_dict_consolidated[k.replace("model.", "") if "lm_head" in k else k]
 
         assert list(full_shard.shape) == expected_shape, (
             f"Shape mismatch for key {k}. Expected shape {expected_shape} but got {full_shard.shape}"

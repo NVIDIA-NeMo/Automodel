@@ -38,12 +38,12 @@ def _drop_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX) -> None:
             sd[k[len(prefix) :]] = sd.pop(k)
 
 
-def _add_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX) -> None:
+def _add_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX, skip_keys: list[str] = []) -> None:
     """
     Prepend `prefix` once to every key in-place (inverse of `_drop_outer_prefix`).
     """
     for k in list(sd.keys()):
-        if not k.startswith(prefix):
+        if not k.startswith(prefix) and k not in skip_keys:
             sd[prefix + k] = sd.pop(k)
 
 
@@ -135,7 +135,10 @@ class ModelState(Stateful):
             # HuggingFace modules normally carry.  Re-add it so that
             # set_model_state_dict can match parameters correctly. This is not needed
             # for torch serialization.
-            _add_outer_prefix(state_dict)
+
+            # However, this should be skipped for the LM head. The LM head should not have any "model." prefix. This is HF convention.
+            lm_head_param_name = _get_lm_head_weight_and_name(self.model)[1]
+            _add_outer_prefix(state_dict, skip_keys=[lm_head_param_name])
 
         # If we intentionally skipped saving "lm_head.weight" (tied embeddings)
         # PyTorch will complain during load even with strict=False.

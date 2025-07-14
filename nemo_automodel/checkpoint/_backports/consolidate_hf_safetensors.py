@@ -231,9 +231,14 @@ def _process_output_file(
                 if fqn == DEFAULT_EXTRA_METADATA_KEY:
                     continue
 
-                # Skip if this tensor doesn't belong in this output file
-                if fqn not in output_data.fqn_data:
-                    continue
+                # Map original FQN to a potentially renamed key (e.g., "model.lm_head.weight" -> "lm_head.weight")
+                target_fqn = fqn
+                if target_fqn not in output_data.fqn_data:
+                    alt_fqn = target_fqn.replace("model.", "", 1) if target_fqn.startswith("model.") else None
+                    if alt_fqn is None or alt_fqn not in output_data.fqn_data:
+                        # Skip if this tensor doesn't belong in this output file
+                        continue
+                    target_fqn = alt_fqn
 
                 data_offsets = metadata[DATA_OFFSETS_KEY]
                 # Get the tensor data as bytes
@@ -244,7 +249,7 @@ def _process_output_file(
                 offsets_of_tensor_being_read = _get_dcp_custom_metadata(file_metadata)[fqn][SAVED_OFFSETS_KEY]
 
                 # Get metadata for this tensor in the output file
-                fqn_data = output_data.fqn_data[fqn]
+                fqn_data = output_data.fqn_data[target_fqn]
 
                 # Write this tensor shard to the appropriate position in the output file
                 _write_sub_tensor_to_file(
@@ -662,6 +667,14 @@ def consolidate_safetensors_files(
 
     # Step 1: Parse metadata to determine tensor shapes and types
     _parse_input_metadata(input_files_data, output_files_data)
+
+    # Rename specific FQN(s) – drop leading "model." for lm_head weights.
+    for output_data in output_files_data.values():
+        # Find any key that matches the pattern we want to rename
+        keys_to_rename = [k for k in list(output_data.fqn_data.keys()) if k.startswith("model.") and "lm_head" in k]
+        for old_key in keys_to_rename:
+            new_key = old_key.replace("model.", "", 1)
+            output_data.fqn_data[new_key] = output_data.fqn_data.pop(old_key)
 
     # Step 2: Write metadata headers to output files
     _write_metadata(output_fs, output_files_data)

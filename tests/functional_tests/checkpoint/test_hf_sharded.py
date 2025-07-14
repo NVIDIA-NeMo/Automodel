@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # pylint: disable=line-too-long
-"""Tests for DCP checkpointing."""
+"""Tests for sharded HF safetensors checkpointing."""
 
 import os
 import shutil
@@ -22,11 +22,45 @@ from pathlib import Path
 import torch
 import torch.distributed.checkpoint as dcp
 import torch.distributed.tensor
+import torch.nn as nn
 
 from nemo_automodel.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
+from nemo_automodel.checkpoint.checkpointing import load_model
 from nemo_automodel.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.config.cli import parse_args_and_load_config
-from recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction
+from recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction, build_model_and_optimizer
+
+
+def get_new_model(trainer: FinetuneRecipeForNextTokenPrediction) -> nn.Module:
+    """Gets a new model."""
+    use_hf_fa2 = trainer.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
+    return build_model_and_optimizer(
+        trainer.dist_env.device,
+        trainer.cfg.model,
+        trainer.cfg.optimizer,
+        use_hf_fa2,
+        trainer.peft_config,
+        trainer.model_wrapper,
+        trainer.cfg.get("seed", 42),
+        trainer.cfg.get("distributed.tp_size", 1),
+    )[0]
+
+
+def get_validation_loss(
+    model: nn.Module, val_batch: dict[str, torch.Tensor], loss_fn: nn.Module, device: torch.device
+) -> torch.Tensor:
+    """Gets the validation loss for a model."""
+    val_batch = {k: v.to(device, non_blocking=True) for k, v in val_batch.items()}
+    model.eval()
+    labels = val_batch.pop("labels")
+    loss_mask = val_batch.pop("loss_mask", None)
+    if loss_mask is None:
+        loss_mask = (labels.detach() != -100).to(torch.int)
+
+    with torch.no_grad():
+        out = model(**val_batch)
+        loss = loss_fn(out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum")
+        return loss
 
 
 def load_dcp(ckpt_dir: Path | str) -> dict[str, torch.Tensor]:
@@ -768,6 +802,18 @@ def test_hf_sharded_checkpoint():
     restored_model_dict = load_dcp(
         Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "model",
     )
+
+    # check if new model and current model give the same CE loss
+    val_batch = next(iter(trainer.val_dataloader))
+    restored_model = get_new_model(trainer)
+    load_model(
+        restored_model,
+        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10",
+        trainer.checkpoint_config,
+    )
+    source_model_loss = get_validation_loss(trainer.model, val_batch, trainer.loss_fn, trainer.dist_env.device)
+    restored_model_loss = get_validation_loss(restored_model, val_batch, trainer.loss_fn, trainer.dist_env.device)
+    assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
 
     # at save time, the model is saved in a dictionary formatted as:
     # {
