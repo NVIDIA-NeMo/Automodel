@@ -28,7 +28,6 @@ python make_and_submit.py \
 
 import dataclasses, getpass, socket
 from datetime import datetime
-from nemo_automodel.components.launcher.slurm.config import SlurmConfig, VolumeMapping
 
 
 HEADER = (
@@ -65,6 +64,7 @@ export HF_TOKEN={hf_token}
 
 # User command
 read -r -d '' CMD <<'EOF'
+pip3 install -U datasets;
 cd {chdir}; whoami; date; pwd;
 {command}
 EOF
@@ -80,28 +80,7 @@ srun \\
     bash -c "$CMD"
 """
 
-def volume_map_to_str(val):
-    if isinstance(val, dict):
-        assert 'source' in val
-        assert 'dest' in val
-        return f"{val['source']}:{val['dest']}"
-    elif isinstance(val, VolumeMapping):
-        return f"{val.source}:{val.dest}"
-    else:
-        raise ValueError(type(val))
-
-def render_script(opts: SlurmConfig, job_dir) -> str:
-    opts = dataclasses.asdict(opts)
-
-    container_mounts = []
-    if val := opts.get("nemo_mount", None):
-        container_mounts.append(volume_map_to_str(val))
-    opts.pop("nemo_mount", None)
-    for val in opts.get('extra_mounts', []):
-        container_mounts.append(volume_map_to_str(val))
-    opts.pop('extra_mounts', None)
-    opts['container_mounts'] = ','.join(container_mounts)
-
+def render_script(opts: dict, job_dir) -> str:
     return TEMPLATE.format(
         user=getpass.getuser(),
         host=socket.gethostname(),

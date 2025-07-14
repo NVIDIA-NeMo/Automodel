@@ -12,16 +12,64 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from nemo_automodel.components.launcher.slurm.arg_parser import render_script
+from nemo_automodel.components.launcher.slurm.config import SlurmConfig, VolumeMapping
+
 from pathlib import Path
 
 import subprocess
 import logging
 import os
+import dataclasses
+from typing import Union
 
 
-def submit_slurm_job(config, job_dir):
+def volume_map_to_str(val: Union[str, dict, VolumeMapping]) -> str:
+    if isinstance(val, dict):
+        assert 'source' in val
+        assert 'dest' in val
+        return f"{val['source']}:{val['dest']}"
+    elif isinstance(val, VolumeMapping):
+        return f"{val.source}:{val.dest}"
+    elif isinstance(val, str):
+        parts = val.split(':')
+        if len(parts) == 1:
+            # val = "/path"
+            return f'{val}:{val}'
+        elif len(parts) == 2:
+            # val = "/path_a:/path_b"
+            # fails on:
+            #   val = ":/path_b"
+            #   val = "/path_a:"
+            #   val = ":"
+            assert len(parts[0]) > 0 and len(parts[1]) > 0, parts
+            return f'{parts[0]}:{parts[1]}'
+        else:
+            raise ValueError(val)
+    else:
+        raise ValueError(type(val))
+
+def make_container_mounts(opts: dict) -> list:
+    container_mounts = []
+    if (hf_home := opts.get("hf_home", None)) and \
+        not hf_home.startswith("~/") and not hf_home.startswith("/home"):
+        # HF_HOME may require both mount and env-var export.
+        container_mounts.append(volume_map_to_str(hf_home))
+    if val := opts.get("nemo_mount", None):
+        container_mounts.append(volume_map_to_str(val))
+    opts.pop("nemo_mount", None)
+    for val in opts.get('extra_mounts', []):
+        container_mounts.append(volume_map_to_str(val))
+    opts.pop('extra_mounts', None)
+    return container_mounts
+
+
+def submit_slurm_job(config: SlurmConfig, job_dir) -> int:
     os.makedirs(job_dir, exist_ok=True)
-    sbatch_script = render_script(config, job_dir)
+    # Render the sbatch script
+    opts = dataclasses.asdict(config)
+    opts['container_mounts'] = ','.join(make_container_mounts(opts))
+    sbatch_script = render_script(opts, job_dir)
+    # write the sbatch script
     sbatch_script_path = os.path.join(job_dir, f"{config.job_name}.sbatch")
     with open(sbatch_script_path, "w") as fp:
         fp.write(sbatch_script)
