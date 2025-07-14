@@ -38,6 +38,10 @@ _OVERRIDES = [
     "peft.alpha",
     "peft.use_triton",
     "peft._target_",
+    "dataset._target_",
+    "dataset.path_or_dataset",
+    "validation_dataset.path_or_dataset",
+    "validation_dataset.limit_dataset_samples",
 ]
 
 
