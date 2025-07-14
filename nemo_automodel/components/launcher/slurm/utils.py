@@ -18,7 +18,7 @@ import subprocess
 from pathlib import Path
 from typing import Union
 
-from nemo_automodel.components.launcher.slurm.arg_parser import render_script
+from nemo_automodel.components.launcher.slurm.template import render_script
 from nemo_automodel.components.launcher.slurm.config import SlurmConfig, VolumeMapping
 
 
