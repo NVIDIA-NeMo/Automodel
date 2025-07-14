@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 import yaml
+
 logging.getLogger().setLevel(logging.INFO)
 
 
@@ -89,6 +90,7 @@ def load_yaml(file_path):
         logger.error(f"parsing YAML file {e} failed.")
         raise e
 
+
 def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
     from nemo_automodel.components.launcher.slurm.config import SlurmConfig, VolumeMapping
     from nemo_automodel.components.launcher.slurm.utils import submit_slurm_job
@@ -96,43 +98,43 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
     last_dir = Path(job_dir).parts[-1]
     assert len(last_dir) == 10 and last_dir.isdigit(), "Expected last dir to be unix timestamp"
     # hf_home needs to be on shared shorage for multinode jobs.
-    if not 'hf_home' in slurm_config:
+    if not "hf_home" in slurm_config:
         # we'll assume that job_dir is on shared storage (visible by all SLURM workers).
-        slurm_config['hf_home'] = str(Path(job_dir).parent / ".hf_home")
-        os.makedirs(slurm_config['hf_home'], exist_ok=True)
+        slurm_config["hf_home"] = str(Path(job_dir).parent / ".hf_home")
+        os.makedirs(slurm_config["hf_home"], exist_ok=True)
 
     # log HF_HOME used.
     logging.info(f"Using HF_HOME= `{slurm_config['hf_home']}`")
 
     # Determine the code repo root
-    if 'repo_root' in slurm_config:
-        repo_root = slurm_config.pop('repo_root')
+    if "repo_root" in slurm_config:
+        repo_root = slurm_config.pop("repo_root")
     else:
         cwd = Path.cwd()
         if (cwd / "nemo_automodel/components").exists() and (cwd / "examples/").exists():
             repo_root = str(cwd)
         else:
-            repo_root = '/opt/Automodel'
+            repo_root = "/opt/Automodel"
     logging.info(f"Using {repo_root} as code repo")
 
     # Make default name
-    if slurm_config.get('job_name', '') == '':
-        slurm_config['job_name'] = f'{args.domain}_{args.command}'
+    if slurm_config.get("job_name", "") == "":
+        slurm_config["job_name"] = f"{args.domain}_{args.command}"
 
     # create the command
-    command = ' '.join(
+    command = " ".join(
         (
-        f'PYTHONPATH={repo_root}:$PYTHONPATH',
-        'python3',
-        f'{repo_root}/nemo_automodel/recipes/{args.domain}/{args.command}.py',
-        '-c',
-        f'{job_conf_path}',
+            f"PYTHONPATH={repo_root}:$PYTHONPATH",
+            "python3",
+            f"{repo_root}/nemo_automodel/recipes/{args.domain}/{args.command}.py",
+            "-c",
+            f"{job_conf_path}",
         )
     )
     # Add extra mounts
-    slurm_config['extra_mounts'].append(VolumeMapping(Path(repo_root), Path(repo_root)))
-    return submit_slurm_job(
-        SlurmConfig(**slurm_config, command=command, chdir=repo_root), job_dir)
+    slurm_config["extra_mounts"].append(VolumeMapping(Path(repo_root), Path(repo_root)))
+    return submit_slurm_job(SlurmConfig(**slurm_config, command=command, chdir=repo_root), job_dir)
+
 
 def build_parser() -> argparse.ArgumentParser:
     """
@@ -201,8 +203,7 @@ def main():
         # if there's no `job_dir` in the slurm section, use cwd/slurm_job/unix_timestamp
         # otherwise will use slurm.job_dir / unix_timestamp
         job_dir = os.path.join(
-            slurm_config.pop("job_dir", os.path.join(os.getcwd(), "slurm_jobs")),
-            str(int(time.time()))
+            slurm_config.pop("job_dir", os.path.join(os.getcwd(), "slurm_jobs")), str(int(time.time()))
         )
         os.makedirs(job_dir, exist_ok=True)
 
@@ -210,7 +211,7 @@ def main():
         job_conf_path = os.path.join(job_dir, "job_config.yaml")
         with open(job_conf_path, "w") as fp:
             yaml.dump(config, fp, default_flow_style=False, sort_keys=False)
-        logging.info(f'Logging Slurm job in: {job_dir}')
+        logging.info(f"Logging Slurm job in: {job_dir}")
         return launch_with_slurm(args, job_conf_path, job_dir, slurm_config)
     elif "k8s" in config or "kubernetes" in config:
         # launch job on kubernetes.
@@ -218,6 +219,7 @@ def main():
     else:
         from torch.distributed.run import determine_local_world_size, get_args_parser
         from torch.distributed.run import run as thrun
+
         script_path = Path(__file__).parent / "recipes" / args.domain / f"{args.command}.py"
 
         # launch job on this node

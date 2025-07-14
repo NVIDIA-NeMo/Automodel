@@ -26,9 +26,9 @@ python make_and_submit.py \
   --dry-run          # inspect only
 """
 
-import dataclasses, getpass, socket
+import getpass
+import socket
 from datetime import datetime
-
 
 HEADER = (
     "# -------------------------------------------------------------------\n"
@@ -39,8 +39,11 @@ HEADER = (
     "# -------------------------------------------------------------------\n"
 )
 
-TEMPLATE = """#!/bin/bash
-"""+ HEADER + """\
+TEMPLATE = (
+    """#!/bin/bash
+"""
+    + HEADER
+    + """\
 #SBATCH -A {account}
 #SBATCH -p {partition}
 #SBATCH -N {nodes}
@@ -78,6 +81,8 @@ srun \\
     --export=ALL \\
     bash -c "$CMD"
 """
+)
+
 
 def render_script(opts: dict, job_dir) -> str:
     return TEMPLATE.format(
@@ -85,5 +90,5 @@ def render_script(opts: dict, job_dir) -> str:
         host=socket.gethostname(),
         timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         job_dir=job_dir,
-        **opts
+        **opts,
     )
