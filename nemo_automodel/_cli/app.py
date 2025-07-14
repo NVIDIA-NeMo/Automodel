@@ -89,54 +89,7 @@ def load_yaml(file_path):
         logger.error(f"parsing YAML file {e} failed.")
         raise e
 
-
-def launch_with_slurm_nemorun(slurm_config, script_path, config_file, job_name="llm_finetune", job_dir=None, container_env={}):
-    """
-    Launches a Slurm job using NeMo-Run's SlurmExecutor
-
-    Args:
-        slurm_config (dict): the slurm config
-        script_path (str): the path to the recipe script (e.g., examples/llm/finetune.py)
-        config_file (str): the path to the config yaml (e.g., examples/llm/llama_3_2_1b_squad.yaml)
-        container_env (str, optional): The container env. Defaults to None.
-    """
-    raise NotImplementedError("Slurm support via nemo-run is pending")
-    assert isinstance(job_dir, str), "Expected job_dir to be a string"
-    import nemo_run as run
-
-    if not "mem" in slurm_config:
-        slurm_config["mem"] = "0"
-    if not "exclusive" in slurm_config:
-        slurm_config["exclusive"] = True
-
-    from nemo_run.config import set_nemorun_home
-
-    set_nemorun_home(job_dir)
-    executor = run.SlurmExecutor(
-        **slurm_config,
-        tunnel=run.LocalTunnel(job_dir=''),
-        packager=None,
-    )
-    # @akoumparouli: uncomment once nemo-run updates its package.
-    # with run.Experiment('exp_ts_', enable_goodbye_message=False) as exp:
-    with run.Experiment("") as exp:
-        exp.add(
-            run.Script(
-                path=script_path,
-                args=[
-                    "--config",
-                    config_file,
-                ],
-                env=container_env,
-                entrypoint="python",
-            ),
-            executor=executor,
-            name=job_name[:37],  # DGX-C run name length limit
-            tail_logs=False,
-        )
-        exp.run(sequential=True, detach=True, tail_logs=False)
-
-def launch_with_slurm(args, job_dir, slurm_config):
+def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
     from nemo_automodel.components.launcher.slurm.config import SlurmConfig, VolumeMapping
     from nemo_automodel.components.launcher.slurm.utils import submit_slurm_job
 
@@ -152,8 +105,16 @@ def launch_with_slurm(args, job_dir, slurm_config):
     logging.info(f"Using {repo_root} as code repo")
 
     # create the command
-    command = f'PYTHONPATH={repo_root}:$PYTHONPATH python3 '\
-        f'{repo_root}/nemo_automodel/recipes/{args.domain}/{args.command}.py -c {job_conf_path}'
+    command = ' '.join(
+        (
+        f'PYTHONPATH={repo_root}:$PYTHONPATH',
+        'python3',
+        f'{repo_root}/nemo_automodel/recipes/{args.domain}/{args.command}.py',
+        '-c',
+        f'{job_conf_path}',
+        )
+    )
+
 
     slurm_config['extra_mounts'].append(VolumeMapping(Path(repo_root), Path(repo_root)))
     if slurm_config.get('job_name', '') == '':
@@ -236,7 +197,7 @@ def main():
         with open(job_conf_path, "w") as fp:
             yaml.dump(config, fp, default_flow_style=False, sort_keys=False)
         logging.info(f'Logging Slurm job in: {job_dir}')
-        return launch_with_slurm(args, job_dir, slurm_config)
+        return launch_with_slurm(args, job_conf_path, job_dir, slurm_config)
     elif "k8s" in config or "kubernetes" in config:
         # launch job on kubernetes.
         raise NotImplementedError("kubernetes support is pending")
