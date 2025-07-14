@@ -44,7 +44,7 @@ class TestNeMoAutoModelForCausalLM:
 
                 # Test line 208 - warning when HAS_LIGER_KERNEL is False
                 with caplog.at_level(logging.WARNING):
-                    model = NeMoAutoModelForCausalLM.from_pretrained("gpt2")
+                    model = NeMoAutoModelForCausalLM.from_pretrained("/home/TestData/akoumparouli/hf_gemma_38m/")
 
                 assert "Asked to use Liger Kernel, but could not import" in caplog.text
                 assert model is mock_model
@@ -61,7 +61,7 @@ class TestNeMoAutoModelForCausalLM:
                 mock_model.config = Mock()
                 mock_from_config.return_value = mock_model
 
-                config = AutoConfig.from_pretrained("gpt2")
+                config = AutoConfig.from_pretrained("/home/TestData/akoumparouli/hf_gemma_38m/")
 
                 # Test line 297 - warning when HAS_LIGER_KERNEL is False
                 with caplog.at_level(logging.WARNING):
@@ -98,7 +98,7 @@ class TestNeMoAutoModelForCausalLM:
                 side_effect=[model1, model2],  # first, then retry
             ) as mock_from_pretrained,
         ):
-            returned = NeMoAutoModelForCausalLM.from_pretrained("gpt2")
+            returned = NeMoAutoModelForCausalLM.from_pretrained("/home/TestData/akoumparouli/hf_gemma_38m/")
 
         # patch_model called twice, first with ligand=True, then False
         assert patch_calls == [(model1, True), (model2, False)]
@@ -120,7 +120,7 @@ class TestNeMoAutoModelForCausalLM:
                 raise RuntimeError("boom")
             return model
 
-        cfg = AutoConfig.from_pretrained("gpt2")
+        cfg = AutoConfig.from_pretrained("/home/TestData/akoumparouli/hf_gemma_38m/")
 
         with (
             patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", True),
@@ -170,7 +170,7 @@ class TestNeMoAutoModelForImageTextToText:
                 mock_model.config = Mock()
                 mock_from_config.return_value = mock_model
 
-                config = AutoConfig.from_pretrained("gpt2")
+                config = AutoConfig.from_pretrained("/home/TestData/akoumparouli/hf_gemma_38m/")
 
                 # Test warning when HAS_LIGER_KERNEL is False
                 with caplog.at_level(logging.WARNING):
@@ -229,7 +229,7 @@ class TestNeMoAutoModelForImageTextToText:
                 raise RuntimeError("boom")
             return model
 
-        cfg = AutoConfig.from_pretrained("gpt2")
+        cfg = AutoConfig.from_pretrained("/home/TestData/akoumparouli/hf_gemma_38m/")
 
         with (
             patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", True),
