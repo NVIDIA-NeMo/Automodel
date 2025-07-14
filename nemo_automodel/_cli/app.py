@@ -93,6 +93,18 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
     from nemo_automodel.components.launcher.slurm.config import SlurmConfig, VolumeMapping
     from nemo_automodel.components.launcher.slurm.utils import submit_slurm_job
 
+    last_dir = Path(job_dir).parts[-1]
+    assert len(last_dir) == 10 and last_dir.isdigit(), "Expected last dir to be unix timestamp"
+    # hf_home needs to be on shared shorage for multinode jobs.
+    if (num_nodes := slurm_config.get('nodes', 1)) == 1:
+        if not 'hf_home' in slurm_config:
+            # we'll assume that job_dir is on shared storage (visible by all SLURM workers).
+            slurm_config['hf_home'] = str(Path(job_dir).parent / ".hf_home")
+            os.makedirs(slurm_config['hf_home'], exist_ok=True)
+
+        # log HF_HOME used.
+        logging.info(f"Using HF_HOME= `{slurm_config['hf_home']}`")
+
     # Determine the code repo root
     if 'repo_root' in slurm_config:
         repo_root = slurm_config.pop('repo_root')
@@ -114,8 +126,7 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
         f'{job_conf_path}',
         )
     )
-
-
+    # Add extra mounts
     slurm_config['extra_mounts'].append(VolumeMapping(Path(repo_root), Path(repo_root)))
     if slurm_config.get('job_name', '') == '':
         slurm_config['job_name'] = f'{args.domain}_{args.command}'
@@ -186,10 +197,12 @@ def main():
 
     if slurm_config := config.pop("slurm", None):
         logging.info("Launching job via SLURM")
-        # if there's no `job_dir` in the slurm section, use cwd/slurm_job
-        job_dir = slurm_config.pop("job_dir", None)
-        if job_dir is None:
-            job_dir = os.path.join(os.getcwd(), "slurm_job", str(int(time.time())))
+        # if there's no `job_dir` in the slurm section, use cwd/slurm_job/unix_timestamp
+        # otherwise will use slurm.job_dir / unix_timestamp
+        job_dir = os.path.join(
+            slurm_config.pop("job_dir", os.path.join(os.getcwd(), "slurm_jobs")),
+            str(int(time.time()))
+        )
         os.makedirs(job_dir, exist_ok=True)
 
         # Write job's config
