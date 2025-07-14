@@ -18,8 +18,8 @@ import subprocess
 from pathlib import Path
 from typing import Union
 
-from nemo_automodel.components.launcher.slurm.template import render_script
 from nemo_automodel.components.launcher.slurm.config import SlurmConfig, VolumeMapping
+from nemo_automodel.components.launcher.slurm.template import render_script
 
 
 def volume_map_to_str(val: Union[str, dict, VolumeMapping]) -> str:
