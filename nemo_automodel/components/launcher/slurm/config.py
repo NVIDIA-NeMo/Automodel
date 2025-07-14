@@ -35,7 +35,7 @@ class VolumeMapping:
             raise ValueError(f"'dest' must be absolute: {self.dest}")
 
     def to_str(self):
-        return f"{source}:{dest}"
+        return f"{self.source}:{self.dest}"
 
 
 @dataclass
