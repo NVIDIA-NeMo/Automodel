@@ -84,10 +84,10 @@ def load_yaml(file_path):
         with open(file_path, "r") as file:
             return yaml.safe_load(file)
     except FileNotFoundError as e:
-        logger.error(f"File '{file_path}' was not found.")
+        logging.error(f"File '{file_path}' was not found.")
         raise e
     except yaml.YAMLError as e:
-        logger.error(f"parsing YAML file {e} failed.")
+        logging.error(f"parsing YAML file {e} failed.")
         raise e
 
 
@@ -226,12 +226,12 @@ def main():
         num_devices = determine_local_world_size(nproc_per_node="gpu")
         assert num_devices > 0, "Expected num-devices to be > 0"
         if args.nproc_per_node == 1 or num_devices == 1:
-            logger.info("Launching job locally on a single device")
+            logging.info("Launching job locally on a single device")
             # run the job with a single rank on this process.
             recipe_main = load_function(script_path, "main")
             return recipe_main(config_path)
         else:
-            logger.info(f"Launching job locally on {num_devices} devices")
+            logging.info(f"Launching job locally on {num_devices} devices")
             # run the job on multiple ranks on this node.
             torchrun_parser = get_args_parser()
             torchrun_args = torchrun_parser.parse_args()
