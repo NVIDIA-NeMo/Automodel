@@ -136,20 +136,9 @@ def launch_with_slurm_nemorun(slurm_config, script_path, config_file, job_name="
         )
         exp.run(sequential=True, detach=True, tail_logs=False)
 
-def launch_with_slurm(args, slurm_config):
+def launch_with_slurm(args, job_dir, slurm_config):
     from nemo_automodel.components.launcher.slurm.config import SlurmConfig, VolumeMapping
     from nemo_automodel.components.launcher.slurm.utils import submit_slurm_job
-    # if there's no `job_dir` in the slurm section, use cwd/slurm_job
-    job_dir = slurm_config.pop("job_dir", None)
-    if job_dir is None:
-        job_dir = os.path.join(os.getcwd(), "slurm_job", str(int(time.time())))
-    os.makedirs(job_dir, exist_ok=True)
-
-    # Write job's config
-    job_conf_path = os.path.join(job_dir, "job_config.yaml")
-    with open(job_conf_path, "w") as fp:
-        yaml.dump(slurm_config, fp, default_flow_style=False, sort_keys=False)
-    logging.info(f'Logging Slurm job in: {job_dir}')
 
     # Determine the code repo root
     if 'repo_root' in slurm_config:
@@ -236,7 +225,18 @@ def main():
 
     if slurm_config := config.pop("slurm", None):
         logging.info("Launching job via SLURM")
-        return launch_with_slurm(args, slurm_config)
+        # if there's no `job_dir` in the slurm section, use cwd/slurm_job
+        job_dir = slurm_config.pop("job_dir", None)
+        if job_dir is None:
+            job_dir = os.path.join(os.getcwd(), "slurm_job", str(int(time.time())))
+        os.makedirs(job_dir, exist_ok=True)
+
+        # Write job's config
+        job_conf_path = os.path.join(job_dir, "job_config.yaml")
+        with open(job_conf_path, "w") as fp:
+            yaml.dump(config, fp, default_flow_style=False, sort_keys=False)
+        logging.info(f'Logging Slurm job in: {job_dir}')
+        return launch_with_slurm(args, job_dir, slurm_config)
     elif "k8s" in config or "kubernetes" in config:
         # launch job on kubernetes.
         raise NotImplementedError("kubernetes support is pending")
