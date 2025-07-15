@@ -19,18 +19,24 @@ export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1"
 
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
--m pytest tests/functional_tests/checkpoint/test_dcp_vlm.py \
-    --config recipes/vlm/gemma_3_vl_4b_cord_v2.yaml \
-    --model.pretrained_model_name_or_path /home/TestData/huiyingl/hf_gemma3_2l/ \
+-m pytest tests/functional_tests/checkpoint/test_hf_sharded.py \
+    --config recipes/llm/llama_3_2_1b_squad.yaml \
+    --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
     --step_scheduler.max_steps 10 \
     --step_scheduler.grad_acc_steps 4 \
-    --dataset._target_=nemo_automodel.datasets.vlm.datasets.make_cord_v2_dataset \
-    --dataset.path_or_dataset /home/TestData/lite/hf_cache/mini_cord_v2/ \
-    --dataset.limit_dataset_samples 100 \
-    --validation_dataset.path_or_dataset /home/TestData/lite/hf_cache/mini_cord_v2/ \
-    --validation_dataset.limit_dataset_samples 10 \
+    --dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
+    --validation_dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
+    --dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
+    --validation_dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
+    --dataset.limit_dataset_samples 1000 \
     --step_scheduler.ckpt_every_steps 10 \
     --checkpoint.enabled true \
     --checkpoint.checkpoint_dir checkpoints/ \
-    --checkpoint.model_save_format torch_save
+    --checkpoint.model_save_format safetensors \
+    --dataloader.batch_size 8 \
+    --distributed._target_ nemo_automodel.distributed.fsdp2.FSDP2Manager \
+    --distributed.dp_size none \
+    --distributed.tp_size 1 \
+    --distributed.cp_size 1 \
+    --distributed.sequence_parallel false
 coverage combine

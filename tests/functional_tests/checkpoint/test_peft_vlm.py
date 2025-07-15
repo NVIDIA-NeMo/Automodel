@@ -17,17 +17,38 @@
 
 import json
 import os
+import shutil
 from pathlib import Path
 
 import torch
 import torch.distributed.checkpoint as dcp
 import torch.distributed.tensor
+import torch.nn as nn
+from peft import PeftModel
 from safetensors import safe_open
+from transformers import AutoModelForImageTextToText
 
 from nemo_automodel.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 from nemo_automodel.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.config.cli import parse_args_and_load_config
 from recipes.vlm.finetune import FinetuneRecipeForVLM
+
+
+def get_validation_loss(
+    model: nn.Module, val_batch: dict[str, torch.Tensor], loss_fn: nn.Module, device: torch.device
+) -> torch.Tensor:
+    """Gets the validation loss for a model."""
+    val_batch = {k: v.to(device, non_blocking=True) for k, v in val_batch.items()}
+    model.eval()
+    labels = val_batch.pop("labels")
+    loss_mask = val_batch.pop("loss_mask", None)
+    if loss_mask is None:
+        loss_mask = (labels.detach() != -100).to(torch.int)
+
+    with torch.no_grad():
+        out = model(**val_batch)
+        loss = loss_fn(out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum")
+        return loss
 
 
 def load_dcp(ckpt_dir: Path | str) -> dict[str, torch.Tensor]:
@@ -180,374 +201,374 @@ def test_hf_peft_checkpoint():
         "base_model.model.model.language_model.layers.1.mlp.down_proj.lora_B.weight": ([128, 8], torch.bfloat16, "cpu"),
     }
     expected_optim_keys = {
-        "optim.optim.state.model.language_model.layers.0.self_attn.q_proj.lora_A.weight.step": (
+        "optim.state.model.language_model.layers.0.self_attn.q_proj.lora_A.weight.step": (
             [],
             torch.float32,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.self_attn.q_proj.lora_A.weight.exp_avg": (
+        "optim.state.model.language_model.layers.0.self_attn.q_proj.lora_A.weight.exp_avg": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.self_attn.q_proj.lora_A.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.0.self_attn.q_proj.lora_A.weight.exp_avg_sq": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.self_attn.q_proj.lora_B.weight.step": (
+        "optim.state.model.language_model.layers.0.self_attn.q_proj.lora_B.weight.step": (
             [],
             torch.float32,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.self_attn.q_proj.lora_B.weight.exp_avg": (
+        "optim.state.model.language_model.layers.0.self_attn.q_proj.lora_B.weight.exp_avg": (
             [64, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.self_attn.q_proj.lora_B.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.0.self_attn.q_proj.lora_B.weight.exp_avg_sq": (
             [64, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.self_attn.k_proj.lora_A.weight.step": (
+        "optim.state.model.language_model.layers.0.self_attn.k_proj.lora_A.weight.step": (
             [],
             torch.float32,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.self_attn.k_proj.lora_A.weight.exp_avg": (
+        "optim.state.model.language_model.layers.0.self_attn.k_proj.lora_A.weight.exp_avg": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.self_attn.k_proj.lora_A.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.0.self_attn.k_proj.lora_A.weight.exp_avg_sq": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.self_attn.k_proj.lora_B.weight.step": (
+        "optim.state.model.language_model.layers.0.self_attn.k_proj.lora_B.weight.step": (
             [],
             torch.float32,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.self_attn.k_proj.lora_B.weight.exp_avg": (
+        "optim.state.model.language_model.layers.0.self_attn.k_proj.lora_B.weight.exp_avg": (
             [32, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.self_attn.k_proj.lora_B.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.0.self_attn.k_proj.lora_B.weight.exp_avg_sq": (
             [32, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.self_attn.v_proj.lora_A.weight.step": (
+        "optim.state.model.language_model.layers.0.self_attn.v_proj.lora_A.weight.step": (
             [],
             torch.float32,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.self_attn.v_proj.lora_A.weight.exp_avg": (
+        "optim.state.model.language_model.layers.0.self_attn.v_proj.lora_A.weight.exp_avg": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.self_attn.v_proj.lora_A.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.0.self_attn.v_proj.lora_A.weight.exp_avg_sq": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.self_attn.v_proj.lora_B.weight.step": (
+        "optim.state.model.language_model.layers.0.self_attn.v_proj.lora_B.weight.step": (
             [],
             torch.float32,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.self_attn.v_proj.lora_B.weight.exp_avg": (
+        "optim.state.model.language_model.layers.0.self_attn.v_proj.lora_B.weight.exp_avg": (
             [32, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.self_attn.v_proj.lora_B.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.0.self_attn.v_proj.lora_B.weight.exp_avg_sq": (
             [32, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.self_attn.o_proj.lora_A.weight.step": (
+        "optim.state.model.language_model.layers.0.self_attn.o_proj.lora_A.weight.step": (
             [],
             torch.float32,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.self_attn.o_proj.lora_A.weight.exp_avg": (
+        "optim.state.model.language_model.layers.0.self_attn.o_proj.lora_A.weight.exp_avg": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.self_attn.o_proj.lora_A.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.0.self_attn.o_proj.lora_A.weight.exp_avg_sq": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.self_attn.o_proj.lora_B.weight.step": (
+        "optim.state.model.language_model.layers.0.self_attn.o_proj.lora_B.weight.step": (
             [],
             torch.float32,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.self_attn.o_proj.lora_B.weight.exp_avg": (
+        "optim.state.model.language_model.layers.0.self_attn.o_proj.lora_B.weight.exp_avg": (
             [64, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.self_attn.o_proj.lora_B.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.0.self_attn.o_proj.lora_B.weight.exp_avg_sq": (
             [64, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.mlp.gate_proj.lora_A.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.language_model.layers.0.mlp.gate_proj.lora_A.weight.exp_avg": (
+        "optim.state.model.language_model.layers.0.mlp.gate_proj.lora_A.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.language_model.layers.0.mlp.gate_proj.lora_A.weight.exp_avg": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.mlp.gate_proj.lora_A.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.0.mlp.gate_proj.lora_A.weight.exp_avg_sq": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.mlp.gate_proj.lora_B.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.language_model.layers.0.mlp.gate_proj.lora_B.weight.exp_avg": (
+        "optim.state.model.language_model.layers.0.mlp.gate_proj.lora_B.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.language_model.layers.0.mlp.gate_proj.lora_B.weight.exp_avg": (
             [128, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.mlp.gate_proj.lora_B.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.0.mlp.gate_proj.lora_B.weight.exp_avg_sq": (
             [128, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.mlp.up_proj.lora_A.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.language_model.layers.0.mlp.up_proj.lora_A.weight.exp_avg": (
+        "optim.state.model.language_model.layers.0.mlp.up_proj.lora_A.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.language_model.layers.0.mlp.up_proj.lora_A.weight.exp_avg": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.mlp.up_proj.lora_A.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.0.mlp.up_proj.lora_A.weight.exp_avg_sq": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.mlp.up_proj.lora_B.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.language_model.layers.0.mlp.up_proj.lora_B.weight.exp_avg": (
+        "optim.state.model.language_model.layers.0.mlp.up_proj.lora_B.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.language_model.layers.0.mlp.up_proj.lora_B.weight.exp_avg": (
             [128, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.mlp.up_proj.lora_B.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.0.mlp.up_proj.lora_B.weight.exp_avg_sq": (
             [128, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.mlp.down_proj.lora_A.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.language_model.layers.0.mlp.down_proj.lora_A.weight.exp_avg": (
+        "optim.state.model.language_model.layers.0.mlp.down_proj.lora_A.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.language_model.layers.0.mlp.down_proj.lora_A.weight.exp_avg": (
             [4, 256],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.mlp.down_proj.lora_A.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.0.mlp.down_proj.lora_A.weight.exp_avg_sq": (
             [4, 256],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.mlp.down_proj.lora_B.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.language_model.layers.0.mlp.down_proj.lora_B.weight.exp_avg": (
+        "optim.state.model.language_model.layers.0.mlp.down_proj.lora_B.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.language_model.layers.0.mlp.down_proj.lora_B.weight.exp_avg": (
             [64, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.0.mlp.down_proj.lora_B.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.0.mlp.down_proj.lora_B.weight.exp_avg_sq": (
             [64, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.q_proj.lora_A.weight.step": (
+        "optim.state.model.language_model.layers.1.self_attn.q_proj.lora_A.weight.step": (
             [],
             torch.float32,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.q_proj.lora_A.weight.exp_avg": (
+        "optim.state.model.language_model.layers.1.self_attn.q_proj.lora_A.weight.exp_avg": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.q_proj.lora_A.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.1.self_attn.q_proj.lora_A.weight.exp_avg_sq": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.q_proj.lora_B.weight.step": (
+        "optim.state.model.language_model.layers.1.self_attn.q_proj.lora_B.weight.step": (
             [],
             torch.float32,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.q_proj.lora_B.weight.exp_avg": (
+        "optim.state.model.language_model.layers.1.self_attn.q_proj.lora_B.weight.exp_avg": (
             [64, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.q_proj.lora_B.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.1.self_attn.q_proj.lora_B.weight.exp_avg_sq": (
             [64, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.k_proj.lora_A.weight.step": (
+        "optim.state.model.language_model.layers.1.self_attn.k_proj.lora_A.weight.step": (
             [],
             torch.float32,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.k_proj.lora_A.weight.exp_avg": (
+        "optim.state.model.language_model.layers.1.self_attn.k_proj.lora_A.weight.exp_avg": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.k_proj.lora_A.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.1.self_attn.k_proj.lora_A.weight.exp_avg_sq": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.k_proj.lora_B.weight.step": (
+        "optim.state.model.language_model.layers.1.self_attn.k_proj.lora_B.weight.step": (
             [],
             torch.float32,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.k_proj.lora_B.weight.exp_avg": (
+        "optim.state.model.language_model.layers.1.self_attn.k_proj.lora_B.weight.exp_avg": (
             [32, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.k_proj.lora_B.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.1.self_attn.k_proj.lora_B.weight.exp_avg_sq": (
             [32, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.v_proj.lora_A.weight.step": (
+        "optim.state.model.language_model.layers.1.self_attn.v_proj.lora_A.weight.step": (
             [],
             torch.float32,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.v_proj.lora_A.weight.exp_avg": (
+        "optim.state.model.language_model.layers.1.self_attn.v_proj.lora_A.weight.exp_avg": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.v_proj.lora_A.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.1.self_attn.v_proj.lora_A.weight.exp_avg_sq": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.v_proj.lora_B.weight.step": (
+        "optim.state.model.language_model.layers.1.self_attn.v_proj.lora_B.weight.step": (
             [],
             torch.float32,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.v_proj.lora_B.weight.exp_avg": (
+        "optim.state.model.language_model.layers.1.self_attn.v_proj.lora_B.weight.exp_avg": (
             [32, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.v_proj.lora_B.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.1.self_attn.v_proj.lora_B.weight.exp_avg_sq": (
             [32, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.o_proj.lora_A.weight.step": (
+        "optim.state.model.language_model.layers.1.self_attn.o_proj.lora_A.weight.step": (
             [],
             torch.float32,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.o_proj.lora_A.weight.exp_avg": (
+        "optim.state.model.language_model.layers.1.self_attn.o_proj.lora_A.weight.exp_avg": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.o_proj.lora_A.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.1.self_attn.o_proj.lora_A.weight.exp_avg_sq": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.o_proj.lora_B.weight.step": (
+        "optim.state.model.language_model.layers.1.self_attn.o_proj.lora_B.weight.step": (
             [],
             torch.float32,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.o_proj.lora_B.weight.exp_avg": (
+        "optim.state.model.language_model.layers.1.self_attn.o_proj.lora_B.weight.exp_avg": (
             [64, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.self_attn.o_proj.lora_B.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.1.self_attn.o_proj.lora_B.weight.exp_avg_sq": (
             [64, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.mlp.gate_proj.lora_A.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.language_model.layers.1.mlp.gate_proj.lora_A.weight.exp_avg": (
+        "optim.state.model.language_model.layers.1.mlp.gate_proj.lora_A.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.language_model.layers.1.mlp.gate_proj.lora_A.weight.exp_avg": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.mlp.gate_proj.lora_A.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.1.mlp.gate_proj.lora_A.weight.exp_avg_sq": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.mlp.gate_proj.lora_B.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.language_model.layers.1.mlp.gate_proj.lora_B.weight.exp_avg": (
+        "optim.state.model.language_model.layers.1.mlp.gate_proj.lora_B.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.language_model.layers.1.mlp.gate_proj.lora_B.weight.exp_avg": (
             [128, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.mlp.gate_proj.lora_B.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.1.mlp.gate_proj.lora_B.weight.exp_avg_sq": (
             [128, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.mlp.up_proj.lora_A.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.language_model.layers.1.mlp.up_proj.lora_A.weight.exp_avg": (
+        "optim.state.model.language_model.layers.1.mlp.up_proj.lora_A.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.language_model.layers.1.mlp.up_proj.lora_A.weight.exp_avg": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.mlp.up_proj.lora_A.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.1.mlp.up_proj.lora_A.weight.exp_avg_sq": (
             [4, 128],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.mlp.up_proj.lora_B.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.language_model.layers.1.mlp.up_proj.lora_B.weight.exp_avg": (
+        "optim.state.model.language_model.layers.1.mlp.up_proj.lora_B.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.language_model.layers.1.mlp.up_proj.lora_B.weight.exp_avg": (
             [128, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.mlp.up_proj.lora_B.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.1.mlp.up_proj.lora_B.weight.exp_avg_sq": (
             [128, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.mlp.down_proj.lora_A.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.language_model.layers.1.mlp.down_proj.lora_A.weight.exp_avg": (
+        "optim.state.model.language_model.layers.1.mlp.down_proj.lora_A.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.language_model.layers.1.mlp.down_proj.lora_A.weight.exp_avg": (
             [4, 256],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.mlp.down_proj.lora_A.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.1.mlp.down_proj.lora_A.weight.exp_avg_sq": (
             [4, 256],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.mlp.down_proj.lora_B.weight.step": ([], torch.float32, "cpu"),
-        "optim.optim.state.model.language_model.layers.1.mlp.down_proj.lora_B.weight.exp_avg": (
+        "optim.state.model.language_model.layers.1.mlp.down_proj.lora_B.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.language_model.layers.1.mlp.down_proj.lora_B.weight.exp_avg": (
             [64, 8],
             torch.bfloat16,
             "cpu",
         ),
-        "optim.optim.state.model.language_model.layers.1.mlp.down_proj.lora_B.weight.exp_avg_sq": (
+        "optim.state.model.language_model.layers.1.mlp.down_proj.lora_B.weight.exp_avg_sq": (
             [64, 8],
             torch.bfloat16,
             "cpu",
@@ -575,7 +596,7 @@ def test_hf_peft_checkpoint():
             "model.language_model.layers.1.self_attn.q_proj",
             "model.language_model.layers.1.self_attn.v_proj",
         ],
-        "task_type": "CONDITIONAL_GENERATION",
+        "task_type": "CAUSAL_LM",
     }
     expected_automodel_peft_config = {
         "dropout": 0.0,
@@ -598,7 +619,6 @@ def test_hf_peft_checkpoint():
     # first extract the in-memory checkpoint
     model_state_dict = ModelState(
         trainer.model,
-        trainer.checkpoint_config.model_save_format,
         trainer.checkpoint_config.is_peft,
     ).state_dict()
     optimizer_state_dict = to_cpu(
@@ -616,7 +636,7 @@ def test_hf_peft_checkpoint():
         # PEFT model state is consolidated - use FULL tensor shape (no splitting)
         curr_shard = v
         model_keys_fixture[k] = (list(curr_shard.shape), curr_shard.dtype, str(curr_shard.device))
-    flattened_optim_dict = _flatten(optimizer_state_dict, parent_key="optim.optim.state")
+    flattened_optim_dict = _flatten(optimizer_state_dict, parent_key="optim.state")
     optim_keys_fixture = {}
     for k, v in flattened_optim_dict.items():
         if isinstance(v, torch.distributed.tensor.DTensor):
@@ -667,15 +687,14 @@ def test_hf_peft_checkpoint():
     _compare_dicts(expected_config, restored_config)
     _compare_dicts(expected_automodel_peft_config, restored_automodel_peft_config)
 
-    # at save time, the model is saved in a dictionary formatted as:
-    # {
-    #     "model": ModelState(...)
-    # }
-    # because of this, DCP will flatten the model state dictionary to:
-    # {
-    #     "model.model.embed_tokens.weight": ...
-    # }
-    # so we need to remove the first occurrence of "model." from the keys
+    # check if new model and current model give the same CE loss
+    val_batch = next(iter(trainer.val_dataloader))
+    restored_model = FinetuneRecipeForVLM(cfg)
+    restored_model.setup()
+    restored_model = restored_model.model
+    source_model_loss = get_validation_loss(trainer.model, val_batch, trainer.loss_fn, trainer.dist_env.device)
+    restored_model_loss = get_validation_loss(restored_model, val_batch, trainer.loss_fn, trainer.dist_env.device)
+    assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
 
     # similarly, the optimizer states are saved in a dictionary formatted as:
     # {
@@ -695,10 +714,10 @@ def test_hf_peft_checkpoint():
     # }
     # because of this, DCP will flatten the optimizer state dictionary to:
     # {
-    #     "optim.optim.state.model.layers.0.self_attn.q_proj.weight.step": ...
+    #     "optim.state.model.layers.0.self_attn.q_proj.weight.step": ...
     # }
     # so we flatten the in-memory optimizer state dictionary to match the on-disk view
-    flattened_optim_dict = _flatten(optimizer_state_dict, parent_key="optim.optim.state")
+    flattened_optim_dict = _flatten(optimizer_state_dict, parent_key="optim.state")
 
     # ---------------------------------------------------------------------
     # Compare the flattened in-memory model state with the on-disk view
@@ -775,6 +794,28 @@ def test_hf_peft_checkpoint():
         )
         assert torch.allclose(v, curr_shard), f"Value mismatch for key {k}. Tensors are not numerically close"
 
+    # finally check if the adapters loaded into the PEFT module are the same as the model we have trained
+    if torch.distributed.get_rank() == 0:
+        base = AutoModelForImageTextToText.from_pretrained(cfg.model.pretrained_model_name_or_path)
+        peft_model = PeftModel.from_pretrained(
+            base, Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "model"
+        ).to(trainer.model.dtype)
+
+        for source_key, source_param in model_state_dict.items():
+            # source key example: 'base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight'
+            for peft_model_key, peft_model_param in peft_model.named_parameters():
+                if "lora" in peft_model_key and source_key.rsplit(".", 1)[0] in peft_model_key:
+                    assert torch.allclose(source_param, peft_model_param), (
+                        "Parameter values are different when they should be the same"
+                    )
+    torch.distributed.barrier()
+
+    if torch.distributed.get_rank() == 0:
+        # delete the checkpoint directory
+        if Path(trainer.checkpoint_config.checkpoint_dir).exists():
+            shutil.rmtree(Path(trainer.checkpoint_config.checkpoint_dir))
+    torch.distributed.barrier()
+
 
 def _flatten(d: dict, parent_key: str | None = None):
     """Recursively flatten *d* using dot-separated keys (à la DCP).
@@ -805,6 +846,3 @@ def _compare_dicts(expected: dict, restored: dict):
             assert sorted(restored[k]) == sorted(v), error_msg.format(sorted(v), sorted(restored[k]))
         else:
             assert restored[k] == v, error_msg.format(v, restored[k])
-
-
-test_hf_peft_checkpoint()

@@ -37,5 +37,10 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --peft.dim 8 \
     --peft.alpha 32 \
     --peft.use_triton false \
-    --peft._target_ nemo_automodel._peft.lora.PeftConfig
+    --peft._target_ nemo_automodel._peft.lora.PeftConfig \
+    --distributed._target_ nemo_automodel.distributed.fsdp2.FSDP2Manager \
+    --distributed.dp_size none \
+    --distributed.tp_size 1 \
+    --distributed.cp_size 1 \
+    --distributed.sequence_parallel false
 coverage combine

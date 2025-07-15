@@ -193,25 +193,25 @@ jobs:
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
           - script: L2_HF_Transformer_PEFT_nvfsdp
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_DCP_Checkpoint
+          - script: L2_DCP_FSDP2_Checkpoint
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_DCP_Checkpoint
+          - script: L2_HF_DCP_FSDP2_Checkpoint
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_Consolidated_Checkpoint
+          - script: L2_HF_Consolidated_FSDP2_Checkpoint
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-#          - script: L2_HF_PEFT_Triton_Checkpoint
+#          - script: L2_HF_PEFT_Triton_FSDP2_Checkpoint
 #            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_PEFT_Checkpoint
+          - script: L2_HF_PEFT_FSDP2_Checkpoint
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
           - script: L2_HF_Transformer_VLM_SFT
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
           - script: L2_HF_Transformer_VLM_PEFT
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_DCP_VLM_Checkpoint
+          - script: L2_DCP_VLM_FSDP2_Checkpoint
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_DCP_VLM_Checkpoint
+          - script: L2_HF_DCP_VLM_FSDP2_Checkpoint
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_PEFT_VLM_Checkpoint
+          - script: L2_HF_PEFT_VLM_FSDP2_Checkpoint
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
     needs: [cicd-unit-tests]
     runs-on: ${{ matrix.runner }}
