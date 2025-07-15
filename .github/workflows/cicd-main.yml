@@ -43,8 +43,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Check base sha
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         shell: bash
-        run: echo '$github.event.pull_request.base.sha'
+        run: echo '$BASE_SHA'
 
       - name: Get changed files
         id: changed-files
