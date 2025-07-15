@@ -243,12 +243,7 @@ jobs:
       - pre-flight
       - cicd-unit-tests
       - cicd-e2e-tests
-    if: |
-      (
-        needs.pre-flight.outputs.docs_only == 'true'
-        || success()
-      )
-      && !cancelled()
+    if: always()
     runs-on: ubuntu-latest
     permissions: write-all
     steps:
@@ -346,7 +341,6 @@ jobs:
     needs: [pre-flight, Nemo_CICD_Test]
     if: |
       needs.pre-flight.outputs.test_to_run != '[]'
-      && needs.pre-flight.outputs.components_to_run != '[]'
       && needs.pre-flight.outputs.docs_only == 'false'
       && (
         success()
@@ -392,3 +386,13 @@ jobs:
           path: |
             .coverage
           include-hidden-files: true
+
+  codecov-placeholder:
+     name: codecov/patch
+     needs: [pre-flight]
+     if: needs.pre-flight.outputs.docs_only == 'true'
+     runs-on: ubuntu-latest
+     steps:
+       - name: codecov_placeholder
+         run: |
+           echo "This is a placeholder status check for when no tests are ran but the codecov status is expected"
