@@ -53,6 +53,7 @@ jobs:
             src:
               - '!**.md'
               - '!docs/**'
+          base_sha: ${{ github.event.pull_request.base.sha }}
 
       - name: Check if docs only
         shell: bash
