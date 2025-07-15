@@ -18,7 +18,7 @@ examples/vlm/finetune.py \
   --model.pretrained_model_name_or_path /home/TestData/huiyingl/hf_gemma3_2l/ \
   --step_scheduler.max_steps 3 \
   --step_scheduler.grad_acc_steps 1 \
-  --dataset._target_=nemo_automodel.datasets.vlm.datasets.make_cord_v2_dataset \
+  --dataset._target_=nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset \
   --dataset.path_or_dataset /home/TestData/lite/hf_cache/mini_cord_v2/ \
   --dataset.limit_dataset_samples 100 \
   --validation_dataset.path_or_dataset /home/TestData/lite/hf_cache/mini_cord_v2/ \
