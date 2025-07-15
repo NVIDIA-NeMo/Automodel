@@ -325,12 +325,12 @@ def _get_hf_peft_config(peft_config: PeftConfig, model_state: ModelState) -> dic
     target_modules = _extract_target_modules(model_state.model)
     try:
         model_task = model_state.model.config.architectures[0].split("For")[-1]
-    except AttributeError:
+    except (AttributeError, IndexError, TypeError):
         model_task = "N/A"
 
     try:
         name_or_path = model_state.model.config.name_or_path
-    except AttributeError:
+    except (AttributeError, TypeError):
         name_or_path = "N/A"
 
     try:
