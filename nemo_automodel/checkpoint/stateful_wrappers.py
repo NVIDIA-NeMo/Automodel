@@ -22,7 +22,6 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
     set_optimizer_state_dict,
 )
-from torch.distributed.checkpoint.stateful import Stateful
 
 _PREFIX = "model."
 
@@ -54,7 +53,7 @@ def _get_lm_head_weight_and_name(model: torch.nn.Module) -> Optional[tuple[torch
 
 
 # modified from pytorch tutorial https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html
-class ModelState(Stateful):
+class ModelState:
     """
     Helper class for tracking model state in distributed checkpointing.
 
@@ -133,7 +132,7 @@ class ModelState(Stateful):
         )
 
 
-class OptimizerState(Stateful):
+class OptimizerState:
     """
     Helper class for tracking optimizer state in distributed checkpointing.
 
