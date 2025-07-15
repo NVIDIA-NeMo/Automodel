@@ -162,7 +162,7 @@ runs:
           bash -c "sleep $(( ${{ inputs.timeout }} * 60 + 60 ))"
         RUN_TEST_EOF
         )
-        ls -lah MNT_PATH/TestData
+        ls -lah $MNT_PATH/TestData
         echo "$cmd" | tee "retry_job.sh"
         bash retry_job.sh
 
