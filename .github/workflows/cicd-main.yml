@@ -42,10 +42,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Check base sha
+        shell: bash
+        run: echo '$github.event.pull_request.base.sha'
+
       - name: Get changed files
         id: changed-files
         uses: step-security/changed-files@v45.0.1
         with:
+          base_sha: ${{ github.event.pull_request.base.sha }}
           files_yaml: |
             doc:
               - '**.md'
@@ -53,7 +58,6 @@ jobs:
             src:
               - '!**.md'
               - '!docs/**'
-          base_sha: ${{ github.event.pull_request.base.sha }}
 
       - name: Check if docs only
         shell: bash
