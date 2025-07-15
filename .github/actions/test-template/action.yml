@@ -68,7 +68,7 @@ runs:
         subscription-id: ${{ inputs.azure-subscription-id }}
 
     - name: Azure Fileshare
-      if: ${{ inputs.has-azure-credentials == 'true' && inputs.is_unit_test == 'false' }}
+      if: ${{ inputs.has-azure-credentials == 'true' }}
       shell: bash
       id: azure-fileshare
       run: |
