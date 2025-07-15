@@ -23,7 +23,7 @@ def main(config="examples/vlm/gemma_3_vl_4b_cord_v2.yaml"):
 
     Loads the configuration, sets up the recipe, and initiates the training loop.
     """
-    config_path, cfg = parse_args_and_load_config(config)
+    cfg = parse_args_and_load_config(config)
     recipe = FinetuneRecipeForVLM(cfg)
     recipe.setup()
     recipe.run_train_validation_loop()
