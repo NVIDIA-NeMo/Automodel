@@ -24,8 +24,6 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.checkpoint.stateful import Stateful
 
-from nemo_automodel.checkpoint._backports.filesystem import SerializationFormat
-
 _PREFIX = "model."
 
 
@@ -67,7 +65,7 @@ class ModelState(Stateful):
         model: The PyTorch model to track.
     """
 
-    def __init__(self, model: torch.nn.Module, serialization_format: SerializationFormat, is_peft: bool = False):
+    def __init__(self, model: torch.nn.Module, is_peft: bool = False):
         """
         Initialize a ModelState instance for distributed checkpointing.
 
@@ -79,13 +77,10 @@ class ModelState(Stateful):
         Args:
             model (torch.nn.Module): The PyTorch model whose state should be
                 captured during checkpointing.
-            serialization_format (SerializationFormat): Backend/format to use when
-                persisting the model state (e.g., torch, safetensors).
             is_peft (bool): Whether the model is PEFT.
         """
         self.model = model
         self.is_tied_lm_head = getattr(getattr(model, "config", {}), "tie_word_embeddings", False)
-        self.serialization_format = serialization_format
         self.is_peft = is_peft
 
     def state_dict(self) -> dict[str, Any]:
@@ -108,13 +103,6 @@ class ModelState(Stateful):
             # correctly with the HF PEFT API.
             _add_outer_prefix(model_state_dict, "base_model.model.")
 
-        elif self.serialization_format == SerializationFormat.SAFETENSORS:
-            # This is a hack to fix the issue with the model state dict being saved with the "model.model." prefix.
-            # This is necessary when saving consolidated safetensors. This is because calling HF's
-            # .from_pretrained() requires the model to be saved with a single "model." prefix.
-            # This is not needed for torch serialization.
-            _drop_outer_prefix(model_state_dict)
-
         return model_state_dict
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
@@ -128,17 +116,6 @@ class ModelState(Stateful):
         if self.is_peft:
             _drop_outer_prefix(state_dict, "base_model.model.")
             options = StateDictOptions(strict=False, broadcast_from_rank0=True, full_state_dict=True)
-        elif self.serialization_format == SerializationFormat.SAFETENSORS:
-            # Undo the prefix-stripping that happened at save-time: DCP removes the
-            # container name ("model") when it dispatches the dict to this
-            # ModelState, so every key now lacks the leading "model." segment that
-            # HuggingFace modules normally carry.  Re-add it so that
-            # set_model_state_dict can match parameters correctly. This is not needed
-            # for torch serialization.
-
-            # However, this should be skipped for the LM head. The LM head should not have any "model." prefix. This is HF convention.
-            lm_head_param_name = _get_lm_head_weight_and_name(self.model)[1]
-            _add_outer_prefix(state_dict, skip_keys=[lm_head_param_name])
 
         # If we intentionally skipped saving "lm_head.weight" (tied embeddings)
         # PyTorch will complain during load even with strict=False.

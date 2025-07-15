@@ -101,7 +101,7 @@ def save_model(
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    model_state = ModelState(model, checkpoint_config.model_save_format, checkpoint_config.is_peft)
+    model_state = ModelState(model, checkpoint_config.is_peft)
 
     if checkpoint_config.is_peft:
         assert peft_config is not None, "PEFT config needs to be provided when checkpointing PEFT models."
@@ -139,12 +139,12 @@ def save_model(
         )
 
         dcp.save(
-            {"model": model_state},
+            model_state.state_dict(),
             checkpoint_id=model_path,
             storage_writer=storage_writer,
         )
     elif checkpoint_config.model_save_format == SerializationFormat.TORCH_SAVE:
-        dcp.save({"model": model_state}, checkpoint_id=model_path)
+        dcp.save(model_state.state_dict(), checkpoint_id=model_path)
     else:
         raise ValueError(f"Unsupported model save format: {checkpoint_config.model_save_format}")
 
@@ -167,7 +167,7 @@ def load_model(
     # Validate checkpoint directory
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model path {model_path} does not exist")
-    model_state = ModelState(model, checkpoint_config.model_save_format, checkpoint_config.is_peft)
+    model_state = ModelState(model, checkpoint_config.is_peft)
 
     if checkpoint_config.is_peft:
         state_dict = model.state_dict()
@@ -181,14 +181,17 @@ def load_model(
     elif checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
         storage_reader = _HuggingFaceStorageReader(path=model_path)
 
+        reinstated_state_dict = model_state.state_dict()
         dcp.load(
-            state_dict={"model": model_state},
+            reinstated_state_dict,
             checkpoint_id=model_path,
             storage_reader=storage_reader,
-            planner=dcp.DefaultLoadPlanner(),
         )
+        model_state.load_state_dict(reinstated_state_dict)
     elif checkpoint_config.model_save_format == SerializationFormat.TORCH_SAVE:
-        dcp.load(state_dict={"model": model_state}, checkpoint_id=model_path)
+        reinstated_state_dict = model_state.state_dict()
+        dcp.load(reinstated_state_dict, checkpoint_id=model_path)
+        model_state.load_state_dict(reinstated_state_dict)
     else:
         raise ValueError(f"Unsupported model save format: {checkpoint_config.model_save_format}")
 
@@ -212,7 +215,7 @@ def save_optimizer(
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         os.makedirs(optimizer_path, exist_ok=True)
     optimizer_state = OptimizerState(model, optimizer, scheduler)
-    dcp.save({"optim": optimizer_state}, checkpoint_id=optimizer_path)
+    dcp.save(optimizer_state.state_dict(), checkpoint_id=optimizer_path)
 
 
 def load_optimizer(
@@ -234,8 +237,10 @@ def load_optimizer(
     if not os.path.exists(optimizer_path):
         raise FileNotFoundError(f"Optimizer path {optimizer_path} does not exist")
 
-    optimizer_state = {"optim": OptimizerState(model, optimizer, scheduler)}
-    dcp.load(state_dict=optimizer_state, checkpoint_id=optimizer_path)
+    optimizer_state = OptimizerState(model, optimizer, scheduler)
+    reinstated_state_dict = optimizer_state.state_dict()
+    dcp.load(reinstated_state_dict, checkpoint_id=optimizer_path)
+    optimizer_state.load_state_dict(reinstated_state_dict)
 
 
 def _get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
