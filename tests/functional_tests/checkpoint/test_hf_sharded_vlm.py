@@ -693,6 +693,7 @@ def test_hf_vlm_sharded_checkpoint():
             f"Device mismatch for key {k}. Expected device {expected_device} but got {curr_shard.device}"
         )
         assert torch.allclose(v, curr_shard), f"Value mismatch for key {k}. Tensors are not numerically close"
+
     if torch.distributed.get_rank() == 0:
         # delete the checkpoint directory
         if Path(trainer.checkpoint_config.checkpoint_dir).exists():
