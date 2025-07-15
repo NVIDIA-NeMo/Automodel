@@ -390,7 +390,7 @@ jobs:
   codecov-placeholder:
      name: codecov/patch
      needs: [pre-flight]
-     if: always()
+     if: needs.pre-flight.outputs.docs_only == 'true'
      runs-on: ubuntu-latest
      steps:
        - name: codecov_placeholder
