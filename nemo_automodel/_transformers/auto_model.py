@@ -333,6 +333,7 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
                 *model_args,
                 **kwargs,
                 torch_dtype=torch_dtype,
+                use_liger_kernel=False,
                 use_sdpa_patching=use_sdpa_patching,
             )
 
