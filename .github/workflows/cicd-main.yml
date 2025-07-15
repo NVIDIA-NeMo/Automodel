@@ -46,7 +46,7 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         shell: bash
-        run: echo '$BASE_SHA'
+        run: echo "$BASE_SHA"
 
       - name: Get changed files
         id: changed-files
