@@ -18,8 +18,8 @@ set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1"
 
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace --parallel-mode \
--m pytest tests/functional_tests/checkpoint/test_peft.py \
+TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
+-m pytest tests/functional_tests/checkpoint/test_dcp.py \
     --config recipes/llm/llama_3_2_1b_squad.yaml \
     --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
     --step_scheduler.max_steps 10 \
@@ -32,10 +32,11 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --step_scheduler.ckpt_every_steps 10 \
     --checkpoint.enabled true \
     --checkpoint.checkpoint_dir checkpoints/ \
+    --checkpoint.model_save_format torch_save \
     --dataloader.batch_size 8 \
-    --peft.match_all_linear true \
-    --peft.dim 8 \
-    --peft.alpha 32 \
-    --peft.use_triton true \
-    --peft.peft_fn nemo_automodel._peft.lora.apply_lora_to_linear_modules
+    --distributed._target_ nemo_automodel.distributed.fsdp2.FSDP2Manager \
+    --distributed.dp_size none \
+    --distributed.tp_size 1 \
+    --distributed.cp_size 1 \
+    --distributed.sequence_parallel false
 coverage combine
