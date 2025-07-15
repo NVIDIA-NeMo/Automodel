@@ -243,12 +243,7 @@ jobs:
       - pre-flight
       - cicd-unit-tests
       - cicd-e2e-tests
-    if: |
-      (
-        needs.pre-flight.outputs.docs_only == 'true'
-        || success()
-      )
-      && !cancelled()
+    if: always()
     runs-on: ubuntu-latest
     permissions: write-all
     steps:
@@ -346,8 +341,6 @@ jobs:
     needs: [pre-flight, Nemo_CICD_Test]
     if: |
       needs.pre-flight.outputs.test_to_run != '[]'
-      && needs.pre-flight.outputs.components_to_run != '[]'
-      && needs.pre-flight.outputs.docs_only == 'false'
       && (
         success()
         || needs.Nemo_CICD_Test.result == 'success'
