@@ -68,7 +68,7 @@ runs:
         subscription-id: ${{ inputs.azure-subscription-id }}
 
     - name: Azure Fileshare
-      if: ${{ inputs.has-azure-credentials == 'true' }}
+      if: ${{ inputs.has-azure-credentials == 'true' && inputs.is_unit_test == 'false' }}
       shell: bash
       id: azure-fileshare
       run: |
@@ -162,7 +162,7 @@ runs:
           bash -c "sleep $(( ${{ inputs.timeout }} * 60 + 60 ))"
         RUN_TEST_EOF
         )
-        ls -lah $MNT_PATH/TestData
+
         echo "$cmd" | tee "retry_job.sh"
         bash retry_job.sh
 
@@ -178,12 +178,11 @@ runs:
 
         docker exec -t nemo_container_${{ github.run_id }} bash -c '
           set -e
-
+          
           . /opt/venv/env.sh
 
-          TRANSFORMERS_OFFLINE=1 HF_HOME=/tmp/hf_cache \
           bash tests/${{ inputs.is_unit_test == 'true' && 'unit_tests' || 'functional_tests' }}/${{ inputs.script }}.sh
-
+          
         '
 
         RUN_TEST_EOF
