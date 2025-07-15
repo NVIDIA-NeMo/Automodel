@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.vlm.finetune import FinetuneRecipeForVLM
+from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
 
 def main(config="examples/vlm/gemma_3_vl_4b_cord_v2.yaml"):
