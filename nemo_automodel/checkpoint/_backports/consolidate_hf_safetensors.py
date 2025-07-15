@@ -231,6 +231,7 @@ def _process_output_file(
                 if fqn == DEFAULT_EXTRA_METADATA_KEY:
                     continue
 
+                # Skip if this tensor doesn't belong in this output file
                 if fqn not in output_data.fqn_data:
                     continue
 
