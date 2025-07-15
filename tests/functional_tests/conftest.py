@@ -43,6 +43,10 @@ _OVERRIDES = [
     "distributed.tp_size",
     "distributed.cp_size",
     "distributed.sequence_parallel",
+    "dataset._target_",
+    "dataset.path_or_dataset",
+    "validation_dataset.path_or_dataset",
+    "validation_dataset.limit_dataset_samples",
 ]
 
 
