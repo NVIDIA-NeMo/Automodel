@@ -8,8 +8,6 @@
 
 ## Build the Documentation
 
-This is a test.
-
 The following sections describe how to set up and build the NeMo Automodel documentation.
 
 Switch to the documentation source folder and generate HTML output.
