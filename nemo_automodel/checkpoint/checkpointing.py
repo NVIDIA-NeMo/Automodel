@@ -321,18 +321,21 @@ def _get_hf_peft_config(peft_config: PeftConfig, model_state: ModelState) -> dic
         "TokenClassification": "TOKEN_CLS",
         "QuestionAnswering": "QUESTION_ANS",
         "FeatureExtraction": "FEATURE_EXTRACTION",
-        "ConditionalGeneration": "CONDITIONAL_GENERATION",
     }
     target_modules = _extract_target_modules(model_state.model)
     try:
         model_task = model_state.model.config.architectures[0].split("For")[-1]
     except AttributeError:
         model_task = "N/A"
+
     try:
         name_or_path = model_state.model.config.name_or_path
-        task_type = MODEL_TYPE_TO_PEFT_TASK_TYPE[model_task]
-    except (KeyError, AttributeError):
+    except AttributeError:
         name_or_path = "N/A"
+
+    try:
+        task_type = MODEL_TYPE_TO_PEFT_TASK_TYPE[model_task]
+    except KeyError:
         task_type = "CAUSAL_LM"
 
     return {

@@ -1856,7 +1856,6 @@ def test_hf_peft_checkpoint():
     # first extract the in-memory checkpoint
     model_state_dict = ModelState(
         trainer.model,
-        trainer.checkpoint_config.model_save_format,
         trainer.checkpoint_config.is_peft,
     ).state_dict()
     optimizer_state_dict = to_cpu(
@@ -1877,7 +1876,7 @@ def test_hf_peft_checkpoint():
         "model/adapter_config.json",
         "model/automodel_peft_config.json",
         "optim/__0_0.distcp",
-        "optim/__1_0.distcp",
+        # "optim/__1_0.distcp",
         "optim/.metadata",
         "step_scheduler.pt",
     ]

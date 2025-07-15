@@ -755,7 +755,6 @@ def test_dcp_checkpoint():
     model_state_dict = to_cpu(
         ModelState(
             trainer.model,
-            trainer.checkpoint_config.model_save_format,
         ).state_dict()
     )
     optimizer_state_dict = to_cpu(
