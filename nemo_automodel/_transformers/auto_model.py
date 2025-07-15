@@ -182,13 +182,32 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
         use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
         sdpa_method = kwargs.pop("sdpa_method", None)
         attn_implementation = kwargs.pop("attn_implementation", "flash_attention_2")
-        model = super().from_pretrained(
-            pretrained_model_name_or_path,
-            *model_args,
-            **kwargs,
-            attn_implementation=attn_implementation,
-            torch_dtype=torch_dtype,
-        )
+        
+        try:
+            model = super().from_pretrained(
+                pretrained_model_name_or_path,
+                *model_args,
+                **kwargs,
+                attn_implementation=attn_implementation,
+                torch_dtype=torch_dtype,
+            )
+        except ValueError as e:
+            if "Unrecognized configuration class" in str(e) and kwargs.get("trust_remote_code", False):
+                # Handle custom configurations that aren't in the standard registry
+                # Fall back to using AutoModelForCausalLM directly from transformers
+                logger.warning(f"Configuration not recognized by NeMoAutoModelForCausalLM registry, "
+                             f"falling back to standard AutoModelForCausalLM: {e}")
+                from transformers import AutoModelForCausalLM as TransformersAutoModelForCausalLM
+                model = TransformersAutoModelForCausalLM.from_pretrained(
+                    pretrained_model_name_or_path,
+                    *model_args,
+                    **kwargs,
+                    attn_implementation=attn_implementation,
+                    torch_dtype=torch_dtype,
+                )
+            else:
+                raise
+        
         try:
             return patch_model(model, use_liger_kernel, use_sdpa_patching, sdpa_method)
         except RuntimeError:
