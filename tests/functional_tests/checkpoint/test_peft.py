@@ -1876,7 +1876,7 @@ def test_hf_peft_checkpoint():
         "model/adapter_config.json",
         "model/automodel_peft_config.json",
         "optim/__0_0.distcp",
-        # "optim/__1_0.distcp",
+        "optim/__1_0.distcp",
         "optim/.metadata",
         "step_scheduler.pt",
     ]
