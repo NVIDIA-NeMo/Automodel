@@ -24,24 +24,9 @@ import torch.distributed.checkpoint as dcp
 import torch.distributed.tensor
 import torch.nn as nn
 
-from nemo_automodel.checkpoint.checkpointing import load_model
 from nemo_automodel.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.config.cli import parse_args_and_load_config
-from recipes.vlm.finetune import FinetuneRecipeForVLM, build_model_and_optimizer
-
-
-def get_new_model(trainer: FinetuneRecipeForVLM) -> nn.Module:
-    """Gets a new model."""
-    return build_model_and_optimizer(
-        trainer.dist_env.device,
-        trainer.cfg.model,
-        trainer.cfg.optimizer,
-        trainer.cfg.get("freeze_config", None),
-        trainer.peft_config,
-        trainer.model_wrapper,
-        trainer.cfg.get("seed", 42),
-        trainer.cfg.get("distributed.tp_size", 1),
-    )[0]
+from recipes.vlm.finetune import FinetuneRecipeForVLM
 
 
 def get_validation_loss(
@@ -578,12 +563,9 @@ def test_vlm_dcp_checkpoint():
 
     # check if new model and current model give the same CE loss
     val_batch = next(iter(trainer.val_dataloader))
-    restored_model = get_new_model(trainer)
-    load_model(
-        restored_model,
-        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10",
-        trainer.checkpoint_config,
-    )
+    restored_model = FinetuneRecipeForVLM(cfg)
+    restored_model.setup()
+    restored_model = restored_model.model
     source_model_loss = get_validation_loss(trainer.model, val_batch, trainer.loss_fn, trainer.dist_env.device)
     restored_model_loss = get_validation_loss(restored_model, val_batch, trainer.loss_fn, trainer.dist_env.device)
     assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
