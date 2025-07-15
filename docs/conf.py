@@ -88,6 +88,13 @@ suppress_warnings = [
 
 html_theme = "nvidia_sphinx_theme"
 html_theme_options = {
+    "icon_links": [
+        {
+            "name": "GitHub",
+            "url": "https://github.com/NVIDIA-NeMo/Automodel/",
+            "icon": "fa-brands fa-github",
+        }
+    ],
     "switcher": {
         "json_url": "versions1.json",
         "version_match": release,
