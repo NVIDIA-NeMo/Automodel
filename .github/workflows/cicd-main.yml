@@ -42,19 +42,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
 
-      - name: Check base sha
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        shell: bash
-        run: echo "$BASE_SHA"
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Determine base reference
+        id: base-ref
+        run: |
+          echo "base=${{ (startsWith(github.ref, 'refs/heads/pull-request/') && fromJSON(steps.get-pr-info.outputs.pr-info).base.ref) || 'HEAD~1' }}" >> $GITHUB_OUTPUT
 
       - name: Get changed files
         id: changed-files
         uses: step-security/changed-files@v45.0.1
         with:
-          base_sha: ${{ github.event.pull_request.base.sha }}
+          base_sha: ${{ steps.base-ref.outputs.base }}
           files_yaml: |
             doc:
               - '**.md'
