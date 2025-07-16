@@ -90,6 +90,11 @@ def load_yaml(file_path):
         logging.error(f"parsing YAML file {e} failed.")
         raise e
 
+def inside_automodel_repo_root():
+    cwd = Path.cwd()
+    if (cwd / "nemo_automodel/components").exists() and (cwd / "examples/").exists():
+        return cwd
+    return None
 
 def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
     from nemo_automodel.components.launcher.slurm.config import SlurmConfig, VolumeMapping
@@ -109,10 +114,11 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
     # Determine the code repo root
     if "repo_root" in slurm_config:
         repo_root = slurm_config.pop("repo_root")
+        logging.info(f"Running job using source defined in yaml: {repo_root}")
     else:
-        cwd = Path.cwd()
-        if (cwd / "nemo_automodel/components").exists() and (cwd / "examples/").exists():
-            repo_root = str(cwd)
+        if repo_root := inside_automodel_repo_root():
+            repo_root = str(repo_root)
+            logging.info(f"Running job using source from: {repo_root}")
         else:
             repo_root = "/opt/Automodel"
     logging.info(f"Using {repo_root} as code repo")
@@ -222,7 +228,15 @@ def main():
         from torch.distributed.run import determine_local_world_size, get_args_parser
         from torch.distributed.run import run as thrun
 
-        script_path = Path(__file__).parent / "recipes" / args.domain / f"{args.command}.py"
+        if repo_root := inside_automodel_repo_root():
+            new_pp = str(repo_root)
+            if 'PYTHONPATH' in os.environ:
+                new_pp += ':' + os.environ['PYTHONPATH']
+            os.environ["PYTHONPATH"] = new_pp
+            logging.info(f"Running job using source from: {repo_root}")
+        else:
+            repo_root = Path(__file__).parents[2]
+        script_path = repo_root / "nemo_automodel" / "recipes" / args.domain / f"{args.command}.py"
 
         # launch job on this node
         num_devices = determine_local_world_size(nproc_per_node="gpu")
