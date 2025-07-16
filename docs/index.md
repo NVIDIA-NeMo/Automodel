@@ -25,6 +25,7 @@ guides/gemma3-3n.md
 :hidden:
 
 guides/dataset.md
+guides/checkpointing.md
 ```
 
 ```{toctree}
