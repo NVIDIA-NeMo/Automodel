@@ -90,6 +90,7 @@ def load_yaml(file_path):
         logging.error(f"parsing YAML file {e} failed.")
         raise e
 
+
 def get_automodel_repo_root():
     """
     if the cwd contains:
@@ -101,6 +102,7 @@ def get_automodel_repo_root():
     if (cwd / "nemo_automodel/components").exists() and (cwd / "examples/").exists():
         return cwd
     return None
+
 
 def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
     from nemo_automodel.components.launcher.slurm.config import SlurmConfig, VolumeMapping
@@ -195,6 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     return parser
 
+
 def get_repo_root():
     """
     Returns the repo root to use and if using non-default, it will modify $PYTHONPATH accordingly
@@ -204,13 +207,14 @@ def get_repo_root():
     """
     if repo_root := get_automodel_repo_root():
         new_pp = str(repo_root)
-        if 'PYTHONPATH' in os.environ:
-            new_pp += ':' + os.environ['PYTHONPATH']
+        if "PYTHONPATH" in os.environ:
+            new_pp += ":" + os.environ["PYTHONPATH"]
         os.environ["PYTHONPATH"] = new_pp
         logging.info(f"Running job using source from: {repo_root}")
     else:
         repo_root = Path(__file__).parents[2]
     return repo_root
+
 
 def run_interactive(args):
     from torch.distributed.run import determine_local_world_size, get_args_parser
@@ -246,6 +250,7 @@ def run_interactive(args):
         if args.nproc_per_node is None:
             torchrun_args.nproc_per_node = num_devices
         return thrun(torchrun_args)
+
 
 def main():
     """CLI for running finetune jobs with NeMo-Automodel, supporting torchrun, Slurm & Kubernetes.
