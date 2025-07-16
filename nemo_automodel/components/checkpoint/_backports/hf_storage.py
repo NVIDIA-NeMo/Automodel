@@ -390,6 +390,31 @@ def _extract_file_index(filename: str) -> int:
     # default to the first shard.
     return 1
 
+def file_for_fqn(fqn: str, weight_map: dict[str, str]) -> str:
+    """
+    Map a *new* FQN (state-dict key) to the filename recorded in
+    `weight_map`, which holds the *old* names.
+
+    Strategy: keep the **longest suffix that is unique** among all
+    weight-map keys.
+
+    Raises
+    ------
+    KeyError
+        if no unique suffix can be found.
+    """
+    tokens = fqn.split(".")
+    for i in range(len(tokens)):          # 0 → full name, len-1 → last token
+        suffix = ".".join(tokens[i:])
+        matches = [k for k in weight_map if k.endswith(suffix)]
+        if len(matches) == 1:             # ← unique longest suffix found
+            return weight_map[matches[0]]
+
+    # never found a unique suffix
+    raise KeyError(
+        f"Ambiguous FQN '{fqn}': cannot identify a unique shard file "
+        "using longest-suffix matching."
+    )
 
 def get_fqn_to_file_index_mapping(reference_model_path: str) -> dict[str, int]:
     """
@@ -411,6 +436,7 @@ def get_fqn_to_file_index_mapping(reference_model_path: str) -> dict[str, int]:
     metadata = hf_reader.read_metadata()
 
     for md_index, storage_info in metadata.storage_data.items():
+        breakpoint()
         fqn = getattr(md_index, "fqn", md_index)
         filename = storage_info.relative_path
         fqn_to_file_index_mapping[str(fqn)] = _extract_file_index(filename)
