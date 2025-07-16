@@ -20,7 +20,7 @@ export CUDA_VISIBLE_DEVICES="0,1"
 
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
 -m pytest tests/functional_tests/checkpoint/test_dcp.py \
-    --config recipes/llm/llama_3_2_1b_squad.yaml \
+    --config examples/llm/llama_3_2_1b_squad.yaml \
     --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
     --step_scheduler.max_steps 10 \
     --step_scheduler.grad_acc_steps 4 \
@@ -34,7 +34,7 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --checkpoint.checkpoint_dir checkpoints/ \
     --checkpoint.model_save_format torch_save \
     --dataloader.batch_size 8 \
-    --distributed._target_ nemo_automodel.distributed.fsdp2.FSDP2Manager \
+    --distributed._target_ nemo_automodel.components.distributed.fsdp2.FSDP2Manager \
     --distributed.dp_size none \
     --distributed.tp_size 1 \
     --distributed.cp_size 1 \

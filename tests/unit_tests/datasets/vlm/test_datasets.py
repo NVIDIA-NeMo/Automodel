@@ -18,7 +18,7 @@ from typing import Dict, List
 
 import pytest
 
-import nemo_automodel.datasets.vlm.datasets as ds
+import nemo_automodel.components.datasets.vlm.datasets as ds
 
 
 @pytest.fixture(autouse=True)

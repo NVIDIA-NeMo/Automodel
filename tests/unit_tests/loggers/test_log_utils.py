@@ -42,7 +42,7 @@ def reload_module():
     if "log_utils" in globals():
         del globals()["log_utils"]
 
-    mod = importlib.import_module("nemo_automodel.loggers.log_utils")
+    mod = importlib.import_module("nemo_automodel.components.loggers.log_utils")
     importlib.reload(mod)
     return mod
 
@@ -80,7 +80,7 @@ def test_rank_filter_blocks_nonzero_rank(monkeypatch):
 # warning_filter
 def test_warning_filter_blocks_only_warning():
     """warning_filter returns False only for WARNING level."""
-    from nemo_automodel.loggers.log_utils import warning_filter
+    from nemo_automodel.components.loggers.log_utils import warning_filter
 
     warn_rec = make_log_record(level=logging.WARNING)
     info_rec = make_log_record(level=logging.INFO)
@@ -92,7 +92,7 @@ def test_warning_filter_blocks_only_warning():
 # module_filter
 def test_module_filter_name_prefix_matching():
     """module_filter suppresses loggers whose names start with prefix."""
-    from nemo_automodel.loggers.log_utils import module_filter
+    from nemo_automodel.components.loggers.log_utils import module_filter
 
     filt = lambda rec: module_filter(rec, modules_to_filter=["foo.bar"])
 

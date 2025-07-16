@@ -28,10 +28,10 @@ from peft import PeftModel
 from safetensors import safe_open
 from transformers import AutoModelForImageTextToText
 
-from nemo_automodel.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
-from nemo_automodel.checkpoint.stateful_wrappers import ModelState, OptimizerState
-from nemo_automodel.config.cli import parse_args_and_load_config
-from recipes.vlm.finetune import FinetuneRecipeForVLM
+from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
+from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
+from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
 
 def get_validation_loss(

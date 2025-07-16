@@ -16,24 +16,21 @@ import importlib
 from .package_info import __package_name__, __version__
 
 __all__ = [
-    "_peft",
-    "config",
-    "datasets",
-    "distributed",
-    "loggers",
-    "loss",
-    "optim",
-    "training",
-    "_transformers",
-    "utils",
+    "recipes",
+    "shared",
+    "components",
     "__version__",
     "__package_name__",
 ]
 
-# ==== Promote NeMoAutoModelForCausalLM, AutoModelForImageTextToText into the top level ====
+# Promote NeMoAutoModelForCausalLM, AutoModelForImageTextToText into the top level
+# to enable: `from nemo_automodel import NeMoAutoModelForCausalLM`
 try:
     # adjust this import path if your class lives somewhere else
-    from ._transformers.auto_model import NeMoAutoModelForCausalLM, NeMoAutoModelForImageTextToText
+    from nemo_automodel.components._transformers.auto_model import (
+        NeMoAutoModelForCausalLM,
+        NeMoAutoModelForImageTextToText,
+    )  # noqa: I001
 
     globals()["NeMoAutoModelForCausalLM"] = NeMoAutoModelForCausalLM
     globals()["NeMoAutoModelForImageTextToText"] = NeMoAutoModelForImageTextToText

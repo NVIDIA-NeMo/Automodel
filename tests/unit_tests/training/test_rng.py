@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 import torch
 
-from nemo_automodel.training.rng import StatefulRNG, init_all_rng
+from nemo_automodel.components.training.rng import StatefulRNG, init_all_rng
 
 
 def _next_values():

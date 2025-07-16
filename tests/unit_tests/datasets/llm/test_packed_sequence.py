@@ -15,7 +15,7 @@
 import pytest
 from datasets import Dataset
 
-from nemo_automodel.datasets.llm.packed_sequence import PackedSequence
+from nemo_automodel.components.datasets.llm.packed_sequence import PackedSequence
 
 
 @pytest.fixture

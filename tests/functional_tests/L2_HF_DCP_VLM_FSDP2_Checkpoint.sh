@@ -20,11 +20,11 @@ export CUDA_VISIBLE_DEVICES="0,1"
 
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
 -m pytest tests/functional_tests/checkpoint/test_hf_sharded_vlm.py \
-    --config recipes/vlm/gemma_3_vl_4b_cord_v2.yaml \
+    --config examples/vlm/gemma_3_vl_4b_cord_v2.yaml \
     --model.pretrained_model_name_or_path /home/TestData/huiyingl/hf_gemma3_2l/ \
     --step_scheduler.max_steps 10 \
     --step_scheduler.grad_acc_steps 4 \
-    --dataset._target_=nemo_automodel.datasets.vlm.datasets.make_cord_v2_dataset \
+    --dataset._target_=nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset \
     --dataset.path_or_dataset /home/TestData/lite/hf_cache/mini_cord_v2/ \
     --dataset.limit_dataset_samples 100 \
     --validation_dataset.path_or_dataset /home/TestData/lite/hf_cache/mini_cord_v2/ \
@@ -33,7 +33,7 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --checkpoint.enabled true \
     --checkpoint.checkpoint_dir checkpoints/ \
     --checkpoint.model_save_format safetensors \
-    --distributed._target_ nemo_automodel.distributed.fsdp2.FSDP2Manager \
+    --distributed._target_ nemo_automodel.components.distributed.fsdp2.FSDP2Manager \
     --distributed.dp_size none \
     --distributed.tp_size 1 \
     --distributed.cp_size 1 \

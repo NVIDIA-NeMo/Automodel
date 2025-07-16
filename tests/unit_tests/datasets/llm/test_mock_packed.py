@@ -20,7 +20,7 @@ import pytest
 # ------------------------------------------------------------------------
 # System-under-test
 # ------------------------------------------------------------------------
-from nemo_automodel.datasets.llm.mock_packed import (
+from nemo_automodel.components.datasets.llm.mock_packed import (
     build_packed_dataset,  # main API
     gen_sentence_ids,  # helper (for distribution test)
     make_vocab,  # helper

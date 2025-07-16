@@ -106,8 +106,8 @@ jobs:
 
       - name: Run ruff
         run: |
-          ruff check .
-          ruff format --check .
+          ruff check . --verbose
+          ruff format --check . --verbose
 
   Nemo_Linting_Test:
     needs: linting
