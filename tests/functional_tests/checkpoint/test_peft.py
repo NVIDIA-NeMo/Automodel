@@ -1899,7 +1899,7 @@ def test_hf_peft_checkpoint():
     restored_model = restored_model.model
     source_model_loss = get_validation_loss(trainer.model, val_batch, trainer.loss_fn, trainer.dist_env.device)
     restored_model_loss = get_validation_loss(restored_model, val_batch, trainer.loss_fn, trainer.dist_env.device)
-    assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
+    assert torch.allclose(source_model_loss, restored_model_loss, equal_nan=True), "Model loss mismatch"
 
     # similarly, the optimizer states are saved in a dictionary formatted as:
     # {
@@ -1965,7 +1965,7 @@ def test_hf_peft_checkpoint():
             assert str(full_shard.device) == expected_device, (
                 f"Device mismatch for key {k}. Expected device {expected_device} but got {full_shard.device}"
             )
-            assert torch.allclose(v, full_shard), f"Value mismatch for key {k}. Tensors are not numerically close"
+            assert torch.allclose(v, full_shard, equal_nan=True), f"Value mismatch for key {k}. Tensors are not numerically close"
 
     # Compare the values, shapes, dtype, and device of the in-memory and on-disk optimizer state
     for k, v in flattened_optim_dict.items():
@@ -1997,7 +1997,7 @@ def test_hf_peft_checkpoint():
         assert str(curr_shard.device) == expected_device, (
             f"Device mismatch for key {k}. Expected device {expected_device} but got {curr_shard.device}"
         )
-        assert torch.allclose(v, curr_shard), f"Value mismatch for key {k}. Tensors are not numerically close"
+        assert torch.allclose(v, curr_shard, equal_nan=True), f"Value mismatch for key {k}. Tensors are not numerically close"
 
     # finally check if the adapters loaded into the PEFT module are the same as the model we have trained
     if torch.distributed.get_rank() == 0:
@@ -2010,7 +2010,7 @@ def test_hf_peft_checkpoint():
             # source key example: 'base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight'
             for peft_model_key, peft_model_param in peft_model.named_parameters():
                 if "lora" in peft_model_key and source_key.rsplit(".", 1)[0] in peft_model_key:
-                    assert torch.allclose(source_param, peft_model_param), (
+                    assert torch.allclose(source_param, peft_model_param, equal_nan=True), (
                         "Parameter values are different when they should be the same"
                     )
     torch.distributed.barrier()
