@@ -26,10 +26,11 @@ import torch.nn as nn
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM
 
-from nemo_automodel.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
-from nemo_automodel.checkpoint.stateful_wrappers import ModelState, OptimizerState
-from nemo_automodel.config.cli import parse_args_and_load_config
-from recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction
+from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
+from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
+from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction
+
 
 
 def load_dcp(ckpt_dir: Path | str) -> dict[str, torch.Tensor]:

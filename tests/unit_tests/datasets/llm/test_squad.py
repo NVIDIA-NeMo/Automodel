@@ -15,7 +15,7 @@
 import pytest
 from datasets import Dataset
 
-import nemo_automodel.datasets.llm.squad as mqd
+import nemo_automodel.components.datasets.llm.squad as mqd
 
 make_squad_dataset = mqd.make_squad_dataset
 

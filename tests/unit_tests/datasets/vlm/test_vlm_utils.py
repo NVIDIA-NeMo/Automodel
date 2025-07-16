@@ -15,7 +15,7 @@
 import pytest
 import torch
 
-from nemo_automodel.datasets.vlm.utils import (
+from nemo_automodel.components.datasets.vlm.utils import (
     PAD_TOKENS,
     extract_skipped_token_ids,
     json2token,
