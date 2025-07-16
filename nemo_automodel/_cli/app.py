@@ -163,16 +163,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Two required positionals (cannot start with "--")
     parser.add_argument(
-        "domain",
-        metavar="<domain>",
-        choices=["llm", "vlm"],
-        help="Domain to operate on (e.g., LLM, VLM, etc)",
-    )
-    parser.add_argument(
         "command",
         metavar="<command>",
         choices=["finetune"],
         help="Command within the domain (e.g., finetune, generate, etc)",
+    )
+    parser.add_argument(
+        "domain",
+        metavar="<domain>",
+        choices=["llm", "vlm"],
+        help="Domain to operate on (e.g., LLM, VLM, etc)",
     )
 
     # Optional/required flag
