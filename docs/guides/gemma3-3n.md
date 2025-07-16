@@ -250,7 +250,7 @@ After fine-tuning your Gemma3 or Gemma3n model, you can use it for inference on 
 
 ### Generation Script
 
-The inference functionality is provided through [`recipes/vlm/generate.py`](../../recipes/vlm/generate.py), which supports loading fine-tuned checkpoints and performing image-text generation.
+The inference functionality is provided through [`recipes/vlm/generate.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/recipes/vlm/generate.py), which supports loading fine-tuned checkpoints and performing image-text generation.
 
 #### Basic Usage
 
