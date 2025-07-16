@@ -22,6 +22,7 @@ from unittest import mock
 
 import pytest
 import yaml
+import os
 
 sys.modules["nemo_run"] = mock.MagicMock()
 
@@ -228,3 +229,41 @@ def argparse_mock_parser():
             )
 
     return DummyParser()
+
+def test_repo_root_when_found(monkeypatch):
+    dummy_root = Path("/tmp/dummy_repo").resolve()
+
+    # Pretend an initial PYTHONPATH
+    monkeypatch.setenv("PYTHONPATH", "foo:bar")
+
+    # Force the helper to return our dummy path
+    monkeypatch.setattr(
+        module, "get_automodel_repo_root", lambda: dummy_root, raising=True
+    )
+
+    # Act
+    result = module.get_repo_root()
+
+    # Assert return value
+    assert result == dummy_root
+
+    # Assert PYTHONPATH was *prepended* with dummy_root and old entries kept
+    assert os.environ["PYTHONPATH"].split(":") == [str(dummy_root), "foo", "bar"]
+
+
+def test_repo_root_when_not_found(monkeypatch):
+    # Start from a known PYTHONPATH
+    monkeypatch.setenv("PYTHONPATH", "foo:bar")
+
+    # Make helper return None
+    monkeypatch.setattr(module, "get_automodel_repo_root", lambda: None, raising=True)
+
+    # Act
+    result = module.get_repo_root()
+
+    # Expected path = two parents up from the module's file
+    expected = Path(module.__file__).parents[2]
+    assert result == expected
+
+    # PYTHONPATH must remain unchanged
+    assert os.environ["PYTHONPATH"] == "foo:bar"

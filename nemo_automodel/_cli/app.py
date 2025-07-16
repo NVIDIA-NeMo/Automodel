@@ -90,7 +90,13 @@ def load_yaml(file_path):
         logging.error(f"parsing YAML file {e} failed.")
         raise e
 
-def inside_automodel_repo_root():
+def get_automodel_repo_root():
+    """
+    if the cwd contains:
+    - nemo_automodel/components
+    - examples/
+    will return cwd, otherwise will return None
+    """
     cwd = Path.cwd()
     if (cwd / "nemo_automodel/components").exists() and (cwd / "examples/").exists():
         return cwd
@@ -116,7 +122,7 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
         repo_root = slurm_config.pop("repo_root")
         logging.info(f"Running job using source defined in yaml: {repo_root}")
     else:
-        if repo_root := inside_automodel_repo_root():
+        if repo_root := get_automodel_repo_root():
             repo_root = str(repo_root)
             logging.info(f"Running job using source from: {repo_root}")
         else:
@@ -189,6 +195,57 @@ def build_parser() -> argparse.ArgumentParser:
     )
     return parser
 
+def get_repo_root():
+    """
+    Returns the repo root to use and if using non-default, it will modify $PYTHONPATH accordingly
+
+    Returns:
+        Path: the repo root path
+    """
+    if repo_root := get_automodel_repo_root():
+        new_pp = str(repo_root)
+        if 'PYTHONPATH' in os.environ:
+            new_pp += ':' + os.environ['PYTHONPATH']
+        os.environ["PYTHONPATH"] = new_pp
+        logging.info(f"Running job using source from: {repo_root}")
+    else:
+        repo_root = Path(__file__).parents[2]
+    return repo_root
+
+def run_interactive(args):
+    from torch.distributed.run import determine_local_world_size, get_args_parser
+    from torch.distributed.run import run as thrun
+
+    config_path = args.config.resolve()
+    repo_root = get_repo_root()
+    script_path = repo_root / "nemo_automodel" / "recipes" / args.domain / f"{args.command}.py"
+
+    # launch job on this node
+    num_devices = determine_local_world_size(nproc_per_node="gpu")
+    assert num_devices > 0, "Expected num-devices to be > 0"
+    if args.nproc_per_node == 1 or num_devices == 1:
+        logging.info("Launching job locally on a single device")
+        # run the job with a single rank on this process.
+        recipe_main = load_function(script_path, "main")
+        return recipe_main(config_path)
+    else:
+        logging.info(f"Launching job locally on {num_devices} devices")
+        # run the job on multiple ranks on this node.
+        torchrun_parser = get_args_parser()
+        torchrun_args = torchrun_parser.parse_args()
+        # overwrite the training script with the actual recipe path
+        torchrun_args.training_script = str(script_path)
+        # training_script_args=['finetune', '--config', 'examples/llm/llama_3_2_1b_squad.yaml']
+        # remove the command (i.e., "finetune") part.
+        torchrun_args.training_script_args.pop(0)
+        tmp = str(args.config)
+        for i in range(len(torchrun_args.training_script_args)):
+            if torchrun_args.training_script_args[i] == tmp:
+                torchrun_args.training_script_args[i] = str(config_path)
+                break
+        if args.nproc_per_node is None:
+            torchrun_args.nproc_per_node = num_devices
+        return thrun(torchrun_args)
 
 def main():
     """CLI for running finetune jobs with NeMo-Automodel, supporting torchrun, Slurm & Kubernetes.
@@ -225,45 +282,7 @@ def main():
         # launch job on kubernetes.
         raise NotImplementedError("kubernetes support is pending")
     else:
-        from torch.distributed.run import determine_local_world_size, get_args_parser
-        from torch.distributed.run import run as thrun
-
-        if repo_root := inside_automodel_repo_root():
-            new_pp = str(repo_root)
-            if 'PYTHONPATH' in os.environ:
-                new_pp += ':' + os.environ['PYTHONPATH']
-            os.environ["PYTHONPATH"] = new_pp
-            logging.info(f"Running job using source from: {repo_root}")
-        else:
-            repo_root = Path(__file__).parents[2]
-        script_path = repo_root / "nemo_automodel" / "recipes" / args.domain / f"{args.command}.py"
-
-        # launch job on this node
-        num_devices = determine_local_world_size(nproc_per_node="gpu")
-        assert num_devices > 0, "Expected num-devices to be > 0"
-        if args.nproc_per_node == 1 or num_devices == 1:
-            logging.info("Launching job locally on a single device")
-            # run the job with a single rank on this process.
-            recipe_main = load_function(script_path, "main")
-            return recipe_main(config_path)
-        else:
-            logging.info(f"Launching job locally on {num_devices} devices")
-            # run the job on multiple ranks on this node.
-            torchrun_parser = get_args_parser()
-            torchrun_args = torchrun_parser.parse_args()
-            # overwrite the training script with the actual recipe path
-            torchrun_args.training_script = str(script_path)
-            # training_script_args=['finetune', '--config', 'examples/llm/llama_3_2_1b_squad.yaml']
-            # remove the command (i.e., "finetune") part.
-            torchrun_args.training_script_args.pop(0)
-            tmp = str(args.config)
-            for i in range(len(torchrun_args.training_script_args)):
-                if torchrun_args.training_script_args[i] == tmp:
-                    torchrun_args.training_script_args[i] = str(config_path)
-                    break
-            if args.nproc_per_node is None:
-                torchrun_args.nproc_per_node = num_devices
-            return thrun(torchrun_args)
+        return run_interactive(args)
 
 
 if __name__ == "__main__":
