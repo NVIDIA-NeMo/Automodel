@@ -267,3 +267,20 @@ def test_repo_root_when_not_found(monkeypatch):
 
     # PYTHONPATH must remain unchanged
     assert os.environ["PYTHONPATH"] == "foo:bar"
+
+
+def test_repo_structure():
+    """
+    inside the nemo_automodel/_cli/app.py we assume a specific directory structure.
+    This test ensures the directory structure is preserved.
+    """
+    cwd = Path.cwd()
+    with pytest.raises(AssertionError):
+        assert (cwd / "nemo_automodel_abc").exists()
+    assert (cwd / "nemo_automodel").exists()
+    assert (cwd / "nemo_automodel" / "components").exists()
+    assert (cwd / "nemo_automodel" / "_cli").exists()
+    assert (cwd / "nemo_automodel" / "recipes").exists()
+    assert (cwd / "nemo_automodel" / "shared").exists()
+    assert (cwd / "docs").exists()
+    assert (cwd / "examples").exists()
