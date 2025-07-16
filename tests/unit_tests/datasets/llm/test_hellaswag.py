@@ -50,7 +50,7 @@ def _patch_external_libs(monkeypatch):
             return ds
 
     monkeypatch.setattr(
-        "nemo_automodel.datasets.utils.SFTSingleTurnPreprocessor",
+        "nemo_automodel.components.datasets.utils.SFTSingleTurnPreprocessor",
         _DummyPreprocessor,
         raising=False,
     )
@@ -60,7 +60,7 @@ def _patch_external_libs(monkeypatch):
 
 def test_dataset_basic():
     # Import after patching so the class sees the fakes
-    from nemo_automodel.datasets.llm.hellaswag import HellaSwag
+    from nemo_automodel.components.datasets.llm.hellaswag import HellaSwag
 
     dummy_tokenizer = object()
     ds = HellaSwag(path_or_dataset="ignored", tokenizer=dummy_tokenizer)
@@ -83,7 +83,7 @@ def test_dataset_basic():
 
 
 def test_sample_limiting():
-    from nemo_automodel.datasets.llm.hellaswag import HellaSwag
+    from nemo_automodel.components.datasets.llm.hellaswag import HellaSwag
 
     dummy_tokenizer = object()
     ds = HellaSwag(

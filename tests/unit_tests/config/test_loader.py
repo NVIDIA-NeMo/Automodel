@@ -21,7 +21,7 @@ from typing import Any
 
 import pytest
 
-from nemo_automodel.config.loader import (
+from nemo_automodel.components.config.loader import (
     ConfigNode,
     _resolve_target,
     load_module_from_file,

@@ -104,7 +104,7 @@ def collate_mod():
     Import the module under test fresh for every test so monkey-patching of
     module-level variables does not leak between tests.
     """
-    import nemo_automodel.datasets.vlm.collate_fns as _m
+    import nemo_automodel.components.datasets.vlm.collate_fns as _m
 
     # Always reload so each test starts from a clean module object.
     return importlib.reload(_m)
@@ -120,7 +120,7 @@ def patch_skipped(monkeypatch):
         return torch.tensor([SKIP_TOKEN])
 
     monkeypatch.setattr(
-        "nemo_automodel.datasets.vlm.collate_fns.extract_skipped_token_ids",
+        "nemo_automodel.components.datasets.vlm.collate_fns.extract_skipped_token_ids",
         _fake_skip_fn,
         raising=True,
     )
@@ -234,7 +234,7 @@ class TestCreateLossMaskWithStartOfResponseToken:
 
         # First occurrence at index 1, second occurrence at index 4
         # Response starts at index 4 + 3 - 1 = 6 (after the response token sequence)
-        expected = [0, 0, 0, 0, 0, 0, 0, 1, 1]
+        expected = [0, 0, 0, 0, 1, 1, 1, 1, 1]
         assert result == expected
 
     def test_start_of_response_token_found_only_once(self, collate_mod):
@@ -271,7 +271,7 @@ class TestCreateLossMaskWithStartOfResponseToken:
             input_ids, processor, start_of_response_token="<start_of_turn>model\n"
         )
 
-        expected = [0, 0, 0, 0, 0, 0, 0, 1, 1]
+        expected = [0, 0, 0, 0, 1, 1, 1, 1, 1]
         assert result == expected
 
     def test_single_token_response_marker(self, collate_mod):
@@ -284,7 +284,7 @@ class TestCreateLossMaskWithStartOfResponseToken:
         )
 
         # Response starts at index 4 + 1 - 1 = 4
-        expected = [0, 0, 0, 0, 0, 1, 1]
+        expected = [0, 0, 0, 0, 1, 1, 1]
         assert result == expected
 
     def test_padding_tokens_masked(self, collate_mod):
@@ -299,7 +299,7 @@ class TestCreateLossMaskWithStartOfResponseToken:
         )
 
         # Response starts at index 4 + 3 = 7, but padding tokens at end should be masked
-        expected = [0, 0, 0, 0, 0, 0, 0, 1, 0, 0]
+        expected = [0, 0, 0, 0, 1, 1, 1, 1, 0, 0]
         assert result == expected
 
     def test_padding_tokens_in_middle(self, collate_mod):
@@ -314,7 +314,7 @@ class TestCreateLossMaskWithStartOfResponseToken:
         )
 
         # Response starts at index 4 + 3 = 7, but padding token at index 2 should be masked
-        expected = [0, 0, 0, 0, 0, 0, 0, 1, 1]
+        expected = [0, 0, 0, 0, 1, 1, 1, 1, 1]
         assert result == expected
 
     def test_custom_pad_token_id(self, collate_mod):
@@ -329,7 +329,7 @@ class TestCreateLossMaskWithStartOfResponseToken:
         )
 
         # Response starts at index 4 + 3 = 7, but padding tokens at end should be masked
-        expected = [0, 0, 0, 0, 0, 0, 0, 1, 0, 0]
+        expected = [0, 0, 0, 0, 1, 1, 1, 1, 0, 0]
         assert result == expected
 
 
@@ -391,8 +391,8 @@ class TestCollateFunctionIntegration:
 
         expected = torch.tensor(
             [
-                [0, 0, 0, 0, 0, 0, 0, 1, 0],  # Padding token at end is masked
-                [0, 0, 0, 0, 0, 0, 0, 1, 1],  # No padding tokens
+                [0, 0, 0, 0, 1, 1, 1, 1, 0],  # Padding token at end is masked
+                [0, 0, 0, 0, 1, 1, 1, 1, 1],  # No padding tokens
             ],
             dtype=torch.float,
             device=batch_input_ids.device,
@@ -420,7 +420,7 @@ class TestCollateFunctionIntegration:
 
         expected = torch.tensor(
             [
-                [0, 0, 0, 0, 0, 0, 0, 1, 1],  # Valid response start at position 4
+                [0, 0, 0, 0, 1, 1, 1, 1, 1],  # Valid response start at position 4
                 [1, 1, 1, 1, 1, 1, 1, 1, 1],  # No masking (all 1s)
             ],
             dtype=torch.float,
