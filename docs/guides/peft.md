@@ -19,9 +19,9 @@ achieving performance comparable to full fine-tuning.
 This guide offers a comprehensive overview of fine-tuning models
 available on the Hugging Face Hub using NeMo AutoModel. In addition to
 fine-tuning, it illustrates how effortlessly you can generate text with
-the trained adapters, evaluate model performance with the LM Eval
-Harness, publish your adapters to the Hugging Face Model Hub, and export
-them to vLLM for seamless deployment.
+the trained adapters, evaluate model performance with the [LM Eval Harness](https://github.com/EleutherAI/lm-evaluation-harness),
+publish your adapters to the Hugging Face Model Hub, and export
+them to [vLLM](https://docs.vllm.ai/en/latest/) for seamless deployment.
 
 <!-- In addition to this user guide, you can also explore our Quickstart,
 which features a [standalone Python3
