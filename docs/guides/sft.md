@@ -310,7 +310,7 @@ huggingface-cli login
 ```
 
 3.  Upload the fine-tuned checkpoint using the
-    [huggingface_hub]{.title-ref} Python API:
+    [huggingface_hub](https://github.com/huggingface/huggingface_hub) Python API:
 
 ``` python
 from huggingface_hub import HfApi
@@ -364,7 +364,7 @@ python3 -m lm_eval --model hf \
 ```
 
 This command will run lm_eval on hellaswag using NeMo
-AutoModel-finetuned checkpoint of [meta-llama/Llama-3.2-1B]{.title-ref}.
+AutoModel-finetuned checkpoint of [meta-llama/Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B).
 
 Before running this command, make sure you have specified the checkpoint
 path that you used during fine-tuning, we will use
@@ -380,7 +380,7 @@ inference while maintaining model accuracy.
 
 NeMo AutoModel provides support for exporting a fine-tuned checkpoint
 for use with vLLM, enabling optimized inference without requiring model
-architecture changes. The [vLLMHFExporter]{.title-ref} utility
+architecture changes. The [vLLMHFExporter](https://github.com/NVIDIA/NeMo/blob/main/nemo/export/vllm_hf_exporter.py)  utility
 facilitates this process, ensuring compatibility with Hugging Face-based
 models.
 
