@@ -1,13 +1,14 @@
 # 🤖 Install NeMo Automodel
 
-NeMo Automodel support LLM, VLM, and OMNI models. Depending on your use case, there are several ways to install it.
+NeMo Automodel support LLM, VLM, and OMNI models. Depending on your use case, there are several ways to install it:
 
-Automodel can be installed with one of the following ways:
-- 📦 Install via PyPI
-- 🐍 Install via GitHub (pip or uv)
-- 🚀 Run Directly from Git Repo
-- 🐳 Mount Repo into NeMo Docker Container
-- 🧪 (Optional) Advanced: Editable Install or Dev Mode
+| Method                             | Use Case                                                          | Recommended For              |
+| ---------------------------------- | ----------------------------------------------------------------- | ---------------------------- |
+| 📦 **PyPI**                        | Install stable release with minimal setup                         | Most users, production usage |
+| 🐍 **GitHub (pip or uv)**          | Use the latest code without cloning or installing extras manually | Power users, testers         |
+| 🧪 **Editable Install (Dev Mode)** | Contribute to the codebase or make local modifications            | Contributors, researchers    |
+| 🐳 **Docker + (optional) Mount**   | Use in isolated GPU environments, e.g., with NeMo container       | Multinode deployments     |
+
 
 ---
 
@@ -52,22 +53,6 @@ pip3 install -e .
 
 > [!NOTE]
 > 🛠️ This installs AutoModel in editable mode, so changes to the code are immediately reflected in Python.
-
-
-
-## Run Without Installing
-You can also use the repo directly **without** installing it:
-```bash
-
-git clone https://github.com/NVIDIA-NeMo/AutoModel.git
-cd AutoModel
-
-# Run your Python script by setting PYTHONPATH
-PYTHONPATH=$(pwd) python3 examples/example_load_model.py
-```
-> [!WARNING]
-> This does not installa any dependencies and is only recommended for advanced users.
-> Useful for quick testing, but dependency resolution is left to the user.
 
 
 ## 🐳 Mount the Repo into a NeMo Docker Container
