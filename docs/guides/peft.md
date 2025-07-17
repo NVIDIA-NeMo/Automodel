@@ -68,8 +68,7 @@ page shows a "Request access" or "Agree and access" button:
 1.  Log in with your Hugging Face account.
 2.  Click the button and accept the license terms.
 3.  Wait for approval (usually instant; occasionally manual).
-4.  Ensure the token you pass to your script (via [huggingface-cli
-    login]{.title-ref} or the \$\$HF_TOKEN\$\$ environment variable)
+4.  Ensure the token you pass to your script (via `huggingface-cli login` or the \$\$HF_TOKEN\$\$ environment variable)
     belongs to the account that was approved.
 
 Trying to pull a gated model without an authorized token will trigger a
@@ -297,7 +296,7 @@ pip3 install huggingface_hub
 huggingface-cli login
 ```
 
-3.  Upload the PEFT adapter using the [huggingface_hub]{.title-ref}
+3.  Upload the PEFT adapter using the [huggingface_hub](https://github.com/huggingface/huggingface_hub)
     Python API:
 
 ``` python
@@ -351,8 +350,7 @@ python3 -m lm_eval --model hf \
     --batch_size 8
 ```
 
-This command will run lm_eval on hellaswag using
-[meta-llama/Llama-3.2-1B]{.title-ref} and the NeMo AutoModel-trained HF
+This command will run lm_eval on hellaswag using [meta-llama/Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B) and the NeMo AutoModel-trained HF
 adapters.
 
 ## Export to vLLM
@@ -365,7 +363,7 @@ inference while maintaining model accuracy.
 
 NeMo AutoModel provides support for exporting PEFT adapters for use with
 vLLM, enabling optimized inference without requiring model architecture
-changes. The [vLLMHFExporter]{.title-ref} utility facilitates this
+changes. The [vLLMHFExporter](https://github.com/NVIDIA/NeMo/blob/main/nemo/export/vllm_hf_exporter.py) utility facilitates this
 process, ensuring compatibility with Hugging Face-based models.
 
 The following script demonstrates how to export a PEFT adapter for vLLM,
@@ -393,5 +391,5 @@ if __name__ == '__main__':
     exporter.export(model=args.model, enable_lora=True)
     exporter.add_lora_models(lora_model_name=lora_model_name, lora_model=args.lora_model)
 
-    print("vLLM Output: ", exporter.forward(input_texts=["How are you doing?"], lora_model_name=lora_model_name)
+    print("vLLM Output: ", exporter.forward(input_texts=["How are you doing?"], lora_model_name=lora_model_name))
 ```
