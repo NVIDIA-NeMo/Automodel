@@ -27,18 +27,62 @@ checkpoints, evaluate performance using the LM Eval Harness, share your
 models on the Hugging Face Model Hub, and deploy them efficiently with
 vLLM.
 
-In addition to this user guide, you can also explore our Quickstart,
+<!-- In addition to this user guide, you can also explore our Quickstart,
 which features a [standalone python3
 recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py),
-offering hands-on demonstrations for quickly getting started with NeMo AutoModel.
+offering hands-on demonstrations for quickly getting started with NeMo AutoModel. -->
 
 ## Run SFT with NeMo AutoModel
 
-Below are three examples of running a simple SFT training loop for the
-`Llama 3.2 1B` model using NeMo AutoModel. Once you
-have set up your environment following the instructions in
-[`Automodel installation guide`](installation.md), you are ready to
-run the simple PEFT tuning script.
+### Prerequisites: install NeMo Automodel
+Before proceeding with this guide, please ensure that you have NeMo Automodel installed on your
+machine. This can be achieved by running:
+```bash
+pip3 install nemo-automodel
+```
+For a complete guide and additional options please consult the [`Automodel installation guide`](installation.md).
+
+### Background
+In this guide, we will fine-tune Meta’s `LLaMA 3.2 1B` model on the popular [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/) (Stanford Question Answering Dataset).
+
+#### 🔍 About LLaMA 3.2 1B
+LLaMA (Large Language Model Meta AI) is a family of decoder-only transformer models developed by Meta. The LLaMA 3.2 1B variant is a compact, lightweight model ideal for research and edge deployment. Despite its size, it maintains architectural features consistent with its larger siblings:
+
+- Decoder-only architecture: Follows a GPT-style, autoregressive design—optimized for generation tasks.
+
+- Rotary positional embeddings (RoPE): Efficient and extendable positional encoding technique.
+
+- Grouped-query attention (GQA): Enhances scalability by decoupling key/value heads from query heads.
+
+- SwiGLU activation: A variant of the GLU activation, offering improved convergence and expressiveness.
+
+- Multi-layer residual connections: Enhances training stability and depth scaling.
+
+These design choices make LLaMA models highly competitive across various benchmarks, and their open weights make them a strong base for task-specific fine-tuning.
+
+#### 📚 About SQuAD
+SQuAD is a benchmark dataset for machine reading comprehension. Each example consists of a passage from Wikipedia, a question, and the answer—a span of text from the passage. It's designed to test a model’s ability to understand and extract factual information from unstructured text.
+
+There are two major versions:
+
+- SQuAD v1.1: All answers are guaranteed to be present in the context.
+
+- SQuAD v2.0: Introduces unanswerable questions, adding complexity and realism.
+
+In this tutorial, we’ll focus on SQuAD v1.1, which is more suitable for straightforward supervised fine-tuning without requiring additional handling of null answers.
+
+Here’s a glimpse of what the data looks like:
+``` json
+{
+  "context": "The Eiffel Tower is a wrought-iron lattice tower on the Champ de Mars in Paris, France.",
+  "question": "Where is the Eiffel Tower located?",
+  "answer_text": "on the Champ de Mars in Paris, France",
+  "answer_start": 41
+}
+```
+This structure is ideal for training models in extractive question answering, where the model learns to locate the answer span within a passage.
+
+
 
 > [!TIP]
 > In this guide, `meta-llama/Llama-3.2-1B` is used only as a placeholder
