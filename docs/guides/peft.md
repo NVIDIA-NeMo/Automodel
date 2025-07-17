@@ -123,6 +123,28 @@ training and saving the finetunine model checkpoint. The recipe can be configure
 as shown next.
 
 ``` yaml
+# The model section is responsible for configuring the model we want to finetune.
+# Since we want to use the Llama 3 1B model, we pass `meta-llama/Llama-3.2-1B` to the
+# `pretrained_model_name_or_path` option.
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+
+# As mentioned earlier, we are using the SQuAD dataset. NeMo Automodel provides the make_squad_dataset
+# function which formats the prepares the dataset (e.g., formatting). We are using the "train"
+# split for training.
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: train
+
+# Similarly, for validation we use the "validation" split, and limit the number of samples to 64.
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: validation
+  limit_dataset_samples: 64
+
 step_scheduler:
   grad_acc_steps: 4
   ckpt_every_steps: 1000
@@ -138,10 +160,7 @@ rng:
   seed: 1111
   ranked: true
 
-model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
-
+# For distributed processing, we will FSDP2.
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: none
@@ -151,31 +170,19 @@ distributed:
 
 loss_fn: nemo_automodel.components.loss.masked_ce.masked_cross_entropy
 
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
-  split: train
-
-packed_sequence:
-  packed_sequence_size: 0
-
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
   batch_size: 8
   shuffle: false
 
-validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
-  split: validation
-  limit_dataset_samples: 64
-
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
   batch_size: 8
 
+# We will use the standard Adam optimizer, but you can specify any optimizer you want, by changing
+# the import path using the _target_ option.
 optimizer:
   _target_: torch.optim.Adam
   betas: [0.9, 0.999]
@@ -196,18 +203,6 @@ optimizer:
 > adapter checkpoint only contains the adapter weights. As a result, when
 > running inference, the adapter and base model weights need to match
 > those used for training.
-
-
-> [!TIP]
-> In the above example, we used the FSDP2 strategy with 8 GPUs. Depending
-> on the size of your model, you may need to adjust the number of GPUs or
-> use a different strategy.
-
-
-> [!NOTE]
-> The FSDP2Strategy is introduced in NeMo\'s lightning strategy and
-> requires an active NeMo installation. See the NeMo documentation for
-> installation details.
 
 
 ## Run the recipe directly
