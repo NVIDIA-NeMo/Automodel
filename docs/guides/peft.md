@@ -45,48 +45,36 @@ have set up your environment following the instructions in
 `install-nemo-framework`{.interpreted-text role="ref"}, you are ready to
 run the simple PEFT tuning script.
 
-::: hint
-::: title
-Hint
-:::
+> [!TIP]
+> In this guide, "meta-llama/Llama-3.2-1B" is used only as a placeholder
+> model ID. You can replace it with any valid Hugging Face model ID, such
+> as "Qwen/Qwen2.5-1.5B\", or any other checkpoint you have access to on
+> the Hugging Face Hub.
 
-In this guide, "meta-llama/Llama-3.2-1B" is used only as a placeholder
-model ID. You can replace it with any valid Hugging Face model ID, such
-as "Qwen/Qwen2.5-1.5B\", or any other checkpoint you have access to on
-the Hugging Face Hub.
-:::
+> [!IMPORTANT]
+> Some Hugging Face model repositories are **gated**---you must explicitly
+> request permission before you can download their files. If the model
+> page shows a "Request access" or "Agree and access" button:
+>
+> 1.  Log in with your Hugging Face account.
+> 2.  Click the button and accept the license terms.
+> 3.  Wait for approval (usually instant; occasionally manual).
+> 4.  Ensure the token you pass to your script (via `huggingface-cli login` or the \$\$HF_TOKEN\$\$ environment variable)
+>    belongs to the account that was approved.
+>
+> Trying to pull a gated model without an authorized token will trigger a 403 "permission denied" error.
 
-::: tip
-::: title
-Tip
-:::
 
-Some Hugging Face model repositories are **gated**---you must explicitly
-request permission before you can download their files. If the model
-page shows a "Request access" or "Agree and access" button:
-
-1.  Log in with your Hugging Face account.
-2.  Click the button and accept the license terms.
-3.  Wait for approval (usually instant; occasionally manual).
-4.  Ensure the token you pass to your script (via `huggingface-cli login` or the \$\$HF_TOKEN\$\$ environment variable)
-    belongs to the account that was approved.
-
-Trying to pull a gated model without an authorized token will trigger a
-403 "permission denied" error.
-:::
-
-::: tab-set
-::: tab-item
-NeMo-Run Recipes
+## NeMo-Run Recipes
 
 The easiest way to run PEFT training is with the recipe files. You can
 find the list of supported models and their predefined recipes
 [here](https://github.com/NVIDIA/NeMo/tree/main/nemo/collections/llm/recipes).
 
-> [!NOTE]
+<!-- > [!NOTE]
 > **Prerequisite**: Before proceeding, please follow the example in
 > `nemo-2-quickstart-nemo-run`{.interpreted-text role="ref"} to
-> familiarize yourself with NeMo-Run first.
+> familiarize yourself with NeMo-Run first. -->
 
 ``` python
 from nemo.collections import llm
