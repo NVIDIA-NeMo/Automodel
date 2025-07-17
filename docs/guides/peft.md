@@ -32,6 +32,8 @@ offering hands-on demonstrations for quickly getting started with NeMo
 AutoModel. -->
 
 
+In this guide, we will fine-tune Meta’s `LLaMA 3.2 1B` model on the popular [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/) (Stanford Question Answering Dataset).
+
 ## 🔍 About LLaMA 3.2 1B
 **LLaMA** is a family of decoder-only transformer models developed by Meta. The **LLaMA 3.2 1B** variant is a compact, lightweight model ideal for research and edge deployment. Despite its size, it maintains architectural features consistent with its larger siblings:
 
@@ -110,9 +112,6 @@ machine. This can be achieved by running:
 pip3 install nemo-automodel
 ```
 For a complete guide and additional options please consult the Automodel [installation guide](installation.md).
-
-### Model and Dataset Context
-In this guide, we will fine-tune Meta’s `LLaMA 3.2 1B` model on the popular [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/) (Stanford Question Answering Dataset).
 
 ### Finetune recipe and configuration
 This example uses the LLM [finetune
