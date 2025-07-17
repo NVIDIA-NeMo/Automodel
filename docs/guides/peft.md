@@ -121,7 +121,7 @@ Specifically, we use the LLM [finetune recipe](https://github.com/NVIDIA-NeMo/Au
 #### 🧠 What is a Recipe?
 
 A recipe in NeMo Automodel is a **self-contained orchestration module** that wires together all
-components needed to perform a specific task—like fine-tuning for next-token prediction or instruction tuning.
+components needed to perform a specific task (e.g., fine-tuning for next-token prediction or instruction tuning).
 Think of it as the equivalent of a Trainer class, but highly modular, stateful, and reproducible.
 
 The `FinetuneRecipeForNextTokenPrediction` class is one such recipe. It inherits from `BaseRecipe` and implements:
