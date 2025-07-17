@@ -25,9 +25,9 @@ import torch
 import torch.distributed
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
-from transformers import PreTrainedTokenizer
 from safetensors import safe_open
 from safetensors.torch import save_file
+from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
@@ -68,7 +68,7 @@ def save_model(
     weights_path: str,
     checkpoint_config: CheckpointingConfig,
     peft_config: Optional["PeftConfig"] = None,
-    tokenizer: Optional[PreTrainedTokenizer] = None,
+    tokenizer: Optional[PreTrainedTokenizerBase] = None,
 ):
     """
     Save a model state dictionary to a weights path.
@@ -102,7 +102,7 @@ def save_model(
             # save the config.json file
             with open(os.path.join(consolidated_model_path, "config.json"), "w") as f:
                 f.write(model.config.to_json_string())
-            
+
             # save the tokenizer
             if tokenizer is not None:
                 tokenizer.save_pretrained(consolidated_model_path)
@@ -147,7 +147,6 @@ def save_model(
             consolidated_output_path=consolidated_model_path,
             fqn_to_index_mapping=fqn_to_file_index_mapping,
         )
-        breakpoint()
         dcp.save(
             model_state.state_dict(),
             checkpoint_id=model_path,
@@ -163,7 +162,7 @@ def load_model(
     model: torch.nn.Module,
     weights_path: str,
     checkpoint_config: CheckpointingConfig,
-) -> Optional[PreTrainedTokenizer]:
+) -> Optional[PreTrainedTokenizerBase]:
     """
     Load a model state dictionary from a weights path.
 

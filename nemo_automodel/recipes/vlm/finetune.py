@@ -70,7 +70,6 @@ def build_model_and_optimizer(
     """Build and initialize a model for VLM."""
     with StatefulRNG(seed=seed, ranked=True):
         model = cfg_model.instantiate()
-        breakpoint()
 
         if cfg_freeze is not None:
             apply_parameter_freezing(model, cfg_freeze)

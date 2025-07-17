@@ -19,9 +19,8 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
-
-from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 from transformers.processing_utils import ProcessorMixin
+from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 from nemo_automodel.components.checkpoint.checkpointing import (
     load_model,
@@ -45,6 +44,7 @@ def has_load_restore_state(object):
     """
     return all(callable(getattr(object, attr, None)) for attr in ("load_state_dict", "state_dict"))
 
+
 def is_tokenizer(object):
     """
     Checks whether object is a tokenizer or VLM processor.
@@ -55,7 +55,8 @@ def is_tokenizer(object):
     Returns:
         bool: returns True if object is a tokenizer or VLM processor.
     """
-    return isinstance(object, (PreTrainedTokenizer, PreTrainedTokenizerFast, ProcessorMixin))
+    return isinstance(object, (PreTrainedTokenizerBase, ProcessorMixin))
+
 
 class BaseRecipe:
     """
