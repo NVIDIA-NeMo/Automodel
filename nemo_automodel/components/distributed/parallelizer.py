@@ -49,6 +49,40 @@ except:
     pass
 
 
+def import_class_from_path(name: str) -> Any:
+    """Import a class from a string path (e.g. 'torch.optim.AdamW').
+
+    Args:
+        full_path: Full path to class including module path and class name
+
+    Returns:
+        The imported class object
+    """
+    module_name, cls_name = name.rsplit(".", 1)
+    cls_instance = getattr(importlib.import_module(module_name), cls_name)
+    return cls_instance
+
+
+def import_classes_from_paths(class_paths: List[str]):
+    """
+    Helper function to import classes from string paths.
+    
+    Args:
+        class_paths (List[str]): The list of string paths to the classes.
+    
+    Returns:
+        List of imported classes.
+    """
+    classes = []
+    for path in class_paths:
+        try:
+            cls = import_class_from_path(path)
+            classes.append(cls)
+        except Exception as e:
+            print(f"Warning: Could not import class from path '{path}': {e}")
+    return classes
+
+
 @lru_cache
 def translate_parallel_style(style: str):
     """Translate parallel style str to parallel type.
@@ -93,7 +127,7 @@ def get_hf_tp_shard_plan(model):
         AssertionError: If no TP plan is found
     """
     model_cls = type(model)
-    if model_cls == Gemma3ForConditionalGeneration:
+    if isinstance(model, Gemma3ForConditionalGeneration):
         inner_model = model.language_model
         model_prefix = "language_model"
     else:
@@ -140,23 +174,6 @@ def get_hf_tp_shard_plan(model):
             hf_tp_plan[k] = translate_parallel_style(v)
 
     return hf_tp_plan
-
-
-
-
-
-def import_class_from_path(name: str) -> Any:
-    """Import a class from a string path (e.g. 'torch.optim.AdamW').
-
-    Args:
-        full_path: Full path to class including module path and class name
-
-    Returns:
-        The imported class object
-    """
-    module_name, cls_name = name.rsplit(".", 1)
-    cls_instance = getattr(importlib.import_module(module_name), cls_name)
-    return cls_instance
 
 
 def nvfsdp_strategy_parallelize(
@@ -282,9 +299,6 @@ def nvfsdp_strategy_parallelize(
     )
 
     return model, optimizer
-
-
-
 
 
 def to_cpu(v):
@@ -414,7 +428,7 @@ def fsdp2_strategy_parallelize(
 
     # Get model layers for later use
     model_cls = type(model)
-    if model_cls.__name__ == "Gemma3ForConditionalGeneration":
+    if isinstance(model, Gemma3ForConditionalGeneration):
         layers = model.language_model.layers
         num_attention_heads = model.config.text_config.num_attention_heads
         num_key_value_heads = model.config.text_config.num_key_value_heads
@@ -535,23 +549,4 @@ def fsdp2_strategy_parallelize(
     )
 
     return model
-
-def import_classes_from_paths(class_paths: List[str]):
-    """
-    Helper function to import classes from string paths.
-    
-    Args:
-        class_paths (List[str]): The list of string paths to the classes.
-    
-    Returns:
-        List of imported classes.
-    """
-    classes = []
-    for path in class_paths:
-        try:
-            cls = import_class_from_path(path)
-            classes.append(cls)
-        except Exception as e:
-            print(f"Warning: Could not import class from path '{path}': {e}")
-    return classes
 
