@@ -46,20 +46,20 @@ have set up your environment following the instructions in
 run the simple PEFT tuning script.
 
 > [!TIP]
-> In this guide, "meta-llama/Llama-3.2-1B" is used only as a placeholder
+> In this guide, `meta-llama/Llama-3.2-1B` is used only as a placeholder
 > model ID. You can replace it with any valid Hugging Face model ID, such
-> as "Qwen/Qwen2.5-1.5B\", or any other checkpoint you have access to on
+> as `Qwen/Qwen2.5-1.5B`, or any other checkpoint you have access to on
 > the Hugging Face Hub.
 
 > [!IMPORTANT]
-> Some Hugging Face model repositories are **gated**---you must explicitly
+> Some Hugging Face model repositories are **gated**, you must explicitly
 > request permission before you can download their files. If the model
 > page shows a "Request access" or "Agree and access" button:
 >
 > 1.  Log in with your Hugging Face account.
 > 2.  Click the button and accept the license terms.
 > 3.  Wait for approval (usually instant; occasionally manual).
-> 4.  Ensure the token you pass to your script (via `huggingface-cli login` or the \$\$HF_TOKEN\$\$ environment variable)
+> 4.  Ensure the token you pass to your script (via `huggingface-cli login` or the `$HF_TOKEN` environment variable)
 >    belongs to the account that was approved.
 >
 > Trying to pull a gated model without an authorized token will trigger a 403 "permission denied" error.
