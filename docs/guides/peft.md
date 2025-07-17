@@ -144,6 +144,14 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
 
+# The PEFT configuration
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: "*.proj" # will match all linear layers with ".proj" in their FQN
+  dim: 8  # the low-rank dimension of the adapters.
+  alpha: 32  # scales the learned weights
+  use_triton: True  # enabled optimized LoRA kernel written in triton-lang
+
 # As mentioned earlier, we are using the SQuAD dataset. NeMo Automodel provides the make_squad_dataset
 # function which formats the prepares the dataset (e.g., formatting). We are using the "train"
 # split for training.
