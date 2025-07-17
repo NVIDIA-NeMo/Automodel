@@ -34,7 +34,7 @@ from nemo_automodel.components.checkpoint._backports.hf_storage import (
     _HuggingFaceStorageWriter,
     get_fqn_to_file_index_mapping,
 )
-from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
+from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState, _get_lm_head_weight_and_name
 
 if TYPE_CHECKING:
     from peft import PeftConfig
@@ -118,16 +118,20 @@ def save_model(
                 checkpoint_config.model_repo_id,
             )
             if index_path:
-                fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(index_path)
+                # HF VLM models may contain a special checkpoint mapping attribute
+                fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(
+                    index_path, getattr(model, "_checkpoint_conversion_mapping", None)
+                )
 
                 # Add any missing keys from the model_state_dict
                 # These will go to the same file as the last file (or file 1 for single-file models)
                 default_index = max(fqn_to_file_index_mapping.values())
 
                 # TODO:(@adil-a): This will need to change when we add PP. Maybe we can cache the keys in ModelState.
+                lm_head_name = _get_lm_head_weight_and_name(model)[1]
                 for fqn in list(model.state_dict().keys()):
                     if fqn not in fqn_to_file_index_mapping:
-                        if model_state.is_tied_lm_head and fqn == "lm_head.weight":
+                        if model_state.is_tied_lm_head and fqn == lm_head_name:
                             continue
                         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                             print(f"Adding missing key to mapping: {fqn}")
