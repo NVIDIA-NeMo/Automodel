@@ -16,11 +16,6 @@ while keeping the base model weights frozen. This approach reduces the
 number of trainable parameters, often to less than 1%, while
 achieving performance comparable to full fine-tuning.
 
-NeMo AutoModel integrates seamlessly with Hugging Face Transformers,
-providing day-0 support without requiring any checkpoint conversion. All
-model checkpoints remain in the Hugging Face format, ensuring
-compatibility and ease of use.
-
 This guide offers a comprehensive overview of fine-tuning models
 available on the Hugging Face Hub using NeMo AutoModel. In addition to
 fine-tuning, it illustrates how effortlessly you can generate text with
