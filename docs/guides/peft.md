@@ -227,7 +227,11 @@ optimizer:
 > those used for training.
 
 
-## Run the recipe with Automodel CLI
+## Run the recipe
+Assuming the above `yaml` is saved in a file named "peft_guide.yaml", we can run the finetune workflow
+with either the automodel CLI or by invoking the recipe python script directrly.
+
+### Automodel CLI
 
 You can use PEFT recipes via the NeMo-Run CLI (See [NeMo-Run\'s
 docs](https://github.com/NVIDIA/NeMo-Run) for more details). LoRA are
@@ -237,17 +241,17 @@ training jobs when you do not need to override any configuration from
 the default recipes.
 
 ``` bash
-automodel finetune llm -c examples/llm/llama_3_2_1b_squad.yaml
+automodel finetune llm -c peft_guide.yaml
 ```
 
-## Run the recipe script directly
+### Invoking the recipe script directly
 
 The easiest way to run PEFT training is with the recipe files. You can
 find the list of supported models and their predefined recipes
 [here](https://github.com/NVIDIA/NeMo/tree/main/nemo/collections/llm/recipes).
 
 ``` bash
-torchrun --nproc-per-node=8 examples/llm/finetune.py --config examples/llm/llama_3_2_1b_squad.yaml
+torchrun --nproc-per-node=8 examples/llm/finetune.py --config peft_guide.yaml
 ```
 
 
