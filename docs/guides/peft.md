@@ -65,7 +65,7 @@ run the simple PEFT tuning script.
 > Trying to pull a gated model without an authorized token will trigger a 403 "permission denied" error.
 
 
-## NeMo-Run Recipes
+## Automodel CLI
 
 The easiest way to run PEFT training is with the recipe files. You can
 find the list of supported models and their predefined recipes
@@ -104,10 +104,8 @@ recipe.peft.alpha = 32
 
 run.run(recipe)
 ```
-:::
 
-::: tab-item
-NeMo-Run CLI
+### NeMo-Run CLI
 
 You can use PEFT recipes via the NeMo-Run CLI (See [NeMo-Run\'s
 docs](https://github.com/NVIDIA/NeMo-Run) for more details). LoRA are
@@ -119,10 +117,8 @@ the default recipes.
 ``` bash
 nemo llm finetune -f hf_auto_model_for_causal_lm model_name="meta-llama/Llama-3.2-1B" peft=lora  # acceptable values are lora/none
 ```
-:::
 
-::: tab-item
-llm.finetune API
+### llm.finetune API
 
 This example uses the [finetune
 API](https://github.com/NVIDIA/NeMo/blob/main/nemo/collections/llm/api.py)
