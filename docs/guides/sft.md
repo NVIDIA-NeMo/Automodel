@@ -34,13 +34,16 @@ offering hands-on demonstrations for quickly getting started with NeMo AutoModel
 
 ## Run SFT with NeMo AutoModel
 
-### Prerequisites: install NeMo Automodel
-Before proceeding with this guide, please ensure that you have NeMo Automodel installed on your
-machine. This can be achieved by running:
-```bash
-pip3 install nemo-automodel
-```
-For a complete guide and additional options please consult the [`Automodel installation guide`](installation.md).
+In this guide, we will run supervised fine-tuning (SFT) on Meta’s `LLaMA 3.2 1B` model with
+the popular [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/) (Stanford Question Answering Dataset).
+
+> [!IMPORTANT]
+> Before proceeding with this guide, please ensure that you have NeMo Automodel installed on your
+> machine. This can be achieved by running:
+> ```bash
+> pip3 install nemo-automodel
+> ```
+> For a complete guide and additional options please consult the Automodel [installation guide](installation.md).
 
 ### Model and Dataset Context
 In this guide, we will fine-tune Meta’s `LLaMA 3.2 1B` model on the popular [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/) (Stanford Question Answering Dataset).
