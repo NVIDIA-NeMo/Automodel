@@ -199,7 +199,7 @@ uv run torchrun --nproc-per-node=2 examples/llm/finetune.py --step_scheduler.ckp
 ...
 ```
 
-## Saving Additional States
+## Advanced: Saving Additional States
 You can also save additional states in NeMo AutoModel. By default, we also automatically checkpoint the `dataloader`, `rng`, and `step_scheduler` states which are necessary to resume training accurately. In full, a Safetensors consolidated checkpoint will look like this:
 
 ```
