@@ -22,6 +22,7 @@ from unittest import mock
 
 import pytest
 import yaml
+import os
 
 sys.modules["nemo_run"] = mock.MagicMock()
 
@@ -100,8 +101,8 @@ def test_launch_with_slurm(monkeypatch):
     fake_executor = mock.MagicMock()
     fake_exp = mock.MagicMock()
     dummy_args = SimpleNamespace(
-        command="finetune",
         domain="llm",
+        command="finetune",
     )
     monkeypatch.setattr(module, "load_yaml", lambda x: {"slurm": mock_slurm_config})
     monkeypatch.setitem(
@@ -149,7 +150,7 @@ def test_launch_with_slurm(monkeypatch):
 def test_main_single_node(monkeypatch, tmp_yaml_file):
     config_path = tmp_yaml_file
 
-    monkeypatch.setattr("sys.argv", ["prog", "llm", "finetune", "-c", str(config_path)])
+    monkeypatch.setattr("sys.argv", ["prog", "finetune", "llm", "-c", str(config_path)])
     monkeypatch.setattr(module, "load_yaml", lambda x: {})
     import torch.distributed.run as thrun
     monkeypatch.setattr(thrun, "determine_local_world_size", lambda **kwargs: 1)
@@ -169,7 +170,7 @@ def test_main_multi_node(monkeypatch, tmp_yaml_file):
     config_path = tmp_yaml_file
 
     # Simulate CLI args using sys.argv
-    monkeypatch.setattr("sys.argv", ["prog", "llm", "finetune", "-c", str(config_path)])
+    monkeypatch.setattr("sys.argv", ["prog", "finetune", "llm", "-c", str(config_path)])
 
     monkeypatch.setattr(module, "load_yaml", lambda x: {})
     run_mod = importlib.import_module("torch.distributed.run")
@@ -204,7 +205,7 @@ def test_main_k8s_not_implemented(monkeypatch, tmp_yaml_file):
         parser.set_defaults(config=str(config_path), domain="llm", command="finetune")
         return parser
 
-    monkeypatch.setattr("sys.argv", ["automodel", "llm", "finetune", "-c", str(config_path)])
+    monkeypatch.setattr("sys.argv", ["automodel", "finetune", "llm", "-c", str(config_path)])
     monkeypatch.setattr(module, "build_parser", custom_parser)
     monkeypatch.setattr(module, "load_yaml", lambda x: {"k8s": {}})
     monkeypatch.setattr(module.Path, "parents", [None, None, Path(__file__).parent])
@@ -228,3 +229,58 @@ def argparse_mock_parser():
             )
 
     return DummyParser()
+
+def test_repo_root_when_found(monkeypatch):
+    dummy_root = Path("/tmp/dummy_repo").resolve()
+
+    # Pretend an initial PYTHONPATH
+    monkeypatch.setenv("PYTHONPATH", "foo:bar")
+
+    # Force the helper to return our dummy path
+    monkeypatch.setattr(
+        module, "get_automodel_repo_root", lambda: dummy_root, raising=True
+    )
+
+    # Act
+    result = module.get_repo_root()
+
+    # Assert return value
+    assert result == dummy_root
+
+    # Assert PYTHONPATH was *prepended* with dummy_root and old entries kept
+    assert os.environ["PYTHONPATH"].split(":") == [str(dummy_root), "foo", "bar"]
+
+
+def test_repo_root_when_not_found(monkeypatch):
+    # Start from a known PYTHONPATH
+    monkeypatch.setenv("PYTHONPATH", "foo:bar")
+
+    # Make helper return None
+    monkeypatch.setattr(module, "get_automodel_repo_root", lambda: None, raising=True)
+
+    # Act
+    result = module.get_repo_root()
+
+    # Expected path = two parents up from the module's file
+    expected = Path(module.__file__).parents[2]
+    assert result == expected
+
+    # PYTHONPATH must remain unchanged
+    assert os.environ["PYTHONPATH"] == "foo:bar"
+
+
+def test_repo_structure():
+    """
+    inside the nemo_automodel/_cli/app.py we assume a specific directory structure.
+    This test ensures the directory structure is preserved.
+    """
+    cwd = Path.cwd()
+    with pytest.raises(AssertionError):
+        assert (cwd / "nemo_automodel_abc").exists()
+    assert (cwd / "nemo_automodel").exists()
+    assert (cwd / "nemo_automodel" / "components").exists()
+    assert (cwd / "nemo_automodel" / "_cli").exists()
+    assert (cwd / "nemo_automodel" / "recipes").exists()
+    assert (cwd / "nemo_automodel" / "shared").exists()
+    assert (cwd / "docs").exists()
+    assert (cwd / "examples").exists()
