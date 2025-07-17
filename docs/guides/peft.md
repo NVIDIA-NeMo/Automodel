@@ -113,14 +113,14 @@ This structure is ideal for training models in context-based question answering,
 > [!TIP]
 > In this guide, we use the `SQuAD v1.1` dataset, but you can specify your own data as needed.
 
+### Finetune recipe and configuration
+This example uses the LLM [finetune
+recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py),
+implemented with the `FinetuneRecipeForNextTokenPrediction` class.
 
-### Finetune recipe config
-
-This example uses the [finetune
-API](https://github.com/NVIDIA/NeMo/blob/main/nemo/collections/llm/api.py)
-from the NeMo Framework LLM collection. This is a lower-level API that
-allows you to lay out the various configurations in a Pythonic fashion.
-This gives you the greatest amount of control over each configuration.
+A recipe is orchestrates the full finetuning workflow, from instantiating the model and datasets, to
+training and saving the finetunine model checkpoint. The recipe can be configured with a yaml config,
+as shown next.
 
 ``` yaml
 step_scheduler:
