@@ -13,7 +13,7 @@ requiring significant hardware resources. To address this, PEFT
 techniques such as Low-Rank Adapters (LoRA) have emerged as a
 lightweight approach that updates only a small subset of parameters
 while keeping the base model weights frozen. This approach reduces the
-number of trainable parameters---often to less than 1%---while while
+number of trainable parameters, often to less than 1%, while
 achieving performance comparable to full fine-tuning.
 
 NeMo AutoModel integrates seamlessly with Hugging Face Transformers,
