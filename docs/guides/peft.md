@@ -31,20 +31,8 @@ Notebook](https://github.com/NVIDIA/NeMo/blob/main/tutorials/llm/automodel/peft.
 offering hands-on demonstrations for quickly getting started with NeMo
 AutoModel. -->
 
-## Run PEFT with NeMo AutoModel
 
-### Prerequisites: install NeMo Automodel
-Before proceeding with this guide, please ensure that you have NeMo Automodel installed on your
-machine. This can be achieved by running:
-```bash
-pip3 install nemo-automodel
-```
-For a complete guide and additional options please consult the Automodel [installation guide](installation.md).
-
-### Model and Dataset Context
-In this guide, we will fine-tune Meta’s `LLaMA 3.2 1B` model on the popular [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/) (Stanford Question Answering Dataset).
-
-#### 🔍 About LLaMA 3.2 1B
+## 🔍 About LLaMA 3.2 1B
 **LLaMA** is a family of decoder-only transformer models developed by Meta. The **LLaMA 3.2 1B** variant is a compact, lightweight model ideal for research and edge deployment. Despite its size, it maintains architectural features consistent with its larger siblings:
 
 - **Decoder-only architecture**: Follows a GPT-style, autoregressive design-optimized for generation tasks.
@@ -79,7 +67,7 @@ These design choices make LLaMA models highly competitive across various benchma
 > Trying to pull a gated model without an authorized token will trigger a 403 "permission denied" error.
 
 
-#### 📚 About SQuAD
+## 📚 About SQuAD
 Stanford Question Answering Dataset (SQuAD) is a **reading comprehension dataset**, consisting of questions posed by crowdworkers on a set of Wikipedia articles, where the answer to every question is a segment of text, or span, from the corresponding reading passage, or the question might be unanswerable.
 
 There are two major versions:
@@ -112,6 +100,19 @@ This structure is ideal for training models in context-based question answering,
 
 > [!TIP]
 > In this guide, we use the `SQuAD v1.1` dataset, but you can specify your own data as needed.
+
+## Run PEFT with NeMo AutoModel
+
+### Prerequisites: install NeMo Automodel
+Before proceeding with this guide, please ensure that you have NeMo Automodel installed on your
+machine. This can be achieved by running:
+```bash
+pip3 install nemo-automodel
+```
+For a complete guide and additional options please consult the Automodel [installation guide](installation.md).
+
+### Model and Dataset Context
+In this guide, we will fine-tune Meta’s `LLaMA 3.2 1B` model on the popular [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/) (Stanford Question Answering Dataset).
 
 ### Finetune recipe and configuration
 This example uses the LLM [finetune
