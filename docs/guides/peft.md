@@ -130,7 +130,7 @@ The `FinetuneRecipeForNextTokenPrediction` class is one such recipe. It inherits
 
 - `run_train_validation_loop()`: executes training + validation steps
 
-- Misc; Checkpoint handling, logging, and RNG setup.
+- Misc: Checkpoint handling, logging, and RNG setup.
 
 > [!NOTE]
 > Key Insight: The recipe ensures stateless config-driven orchestration, meaning no component is hardcoded: everything is loaded via Hydra-compatible `instantiate()` calls.
