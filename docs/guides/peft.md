@@ -34,7 +34,7 @@ AutoModel. -->
 
 In this guide, we will fine-tune Meta’s `LLaMA 3.2 1B` model on the popular [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/) (Stanford Question Answering Dataset).
 
-## 🔍 About LLaMA 3.2 1B
+## 🔍 LLaMA 3.2 1B Model
 **LLaMA** is a family of decoder-only transformer models developed by Meta. The **LLaMA 3.2 1B** variant is a compact, lightweight model ideal for research and edge deployment. Despite its size, it maintains architectural features consistent with its larger siblings:
 
 - **Decoder-only architecture**: Follows a GPT-style, autoregressive design-optimized for generation tasks.
@@ -69,7 +69,7 @@ These design choices make LLaMA models highly competitive across various benchma
 > Trying to pull a gated model without an authorized token will trigger a 403 "permission denied" error.
 
 
-## 📚 About SQuAD
+## 📚 SQuAD Dataset
 Stanford Question Answering Dataset (SQuAD) is a **reading comprehension dataset**, consisting of questions posed by crowdworkers on a set of Wikipedia articles, where the answer to every question is a segment of text, or span, from the corresponding reading passage, or the question might be unanswerable.
 
 There are two major versions:
