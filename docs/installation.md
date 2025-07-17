@@ -2,9 +2,16 @@
 
 NeMo Automodel support LLM, VLM, and OMNI models. Depending on your use case, there are several ways to install it.
 
+Automodel can be installed with one of the following ways:
+- 📦 Install via PyPI
+- 🐍 Install via GitHub (pip or uv)
+- 🚀 Run Directly from Git Repo
+- 🐳 Mount Repo into NeMo Docker Container
+- 🧪 (Optional) Advanced: Editable Install or Dev Mode
+
 ---
 
-## 📦 1. Install via PyPI (Recommended)
+## 📦 Install via PyPI (Recommended)
 
 For most users, the easiest way to get started is using `pip3`.
 
@@ -15,7 +22,7 @@ pip3 install nemo-automodel
 > This installs the latest stable release of nemo-automodel from PyPI along with all required dependencies.
 
 
-## 🐍 2. Install via GitHub (Source)
+## 🐍 Install via GitHub (Source)
 
 If you want the **latest features** from the `main` branch or want to contribute:
 
@@ -35,7 +42,7 @@ uv pip install git+https://github.com/NVIDIA-NeMo/AutoModel.git
 > `uv` handles virtual environment transparently and enables more reproducible installs.
 
 
-## 🧪 3. Developer Mode (Editable Install)
+## 🧪 Developer Mode (Editable Install)
 To contribute or modify the code:
 ```bash
 git clone https://github.com/NVIDIA-NeMo/AutoModel.git
@@ -48,7 +55,7 @@ pip3 install -e .
 
 
 
-## 4. Run Without Installing
+## Run Without Installing
 You can also use the repo directly **without** installing it:
 ```bash
 
@@ -63,7 +70,7 @@ PYTHONPATH=$(pwd) python3 examples/example_load_model.py
 > Useful for quick testing, but dependency resolution is left to the user.
 
 
-## 🐳 5. Mount the Repo into a NeMo Docker Container
+## 🐳 Mount the Repo into a NeMo Docker Container
 To run `AutoModel` inside a NeMo container while **mounting your local repo**, follow these steps:
 
 ### Step 1 - Clone the repo locally
