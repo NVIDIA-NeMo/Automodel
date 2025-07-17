@@ -20,27 +20,13 @@
 
 step_scheduler:
   grad_acc_steps: 4
-  ckpt_every_steps: 10
+  ckpt_every_steps: 1000
   val_every_steps: 10  # will run every x number of gradient steps
   num_epochs: 1
 
 dist_env:
   backend: nccl
   timeout_minutes: 1
-
-peft:
-  _target_: nemo_automodel.components._peft.lora.PeftConfig
-  target_modules: "*.proj" # will match all linear layers with ".proj" in their FQN
-  dim: 8  # the low-rank dimension of the adapters.
-  alpha: 32  # scales the learned weights
-  use_triton: false  # enabled optimized LoRA kernel written in triton-lang
-
-
-checkpoint:
-  enabled: true
-  checkpoint_dir: checkpoints/
-  model_save_format: safetensors
-  save_consolidated: True # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
