@@ -20,11 +20,7 @@
 
 ---
 
-## ✨ What is NeMo AutoModel?
-
-**NeMo AutoModel** is an NVIDIA-developed library that delivers a high-performance, easy-to-use solution for fine-tuning and pretraining large language models (LLMs) and vision-language models (VLMs) directly from the Hugging Face Hub. It provides true **Day-0 compatibility** with any Hugging Face model, so you can start using models immediately without conversion or setup delays.
-
-Start fine-tuning models instantly, scale effortlessly with PyTorch-native data/model parallelism, optimized custom kernels, and memory-efficient recipes-all while preserving the original checkpoint format for seamless use across the Hugging Face ecosystem.
+NeMo Framework is NVIDIA's GPU accelerated, end-to-end training framework for large language models (LLMs), multi-modal models and speech models. It enables seamless scaling of training (both pretraining and post-training) workloads from single GPU to thousand-node clusters for both 🤗Hugging Face/PyTorch and Megatron models. It includes a suite of libraries and recipe collections to help users train models from end to end. The **AutoModel library ("NeMo AutoModel")** provides GPU-accelerated PyTorch training for 🤗Hugging Face models on **Day-0**. Users can start training and fine-tuning models instantly without conversion delays, scale effortlessly with PyTorch-native parallelisms, optimized custom kernels, and memory-efficient recipes-all while preserving the original checkpoint format for seamless use across the Hugging Face ecosystem.
 
 > ⚠️ Note: NeMo AutoModel is under active development. New features, improvements, and documentation updates are released regularly. We are working toward a stable release, so expect the interface to solidify over time. Your feedback and contributions are welcome, and we encourage you to follow along as new updates roll out.
 
