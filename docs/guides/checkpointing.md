@@ -32,7 +32,9 @@ checkpoint:
 ### Safetensors
 To ensure a smooth integration with the HuggingFace ecosystem, we make the Safetensors format (`.safetensors` extension) available to the user.
 
-The sharded Safetensors format leverages the PyTorch DCP API for saving, so it provides the same benefits of parallel checkpointing and load-time resharding. The added advantage of this format is that we can optionally consolidate the shards into a full HuggingFace format model.
+The sharded Safetensors format leverages the PyTorch DCP API under the hood for saving. PyTorch DCP supports loading and saving training states from multiple ranks in parallel, which makes checkpointing far more efficient as all GPUs can contribute their "shard" of the state. We can also benefit from features like load-time resharding which allows the user to save in one hardware setup and load it back in another. For example, the user can save with 2 GPUs at train time and still be able to load it back in with 1 GPU. 
+
+**Most importantly**, the added advantage of this format is that we can optionally consolidate the various shards into a full HuggingFace format model.
 
 To showcase this, we can run the following command and we get the following checkpoint:
 ```bash
@@ -49,14 +51,17 @@ checkpoints/
     │   ├── consolidated/
     │   │   ├── config.json
     │   │   ├── model-00001-of-00001.safetensors
-    |   |   └── model.safetensors.index.json
-    │   ├── shard-00001-model-00001-of-00001.safetensors
-    │   └── shard-00002-model-00001-of-00001.safetensors
+    │   │   ├── model.safetensors.index.json
+    │   │   ├── special_tokens_map.json
+    │   │   ├── tokenizer_config.json
+    │   │   └── tokenizer.json
+    │   ├── shard-00001-model-00001-of-00002.safetensors
+    │   └── shard-00002-model-00001-of-00002.safetensors
     └── optim/
         ├── __0_0.distcp
         ├── __1_0.distcp
         └── .metadata
-        ...
+    ...
 ```
 The `shard-*` files will be used by the PyTorch DCP API when resuming from the checkpoint for training. The consolidated model is only stored for downstream usage.
 
@@ -69,13 +74,11 @@ import torch
 from transformers import pipeline
 
 model_id = "checkpoints/epoch_0_step_20/model/consolidated/"
-tokenizer_id = "meta-llama/Llama-3.2-1B"
 pipe = pipeline(
     "text-generation", 
     model=model_id, 
     torch_dtype=torch.bfloat16, 
     device_map="auto",
-    tokenizer=tokenizer_id
 )
 
 print(pipe("The key to life is"))
@@ -84,6 +87,9 @@ print(pipe("The key to life is"))
 ```
 
 #### PEFT
+When a user performs training using PEFT techniques, the trainable model weights are only a fraction of the full model. All remaining model weights are treated to be frozen.
+
+This means that the state to checkpoint is very small (usually a few MB), so it's unnecessary to have very small sharded states. Consequently, NeMo AutoModel enforces consolidated HuggingFace compatible checkpoints when training with PEFT techniques
 
 ### PyTorch DCP
 PyTorch DCP supports loading and saving training states from multiple ranks in parallel. It also handles load-time resharding which allows the user to save in one hardware setup and load it back in another. For example, the user can save with 2 GPUs at train time and still be able to load it back in with 1 GPU.
