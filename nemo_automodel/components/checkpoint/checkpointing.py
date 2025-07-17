@@ -34,7 +34,11 @@ from nemo_automodel.components.checkpoint._backports.hf_storage import (
     _HuggingFaceStorageWriter,
     get_fqn_to_file_index_mapping,
 )
-from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState, _get_lm_head_weight_and_name
+from nemo_automodel.components.checkpoint.stateful_wrappers import (
+    ModelState,
+    OptimizerState,
+    _get_lm_head_weight_and_name,
+)
 
 if TYPE_CHECKING:
     from peft import PeftConfig

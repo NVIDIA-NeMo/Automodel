@@ -18,8 +18,8 @@
 
 import dataclasses
 import json
-import re
 import queue
+import re
 from typing import Any, Optional
 
 import torch
@@ -392,7 +392,9 @@ def _extract_file_index(filename: str) -> int:
     return 1
 
 
-def get_fqn_to_file_index_mapping(reference_model_path: str, key_mapping: Optional[dict[str, str]] = None) -> dict[str, int]:
+def get_fqn_to_file_index_mapping(
+    reference_model_path: str, key_mapping: Optional[dict[str, str]] = None
+) -> dict[str, int]:
     """
     Get the FQN to file index mapping from the metadata.
 
@@ -418,6 +420,7 @@ def get_fqn_to_file_index_mapping(reference_model_path: str, key_mapping: Option
         fqn_to_file_index_mapping[str(fqn)] = _extract_file_index(filename)
 
     return fqn_to_file_index_mapping
+
 
 # the following function is taken from https://github.com/huggingface/transformers/blob/b85ed49e0a5f1bd9fd887f497d055b22b9319a12/src/transformers/modeling_utils.py#L4989-L5047
 def _get_key_renaming_mapping(
