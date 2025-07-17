@@ -49,62 +49,47 @@ except:
     pass
 
 
-def import_class_from_path(name: str) -> Any:
-    """Import a class from a string path (e.g. 'torch.optim.AdamW').
+def apply_fsdp_sharding_recursively(
+    module: nn.Module,
+    mesh: DeviceMesh,
+    mp_policy: Optional[MixedPrecisionPolicy],
+    offload_policy: Optional[CPUOffloadPolicy] = None,
+) -> None:
+    """
+    Recursively apply FSDP sharding to modules, with optimizations for ModuleList.
+
+    This utility function traverses a model hierarchy and applies FSDP sharding
+    to each module. For ModuleList instances (commonly used for transformer layers),
+    it applies an optimization where the last layer doesn't reshard after forward
+    since FSDP will prefetch it immediately.
 
     Args:
-        full_path: Full path to class including module path and class name
+        module (nn.Module): The module to apply FSDP sharding to.
+        mesh (DeviceMesh): The device mesh for FSDP sharding.
+        mp_policy (Optional[MixedPrecisionPolicy]): Mixed precision policy for FSDP.
+        offload_policy (Optional[CPUOffloadPolicy]): CPU offload policy for FSDP.
+            Defaults to None.
 
-    Returns:
-        The imported class object
+    Note:
+        This function modifies the module in-place by replacing modules with their
+        FSDP-wrapped versions.
     """
-    module_name, cls_name = name.rsplit(".", 1)
-    cls_instance = getattr(importlib.import_module(module_name), cls_name)
-    return cls_instance
-
-
-def import_classes_from_paths(class_paths: List[str]):
-    """
-    Helper function to import classes from string paths.
-    
-    Args:
-        class_paths (List[str]): The list of string paths to the classes.
-    
-    Returns:
-        List of imported classes.
-    """
-    classes = []
-    for path in class_paths:
-        try:
-            cls = import_class_from_path(path)
-            classes.append(cls)
-        except Exception as e:
-            print(f"Warning: Could not import class from path '{path}': {e}")
-    return classes
-
-
-@lru_cache
-def translate_parallel_style(style: str):
-    """Translate parallel style str to parallel type.
-
-    Taken and modified from: https://github.com/NVIDIA/NeMo/blob/6c6169db01bcca73ae8ad3ac35242fadbb9a78ba/nemo/lightning/pytorch/strategies/utils.py#L547
-    """
-    assert isinstance(style, str), (
-        f"parallel style type should be str, but got {type(style)}"
-    )
-
-    if style == "colwise":
-        return ColwiseParallel()
-    elif style == "rowwise":
-        return RowwiseParallel()
-    elif style == "colwise_rep":
-        return ColwiseParallel(output_layouts=Replicate())
-    elif style == "rowwise_rep":
-        return RowwiseParallel(input_layouts=Replicate())
-    elif style == "sequence_parallel":
-        return SequenceParallel()
+    if isinstance(module, nn.ModuleList):
+        for layer_id, transformer_block in enumerate(module):
+            # As an optimization, do not reshard after forward for the last
+            # transformer block since FSDP would prefetch it immediately
+            reshard_after_forward = int(layer_id) < len(module) - 1
+            fully_shard(
+                transformer_block,
+                mesh=mesh,
+                mp_policy=mp_policy,
+                reshard_after_forward=reshard_after_forward,
+                offload_policy=offload_policy,
+            )
+            module[layer_id] = transformer_block
     else:
-        raise ValueError(f"Unknown parallel style: {style}")
+        for name, sub_module in module.named_children():
+            apply_fsdp_sharding_recursively(sub_module, mesh, mp_policy, offload_policy)
 
 
 def get_hf_tp_shard_plan(model):
@@ -174,6 +159,64 @@ def get_hf_tp_shard_plan(model):
             hf_tp_plan[k] = translate_parallel_style(v)
 
     return hf_tp_plan
+
+
+def import_class_from_path(name: str) -> Any:
+    """Import a class from a string path (e.g. 'torch.optim.AdamW').
+
+    Args:
+        full_path: Full path to class including module path and class name
+
+    Returns:
+        The imported class object
+    """
+    module_name, cls_name = name.rsplit(".", 1)
+    cls_instance = getattr(importlib.import_module(module_name), cls_name)
+    return cls_instance
+
+
+def import_classes_from_paths(class_paths: List[str]):
+    """
+    Helper function to import classes from string paths.
+    
+    Args:
+        class_paths (List[str]): The list of string paths to the classes.
+    
+    Returns:
+        List of imported classes.
+    """
+    classes = []
+    for path in class_paths:
+        try:
+            cls = import_class_from_path(path)
+            classes.append(cls)
+        except Exception as e:
+            print(f"Warning: Could not import class from path '{path}': {e}")
+    return classes
+
+
+@lru_cache
+def translate_parallel_style(style: str):
+    """Translate parallel style str to parallel type.
+
+    Taken and modified from: https://github.com/NVIDIA/NeMo/blob/6c6169db01bcca73ae8ad3ac35242fadbb9a78ba/nemo/lightning/pytorch/strategies/utils.py#L547
+    """
+    assert isinstance(style, str), (
+        f"parallel style type should be str, but got {type(style)}"
+    )
+
+    if style == "colwise":
+        return ColwiseParallel()
+    elif style == "rowwise":
+        return RowwiseParallel()
+    elif style == "colwise_rep":
+        return ColwiseParallel(output_layouts=Replicate())
+    elif style == "rowwise_rep":
+        return RowwiseParallel(input_layouts=Replicate())
+    elif style == "sequence_parallel":
+        return SequenceParallel()
+    else:
+        raise ValueError(f"Unknown parallel style: {style}")
 
 
 def nvfsdp_strategy_parallelize(
@@ -365,7 +408,6 @@ def fsdp2_strategy_parallelize(
     activation_checkpointing: bool = False,
     cpu_offload: bool = False,
     tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
-    use_hf_tp_plan: bool = False,
 ):
     """
     Apply parallelisms and activation checkpointing to the model.
@@ -392,7 +434,6 @@ def fsdp2_strategy_parallelize(
             - A dictionary mapping module names to parallel styles
             - A string path to a dictionary or function that returns a dictionary
             If provided, this takes precedence over automatic plan generation.
-        use_hf_tp_plan (bool): Whether to force use of HuggingFace TP plan. Defaults to False.
 
     Returns:
         The parallelized model.
@@ -400,32 +441,6 @@ def fsdp2_strategy_parallelize(
     NOTE: The passed-in model preferably should be on meta device. Otherwise,
     the model must fit on GPU or CPU memory.
     """
-    # Set up mixed precision policy
-    if not mp_policy:
-        mp_policy = MixedPrecisionPolicy(
-            param_dtype=param_dtype,
-            reduce_dtype=torch.float32,
-            output_dtype=torch.float32,
-        )
-
-    # Set up offload policy
-    if not offload_policy:
-        offload_policy = (
-            CPUOffloadPolicy(pin_memory=False)
-            if cpu_offload
-            else None
-        )
-
-    # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
-    dp_mesh = device_mesh[
-        ("dp_cp" if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(device_mesh, {}) else "data_parallel")
-    ]
-
-    if dp_mesh.size() > 1:
-        assert dp_mesh.ndim == 1, "Hybrid-sharding not supported"
-
-    tp_mesh = device_mesh["tensor_parallel"]
-
     # Get model layers for later use
     model_cls = type(model)
     if isinstance(model, Gemma3ForConditionalGeneration):
@@ -436,6 +451,16 @@ def fsdp2_strategy_parallelize(
         layers = model.model.layers
         num_attention_heads = model.config.num_attention_heads
         num_key_value_heads = model.config.num_key_value_heads
+
+    # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
+    dp_mesh = device_mesh[
+        ("dp_cp" if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(device_mesh, {}) else "data_parallel")
+    ]
+
+    if dp_mesh.size() > 1:
+        assert dp_mesh.ndim == 1, "Hybrid-sharding not supported"
+
+    tp_mesh = device_mesh["tensor_parallel"]
 
     # TP sharding with enhanced plan generation
     if tp_mesh.size() > 1:
@@ -477,7 +502,7 @@ def fsdp2_strategy_parallelize(
                     )
 
         # 2. Use optimized parallel plan based on model type
-        elif model_cls in PARALLELIZE_FUNCTIONS and not use_hf_tp_plan:
+        elif model_cls in PARALLELIZE_FUNCTIONS:
             try:
                 func = PARALLELIZE_FUNCTIONS[model_cls]
                 model_parallel_plan = func(model, sequence_parallel)
@@ -513,29 +538,27 @@ def fsdp2_strategy_parallelize(
             if hasattr(layer, 'mlp'):
                 layers[i].mlp = checkpoint_wrapper(layer.mlp)
 
-    def parallelize_helper(module, mesh, mp_policy):
-        if isinstance(module, nn.ModuleList):
-            for layer_id, transformer_block in enumerate(module):
-                # As an optimization, do not reshard after forward for the last
-                # transformer block since FSDP would prefetch it immediately
-                reshard_after_forward = int(layer_id) < len(module) - 1
-                fully_shard(
-                    transformer_block,
-                    mesh=mesh,
-                    mp_policy=mp_policy,
-                    reshard_after_forward=reshard_after_forward,
-                    offload_policy=offload_policy,
-                )
-                module[layer_id] = transformer_block
-        else:
-            for name, sub_module in module.named_children():
-                parallelize_helper(sub_module, mesh, mp_policy)
+    # Set up mixed precision policy
+    if not mp_policy:
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=param_dtype,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.float32,
+        )
+
+    # Set up offload policy
+    if not offload_policy:
+        offload_policy = (
+            CPUOffloadPolicy(pin_memory=False)
+            if cpu_offload
+            else None
+        )
 
     # FSDP sharding
     assert dp_mesh.ndim == 1, "Hybrid-sharding not supported"
 
     # Find transformer layers and apply parallelisms
-    parallelize_helper(model, dp_mesh, mp_policy)
+    apply_fsdp_sharding_recursively(model, dp_mesh, mp_policy, offload_policy)
 
     # Apply FSDP to the root model
     # Do not reshard after forward for root model because its parameters 
