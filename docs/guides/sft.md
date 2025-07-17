@@ -121,34 +121,8 @@ The easiest way to run SFT training is with the recipe files. You can
 find the list of supported models and their predefined recipes available
 on NeMo Automodel's [GitHub repository](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm).
 
-<!--
-> [!NOTE]
-> **Prerequisite**: Before proceeding, please follow the example in
-> `nemo-2-quickstart-nemo-run`{.interpreted-text role="ref"} to familiarize yourself with NeMo-Run first.
--->
-
 ``` python
-from nemo.collections import llm
-import nemo_run as run
-
-nodes = 1
-gpus_per_node = 1
-# Note: we use peft=None to enable full fine-tuning.
-recipe = llm.hf_auto_model_for_causal_lm.finetune_recipe(
-    model_name="meta-llama/Llama-3.2-1B",  # The Hugging Face model-id or path to a local checkpoint (HF-native format).
-    dir="/ft_checkpoints/llama3.2_1b", # Path to store checkpoints
-    name="llama3_sft",
-    num_nodes=nodes,
-    num_gpus_per_node=gpus_per_node,
-    peft_scheme=None, # Setting peft_scheme=None disables parameter-efficient tuning and triggers full fine-tuning.
-
-
-)
-
-# Add other overrides here
-...
-
-run.run(recipe)
+torchrun --nproc-per-node=8 examples/llm/finetune.py --config examples/llm/llama_3_2_1b_squad.yaml
 ```
 
 ### Automodel CLI
