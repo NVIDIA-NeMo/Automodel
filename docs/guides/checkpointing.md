@@ -6,7 +6,7 @@ During machine-learning experiments, the model-training routine regularly saves 
 
 NeMo AutoModel checkpoints capture the complete state of a distributed training run (across multiple GPUs or nodes). This reduces memory overhead, improves GPU utilization, and allows training to be resumed with a different parallelism strategy
 
-NeMo AutoModel writes checkpoints in two formats (HuggingFace [Safetensors](https://huggingface.co/docs/safetensors/en/index) and [PyTorch Distributed Checkpointing (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html)) and in two layouts:
+NeMo AutoModel writes checkpoints in two formats (HuggingFace [Safetensors](https://github.com/huggingface/safetensors) and [PyTorch Distributed Checkpointing (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html)) and in two layouts:
 
 - **Consolidated** checkpoints: the complete model state is saved as a HuggingFace-compatible bundle, often a single file, or a small set of files and an index. Because no tensor is split across GPUs (unsharded), downstream tools like HuggingFace, vLLM, and SGLang can load it directly.
 
@@ -35,7 +35,7 @@ checkpoint:
 
 
 ## Safetensors
-To ensure seamless integration with the Hugging Face ecosystem, we save checkpoints in the Safetensors format (.safetensors), natively supported by 🤗 Transformers.
+To ensure seamless integration with the Hugging Face ecosystem, we save checkpoints in the [Safetensors](https://github.com/huggingface/safetensors) format, natively supported by 🤗 Transformers. Safetensors is a memory-safe, zero-copy alternative to Python's pickle (Pytorch .bin).
 
 The sharded Safetensors format leverages the PyTorch DCP API under the hood for saving. PyTorch DCP supports loading and saving training states from multiple ranks in parallel, which makes checkpointing far more efficient as all GPUs can contribute their "shard" of the state. We can also benefit from features like load-time resharding which allows the user to save in one hardware setup and load it back in another. For example, the user can save with 2 GPUs at train time and still be able to load it back in with 1 GPU. 
 
