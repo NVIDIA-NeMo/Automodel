@@ -225,7 +225,7 @@ optimizer:
 
 
 ## Run the finetune recipe
-Assuming the above `yaml` is saved in a file named `peft_guide.yaml`, we can run the finetune workflow
+Assuming the above `yaml` is saved in a file named `sft_guide.yaml`, we can run the finetune workflow
 with either the automodel CLI or by invoking the recipe python script directrly.
 
 ### Automodel CLI
@@ -241,7 +241,7 @@ training jobs when you do not need to override any configuration from
 the default recipes. -->
 
 ``` bash
-automodel finetune llm -c peft_guide.yaml
+automodel finetune llm -c sft_guide.yaml
 ```
 
 ### Invoking the recipe script directly
@@ -249,7 +249,7 @@ automodel finetune llm -c peft_guide.yaml
 Alternatively, you can run the recipe [script](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py) directly using [torchrun](https://docs.pytorch.org/docs/stable/elastic/run.html), as shown bellow.
 
 ``` bash
-torchrun --nproc-per-node=8 examples/llm/finetune.py --config peft_guide.yaml
+torchrun --nproc-per-node=8 examples/llm/finetune.py --config sft_guide.yaml
 ```
 
 
