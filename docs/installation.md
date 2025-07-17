@@ -69,7 +69,8 @@ cd AutoModel
 docker pull nvcr.io/nvidia/nemo:25.07
 ```
 > [!NOTE]
-> Use a recent NeMo container that includes the latest dependencies like torch, transformers, etc.
+> The above `docker` command uses the `25.07` container, but it's recommended to use the most recent,
+> to ensure you get the latest version of Automodel and its dependencies like torch, transformers, etc.
 
 ### Step 3 - Mount and run:
 ```bash
