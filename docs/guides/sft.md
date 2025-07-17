@@ -10,7 +10,7 @@ labeled data, refining its responses while preserving the broad
 knowledge acquired during pretraining.
 
 Unlike Parameter-Efficient Fine-Tuning (PEFT), which optimizes a small
-subset of parameters, SFT updates a larger portion---or even all---of
+subset of parameters, SFT updates a larger portion, or even all, of
 the model's weights. While this requires more computational resources,
 it allows for deeper adaptation, making it particularly useful for
 complex or high-precision applications.
@@ -29,11 +29,8 @@ vLLM.
 
 In addition to this user guide, you can also explore our Quickstart,
 which features a [standalone python3
-script](https://github.com/NVIDIA/NeMo/blob/main/examples/llm/sft/automodel.py)
-and a guided [Jupyter
-Notebook](https://github.com/NVIDIA/NeMo/blob/main/tutorials/llm/automodel/sft.ipynb),
-offering hands-on demonstrations for quickly getting started with NeMo
-AutoModel.
+recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py),
+offering hands-on demonstrations for quickly getting started with NeMo AutoModel.
 
 ## Run SFT with NeMo AutoModel
 
@@ -81,10 +78,9 @@ NeMo-Run Recipes
 
 The easiest way to run SFT training is with the recipe files. You can
 find the list of supported models and their predefined recipes available
-on NeMo\'s [GitHub
-repository](https://github.com/NVIDIA/NeMo/tree/main/nemo/collections/llm/recipes).
+on NeMo Automodel's [GitHub repository](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm).
 
-::: note
+<!-- ::: note
 ::: title
 Note
 :::
@@ -92,7 +88,7 @@ Note
 **Prerequisite**: Before proceeding, please follow the example in
 `nemo-2-quickstart-nemo-run`{.interpreted-text role="ref"} to
 familiarize yourself with NeMo-Run first.
-:::
+::: -->
 
 ``` python
 from nemo.collections import llm

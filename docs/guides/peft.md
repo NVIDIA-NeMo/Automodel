@@ -390,14 +390,9 @@ process, ensuring compatibility with Hugging Face-based models.
 The following script demonstrates how to export a PEFT adapter for vLLM,
 allowing seamless deployment and efficient inference.
 
-::: note
-::: title
-Note
-:::
-
-Make sure vLLM is installed (pip install vllm, or use the environment
-that includes it) before proceeding with vLLMHFExporter.
-:::
+> [!NOTE]
+> Make sure vLLM is installed (pip install vllm, or use the environment
+> that includes it) before proceeding with vLLMHFExporter.
 
 ``` python
 from nemo.export.vllm_hf_exporter import vLLMHFExporter
