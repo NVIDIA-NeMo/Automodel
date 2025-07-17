@@ -2,12 +2,13 @@
 
 NeMo Automodel support LLM, VLM, and OMNI models. Depending on your use case, there are several ways to install it:
 
-| Method                             | Use Case                                                          | Recommended For              |
-| ---------------------------------- | ----------------------------------------------------------------- | ---------------------------- |
-| 📦 **PyPI**                        | Install stable release with minimal setup                         | Most users, production usage |
-| 🐍 **GitHub (pip or uv)**          | Use the latest code without cloning or installing extras manually | Power users, testers         |
-| 🧪 **Editable Install (Dev Mode)** | Contribute to the codebase or make local modifications            | Contributors, researchers    |
-| 🐳 **Docker + (optional) Mount**   | Use in isolated GPU environments, e.g., with NeMo container       | Multinode deployments     |
+| Method                             | Dev Mode | Use Case                                                          | Recommended For             |
+| ---------------------------------- | ---------|----------------------------------------------------------------- | ---------------------------- |
+| 📦 **PyPI**                        | -- | Install stable release with minimal setup                         | Most users, production usage |
+| 🐳 **Docker**                      | -- | Use in isolated GPU environments, e.g., with NeMo container       | Multinode deployments     |
+| 🐍 **GitHub (pip or uv)**          | ✅ | Use the latest code without cloning or installing extras manually | Power users, testers         |
+| 🧪 **Editable Install (Dev Mode)** | ✅ | Contribute to the codebase or make local modifications            | Contributors, researchers    |
+| 🐳 **Docker + optional Mount**     | ✅ | Use in isolated GPU environments, e.g., with NeMo container       | Multinode deployments     |
 
 
 ---
