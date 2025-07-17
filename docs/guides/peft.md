@@ -180,76 +180,73 @@ from the NeMo Framework LLM collection. This is a lower-level API that
 allows you to lay out the various configurations in a Pythonic fashion.
 This gives you the greatest amount of control over each configuration.
 
-``` python
-import fiddle as fdl
-import lightning.pytorch as pl
-from nemo import lightning as nl
-from nemo.collections import llm
+``` yaml
+step_scheduler:
+  grad_acc_steps: 4
+  ckpt_every_steps: 1000
+  val_every_steps: 10  # will run every x number of gradient steps
+  num_epochs: 1
 
+dist_env:
+  backend: nccl
+  timeout_minutes: 1
 
-def make_squad_hf_dataset(tokenizer, batch_size):
-    def formatting_prompts_func(example):
-        formatted_text = [
-            f"Context: {example['context']} Question: {example['question']} Answer:",
-            f" {example['answers']['text'][0].strip()}",
-        ]
-        context_ids, answer_ids = list(map(tokenizer.text_to_ids, formatted_text))
-        if len(context_ids) > 0 and context_ids[0] != tokenizer.bos_id and tokenizer.bos_id is not None:
-            context_ids.insert(0, tokenizer.bos_id)
-        if len(answer_ids) > 0 and answer_ids[-1] != tokenizer.eos_id and tokenizer.eos_id is not None:
-            answer_ids.append(tokenizer.eos_id)
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
 
-        return dict(
-            labels=(context_ids + answer_ids)[1:],
-            input_ids=(context_ids + answer_ids)[:-1],
-            loss_mask=[0] * (len(context_ids) - 1) + [1] * len(answer_ids),
-        )
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
 
-    datamodule = llm.HFDatasetDataModule(
-        "rajpurkar/squad", split="train",
-        micro_batch_size=batch_size, pad_token_id=tokenizer.eos_id or 0
-    )
-    datamodule.map(
-        formatting_prompts_func,
-        batched=False,
-        batch_size=2,
-        remove_columns=["id", "title", "context", "question", 'answers'],
-    )
-    return datamodule
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
 
+loss_fn: nemo_automodel.components.loss.masked_ce.masked_cross_entropy
 
-model = llm.HFAutoModelForCausalLM(model_name="meta-llama/Llama-3.2-1B")
-strategy = nl.FSDP2Strategy(
-    data_parallel_size=8,
-    tensor_parallel_size=1,
-    checkpoint_io=model.make_checkpoint_io(adapter_only=True),
-)
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: train
 
+packed_sequence:
+  packed_sequence_size: 0
 
-llm.api.finetune(
-    model=model,
-    data=make_squad_hf_dataset(model.tokenizer, batch_size=1),
-    trainer=nl.Trainer(
-        devices=8,
-        num_nodes=1,
-        max_steps=100,
-        accelerator='gpu',
-        strategy=strategy,
-        log_every_n_steps=1,
-        limit_val_batches=0.0,
-        num_sanity_val_steps=0,
-        accumulate_grad_batches=10,
-        gradient_clip_val=1.0,
-        use_distributed_sampler=False,
-        logger=wandb,
-        precision="bf16-mixed",
-    ),
-    optim=fdl.build(llm.adam.te_adam_with_flat_lr(lr=1e-5)),
-    peft=llm.peft.LoRA(
-        target_modules=['*_proj'],
-        dim=8,
-    ),
-)
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  batch_size: 8
+  shuffle: false
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: validation
+  limit_dataset_samples: 64
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  batch_size: 8
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0
+
+# Uncomment and configure for W&B logging
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: <your_wandb_exp_name>
+#   save_dir: <your_wandb_save_dir>
 ```
 
 > [!TIP]
