@@ -329,6 +329,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             seed=self.cfg.get("seed", 42),
             tp_size=self.cfg.get("distributed.tp_size", 1),
         )
+        print(self.model)
+
         self.loss_fn = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
         self.dataloader = build_dataloader(
             self.cfg.dataset,

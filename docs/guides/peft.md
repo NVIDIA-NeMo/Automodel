@@ -255,6 +255,46 @@ Alternatively, you can run the recipe [script](https://github.com/NVIDIA-NeMo/Au
 torchrun --nproc-per-node=8 examples/llm/finetune.py --config peft_guide.yaml
 ```
 
+### Sample output
+Running the recipe with either the `automodel` app or the invoking directly the recipe script, should produce
+the following log:
+```
+$ automodel finetune llm -c peft_guide.yaml
+INFO:root:Domain:  llm
+INFO:root:Command: finetune
+INFO:root:Config:  /mnt/4tb/auto/Automodel/peft_guide.yaml
+INFO:root:Running job using source from: /mnt/4tb/auto/Automodel
+INFO:root:Launching job locally on 2 devices
+cfg-path: /mnt/4tb/auto/Automodel/peft_guide.yaml
+INFO:root:step 4 | epoch 0 | loss 1.5514 | grad_norm 102.0000 | mem: 11.66 GiB | tps 6924.50
+INFO:root:step 8 | epoch 0 | loss 0.7913 | grad_norm 46.2500 | mem: 14.58 GiB | tps 9328.79
+Saving checkpoint to checkpoints/epoch_0_step_10
+INFO:root:step 12 | epoch 0 | loss 0.4358 | grad_norm 23.8750 | mem: 15.48 GiB | tps 9068.99
+INFO:root:step 16 | epoch 0 | loss 0.2057 | grad_norm 12.9375 | mem: 16.47 GiB | tps 9148.28
+INFO:root:step 20 | epoch 0 | loss 0.2557 | grad_norm 13.4375 | mem: 12.35 GiB | tps 9196.97
+Saving checkpoint to checkpoints/epoch_0_step_20
+INFO:root:[val] step 20 | epoch 0 | loss 0.2469
+```
+For each training batch the finetuning recipe logs the current loss, along with current peak memory usage and tokens per second (TPS).
+
+In addition, the model checkpoint is saved under the `checkpoints/` directory, with the following contents:
+``` bash
+$ tree checkpoints/epoch_0_step_10/
+checkpoints/epoch_0_step_10/
+├── dataloader.pt
+├── model
+│   ├── adapter_config.json
+│   ├── adapter_model.safetensors
+│   └── automodel_peft_config.json
+├── optim
+│   ├── __0_0.distcp
+│   └── __1_0.distcp
+├── rng.pt
+└── step_scheduler.pt
+
+2 directories, 8 files
+```
+
 
 ## Run PEFT Inference with NeMo AutoModel-trained Adapters
 
@@ -278,7 +318,7 @@ tokenizer = AutoTokenizer.from_pretrained(base_model_name)
 model = AutoModelForCausalLM.from_pretrained(base_model_name)
 
 # Load PEFT adapter
-adapter_path = "path/to/nemo-trained/peft/adapter"
+adapter_path = "checkpoints/epoch_0_step_10/model/"
 model = PeftModel.from_pretrained(model, adapter_path)
 
 # Move model to GPU if available
@@ -327,7 +367,7 @@ from huggingface_hub import HfApi
 
 api = HfApi()
 api.upload_folder(
-    folder_path="path/to/nemo-trained/peft/adapter",
+    folder_path="checkpoints/epoch_0_step_10/model/",
     repo_id="your-username/peft-adapter-name",
     repo_type="model"
 )

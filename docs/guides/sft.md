@@ -315,7 +315,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Load finetuned checkpoint
-finetuned_ckpt_path = "checkpoints/epoch_0_step_10/"
+finetuned_ckpt_path = "checkpoints/epoch_0_step_10/model/consolidated"
 tokenizer = AutoTokenizer.from_pretrained(finetuned_ckpt_path)
 model = AutoModelForCausalLM.from_pretrained(finetuned_ckpt_path)
 
@@ -365,7 +365,7 @@ from huggingface_hub import HfApi
 
 api = HfApi()
 api.upload_folder(
-    folder_path="checkpoints/epoch_0_step_10/",
+    folder_path="checkpoints/epoch_0_step_10/model/consolidated",
     repo_id="your-username/llama3.2_1b-finetuned-name",
     repo_type="model"
 )
