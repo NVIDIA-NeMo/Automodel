@@ -47,7 +47,7 @@ In this guide, we will fine-tune Meta’s `LLaMA 3.2 1B` model on the popular [S
 #### 🔍 About LLaMA 3.2 1B
 **LLaMA** is a family of decoder-only transformer models developed by Meta. The **LLaMA 3.2 1B** variant is a compact, lightweight model ideal for research and edge deployment. Despite its size, it maintains architectural features consistent with its larger siblings:
 
-- **Decoder-only architecture**: Follows a GPT-style, autoregressive design—optimized for generation tasks.
+- **Decoder-only architecture**: Follows a GPT-style, autoregressive design-optimized for generation tasks.
 
 - **Rotary positional embeddings (RoPE)**: Efficient and extendable positional encoding technique.
 
@@ -255,7 +255,7 @@ training jobs when you do not need to override any configuration from
 the default recipes.
 
 ``` bash
-nemo llm finetune -f hf_auto_model_for_causal_lm model_name="meta-llama/Llama-3.2-1B" peft=lora  # acceptable values are lora/none
+automodel finetune llm -c examples/llm/llama_3_2_1b_squad.yaml
 ```
 
 
