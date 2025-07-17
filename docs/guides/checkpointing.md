@@ -92,7 +92,7 @@ When a user performs training using PEFT techniques, the trainable model weights
 This means that the state to checkpoint is very small (usually a few MB), so it's unnecessary to have very small sharded states. Consequently, NeMo AutoModel enforces consolidated HuggingFace compatible checkpoints when training with PEFT techniques
 
 ### PyTorch DCP
-PyTorch DCP supports loading and saving training states from multiple ranks in parallel. It also handles load-time resharding which allows the user to save in one hardware setup and load it back in another. For example, the user can save with 2 GPUs at train time and still be able to load it back in with 1 GPU.
+NeMo AutoModel also offers native PyTorch DCP checkpointing support (`.distcp` extension). Similar to Safetensors, it also provides the same features of load-time resharding and parallel saving.
 
 As a simple example, we can run the following command to launch the training recipe on 2 GPUs.
 ```bash
@@ -128,7 +128,29 @@ uv run torchrun --nproc-per-node=2 examples/llm/finetune.py --step_scheduler.ckp
 ```
 
 ### Saving Additional States
-You can also save additional states in NeMo AutoModel. By default, we aso checkpoint the `dataloader`, `rng`, and `step_scheduler` states which are necessary to resume training accurately.
+You can also save additional states in NeMo AutoModel. By default, we also automatically checkpoint the `dataloader`, `rng`, and `step_scheduler` states which are necessary to resume training accurately. In full, a Safetensors consolidated checkpoint will look like this:
+
+```
+checkpoints/
+└── epoch_0_step_20/
+    ├── model/
+    │   ├── consolidated/
+    │   │   ├── config.json
+    │   │   ├── model-00001-of-00001.safetensors
+    │   │   ├── model.safetensors.index.json
+    │   │   ├── special_tokens_map.json
+    │   │   ├── tokenizer_config.json
+    │   │   └── tokenizer.json
+    │   ├── shard-00001-model-00001-of-00002.safetensors
+    │   └── shard-00002-model-00001-of-00002.safetensors
+    ├── optim/
+    │   ├── __0_0.distcp
+    │   ├── __1_0.distcp
+    │   └── .metadata
+    ├── dataloader.pt
+    ├── rng.pt
+    └── step_scheduler.pt
+```
 
 If the user wants to define a new state to be checkpointed in the recipe, the easiest way to do this is create a new attribute in the recipe (i.e., defined using `self.` inside the recipe) and make sure the new attribute has `load_state_dict` and `state_dict` methods.
 
