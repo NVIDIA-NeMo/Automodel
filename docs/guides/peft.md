@@ -84,15 +84,10 @@ The easiest way to run PEFT training is with the recipe files. You can
 find the list of supported models and their predefined recipes
 [here](https://github.com/NVIDIA/NeMo/tree/main/nemo/collections/llm/recipes).
 
-::: note
-::: title
-Note
-:::
-
-**Prerequisite**: Before proceeding, please follow the example in
-`nemo-2-quickstart-nemo-run`{.interpreted-text role="ref"} to
-familiarize yourself with NeMo-Run first.
-:::
+> [!NOTE]
+> **Prerequisite**: Before proceeding, please follow the example in
+> `nemo-2-quickstart-nemo-run`{.interpreted-text role="ref"} to
+> familiarize yourself with NeMo-Run first.
 
 ``` python
 from nemo.collections import llm
@@ -219,39 +214,25 @@ llm.api.finetune(
     ),
 )
 ```
-:::
-:::
 
-::: hint
-::: title
-Hint
-:::
+> [!TIP]
+> To avoid using unnessary storage space and enable faster sharing, the
+> adapter checkpoint only contains the adapter weights. As a result, when
+> running inference, the adapter and base model weights need to match
+> those used for training.
 
-To avoid using unnessary storage space and enable faster sharing, the
-adapter checkpoint only contains the adapter weights. As a result, when
-running inference, the adapter and base model weights need to match
-those used for training.
-:::
 
-::: hint
-::: title
-Hint
-:::
+> [!TIP]
+> In the above example, we used the FSDP2 strategy with 8 GPUs. Depending
+> on the size of your model, you may need to adjust the number of GPUs or
+> use a different strategy.
 
-In the above example, we used the FSDP2 strategy with 8 GPUs. Depending
-on the size of your model, you may need to adjust the number of GPUs or
-use a different strategy.
-:::
 
-::: note
-::: title
-Note
-:::
+> [!NOTE]
+> The FSDP2Strategy is introduced in NeMo\'s lightning strategy and
+> requires an active NeMo installation. See the NeMo documentation for
+> installation details.
 
-The FSDP2Strategy is introduced in NeMo\'s lightning strategy and
-requires an active NeMo installation. See the NeMo documentation for
-installation details.
-:::
 
 ## Run PEFT Inference with NeMo AutoModel-trained Adapters
 
