@@ -115,119 +115,140 @@ This structure is ideal for training models in context-based question answering,
 > In this guide, we use the `SQuAD v1.1` dataset, but you can specify your own data as needed.
 
 
-### Automodel Recipe
+### Finetune recipe and configuration
 
-The easiest way to run SFT training is with the recipe files. You can
-find the list of supported models and their predefined recipes available
-on NeMo Automodel's [GitHub repository](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm).
+This example demonstrates how to fine-tune a large language model using NVIDIA's NeMo Automodel library.
+Specifically, we use the LLM [finetune recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py),and in particular the `FinetuneRecipeForNextTokenPrediction` class to orchestrate the fine-tuning process end-to-end: model loading, dataset preparation, optimizer setup, distributed training, checkpointing, and logging.
 
-``` python
-torchrun --nproc-per-node=8 examples/llm/finetune.py --config examples/llm/llama_3_2_1b_squad.yaml
+#### 🧠 What is a Recipe?
+
+A recipe in NeMo Automodel is a **self-contained orchestration module** that wires together all
+components needed to perform a specific task—like fine-tuning for next-token prediction or instruction tuning.
+Think of it as the equivalent of a Trainer class, but highly modular, stateful, and reproducible.
+
+The `FinetuneRecipeForNextTokenPrediction` class is one such recipe. It inherits from `BaseRecipe` and implements:
+
+- `setup()`: builds all training components from the config
+
+- `run_train_validation_loop()`: executes training + validation steps
+
+- Misc: Checkpoint handling, logging, and RNG setup.
+
+> [!NOTE]
+> Key Insight: The recipe ensures stateless config-driven orchestration, meaning no component is hardcoded: key items, such as the model, dataset and optimizer are loaded via Hydra-style `instantiate()` calls.
+
+#### Recipe Config
+``` yaml
+# The model section is responsible for configuring the model we want to finetune.
+# Since we want to use the Llama 3 1B model, we pass `meta-llama/Llama-3.2-1B` to the
+# `pretrained_model_name_or_path` option.
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+
+# As mentioned earlier, we are using the SQuAD dataset. NeMo Automodel provides the make_squad_dataset
+# function which formats the prepares the dataset (e.g., formatting). We are using the "train"
+# split for training.
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: train
+
+# Similarly, for validation we use the "validation" split, and limit the number of samples to 64.
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: validation
+  limit_dataset_samples: 64
+
+step_scheduler:
+  grad_acc_steps: 4
+  ckpt_every_steps: 1000
+  val_every_steps: 10  # will run every x number of gradient steps
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 1
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+# For distributed processing, we will FSDP2.
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+loss_fn: nemo_automodel.components.loss.masked_ce.masked_cross_entropy
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  batch_size: 8
+  shuffle: false
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  batch_size: 8
+
+# We will use the standard Adam optimizer, but you can specify any optimizer you want, by changing
+# the import path using the _target_ option.
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0
+
+# If you want to log your experiment on wandb, uncomment and configure the following section
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: <your_wandb_exp_name>
+#   save_dir: <your_wandb_save_dir>
 ```
+
+> [!TIP]
+> To avoid using unnessary storage space and enable faster sharing, the
+> adapter checkpoint only contains the adapter weights. As a result, when
+> running inference, the adapter and base model weights need to match
+> those used for training.
+
+
+## Run the finetune recipe
+Assuming the above `yaml` is saved in a file named `peft_guide.yaml`, we can run the finetune workflow
+with either the automodel CLI or by invoking the recipe python script directrly.
 
 ### Automodel CLI
 
-You can use SFT recipes via the NeMo-Run CLI (See [NeMo-Run\'s
-docs](https://github.com/NVIDIA/NeMo-Run) for more details). This
-provides a quick and easy way to launch training jobs when you do not
-need to override any configuration from the default recipes.
+When NeMo Automodel is installed on your system, it includes the `automodel` CLI program that you
+can use to run jobs, locally or on distributed environments.
+
+<!-- You can use PEFT recipes via the NeMo-Run CLI (See [NeMo-Run\'s
+docs](https://github.com/NVIDIA/NeMo-Run) for more details). LoRA are
+registered as factory classes, so you can specify `peft=<lora/none>`
+directly in the terminal. This provides a quick and easy way to launch
+training jobs when you do not need to override any configuration from
+the default recipes. -->
 
 ``` bash
-automodel finetune llm -c examples/llm/llama_3_2_1b_squad.yaml
+automodel finetune llm -c peft_guide.yaml
 ```
 
-<!-- ### llm.finetune API
+### Invoking the recipe script directly
 
-This example uses the [finetune
-API](https://github.com/NVIDIA/NeMo/blob/main/nemo/collections/llm/api.py)
-from the NeMo Framework LLM collection. This is a lower-level API that
-allows you to lay out the various configurations in a Pythonic fashion.
-This gives you the greatest amount of control over each configuration.
+Alternatively, you can run the recipe [script](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py) directly using [torchrun](https://docs.pytorch.org/docs/stable/elastic/run.html), as shown bellow.
 
-``` python
-import fiddle as fdl
-import lightning.pytorch as pl
-from nemo import lightning as nl
-from nemo.collections import llm
-from lightning.pytorch.loggers import WandbLogger
-
-def make_squad_hf_dataset(tokenizer, batch_size):
-    def formatting_prompts_func(example):
-        formatted_text = [
-            f"Context: {example['context']} Question: {example['question']} Answer:",
-            f" {example['answers']['text'][0].strip()}",
-        ]
-        context_ids, answer_ids = list(map(tokenizer.text_to_ids, formatted_text))
-        if len(context_ids) > 0 and context_ids[0] != tokenizer.bos_id and tokenizer.bos_id is not None:
-            context_ids.insert(0, tokenizer.bos_id)
-        if len(answer_ids) > 0 and answer_ids[-1] != tokenizer.eos_id and tokenizer.eos_id is not None:
-            answer_ids.append(tokenizer.eos_id)
-
-        return dict(
-            labels=(context_ids + answer_ids)[1:],
-            input_ids=(context_ids + answer_ids)[:-1],
-            loss_mask=[0] * (len(context_ids) - 1) + [1] * len(answer_ids),
-        )
-
-    datamodule = llm.HFDatasetDataModule(
-        "rajpurkar/squad", split="train",
-        micro_batch_size=batch_size, pad_token_id=tokenizer.eos_id or 0
-    )
-    datamodule.map(
-        formatting_prompts_func,
-        batched=False,
-        batch_size=2,
-        remove_columns=["id", "title", "context", "question", 'answers'],
-    )
-    return datamodule
-
-
-model = llm.HFAutoModelForCausalLM(model_name="meta-llama/Llama-3.2-1B")
-strategy = nl.FSDP2Strategy(
-    data_parallel_size=8,
-    tensor_parallel_size=1,
-    checkpoint_io=model.make_checkpoint_io(adapter_only=True),
-)
-
-wandb = WandbLogger(
-    project="nemo-automodel-sft",
-    name="user-guide-llama",
-)
-
-llm.api.finetune(
-    model=model,
-    data=make_squad_hf_dataset(model.tokenizer, batch_size=1),
-    trainer=nl.Trainer(
-        devices=8,
-        num_nodes=1,
-        max_steps=100,
-        accelerator='gpu',
-        strategy=strategy,
-        log_every_n_steps=1,
-        limit_val_batches=0.0,
-        num_sanity_val_steps=0,
-        accumulate_grad_batches=10,
-        gradient_clip_val=1.0,
-        use_distributed_sampler=False,
-        logger=wandb,
-        precision="bf16-mixed",
-    ),
-    optim=fdl.build(llm.adam.te_adam_with_flat_lr(lr=1e-5)),
-    peft=None, # Setting peft=None disables parameter-efficient tuning and triggers full fine-tuning.
-)
+``` bash
+torchrun --nproc-per-node=8 examples/llm/finetune.py --config peft_guide.yaml
 ```
 
-> [!HINT]
-> In the above example, we used the FSDP2 strategy with 8 GPUs. Depending
-> on the size of your model, you may need to adjust the number of GPUs or
-> use a different strategy.
-
-> [!Note]
-> The FSDP2Strategy is introduced in NeMo\'s lightning strategy and
-> requires an active NeMo installation. See the NeMo documentation for
-> installation details.
-
- -->
 
 ## Run Inference with the NeMo AutoModel Fine-Tuned Checkpoint
 
