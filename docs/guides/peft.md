@@ -114,13 +114,26 @@ This structure is ideal for training models in context-based question answering,
 > In this guide, we use the `SQuAD v1.1` dataset, but you can specify your own data as needed.
 
 ### Finetune recipe and configuration
-This example uses the LLM [finetune
-recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py),
-implemented with the `FinetuneRecipeForNextTokenPrediction` class.
 
-A recipe is orchestrates the full finetuning workflow, from instantiating the model and datasets, to
-training and saving the finetunine model checkpoint. The recipe can be configured with a yaml config,
-as shown next.
+This example demonstrates how to fine-tune a large language model using NVIDIA's NeMo Automodel library.
+Specifically, we use the LLM [finetune recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py),and in particular the `FinetuneRecipeForNextTokenPrediction` class to orchestrate the fine-tuning process end-to-end: model loading, dataset preparation, optimizer setup, distributed training, checkpointing, and logging.
+
+#### 🧠 What is a Recipe?
+
+A recipe in NeMo Automodel is a **self-contained orchestration module** that wires together all
+components needed to perform a specific task—like fine-tuning for next-token prediction or instruction tuning.
+Think of it as the equivalent of a Trainer class, but highly modular, stateful, and reproducible.
+
+The `FinetuneRecipeForNextTokenPrediction` class is one such recipe. It inherits from `BaseRecipe` and implements:
+
+- `setup()`: builds all training components from the config
+
+- `run_train_validation_loop()`: executes training + validation steps
+
+- Misc; Checkpoint handling, logging, and RNG setup.
+
+> [!NOTE]
+> Key Insight: The recipe ensures stateless config-driven orchestration, meaning no component is hardcoded: everything is loaded via Hydra-compatible `instantiate()` calls.
 
 ``` yaml
 # The model section is responsible for configuring the model we want to finetune.
@@ -190,7 +203,7 @@ optimizer:
   lr: 1.0e-5
   weight_decay: 0
 
-# Uncomment and configure for W&B logging
+# If you want to log your experiment on wandb, uncomment and configure the following section
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
