@@ -35,60 +35,42 @@ offering hands-on demonstrations for quickly getting started with NeMo AutoModel
 ## Run SFT with NeMo AutoModel
 
 Below are three examples of running a simple SFT training loop for the
-Llama 3.2 1B model using NeMo AutoModel. These examples showcase
-different levels of abstraction provided by the NeMo Framework. Once you
+`Llama 3.2 1B` model using NeMo AutoModel. Once you
 have set up your environment following the instructions in
-`install-nemo-framework`{.interpreted-text role="ref"}, you are ready to
-run the simple SFT tuning script.
+[`Automodel installation guide`](installation.md), you are ready to
+run the simple PEFT tuning script.
 
-::: hint
-::: title
-Hint
-:::
+> [!TIP]
+> In this guide, `meta-llama/Llama-3.2-1B` is used only as a placeholder
+> model ID. You can replace it with any valid Hugging Face model ID, such
+> as `Qwen/Qwen2.5-1.5B`, or any other checkpoint you have access to on
+> the Hugging Face Hub.
 
-In this guide, "meta-llama/Llama-3.2-1B" is used only as a placeholder
-model ID. You can replace it with any valid Hugging Face model ID, such
-as "Qwen/Qwen2.5-1.5B", or any other model available on the Hugging Face
-Hub.
-:::
+> [!IMPORTANT]
+> Some Hugging Face model repositories are **gated**, you must explicitly
+> request permission before you can download their files. If the model
+> page shows a "Request access" or "Agree and access" button:
+>
+> 1.  Log in with your Hugging Face account.
+> 2.  Click the button and accept the license terms.
+> 3.  Wait for approval (usually instant; occasionally manual).
+> 4.  Ensure the token you pass to your script (via `huggingface-cli login` or the `HF_TOKEN` environment variable)
+>    belongs to the account that was approved.
+>
+> Trying to pull a gated model without an authorized token will trigger a 403 "permission denied" error.
 
-::: tip
-::: title
-Tip
-:::
 
-Some Hugging Face model repositories are **gated**---you must explicitly
-request permission before you can download their files. If the model
-page shows a "Request access" or "Agree and access" button:
-
-1.  Log in with your Hugging Face account.
-2.  Click the button and accept the license terms.
-3.  Wait for approval (usually instant; occasionally manual).
-4.  Ensure the token you pass to your script (via [huggingface-cli
-    login]{.title-ref} or the \$\$HF_TOKEN\$\$ environment variable)
-    belongs to the account that was approved.
-
-Trying to pull a gated model without an authorized token will trigger a
-403 "permission denied" error.
-:::
-
-::: tab-set
-::: tab-item
-NeMo-Run Recipes
+### NeMo-Run Recipes
 
 The easiest way to run SFT training is with the recipe files. You can
 find the list of supported models and their predefined recipes available
 on NeMo Automodel's [GitHub repository](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm).
 
-<!-- ::: note
-::: title
-Note
-:::
-
-**Prerequisite**: Before proceeding, please follow the example in
-`nemo-2-quickstart-nemo-run`{.interpreted-text role="ref"} to
-familiarize yourself with NeMo-Run first.
-::: -->
+<!--
+> [!NOTE]
+> **Prerequisite**: Before proceeding, please follow the example in
+> `nemo-2-quickstart-nemo-run`{.interpreted-text role="ref"} to familiarize yourself with NeMo-Run first.
+-->
 
 ``` python
 from nemo.collections import llm
@@ -113,10 +95,8 @@ recipe = llm.hf_auto_model_for_causal_lm.finetune_recipe(
 
 run.run(recipe)
 ```
-:::
 
-::: tab-item
-NeMo-Run CLI
+### NeMo-Run CLI
 
 You can use SFT recipes via the NeMo-Run CLI (See [NeMo-Run\'s
 docs](https://github.com/NVIDIA/NeMo-Run) for more details). This
@@ -126,10 +106,8 @@ need to override any configuration from the default recipes.
 ``` bash
 nemo llm finetune -f hf_auto_model_for_causal_lm model_name="meta-llama/Llama-3.2-1B" peft=none
 ```
-:::
 
-::: tab-item
-llm.finetune API
+### llm.finetune API
 
 This example uses the [finetune
 API](https://github.com/NVIDIA/NeMo/blob/main/nemo/collections/llm/api.py)
@@ -209,37 +187,23 @@ llm.api.finetune(
     peft=None, # Setting peft=None disables parameter-efficient tuning and triggers full fine-tuning.
 )
 ```
-:::
-:::
 
-::: hint
-::: title
-Hint
-:::
+> [!HINT]
+> In the above example, we used the FSDP2 strategy with 8 GPUs. Depending
+> on the size of your model, you may need to adjust the number of GPUs or
+> use a different strategy.
 
-In the above example, we used the FSDP2 strategy with 8 GPUs. Depending
-on the size of your model, you may need to adjust the number of GPUs or
-use a different strategy.
-:::
-
-::: note
-::: title
-Note
-:::
-
-The FSDP2Strategy is introduced in NeMo\'s lightning strategy and
-requires an active NeMo installation. See the NeMo documentation for
-installation details.
-:::
+> [!Note]
+> The FSDP2Strategy is introduced in NeMo\'s lightning strategy and
+> requires an active NeMo installation. See the NeMo documentation for
+> installation details.
 
 ## Run Inference with the NeMo AutoModel Fine-Tuned Checkpoint
 
-Inference on the fine-tuned checkpoint is supported using Hugging
-Face\'s generate API. Simply replace the path of the full model with the
-path to a SFT checkpoint.
+Inference on the fine-tuned checkpoint is supported using Hugging Face's generate API.
+Simply replace the path of the full model with the path to a SFT checkpoint.
 
-The following is an example script using Hugging Face\'s transformers
-library:
+The following is an example script using Hugging Face's transformers library:
 
 ``` python
 import torch
@@ -273,8 +237,7 @@ seamless integration with the Hugging Face ecosystem.
 
 Using the Hugging Face Hub API, we can push the fine-tuned checkpoint to
 a repository, ensuring that others can easily load and use it with
-transformer\'s
-[AutoModelForCausalLM](https://huggingface.co/docs/transformers/en/model_doc/auto#transformers.AutoModelForCausalLM).
+transformer's [AutoModelForCausalLM](https://huggingface.co/docs/transformers/en/model_doc/auto#transformers.AutoModelForCausalLM).
 The following steps outline how to publish the fine-tuned checkpoint:
 
 1.  Install the Hugging Face Hub library (if not alredy installed):
@@ -368,14 +331,10 @@ The following script demonstrates how to export a fine-tuned checkpoint
 to vLLM and deploy it using PyTriton, allowing seamless deployment and
 efficient inference:
 
-::: note
-::: title
-Note
-:::
+> [!NOTE]
+> Make sure vLLM is installed (pip install vllm, or use the environment
+> that includes it) before proceeding with vLLMHFExporter.
 
-Make sure vLLM is installed (pip install vllm, or use the environment
-that includes it) before proceeding with vLLMHFExporter.
-:::
 
 ``` python
 from nemo.deploy import DeployPyTriton
