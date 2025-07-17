@@ -28,13 +28,13 @@ the trained adapters, evaluate model performance with the LM Eval
 Harness, publish your adapters to the Hugging Face Model Hub, and export
 them to vLLM for seamless deployment.
 
-In addition to this user guide, you can also explore our Quickstart,
+<!-- In addition to this user guide, you can also explore our Quickstart,
 which features a [standalone Python3
 script](https://github.com/NVIDIA/NeMo/blob/main/examples/llm/peft/automodel.py)
 and a guided [Jupyter
 Notebook](https://github.com/NVIDIA/NeMo/blob/main/tutorials/llm/automodel/peft.ipynb),
 offering hands-on demonstrations for quickly getting started with NeMo
-AutoModel.
+AutoModel. -->
 
 ## Run PEFT with NeMo AutoModel
 
