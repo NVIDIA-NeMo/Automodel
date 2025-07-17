@@ -116,6 +116,10 @@ def save_model(
     if checkpoint_config.is_peft:
         assert peft_config is not None, "PEFT config needs to be provided when checkpointing PEFT models."
         _save_peft_adapters(model_state, peft_config, model_path)
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            # save the tokenizer
+            if tokenizer is not None:
+                tokenizer.save_pretrained(model_path)
 
     elif checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
         fqn_to_file_index_mapping = None
