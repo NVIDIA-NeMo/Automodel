@@ -114,60 +114,7 @@ This structure is ideal for training models in context-based question answering,
 > In this guide, we use the `SQuAD v1.1` dataset, but you can specify your own data as needed.
 
 
-## Automodel CLI
-
-The easiest way to run PEFT training is with the recipe files. You can
-find the list of supported models and their predefined recipes
-[here](https://github.com/NVIDIA/NeMo/tree/main/nemo/collections/llm/recipes).
-
-<!-- > [!NOTE]
-> **Prerequisite**: Before proceeding, please follow the example in
-> `nemo-2-quickstart-nemo-run`{.interpreted-text role="ref"} to
-> familiarize yourself with NeMo-Run first. -->
-
-``` python
-from nemo.collections import llm
-import nemo_run as run
-
-nodes = 1
-gpus_per_node = 1
-recipe = llm.hf_auto_model_for_causal_lm.finetune_recipe(
-    model_name="meta-llama/Llama-3.2-1B",  # The Hugging Face model-id or path to a local checkpoint (HF-native format).
-    dir="/checkpoints/llama3.2_1b", # Path to store checkpoints
-    name="llama3_lora",
-    num_nodes=nodes,
-    num_gpus_per_node=gpus_per_node,
-    peft_scheme="lora",
-)
-# Note: "lora" is the default peft_scheme.
-# Supported values are "lora", "none"/None (full fine-tuning).
-
-# Override your PEFT configuration here, if needed. Regexp-like format is also supported,
-# to match all modules ending in `_proj` use `*_proj`. For example:
-recipe.peft.target_modules = ["linear_qkv", "linear_proj", "linear_fc1", "*_proj"]
-recipe.peft.dim = 16
-recipe.peft.alpha = 32
-
-# Add other overrides here:
-...
-
-run.run(recipe)
-```
-
-### NeMo-Run CLI
-
-You can use PEFT recipes via the NeMo-Run CLI (See [NeMo-Run\'s
-docs](https://github.com/NVIDIA/NeMo-Run) for more details). LoRA are
-registered as factory classes, so you can specify `peft=<lora/none>`
-directly in the terminal. This provides a quick and easy way to launch
-training jobs when you do not need to override any configuration from
-the default recipes.
-
-``` bash
-nemo llm finetune -f hf_auto_model_for_causal_lm model_name="meta-llama/Llama-3.2-1B" peft=lora  # acceptable values are lora/none
-```
-
-### llm.finetune API
+### Finetune recipe config
 
 This example uses the [finetune
 API](https://github.com/NVIDIA/NeMo/blob/main/nemo/collections/llm/api.py)
@@ -261,6 +208,60 @@ optimizer:
 > The FSDP2Strategy is introduced in NeMo\'s lightning strategy and
 > requires an active NeMo installation. See the NeMo documentation for
 > installation details.
+
+
+## Run the recipe directly
+
+The easiest way to run PEFT training is with the recipe files. You can
+find the list of supported models and their predefined recipes
+[here](https://github.com/NVIDIA/NeMo/tree/main/nemo/collections/llm/recipes).
+
+<!-- > [!NOTE]
+> **Prerequisite**: Before proceeding, please follow the example in
+> `nemo-2-quickstart-nemo-run`{.interpreted-text role="ref"} to
+> familiarize yourself with NeMo-Run first. -->
+
+``` python
+from nemo.collections import llm
+import nemo_run as run
+
+nodes = 1
+gpus_per_node = 1
+recipe = llm.hf_auto_model_for_causal_lm.finetune_recipe(
+    model_name="meta-llama/Llama-3.2-1B",  # The Hugging Face model-id or path to a local checkpoint (HF-native format).
+    dir="/checkpoints/llama3.2_1b", # Path to store checkpoints
+    name="llama3_lora",
+    num_nodes=nodes,
+    num_gpus_per_node=gpus_per_node,
+    peft_scheme="lora",
+)
+# Note: "lora" is the default peft_scheme.
+# Supported values are "lora", "none"/None (full fine-tuning).
+
+# Override your PEFT configuration here, if needed. Regexp-like format is also supported,
+# to match all modules ending in `_proj` use `*_proj`. For example:
+recipe.peft.target_modules = ["linear_qkv", "linear_proj", "linear_fc1", "*_proj"]
+recipe.peft.dim = 16
+recipe.peft.alpha = 32
+
+# Add other overrides here:
+...
+
+run.run(recipe)
+```
+
+## Run the recipe with Automodel CLI
+
+You can use PEFT recipes via the NeMo-Run CLI (See [NeMo-Run\'s
+docs](https://github.com/NVIDIA/NeMo-Run) for more details). LoRA are
+registered as factory classes, so you can specify `peft=<lora/none>`
+directly in the terminal. This provides a quick and easy way to launch
+training jobs when you do not need to override any configuration from
+the default recipes.
+
+``` bash
+nemo llm finetune -f hf_auto_model_for_causal_lm model_name="meta-llama/Llama-3.2-1B" peft=lora  # acceptable values are lora/none
+```
 
 
 ## Run PEFT Inference with NeMo AutoModel-trained Adapters
