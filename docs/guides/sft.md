@@ -334,7 +334,7 @@ model = AutoModelForCausalLM.from_pretrained("your-username/llama3.2_1b-finetune
 By publishing the fine-tuned checkpoint to the Hugging Face Hub, we
 enable easy sharing, reproducibility, and integration with downstream
 applications.
-
+<!-- 
 ## Evaluate with the LM Evaluation Harness
 
 After fine-tuning the pretrained model on a domain-specific dataset
@@ -368,7 +368,7 @@ AutoModel-finetuned checkpoint of [meta-llama/Llama-3.2-1B](https://huggingface.
 
 Before running this command, make sure you have specified the checkpoint
 path that you used during fine-tuning, we will use
-[/ft_checkpoints/llama3.2_1b]{.title-ref} as in the fine-tuning section.
+[/ft_checkpoints/llama3.2_1b]{.title-ref} as in the fine-tuning section. -->
 
 ## Export to vLLM
 

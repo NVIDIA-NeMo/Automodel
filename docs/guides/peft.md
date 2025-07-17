@@ -360,7 +360,7 @@ peft_model = PeftModel.from_pretrained(model, "your-username/peft-adapter-name")
 By publishing the adapters to the Hugging Face Hub, we enable easy
 sharing, reproducibility, and integration with downstream applications.
 
-## Evaluate with the LM Evaluation Harness
+<!-- ## Evaluate with the LM Evaluation Harness
 
 After fine-tuning the pretrained model on a domain-specific dataset
 using NeMo AutoModel, the process generates Hugging Face-native PEFT
@@ -389,7 +389,7 @@ python3 -m lm_eval --model hf \
 ```
 
 This command will run lm_eval on hellaswag using [meta-llama/Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B) and the NeMo AutoModel-trained HF
-adapters.
+adapters. -->
 
 ## Export to vLLM
 
