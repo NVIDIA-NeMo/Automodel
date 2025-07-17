@@ -46,43 +46,19 @@ For a complete guide and additional options please consult the [`Automodel insta
 In this guide, we will fine-tune Meta’s `LLaMA 3.2 1B` model on the popular [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/) (Stanford Question Answering Dataset).
 
 #### 🔍 About LLaMA 3.2 1B
-LLaMA (Large Language Model Meta AI) is a family of decoder-only transformer models developed by Meta. The LLaMA 3.2 1B variant is a compact, lightweight model ideal for research and edge deployment. Despite its size, it maintains architectural features consistent with its larger siblings:
+**LLaMA** is a family of decoder-only transformer models developed by Meta. The **LLaMA 3.2 1B** variant is a compact, lightweight model ideal for research and edge deployment. Despite its size, it maintains architectural features consistent with its larger siblings:
 
-- Decoder-only architecture: Follows a GPT-style, autoregressive design—optimized for generation tasks.
+- **Decoder-only architecture**: Follows a GPT-style, autoregressive design—optimized for generation tasks.
 
-- Rotary positional embeddings (RoPE): Efficient and extendable positional encoding technique.
+- **Rotary positional embeddings (RoPE)**: Efficient and extendable positional encoding technique.
 
-- Grouped-query attention (GQA): Enhances scalability by decoupling key/value heads from query heads.
+- **Grouped-query attention (GQA)**: Enhances scalability by decoupling key/value heads from query heads.
 
-- SwiGLU activation: A variant of the GLU activation, offering improved convergence and expressiveness.
+- **SwiGLU activation**: A variant of the GLU activation, offering improved convergence and expressiveness.
 
-- Multi-layer residual connections: Enhances training stability and depth scaling.
+- **Multi-layer residual connections**: Enhances training stability and depth scaling.
 
 These design choices make LLaMA models highly competitive across various benchmarks, and their open weights make them a strong base for task-specific fine-tuning.
-
-#### 📚 About SQuAD
-SQuAD is a benchmark dataset for machine reading comprehension. Each example consists of a passage from Wikipedia, a question, and the answer—a span of text from the passage. It's designed to test a model’s ability to understand and extract factual information from unstructured text.
-
-There are two major versions:
-
-- SQuAD v1.1: All answers are guaranteed to be present in the context.
-
-- SQuAD v2.0: Introduces unanswerable questions, adding complexity and realism.
-
-In this tutorial, we’ll focus on SQuAD v1.1, which is more suitable for straightforward supervised fine-tuning without requiring additional handling of null answers.
-
-Here’s a glimpse of what the data looks like:
-``` json
-{
-  "context": "The Eiffel Tower is a wrought-iron lattice tower on the Champ de Mars in Paris, France.",
-  "question": "Where is the Eiffel Tower located?",
-  "answer_text": "on the Champ de Mars in Paris, France",
-  "answer_start": 41
-}
-```
-This structure is ideal for training models in extractive question answering, where the model learns to locate the answer span within a passage.
-
-
 
 > [!TIP]
 > In this guide, `meta-llama/Llama-3.2-1B` is used only as a placeholder
@@ -102,6 +78,41 @@ This structure is ideal for training models in extractive question answering, wh
 >    belongs to the account that was approved.
 >
 > Trying to pull a gated model without an authorized token will trigger a 403 "permission denied" error.
+
+
+#### 📚 About SQuAD
+Stanford Question Answering Dataset (SQuAD) is a **reading comprehension dataset**, consisting of questions posed by crowdworkers on a set of Wikipedia articles, where the answer to every question is a segment of text, or span, from the corresponding reading passage, or the question might be unanswerable.
+
+There are two major versions:
+
+- **SQuAD v1.1**: All answers are guaranteed to be present in the context.
+
+- **SQuAD v2.0**: Introduces unanswerable questions, adding complexity and realism.
+
+In this tutorial, we’ll focus on **SQuAD v1.1**, which is more suitable for straightforward supervised fine-tuning without requiring additional handling of null answers.
+
+Here’s a glimpse of what the data looks like:
+``` json
+{
+
+    "id": "5733be284776f41900661182",
+    "title": "University_of_Notre_Dame",
+    "context": "Architecturally, the school has a Catholic character. Atop the Main Building's gold dome is a golden statue of the Virgin Mary. Immediately in front of the Main Building and facing it, is a copper statue of Christ with arms upraised with the legend Venite Ad Me Omnes. Next to the Main Building is the Basilica of the Sacred Heart. Immediately behind the basilica is the Grotto, a Marian place of prayer and reflection. It is a replica of the grotto at Lourdes, France where the Virgin Mary reputedly appeared to Saint Bernadette Soubirous in 1858. At the end of the main drive (and in a direct line that connects through 3 statues and the Gold Dome), is a simple, modern stone statue of Mary.",
+    "question": "To whom did the Virgin Mary allegedly appear in 1858 in Lourdes France?",
+    "answers": {
+        "text": [
+            "Saint Bernadette Soubirous"
+        ],
+        "answer_start": [
+            515
+        ]
+    }
+}
+```
+This structure is ideal for training models in context-based question answering, where the model learns to answer questions based on the input context.
+
+> [!TIP]
+> In this guide, we use the `SQuAD v1.1` dataset, but you can specify your own data as needed.
 
 
 ### NeMo-Run Recipes
