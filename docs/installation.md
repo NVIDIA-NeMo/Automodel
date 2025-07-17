@@ -88,7 +88,8 @@ Use this if you want to:
 
 ```bash
 git clone https://github.com/NVIDIA/NeMo.git
-cd NeMo```
+cd NeMo
+```
 
 ---
 
