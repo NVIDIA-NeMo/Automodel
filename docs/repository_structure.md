@@ -9,9 +9,9 @@ NeMo Automodel is a PyTorch-native machine learning framework/library for finetu
 
 ## Repository structure, components and recipes
 The Automodel source code is availabe under the `nemo_automodel` directory. It is organized in three main parts:
-- components/
-- recipes/
-- cli/
+- `components/`
+- `recipes/`
+- `cli/`
 
 ### Components
 The `components/` directory contains self-contained modules used in training and fine-tuning loops.
