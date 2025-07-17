@@ -19,10 +19,10 @@ NeMo Automodel support LLM, VLM, and OMNI models. Depending on your use case, th
 For most users, the easiest way to get started is using `pip3`.
 
 ```bash
-pip3 install nemo-automodel
+pip3 install nemo-Automodel
 ```
 > [!TIP]
-> This installs the latest stable release of nemo-automodel from PyPI along with all required dependencies.
+> This installs the latest stable release of nemo-Automodel from PyPI along with all required dependencies.
 
 ## NeMo docker container
 You can use NeMo Automodel with NeMo docker container. You can pull the container by running:
@@ -49,7 +49,7 @@ If you want the **latest features** from the `main` branch or want to contribute
 
 ### Option A - Using `pip` with git repo:
 ```bash
-pip3 install git+https://github.com/NVIDIA-NeMo/AutoModel.git
+pip3 install git+https://github.com/NVIDIA-NeMo/Automodel.git
 ```
 > [!NOTE]
 > This installs the repo as a standard Python package (not editable).
@@ -57,7 +57,7 @@ pip3 install git+https://github.com/NVIDIA-NeMo/AutoModel.git
 
 ### Option B - Using `uv` with git repo:
 ```bash
-uv pip install git+https://github.com/NVIDIA-NeMo/AutoModel.git
+uv pip install git+https://github.com/NVIDIA-NeMo/Automodel.git
 ```
 > [!NOTE]
 > `uv` handles virtual environment transparently and enables more reproducible installs.
@@ -66,49 +66,52 @@ uv pip install git+https://github.com/NVIDIA-NeMo/AutoModel.git
 ## 🧪 Developer Mode (Editable Install)
 To contribute or modify the code:
 ```bash
-git clone https://github.com/NVIDIA-NeMo/AutoModel.git
-cd AutoModel
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
 pip3 install -e .
 ```
 
 > [!NOTE]
-> 🛠️ This installs AutoModel in editable mode, so changes to the code are immediately reflected in Python.
+> 🛠️ This installs Automodel in editable mode, so changes to the code are immediately reflected in Python.
 
 
 ## 🐳 Mount the Repo into a NeMo Docker Container
-To run `AutoModel` inside a NeMo container while **mounting your local repo**, follow these steps:
+To run `Automodel` inside a NeMo container while **mounting your local repo**, follow these steps:
 
 ```
-# Step 1: Clone the AutoModel repository
-git clone https://github.com/NVIDIA-NeMo/AutoModel.git && cd AutoModel && \
+# Step 1: Clone the Automodel repository
+git clone https://github.com/NVIDIA-NeMo/Automodel.git && cd Automodel && \
 
 # Step 2: Pull the latest compatible NeMo container (replace 25.07 with latest if desired)
 docker pull nvcr.io/nvidia/nemo:25.07 && \
 
 # Step 3: Run the NeMo container with GPU support, shared memory, and mount the repo
 docker run --gpus all -it --rm \
-  -v $(pwd):/workspace/automodel \         # Mount repo into container workspace
+  -v $(pwd):/workspace/Automodel \         # Mount repo into container workspace
   -v $(pwd)/Automodel:/opt/Automodel \     # Optional: Mount Automodel under /opt for flexibility
   --shm-size=8g \                           # Increase shared memory for PyTorch/data loading
   nvcr.io/nvidia/nemo:25.07 /bin/bash -c "\
-    cd /workspace/automodel && \           # Enter the mounted repo
-    pip install -e . && \                  # Install AutoModel in editable mode
+    cd /workspace/Automodel && \           # Enter the mounted repo
+    pip install -e . && \                  # Install Automodel in editable mode
     python3 examples/llm/finetune.py" # Run a usage example
 ```
+> [!NOTE]
+> The above `docker` command uses the volume `-v` option to mount the local `Automodel` directory
+> under `/opt/Automodel`.
 
 ## 🧪 Bonus: Install Extras
 Some functionality may require optional extras. You can install them like this:
 ```bash
-pip3 install nemo-automodel[cli]    # Installs only the automodel CLI
-pip3 install nemo-automodel         # Installs the CLI and all LLM dependencies.
-pip3 install nemo-automodel[vlm]    # Install all VLM-related dependencies.
+pip3 install nemo-Automodel[cli]    # Installs only the Automodel CLI
+pip3 install nemo-Automodel         # Installs the CLI and all LLM dependencies.
+pip3 install nemo-Automodel[vlm]    # Install all VLM-related dependencies.
 ```
 
 ## 📌 Summary
 | Goal                        | Command or Method                                               |
 | --------------------------- | --------------------------------------------------------------- |
-| Stable install (PyPI)       | `pip3 install nemo-automodel`                                   |
-| Latest from GitHub          | `pip3 install git+https://github.com/NVIDIA-NeMo/AutoModel.git` |
+| Stable install (PyPI)       | `pip3 install nemo-Automodel`                                   |
+| Latest from GitHub          | `pip3 install git+https://github.com/NVIDIA-NeMo/Automodel.git` |
 | Editable install (dev mode) | `pip install -e .` after cloning                                |
 | Run without installing      | Use `PYTHONPATH=$(pwd)` to run scripts                          |
 | Use in Docker container     | Mount repo and `pip install -e .` inside container              |
