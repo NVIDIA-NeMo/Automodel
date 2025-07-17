@@ -26,18 +26,18 @@ The following directory listing shows all components with explaination of their 
 ```
 $ tree -L 1.
 .
-├── _peft/ - implementations of PEFT methods (e.g., LoRA).
-├── _transformers/ - Optimized model implementations for Hugging Face models.
-├── checkpoint/ - Checkpoint save / load related logic.
-├── config/ - Utils to load yamls and CLI parsing helpers.
-├── datasets/ - LLM and VLM datasets and utils (collate functions, preprocessing).
-├── distributed/ - Distributed processing primited (DDP, FSDP2, nvFSDP).
-├── launcher/ - Job launcher (slurm, k8s, local); imports only stdlib + config.
-├── loggers/ - Metric/event logging for Weights-&-Biases, etc.
-├── loss/ - Loss function (e.g., cross-entropy, linear cross-entropy, etc).
-├── optim/ - Optimizers and LR schedulers, including fused or second-order variants.
-├── training/ - Base recipe and high-level training/finetuning utils.
-└── utils/ - Small, dependency-free helpers (seed, profiler, timing, fs).
+├── _peft/          - implementations of PEFT methods (e.g., LoRA).
+├── _transformers/  - Optimized model implementations for Hugging Face models.
+├── checkpoint/     - Checkpoint save / load related logic.
+├── config/         - Utils to load yamls and CLI parsing helpers.
+├── datasets/       - LLM and VLM datasets and utils (collate functions, preprocessing).
+├── distributed/    - Distributed processing primited (DDP, FSDP2, nvFSDP).
+├── launcher/       - Job launcher (slurm, k8s, local); imports only stdlib + config.
+├── loggers/        - Metric/event logging for Weights-&-Biases, etc.
+├── loss/           - Loss function (e.g., cross-entropy, linear cross-entropy, etc).
+├── optim/          - Optimizers and LR schedulers, including fused or second-order variants.
+├── training/       - Base recipe and high-level training/finetuning utils.
+└── utils/          - Small, dependency-free helpers (seed, profiler, timing, fs).
 ```
 
 ### Recipes
