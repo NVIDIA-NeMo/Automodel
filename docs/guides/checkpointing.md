@@ -35,26 +35,36 @@ checkpoint:
 
 
 ## Safetensors
-To ensure seamless integration with the Hugging Face ecosystem, NeMo Automodel saves checkpoints in the [Safetensors](https://github.com/huggingface/safetensors) format. Safetensors is a memory-safe, zero-copy alternative to Python's pickle (Pytorch .bin), natively supported by 🤗 Transformers.
+To ensure seamless integration with the Hugging Face ecosystem, NeMo Automodel saves checkpoints in the [Safetensors](https://github.com/huggingface/safetensors) format. Safetensors is a memory-safe, zero-copy alternative to Python's pickle (Pytorch .bin), natively supported by 🤗 Transformers, offering both safety and performance advantages over Python pickle-based approaches.
 
-The sharded Safetensors format leverages the PyTorch DCP API under the hood for saving. PyTorch DCP supports loading and saving training states from multiple ranks in parallel, which makes checkpointing far more efficient as all GPUs can contribute their "shard" of the state. We can also benefit from features like load-time resharding which allows the user to save in one hardware setup and load it back in another. For example, the user can save with 2 GPUs at train time and still be able to load it back in with 1 GPU. 
+### Key Benefits:
+- **Native Hugging Face Compatibility**: Checkpoints can be loaded directly into Hugging Face-compatible tools (e.g., vLLM, SGLang, etc).
+- **Memory Safety & Speed**: Safetensors format prohibits saving serialized python code and leverages zero-copying for speed.
+- **Optional Consolidation**: Sharded checkpoints can be merged into a standard Hugging Face model format for easier downstream use.
 
 **Most importantly**, the added advantage of this format is that we can optionally consolidate the various shards into a full HuggingFace format model.
 
-To showcase this, we can run the following command on 2 GPUs and we get the following checkpoint:
+### Example
+
+The following example shows how to run the LLM finetune recipe using two GPUs and saves a checkpoint using the Safetensors format. Using the following command:
 ```bash
 uv run torchrun --nproc-per-node=2 examples/llm/finetune.py --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors --checkpoint.save_consolidated True
-
-...
-> Saving checkpoint to checkpoints/epoch_0_step_20
-...
 ```
+
 :::{tip}
 If you're running on a single GPU, you can run
 ```
 uv run examples/llm/finetune.py --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors --checkpoint.save_consolidated True
 ```
-:::
+
+After running for a few seconds, the following should appear in the standard output:
+```
+...
+> Saving checkpoint to checkpoints/epoch_0_step_20
+...
+```
+
+The `checkpoints/` should have the following contents:
 ```
 checkpoints/
 └── epoch_0_step_20/
@@ -74,12 +84,10 @@ checkpoints/
         └── .metadata
     ...
 ```
-The `shard-*` files will be used by the PyTorch DCP API when resuming from the checkpoint for training. The consolidated model is only stored for downstream usage.
 
-The consolidation step happens on the main process as the final step of checkpointing. This step is done solely through file I/O operations which means we will never have to materialize the sharded weights in GPU memory.
+The `epoch_0_step_20/` directory contains the training state from step `20` of the first epoch. It includes the complete training state (i.e., model and optimizer state).
 
-We can load and run the consolidated model using HuggingFace API:
-
+We can load and run the consolidated checkpoint using 🤗 Transformers API directly:
 ```python
 import torch
 from transformers import pipeline
@@ -97,15 +105,28 @@ print(pipe("The key to life is"))
 >>> [{'generated_text': 'The key to life is to be happy. The key to happiness is to be kind. The key to kindness is to be'}]
 ```
 
-### PEFT
-When a user performs training using PEFT techniques, the trainable model weights are only a fraction of the full model. All remaining model weights are treated to be frozen.
+While this uses the 🤗 Transformers API, we can use the `consolidated/` checkpoint with any of HF-compatible tool (e.g., vLLM, SGLang, etc).
 
-This means that the state to checkpoint is very small (usually a few MB), so it's unnecessary to have multiple small sharded states. Consequently, NeMo AutoModel enforces consolidated HuggingFace compatible checkpoints when training with PEFT techniques. To run an example on 2 GPUs, the user can run the following example:
+
+## PEFT
+When training with PEFT (Parameter-Efficient Fine-Tuning) techniques, only a small subset of model weights are updated — the rest of the model remains frozen. This dramatically reduces the size of the checkpoint, often to just a few megabytes.
+
+### Why Consolidated Checkpoints?
+Because the PEFT state is so lightweight, sharded checkpointing adds unnecessary overhead. Instead, NeMo Automodel automatically saves a single, consolidated Hugging Face–compatible checkpoint when using PEFT. This makes it:
+
+- Easier to manage and share (just the adapters),
+- Compatible with 🤗 Transformers out of the box,
+- Ideal for deployment and downstream evaluation.
+
+### Example: PEFT finetuning on 2 GPUs
+
+To fine-tune a model using PEFT and save a Hugging Face–ready checkpoint:
 ```
 uv run torchrun --nproc-per-node=2 examples/llm/finetune.py --config examples/llm/llama_3_2_1b_hellaswag_peft.yaml --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors
 ```
 
-A HuggingFace compatible PEFT checkpoint gets saved
+After training, you'll get a compact, consolidated Safetensors checkpoint that can be loaded directly with Hugging Face tools:
+
 ```
 checkpoints/
 └── epoch_0_step_20/
