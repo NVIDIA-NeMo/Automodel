@@ -2,14 +2,15 @@
 
 ## Introduction
 
-In model training, checkpoints are used to periodically save intermediate model states (including model weights, optimizer states, and other necessary metadata). This allows for easy recovery if the training process is interrupted.
+During machine-learning experiments, the model-training routine regularly saves checkpoints. A checkpoint is a complete snapshots of a run that include model weights, optimizer states, and other metadata required to resume training exactly where it left off. Writing these snapshots at regular intervals lets you recover quickly from crashes or pauses without losing progress.
 
-Checkpointing in NeMo AutoModel refers to saving the state of a distributed training job across multiple GPUs or nodes. This approach aims to reduce memory overhead and improve GPU utilization. It also provides users with the flexibility to resume training using different parallelism strategies.
+NeMo AutoModel checkpoints capture the complete state of a distributed training run (across multiple GPUs or nodes). This reduces memory overhead, improves GPU utilization, and allows training to be resumed with a different parallelism strategy
 
-NeMo AutoModel offers state checkpointing across [HuggingFace Safetensors](https://huggingface.co/docs/safetensors/en/index) and [PyTorch Distributed Checkpointing (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html) formats. State checkpointing can be done either sharded or consolidated.
+NeMo AutoModel writes checkpoints in two formats (HuggingFace [Safetensors](https://huggingface.co/docs/safetensors/en/index) and [PyTorch Distributed Checkpointing (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html)) and in two layouts:
 
-- **Sharded** checkpoints: distributed training is done by splitting states (model weights, optimizer states, etc.) over many GPUs and each GPU will save its own "shard" of the full state. As such, it allows checkpointing to be done in parallel across all the GPUs thus speeding up checkpointing tremendously.
-- **Consolidated** checkpoints: the multiple sharded files get _consolidated_ from a sharded checkpoint into one complete HuggingFace compatible checkpoint. This can then be loaded into downstream applications using the HuggingFace API (e.g., HuggingFace, vLLM, SGLang, etc.).
+- **Consolidated** checkpoints: the complete model state is saved as a HuggingFace-compatible bundle, often a single file, or a small set of files and an index. Because no tensor is split across GPUs (unsharded), downstream tools like HuggingFace, vLLM, and SGLang can load it directly.
+
+- **Sharded** checkpoints: During distributed training with parameter sharing, typically each GPU holds a subset of the full state (e.g., model weights, optimizer states, and so on), also referred to as a "shard". During checkpointing each GPU saves its own shard of the full state, without reconstructing the full state.
 
 We provide an overview of the different types of available checkpoint formats in the table below.
 
@@ -17,21 +18,24 @@ We provide an overview of the different types of available checkpoint formats in
 |----------------------|:-----------:|:-------------------:|:------------------------:|
 | LLM                  | ✅          | ✅                   | ✅                      |
 | VLM                  | ✅          | ✅                   | ✅                      |
-| LLM / VLM – PEFT     | ❌          | ❌                   | ✅                      | 
+| LLM / VLM – PEFT     | 🚧          | 🚧                   | ✅                      | 
 
-The user can seamlessly switch between output formats through the recipe `yaml` file
+
+Changing between output formats can be done seamlessly through the recipe's `yaml` configuration file:
 ```
 checkpoint:
     ...
-    model_save_format: torch_save # Format for saving (torch_save or safetensors)
-    save_consolidated: false # Change to true if you want the checkpoint to have HuggingFace compatibility.
-                             # Requires model_save_format to be safetensors.
+    model_save_format: safetensors # Format for saving (torch_save or safetensors)
+    save_consolidated: true # Change to false if you want to save sharded checkpoints.
     ...
 ```
+> **Note:** We recommend using the above checkpoint configuration for maximum compatibility with the HF ecosystem (e.g., downstream tools vLLM, SGLang, etc).
+
 > **Note:** The optimizer states are _always_ saved in DCP (`.distcp` extension) format.
 
+
 ## Safetensors
-To ensure a smooth integration with the HuggingFace ecosystem, we make the Safetensors format (`.safetensors` extension) available to the user.
+To ensure seamless integration with the Hugging Face ecosystem, we save checkpoints in the Safetensors format (.safetensors). Safetensors is a memory-safe, zero-copy alternative to PyTorch’s .bin files and is natively supported by 🤗 Transformers.
 
 The sharded Safetensors format leverages the PyTorch DCP API under the hood for saving. PyTorch DCP supports loading and saving training states from multiple ranks in parallel, which makes checkpointing far more efficient as all GPUs can contribute their "shard" of the state. We can also benefit from features like load-time resharding which allows the user to save in one hardware setup and load it back in another. For example, the user can save with 2 GPUs at train time and still be able to load it back in with 1 GPU. 
 
