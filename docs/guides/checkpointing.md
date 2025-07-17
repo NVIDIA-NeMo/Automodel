@@ -35,7 +35,7 @@ checkpoint:
 
 
 ## Safetensors
-To ensure seamless integration with the Hugging Face ecosystem, we save checkpoints in the [Safetensors](https://github.com/huggingface/safetensors) format, natively supported by 🤗 Transformers. Safetensors is a memory-safe, zero-copy alternative to Python's pickle (Pytorch .bin).
+To ensure seamless integration with the Hugging Face ecosystem, NeMo Automodel saves checkpoints in the [Safetensors](https://github.com/huggingface/safetensors) format. Safetensors is a memory-safe, zero-copy alternative to Python's pickle (Pytorch .bin), natively supported by 🤗 Transformers.
 
 The sharded Safetensors format leverages the PyTorch DCP API under the hood for saving. PyTorch DCP supports loading and saving training states from multiple ranks in parallel, which makes checkpointing far more efficient as all GPUs can contribute their "shard" of the state. We can also benefit from features like load-time resharding which allows the user to save in one hardware setup and load it back in another. For example, the user can save with 2 GPUs at train time and still be able to load it back in with 1 GPU. 
 
