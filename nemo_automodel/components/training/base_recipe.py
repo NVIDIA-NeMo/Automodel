@@ -160,6 +160,10 @@ class BaseRecipe:
                 model = getattr(self, key)
             elif isinstance(getattr(self, key), Optimizer):
                 optimizer = getattr(self, key)
+            elif is_tokenizer(getattr(self, key)):
+                # we don't need to load the tokenizer from the checkpoint
+                # we only save the tokenizer for consolidated checkpoints for downstream use
+                continue
             else:
                 getattr(self, key).load_state_dict(torch.load(os.path.join(ckpt_dir, f"{key}.pt"), weights_only=False))
 
