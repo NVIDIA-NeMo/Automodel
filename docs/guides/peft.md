@@ -10,7 +10,7 @@ while leveraging the extensive knowledge captured during pretraining.
 
 However, full-parameter fine-tuning can be computationally expensive,
 requiring significant hardware resources. To address this, PEFT
-techniques such as Low-Rank Adapters (LoRA) have emerged as a
+techniques such as [Low-Rank Adapters (LoRA)](https://arxiv.org/abs/2106.09685) have emerged as a
 lightweight approach that updates only a small subset of parameters
 while keeping the base model weights frozen. This approach reduces the
 number of trainable parameters, often to less than 1%, while
