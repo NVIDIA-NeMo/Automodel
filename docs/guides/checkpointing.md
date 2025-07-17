@@ -14,11 +14,11 @@ NeMo AutoModel writes checkpoints in two formats ([🤗 Safetensors](https://git
 
 We provide an overview of the different types of available checkpoint formats in the table below.
 
-| Model type           | DCP (sharded) | Safetensors (sharded) | Safetensors (consolidated) |
-|----------------------|:-----------:|:-------------------:|:------------------------:|
-| LLM                  | ✅          | ✅                   | ✅                      |
-| VLM                  | ✅          | ✅                   | ✅                      |
-| LLM / VLM – PEFT     | 🚧          | 🚧                   | ✅                      | 
+Task | Model domain  | DCP (sharded) | Safetensors (sharded) | Safetensors (consolidated) |
+-----|----------------------|:-----------:|:-------------------:|:------------------------:|
+SFT  | LLM                  | ✅          | ✅                   | ✅                      |
+SFT  | VLM                  | ✅          | ✅                   | ✅                      |
+PEFT | LLM / VLM            | 🚧          | 🚧                   | ✅                      | 
 
 
 Changing between output formats can be done seamlessly through the recipe's `yaml` configuration file:
