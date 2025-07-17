@@ -42,7 +42,7 @@ pip3 install nemo-automodel
 ```
 For a complete guide and additional options please consult the [`Automodel installation guide`](installation.md).
 
-### Background
+### Model and Dataset Context
 In this guide, we will fine-tune Meta’s `LLaMA 3.2 1B` model on the popular [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/) (Stanford Question Answering Dataset).
 
 #### 🔍 About LLaMA 3.2 1B
@@ -113,10 +113,9 @@ This structure is ideal for training models in context-based question answering,
 
 > [!TIP]
 > In this guide, we use the `SQuAD v1.1` dataset, but you can specify your own data as needed.
----
 
 
-### NeMo-Run Recipes
+### Automodel Recipe
 
 The easiest way to run SFT training is with the recipe files. You can
 find the list of supported models and their predefined recipes available
