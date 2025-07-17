@@ -162,7 +162,7 @@ def load_model(
     model: torch.nn.Module,
     weights_path: str,
     checkpoint_config: CheckpointingConfig,
-) -> Optional[PreTrainedTokenizerBase]:
+):
     """
     Load a model state dictionary from a weights path.
 
