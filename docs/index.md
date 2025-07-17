@@ -5,7 +5,7 @@
 ```{toctree}
 :caption: 🖥️  Environment Start
 :hidden:
-
+guides/installation.md
 environment/local-workstation.md
 ```
 <!--
