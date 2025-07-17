@@ -96,7 +96,7 @@ recipe = llm.hf_auto_model_for_causal_lm.finetune_recipe(
 run.run(recipe)
 ```
 
-### NeMo-Run CLI
+### Automodel CLI
 
 You can use SFT recipes via the NeMo-Run CLI (See [NeMo-Run\'s
 docs](https://github.com/NVIDIA/NeMo-Run) for more details). This
@@ -104,10 +104,10 @@ provides a quick and easy way to launch training jobs when you do not
 need to override any configuration from the default recipes.
 
 ``` bash
-nemo llm finetune -f hf_auto_model_for_causal_lm model_name="meta-llama/Llama-3.2-1B" peft=none
+automodel finetune llm -c examples/llm/llama_3_2_1b_squad.yaml
 ```
 
-### llm.finetune API
+<!-- ### llm.finetune API
 
 This example uses the [finetune
 API](https://github.com/NVIDIA/NeMo/blob/main/nemo/collections/llm/api.py)
@@ -197,6 +197,8 @@ llm.api.finetune(
 > The FSDP2Strategy is introduced in NeMo\'s lightning strategy and
 > requires an active NeMo installation. See the NeMo documentation for
 > installation details.
+
+ -->
 
 ## Run Inference with the NeMo AutoModel Fine-Tuned Checkpoint
 
