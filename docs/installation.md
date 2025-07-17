@@ -11,6 +11,7 @@ NeMo Automodel support LLM, VLM, and OMNI models. Depending on your use case, th
 
 
 ---
+# Installation options for non-developers
 
 ## 📦 Install via PyPI (Recommended)
 
@@ -22,6 +23,24 @@ pip3 install nemo-automodel
 > [!TIP]
 > This installs the latest stable release of nemo-automodel from PyPI along with all required dependencies.
 
+## NeMo docker container
+You can use NeMo Automodel with NeMo docker container. You can pull the container by running:
+```bash
+docker pull nvcr.io/nvidia/nemo:25.07
+```
+> [!NOTE]
+> The above `docker` command uses the `25.07` container, but it's recommended to use the most recent,
+> to ensure you get the latest version of Automodel and its dependencies like torch, transformers, etc.
+
+Then you can enter the container using:
+```bash
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  nvcr.io/nvidia/nemo:25.07
+```
+
+---
+# Installation options for developers
 
 ## 🐍 Install via GitHub (Source)
 
@@ -72,16 +91,36 @@ docker pull nvcr.io/nvidia/nemo:25.07
 > The above `docker` command uses the `25.07` container, but it's recommended to use the most recent,
 > to ensure you get the latest version of Automodel and its dependencies like torch, transformers, etc.
 
-### Step 3 - Mount and run:
+### Step 3 - run the container:
 ```bash
 docker run --gpus all -it --rm \
   -v $(pwd):/workspace/automodel \
   --shm-size=8g \
-  -v Automodel:/opt/Automodel \
   nvcr.io/nvidia/nemo:25.07
 ```
 
-You now have full access to `nemo-automodel` inside the NeMo docker container!
+You now have full access to `nemo-automodel` contained inside the NeMo docker container!
+
+
+### Optional: Mount a local Automodel repo in docker container:
+```bash
+docker run --gpus all -it --rm \
+  -v $(pwd):/workspace/automodel \
+  --shm-size=8g \
+  -v $(pwd)/Automodel:/opt/Automodel \
+  nvcr.io/nvidia/nemo:25.07
+```
+> [!NOTE]
+> The above `docker` command uses the volume `-v` option to mount the local `Automodel` directory
+> under `/opt/Automodel`. This works for most cases, where dependencies stay the same.
+
+### Optional: Install a local Automodel repo inside a docker container:
+```bash
+cd /workspace/automodel
+pip install -e .
+python3 examples/example_load_model.py
+```
+
 
 ## 🧪 Bonus: Install Extras
 Some functionality may require optional extras. You can install them like this:
