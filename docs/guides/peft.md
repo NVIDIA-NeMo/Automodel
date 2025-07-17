@@ -42,7 +42,7 @@ Below are three examples of running a simple PEFT training loop for the
 `Llama 3.2 1B` model using NeMo AutoModel. These examples showcase
 different levels of abstraction provided by the NeMo Framework. Once you
 have set up your environment following the instructions in
-[`install-automodel`](docs/installation.md), you are ready to
+[`Automodel installation guide`](docs/installation.md), you are ready to
 run the simple PEFT tuning script.
 
 > [!TIP]
