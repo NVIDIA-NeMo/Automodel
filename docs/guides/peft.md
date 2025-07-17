@@ -59,7 +59,7 @@ run the simple PEFT tuning script.
 > 1.  Log in with your Hugging Face account.
 > 2.  Click the button and accept the license terms.
 > 3.  Wait for approval (usually instant; occasionally manual).
-> 4.  Ensure the token you pass to your script (via `huggingface-cli login` or the `\$HF_TOKEN` environment variable)
+> 4.  Ensure the token you pass to your script (via `huggingface-cli login` or the `HF_TOKEN` environment variable)
 >    belongs to the account that was approved.
 >
 > Trying to pull a gated model without an authorized token will trigger a 403 "permission denied" error.
