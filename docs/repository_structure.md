@@ -24,9 +24,9 @@ Key points:
 
 The following directory listing shows all components with explaination of their contents:
 ```
-$ tree -L 1.
-.
-├── _peft/          - implementations of PEFT methods (e.g., LoRA).
+$ tree -L 1 nemo_automodel/components/
+
+├── _peft/          - Implementations of PEFT methods (e.g., LoRA).
 ├── _transformers/  - Optimized model implementations for Hugging Face models.
 ├── checkpoint/     - Checkpoint save / load related logic.
 ├── config/         - Utils to load yamls and CLI parsing helpers.
