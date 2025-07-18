@@ -303,11 +303,7 @@ checkpoints/epoch_0_step_10/
 
 ## Run PEFT Inference with NeMo AutoModel-Trained Adapters
 
-Inference with adapters is supported using Hugging Face\'s generate API.
-Simply replace the path to the full model with the path to a PEFT
-checkpoint. The required configurations, including the model type,
-adapter type, and base model checkpoint path, should be properly set up
-within the PEFT checkpoint.
+Inference with adapters is supported through the Hugging Face generate API. To use it, replace the full model path with the path to a PEFT checkpoint, which should include all necessary configuration settings such as model type, adapter type, and base model checkpoint path.
 
 The following is an example script using Hugging Face's Transformers library:
 
