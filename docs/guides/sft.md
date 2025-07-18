@@ -256,7 +256,7 @@ Alternatively, you can run the recipe [script](https://github.com/NVIDIA-NeMo/Au
 torchrun --nproc-per-node=8 examples/llm/finetune.py --config sft_guide.yaml
 ```
 
-### Sample output
+### Sample Output
 Running the recipe using either the `automodel` app or by directly invoking the recipe script should produce
 the following log:
 ```
