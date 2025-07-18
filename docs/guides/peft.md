@@ -169,7 +169,7 @@ validation_dataset:
 
 step_scheduler:
   grad_acc_steps: 4
-  ckpt_every_steps: 1000
+  ckpt_every_steps: 10
   val_every_steps: 10  # will run every x number of gradient steps
   num_epochs: 1
 
@@ -202,6 +202,13 @@ validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
   batch_size: 8
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors
+  save_consolidated: True # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+
 
 # We will use the standard Adam optimizer, but you can specify any optimizer you want, by changing
 # the import path using the _target_ option.
