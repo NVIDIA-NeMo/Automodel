@@ -9,7 +9,7 @@ This guide explains how to install NeMo AutoModel for LLM, VLM, and OMNI models 
 | 🐍 **Git Repo**         | ✅ | Use the latest code without cloning or installing extras manually | Power users, testers         |
 | 🧪 **Editable Install** | ✅ | Contribute to the codebase or make local modifications            | Contributors, researchers    |
 | 🐳 **Docker + Mount**   | ✅ | Use in isolated GPU environments, e.g., with NeMo container       | Multinode deployments     |
-## Prerequisites
+
 ## Prerequisites
 
 ### System Requirements
@@ -23,18 +23,7 @@ This guide explains how to install NeMo AutoModel for LLM, VLM, and OMNI models 
 - **GPU**: NVIDIA GPU with 8GB+ VRAM (16GB+ recommended)
 - **CPU**: Multi-core processor (8+ cores recommended)
 - **Network**: Stable internet connection for downloading models
-### System Requirements
-- **Python**: 3.9 or higher
-- **CUDA**: 11.8 or higher (for GPU support)
-- **Memory**: Minimum 16GB RAM, 32GB+ recommended
-- **Storage**: At least 50GB free space for models and datasets
 
-### Hardware Requirements
-
-- **GPU**: NVIDIA GPU with 8GB+ VRAM (16GB+ recommended)
-- **CPU**: Multi-core processor (8+ cores recommended)
-- **Network**: Stable internet connection for downloading models
-This section explains the easiest installation options for non-developers, including using pip3 via PyPI or leveraging a preconfigured NVIDIA NeMo Docker container. Both methods offer quick access to the latest stable release of NeMo Automodel with all required dependencies.
 ---
 ## Installation Options for Non-Developers
 This section explains the easiest installation options for non-developers, including using pip3 via PyPI or leveraging a preconfigured NVIDIA NeMo Docker container. Both methods offer quick access to the latest stable release of NeMo Automodel with all required dependencies.
