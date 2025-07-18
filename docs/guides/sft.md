@@ -227,7 +227,7 @@ optimizer:
 > those used for training.
 
 
-## Run the finetune recipe
+## Run the Fine-Tune Recipe
 Assuming the above `yaml` is saved in a file named `sft_guide.yaml`, we can run the finetune workflow
 with either the automodel CLI or by invoking the recipe python script directrly.
 
