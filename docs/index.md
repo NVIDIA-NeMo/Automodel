@@ -3,6 +3,14 @@
 ```
 
 ```{toctree}
+
+:caption: Introduction
+:hidden:
+
+repository_structure.md
+automodel_cli.md
+
+
 :caption: 🖥️  Environment Start
 :hidden:
 
