@@ -54,7 +54,7 @@ docker run --gpus all -it --rm \
 ---
 ## Installation Options for Developers
 
-## 🐍 Install via GitHub (Source)
+### 🐍 Install via GitHub (Source)
 
 If you want the **latest features** from the `main` branch or want to contribute:
 
