@@ -26,7 +26,7 @@ This guide explains how to install NeMo AutoModel for LLM, VLM, and OMNI models 
 ---
 # Installation options for non-developers
 
-## 📦 Install via PyPI (Recommended)
+### 📦 Install via PyPI (Recommended)
 
 For most users, the easiest way to get started is using `pip3`.
 
