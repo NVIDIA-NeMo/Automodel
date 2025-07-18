@@ -74,7 +74,7 @@ uv pip install git+https://github.com/NVIDIA-NeMo/Automodel.git
 > `uv` handles virtual environment transparently and enables more reproducible installs.
 
 
-## 🧪 Developer Mode (Editable Install)
+### 🧪 Install in Developer Mode (Editable Install)
 To contribute or modify the code:
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
