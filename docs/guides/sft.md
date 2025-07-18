@@ -228,8 +228,7 @@ optimizer:
 
 
 ## Run the Fine-Tune Recipe
-Assuming the above `yaml` is saved in a file named `sft_guide.yaml`, we can run the finetune workflow
-with either the automodel CLI or by invoking the recipe python script directrly.
+Assuming the above `yaml` is saved in a file named `sft_guide.yaml`, you can run the fine-tuning workflow either using the Automodel CLI or by directly invoking the recipe Python script.
 
 ### Automodel CLI
 
