@@ -34,7 +34,7 @@ For most users, the easiest way to get started is using `pip3`.
 pip3 install nemo-Automodel
 ```
 > [!TIP]
-> This installs the latest stable release of nemo-Automodel from PyPI along with all required dependencies.
+> This installs the latest stable release of NeMo Automodel from PyPI, along with all of its required dependencies.
 
 ### Install via NeMo Docker Container
 You can use NeMo Automodel with the NeMo Docker container. You can pull the container by running:
