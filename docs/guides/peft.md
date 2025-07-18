@@ -234,7 +234,7 @@ optimizer:
 > those used for training.
 
 
-## Run the finetune recipe
+## Run the Fine-Tune Recipe
 Assuming the above `yaml` is saved in a file named `peft_guide.yaml`, you can run the fine-tuning workflow either using the Automodel CLI or by directly invoking the recipe Python script.
 
 ### Automodel CLI
