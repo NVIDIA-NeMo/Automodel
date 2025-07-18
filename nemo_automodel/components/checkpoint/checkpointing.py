@@ -126,20 +126,22 @@ def save_model(
                 fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(
                     index_path, getattr(model, "_checkpoint_conversion_mapping", None)
                 )
+            else:
+                fqn_to_file_index_mapping = {k: 1 for k in model.state_dict().keys()}
 
-                # Add any missing keys from the model_state_dict
-                # These will go to the same file as the last file (or file 1 for single-file models)
-                default_index = max(fqn_to_file_index_mapping.values())
+            # Add any missing keys from the model_state_dict
+            # These will go to the same file as the last file (or file 1 for single-file models)
+            default_index = max(fqn_to_file_index_mapping.values())
 
-                # TODO:(@adil-a): This will need to change when we add PP. Maybe we can cache the keys in ModelState.
-                lm_head_name = _get_lm_head_weight_and_name(model)[1]
-                for fqn in list(model.state_dict().keys()):
-                    if fqn not in fqn_to_file_index_mapping:
-                        if model_state.is_tied_lm_head and fqn == lm_head_name:
-                            continue
-                        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                            print(f"Adding missing key to mapping: {fqn}")
-                        fqn_to_file_index_mapping[fqn] = default_index
+            # TODO:(@adil-a): This will need to change when we add PP. Maybe we can cache the keys in ModelState.
+            lm_head_name = _get_lm_head_weight_and_name(model)[1]
+            for fqn in list(model.state_dict().keys()):
+                if fqn not in fqn_to_file_index_mapping:
+                    if model_state.is_tied_lm_head and fqn == lm_head_name:
+                        continue
+                    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                        print(f"Adding missing key to mapping: {fqn}")
+                    fqn_to_file_index_mapping[fqn] = default_index
 
         storage_writer = _HuggingFaceStorageWriter(
             path=model_path,
