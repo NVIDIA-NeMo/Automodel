@@ -14,7 +14,7 @@
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.loss.chunked_ce import chunked_cross_entropy, compute_cross_entropy
+from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy, compute_cross_entropy
 
 
 def test_compute_cross_entropy_basic():
@@ -59,7 +59,7 @@ def test_compute_cross_entropy_ignore_index():
 
 def test_chunked_cross_entropy_matches_compute_cross_entropy():
     """
-    Tests that chunked_cross_entropy produces the same result as compute_cross_entropy
+    Tests that ChunkedCrossEntropy produces the same result as compute_cross_entropy
 
     when the entire sequence is processed in one chunk.
     """
@@ -73,9 +73,9 @@ def test_chunked_cross_entropy_matches_compute_cross_entropy():
     # Loss from normal compute_cross_entropy
     loss_ref = compute_cross_entropy(logits, targets) / (targets != -100).sum().detach()
 
-    # Loss from chunked_cross_entropy when chunk_len = seq_len (effectively one chunk)
+    # Loss from ChunkedCrossEntropy when chunk_len = seq_len (effectively one chunk)
     chunk_len = seq_len  # so there's only one chunk
-    loss_chunked = chunked_cross_entropy(logits, targets, chunk_len=chunk_len)
+    loss_chunked = ChunkedCrossEntropy()(logits, targets, chunk_len=chunk_len)
 
     assert torch.allclose(loss_chunked, loss_ref, atol=1e-6), (
         f"Expected chunked loss {loss_ref.item()}, but got {loss_chunked.item()}."
@@ -84,7 +84,7 @@ def test_chunked_cross_entropy_matches_compute_cross_entropy():
 
 def test_chunked_cross_entropy_ignore_index_and_mask():
     """
-    Tests that chunked_cross_entropy properly ignores indices and respects masks.
+    Tests that ChunkedCrossEntropy properly ignores indices and respects masks.
 
     Verifies consistency with compute_cross_entropy.
     """
@@ -103,9 +103,9 @@ def test_chunked_cross_entropy_ignore_index_and_mask():
     loss_ref = compute_cross_entropy(logits, masked_targets, ignore_index=ignore_idx)
     loss_ref /= (masked_targets != ignore_idx).sum().detach()
 
-    # Now compute chunked CE with mask
+    # Now compute ChunkedCrossEntropy with mask
     chunk_len = 3  # just an arbitrary small chunk size
-    loss_chunked = chunked_cross_entropy(logits, targets, mask=mask, chunk_len=chunk_len, ignore_index=ignore_idx)
+    loss_chunked = ChunkedCrossEntropy()(logits, targets, mask=mask, chunk_len=chunk_len, ignore_index=ignore_idx)
 
     assert torch.allclose(loss_chunked, loss_ref, atol=1e-6), (
         f"Expected chunked loss {loss_ref.item()}, but got {loss_chunked.item()}."
