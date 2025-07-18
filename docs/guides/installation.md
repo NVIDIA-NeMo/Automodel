@@ -96,7 +96,7 @@ git clone https://github.com/NVIDIA-NeMo/Automodel.git && cd Automodel && \
 # Step 2: Pull the latest compatible NeMo container (replace 25.07 with latest if desired)
 docker pull nvcr.io/nvidia/nemo:25.07 && \
 
-# Step 3: Run the NeMo container with GPU support, shared memory, and mount the repo
+# Step 3: Run the NeMo container with GPU support, shared memory, and mount the repo.
 docker run --gpus all -it --rm \
   -v $(pwd):/workspace/Automodel \         # Mount repo into container workspace
   -v $(pwd)/Automodel:/opt/Automodel \     # Optional: Mount Automodel under /opt for flexibility
