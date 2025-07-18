@@ -24,7 +24,7 @@ This guide explains how to install NeMo AutoModel for LLM, VLM, and OMNI models 
 - **Network**: Stable internet connection for downloading models
 
 ---
-# Installation options for non-developers
+## Installation Options for Non-Developers
 
 ### 📦 Install via PyPI (Recommended)
 
