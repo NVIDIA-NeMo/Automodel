@@ -308,7 +308,7 @@ checkpoints/epoch_0_step_10/
 Inference on the fine-tuned checkpoint is supported using Hugging Face's generate API.
 Simply replace the path of the full model with the path to a SFT checkpoint.
 
-The following is an example script using Hugging Face's transformers library:
+The following is an example script using Hugging Face's Transformers library:
 
 ``` python
 import torch
