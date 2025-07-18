@@ -194,6 +194,7 @@ dataset:
   path_or_dataset: rowan/hellaswag
   split: train
 ```
+
 - 2. File Path + Function Name
 
 ```
@@ -210,6 +211,37 @@ dataset:
   num_blocks: 111
 ```
 This will call `build_my_dataset()` from the specified file with the other keys (e.g., num_blocks) as arguments. This approach allows you to integrate custom datasets via config alone—no need to alter the codebase or package structure.
+
+
+## Packed Sequence Support in NeMo AutoModel
+NeMo AutoModel supports **packed sequences**, a technique to optimize training with variable-length sequences (e.g., text) by minimizing padding.
+
+### What is a Packed Sequence?
+Instead of padding each sequence to a fixed length (wasting computation on `[PAD]` tokens), packed sequences:
+- Concatenate short sequences into a single continuous sequence.
+- Separate sequences with special tokens (e.g., `[EOS]`).
+- Track lengths via a "attention mask" to prevent cross-sequence information leakage.
+
+### Benefits:
+- Reduces redundant computation on padding tokens leading to faster training.
+- Enables larger effective batch sizes leading to better GPU utilization.
+- Especially useful for language modeling and text datasets.
+
+
+### Enabling Packed Sequences in NeMo Automodel:
+
+Add these keys to your recipe's YAML config:
+```
+packed_sequence:
+   # Set packed_sequence_size > 0 to run with packed sequences
+   packed_sequence_size: 1024
+   split_across_pack: False
+```
+
+The `packed_sequence` has two options:
+- **packed_sequence_size**: Defines the total token length of each packed sequence, higher values require higher GPU memory usage.
+- **split_across_pack**: If two will split a sequence across different packed sequences.
+
 
 ## 🔧 Troubleshooting Tips
 
