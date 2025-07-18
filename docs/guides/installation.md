@@ -36,7 +36,7 @@ pip3 install nemo-Automodel
 > [!TIP]
 > This installs the latest stable release of nemo-Automodel from PyPI along with all required dependencies.
 
-## NeMo docker container
+### Install via NeMo Docker Container
 You can use NeMo Automodel with NeMo docker container. You can pull the container by running:
 ```bash
 docker pull nvcr.io/nvidia/nemo:25.07
