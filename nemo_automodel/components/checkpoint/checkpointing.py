@@ -37,7 +37,6 @@ from nemo_automodel.components.checkpoint._backports.hf_storage import (
 from nemo_automodel.components.checkpoint.stateful_wrappers import (
     ModelState,
     OptimizerState,
-    _get_lm_head_weight_and_name,
 )
 
 if TYPE_CHECKING:
@@ -114,6 +113,7 @@ def save_model(
         _save_peft_adapters(model_state, peft_config, model_path)
 
     elif checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
+        model_state_dict = model_state.state_dict()
         fqn_to_file_index_mapping = None
         if checkpoint_config.save_consolidated:
             # we first need to find the FQN -> .safetensors mapping
@@ -127,18 +127,15 @@ def save_model(
                     index_path, getattr(model, "_checkpoint_conversion_mapping", None)
                 )
             else:
-                fqn_to_file_index_mapping = {k: 1 for k in model.state_dict().keys()}
+                fqn_to_file_index_mapping = {k: 1 for k in model_state_dict.keys()}
 
             # Add any missing keys from the model_state_dict
             # These will go to the same file as the last file (or file 1 for single-file models)
             default_index = max(fqn_to_file_index_mapping.values())
 
             # TODO:(@adil-a): This will need to change when we add PP. Maybe we can cache the keys in ModelState.
-            lm_head_name = _get_lm_head_weight_and_name(model)[1]
-            for fqn in list(model.state_dict().keys()):
+            for fqn in list(model_state_dict.keys()):
                 if fqn not in fqn_to_file_index_mapping:
-                    if model_state.is_tied_lm_head and fqn == lm_head_name:
-                        continue
                     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                         print(f"Adding missing key to mapping: {fqn}")
                     fqn_to_file_index_mapping[fqn] = default_index
@@ -151,7 +148,7 @@ def save_model(
         )
 
         dcp.save(
-            model_state.state_dict(),
+            model_state_dict,
             checkpoint_id=model_path,
             storage_writer=storage_writer,
         )
