@@ -66,7 +66,7 @@ pip3 install git+https://github.com/NVIDIA-NeMo/Automodel.git
 > This installs the repo as a standard Python package (not editable).
 
 
-### Option B - Using `uv` with git repo:
+#### Option B - Use `uv` with git repo:
 ```bash
 uv pip install git+https://github.com/NVIDIA-NeMo/Automodel.git
 ```
