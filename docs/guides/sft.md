@@ -292,9 +292,11 @@ checkpoints/epoch_0_step_10/
 │   │   ├── special_tokens_map.json
 │   │   ├── tokenizer.json
 │   │   └── tokenizer_config.json
-│   └── shard-00001-model-00001-of-00001.safetensors
+│   ├── shard-00001-model-00001-of-00001.safetensors
+│   └── shard-00002-model-00001-of-00001.safetensors
 ├── optim
-│   └── __0_0.distcp
+│   ├── __0_0.distcp
+│   └── __1_0.distcp
 ├── rng.pt
 └── step_scheduler.pt
 
