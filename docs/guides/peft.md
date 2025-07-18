@@ -118,7 +118,7 @@ This structure is ideal for training models in context-based question answering,
 This example demonstrates how to fine-tune a large language model using NVIDIA's NeMo Automodel library.
 Specifically, we use the LLM [finetune recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py), and in particular, the `FinetuneRecipeForNextTokenPrediction` class to orchestrate the fine-tuning process end-to-end: model loading, dataset preparation, optimizer setup, distributed training, checkpointing, and logging.
 
-#### 🧠 What is a Recipe?
+#### What is a Recipe?
 
 A recipe in NeMo Automodel is a **self-contained orchestration module** that wires together all
 components needed to perform a specific task (e.g., fine-tuning for next-token prediction or instruction tuning).
