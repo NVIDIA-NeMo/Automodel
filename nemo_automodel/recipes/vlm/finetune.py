@@ -26,6 +26,7 @@ import wandb
 from torch.distributed.device_mesh import _mesh_resources
 from torch.utils.data import DataLoader
 from transformers import AutoProcessor
+from transformers.processing_utils import ProcessorMixin
 from wandb import Settings
 
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
@@ -123,6 +124,10 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
         cfg_ckpt = cfg_ckpt.to_dict()
         cfg_ckpt.pop("restore_from", None)
         ckpt_kwargs |= cfg_ckpt
+    if ckpt_kwargs.get("is_peft", False) and ckpt_kwargs.get("model_save_format") == "torch_save":
+        raise ValueError(
+            "PEFT checkpointing is not supported for torch_save format. Save using `safetensors` format instead."
+        )
     return CheckpointingConfig(**ckpt_kwargs)
 
 
@@ -142,7 +147,7 @@ def build_loss_fn(device, cfg_loss):
         return cfg_loss.instantiate().to(device)
 
 
-def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed) -> DataLoader:
+def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed) -> tuple[DataLoader, ProcessorMixin]:
     """Build a VLM dataloader."""
     dist_sampler_kwargs = {
         "shuffle": cfg_dl.get("shuffle", True),
@@ -179,7 +184,7 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed
                 logging.warning(f"You are using {processor_type} with default collate function.")
             collate_fn = lambda examples: COLLATE_FNS[processor_type](examples, processor)
 
-        return cfg_dl.instantiate(dataset=ds, sampler=sampler, collate_fn=collate_fn)
+        return cfg_dl.instantiate(dataset=ds, sampler=sampler, collate_fn=collate_fn), processor
 
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
@@ -283,7 +288,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             tp_size=self.cfg.get("distributed.tp_size", 1),
         )
         self.loss_fn = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
-        self.dataloader = build_dataloader(  # VLM-specific
+        self.dataloader, self.processor = build_dataloader(  # VLM-specific
             self.cfg.dataset,
             self.cfg.dataloader,
             self.cfg.model,
@@ -295,7 +300,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Build validation dataloader if the config provides it
         self.val_dataloader = None
         if "validation_dataset" in self.cfg:
-            self.val_dataloader = build_dataloader(  # VLM-specific
+            self.val_dataloader, _ = build_dataloader(  # VLM-specific
                 self.cfg.validation_dataset,
                 self.cfg.validation_dataloader,
                 self.cfg.model,

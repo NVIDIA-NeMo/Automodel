@@ -27,6 +27,7 @@ from torch.distributed.device_mesh import _mesh_resources
 from torch.utils.data import DataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoTokenizer
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from wandb import Settings
 
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
@@ -167,7 +168,9 @@ def build_loss_fn(device, cfg_loss):
         return cfg_loss.instantiate().to(device)
 
 
-def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_ps, device_mesh, seed) -> DataLoader:
+def build_dataloader(
+    cfg_ds, cfg_dl, cfg_model, cfg_ps, device_mesh, seed
+) -> tuple[DataLoader, PreTrainedTokenizerBase]:
     """Build a DataLoader for the dataset.
 
     Args:
@@ -177,7 +180,7 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_ps, device_mesh, seed) -> Da
         distributed_sampler_kwargs: Additional arguments for the DistributedSampler.
 
     Returns:
-        The instantiated DataLoader.
+        The instantiated DataLoader and tokenizer.
     """
     dist_sampler_kwargs = {
         "shuffle": cfg_dl.get("shuffle", True),
@@ -213,7 +216,7 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_ps, device_mesh, seed) -> Da
             drop_last=True,
             **dist_sampler_kwargs,
         )
-        return cfg_dl.instantiate(dataset=ds, sampler=sampler)
+        return cfg_dl.instantiate(dataset=ds, sampler=sampler), tokenizer
 
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
@@ -330,7 +333,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             tp_size=self.cfg.get("distributed.tp_size", 1),
         )
         self.loss_fn = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
-        self.dataloader = build_dataloader(
+        self.dataloader, self.tokenizer = build_dataloader(
             self.cfg.dataset,
             self.cfg.dataloader,
             self.cfg.model,
@@ -344,7 +347,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if "validation_dataset" in self.cfg:
             # For validation, do not use packed sequences for fair comparison with baseline
 
-            self.val_dataloader = build_dataloader(
+            self.val_dataloader, _ = build_dataloader(
                 self.cfg.validation_dataset,
                 self.cfg.validation_dataloader,
                 self.cfg.model,

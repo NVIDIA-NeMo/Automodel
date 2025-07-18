@@ -403,11 +403,7 @@ def get_fqn_to_file_index_mapping(reference_model_path: str) -> dict[str, int]:
         Indices are from 1 to N, where N is the number of files.
     """
     hf_reader = _HuggingFaceStorageReader(reference_model_path)
-
     fqn_to_file_index_mapping: dict[str, int] = {}
-
-    # ``read_metadata`` transparently handles both the presence of an index
-    # JSON **and** the single-file fallback, so we can simply rely on it.
     metadata = hf_reader.read_metadata()
 
     for md_index, storage_info in metadata.storage_data.items():

@@ -43,7 +43,7 @@ the popular [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/) (Stanford Quest
 > ```bash
 > pip3 install nemo-automodel
 > ```
-> For a complete guide and additional options please consult the Automodel [installation guide](installation.md).
+> For a complete guide and additional options please consult the Automodel [installation guide](../installation.md).
 
 ### Model and Dataset Context
 In this guide, we will fine-tune Meta’s `LLaMA 3.2 1B` model on the popular [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/) (Stanford Question Answering Dataset).

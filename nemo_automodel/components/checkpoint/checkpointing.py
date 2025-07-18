@@ -38,6 +38,7 @@ from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, O
 
 if TYPE_CHECKING:
     from peft import PeftConfig
+    from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 
 @dataclass
@@ -67,6 +68,7 @@ def save_model(
     weights_path: str,
     checkpoint_config: CheckpointingConfig,
     peft_config: Optional["PeftConfig"] = None,
+    tokenizer: Optional["PreTrainedTokenizerBase"] = None,
 ):
     """
     Save a model state dictionary to a weights path.
@@ -79,6 +81,8 @@ def save_model(
         model: Model to save
         weights_path: Path to save model weights
         checkpoint_config: Checkpointing configuration
+        peft_config: PEFT config
+        tokenizer: Tokenizer. Only saved if checkpoint_config.save_consolidated is True.
     """
     # We also need to eventually add suport for HSDP, so we only save on non-duplicate ranks.
     model_path = os.path.join(weights_path, "model")
@@ -99,6 +103,10 @@ def save_model(
             with open(os.path.join(consolidated_model_path, "config.json"), "w") as f:
                 f.write(model.config.to_json_string())
 
+            # save the tokenizer
+            if tokenizer is not None:
+                tokenizer.save_pretrained(consolidated_model_path)
+
     # Ensure all ranks wait for rank 0 to handle directories
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
@@ -108,6 +116,10 @@ def save_model(
     if checkpoint_config.is_peft:
         assert peft_config is not None, "PEFT config needs to be provided when checkpointing PEFT models."
         _save_peft_adapters(model_state, peft_config, model_path)
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            # save the tokenizer
+            if tokenizer is not None:
+                tokenizer.save_pretrained(model_path)
 
     elif checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
         fqn_to_file_index_mapping = None
@@ -139,7 +151,6 @@ def save_model(
             consolidated_output_path=consolidated_model_path,
             fqn_to_index_mapping=fqn_to_file_index_mapping,
         )
-
         dcp.save(
             model_state.state_dict(),
             checkpoint_id=model_path,

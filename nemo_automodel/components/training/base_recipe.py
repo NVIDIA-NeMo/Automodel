@@ -19,6 +19,8 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
+from transformers.processing_utils import ProcessorMixin
+from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 from nemo_automodel.components.checkpoint.checkpointing import (
     load_model,
@@ -41,6 +43,19 @@ def has_load_restore_state(object):
         bool: returns True if has callable load_state_dict and state_dict
     """
     return all(callable(getattr(object, attr, None)) for attr in ("load_state_dict", "state_dict"))
+
+
+def is_tokenizer(object):
+    """
+    Checks whether object is a tokenizer or VLM processor.
+
+    Args:
+        object (any): the object to check.
+
+    Returns:
+        bool: returns True if object is a tokenizer or VLM processor.
+    """
+    return isinstance(object, (PreTrainedTokenizerBase, ProcessorMixin))
 
 
 class BaseRecipe:
@@ -66,7 +81,7 @@ class BaseRecipe:
         if "__state_tracked" not in self.__dict__:
             self.__dict__["__state_tracked"] = set()
         # Track stateful objects unless they are validation/eval components.
-        should_track = isinstance(value, (nn.Module, Optimizer)) or has_load_restore_state(value)
+        should_track = isinstance(value, (nn.Module, Optimizer)) or has_load_restore_state(value) or is_tokenizer(value)
 
         if should_track and not any(substr in key.lower() for substr in ("val", "eval", "test")):
             assert key not in self.__dict__["__state_tracked"]
@@ -94,13 +109,15 @@ class BaseRecipe:
             print(f"Saving checkpoint to {path}", flush=True)
 
         # TODO(@adil-a): Change this when we create a LR scheduler class
-        model, optimizer = None, None
+        model, optimizer, tokenizer = None, None, None
 
         for key in self.__dict__["__state_tracked"]:
             if isinstance(getattr(self, key), nn.Module):
                 model = getattr(self, key)
             elif isinstance(getattr(self, key), Optimizer):
                 optimizer = getattr(self, key)
+            elif is_tokenizer(getattr(self, key)):
+                tokenizer = getattr(self, key)
             else:
                 if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                     torch.save(
@@ -110,7 +127,7 @@ class BaseRecipe:
                 if torch.distributed.is_initialized():
                     torch.distributed.barrier()
 
-        save_model(model, path, self.checkpoint_config, peft_config=self.peft_config)
+        save_model(model, path, self.checkpoint_config, peft_config=self.peft_config, tokenizer=tokenizer)
         save_optimizer(optimizer, model, path)
 
     def load_checkpoint(self, restore_from: str | None = None):
@@ -143,6 +160,10 @@ class BaseRecipe:
                 model = getattr(self, key)
             elif isinstance(getattr(self, key), Optimizer):
                 optimizer = getattr(self, key)
+            elif is_tokenizer(getattr(self, key)):
+                # we don't need to load the tokenizer from the checkpoint
+                # we only save the tokenizer for consolidated checkpoints for downstream use
+                continue
             else:
                 getattr(self, key).load_state_dict(torch.load(os.path.join(ckpt_dir, f"{key}.pt"), weights_only=False))
 
