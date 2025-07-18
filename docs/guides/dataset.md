@@ -1,10 +1,10 @@
 # Bringing Your Own Dataset
 
-This guide shows you how to bring your own dataset into NeMo Automodel for training. You'll learn about three main dataset types: **completion datasets** for language modeling (like HellaSwag), **instruction datasets** for question-answering tasks (like SQuAD), and **multi-modal datasets** that combine text with images or other modalities. We'll cover how to create custom datasets by implementing the required methods and preprocessing functions, and finally show you how to specify your own data logic using YAML configuration with file paths—allowing you to define custom dataset processing without modifying the main codebase.
+This guide shows you how to bring your own dataset into NeMo Automodel for training. You'll learn about three main dataset types: **completion datasets** for language modeling (like [HellaSwag](https://huggingface.co/datasets/rowan/hellaswag)), **instruction datasets** for question-answering tasks (like [SQuAD](https://huggingface.co/datasets/rajpurkar/squad)), and **multi-modal datasets** that combine text with images or other modalities. We'll cover how to create custom datasets by implementing the required methods and preprocessing functions, and finally show you how to specify your own data logic using YAML configuration with file paths—allowing you to define custom dataset processing without modifying the main codebase.
 
 ## Types of Supported Datasets
 
-NeMo Automodel supports several types of datasets for different training scenarios.
+NeMo Automodel supports a variety of datasets depending on the task.
 
 ### Completion Datasets
 
@@ -31,7 +31,7 @@ Endings: [
 Label: 0  # First ending is correct
 ```
 
-#### SFTSingleTurnPreprocessor
+#### Preprocessing with SFTSingleTurnPreprocessor
 
 NeMo Automodel provides the `SFTSingleTurnPreprocessor` class to handle completion datasets. This processor:
 
@@ -44,7 +44,7 @@ NeMo Automodel provides the `SFTSingleTurnPreprocessor` class to handle completi
 
 #### Creating Your Own Completion Dataset
 
-To create a completion dataset like HellaSwag, you need to implement a class with `get_context()` and `get_target()` methods:
+To adapt your dataset into this format, define a class like this:
 
 ```python
 from datasets import load_dataset
@@ -87,7 +87,7 @@ The [SQuAD (Stanford Question Answering Dataset)](https://huggingface.co/dataset
 
 #### Creating Your Own Instruction Dataset
 
-The `squad.py` file contains the implementation for processing the SQuAD dataset into a format suitable for instruction tuning. It defines a dataset class and preprocessing functions that extract the context, question, and answer fields, concatenate them into a prompt-completion format, and apply tokenization, padding, and loss masking. This serves as a template for building custom instruction datasets by following a similar structure and adapting the extraction logic to your dataset's schema.
+The [`squad.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/squad.py) file contains the implementation for processing the SQuAD dataset into a format suitable for instruction tuning. It defines a dataset class and preprocessing functions that extract the context, question, and answer fields, concatenate them into a prompt-completion format, and apply tokenization, padding, and loss masking. This serves as a template for building custom instruction datasets by following a similar structure and adapting the extraction logic to your dataset's schema.
 
 Based on the SQuAD implementation in `squad.py`, you can create your own instruction dataset using the `make_squad_dataset` pattern:
 
@@ -101,28 +101,13 @@ def make_my_instruction_dataset(
     split="train",
     dataset_name="your-dataset-name",
 ):
-    """
-    Load and preprocess your instruction dataset.
-    
-    Args:
-        tokenizer: HuggingFace tokenizer
-        seq_length: Optional sequence length for padding
-        limit_dataset_samples: Limit number of samples
-        split: Dataset split to use
-        dataset_name: Your dataset identifier
-    
-    Returns:
-        Processed dataset with input_ids, labels, and loss_mask
-    """
-    # Load dataset
     if limit_dataset_samples:
         split = f"{split}[:{limit_dataset_samples}]"
     
     dataset = load_dataset(dataset_name, split=split)
 
-    # Apply formatting
     return dataset.map(
-        your_own_fmt_fn,
+        your_own_fmt_fn,  # Your formatting function
         batched=False,
         remove_columns=dataset.column_names,
     )
@@ -136,19 +121,17 @@ Multi-modal datasets combine text with other modalities like images, audio, or v
 
 The [MedPix-VQA](https://huggingface.co/datasets/mmoukouba/MedPix-VQA) dataset is a comprehensive medical Visual Question Answering dataset designed for training and evaluating VQA models in the medical domain. It contains medical images from MedPix, a well-known medical image database, paired with questions and answers that focus on medical image interpretation.
 
-The dataset consists of 20,500 examples with the following structure:
-- **Training Set**: 17,420 examples (85%)
-- **Validation Set**: 3,080 examples (15%)
-- **Columns**: `image_id`, `mode`, `case_id`, `question`, `answer`
+**Structure**:
+- 20,500 total examples
+- Columns: `image_id`, `mode`, `case_id`, `question`, `answer`
 
-The dataset preprocessing performs the following steps:
+The example dataset preprocessing performs the following steps:
 
-1. **Load the dataset** using HuggingFace's `datasets` library
-2. **Extract question-answer pairs** - Process the `question` and `answer` fields from the dataset
-3. **Convert to Huggingface message list format** - Transform the data into a chat-like format suitable for Huggingface Autoprocessor's `apply_chat_template` function:
+1. Load the dataset using HuggingFace's `datasets` library
+2. Extract the `question` and `answer`
+3. Transform the data into a chat-like format suitable for Huggingface Autoprocessor's `apply_chat_template` function:
 
 ```python
-# Example of the conversation format created
 conversation = [
     {
         "role": "user",
@@ -164,18 +147,20 @@ conversation = [
 ]
 ```
 
-For more detailed examples of how to process multi-modal datasets for VLMs, see the [examples in `datasets.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/vlm/datasets.py). These examples demonstrate how to load, preprocess, and format multi-modal data.
+For more detailed examples of how to process multi-modal datasets for VLMs, see the examples in [`datasets.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/vlm/datasets.py).
 
 #### Collate Functions
 
 NeMo Automodel provides specialized collate functions for different VLM processors. The collate function is responsible for batching examples and preparing them for model input.
 
-If your model provides a HuggingFace `AutoProcessor`, you can use it directly for preprocessing and collation. Otherwise, you will need to implement your own preprocessing and collate logic tailored to your model and dataset. We provide [example custom collate functions](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/vlm/collate_fns.py) that you can use as references for your implementation. After you implement your own collate function, you can specify it in your YAML config.
+Multi-modal models require custom collate functions to batch and process each sample correctly. If your model uses a HuggingFace `AutoProcessor`, you can use it directly. Otherwise, you can define your own collate logic and point to it in your YAML config. We provide [example custom collate functions](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/vlm/collate_fns.py) that you can use as references for your implementation. After you implement your own collate function, you can specify it in your YAML config.
 
 
-## Customizing Data Processing with YAML Configuration
+## YAML-based Custom Dataset Configuration
 
-NeMo Automodel supports specifying the `_target_` parameter using Python dotted module paths. This allows you to reference a function or class directly from an installed Python module.
+NeMo Automodel supports YAML-based dataset specification using the _target_ key. This lets you reference dataset-building classes or functions using either:
+
+- 1. Python Dotted Path
 
 ```yaml
 dataset:
@@ -183,12 +168,7 @@ dataset:
   path_or_dataset: rowan/hellaswag
   split: train
 ```
-
-NeMo Automodel also supports using file paths directly in the `_target_` parameter, which enables you to specify custom dataset functions from a file. This is particularly useful when you want to define your own dataset processing logic and use it directly in your YAML configuration.
-
-### Syntax
-
-The `_target_` parameter supports the following file path format:
+- 2. File Path + Function Name
 
 ```
 <file-path>:<function-name>
@@ -203,4 +183,4 @@ dataset:
   _target_: /path/to/your/custom_dataset.py:build_my_dataset
   num_blocks: 111
 ```
-In the above example, it will call the `build_my_dataset` with the rest of the parameters (i.e., num_blocks) that are under the dataset section. This feature makes it very convenient to define custom datasets and use them directly through YAML configuration without the need to modify the main codebase or create formal Python packages.
+This will call `build_my_dataset()` from the specified file with the other keys (e.g., num_blocks) as arguments. This approach allows you to integrate custom datasets via config alone—no need to alter the codebase or package structure.
