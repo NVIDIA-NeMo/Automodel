@@ -27,7 +27,6 @@ import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 from safetensors import safe_open
 from safetensors.torch import save_file
-from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
@@ -39,6 +38,7 @@ from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, O
 
 if TYPE_CHECKING:
     from peft import PeftConfig
+    from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 
 @dataclass
@@ -68,7 +68,7 @@ def save_model(
     weights_path: str,
     checkpoint_config: CheckpointingConfig,
     peft_config: Optional["PeftConfig"] = None,
-    tokenizer: Optional[PreTrainedTokenizerBase] = None,
+    tokenizer: Optional["PreTrainedTokenizerBase"] = None,
 ):
     """
     Save a model state dictionary to a weights path.
