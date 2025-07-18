@@ -35,6 +35,7 @@ from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGener
 # Import the function under test
 from nemo_automodel.components.distributed.parallelizer import (
     fsdp2_strategy_parallelize,
+    nvfsdp_strategy_parallelize,
     import_class_from_path,
     get_hf_tp_shard_plan,
     apply_fsdp_sharding_recursively,
@@ -235,7 +236,7 @@ def mock_distributed_env(monkeypatch):
         "dist": dist_mock,
         "mesh_resources": mesh_resources_mock,
         "fsdp": fsdp_mock,
-        "tp": tp_parallel_mock,
+        "tensor_parallel": tp_parallel_mock,
     }
 
 
@@ -545,6 +546,352 @@ class TestFSDP2StrategyParallelize:
         assert result is model
         # Verify fully_shard was called multiple times (once per layer + root)
         assert mock_distributed_env["fsdp"].fully_shard.call_count > 1
+
+    def test_custom_mesh_names(self, mock_distributed_env):
+        """Test custom mesh names functionality."""
+        # Create a mock device mesh with custom keys
+        mesh = MagicMock(spec=DeviceMesh)
+        mesh.device_type = "cuda"
+        
+        # Mock custom submeshes
+        custom_dp_mesh = MagicMock()
+        custom_tp_mesh = MagicMock()
+        
+        custom_dp_mesh.size.return_value = 2
+        custom_tp_mesh.size.return_value = 1
+        custom_dp_mesh.ndim = 1
+        custom_tp_mesh.ndim = 1
+        
+        # Configure mesh access with custom names
+        mesh.__getitem__.side_effect = lambda key: {
+            "custom_dp": custom_dp_mesh,
+            "custom_tp": custom_tp_mesh,
+            "custom_dp_cp": custom_dp_mesh,
+        }[key]
+        
+        model = MockModel()
+        
+        result = fsdp2_strategy_parallelize(
+            model=model,
+            device_mesh=mesh,
+            dp_mesh_name="custom_dp",
+            tp_mesh_name="custom_tp",
+            dp_cp_mesh_name="custom_dp_cp",
+        )
+        
+        assert result is model
+        mock_distributed_env["fsdp"].fully_shard.assert_called()
+        # Verify that mesh was accessed with custom keys
+        mesh.__getitem__.assert_called()
+
+    def test_custom_mesh_names_with_dp_cp_fallback(self, mock_distributed_env):
+        """Test custom mesh names with dp_cp mesh fallback logic."""
+        # Create a mock device mesh with custom keys
+        mesh = MagicMock(spec=DeviceMesh)
+        mesh.device_type = "cuda"
+        
+        # Mock custom submeshes
+        custom_dp_mesh = MagicMock()
+        custom_tp_mesh = MagicMock()
+        custom_dp_cp_mesh = MagicMock()
+        
+        custom_dp_mesh.size.return_value = 2
+        custom_tp_mesh.size.return_value = 1
+        custom_dp_cp_mesh.size.return_value = 2
+        
+        custom_dp_mesh.ndim = 1
+        custom_tp_mesh.ndim = 1
+        custom_dp_cp_mesh.ndim = 1
+        
+        # Configure mesh access with custom names
+        mesh.__getitem__.side_effect = lambda key: {
+            "my_dp": custom_dp_mesh,
+            "my_tp": custom_tp_mesh,
+            "my_dp_cp": custom_dp_cp_mesh,
+        }[key]
+        
+        # Mock mesh resources to simulate dp_cp mesh exists
+        mock_distributed_env["mesh_resources"].root_to_flatten_mapping.get.return_value = {"my_dp_cp": True}
+        
+        model = MockModel()
+        
+        result = fsdp2_strategy_parallelize(
+            model=model,
+            device_mesh=mesh,
+            dp_mesh_name="my_dp",
+            tp_mesh_name="my_tp", 
+            dp_cp_mesh_name="my_dp_cp",
+        )
+        
+        assert result is model
+        mock_distributed_env["fsdp"].fully_shard.assert_called()
+
+    def test_custom_mesh_names_with_tensor_parallelism(self, mock_distributed_env):
+        """Test custom mesh names with tensor parallelism enabled."""
+        # Create a mock device mesh with custom keys
+        mesh = MagicMock(spec=DeviceMesh)
+        mesh.device_type = "cuda"
+        
+        # Mock custom submeshes
+        custom_dp_mesh = MagicMock()
+        custom_tp_mesh = MagicMock()
+        
+        custom_dp_mesh.size.return_value = 2
+        custom_tp_mesh.size.return_value = 2  # Enable TP
+        custom_dp_mesh.ndim = 1
+        custom_tp_mesh.ndim = 1
+        
+        # Configure mesh access with custom names
+        mesh.__getitem__.side_effect = lambda key: {
+            "my_data_parallel": custom_dp_mesh,
+            "my_tensor_parallel": custom_tp_mesh,
+            "my_dp_cp": custom_dp_mesh,
+        }[key]
+        
+        model = MockModel()
+        custom_plan = {"model.layers.0.self_attn.q_proj": ColwiseParallel()}
+        
+        result = fsdp2_strategy_parallelize(
+            model=model,
+            device_mesh=mesh,
+            tp_shard_plan=custom_plan,
+            dp_mesh_name="my_data_parallel",
+            tp_mesh_name="my_tensor_parallel",
+            dp_cp_mesh_name="my_dp_cp",
+        )
+        
+        assert result is model
+        mock_distributed_env["tensor_parallel"].parallelize_module.assert_called_once()
+        mock_distributed_env["fsdp"].fully_shard.assert_called()
+
+
+class TestNvFSDPStrategyParallelize:
+    """Test suite for nvfsdp_strategy_parallelize function."""
+    
+    @pytest.fixture
+    def mock_nvfsdp_env(self, monkeypatch):
+        """Mock nvFSDP environment and dependencies."""
+        # Mock nvfsdp module
+        nvfsdp_mock = SimpleNamespace()
+        nvfsdp_mock.fully_shard = MagicMock(return_value=(MagicMock(), None))
+        
+        # Mock HAVE_NVFSDP flag
+        monkeypatch.setattr("nemo_automodel.components.distributed.parallelizer.HAVE_NVFSDP", True, raising=False)
+        monkeypatch.setattr("nemo_automodel.components.distributed.parallelizer.nvfsdp_fully_shard", nvfsdp_mock.fully_shard, raising=False)
+        
+        # Mock parallelize_module
+        parallelize_module_mock = MagicMock()
+        monkeypatch.setattr("nemo_automodel.components.distributed.parallelizer.parallelize_module", parallelize_module_mock, raising=False)
+        
+        # Mock import_classes_from_paths
+        import_classes_mock = MagicMock(return_value=[])
+        monkeypatch.setattr("nemo_automodel.components.distributed.parallelizer.import_classes_from_paths", import_classes_mock, raising=False)
+        
+        return {
+            "nvfsdp": nvfsdp_mock,
+            "parallelize_module": parallelize_module_mock,
+            "import_classes": import_classes_mock,
+        }
+    
+    def test_basic_nvfsdp_with_default_mesh_names(self, mock_device_mesh, mock_nvfsdp_env):
+        """Test basic nvFSDP with default mesh names."""
+        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
+        tp_mesh.size.return_value = 1  # No tensor parallelism
+        cp_mesh.size.return_value = 1  # No context parallelism
+        
+        model = MockModel()
+        optimizer = MagicMock()
+        
+        result_model, result_optimizer = nvfsdp_strategy_parallelize(
+            model=model,
+            device_mesh=mesh,
+            optimizer=optimizer,
+        )
+        
+        # Verify nvfsdp_fully_shard was called with default mesh names
+        mock_nvfsdp_env["nvfsdp"].fully_shard.assert_called_once()
+        call_kwargs = mock_nvfsdp_env["nvfsdp"].fully_shard.call_args[1]
+        assert call_kwargs["dp_mesh_name"] == "data_parallel"
+        assert call_kwargs["tp_mesh_name"] == "tensor_parallel"
+        assert call_kwargs["cp_mesh_name"] == "context_parallel"
+    
+    def test_nvfsdp_with_custom_mesh_names(self, mock_nvfsdp_env):
+        """Test nvFSDP with custom mesh names."""
+        # Create a mock device mesh with custom keys
+        mesh = MagicMock(spec=DeviceMesh)
+        mesh.device_type = "cuda"
+        
+        # Mock custom submeshes
+        custom_dp_mesh = MagicMock()
+        custom_tp_mesh = MagicMock()
+        custom_cp_mesh = MagicMock()
+        
+        custom_dp_mesh.size.return_value = 2
+        custom_tp_mesh.size.return_value = 1
+        custom_cp_mesh.size.return_value = 1
+        custom_dp_mesh.ndim = 1
+        custom_tp_mesh.ndim = 1
+        custom_cp_mesh.ndim = 1
+        
+        # Configure mesh access with custom names
+        mesh.__getitem__.side_effect = lambda key: {
+            "my_dp": custom_dp_mesh,
+            "my_tp": custom_tp_mesh,
+            "my_cp": custom_cp_mesh,
+        }[key]
+        
+        model = MockModel()
+        optimizer = MagicMock()
+        
+        result_model, result_optimizer = nvfsdp_strategy_parallelize(
+            model=model,
+            device_mesh=mesh,
+            optimizer=optimizer,
+            dp_mesh_name="my_dp",
+            tp_mesh_name="my_tp",
+            cp_mesh_name="my_cp",
+        )
+        
+        # Verify nvfsdp_fully_shard was called with custom mesh names
+        mock_nvfsdp_env["nvfsdp"].fully_shard.assert_called_once()
+        call_kwargs = mock_nvfsdp_env["nvfsdp"].fully_shard.call_args[1]
+        assert call_kwargs["dp_mesh_name"] == "my_dp"
+        assert call_kwargs["tp_mesh_name"] == "my_tp"
+        assert call_kwargs["cp_mesh_name"] == "my_cp"
+    
+    def test_nvfsdp_with_tensor_parallelism_custom_names(self, mock_nvfsdp_env):
+        """Test nvFSDP with tensor parallelism and custom mesh names."""
+        # Create a mock device mesh with custom keys
+        mesh = MagicMock(spec=DeviceMesh)
+        mesh.device_type = "cuda"
+        
+        # Mock custom submeshes
+        custom_dp_mesh = MagicMock()
+        custom_tp_mesh = MagicMock()
+        custom_cp_mesh = MagicMock()
+        
+        custom_dp_mesh.size.return_value = 2
+        custom_tp_mesh.size.return_value = 2  # Enable TP
+        custom_cp_mesh.size.return_value = 1
+        custom_dp_mesh.ndim = 1
+        custom_tp_mesh.ndim = 1
+        custom_cp_mesh.ndim = 1
+        
+        # Configure mesh access with custom names
+        mesh.__getitem__.side_effect = lambda key: {
+            "custom_data": custom_dp_mesh,
+            "custom_tensor": custom_tp_mesh,
+            "custom_context": custom_cp_mesh,
+        }[key]
+        
+        model = MockModel()
+        optimizer = MagicMock()
+        tp_plan = {"model.layers.0.self_attn.q_proj": ColwiseParallel()}
+        
+        result_model, result_optimizer = nvfsdp_strategy_parallelize(
+            model=model,
+            device_mesh=mesh,
+            optimizer=optimizer,
+            tp_shard_plan=tp_plan,
+            dp_mesh_name="custom_data",
+            tp_mesh_name="custom_tensor",
+            cp_mesh_name="custom_context",
+        )
+        
+        # Verify parallelize_module was called for tensor parallelism
+        mock_nvfsdp_env["parallelize_module"].assert_called_once()
+        
+        # Verify nvfsdp_fully_shard was called with custom mesh names
+        mock_nvfsdp_env["nvfsdp"].fully_shard.assert_called_once()
+        call_kwargs = mock_nvfsdp_env["nvfsdp"].fully_shard.call_args[1]
+        assert call_kwargs["dp_mesh_name"] == "custom_data"
+        assert call_kwargs["tp_mesh_name"] == "custom_tensor"
+        assert call_kwargs["cp_mesh_name"] == "custom_context"
+    
+    def test_nvfsdp_with_context_parallelism_custom_names(self, mock_nvfsdp_env):
+        """Test nvFSDP with context parallelism and custom mesh names."""
+        # Create a mock device mesh with custom keys
+        mesh = MagicMock(spec=DeviceMesh)
+        mesh.device_type = "cuda"
+        
+        # Mock custom submeshes
+        custom_dp_mesh = MagicMock()
+        custom_tp_mesh = MagicMock()
+        custom_cp_mesh = MagicMock()
+        
+        custom_dp_mesh.size.return_value = 2
+        custom_tp_mesh.size.return_value = 1
+        custom_cp_mesh.size.return_value = 2  # Enable CP
+        custom_dp_mesh.ndim = 1
+        custom_tp_mesh.ndim = 1
+        custom_cp_mesh.ndim = 1
+        
+        # Configure mesh access with custom names
+        mesh.__getitem__.side_effect = lambda key: {
+            "dp_mesh": custom_dp_mesh,
+            "tp_mesh": custom_tp_mesh,
+            "cp_mesh": custom_cp_mesh,
+        }[key]
+        
+        model = MockModel()
+        optimizer = MagicMock()
+        
+        result_model, result_optimizer = nvfsdp_strategy_parallelize(
+            model=model,
+            device_mesh=mesh,
+            optimizer=optimizer,
+            dp_mesh_name="dp_mesh",
+            tp_mesh_name="tp_mesh",
+            cp_mesh_name="cp_mesh",
+        )
+        
+        # Verify nvfsdp_fully_shard was called with dp_cp_mesh_name set correctly
+        mock_nvfsdp_env["nvfsdp"].fully_shard.assert_called_once()
+        call_kwargs = mock_nvfsdp_env["nvfsdp"].fully_shard.call_args[1]
+        assert call_kwargs["dp_cp_mesh_name"] == "dp_cp"  # Should use default when CP > 1
+    
+    def test_nvfsdp_backward_compatibility(self, mock_device_mesh, mock_nvfsdp_env):
+        """Test nvFSDP maintains backward compatibility with existing code."""
+        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
+        
+        model = MockModel()
+        optimizer = MagicMock()
+        
+        # Call without specifying mesh names (should use defaults)
+        result_model, result_optimizer = nvfsdp_strategy_parallelize(
+            model=model,
+            device_mesh=mesh,
+            optimizer=optimizer,
+            data_parallel_sharding_strategy="optim_grads_params",
+            grad_reduce_in_fp32=True,
+        )
+        
+        # Verify mesh was accessed with default keys
+        mesh.__getitem__.assert_any_call("data_parallel")
+        mesh.__getitem__.assert_any_call("tensor_parallel")
+        mesh.__getitem__.assert_any_call("context_parallel")
+        
+        # Verify nvfsdp_fully_shard was called with default names
+        mock_nvfsdp_env["nvfsdp"].fully_shard.assert_called_once()
+        call_kwargs = mock_nvfsdp_env["nvfsdp"].fully_shard.call_args[1]
+        assert call_kwargs["dp_mesh_name"] == "data_parallel"
+        assert call_kwargs["tp_mesh_name"] == "tensor_parallel"
+        assert call_kwargs["cp_mesh_name"] == "context_parallel"
+        assert call_kwargs["grad_reduce_in_fp32"] is True
+    
+    def test_nvfsdp_not_available_error(self, mock_device_mesh, monkeypatch):
+        """Test error when nvFSDP is not available."""
+        # Mock HAVE_NVFSDP as False
+        monkeypatch.setattr("nemo_automodel.components.distributed.parallelizer.HAVE_NVFSDP", False, raising=False)
+        
+        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
+        model = MockModel()
+        
+        with pytest.raises(AssertionError, match="nvFSDP is not installed"):
+            nvfsdp_strategy_parallelize(
+                model=model,
+                device_mesh=mesh,
+            )
 
 
 class TestUtilityFunctions:
