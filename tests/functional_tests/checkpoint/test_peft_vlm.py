@@ -661,7 +661,6 @@ def test_hf_peft_checkpoint():
         "model/tokenizer_config.json",
         "model/tokenizer.json",
         "model/special_tokens_map.json",
-        "model/tokenizer.model",
         "optim/__0_0.distcp",
         "optim/__1_0.distcp",
         "optim/.metadata",

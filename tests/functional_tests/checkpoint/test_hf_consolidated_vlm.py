@@ -299,7 +299,6 @@ def test_consolidated_vlm_checkpoint():
         "model/consolidated/processor_config.json",
         "model/consolidated/tokenizer_config.json",
         "model/consolidated/tokenizer.json",
-        "model/consolidated/tokenizer.model",
         "model/consolidated/special_tokens_map.json",
         "optim/__0_0.distcp",
         "optim/__1_0.distcp",
