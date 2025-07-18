@@ -304,8 +304,7 @@ checkpoints/epoch_0_step_10/
 
 ## Run Inference with the NeMo AutoModel Fine-Tuned Checkpoint
 
-Inference on the fine-tuned checkpoint is supported using Hugging Face's generate API.
-Simply replace the path of the full model with the path to a SFT checkpoint.
+Inference on the fine-tuned checkpoint is supported through the Hugging Face generate API. To use it, replace the path of the full model with the path to a SFT checkpoint.
 
 The following is an example script using Hugging Face's Transformers library:
 
