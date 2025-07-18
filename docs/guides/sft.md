@@ -426,67 +426,19 @@ engine designed to optimize the deployment of large language models
 parallel processing and optimized memory management, vLLM accelerates
 inference while maintaining model accuracy.
 
-NeMo AutoModel provides support for exporting a fine-tuned checkpoint
-for use with vLLM, enabling optimized inference without requiring model
-architecture changes. The [vLLMHFExporter](https://github.com/NVIDIA/NeMo/blob/main/nemo/export/vllm_hf_exporter.py)  utility
-facilitates this process, ensuring compatibility with Hugging Face-based
-models.
-
-The following script demonstrates how to export a fine-tuned checkpoint
-to vLLM and deploy it using PyTriton, allowing seamless deployment and
-efficient inference:
+The following script demonstrates how to use a fine-tuned checkpoint
+in vLLM, allowing seamless deployment and efficient inference:
 
 > [!NOTE]
 > Make sure vLLM is installed (pip install vllm, or use the environment
-> that includes it) before proceeding with vLLMHFExporter.
+> that includes it).
 
 
 ``` python
-from nemo.deploy import DeployPyTriton
-from nemo.deploy.nlp import NemoQueryLLM
+from vllm import LLM, SamplingParams
 
-try:
-    from nemo.export.vllm_hf_exporter import vLLMHFExporter
-except Exception:
-    raise Exception(
-        "vLLM should be installed in the environment or import "
-        "the vLLM environment in the NeMo FW container using "
-        "source /opt/venv/bin/activate command"
-    )
-
-
-if __name__ == '__main__':
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model', required=True, type=str, help="Local path or model name on Hugging Face")
-    parser.add_argument('--triton-model-name', required=True, type=str, help="Name for the service")
-    args = parser.parse_args()
-
-    exporter = vLLMHFExporter()
-    exporter.export(model=args.model)
-
-    nm = DeployPyTriton(
-        model=exporter,
-        triton_model_name=args.triton_model_name,
-        triton_model_version=1,
-        max_batch_size=64,
-        http_port=8000,
-        address="0.0.0.0",
-    )
-
-    nm.deploy()
-    nm.run()
-
-    nq = NemoQueryLLM(url="localhost:8000", model_name=args.triton_model_name)
-    output_deployed = nq.query_llm(
-        prompts=["How are you doing?"],
-        max_output_len=128,
-        top_k=1,
-        top_p=0.2,
-        temperature=1.0,
-    )
-
-    print(" Output: ", output_deployed)
-    nm.stop()
+llm = LLM(model="checkpoints/epoch_0_step_10/model/consolidated/", model_impl="transformers")
+params = SamplingParams(max_tokens=20)
+outputs = llm.generate("Toronto is", sampling_params=params)
+print(f"Generated text: {outputs[0].outputs[0].text}")
 ```
