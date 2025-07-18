@@ -58,7 +58,7 @@ docker run --gpus all -it --rm \
 
 If you want the **latest features** from the `main` branch or want to contribute:
 
-### Option A - Using `pip` with git repo:
+#### Option A - Use `pip` with git repo:
 ```bash
 pip3 install git+https://github.com/NVIDIA-NeMo/Automodel.git
 ```
