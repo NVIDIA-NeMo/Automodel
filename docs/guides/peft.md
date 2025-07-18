@@ -253,7 +253,7 @@ the default recipes. -->
 automodel finetune llm -c peft_guide.yaml
 ```
 
-### Invoking the recipe script directly
+### Invoke the Recipe Script Directly
 
 Alternatively, you can run the recipe [script](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py) directly using [torchrun](https://docs.pytorch.org/docs/stable/elastic/run.html), as shown below.
 
