@@ -275,7 +275,7 @@ class TestFSDP2StrategyParallelize:
         
         assert result is model
         mock_distributed_env["fsdp"].fully_shard.assert_called()
-        mock_distributed_env["tp"].parallelize_module.assert_not_called()
+        mock_distributed_env["tensor_parallel"].parallelize_module.assert_not_called()
     
     def test_tensor_parallelism_with_custom_plan(self, mock_device_mesh, mock_distributed_env):
         """Test tensor parallelism with custom parallel plan."""
@@ -292,7 +292,7 @@ class TestFSDP2StrategyParallelize:
         )
         
         assert result is model
-        mock_distributed_env["tp"].parallelize_module.assert_called_once()
+        mock_distributed_env["tensor_parallel"].parallelize_module.assert_called_once()
         mock_distributed_env["fsdp"].fully_shard.assert_called()
     
     def test_gemma3_model_handling(self, mock_device_mesh, mock_distributed_env):
@@ -337,7 +337,7 @@ class TestFSDP2StrategyParallelize:
         
         assert result is model
         # Verify checkpoint_wrapper was called for MLP layers
-        mock_distributed_env["tp"].checkpoint_wrapper.assert_called()
+        mock_distributed_env["tensor_parallel"].checkpoint_wrapper.assert_called()
     
     def test_optimized_tp_plan_usage(self, mock_device_mesh, mock_distributed_env, mock_optimized_tp_plans):
         """Test usage of optimized TP plan based on model type."""
@@ -354,7 +354,7 @@ class TestFSDP2StrategyParallelize:
             )
         
         assert result is model
-        mock_distributed_env["tp"].parallelize_module.assert_called_once()
+        mock_distributed_env["tensor_parallel"].parallelize_module.assert_called_once()
     
     def test_hf_tp_plan_fallback(self, mock_device_mesh, mock_distributed_env):
         """Test fallback to HuggingFace TP plan."""
@@ -373,7 +373,7 @@ class TestFSDP2StrategyParallelize:
         
         assert result is model
         mock_hf_plan.assert_called_once_with(model)
-        mock_distributed_env["tp"].parallelize_module.assert_called_once()
+        mock_distributed_env["tensor_parallel"].parallelize_module.assert_called_once()
     
     def test_string_tp_plan_import(self, mock_device_mesh, mock_distributed_env):
         """Test importing TP plan from string path."""
@@ -394,7 +394,7 @@ class TestFSDP2StrategyParallelize:
         
         assert result is model
         mock_import.assert_called_once_with("path.to.parallel.plan")
-        mock_distributed_env["tp"].parallelize_module.assert_called_once()
+        mock_distributed_env["tensor_parallel"].parallelize_module.assert_called_once()
     
     def test_function_tp_plan_import(self, mock_device_mesh, mock_distributed_env):
         """Test importing TP plan from function path."""
@@ -417,7 +417,7 @@ class TestFSDP2StrategyParallelize:
         
         assert result is model
         mock_import.assert_called_once_with("path.to.plan.function")
-        mock_distributed_env["tp"].parallelize_module.assert_called_once()
+        mock_distributed_env["tensor_parallel"].parallelize_module.assert_called_once()
     
     def test_invalid_tp_plan_error(self, mock_device_mesh, mock_distributed_env):
         """Test error handling for invalid TP plan."""
@@ -482,7 +482,7 @@ class TestFSDP2StrategyParallelize:
             )
         
         assert result is model
-        mock_distributed_env["tp"].parallelize_module.assert_called_once()
+        mock_distributed_env["tensor_parallel"].parallelize_module.assert_called_once()
     
     def test_sequence_parallel_with_hf_plan_error(self, mock_device_mesh, mock_distributed_env):
         """Test error when sequence parallel is used with HF plan."""
@@ -817,8 +817,8 @@ class TestFSDP2StrategyEndToEnd:
         assert result is model
         
         # Verify all expected calls were made
-        mock_distributed_env["tp"].parallelize_module.assert_called_once()
-        mock_distributed_env["tp"].checkpoint_wrapper.assert_called()
+        mock_distributed_env["tensor_parallel"].parallelize_module.assert_called_once()
+        mock_distributed_env["tensor_parallel"].checkpoint_wrapper.assert_called()
         mock_distributed_env["fsdp"].fully_shard.assert_called() 
 
 
