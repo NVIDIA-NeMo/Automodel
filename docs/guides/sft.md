@@ -439,6 +439,9 @@ from vllm import LLM, SamplingParams
 
 llm = LLM(model="checkpoints/epoch_0_step_10/model/consolidated/", model_impl="transformers")
 params = SamplingParams(max_tokens=20)
-outputs = llm.generate("Toronto is", sampling_params=params)
+outputs = llm.generate("Toronto is a city in Canada.", sampling_params=params)
 print(f"Generated text: {outputs[0].outputs[0].text}")
+```
+```text
+>>> Generated text:  It is the capital of Ontario. Toronto is a global hub for cultural tourism. The City of Toronto
 ```
