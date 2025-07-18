@@ -86,7 +86,7 @@ pip3 install -e .
 > 🛠️ This installs Automodel in editable mode, so changes to the code are immediately reflected in Python.
 
 
-## 🐳 Mount the Repo into a NeMo Docker Container
+### 🐳 Mount the Repo into a NeMo Docker Container
 To run `Automodel` inside a NeMo container while **mounting your local repo**, follow these steps:
 
 ```
