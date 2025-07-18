@@ -126,20 +126,19 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
     return CheckpointingConfig(**ckpt_kwargs)
 
 
-def build_loss_fn(device, cfg_loss):
+def build_loss_fn(cfg_loss):
     """Build a loss function.
 
     Args:
-        device: The target device.
         cfg_loss: Loss function configuration or a callable loss function.
 
     Returns:
-        The instantiated loss function on the specified device.
+        The instantiated loss function.
     """
     if callable(cfg_loss):
-        return cfg_loss
+        return cfg_loss()
     else:
-        return cfg_loss.instantiate().to(device)
+        return cfg_loss.instantiate()
 
 
 def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed) -> DataLoader:
@@ -282,7 +281,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             seed=self.cfg.get("seed", 42),
             tp_size=self.cfg.get("distributed.tp_size", 1),
         )
-        self.loss_fn = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
+        self.loss_fn = build_loss_fn(self.cfg.loss_fn)
         self.dataloader = build_dataloader(  # VLM-specific
             self.cfg.dataset,
             self.cfg.dataloader,
@@ -377,7 +376,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         with train_ctx():
             out = self.model(**batch)
             local_loss = self.loss_fn(
-                out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum"
+                out.logits, labels, mask=loss_mask, reduction="sum"
             )
 
         local_num_tokens = loss_mask.sum().detach().to(torch.int)
@@ -476,7 +475,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 with train_ctx():
                     out = self.model(**batch)
                     local_loss = self.loss_fn(
-                        out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum"
+                        out.logits, labels, mask=loss_mask, reduction="sum"
                     )
 
                 total_loss += local_loss.item()
