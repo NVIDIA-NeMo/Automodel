@@ -301,7 +301,7 @@ checkpoints/epoch_0_step_10/
 ```
 
 
-## Run PEFT Inference with NeMo AutoModel-trained Adapters
+## Run PEFT Inference with NeMo AutoModel-Trained Adapters
 
 Inference with adapters is supported using Hugging Face\'s generate API.
 Simply replace the path to the full model with the path to a PEFT
