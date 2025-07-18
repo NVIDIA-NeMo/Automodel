@@ -14,7 +14,7 @@
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.loss.chunked_ce import chunked_cross_entropy, compute_cross_entropy
+from nemo_automodel.components.loss.chunked_ce import chunked_cross_entropy, compute_cross_entropy
 
 
 def test_compute_cross_entropy_basic():
