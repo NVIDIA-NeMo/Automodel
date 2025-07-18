@@ -2,10 +2,16 @@
 
 This guide shows you how to bring your own dataset into NeMo Automodel for training. You'll learn about three main dataset types: **completion datasets** for language modeling (like [HellaSwag](https://huggingface.co/datasets/rowan/hellaswag)), **instruction datasets** for question-answering tasks (like [SQuAD](https://huggingface.co/datasets/rajpurkar/squad)), and **multi-modal datasets** that combine text with images or other modalities. We'll cover how to create custom datasets by implementing the required methods and preprocessing functions, and finally show you how to specify your own data logic using YAML configuration with file paths—allowing you to define custom dataset processing without modifying the main codebase.
 
+## Quick Start Summary
+| **Type**        |  **Use Case**    | **Example** | **Preprocessor**               | **Section**              |
+| --------------- | ------------------ | -------------- | --------------------------------- | --------------------------- |
+| ✍️ Completion   | Language modeling  | HellaSwag      | `SFTSingleTurnPreprocessor`       | [Jump](#completion-datasets)  |
+| 🗣️ Instruction  | Question answering | SQuAD          | `make_*` function                 | [Jump](#instruction-datasets) |
+| 🖼️ Multi-modal  | Vision + Language  | MedPix-VQA     | `apply_chat_template`, collate fn | [Jump](#multi-modal-datasets) |
+
 ## Types of Supported Datasets
 
 NeMo Automodel supports a variety of datasets depending on the task.
-
 ### Completion Datasets
 
 **Completion datasets** are single text sequences designed for language modeling where the model learns to predict the next token given a context. These datasets typically contain a context (prompt) and a target (completion) that the model should learn to generate.
@@ -42,7 +48,7 @@ NeMo Automodel provides the `SFTSingleTurnPreprocessor` class to handle completi
 5. **Pads** sequences to equal length
 
 
-#### Creating Your Own Completion Dataset
+#### Create Your Own Completion Dataset
 
 To adapt your dataset into this format, define a class like this:
 
@@ -55,18 +61,18 @@ class MyCompletionDataset:
         raw_datasets = load_dataset(path_or_dataset, split=split)
         processor = SFTSingleTurnPreprocessor(tokenizer)
         self.dataset = processor.process(raw_datasets, self)
-    
+
     def get_context(self, examples):
         """Extract context/prompt from your dataset"""
         return examples["context_field"]  # Replace with your context field
-    
+
     def get_target(self, examples):
         """Extract target/completion from your dataset"""
         return examples["target_field"]   # Replace with your target field
-    
+
     def __getitem__(self, index):
         return self.dataset[index]
-    
+
     def __len__(self):
         return len(self.dataset)
 ```
@@ -85,7 +91,7 @@ The [SQuAD (Stanford Question Answering Dataset)](https://huggingface.co/dataset
 - **Question**: A question about the context
 - **Answers**: The correct answer with its position in the context
 
-#### Creating Your Own Instruction Dataset
+#### Create Your Own Instruction Dataset
 
 The [`squad.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/squad.py) file contains the implementation for processing the SQuAD dataset into a format suitable for instruction tuning. It defines a dataset class and preprocessing functions that extract the context, question, and answer fields, concatenate them into a prompt-completion format, and apply tokenization, padding, and loss masking. This serves as a template for building custom instruction datasets by following a similar structure and adapting the extraction logic to your dataset's schema.
 
@@ -103,7 +109,7 @@ def make_my_instruction_dataset(
 ):
     if limit_dataset_samples:
         split = f"{split}[:{limit_dataset_samples}]"
-    
+
     dataset = load_dataset(dataset_name, split=split)
 
     return dataset.map(
@@ -115,15 +121,35 @@ def make_my_instruction_dataset(
 
 ### Multi-modal Datasets
 
-Multi-modal datasets combine text with other modalities like images, audio, or video. These datasets are essential for training Vision-Language Models (VLMs) and other multi-modal AI systems.
+Multi-modal datasets combine text with other input types (e.g., images, audio or video) and are essential for training Vision-Language Models (VLMs). These datasets introduce specific challenges such as aligning modalities, batching diverse data types, and formatting prompts for multi-turn, multi-modal dialogue.
+
+NeMo Automodel supports multi-modal dataset integration through flexible preprocessing, custom formatting, and YAML-based configuration.
+
+#### Typical types in Multi-modal Datasets
+A multi-modal dataset typically contains?
+- **Image(s) / video(s) / audio(s)** or other non-text modalities
+- **Textual inputs** such as questions, instructions or captions
+- **Answers** or expected outputs from the model
+
+These are formatted into structured conversations or instruction-response pairs for use with VLMs like BLIP, Llava, or Flamingo.
 
 #### Example: MedPix-VQA Dataset
 
-The [MedPix-VQA](https://huggingface.co/datasets/mmoukouba/MedPix-VQA) dataset is a comprehensive medical Visual Question Answering dataset designed for training and evaluating VQA models in the medical domain. It contains medical images from MedPix, a well-known medical image database, paired with questions and answers that focus on medical image interpretation.
+The [MedPix-VQA](https://huggingface.co/datasets/mmoukouba/MedPix-VQA) dataset is a comprehensive medical Visual Question Answering dataset designed for training and evaluating VQA models in the medical domain. It contains radiological images (from MedPix; well-known medial image dataset) and associated QA pairs used for medical image interpretation.
 
 **Structure**:
 - 20,500 total examples
 - Columns: `image_id`, `mode`, `case_id`, `question`, `answer`
+
+```json
+{
+  "image_id": "medpix_0143.jpg",
+  "mode": "CT",
+  "case_id": "case_101",
+  "question": "What abnormality is visible in the left hemisphere?",
+  "answer": "Subdural hematoma"
+}
+```
 
 The example dataset preprocessing performs the following steps:
 
@@ -141,7 +167,7 @@ conversation = [
         ],
     },
     {
-        "role": "assistant", 
+        "role": "assistant",
         "content": [{"type": "text", "text": example["answer"]}]
     },
 ]
@@ -184,3 +210,9 @@ dataset:
   num_blocks: 111
 ```
 This will call `build_my_dataset()` from the specified file with the other keys (e.g., num_blocks) as arguments. This approach allows you to integrate custom datasets via config alone—no need to alter the codebase or package structure.
+
+## 🔧 Troubleshooting Tips
+
+- **Tokenization Mismatch?** Ensure your tokenizer aligns with the model's expected inputs.
+- **Dataset too large?** Use `limit_dataset_samples` in your YAML config to load a subset, useful for quick debugging.
+- **Loss not decreasing?** Verify that your loss mask correctly ignores prompt tokens.
