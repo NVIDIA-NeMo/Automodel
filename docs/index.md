@@ -5,7 +5,7 @@
 ```{toctree}
 :caption: 🖥️  Environment Start
 :hidden:
-
+guides/installation.md
 environment/local-workstation.md
 ```
 <!--
@@ -16,8 +16,9 @@ environment/cluster.md
 :caption: 🚀 E2E Examples
 :hidden:
 
-guides/sft.md
-guides/gemma3-3n.md
+guides/llm/sft.md
+guides/llm/peft.md
+guides/omni/gemma3-3n.md
 ```
 
 ```{toctree}
