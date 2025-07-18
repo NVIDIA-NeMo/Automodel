@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # pylint: disable=line-too-long
-"""Tests for consolidated HF safetensors checkpointing."""
+"""Tests for consolidated HF safetensors checkpointing for LLM."""
 
 import os
 import shutil
@@ -101,9 +101,9 @@ def get_validation_loss(
         return loss
 
 
-def test_hf_sharded_checkpoint():
+def test_consolidated_llm_checkpoint():
     """
-    Tests HF sharded checkpoint
+    Tests HF consolidated checkpoint for LLM.
     """
     expected_model_keys = {
         "model.embed_tokens.weight": ([16000, 512], torch.bfloat16, "cpu"),
@@ -779,6 +779,8 @@ def test_hf_sharded_checkpoint():
         "model/shard-00001-model-00001-of-00001.safetensors",
         "model/shard-00002-model-00001-of-00001.safetensors",
         "model/consolidated/model-00001-of-00001.safetensors",
+        "model/consolidated/config.json",
+        "model/consolidated/model.safetensors.index.json",
         "optim/__0_0.distcp",
         "optim/__1_0.distcp",
         "optim/.metadata",
