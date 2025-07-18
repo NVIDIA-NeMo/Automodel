@@ -221,7 +221,7 @@ optimizer:
 ```
 
 > [!TIP]
-> To avoid using unnessary storage space and enable faster sharing, the
+> To avoid using unnecessary storage space and enable faster sharing, the
 > adapter checkpoint only contains the adapter weights. As a result, when
 > running inference, the adapter and base model weights need to match
 > those used for training.
