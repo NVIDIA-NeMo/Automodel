@@ -106,8 +106,7 @@ def initialize_distributed(
 
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
-    # device = torch.device("cuda", rank % torch.cuda.device_count())
-    device = torch.device("cpu", rank)
+    device = torch.device("cuda", rank % torch.cuda.device_count())
     return DistInfo(backend, rank, world_size, device, rank == 0)
 
 

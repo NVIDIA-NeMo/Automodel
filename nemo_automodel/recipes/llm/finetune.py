@@ -296,7 +296,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         Raises:
             NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
         """
-        # torch.cuda.reset_peak_memory_stats()
+        torch.cuda.reset_peak_memory_stats()
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
         # setups logging and adds the rankfilter to logging
         setup_logging()
@@ -490,7 +490,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     tps,
                 )
             )
-            # torch.cuda.reset_peak_memory_stats()
+            torch.cuda.reset_peak_memory_stats()
 
     @torch.no_grad()
     def _run_validation_epoch(self) -> float:
@@ -601,13 +601,8 @@ def main(config_path=None):
     cfg = parse_args_and_load_config(config_path)
     trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
-    import cProfile
-    prof = cProfile.Profile()
-    prof.enable()
     trainer.run_train_validation_loop()
 
-    prof.disabled()
-    prof.dump_stats('cprof_RANK%d.prof' % torch.distributed.get_rank())
 
 if __name__ == "__main__":
     main()
