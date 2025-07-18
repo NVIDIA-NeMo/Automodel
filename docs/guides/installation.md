@@ -93,7 +93,7 @@ To run `Automodel` inside a NeMo container while **mounting your local repo**, f
 # Step 1: Clone the Automodel repository.
 git clone https://github.com/NVIDIA-NeMo/Automodel.git && cd Automodel && \
 
-# Step 2: Pull the latest compatible NeMo container (replace 25.07 with latest if desired)
+# Step 2: Pull the latest compatible NeMo container (replace 25.07 with latest if needed).
 docker pull nvcr.io/nvidia/nemo:25.07 && \
 
 # Step 3: Run the NeMo container with GPU support, shared memory, and mount the repo.
