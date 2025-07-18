@@ -52,7 +52,7 @@ docker run --gpus all -it --rm \
 ```
 
 ---
-# Installation options for developers
+## Installation Options for Developers
 
 ## 🐍 Install via GitHub (Source)
 
