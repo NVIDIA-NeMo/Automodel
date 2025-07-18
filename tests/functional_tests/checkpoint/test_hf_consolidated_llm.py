@@ -910,11 +910,11 @@ def test_consolidated_llm_checkpoint():
         v = model_state_dict[k]
         if isinstance(v, torch.distributed.tensor.DTensor):
             v = v.full_tensor().cpu()
-        assert k.replace("model.", "") if "lm_head" in k else k in restored_model_dict_consolidated, (
+        assert k in restored_model_dict_consolidated, (
             f"Key {k} not found in restored model state"
         )
         assert isinstance(
-            restored_model_dict_consolidated[k.replace("model.", "") if "lm_head" in k else k],
+            restored_model_dict_consolidated[k],
             torch.Tensor,
         ), f"Value for key {k} is not a tensor"
 
@@ -922,7 +922,7 @@ def test_consolidated_llm_checkpoint():
         expected_shape, expected_dtype, expected_device = expected_model_keys[k]
         expected_shape[0] *= 2  # since the hardcoded shapes are for sharded Tensors
 
-        full_shard = restored_model_dict_consolidated[k.replace("model.", "") if "lm_head" in k else k]
+        full_shard = restored_model_dict_consolidated[k]
 
         assert list(full_shard.shape) == expected_shape, (
             f"Shape mismatch for key {k}. Expected shape {expected_shape} but got {full_shard.shape}"
