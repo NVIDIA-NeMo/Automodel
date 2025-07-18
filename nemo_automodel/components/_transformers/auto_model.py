@@ -189,6 +189,9 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
             attn_implementation=attn_implementation,
             torch_dtype=torch_dtype,
         )
+        if not torch.cuda.is_available():
+            logging.info("GPU unavailable; skipping patching")
+            return model
         try:
             return patch_model(model, use_liger_kernel, use_sdpa_patching, sdpa_method)
         except RuntimeError:

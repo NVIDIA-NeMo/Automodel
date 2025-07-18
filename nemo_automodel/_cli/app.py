@@ -217,6 +217,7 @@ def get_repo_root():
 
 
 def run_interactive(args):
+    import torch
     from torch.distributed.run import determine_local_world_size, get_args_parser
     from torch.distributed.run import run as thrun
 
@@ -225,18 +226,19 @@ def run_interactive(args):
     script_path = repo_root / "nemo_automodel" / "recipes" / args.domain / f"{args.command}.py"
 
     # launch job on this node
-    num_devices = determine_local_world_size(nproc_per_node="gpu")
+    device_type = "gpu" if torch.cuda.is_available() else "cpu"
+    num_devices = determine_local_world_size(nproc_per_node=device_type)
     assert num_devices > 0, "Expected num-devices to be > 0"
     if args.nproc_per_node == 1 or num_devices == 1:
-        logging.info("Launching job locally on a single device")
+        logging.info(f"Launching job locally on a single {device_type.upper()}")
         # run the job with a single rank on this process.
         recipe_main = load_function(script_path, "main")
         return recipe_main(config_path)
     else:
-        logging.info(f"Launching job locally on {num_devices} devices")
+        logging.info(f"Launching job locally on {num_devices} {device_type.upper()}s")
         # run the job on multiple ranks on this node.
         torchrun_parser = get_args_parser()
-        torchrun_args = torchrun_parser.parse_args()
+        torchrun_args, extra = torchrun_parser.parse_known_args()
         # overwrite the training script with the actual recipe path
         torchrun_args.training_script = str(script_path)
         # training_script_args=['finetune', '--config', 'examples/llm/llama_3_2_1b_squad.yaml']
@@ -261,7 +263,7 @@ def main():
     Returns:
         int: Job's status code
     """
-    args = build_parser().parse_args()
+    args, extra = build_parser().parse_known_args()
     logging.info(f"Domain:  {args.domain}")
     logging.info(f"Command: {args.command}")
     logging.info(f"Config:  {args.config.resolve()}")
