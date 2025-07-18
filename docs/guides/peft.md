@@ -310,8 +310,7 @@ checkpoint. The required configurations, including the model type,
 adapter type, and base model checkpoint path, should be properly set up
 within the PEFT checkpoint.
 
-The following is an example script using Hugging Face\'s transformers
-library:
+The following is an example script using Hugging Face's Transformers library:
 
 ``` python
 from transformers import AutoModelForCausalLM, AutoTokenizer
