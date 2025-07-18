@@ -90,7 +90,7 @@ pip3 install -e .
 To run `Automodel` inside a NeMo container while **mounting your local repo**, follow these steps:
 
 ```
-# Step 1: Clone the Automodel repository
+# Step 1: Clone the Automodel repository.
 git clone https://github.com/NVIDIA-NeMo/Automodel.git && cd Automodel && \
 
 # Step 2: Pull the latest compatible NeMo container (replace 25.07 with latest if desired)
