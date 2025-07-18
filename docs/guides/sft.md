@@ -258,7 +258,7 @@ torchrun --nproc-per-node=8 examples/llm/finetune.py --config sft_guide.yaml
 ```
 
 ### Sample output
-Running the recipe with either the `automodel` app or the invoking directly the recipe script, should produce
+Running the recipe using either the `automodel` app or by directly invoking the recipe script should produce
 the following log:
 ```
 $ automodel finetune llm -c sft_guide.yaml
