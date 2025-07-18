@@ -114,7 +114,7 @@ This structure is ideal for training models in context-based question answering,
 > In this guide, we use the `SQuAD v1.1` dataset, but you can specify your own data as needed.
 
 
-### Finetune recipe and configuration
+### Use a Recipe to Fine-Tune the Model
 
 This example demonstrates how to fine-tune a large language model using NVIDIA's NeMo Automodel library.
 Specifically, we use the LLM [finetune recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py), and in particular, the `FinetuneRecipeForNextTokenPrediction` class to orchestrate the fine-tuning process end-to-end: model loading, dataset preparation, optimizer setup, distributed training, checkpointing, and logging.
