@@ -133,7 +133,7 @@ The `FinetuneRecipeForNextTokenPrediction` class is one such recipe. It inherits
 - Misc: Checkpoint handling, logging, and RNG setup.
 
 > [!NOTE]
-> Key Insight: The recipe ensures stateless config-driven orchestration, meaning no component is hardcoded: key items, such as the model, dataset and optimizer are loaded via Hydra-style `instantiate()` calls.
+> The recipe ensures stateless, config-driven orchestration where core components like the model, dataset, and optimizer are configured dynamically using Hydra-style `instantiate()` calls, avoiding hardcoded dependencies.
 
 #### Recipe Config
 ``` yaml
