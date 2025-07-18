@@ -25,7 +25,7 @@ This guide explains how to install NeMo AutoModel for LLM, VLM, and OMNI models 
 
 ---
 ## Installation Options for Non-Developers
-
+This section explains the easiest installation options for non-developers, including using pip3 via PyPI or leveraging a preconfigured NVIDIA NeMo Docker container. Both methods offer quick access to the latest stable release of NeMo Automodel with all required dependencies.
 ### 📦 Install via PyPI (Recommended)
 
 For most users, the easiest way to get started is using `pip3`.
