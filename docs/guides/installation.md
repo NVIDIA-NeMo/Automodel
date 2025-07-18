@@ -53,7 +53,7 @@ docker run --gpus all -it --rm \
 
 ---
 ## Installation Options for Developers
-
+This section provides installation options for developers, including pulling the latest source from GitHub, using editable mode, or mounting the repo inside a NeMo Docker container.
 ### 🐍 Install via GitHub (Source)
 
 If you want the **latest features** from the `main` branch or want to contribute:
