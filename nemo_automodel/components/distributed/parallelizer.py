@@ -156,7 +156,7 @@ def get_hf_tp_shard_plan(model):
                 output_layouts=Shard(-1), use_local_output=False
             )
         else:
-            hf_tp_plan[k] = translate_parallel_style(v)
+            hf_tp_plan[k] = translate_to_torch_parallel_style(v)
 
     return hf_tp_plan
 
@@ -196,10 +196,13 @@ def import_classes_from_paths(class_paths: List[str]):
 
 
 @lru_cache
-def translate_parallel_style(style: str):
-    """Translate parallel style str to parallel type.
-
-    Taken and modified from: https://github.com/NVIDIA/NeMo/blob/6c6169db01bcca73ae8ad3ac35242fadbb9a78ba/nemo/lightning/pytorch/strategies/utils.py#L547
+def translate_to_torch_parallel_style(style: str):
+    """
+    Translates string descriptions to parallelism plans.
+    
+    In model configurations, we use a neutral type (string) to specify parallel
+    styles, here we translate them into torch.distributed tensor-parallel
+    types.
     """
     assert isinstance(style, str), (
         f"parallel style type should be str, but got {type(style)}"
@@ -238,6 +241,9 @@ def nvfsdp_strategy_parallelize(
     keep_fp8_transpose_cache_when_using_custom_fsdp: bool = False,
     nccl_ub: bool = False,
     fsdp_double_buffer: bool = False,
+    dp_mesh_name: str = "data_parallel",
+    cp_mesh_name: str = "context_parallel",
+    tp_mesh_name: str = "tensor_parallel", 
 ):
     """
     Apply tensor/data parallelism (nvFSDP) and optional activation-checkpointing to the model.
@@ -282,6 +288,12 @@ def nvfsdp_strategy_parallelize(
             latency on some networks.
         fsdp_double_buffer (bool): Enable double buffering of parameters to
             overlap communication and computation in nvFSDP.
+        dp_mesh_name (str): Key name for the data parallel mesh in device_mesh.
+            Defaults to "data_parallel".
+        cp_mesh_name (str): Key name for the context parallel mesh in device_mesh.
+            Defaults to "context_parallel".
+        tp_mesh_name (str): Key name for the tensor parallel mesh in device_mesh.
+            Defaults to "tensor_parallel".
 
     NOTE: The passed-in model should preferably reside on the meta device.
     Otherwise, ensure the model fits into available GPU or CPU memory.
@@ -295,9 +307,9 @@ def nvfsdp_strategy_parallelize(
     )
 
     # DP_CP ranks are sharded by FSDP.
-    dp_mesh = device_mesh["data_parallel"]
-    tp_mesh = device_mesh["tensor_parallel"]
-    cp_mesh = device_mesh["context_parallel"]
+    dp_mesh = device_mesh[dp_mesh_name]
+    cp_mesh = device_mesh[cp_mesh_name]
+    tp_mesh = device_mesh[tp_mesh_name]
 
     if dp_mesh.size() > 1:
         # TODO(boxiangw): remove this once HSDP is supported.
@@ -321,9 +333,9 @@ def nvfsdp_strategy_parallelize(
         optimizer=optimizer,
         fsdp_unit_modules=nvfsdp_unit_modules,
         device_mesh=device_mesh,
-        dp_mesh_name="data_parallel",
-        cp_mesh_name="context_parallel",
-        tp_mesh_name="tensor_parallel",
+        dp_mesh_name=dp_mesh_name,
+        cp_mesh_name=cp_mesh_name,
+        tp_mesh_name=tp_mesh_name,
         dp_cp_mesh_name=dp_cp_mesh_name,
         data_parallel_sharding_strategy=data_parallel_sharding_strategy,
         init_model_with_meta_device=init_nvfsdp_with_meta_device,
@@ -408,6 +420,9 @@ def fsdp2_strategy_parallelize(
     activation_checkpointing: bool = False,
     cpu_offload: bool = False,
     tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+    dp_mesh_name: str = "data_parallel",
+    tp_mesh_name: str = "tensor_parallel",
+    dp_cp_mesh_name: str = "dp_cp",
 ):
     """
     Apply parallelisms and activation checkpointing to the model.
@@ -429,11 +444,17 @@ def fsdp2_strategy_parallelize(
         sequence_parallel (bool): Whether to use sequence parallelism. Defaults to False.
         activation_checkpointing (bool): Whether to use activation checkpointing. Defaults to False.
         cpu_offload (bool): Whether to enable cpu offloading for FSDP. Defaults to False.
-        parallel_plan (Optional[Union[Dict[str, ParallelStyle], str]]): 
+        tp_shard_plan (Optional[Union[Dict[str, ParallelStyle], str]]): 
             Custom tensor parallel plan for the model. Can be:
             - A dictionary mapping module names to parallel styles
             - A string path to a dictionary or function that returns a dictionary
             If provided, this takes precedence over automatic plan generation.
+        dp_mesh_name (str): Key name for the data parallel mesh in device_mesh.
+            Defaults to "data_parallel".
+        dp_cp_mesh_name (str): Key name for the data parallel + context parallel mesh in device_mesh.
+            Used when context parallelism is enabled. Defaults to "dp_cp".
+        tp_mesh_name (str): Key name for the tensor parallel mesh in device_mesh.
+            Defaults to "tensor_parallel".
 
     Returns:
         The parallelized model.
@@ -454,13 +475,13 @@ def fsdp2_strategy_parallelize(
 
     # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
     dp_mesh = device_mesh[
-        ("dp_cp" if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(device_mesh, {}) else "data_parallel")
+        (dp_cp_mesh_name if dp_cp_mesh_name in _mesh_resources.root_to_flatten_mapping.get(device_mesh, {}) else dp_mesh_name)
     ]
 
     if dp_mesh.size() > 1:
         assert dp_mesh.ndim == 1, "Hybrid-sharding not supported"
 
-    tp_mesh = device_mesh["tensor_parallel"]
+    tp_mesh = device_mesh[tp_mesh_name]
 
     # TP sharding with enhanced plan generation
     if tp_mesh.size() > 1:
