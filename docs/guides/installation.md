@@ -1,6 +1,6 @@
 # 🤖 Install NeMo Automodel
 
-NeMo Automodel support LLM, VLM, and OMNI models. Depending on your use case, there are several ways to install it:
+This guide explains how to install NeMo AutoModel for LLM, VLM, and OMNI models on various platforms and environments. Depending on your use case, there are several ways to install it:
 
 | Method                  | Dev Mode | Use Case                                                          | Recommended For             |
 | ----------------------- | ---------|----------------------------------------------------------------- | ---------------------------- |
