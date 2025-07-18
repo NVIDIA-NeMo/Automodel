@@ -280,7 +280,7 @@ INFO:root:step 20 | epoch 0 | loss 0.2557 | grad_norm 13.4375 | mem: 12.35 GiB |
 Saving checkpoint to checkpoints/epoch_0_step_20
 INFO:root:[val] step 20 | epoch 0 | loss 0.2469
 ```
-For each training batch the finetuning recipe logs the current loss, along with current peak memory usage and tokens per second (TPS).
+For each training batch, the fine-tuning recipe logs the current loss, along with current peak memory usage and tokens per second (TPS).
 
 In addition, the model checkpoint is saved under the `checkpoints/` directory, with the following contents:
 ``` bash
