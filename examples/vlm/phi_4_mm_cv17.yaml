@@ -26,7 +26,7 @@ dist_env:
   timeout_minutes: 10
 
 rng:
-  _target_: nemo_automodel.training.rng.StatefulRNG
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
   seed: 42
   ranked: true
 
@@ -54,10 +54,10 @@ checkpoint:
 #   cp_size: 1
 #   sequence_parallel: false
 
-loss_fn: nemo_automodel.loss.masked_ce.masked_cross_entropy
+loss_fn: nemo_automodel.components.loss.masked_ce.masked_cross_entropy
 
 dataset:
-  _target_: nemo_automodel.datasets.vlm.datasets.make_cv17_dataset
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_cv17_dataset
   path_or_dataset: ysdede/commonvoice_17_tr_fixed
   split: train
 
@@ -67,10 +67,10 @@ dataloader:
   num_workers: 0
   pin_memory: true
   collate_fn:
-    _target_: nemo_automodel.datasets.vlm.collate_fns.phi4_mm_collate_fn
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.phi4_mm_collate_fn
 
 validation_dataset:
-  _target_: nemo_automodel.datasets.vlm.datasets.make_cv17_dataset
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_cv17_dataset
   path_or_dataset: ysdede/commonvoice_17_tr_fixed
   split: validation
 
@@ -78,7 +78,7 @@ validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   batch_size: 2
   collate_fn:
-    _target_: nemo_automodel.datasets.vlm.collate_fns.phi4_mm_collate_fn
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.phi4_mm_collate_fn
   
 optimizer:
   _target_: torch.optim.AdamW
