@@ -16,9 +16,9 @@ environment/cluster.md
 :caption: 🚀 E2E Examples
 :hidden:
 
-guides/sft.md
-guides/peft.md
-guides/gemma3-3n.md
+guides/llm/sft.md
+guides/llm/peft.md
+guides/omni/gemma3-3n.md
 ```
 
 ```{toctree}
