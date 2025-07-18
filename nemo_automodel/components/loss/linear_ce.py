@@ -137,7 +137,6 @@ class FusedLinearCrossEntropy(LossFunction):
             labels: Target labels
             num_items_in_batch: Number of valid tokens (where labels != ignore_index)
             ignore_index: Value to ignore in labels (default: -100)
-            reduction: Reduction method ('mean' or 'sum')
             logit_softcapping: Value for softcapping logits (0 means no capping)
             accuracy_threshold: Threshold for accuracy computation
         """
