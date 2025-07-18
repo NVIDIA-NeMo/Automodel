@@ -137,7 +137,7 @@ The `FinetuneRecipeForNextTokenPrediction` class is one such recipe. It inherits
 The recipe ensures stateless, config-driven orchestration where core components like the model, dataset, and optimizer are configured dynamically using Hydra-style `instantiate()` calls, avoiding hardcoded dependencies.
 :::
 
-#### Recipe Config
+### Recipe Config
 ``` yaml
 # The model section is responsible for configuring the model we want to finetune.
 # Since we want to use the Llama 3 1B model, we pass `meta-llama/Llama-3.2-1B` to the
