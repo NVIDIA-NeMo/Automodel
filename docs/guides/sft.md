@@ -63,24 +63,20 @@ In this guide, we will fine-tune Meta’s `LLaMA 3.2 1B` model on the popular [S
 
 These design choices make LLaMA models highly competitive across various benchmarks, and their open weights make them a strong base for task-specific fine-tuning.
 
-> [!TIP]
-> In this guide, `meta-llama/Llama-3.2-1B` is used only as a placeholder
-> model ID. You can replace it with any valid Hugging Face model ID, such
-> as `Qwen/Qwen2.5-1.5B`, or any other checkpoint you have access to on
-> the Hugging Face Hub.
+:::{tip}
+In this guide, `meta-llama/Llama-3.2-1B` is used only as a placeholder model ID. You can replace it with any valid Hugging Face model ID, such as `Qwen/Qwen2.5-1.5B`, or any other checkpoint you have access to on the Hugging Face Hub.
+:::
 
-> [!IMPORTANT]
-> Some Hugging Face model repositories are **gated**, you must explicitly
-> request permission before you can download their files. If the model
-> page shows a "Request access" or "Agree and access" button:
->
-> 1.  Log in with your Hugging Face account.
-> 2.  Click the button and accept the license terms.
-> 3.  Wait for approval (usually instant; occasionally manual).
-> 4.  Ensure the token you pass to your script (via `huggingface-cli login` or the `HF_TOKEN` environment variable)
->    belongs to the account that was approved.
->
-> Trying to pull a gated model without an authorized token will trigger a 403 "permission denied" error.
+:::{important}
+Some Hugging Face model repositories are **gated**, you must explicitly request permission before you can download their files. If the model page shows a "Request access" or "Agree and access" button:
+
+1.  Log in with your Hugging Face account.
+2.  Click the button and accept the license terms.
+3.  Wait for approval (usually instant; occasionally manual).
+4.  Ensure the token you pass to your script (via `huggingface-cli login` or the `HF_TOKEN` environment variable) belongs to the account that was approved.
+
+ Trying to pull a gated model without an authorized token will trigger a 403 "permission denied" error.
+ :::
 
 
 #### 📚 About SQuAD
@@ -137,8 +133,9 @@ The `FinetuneRecipeForNextTokenPrediction` class is one such recipe. It inherits
 
 - Misc: Checkpoint handling, logging, and RNG setup.
 
-> [!NOTE]
-> Key Insight: The recipe ensures stateless config-driven orchestration, meaning no component is hardcoded: key items, such as the model, dataset and optimizer are loaded via Hydra-style `instantiate()` calls.
+:::{note}
+Key Insight: The recipe ensures stateless config-driven orchestration, meaning no component is hardcoded: key items, such as the model, dataset and optimizer are loaded via Hydra-style `instantiate()` calls.
+:::
 
 #### Recipe Config
 ``` yaml
@@ -288,19 +285,20 @@ $ tree checkpoints/epoch_0_step_10/
 checkpoints/epoch_0_step_10/
 ├── dataloader.pt
 ├── model
-│   ├── consolidated
-│   │   ├── config.json
-│   │   ├── model-00001-of-00001.safetensors
-│   │   └── model.safetensors.index.json
-│   ├── shard-00001-model-00001-of-00001.safetensors
-│   └── shard-00002-model-00001-of-00001.safetensors
+│   ├── consolidated
+│   │   ├── config.json
+│   │   ├── model-00001-of-00001.safetensors
+│   │   ├── model.safetensors.index.json
+│   │   ├── special_tokens_map.json
+│   │   ├── tokenizer.json
+│   │   └── tokenizer_config.json
+│   └── shard-00001-model-00001-of-00001.safetensors
 ├── optim
-│   ├── __0_0.distcp
-│   └── __1_0.distcp
+│   └── __0_0.distcp
 ├── rng.pt
 └── step_scheduler.pt
 
-3 directories, 10 file
+4 directories, 11 files
 ```
 
 ## Run Inference with the NeMo AutoModel Fine-Tuned Checkpoint
@@ -429,9 +427,9 @@ inference while maintaining model accuracy.
 The following script demonstrates how to use a fine-tuned checkpoint
 in vLLM, allowing seamless deployment and efficient inference:
 
-> [!NOTE]
-> Make sure vLLM is installed (pip install vllm, or use the environment
-> that includes it).
+:::{note}
+Make sure vLLM is installed (pip install vllm, or use the environment that includes it).
+:::
 
 
 ``` python
