@@ -103,7 +103,7 @@ def get_validation_loss(
         return loss
 
 
-def test_hf_peft_checkpoint():
+def test_hf_peft_checkpoint(use_triton=False):
     """
     Tests HF PEFT checkpoint
     """
@@ -1833,6 +1833,10 @@ def test_hf_peft_checkpoint():
 
     script_path = Path(__file__).parent.resolve()
     cfg = parse_args_and_load_config(script_path / "llama_3_2_1b_hellaswag_peft.yaml")
+
+    # set use_triton value based on parsed input
+    expected_automodel_peft_config["use_triton"] = cfg.peft.use_triton
+
     trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
