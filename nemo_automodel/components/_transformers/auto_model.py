@@ -16,7 +16,7 @@ import functools
 import inspect
 import logging
 import types
-from types import Optional, List
+from typing import Optional, List
 
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
