@@ -157,7 +157,7 @@ runs:
           --env RUN_ID=${{ github.run_id }} \
           --volume $(pwd)/NeMo-Automodel:/workspace \
           --workdir /workspace \
-          --volume $MNT_PATH/TestData:/home/TestData \
+          --volume $MNT_PATH/TestData:/home/TestData:ro \
           automodel \
           bash -c "sleep $(( ${{ inputs.timeout }} * 60 + 60 ))"
         RUN_TEST_EOF
