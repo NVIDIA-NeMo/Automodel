@@ -61,7 +61,6 @@ def get_local_rank_preinit() -> int:
     return int(os.getenv("LOCAL_RANK", "0"))
 
 
-
 @dataclass
 class DistInfo:
     """Holds information about the distributed training environment.
