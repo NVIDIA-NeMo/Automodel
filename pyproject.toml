@@ -71,7 +71,7 @@ classifiers = [
 dependencies = [
     "bitsandbytes==0.45.5; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@87a86ab",
-    "datasets",
+    "datasets<4.0.0",
     "liger-kernel==0.5.8; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "pyyaml",
     "torch",
