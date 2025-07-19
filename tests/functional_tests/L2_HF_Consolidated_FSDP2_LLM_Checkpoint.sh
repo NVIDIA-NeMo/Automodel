@@ -19,7 +19,7 @@ export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1"
 
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
--m pytest tests/functional_tests/checkpoint/test_hf_consolidated.py \
+-m pytest tests/functional_tests/checkpoint/test_hf_consolidated_llm.py \
     --config examples/llm/llama_3_2_1b_squad.yaml \
     --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
     --step_scheduler.max_steps 10 \
