@@ -174,7 +174,7 @@ convention = "google"
 known-third-party = ["datasets"]
 
 [importlinter]
-root_package = nemo_automodel
+root_package = "nemo_automodel"
 exclude_type_checking_imports = True
 
 [importlinter:contract:components_independent]
