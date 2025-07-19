@@ -48,7 +48,14 @@ jobs:
       - name: Run ruff
         run: |
           ruff check . --verbose
-          ruff format --check . --verbose
+          ruff format --check .
+
+      - name: Import‑graph contract
+        run: |
+          pip install import-linter
+          ls -lah
+          PYTHONPATH=$(pwd) lint-imports --debug --verbose --no-cache
+
 
   Nemo_Linting_Test:
     needs: linting
