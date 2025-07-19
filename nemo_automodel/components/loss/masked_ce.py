@@ -16,11 +16,10 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.loss.loss_interface import LossFunction, LossType
+from nemo_automodel.components.loss.loss_interface import LossFunction
+
 
 class MaskedCrossEntropy(LossFunction):
-    loss_type = LossType.TOKEN_LEVEL
-
     def __call__(
         self,
         next_token_logits: torch.Tensor,

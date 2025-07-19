@@ -65,7 +65,7 @@ from typing import Optional
 import torch
 
 from nemo_automodel.shared.import_utils import MISSING_CUT_CROSS_ENTROPY_MSG
-from nemo_automodel.components.loss.loss_interface import LossFunction, LossType
+from nemo_automodel.components.loss.loss_interface import LossFunction
 
 try:
     import cut_cross_entropy.tl_utils as tl_utils
@@ -116,8 +116,6 @@ if HAVE_CUT_CROSS_ENTROPY:
 
 
 class FusedLinearCrossEntropy(LossFunction):
-    loss_type = LossType.TOKEN_LEVEL
-
     def __call__(
         self,
         next_token_logits: torch.Tensor,

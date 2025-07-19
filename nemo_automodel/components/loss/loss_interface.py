@@ -12,15 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import enum
 from abc import abstractmethod
 
 import torch
-
-
-class LossType(enum.Enum):
-    TOKEN_LEVEL = "token_level"
-    SEQUENCE_LEVEL = "sequence_level"
 
 
 class LossFunction:
@@ -28,8 +22,6 @@ class LossFunction:
 
     Loss functions compute a scalar loss value from model logits and other data.
     """
-
-    loss_type: LossType
 
     @abstractmethod
     def __call__(
