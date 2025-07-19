@@ -147,10 +147,7 @@ def save_model(
 
             # TODO:(@adil-a): This will need to change when we add PP. Maybe we can cache the keys in ModelState.
             for fqn in list(model_state_dict.keys()):
-                if fqn not in fqn_to_file_index_mapping:
-                    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                        print(f"Adding missing key to mapping: {fqn}")
-                    fqn_to_file_index_mapping[fqn] = default_index
+                fqn_to_file_index_mapping[fqn] = fqn_to_file_index_mapping.get(fqn, default_index)
 
         storage_writer = _HuggingFaceStorageWriter(
             path=model_path,
