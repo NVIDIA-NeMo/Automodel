@@ -50,6 +50,12 @@ jobs:
           ruff check . --verbose
           ruff format --check . --verbose
 
+      - name: Import‑graph contract
+        run: |
+          pip install import-linter
+          lint-imports
+
+
   Nemo_Linting_Test:
     needs: linting
     runs-on: ubuntu-latest
