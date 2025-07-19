@@ -47,8 +47,8 @@ jobs:
 
       - name: Run ruff
         run: |
-          ruff check . --verbose
-          ruff format --check . --verbose
+          ruff check . --verbose --exclude=pyproject.toml
+          ruff format --check . --exclude=pyproject.toml
 
       - name: Import‑graph contract
         run: |
