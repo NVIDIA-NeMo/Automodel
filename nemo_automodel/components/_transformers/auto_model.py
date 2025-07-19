@@ -202,6 +202,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         # load model
         try:
+            name = cls.__name__
+            if name.startswith("NeMo"):
+                cls.__name__ = name[4:]
             model = super().from_pretrained(
                 pretrained_model_name_or_path,
                 *model_args,
@@ -209,6 +212,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 attn_implementation=attn_implementation,
                 **kwargs,
             )
+            cls.__name__ = name
         except ValueError as e:
             if "does not support" in str(e):
                 logging.warning("Falling back to eager attention.")
@@ -305,6 +309,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         # load model
         try:
+            name = cls.__name__
+            if name.startswith("NeMo"):
+                cls.__name__ = name[4:]
             model = super().from_config(
                 config,
                 *model_args,
@@ -312,6 +319,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 attn_implementation=attn_implementation,
                 **kwargs,
             )
+            cls.__name__ = name
         except ValueError as e:
             if "does not support" in str(e):
                 logging.warning("Falling back to eager attention.")
