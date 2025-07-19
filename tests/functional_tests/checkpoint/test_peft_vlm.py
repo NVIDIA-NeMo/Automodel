@@ -657,7 +657,7 @@ def test_hf_peft_checkpoint():
         "model/automodel_peft_config.json",
         "model/chat_template.jinja",
         "model/preprocessor_config.json",
-        "model/preprocessor_config.json",
+        "model/processor_config.json",
         "model/tokenizer_config.json",
         "model/tokenizer.json",
         "model/special_tokens_map.json",
