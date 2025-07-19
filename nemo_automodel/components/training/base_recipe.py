@@ -109,13 +109,16 @@ class BaseRecipe:
             print(f"Saving checkpoint to {path}", flush=True)
 
         # TODO(@adil-a): Change this when we create a LR scheduler class
-        model, optimizer, tokenizer = None, None, None
+        model, optimizer, scheduler, tokenizer = None, None, None, None
+
 
         for key in self.__dict__["__state_tracked"]:
             if isinstance(getattr(self, key), nn.Module):
                 model = getattr(self, key)
             elif isinstance(getattr(self, key), Optimizer):
                 optimizer = getattr(self, key)
+            elif hasattr(getattr(self, key), 'optimizer') and hasattr(getattr(self, key), 'step'):
+                scheduler = getattr(self, key)
             elif is_tokenizer(getattr(self, key)):
                 tokenizer = getattr(self, key)
             else:
@@ -128,7 +131,7 @@ class BaseRecipe:
                     torch.distributed.barrier()
 
         save_model(model, path, self.checkpoint_config, peft_config=self.peft_config, tokenizer=tokenizer)
-        save_optimizer(optimizer, model, path)
+        save_optimizer(optimizer, model, path, scheduler)
 
     def load_checkpoint(self, restore_from: str | None = None):
         """
@@ -152,14 +155,15 @@ class BaseRecipe:
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             print(f"Loading checkpoint from {ckpt_dir}", flush=True)
 
-        # TODO(@adil-a): Change this when we create a LR scheduler class
-        model, optimizer = None, None
+        model, optimizer, scheduler = None, None, None
 
         for key in self.__dict__["__state_tracked"]:
             if isinstance(getattr(self, key), nn.Module):
                 model = getattr(self, key)
             elif isinstance(getattr(self, key), Optimizer):
                 optimizer = getattr(self, key)
+            elif hasattr(getattr(self, key), 'optimizer') and hasattr(getattr(self, key), 'step'):
+                scheduler = getattr(self, key)
             elif is_tokenizer(getattr(self, key)):
                 # we don't need to load the tokenizer from the checkpoint
                 # we only save the tokenizer for consolidated checkpoints for downstream use
@@ -168,7 +172,7 @@ class BaseRecipe:
                 getattr(self, key).load_state_dict(torch.load(os.path.join(ckpt_dir, f"{key}.pt"), weights_only=False))
 
         load_model(model, ckpt_dir, self.checkpoint_config)
-        load_optimizer(optimizer, model, ckpt_dir)
+        load_optimizer(optimizer, model, ckpt_dir, scheduler)
 
 
 def _find_latest_checkpoint(checkpoint_dir):
