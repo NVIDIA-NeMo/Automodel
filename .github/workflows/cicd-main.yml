@@ -53,7 +53,7 @@ jobs:
       - name: Import‑graph contract
         run: |
           pip install import-linter
-          lint-imports --debug --verbose
+          PYTHONPATH=$(pwd) lint-imports --debug --verbose
 
 
   Nemo_Linting_Test:
