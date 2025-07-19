@@ -40,7 +40,7 @@ In this guide, we will fine-tune Meta’s `LLaMA 3.2 1B` model on the popular [S
 > ```bash
 > pip3 install nemo-automodel
 > ```
-> For a complete guide and additional options please consult the Automodel [installation guide](installation.md).
+> For a complete guide and additional options please consult the Automodel [installation guide](../installation.md).
 
 
 
