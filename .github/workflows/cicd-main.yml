@@ -54,7 +54,7 @@ jobs:
         run: |
           pip install import-linter
           ls -lah
-          PYTHONPATH=$(pwd) lint-imports --debug --verbose
+          PYTHONPATH=$(pwd) lint-imports --debug --verbose --no-cache
 
 
   Nemo_Linting_Test:
