@@ -173,11 +173,11 @@ convention = "google"
 [tool.ruff.lint.isort]
 known-third-party = ["datasets"]
 
-[toolimportlinter]
+[tool.importlinter]
 root_package = "nemo_automodel"
 exclude_type_checking_imports = true
 
-    [[toolimportlinter.contract]]
+    [[tool.importlinter.contract]]
     name = "Components must not import each other"
     type = "independence"
     modules = [
