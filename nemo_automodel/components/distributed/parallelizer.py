@@ -16,7 +16,7 @@ import importlib
 import signal
 from functools import lru_cache
 from types import FunctionType
-from typing import Callable, Dict, List, Optional, Union, Any
+from typing import Dict, List, Optional, Union, Any
 
 import torch
 from torch import Tensor, nn
@@ -222,192 +222,6 @@ def translate_to_torch_parallel_style(style: str):
         raise ValueError(f"Unknown parallel style: {style}")
 
 
-def nvfsdp_strategy_parallelize(
-    model,
-    device_mesh: DeviceMesh,
-    optimizer=None,
-    nvfsdp_unit_modules: Optional[List[str]] = None,
-    tp_shard_plan: Optional[Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]] = None,
-    data_parallel_sharding_strategy: str = "optim_grads_params",
-    init_nvfsdp_with_meta_device: bool = False,
-    grad_reduce_in_fp32: bool = False,
-    preserve_fp32_weights: bool = False,
-    overlap_grad_reduce: bool = True,
-    overlap_param_gather: bool = True,
-    check_for_nan_in_grad: bool = True,
-    average_in_collective: bool = False,
-    disable_bucketing: bool = False,
-    calculate_per_token_loss: bool = False,
-    keep_fp8_transpose_cache_when_using_custom_fsdp: bool = False,
-    nccl_ub: bool = False,
-    fsdp_double_buffer: bool = False,
-    dp_mesh_name: str = "data_parallel",
-    cp_mesh_name: str = "context_parallel",
-    tp_mesh_name: str = "tensor_parallel", 
-):
-    """
-    Apply tensor/data parallelism (nvFSDP) and optional activation-checkpointing to the model.
-
-    Args:
-        model: The model to be parallelized.
-        device_mesh (DeviceMesh): The device mesh describing the physical devices
-            used for distributed training.
-        nvfsdp_unit_modules (Optional[List[str]]): Names of sub-modules that should
-            become individual nvFSDP units. If None, the full model is wrapped as
-            a single unit.
-        tp_shard_plan (Optional[Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]]):
-            A tensor-parallel sharding plan.
-            Keys are module names; values specify the parallel style to apply
-            (e.g., RowwiseParallel, ColwiseParallel, SequenceParallel).
-        data_parallel_sharding_strategy (str): Strategy for sharding parameters,
-            gradients, and optimizer states across data-parallel ranks.
-            Valid options include "params", "grads_params", and
-            "optim_grads_params" (default).
-        init_nvfsdp_with_meta_device (bool): If True, construct the model on a
-            meta device first and materialize weights lazily to reduce memory
-            fragmentation.
-        grad_reduce_in_fp32 (bool): Reduce gradients in FP32 irrespective of the
-            parameter precision to improve numerical stability.
-        preserve_fp32_weights (bool): Keep a master FP32 copy of weights when
-            training in reduced precision (e.g., FP16/BF16).
-        overlap_grad_reduce (bool): If True, overlap gradient reduction with
-            backward computation.
-        overlap_param_gather (bool): If True, overlap parameter gathering with
-            forward computation.
-        check_for_nan_in_grad (bool): Whether to check gradients for NaNs/Infs
-            before applying the optimizer step.
-        average_in_collective (bool): Perform gradient averaging inside the
-            collective operation instead of dividing afterward.
-        disable_bucketing (bool): Disable gradient bucketing; gradients are
-            reduced immediately as they are produced.
-        calculate_per_token_loss (bool): Compute loss normalized by the number of
-            tokens instead of the number of sequences.
-        keep_fp8_transpose_cache_when_using_custom_fsdp (bool): Retain the FP8
-            transpose cache when using a custom nvFSDP wrapper.
-        nccl_ub (bool): Enable NCCL user-buffer API (experimental) for reduced
-            latency on some networks.
-        fsdp_double_buffer (bool): Enable double buffering of parameters to
-            overlap communication and computation in nvFSDP.
-        dp_mesh_name (str): Key name for the data parallel mesh in device_mesh.
-            Defaults to "data_parallel".
-        cp_mesh_name (str): Key name for the context parallel mesh in device_mesh.
-            Defaults to "context_parallel".
-        tp_mesh_name (str): Key name for the tensor parallel mesh in device_mesh.
-            Defaults to "tensor_parallel".
-
-    NOTE: The passed-in model should preferably reside on the meta device.
-    Otherwise, ensure the model fits into available GPU or CPU memory.
-
-    NOTE: The user must ensure that the provided tp_shard_plan is compatible
-    with the model architecture.
-    """
-    assert HAVE_NVFSDP, (
-        "nvFSDP is not installed, please visit \
-        https://github.com/NVIDIA-NeMo/nvFSDP for more information"
-    )
-
-    # DP_CP ranks are sharded by FSDP.
-    dp_mesh = device_mesh[dp_mesh_name]
-    cp_mesh = device_mesh[cp_mesh_name]
-    tp_mesh = device_mesh[tp_mesh_name]
-
-    if dp_mesh.size() > 1:
-        # TODO(boxiangw): remove this once HSDP is supported.
-        assert dp_mesh.ndim == 1, "Hybrid-sharding not supported"
-
-    # TP sharding.
-    if tp_mesh.size() > 1:
-        parallelize_module(model, tp_mesh, tp_shard_plan)
-
-    if cp_mesh.size() > 1:
-        dp_cp_mesh_name = "dp_cp"
-    else:
-        dp_cp_mesh_name = "data_parallel"
-
-    # Import nvFSDP unit modules specified by the user.
-    nvfsdp_unit_modules = import_classes_from_paths(nvfsdp_unit_modules)
-
-    # Wrap model with nvFSDP.
-    model, optimizer = nvfsdp_fully_shard(
-        module=model,
-        optimizer=optimizer,
-        fsdp_unit_modules=nvfsdp_unit_modules,
-        device_mesh=device_mesh,
-        dp_mesh_name=dp_mesh_name,
-        cp_mesh_name=cp_mesh_name,
-        tp_mesh_name=tp_mesh_name,
-        dp_cp_mesh_name=dp_cp_mesh_name,
-        data_parallel_sharding_strategy=data_parallel_sharding_strategy,
-        init_model_with_meta_device=init_nvfsdp_with_meta_device,
-        grad_reduce_in_fp32=grad_reduce_in_fp32,
-        preserve_fp32_weights=preserve_fp32_weights,
-        overlap_grad_reduce=overlap_grad_reduce,
-        overlap_param_gather=overlap_param_gather,
-        sync_grads_each_step=False,  # For better performance, avoid sync every step
-        check_for_nan_in_grad=check_for_nan_in_grad,
-        average_in_collective=average_in_collective,
-        disable_bucketing=disable_bucketing,
-        calculate_per_token_loss=calculate_per_token_loss,
-        keep_fp8_transpose_cache_when_using_custom_fsdp=keep_fp8_transpose_cache_when_using_custom_fsdp,
-        nccl_ub=nccl_ub,
-        fsdp_double_buffer=fsdp_double_buffer,
-    )
-
-    return model, optimizer
-
-
-def to_cpu(v):
-    """
-    Move a tensor or distributed tensor to the CPU.
-
-    This function takes an input tensor, which can be either a `DTensor` (distributed tensor)
-    or a standard `Tensor`, and ensures that it is moved to the CPU.
-
-    Args:
-        v (DTensor | Tensor | any): The input value, which can be a `DTensor`, `Tensor`, or
-                                    any other object. If `DTensor`, it checks the device and
-                                    moves the tensor accordingly.
-
-    Returns:
-        Tensor | any: The corresponding CPU tensor if `v` is a `DTensor` or `Tensor`,
-                    otherwise returns `v` unchanged.
-
-    Raises:
-        ValueError: If `v` is a `DTensor` but its device is neither 'cuda' nor 'cpu'.
-
-    Example:
-        >>> t = torch.tensor([1, 2, 3], device='cuda')
-        >>> to_cpu(t)  # Moves tensor to CPU
-        tensor([1, 2, 3])
-
-        >>> dt = DTensor(torch.tensor([4, 5, 6], device='cuda'))
-        >>> to_cpu(dt)  # Moves DTensor to CPU
-        tensor([4, 5, 6])
-    """
-    if isinstance(v, DTensor):
-        if v.device.type == "cuda":
-            return v.full_tensor().cpu()
-        elif v.device.type == "cpu":
-            return v._local_tensor
-        else:
-            raise ValueError("Unknown device " + str(v.device))
-    elif isinstance(v, Tensor):
-        return v.cpu()
-    else:
-        return v
-
-
-def _destroy_dist_connection() -> None:
-    """
-    Destroy process group.
-    """
-    # Don't allow Ctrl+C to interrupt this handler
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        torch.distributed.destroy_process_group()
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-
-
 # Taken and modified from torchtitan
 # https://github.com/pytorch/torchtitan/blob/main/torchtitan/parallelisms/parallelize_llama.py
 def fsdp2_strategy_parallelize(
@@ -593,4 +407,163 @@ def fsdp2_strategy_parallelize(
     )
 
     return model
+
+
+def nvfsdp_strategy_parallelize(
+    model,
+    device_mesh: DeviceMesh,
+    optimizer=None,
+    nvfsdp_unit_modules: Optional[List[str]] = None,
+    tp_shard_plan: Optional[Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]] = None,
+    data_parallel_sharding_strategy: str = "optim_grads_params",
+    init_nvfsdp_with_meta_device: bool = False,
+    grad_reduce_in_fp32: bool = False,
+    preserve_fp32_weights: bool = False,
+    overlap_grad_reduce: bool = True,
+    overlap_param_gather: bool = True,
+    check_for_nan_in_grad: bool = True,
+    average_in_collective: bool = False,
+    disable_bucketing: bool = False,
+    calculate_per_token_loss: bool = False,
+    keep_fp8_transpose_cache_when_using_custom_fsdp: bool = False,
+    nccl_ub: bool = False,
+    fsdp_double_buffer: bool = False,
+    dp_mesh_name: str = "data_parallel",
+    cp_mesh_name: str = "context_parallel",
+    tp_mesh_name: str = "tensor_parallel", 
+):
+    """
+    Apply tensor/data parallelism (nvFSDP) and optional activation-checkpointing to the model.
+
+    Args:
+        model: The model to be parallelized.
+        device_mesh (DeviceMesh): The device mesh describing the physical devices
+            used for distributed training.
+        nvfsdp_unit_modules (Optional[List[str]]): Names of sub-modules that should
+            become individual nvFSDP units. If None, the full model is wrapped as
+            a single unit.
+        tp_shard_plan (Optional[Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]]):
+            A tensor-parallel sharding plan.
+            Keys are module names; values specify the parallel style to apply
+            (e.g., RowwiseParallel, ColwiseParallel, SequenceParallel).
+        data_parallel_sharding_strategy (str): Strategy for sharding parameters,
+            gradients, and optimizer states across data-parallel ranks.
+            Valid options include "params", "grads_params", and
+            "optim_grads_params" (default).
+        init_nvfsdp_with_meta_device (bool): If True, construct the model on a
+            meta device first and materialize weights lazily to reduce memory
+            fragmentation.
+        grad_reduce_in_fp32 (bool): Reduce gradients in FP32 irrespective of the
+            parameter precision to improve numerical stability.
+        preserve_fp32_weights (bool): Keep a master FP32 copy of weights when
+            training in reduced precision (e.g., FP16/BF16).
+        overlap_grad_reduce (bool): If True, overlap gradient reduction with
+            backward computation.
+        overlap_param_gather (bool): If True, overlap parameter gathering with
+            forward computation.
+        check_for_nan_in_grad (bool): Whether to check gradients for NaNs/Infs
+            before applying the optimizer step.
+        average_in_collective (bool): Perform gradient averaging inside the
+            collective operation instead of dividing afterward.
+        disable_bucketing (bool): Disable gradient bucketing; gradients are
+            reduced immediately as they are produced.
+        calculate_per_token_loss (bool): Compute loss normalized by the number of
+            tokens instead of the number of sequences.
+        keep_fp8_transpose_cache_when_using_custom_fsdp (bool): Retain the FP8
+            transpose cache when using a custom nvFSDP wrapper.
+        nccl_ub (bool): Enable NCCL user-buffer API (experimental) for reduced
+            latency on some networks.
+        fsdp_double_buffer (bool): Enable double buffering of parameters to
+            overlap communication and computation in nvFSDP.
+        dp_mesh_name (str): Key name for the data parallel mesh in device_mesh.
+            Defaults to "data_parallel".
+        cp_mesh_name (str): Key name for the context parallel mesh in device_mesh.
+            Defaults to "context_parallel".
+        tp_mesh_name (str): Key name for the tensor parallel mesh in device_mesh.
+            Defaults to "tensor_parallel".
+
+    NOTE: The passed-in model should preferably reside on the meta device.
+    Otherwise, ensure the model fits into available GPU or CPU memory.
+
+    NOTE: The user must ensure that the provided tp_shard_plan is compatible
+    with the model architecture.
+    """
+    assert HAVE_NVFSDP, (
+        "nvFSDP is not installed, please visit \
+        https://github.com/NVIDIA-NeMo/nvFSDP for more information"
+    )
+
+    # DP_CP ranks are sharded by FSDP.
+    dp_mesh = device_mesh[dp_mesh_name]
+    cp_mesh = device_mesh[cp_mesh_name]
+    tp_mesh = device_mesh[tp_mesh_name]
+
+    if dp_mesh.size() > 1:
+        # TODO(boxiangw): remove this once HSDP is supported.
+        assert dp_mesh.ndim == 1, "Hybrid-sharding not supported"
+
+    # TP sharding.
+    if tp_mesh.size() > 1:
+        parallelize_module(model, tp_mesh, tp_shard_plan)
+
+    if cp_mesh.size() > 1:
+        dp_cp_mesh_name = "dp_cp"
+    else:
+        dp_cp_mesh_name = "data_parallel"
+
+    # Import nvFSDP unit modules specified by the user.
+    nvfsdp_unit_modules = import_classes_from_paths(nvfsdp_unit_modules)
+
+    # Wrap model with nvFSDP.
+    model, optimizer = nvfsdp_fully_shard(
+        module=model,
+        optimizer=optimizer,
+        fsdp_unit_modules=nvfsdp_unit_modules,
+        device_mesh=device_mesh,
+        dp_mesh_name=dp_mesh_name,
+        cp_mesh_name=cp_mesh_name,
+        tp_mesh_name=tp_mesh_name,
+        dp_cp_mesh_name=dp_cp_mesh_name,
+        data_parallel_sharding_strategy=data_parallel_sharding_strategy,
+        init_model_with_meta_device=init_nvfsdp_with_meta_device,
+        grad_reduce_in_fp32=grad_reduce_in_fp32,
+        preserve_fp32_weights=preserve_fp32_weights,
+        overlap_grad_reduce=overlap_grad_reduce,
+        overlap_param_gather=overlap_param_gather,
+        sync_grads_each_step=False,  # For better performance, avoid sync every step
+        check_for_nan_in_grad=check_for_nan_in_grad,
+        average_in_collective=average_in_collective,
+        disable_bucketing=disable_bucketing,
+        calculate_per_token_loss=calculate_per_token_loss,
+        keep_fp8_transpose_cache_when_using_custom_fsdp=keep_fp8_transpose_cache_when_using_custom_fsdp,
+        nccl_ub=nccl_ub,
+        fsdp_double_buffer=fsdp_double_buffer,
+    )
+
+    return model, optimizer
+
+
+def _destroy_dist_connection() -> None:
+    """
+    Destroy process group.
+    """
+    # Don't allow Ctrl+C to interrupt this handler
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+
+@contextmanager
+def unshard_fsdp2_model(model: nn.Module) -> Generator[None, None, None]:
+    """Explicitly unshard and then reshard the FSDP2 modules. Useful for logprob inference."""
+    try:
+        for module in model.modules():
+            if isinstance(module, FSDPModule):
+                module.unshard()
+        yield
+    finally:
+        for module in model.modules():
+            if isinstance(module, FSDPModule):
+                module.reshard()
 
