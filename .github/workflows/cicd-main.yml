@@ -53,6 +53,7 @@ jobs:
       - name: Import‑graph contract
         run: |
           pip install import-linter
+          ls -lah
           PYTHONPATH=$(pwd) lint-imports --debug --verbose
 
 
