@@ -172,14 +172,3 @@ convention = "google"
 
 [tool.ruff.lint.isort]
 known-third-party = ["datasets"]
-
-
-[importlinter]
-root_package = nemo_automodel
-exclude_type_checking_imports = true
-
-[importlinter:contract:components_independent]
-name = Components must not import each other
-type = independence
-modules =
-    nemo_automodel.components.*
