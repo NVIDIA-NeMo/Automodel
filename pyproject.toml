@@ -177,7 +177,7 @@ known-third-party = ["datasets"]
 root_package = "nemo_automodel"
 exclude_type_checking_imports = true
 
-    [[tool.importlinter.contract]]
+    [[tool.importlinter.contracts]]
     name = "Components must not import each other"
     type = "independence"
     modules = [

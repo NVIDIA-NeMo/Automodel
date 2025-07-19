@@ -126,46 +126,6 @@ class FirstRankPerNode(ContextDecorator):
         return False
 
 
-def get_rank_safe() -> int:
-    """
-    Get the distributed rank safely, even if torch.distributed is not initialized.
-
-    Returns:
-        The current process rank.
-    """
-    # In megatron init, args.rank comes from the torchrun env var.
-    # Once init has been done, args.rank is updated to value of torch get_rank()
-    if torch.distributed.is_initialized():
-        return torch.distributed.get_rank()
-    else:
-        return int(os.getenv("RANK", "0"))
-
-
-def get_world_size_safe() -> int:
-    """
-    Get the distributed world size safely, even if torch.distributed is not initialized.
-
-    Returns:
-        The total number of processes in the distributed job.
-    """
-    # In megatron init, args.world_size comes from the torchrun env var.
-    # Once init has been done, args.world_size is updated to value of torch get_world_size()
-    if torch.distributed.is_initialized():
-        return torch.distributed.get_world_size()
-    else:
-        return int(os.getenv("WORLD_SIZE", "1"))
-
-
-def get_local_rank_preinit() -> int:
-    """
-    Get the local rank from the environment variable, intended for use before full init.
-
-    Returns:
-        The local rank of the current process.
-    """
-    return int(os.getenv("LOCAL_RANK", "0"))
-
-
 def append_to_progress_log(save_dir: str, string: str, barrier: bool = True) -> None:
     """
     Append a formatted string to the progress log file (rank 0 only).
