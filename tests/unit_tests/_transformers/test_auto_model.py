@@ -31,7 +31,6 @@ from nemo_automodel import __version__
 
 class TestNeMoAutoModelForCausalLM:
     """Test cases for NeMoAutoModelForCausalLM class."""
-
     def test_from_pretrained_liger_kernel_not_available(self, caplog):
         """Test warning when Liger kernel is not available."""
         with (
@@ -215,6 +214,41 @@ class TestNeMoAutoModelForImageTextToText:
         # The final object returned by our helper is the *second* model
         assert returned is model2
 
+
+    def test_from_pretrained_sdpa_runtimeerror_triggers_reload(self):
+        """When _patch_liger_kernel raises, the loader should retry with
+        use_liger_kernel=False and return the second model instance."""
+        # first and second dummy model objects
+        model1, model2 = Mock(name="m1"), Mock(name="m2")
+        model1.config = {}
+        model2.config = {}
+
+        patch_calls = []
+        def fake__patch_attention(model, sdpa_method):
+            patch_calls.append(model)
+            raise RuntimeError("boom")
+
+        with (
+            patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", True),
+            patch("nemo_automodel.components._transformers.auto_model._patch_liger_kernel", lambda x: x),
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", fake__patch_attention),
+            patch.object(
+                transformers.AutoModelForImageTextToText,
+                "from_pretrained",
+                side_effect=[model1, model2],  # first, then retry
+            ) as mock_from_pretrained,
+        ):
+            returned = NeMoAutoModelForImageTextToText.from_pretrained("dummy_model")
+            assert returned.config["nemo_version"] == __version__
+
+
+        # _patch_liger_kernel called twice, first with ligand=True, then False
+        assert patch_calls == [model1]
+        # The underlying HF loader is also called twice
+        assert mock_from_pretrained.call_count == 2
+        # The final object returned by our helper is the *second* model
+        assert returned is model2
+
     def test_from_config_runtimeerror_triggers_reload(self):
         model1, model2 = Mock(name="m1"), Mock(name="m2")
         model1.config = {}
@@ -243,6 +277,33 @@ class TestNeMoAutoModelForImageTextToText:
         assert mock_from_config.call_count == 2
         assert returned is model2
 
+    def test_from_config_sdap_runtimeerror_triggers_reload(self):
+        model1, model2 = Mock(name="m1"), Mock(name="m2")
+        model1.config = {}
+        model2.config = {}
+
+        patch_calls = []
+
+        def fake__patch_attention(model, sdpa_method):
+            patch_calls.append(model)
+            raise RuntimeError("boom")
+
+        cfg = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
+
+        with (
+            patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", True),
+            patch("nemo_automodel.components._transformers.auto_model._patch_liger_kernel", lambda x: x),
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", fake__patch_attention),
+            patch.object(
+                transformers.AutoModelForImageTextToText, "from_config", side_effect=[model1, model2]
+            ) as mock_from_config,
+        ):
+            returned = NeMoAutoModelForImageTextToText.from_config(cfg)
+            assert returned.config["nemo_version"] == __version__
+
+        assert patch_calls == [model1]
+        assert mock_from_config.call_count == 2
+        assert returned is model2
 
 class TestPatchAttention:
     """Test cases for _patch_attention function."""
