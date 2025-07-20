@@ -16,18 +16,26 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.loss.loss_interface import LossFunction
+class MaskedCrossEntropy:
+    def __init__(self, fp32_upcast: bool = True, ignore_index: int = -100, reduction: str = "sum"):
+        """
+        Masked cross-entropy loss.
 
+        Args:
+            fp32_upcast (bool): if True it will cast logits to float32 before computing
+                cross entropy. Default: True.
+            ignore_index (int): label to ignore in CE calculation. Defaults to -100.
+            reduction (str): type of reduction. Defaults to "sum".
+        """
+        self.fp32_upcast = fp32_upcast
+        self.ignore_index = ignore_index
+        self.reduction = reduction
 
-class MaskedCrossEntropy(LossFunction):
     def __call__(
         self,
-        next_token_logits: torch.Tensor,
+        logits: torch.Tensor,
         labels: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-        fp32_upcast: bool = True,
-        ignore_index: int = -100,
-        reduction: str = "mean",
     ) -> torch.Tensor:
         """
         Compute the masked cross-entropy loss between logits and targets.
@@ -36,31 +44,27 @@ class MaskedCrossEntropy(LossFunction):
         and then averaged. If no mask is provided, the standard cross-entropy loss is used.
 
         Args:
-            next_token_logits (torch.Tensor): The predicted logits with shape [batch_size, seq_len, vocab_size] where C is the number of classes.
+            logits (torch.Tensor): The predicted logits with shape [batch_size, seq_len, vocab_size] where C is the number of classes.
             labels (torch.Tensor): The ground truth class indices with shape [batch_size, seq_len].
             mask (torch.Tensor, optional): A tensor that masks the loss computation. Items marked with
                 1 will be used to calculate loss, otherwise ignored. Must be broadcastable to the shape
                 of the loss. Defaults to None.
-            fp32_upcast (bool, optional): if True it will cast logits to float32 before computing
-            cross entropy. Default: True.
-            ignore_index (int): label to ignore in CE calculation. Defaults to -100.
-            reduction (str): type of reduction. Defaults to "mean".
 
         Returns:
             torch.Tensor: The computed loss as a scalar tensor.
         """
         # this may happen with CPUOffloadPolicy
-        if labels.device != next_token_logits.device:
-            labels = labels.to(next_token_logits.device)
+        if labels.device != logits.device:
+            labels = labels.to(logits.device)
         # reshape to (N, C) and (N,) respectively
-        next_token_logits = next_token_logits.view(-1, next_token_logits.size(-1))
+        logits = logits.view(-1, logits.size(-1))
         labels = labels.view(-1)
         if mask is not None:
             with torch.no_grad():
                 if mask.device != labels.device:
                     mask = mask.to(labels.device)
-                labels.masked_fill_(mask.view(-1) == 0, ignore_index)
+                labels.masked_fill_(mask.view(-1) == 0, self.ignore_index)
                 del mask
-        if fp32_upcast:
-            next_token_logits = next_token_logits.float()
-        return F.cross_entropy(next_token_logits, labels, reduction=reduction)
+        if self.fp32_upcast:
+            logits = logits.float()
+        return F.cross_entropy(logits, labels, reduction=self.reduction)

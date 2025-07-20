@@ -65,7 +65,6 @@ from typing import Optional
 import torch
 
 from nemo_automodel.shared.import_utils import MISSING_CUT_CROSS_ENTROPY_MSG
-from nemo_automodel.components.loss.loss_interface import LossFunction
 
 try:
     import cut_cross_entropy.tl_utils as tl_utils
@@ -115,45 +114,50 @@ if HAVE_CUT_CROSS_ENTROPY:
     tl_utils.is_triton_greater_or_equal_3_2_0 = new_is_triton_greater_or_equal_3_2_0
 
 
-class FusedLinearCrossEntropy(LossFunction):
+class FusedLinearCrossEntropy:
+    def __init__(self, ignore_index: int = -100, logit_softcapping: float = 0, reduction: str = "sum"):
+        """
+        Fused linear cross entropy loss.
+
+        Args:
+            ignore_index (int): Target value that is ignored when computing the loss. Defaults to -100.
+            logit_softcapping (float): Value for softcapping logits (0 means no capping). Defaults to 0.
+            reduction (str): Type of reduction. Defaults to "sum".
+        """
+        self.ignore_index = ignore_index
+        self.logit_softcapping = logit_softcapping
+        self.reduction = reduction
+
     def __call__(
         self,
-        next_token_logits: torch.Tensor,
+        hidden_states: torch.Tensor,
         labels: torch.Tensor,
         lm_weight: torch.Tensor,
-        num_items_in_batch: int = None,
-        ignore_index: int = -100,
-        logit_softcapping: float = 0,
-        accuracy_threshold: str = "auto",
     ) -> torch.Tensor:
         """
         Compute fused linear cross entropy loss that matches PyTorch's cross_entropy behavior.
 
         Args:
-            next_token_logits: Input hidden states
-            lm_weight: Weight matrix for linear transformation
+            hidden_states: Input hidden states
             labels: Target labels
-            num_items_in_batch: Number of valid tokens (where labels != ignore_index)
-            ignore_index: Value to ignore in labels (default: -100)
-            logit_softcapping: Value for softcapping logits (0 means no capping)
-            accuracy_threshold: Threshold for accuracy computation
+            lm_weight: Weight matrix for linear transformation
         """
         if not HAVE_CUT_CROSS_ENTROPY:
             raise ImportError(MISSING_CUT_CROSS_ENTROPY_MSG)
 
         # First compute loss with sum reduction to handle normalization ourselves
-        if logit_softcapping == 0:
-            logit_softcapping = None
+        if self.logit_softcapping == 0:
+            self.logit_softcapping = None
 
         # Compute loss with shift=False to match PyTorch behavior
         # Set filter_eps=None to avoid any token filtering
         loss = linear_cross_entropy(
-            next_token_logits,
+            hidden_states,
             lm_weight,
             targets=labels,
-            ignore_index=ignore_index,
-            softcap=logit_softcapping,
-            reduction="sum",  # Use sum reduction to handle normalization ourselves
+            ignore_index=self.ignore_index,
+            softcap=self.logit_softcapping,
+            reduction=self.reduction,  # Use sum reduction to handle normalization ourselves
             shift=False,  # Match PyTorch behavior
             filter_eps=None,  # No token filtering
         )
