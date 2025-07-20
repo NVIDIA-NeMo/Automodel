@@ -157,7 +157,7 @@ def build_loss_fn(cfg_loss):
     """Build a loss function.
 
     Args:
-        cfg_loss: Loss function configuration or a callable loss function.
+        cfg_loss: Loss function configuration.
 
     Returns:
         The instantiated loss function on the specified device.
