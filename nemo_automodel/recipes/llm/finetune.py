@@ -567,8 +567,13 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels, loss_mask)
                 with train_ctx():
                     out = self.model(**batch)
-                    local_loss = self.loss_fn(
-                        out.logits, labels, mask=loss_mask, reduction="sum"
+                    local_loss = calculate_loss(
+                        self.loss_fn,
+                        logits=out.logits,
+                        labels=labels,
+                        mask=loss_mask,
+                        model=self.model,
+                        hidden_states=out.hidden_states[-1],
                     )
 
                 total_loss += local_loss.item()
