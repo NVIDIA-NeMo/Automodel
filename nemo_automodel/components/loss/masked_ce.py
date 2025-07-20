@@ -16,6 +16,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+
 class MaskedCrossEntropy:
     def __init__(self, fp32_upcast: bool = True, ignore_index: int = -100, reduction: str = "sum"):
         """

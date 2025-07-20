@@ -16,7 +16,6 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-
 _compiled_compute_cross_entropy = None
 
 

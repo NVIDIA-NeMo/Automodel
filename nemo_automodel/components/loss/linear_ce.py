@@ -60,7 +60,6 @@
 # copyright notices and license terms - please see the file ACKNOWLEDGEMENTS.md.
 # -------------------------------------------------------------------------------
 
-from typing import Optional
 
 import torch
 

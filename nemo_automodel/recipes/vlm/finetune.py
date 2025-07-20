@@ -38,6 +38,7 @@ from nemo_automodel.components.distributed.init_utils import initialize_distribu
 from nemo_automodel.components.distributed.nvfsdp import NVFSDPManager
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.training.base_recipe import BaseRecipe
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
@@ -49,7 +50,6 @@ from nemo_automodel.components.utils.dist_utils import (
     rescale_gradients,
 )
 from nemo_automodel.components.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 
 logger = logging.getLogger(__name__)
 
@@ -236,6 +236,7 @@ def build_wandb(cfg):
     )
     return run
 
+
 def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
     """Calculate the loss.
 
@@ -258,17 +259,21 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
                 break
         if lm_head is None:
             raise ValueError("lm_head.weight not found in model")
-        loss_fn_kwargs.update({
-            "hidden_states": kwargs.pop("hidden_states"),
-            "labels": kwargs.pop("labels"),
-            "lm_weight": lm_head,
-        })
+        loss_fn_kwargs.update(
+            {
+                "hidden_states": kwargs.pop("hidden_states"),
+                "labels": kwargs.pop("labels"),
+                "lm_weight": lm_head,
+            }
+        )
     else:
-        loss_fn_kwargs.update({
-            "logits": kwargs.pop("logits"),
-            "labels": kwargs.pop("labels"),
-            "mask": kwargs.pop("mask"),
-        })
+        loss_fn_kwargs.update(
+            {
+                "logits": kwargs.pop("logits"),
+                "labels": kwargs.pop("labels"),
+                "mask": kwargs.pop("mask"),
+            }
+        )
 
     return loss_fn(**loss_fn_kwargs)
 
@@ -415,7 +420,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         with train_ctx():
             out = self.model(**batch)
             if isinstance(self.loss_fn, FusedLinearCrossEntropy) and "hidden_states" not in out:
-                raise ValueError("FusedLinearCrossEntropy requires the model to output hidden states. Set `model.output_hidden_states=True` in the config.")
+                raise ValueError(
+                    "FusedLinearCrossEntropy requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
+                )
             local_loss = calculate_loss(
                 self.loss_fn,
                 logits=out.logits,
