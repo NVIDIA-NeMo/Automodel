@@ -16,10 +16,12 @@ import functools
 import inspect
 import logging
 import types
+from typing import List, Optional, Union
 
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
+from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, PreTrainedModel
+from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
 from nemo_automodel import __version__
 from nemo_automodel.shared.import_utils import safe_import
@@ -40,7 +42,7 @@ def _assert_same_signature(original, patched):
         raise AssertionError(f"Signature mismatch:\n  original: {sig_orig}\n  patched : {sig_patch}")
 
 
-def patch_attention(obj, sdpa_method=None):
+def _patch_attention(obj, sdpa_method=None):
     """
     Wrap the `forward` method of `obj` in an `sdap_kernel` context manager.
 
@@ -81,7 +83,7 @@ def patch_attention(obj, sdpa_method=None):
     return obj
 
 
-def patch_model(model, use_liger_kernel=True, use_sdpa_patching=True, sdpa_method=None):
+def _patch_liger_kernel(model):
     """
     Patches a model with liger-kernel and sdpa_kernel
 
@@ -95,24 +97,256 @@ def patch_model(model, use_liger_kernel=True, use_sdpa_patching=True, sdpa_metho
     Returns:
         nn.Module: the patched model
     """
-    if use_liger_kernel:
-        if not HAS_LIGER_KERNEL:
-            logging.warning("Asked to use Liger Kernel, but could not import")
-        else:
-            try:
-                liger_kernel_trf._apply_liger_kernel_to_instance(model=model)
-                logging.info("Applied liger-kernel to model")
-            except Exception:
-                logging.warning("Failed to apply liger-kernels to model; falling back to eager")
-                del model
-                raise RuntimeError("Failed to patch model")
-    if use_sdpa_patching:
-        model = patch_attention(model, sdpa_method)
-    model.config.update({"nemo_version": __version__})
-    return model
+    if not HAS_LIGER_KERNEL:
+        logging.warning("Asked to use Liger Kernel, but could not import")
+        return model
+
+    try:
+        liger_kernel_trf._apply_liger_kernel_to_instance(model=model)
+        logging.info("Applied liger-kernel to model")
+        return model
+    except Exception:
+        logging.warning("Failed to apply liger-kernels to model; falling back to eager")
+        del model
+        raise RuntimeError("Failed to patch model")
 
 
-class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
+class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
+    """
+    Drop-in replacement for ``_BaseAutoModelClass`` that includes custom-kernels.
+
+    The class only overrides ``from_pretrained`` and ``from_config`` to add the
+    optional ``use_liger_kernel`` flag.  If the flag is ``True`` (default) and
+    the Liger kernel is available, the model's attention layers are
+    monkey-patched in place.  If patching fails for any reason, the call is
+    retried once with ``use_liger_kernel=False`` so that users still obtain a
+    functional model.
+
+
+    TODO(@akoumpa): extend this beyond liger_kernel.
+
+    Notes:
+    -----
+    - No changes are made to the model's public API; forward signatures,
+      generation utilities, and weight shapes remain identical.
+    - Only decoder-style (causal) architectures are currently supported by the
+      Liger patch.  Unsupported models will silently fall back.
+    """
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path,
+        *model_args,
+        use_liger_kernel: bool = True,
+        use_sdpa_patching: bool = True,
+        sdpa_method: Optional[List[SDPBackend]] = None,
+        torch_dtype="auto",
+        attn_implementation: str = "flash_attention_2",
+        **kwargs,
+    ) -> PreTrainedModel:
+        """
+        Instantiate and (optionally) patch a causal-language model.
+
+        This is a light wrapper around
+        `transformers.AutoModelForCausalLM.from_pretrained` that can
+        automatically apply Liger and/or SDPA (scaled-dot-product
+        attention) kernel optimizations.
+
+        Args:
+            pretrained_model_name_or_path (str | os.PathLike): Hugging Face
+                hub repo ID or local path accepted by
+                `AutoModelForCausalLM.from_pretrained`.
+            *model_args: Positional arguments forwarded verbatim to
+                `AutoModelForCausalLM.from_pretrained`.
+            use_liger_kernel (bool, default=True): If `True`, try to patch
+                the model with Liger kernels for faster inference/training.
+            use_sdpa_patching (bool, default=True): If `True`, patch the
+                model with SDPA-based attention optimizations.
+            sdpa_method (list[SDPBackend] | None, optional): Explicit list of
+                SDPA back-ends to consider when `use_sdpa_patching=True`.
+            torch_dtype (str | torch.dtype | Literal["auto"], default="auto"):
+                Data type passed to the underlying `from_pretrained` call.
+            attn_implementation (str, default="flash_attention_2"): Desired
+                attention implementation; forwarded to the HF config.
+            **kwargs: Additional keyword arguments forwarded verbatim to
+                `AutoModelForCausalLM.from_pretrained`.
+
+        Returns:
+            transformers.PreTrainedModel: The loaded (and possibly patched)
+            model instance.
+
+        Warns:
+            UserWarning: Emitted when `use_liger_kernel=True` but the Liger
+            package is unavailable.
+
+        Notes:
+            If kernel patching fails, the partially constructed model is
+              deleted and the method recurses once with
+              `use_liger_kernel=False` or `use_sdpa_patching=False`
+        """
+        torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
+
+        def _retry(**override):
+            """Internal helper to re-enter this function with patched args."""
+            return cls.from_pretrained(
+                pretrained_model_name_or_path,
+                *model_args,
+                torch_dtype=torch_dtype,
+                attn_implementation=override.get("attn_implementation", attn_implementation),
+                use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
+                use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
+                sdpa_method=sdpa_method,
+                **kwargs,
+            )
+
+        # load model
+        try:
+            name = cls.__name__
+            if name.startswith("NeMo"):
+                cls.__name__ = name[4:]
+            model = super().from_pretrained(
+                pretrained_model_name_or_path,
+                *model_args,
+                torch_dtype=torch_dtype,
+                attn_implementation=attn_implementation,
+                **kwargs,
+            )
+            cls.__name__ = name
+        except ValueError as e:
+            if "does not support" in str(e):
+                logging.warning("Falling back to eager attention.")
+                return _retry(attn_implementation="eager")
+            raise e
+
+        # Kernel patching
+        try:
+            if use_liger_kernel:
+                model = _patch_liger_kernel(model)
+        except RuntimeError:
+            logging.warning("Retrying without Liger kernels.")
+            return _retry(use_liger_kernel=False)
+
+        # Patch sdpa attention
+        try:
+            if use_sdpa_patching:
+                model = _patch_attention(model, sdpa_method)
+        except:
+            logging.warning("Retrying without Liger kernels.")
+            return _retry(use_sdpa_patching=False)
+
+        model.config.update({"nemo_version": __version__})
+        return model
+
+    @classmethod
+    def from_config(
+        cls,
+        config,
+        *model_args,
+        use_liger_kernel: bool = True,
+        use_sdpa_patching: bool = True,
+        sdpa_method: Optional[List[SDPBackend]] = None,
+        torch_dtype: Union[str, torch.dtype] = "auto",
+        attn_implementation: str = "flash_attention_2",
+        **kwargs,
+    ) -> PreTrainedModel:
+        """
+        Instantiate a model from a ``transformers.PretrainedConfig`` and optionally
+        patch it with Liger or SDPA-optimized kernels.
+
+        Args:
+            config (transformers.PretrainedConfig):
+                The configuration object used to build the model.
+            *model_args:
+                Positional arguments forwarded to the underlying
+                ``transformers.AutoModelForCausalLM.from_config`` call.
+            use_liger_kernel (bool, optional):
+                If ``True``, tries to patch the instantiated model with Liger
+                optimized attention kernels. Defaults to ``True``.
+            use_sdpa_patching (bool, optional):
+                If ``True``, applies in-place SDPA (Scaled-Dot-Product-Attention)
+                kernel optimizations wherever possible. Defaults to ``True``.
+            sdpa_method (Optional[List[SDPBackend]], optional):
+                One or multiple SDPA back-ends to prefer when applying SDPA
+                patching. When ``None``, the default backend resolution logic is
+                used. Defaults to ``None``.
+            torch_dtype (Union[str, torch.dtype], optional):
+                The desired data type for model initialization
+                (e.g., ``"auto"``, ``torch.float16``). Passed through to
+                ``transformers.AutoModel``. Defaults to ``"auto"``.
+            attn_implementation (str, optional):
+                Specifies which attention implementation to use (e.g.,
+                ``"flash_attention_2"``, ``"eager"``). Only applied when the
+                base model supports this kwarg. Defaults to
+                ``"flash_attention_2"``.
+            **kwargs:
+                Additional keyword arguments forwarded to the superclass
+                constructor and underlying ``from_config`` logic.
+
+        Returns:
+            transformers.PreTrainedModel: The instantiated (and possibly
+            kernel-patched) model.
+
+        Notes:
+            If kernel patching fails, the partially constructed model is
+              deleted and the method recurses once with
+              `use_liger_kernel=False` or `use_sdpa_patching=False`
+        """
+        torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
+
+        def _retry(**override):
+            """Internal helper to re-enter this function with patched args."""
+            return cls.from_config(
+                config,
+                *model_args,
+                torch_dtype=torch_dtype,
+                attn_implementation=override.get("attn_implementation", attn_implementation),
+                use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
+                use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
+                sdpa_method=sdpa_method,
+                **kwargs,
+            )
+
+        # load model
+        try:
+            name = cls.__name__
+            if name.startswith("NeMo"):
+                cls.__name__ = name[4:]
+            model = super().from_config(
+                config,
+                *model_args,
+                torch_dtype=torch_dtype,
+                attn_implementation=attn_implementation,
+                **kwargs,
+            )
+            cls.__name__ = name
+        except ValueError as e:
+            if "does not support" in str(e):
+                logging.warning("Falling back to eager attention.")
+                return _retry(attn_implementation="eager")
+            raise e
+
+        # Kernel patching
+        try:
+            if use_liger_kernel:
+                model = _patch_liger_kernel(model)
+        except RuntimeError:
+            logging.warning("Retrying without Liger kernels.")
+            return _retry(use_liger_kernel=False)
+
+        # Patch sdpa attention
+        try:
+            if use_sdpa_patching:
+                model = _patch_attention(model, sdpa_method)
+        except:
+            logging.warning("Retrying without Liger kernels.")
+            return _retry(use_sdpa_patching=False)
+
+        model.config.update({"nemo_version": __version__})
+        return model
+
+
+class NeMoAutoModelForCausalLM(_BaseNeMoAutoModelClass, AutoModelForCausalLM):
     """
     Drop-in replacement for ``transformers.AutoModelForCausalLM`` that includes custom-kernels.
 
@@ -140,114 +374,10 @@ class NeMoAutoModelForCausalLM(AutoModelForCausalLM):
     ...     "gpt2", use_liger_kernel=False)                                 # skip Liger
     """
 
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        """
-        Load a pretrained causal-language-model and (optionally) patch it with custom kernels.
-
-        Parameters
-        ----------
-        pretrained_model_name_or_path : str or os.PathLike
-            Repository ID or local path accepted by
-            ``transformers.AutoModelForCausalLM.from_pretrained``.
-        *model_args
-            Positional arguments forwarded verbatim to the superclass.
-        use_liger_kernel : bool, default True
-            Whether to attempt patching the loaded model with Liger kernels.
-        use_sdpa_patching : bool, default True
-            Whether to patch the model with SDPA kernel optimizations.
-        **kwargs
-            Keyword arguments forwarded verbatim to the superclass.
-
-        Returns:
-        -------
-        transformers.PreTrainedModel
-            The instantiated model, possibly Liger-patched.
-
-        Warnings:
-        --------
-        Emits a ``logging.warning`` if ``use_liger_kernel=True`` but the Liger
-        package is not available.
-
-        Retries
-        -------
-        If patching raises an exception, the method deletes the partially
-        constructed model and recursively reloads it once with
-        ``use_liger_kernel=False``.
-        """
-        torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
-        if torch_dtype != "auto":
-            torch_dtype = dtype_from_str(torch_dtype)
-        use_liger_kernel = kwargs.pop("use_liger_kernel", True)
-        use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
-        sdpa_method = kwargs.pop("sdpa_method", None)
-        attn_implementation = kwargs.pop("attn_implementation", "flash_attention_2")
-        model = super().from_pretrained(
-            pretrained_model_name_or_path,
-            *model_args,
-            **kwargs,
-            attn_implementation=attn_implementation,
-            torch_dtype=torch_dtype,
-        )
-        try:
-            return patch_model(model, use_liger_kernel, use_sdpa_patching, sdpa_method)
-        except RuntimeError:
-            del model
-            return cls.from_pretrained(
-                pretrained_model_name_or_path,
-                *model_args,
-                **kwargs,
-                torch_dtype=torch_dtype,
-                use_liger_kernel=False,
-                use_sdpa_patching=use_sdpa_patching,
-            )
-
-    @classmethod
-    def from_config(cls, config, **kwargs):
-        """
-        Instantiate a model from a config object and (optionally) patch it with custom kernels.
-
-        Parameters
-        ----------
-        config : transformers.PretrainedConfig
-            Configuration used to build the model.
-        use_liger_kernel : bool, default True
-            Whether to attempt patching the instantiated model with Liger
-            kernels.
-        use_sdpa_patching : bool, default True
-            Whether to patch the model with SDPA kernel optimizations.
-        **kwargs
-            Additional keyword arguments forwarded to the superclass.
-
-        Returns:
-        -------
-        transformers.PreTrainedModel
-            The instantiated model, possibly Liger-patched.
-
-        See Also:
-        --------
-        NeMoAutoModelForCausalLM.from_pretrained : Same logic for checkpoint
-        loading.
-        """
-        torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
-        if torch_dtype != "auto":
-            torch_dtype = dtype_from_str(torch_dtype)
-        use_liger_kernel = kwargs.pop("use_liger_kernel", True)
-        use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
-        sdpa_method = kwargs.pop("sdpa_method", None)
-        attn_implementation = kwargs.pop("attn_implementation", "flash_attention_2")
-        model = super().from_config(config, **kwargs, attn_implementation=attn_implementation, torch_dtype=torch_dtype)
-        try:
-            return patch_model(model, use_liger_kernel, use_sdpa_patching, sdpa_method)
-        except RuntimeError:
-            del model
-            # If patching failed, retry
-            return cls.from_config(
-                config, **kwargs, use_liger_kernel=False, torch_dtype=torch_dtype, use_sdpa_patching=use_sdpa_patching
-            )
+    pass
 
 
-class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
+class NeMoAutoModelForImageTextToText(_BaseNeMoAutoModelClass, AutoModelForImageTextToText):
     """Drop-in replacement for ``transformers.AutoModelForImageTextToText`` with custom-kernels.
 
     The class only overrides ``from_pretrained`` and ``from_config`` to add the
@@ -274,109 +404,4 @@ class NeMoAutoModelForImageTextToText(AutoModelForImageTextToText):
     ...     "Qwen/Qwen2.5-VL-3B-Instruct", use_liger_kernel=False)                            # skip Liger
     """
 
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        """
-        Load a pretrained image-text-to-text model and (optionally) patch it with custom kernels.
-
-        Parameters
-        ----------
-        pretrained_model_name_or_path : str or os.PathLike
-            Repository ID or local path accepted by
-            ``transformers.AutoModelForImageTextToText.from_pretrained``.
-        *model_args
-            Positional arguments forwarded verbatim to the superclass.
-        use_liger_kernel : bool, default True
-            Whether to attempt patching the loaded model with Liger kernels.
-        use_sdpa_patching : bool, default True
-            Whether to patch the model with SDPA kernel optimizations.
-        **kwargs
-            Keyword arguments forwarded verbatim to the superclass.
-
-        Returns:
-        -------
-        transformers.PreTrainedModel
-            The instantiated model, possibly Liger-patched.
-
-        Warnings:
-        --------
-        Emits a ``logging.warning`` if ``use_liger_kernel=True`` but the Liger
-        package is not available.
-
-        Retries
-        -------
-        If patching raises an exception, the method deletes the partially
-        constructed model and recursively reloads it once with
-        ``use_liger_kernel=False``.
-        """
-        torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
-        if torch_dtype != "auto":
-            torch_dtype = dtype_from_str(torch_dtype)
-        use_liger_kernel = kwargs.pop("use_liger_kernel", True)
-        use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
-        sdpa_method = kwargs.pop("sdpa_method", None)
-        attn_implementation = kwargs.pop("attn_implementation", "flash_attention_2")
-        model = super().from_pretrained(
-            pretrained_model_name_or_path,
-            *model_args,
-            **kwargs,
-            attn_implementation=attn_implementation,
-            torch_dtype=torch_dtype,
-        )
-        try:
-            return patch_model(model, use_liger_kernel, use_sdpa_patching, sdpa_method)
-        except RuntimeError:
-            del model
-            # If patching failed, retry
-            return cls.from_pretrained(
-                pretrained_model_name_or_path,
-                *model_args,
-                **kwargs,
-                torch_dtype=torch_dtype,
-                use_liger_kernel=False,
-                use_sdpa_patching=use_sdpa_patching,
-            )
-
-    @classmethod
-    def from_config(cls, config, **kwargs):
-        """
-        Instantiate a model from a config object and (optionally) patch it with custom kernels.
-
-        Parameters
-        ----------
-        config : transformers.PretrainedConfig
-            Configuration used to build the model.
-        use_liger_kernel : bool, default True
-            Whether to attempt patching the instantiated model with Liger
-            kernels.
-        use_sdpa_patching : bool, default True
-            Whether to patch the model with SDPA kernel optimizations.
-        **kwargs
-            Additional keyword arguments forwarded to the superclass.
-
-        Returns:
-        -------
-        transformers.PreTrainedModel
-            The instantiated model, possibly Liger-patched.
-
-        See Also:
-        --------
-        NeMoAutoModelForImageTextToText.from_pretrained : Same logic for checkpoint
-        loading.
-        """
-        torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
-        if torch_dtype != "auto":
-            torch_dtype = dtype_from_str(torch_dtype)
-        use_liger_kernel = kwargs.pop("use_liger_kernel", True)
-        use_sdpa_patching = kwargs.pop("use_sdpa_patching", True)
-        sdpa_method = kwargs.pop("sdpa_method", None)
-        attn_implementation = kwargs.pop("attn_implementation", "flash_attention_2")
-        model = super().from_config(config, **kwargs, attn_implementation=attn_implementation, torch_dtype=torch_dtype)
-        try:
-            return patch_model(model, use_liger_kernel, use_sdpa_patching, sdpa_method)
-        except RuntimeError:
-            del model
-            # If patching failed, retry
-            return cls.from_config(
-                config, **kwargs, use_liger_kernel=False, torch_dtype=torch_dtype, use_sdpa_patching=use_sdpa_patching
-            )
+    pass
