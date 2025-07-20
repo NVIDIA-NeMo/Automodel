@@ -30,66 +30,44 @@ permissions:
 
 jobs:
   pre-flight:
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.45.0
+
+  linting:
     runs-on: ubuntu-latest
-    outputs:
-      is_ci_workload: ${{ steps.is_ci_workload.outputs.main }}
-      no_fail_fast: ${{ steps.no_fail_fast.outputs.main }}
-      docs_only: ${{ steps.docs_only.outputs.main == 'true' }}
-    env:
-      TESTS_TO_RUN: ${{ inputs.test_to_run }}
-      EVENT_NAME: ${{ github.event_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Get changed files
-        id: changed-files
-        uses: step-security/changed-files@v45.0.1
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          files_yaml: |
-            doc:
-              - '**.md'
-              - docs/**
-            src:
-              - '!**.md'
-              - '!docs/**'
+          python-version: "3.10"
+      - name: Install ruff
+        run: |
+          pip install ruff
 
-      - name: Check if docs only
-        shell: bash
-        id: docs_only
+      - name: Run ruff
+        run: |
+          ruff check . --verbose
+          ruff format --check . --verbose
+
+  Nemo_Linting_Test:
+    needs: linting
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Main
         env:
-          DOCS_ONLY: ${{ steps.changed-files.outputs.doc_any_changed == 'true' && steps.changed-files.outputs.src_any_changed == 'false' }}
+          RESULTS: ${{ toJson(needs.linting) }}
         run: |
-          echo "main=$DOCS_ONLY" | tee -a "$GITHUB_OUTPUT"
+          RESULT=$(echo "$RESULTS" | jq -r '.result')
 
-      - name: Check if this is a CI workload
-        shell: bash
-        id: is_ci_workload
-        run: |
-          branch_name=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}
-
-          if [[ "$branch_name" =~ ^bump-ci-container || "$EVENT_NAME" == "schedule" ]]; then
-            is_ci_workload=true
-            echo "main=true" | tee -a "$GITHUB_OUTPUT"
+          if [[ "$RESULT" == "success" ]]; then
+            echo "All passed."
+            exit 0
           else
-            is_ci_workload=false
+            echo "Some linting domains failed."
+            exit 1
           fi
-
-          echo "main=$is_ci_workload" | tee -a "$GITHUB_OUTPUT"
-
-      - name: Check if no-fail-fast is set
-        shell: bash
-        id: no_fail_fast
-        env:
-          HAS_FAIL_FAST_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'no-fail-fast') }}
-        run: |
-          if [[ "$HAS_FAIL_FAST_LABEL" == "true" || "$EVENT_NAME" == "schedule" ]]; then
-            no_fail_fast=true
-          else
-            no_fail_fast=false
-          fi
-
-          echo "main=$no_fail_fast" | tee -a "$GITHUB_OUTPUT"
 
   cicd-wait-in-queue:
     needs: [pre-flight]
@@ -120,6 +98,13 @@ jobs:
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.script }}
     environment: nemo-ci
+    if: |
+      (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && !cancelled()
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -149,20 +134,39 @@ jobs:
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
           - script: L2_HF_Transformer_PEFT_nvfsdp
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_DCP_Checkpoint
+          - script: L2_DCP_FSDP2_Checkpoint
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_DCP_Checkpoint
+          - script: L2_HF_DCP_FSDP2_Checkpoint
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_Consolidated_Checkpoint
+          - script: L2_HF_Consolidated_FSDP2_LLM_Checkpoint
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-#          - script: L2_HF_PEFT_Triton_Checkpoint
+          - script: L2_HF_Consolidated_FSDP2_VLM_Checkpoint
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+#          - script: L2_HF_PEFT_Triton_FSDP2_Checkpoint
 #            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_PEFT_Checkpoint
+          - script: L2_HF_PEFT_FSDP2_Checkpoint
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+          - script: L2_HF_Transformer_VLM_SFT
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+          - script: L2_HF_Transformer_VLM_PEFT
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+          - script: L2_DCP_VLM_FSDP2_Checkpoint
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+          - script: L2_HF_DCP_VLM_FSDP2_Checkpoint
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+          - script: L2_HF_PEFT_VLM_FSDP2_Checkpoint
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
     needs: [cicd-unit-tests]
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.script }}
     environment: nemo-ci
+    if: |
+      (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && !cancelled()
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -280,7 +284,6 @@ jobs:
     needs: [pre-flight, Nemo_CICD_Test]
     if: |
       needs.pre-flight.outputs.test_to_run != '[]'
-      && needs.pre-flight.outputs.components_to_run != '[]'
       && needs.pre-flight.outputs.docs_only == 'false'
       && (
         success()
@@ -326,3 +329,13 @@ jobs:
           path: |
             .coverage
           include-hidden-files: true
+
+  codecov-placeholder:
+     name: codecov/patch
+     needs: [pre-flight]
+     if: needs.pre-flight.outputs.docs_only == 'true'
+     runs-on: ubuntu-latest
+     steps:
+       - name: codecov_placeholder
+         run: |
+           echo "This is a placeholder status check for when no tests are ran but the codecov status is expected"

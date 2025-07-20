@@ -14,90 +14,95 @@
 
 import logging
 import types
-import pytest
 from unittest.mock import MagicMock, Mock, patch
+
+import pytest
+import torch
 import transformers
 from transformers import AutoConfig
-import torch
-from nemo_automodel._transformers.auto_model import (
+
+from nemo_automodel.components._transformers.auto_model import (
     NeMoAutoModelForCausalLM,
     NeMoAutoModelForImageTextToText,
-    patch_attention,
-    patch_model,
+    _patch_attention,
 )
+from nemo_automodel import __version__
 
 
 class TestNeMoAutoModelForCausalLM:
     """Test cases for NeMoAutoModelForCausalLM class."""
-
     def test_from_pretrained_liger_kernel_not_available(self, caplog):
         """Test warning when Liger kernel is not available."""
-        with patch('nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL', False), \
-            patch('nemo_automodel._transformers.auto_model.patch_attention', lambda obj, sdpa_method=None: obj):
-            with patch.object(transformers.AutoModelForCausalLM, 'from_pretrained') as mock_from_pretrained:
-                mock_model = Mock()
-                mock_model.config = Mock()
-                mock_from_pretrained.return_value = mock_model
+        with (
+            patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", False),
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_from_pretrained,
+        ):
+            mock_model = MagicMock()
+            mock_model.config = {}
+            mock_from_pretrained.return_value = mock_model
 
-                # Test line 208 - warning when HAS_LIGER_KERNEL is False
-                with caplog.at_level(logging.WARNING):
-                    model = NeMoAutoModelForCausalLM.from_pretrained("gpt2")
+            # Test line 208 - warning when HAS_LIGER_KERNEL is False
+            with caplog.at_level(logging.WARNING):
+                model = NeMoAutoModelForCausalLM.from_pretrained("hf-internal-testing/tiny-random-gpt2")
+                assert model.config["nemo_version"] == __version__
 
-                assert "Asked to use Liger Kernel, but could not import" in caplog.text
-                assert model is mock_model
-                mock_from_pretrained.assert_called_once()
-
+            assert "Asked to use Liger Kernel, but could not import" in caplog.text
+            assert model is mock_model
+            assert mock_from_pretrained.call_count == 1
 
     def test_from_config_liger_kernel_not_available(self, caplog):
         """Test warning when Liger kernel is not available in from_config."""
-        with patch('nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL', False), \
-            patch('nemo_automodel._transformers.auto_model.patch_attention', lambda obj, sdpa_method=None: obj):
-            with patch.object(transformers.AutoModelForCausalLM, 'from_config') as mock_from_config:
-                mock_model = Mock()
-                mock_model.config = Mock()
-                mock_from_config.return_value = mock_model
+        with (
+            patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", False),
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch.object(transformers.AutoModelForCausalLM, "from_config") as mock_from_config,
+        ):
+            mock_model = MagicMock()
+            mock_model.config = {}
+            mock_from_config.return_value = mock_model
 
-                config = AutoConfig.from_pretrained("gpt2")
+            config = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
 
-                # Test line 297 - warning when HAS_LIGER_KERNEL is False
-                with caplog.at_level(logging.WARNING):
-                    model = NeMoAutoModelForCausalLM.from_config(config)
+            # Test line 297 - warning when HAS_LIGER_KERNEL is False
+            with caplog.at_level(logging.WARNING):
+                model = NeMoAutoModelForCausalLM.from_config(config)
+                assert model.config["nemo_version"] == __version__
 
-                assert "Asked to use Liger Kernel, but could not import" in caplog.text
-                assert model is mock_model
-                mock_from_config.assert_called_once()
+            assert "Asked to use Liger Kernel, but could not import" in caplog.text
+            assert model is mock_model
+            assert mock_from_config.call_count == 1
 
     def test_from_pretrained_runtimeerror_triggers_reload(self):
-        """When patch_model raises, the loader should retry with
+        """When _patch_liger_kernel raises, the loader should retry with
         use_liger_kernel=False and return the second model instance."""
         # first and second dummy model objects
         model1, model2 = Mock(name="m1"), Mock(name="m2")
-        model1.config = Mock()
-        model2.config = Mock()
+        model1.config = {}
+        model2.config = {}
 
-        # record every call to patch_model
+        # record every call to _patch_liger_kernel
         patch_calls = []
 
-        def fake_patch_model(model, use_liger_kernel, use_sdpa_patching, sdpa_method):
-            patch_calls.append((model, use_liger_kernel))
-            if use_liger_kernel:               # first attempt -> raise
-                raise RuntimeError("boom")
-            return model                       # second attempt succeeds
+        def fake__patch_liger_kernel(model):
+            patch_calls.append(model)
+            raise RuntimeError("boom")
 
-        with patch('nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL', True), \
-             patch('nemo_automodel._transformers.auto_model.patch_model', new=fake_patch_model), \
-             patch('nemo_automodel._transformers.auto_model.patch_attention',
-                   lambda obj, sdpa_method=None: obj), \
-             patch.object(
-                 transformers.AutoModelForCausalLM,
-                 'from_pretrained',
-                 side_effect=[model1, model2]         # first, then retry
-             ) as mock_from_pretrained:
+        with (
+            patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", True),
+            patch("nemo_automodel.components._transformers.auto_model._patch_liger_kernel", new=fake__patch_liger_kernel),
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch.object(
+                transformers.AutoModelForCausalLM,
+                "from_pretrained",
+                side_effect=[model1, model2],  # first, then retry
+            ) as mock_from_pretrained,
+        ):
+            returned = NeMoAutoModelForCausalLM.from_pretrained("hf-internal-testing/tiny-random-gpt2")
+            assert returned.config["nemo_version"] == __version__
 
-            returned = NeMoAutoModelForCausalLM.from_pretrained("gpt2")
-
-        # patch_model called twice, first with ligand=True, then False
-        assert patch_calls == [(model1, True), (model2, False)]
+        # _patch_liger_kernel called twice, first with ligand=True, then False
+        assert patch_calls == [model1]
         # The underlying HF loader is also called twice
         assert mock_from_pretrained.call_count == 2
         # The final object returned by our helper is the *second* model
@@ -105,105 +110,140 @@ class TestNeMoAutoModelForCausalLM:
 
     def test_from_config_runtimeerror_triggers_reload(self):
         model1, model2 = Mock(name="m1"), Mock(name="m2")
-        model1.config = Mock()
-        model2.config = Mock()
+        model1.config = {}
+        model2.config = {}
 
         patch_calls = []
+        def fake__patch_liger_kernel(model):
+            patch_calls.append(model)
+            raise RuntimeError("boom")
 
-        def fake_patch_model(model, use_liger_kernel, use_sdpa_patching, sdpa_method):
-            patch_calls.append((model, use_liger_kernel))
-            if use_liger_kernel:
-                raise RuntimeError("boom")
-            return model
+        cfg = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
 
-        cfg = AutoConfig.from_pretrained("gpt2")
-
-        with patch('nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL', True), \
-             patch('nemo_automodel._transformers.auto_model.patch_model', new=fake_patch_model), \
-             patch('nemo_automodel._transformers.auto_model.patch_attention',
-                   lambda obj, sdpa_method=None: obj), \
-             patch.object(
-                 transformers.AutoModelForCausalLM,
-                 'from_config',
-                 side_effect=[model1, model2]
-             ) as mock_from_config:
-
+        with (
+            patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", True),
+            patch("nemo_automodel.components._transformers.auto_model._patch_liger_kernel", new=fake__patch_liger_kernel),
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch.object(
+                transformers.AutoModelForCausalLM, "from_config", side_effect=[model1, model2]
+            ) as mock_from_config,
+        ):
             returned = NeMoAutoModelForCausalLM.from_config(cfg)
+            assert returned.config["nemo_version"] == __version__
 
-        assert patch_calls == [(model1, True), (model2, False)]
+        assert patch_calls == [model1]
         assert mock_from_config.call_count == 2
         assert returned is model2
+
 
 class TestNeMoAutoModelForImageTextToText:
     """Test cases for NeMoAutoModelForImageTextToText class."""
 
     def test_from_pretrained_liger_kernel_not_available(self, caplog):
         """Test warning when Liger kernel is not available."""
-        with patch('nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL', False), \
-            patch('nemo_automodel._transformers.auto_model.patch_attention', lambda obj, sdpa_method=None: obj):
-            with patch.object(transformers.AutoModelForImageTextToText, 'from_pretrained') as mock_from_pretrained:
-                mock_model = Mock()
-                mock_model.config = Mock()
-                mock_from_pretrained.return_value = mock_model
+        with (
+            patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", False),
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch.object(transformers.AutoModelForImageTextToText, "from_pretrained") as mock_from_pretrained,
+        ):
+            mock_model = Mock()
+            mock_model.config = {}
+            mock_from_pretrained.return_value = mock_model
 
-                # Test line 356 - warning when HAS_LIGER_KERNEL is False
-                with caplog.at_level(logging.WARNING):
-                    model = NeMoAutoModelForImageTextToText.from_pretrained("dummy_model")
+            # Test line 356 - warning when HAS_LIGER_KERNEL is False
+            with caplog.at_level(logging.WARNING):
+                model = NeMoAutoModelForImageTextToText.from_pretrained("dummy_model")
+                assert model.config["nemo_version"] == __version__
 
-                assert "Asked to use Liger Kernel, but could not import" in caplog.text
-                assert model is mock_model
-                mock_from_pretrained.assert_called_once()
+            assert "Asked to use Liger Kernel, but could not import" in caplog.text
+            assert model is mock_model
+            assert mock_from_pretrained.call_count == 1
 
     def test_from_config_liger_kernel_not_available(self, caplog):
         """Test warning when Liger kernel is not available in from_config."""
-        with patch('nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL', False), \
-            patch('nemo_automodel._transformers.auto_model.patch_attention', lambda obj, sdpa_method=None: obj):
-            with patch.object(transformers.AutoModelForImageTextToText, 'from_config') as mock_from_config:
-                mock_model = Mock()
-                mock_model.config = Mock()
-                mock_from_config.return_value = mock_model
+        with (
+            patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", False),
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch.object(transformers.AutoModelForImageTextToText, "from_config") as mock_from_config,
+        ):
+            mock_model = Mock()
+            mock_model.config = Mock()
+            mock_from_config.return_value = mock_model
 
-                config = AutoConfig.from_pretrained("gpt2")
+            config = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
 
-                # Test warning when HAS_LIGER_KERNEL is False
-                with caplog.at_level(logging.WARNING):
-                    model = NeMoAutoModelForImageTextToText.from_config(config)
+            # Test warning when HAS_LIGER_KERNEL is False
+            with caplog.at_level(logging.WARNING):
+                model = NeMoAutoModelForImageTextToText.from_config(config)
 
-                assert "Asked to use Liger Kernel, but could not import" in caplog.text
-                assert model is mock_model
-                mock_from_config.assert_called_once()
+            assert "Asked to use Liger Kernel, but could not import" in caplog.text
+            assert model is mock_model
+            assert mock_from_config.call_count == 1
 
     def test_from_pretrained_runtimeerror_triggers_reload(self):
-        """When patch_model raises, the loader should retry with
+        """When _patch_liger_kernel raises, the loader should retry with
         use_liger_kernel=False and return the second model instance."""
         # first and second dummy model objects
         model1, model2 = Mock(name="m1"), Mock(name="m2")
-        model1.config = Mock()
-        model2.config = Mock()
+        model1.config = {}
+        model2.config = {}
 
-        # record every call to patch_model
         patch_calls = []
+        def fake__patch_liger_kernel(model):
+            patch_calls.append(model)
+            raise RuntimeError("boom")
 
-        def fake_patch_model(model, use_liger_kernel, use_sdpa_patching, sdpa_method):
-            patch_calls.append((model, use_liger_kernel))
-            if use_liger_kernel:               # first attempt -> raise
-                raise RuntimeError("boom")
-            return model                       # second attempt succeeds
-
-        with patch('nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL', True), \
-             patch('nemo_automodel._transformers.auto_model.patch_model', new=fake_patch_model), \
-             patch('nemo_automodel._transformers.auto_model.patch_attention',
-                   lambda obj, sdpa_method=None: obj), \
-             patch.object(
-                 transformers.AutoModelForImageTextToText,
-                 'from_pretrained',
-                 side_effect=[model1, model2]         # first, then retry
-             ) as mock_from_pretrained:
-
+        with (
+            patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", True),
+            patch("nemo_automodel.components._transformers.auto_model._patch_liger_kernel", new=fake__patch_liger_kernel),
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch.object(
+                transformers.AutoModelForImageTextToText,
+                "from_pretrained",
+                side_effect=[model1, model2],  # first, then retry
+            ) as mock_from_pretrained,
+        ):
             returned = NeMoAutoModelForImageTextToText.from_pretrained("dummy_model")
+            assert returned.config["nemo_version"] == __version__
 
-        # patch_model called twice, first with ligand=True, then False
-        assert patch_calls == [(model1, True), (model2, False)]
+
+        # _patch_liger_kernel called twice, first with ligand=True, then False
+        assert patch_calls == [model1]
+        # The underlying HF loader is also called twice
+        assert mock_from_pretrained.call_count == 2
+        # The final object returned by our helper is the *second* model
+        assert returned is model2
+
+
+    def test_from_pretrained_sdpa_runtimeerror_triggers_reload(self):
+        """When _patch_liger_kernel raises, the loader should retry with
+        use_liger_kernel=False and return the second model instance."""
+        # first and second dummy model objects
+        model1, model2 = Mock(name="m1"), Mock(name="m2")
+        model1.config = {}
+        model2.config = {}
+
+        patch_calls = []
+        def fake__patch_attention(model, sdpa_method):
+            patch_calls.append(model)
+            raise RuntimeError("boom")
+
+        with (
+            patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", True),
+            patch("nemo_automodel.components._transformers.auto_model._patch_liger_kernel", lambda x: x),
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", fake__patch_attention),
+            patch.object(
+                transformers.AutoModelForImageTextToText,
+                "from_pretrained",
+                side_effect=[model1, model2],  # first, then retry
+            ) as mock_from_pretrained,
+        ):
+            returned = NeMoAutoModelForImageTextToText.from_pretrained("dummy_model")
+            assert returned.config["nemo_version"] == __version__
+
+
+        # _patch_liger_kernel called twice, first with ligand=True, then False
+        assert patch_calls == [model1]
         # The underlying HF loader is also called twice
         assert mock_from_pretrained.call_count == 2
         # The final object returned by our helper is the *second* model
@@ -211,40 +251,65 @@ class TestNeMoAutoModelForImageTextToText:
 
     def test_from_config_runtimeerror_triggers_reload(self):
         model1, model2 = Mock(name="m1"), Mock(name="m2")
-        model1.config = Mock()
-        model2.config = Mock()
+        model1.config = {}
+        model2.config = {}
 
         patch_calls = []
 
-        def fake_patch_model(model, use_liger_kernel, use_sdpa_patching, sdpa_method):
-            patch_calls.append((model, use_liger_kernel))
-            if use_liger_kernel:
-                raise RuntimeError("boom")
-            return model
+        def fake__patch_liger_kernel(model):
+            patch_calls.append(model)
+            raise RuntimeError("boom")
 
-        cfg = AutoConfig.from_pretrained("gpt2")
+        cfg = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
 
-        with patch('nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL', True), \
-             patch('nemo_automodel._transformers.auto_model.patch_model', new=fake_patch_model), \
-             patch('nemo_automodel._transformers.auto_model.patch_attention',
-                   lambda obj, sdpa_method=None: obj), \
-             patch.object(
-                 transformers.AutoModelForImageTextToText,
-                 'from_config',
-                 side_effect=[model1, model2]
-             ) as mock_from_config:
-
+        with (
+            patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", True),
+            patch("nemo_automodel.components._transformers.auto_model._patch_liger_kernel", new=fake__patch_liger_kernel),
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch.object(
+                transformers.AutoModelForImageTextToText, "from_config", side_effect=[model1, model2]
+            ) as mock_from_config,
+        ):
             returned = NeMoAutoModelForImageTextToText.from_config(cfg)
+            assert returned.config["nemo_version"] == __version__
 
-        assert patch_calls == [(model1, True), (model2, False)]
+        assert patch_calls == [model1]
+        assert mock_from_config.call_count == 2
+        assert returned is model2
+
+    def test_from_config_sdap_runtimeerror_triggers_reload(self):
+        model1, model2 = Mock(name="m1"), Mock(name="m2")
+        model1.config = {}
+        model2.config = {}
+
+        patch_calls = []
+
+        def fake__patch_attention(model, sdpa_method):
+            patch_calls.append(model)
+            raise RuntimeError("boom")
+
+        cfg = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
+
+        with (
+            patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", True),
+            patch("nemo_automodel.components._transformers.auto_model._patch_liger_kernel", lambda x: x),
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", fake__patch_attention),
+            patch.object(
+                transformers.AutoModelForImageTextToText, "from_config", side_effect=[model1, model2]
+            ) as mock_from_config,
+        ):
+            returned = NeMoAutoModelForImageTextToText.from_config(cfg)
+            assert returned.config["nemo_version"] == __version__
+
+        assert patch_calls == [model1]
         assert mock_from_config.call_count == 2
         assert returned is model2
 
 class TestPatchAttention:
-    """Test cases for patch_attention function."""
+    """Test cases for _patch_attention function."""
 
-    def test_patch_attention_basic(self):
-        """Test basic patch_attention functionality."""
+    def test__patch_attention_basic(self):
+        """Test basic _patch_attention functionality."""
         # Create a mock object with a forward method
         mock_obj = Mock()
         mock_forward = Mock()
@@ -254,16 +319,18 @@ class TestPatchAttention:
         mock_forward.__func__ = Mock()
         mock_forward.__self__ = mock_obj
 
-        with patch('nemo_automodel._transformers.auto_model.sdpa_kernel') as mock_sdpa_kernel:
-            with patch('nemo_automodel._transformers.auto_model._assert_same_signature'):
-                result = patch_attention(mock_obj)
+        with (
+            patch("nemo_automodel.components._transformers.auto_model.sdpa_kernel") as mock_sdpa_kernel,  # noqa: F841
+            patch("nemo_automodel.components._transformers.auto_model._assert_same_signature"),
+        ):
+            result = _patch_attention(mock_obj)
 
-                assert result is mock_obj
-                # Verify that the forward method was replaced
-                assert mock_obj.forward != mock_forward
+            assert result is mock_obj
+            # Verify that the forward method was replaced
+            assert mock_obj.forward != mock_forward
 
-    def test_patch_attention_with_custom_sdpa_method(self):
-        """Test patch_attention with custom SDPA method."""
+    def test__patch_attention_with_custom_sdpa_method(self):
+        """Test _patch_attention with custom SDPA method."""
         from torch.nn.attention import SDPBackend
 
         mock_obj = Mock()
@@ -276,13 +343,15 @@ class TestPatchAttention:
 
         custom_sdpa_method = [SDPBackend.FLASH_ATTENTION]
 
-        with patch('nemo_automodel._transformers.auto_model.sdpa_kernel') as mock_sdpa_kernel:
-            with patch('nemo_automodel._transformers.auto_model._assert_same_signature'):
-                result = patch_attention(mock_obj, custom_sdpa_method)
+        with (
+            patch("nemo_automodel.components._transformers.auto_model.sdpa_kernel") as mock_sdpa_kernel,  # noqa: F841
+            patch("nemo_automodel.components._transformers.auto_model._assert_same_signature"),
+        ):
+            result = _patch_attention(mock_obj, custom_sdpa_method)
 
-                assert result is mock_obj
-                # Verify that the forward method was replaced
-                assert mock_obj.forward != mock_forward
+            assert result is mock_obj
+            # Verify that the forward method was replaced
+            assert mock_obj.forward != mock_forward
 
 
 class TestUtilityFunctions:
@@ -290,7 +359,7 @@ class TestUtilityFunctions:
 
     def test_assert_same_signature_matching(self):
         """Test _assert_same_signature with matching signatures."""
-        from nemo_automodel._transformers.auto_model import _assert_same_signature
+        from nemo_automodel.components._transformers.auto_model import _assert_same_signature
 
         def func1(a, b, c=None):
             pass
@@ -303,7 +372,7 @@ class TestUtilityFunctions:
 
     def test_assert_same_signature_different(self):
         """Test _assert_same_signature with different signatures."""
-        from nemo_automodel._transformers.auto_model import _assert_same_signature
+        from nemo_automodel.components._transformers.auto_model import _assert_same_signature
 
         def func1(a, b, c=None):
             pass
@@ -316,22 +385,21 @@ class TestUtilityFunctions:
             _assert_same_signature(func1, func2)
 
 
-
 class DummyModel(torch.nn.Module):
     """A tiny nn.Module that behaves enough like a HF/BERT style model."""
+
     def __init__(self):
         super().__init__()
-        self.config = {}          # patch_model calls  model.config.update(...)
-        self.called = False       # turned on by fake liger kernel
+        self.config = {}  # _patch_liger_kernel calls  model.config.update(...)
+        self.called = False  # turned on by fake liger kernel
 
     def mark(self):
         self.called = True
 
-def prepare_env(monkeypatch, target_mod, *,
-                has_liger=True,
-                apply_ok=True):
+
+def prepare_env(monkeypatch, target_mod, *, has_liger=True, apply_ok=True):
     """
-    Patch every external symbol that patch_model touches.
+    Patch every external symbol that _patch_liger_kernel touches.
 
     Parameters
     ----------
@@ -354,37 +422,29 @@ def prepare_env(monkeypatch, target_mod, *,
     monkeypatch.setattr(target_mod, "liger_kernel_trf", liger_stub, raising=False)
 
     patch_attn_mock = MagicMock(side_effect=lambda *args, **kwargs: args[0])
-    monkeypatch.setattr(target_mod, "patch_attention", patch_attn_mock, raising=True)
-
-    monkeypatch.setattr(target_mod, "__version__", "unit-test-ver", raising=False)
+    monkeypatch.setattr(target_mod, "_patch_attention", patch_attn_mock, raising=True)
 
     return apply_mock, patch_attn_mock
+
 
 @pytest.mark.parametrize("use_liger,has_liger", [(True, True), (False, True)])
 def test_success_paths(monkeypatch, use_liger, has_liger):
     """
-    1. Liger available & requested  -> kernel applied, patch_attention called.
-    2. Liger *not* requested        -> kernel *not* applied, patch_attention called.
+    1. Liger available & requested  -> kernel applied, _patch_attention called.
+    2. Liger *not* requested        -> kernel *not* applied, _patch_attention called.
     """
-    import nemo_automodel._transformers.auto_model as tgt
-    apply_mock, attn_mock = prepare_env(
-        monkeypatch,
-        tgt,
-        has_liger=has_liger,
-        apply_ok=True
-    )
+    import nemo_automodel.components._transformers.auto_model as tgt
+
+    apply_mock, attn_mock = prepare_env(monkeypatch, tgt, has_liger=has_liger, apply_ok=True)
 
     model = DummyModel()
-    patched = tgt.patch_model(
-        model,
-        use_liger_kernel=use_liger,
-        use_sdpa_patching=True,
-    )
+    if use_liger:
+        patched = tgt._patch_liger_kernel(model)
+    else:
+        patched = model
 
     # Always returns same instance (unless exception path)
     assert patched is model
-    # nemo_version must be set
-    assert patched.config["nemo_version"] == "unit-test-ver"
 
     if use_liger:
         apply_mock.assert_called_once()
@@ -393,73 +453,50 @@ def test_success_paths(monkeypatch, use_liger, has_liger):
         apply_mock.assert_not_called()
         assert model.called is False
 
-    # SDPA path always taken in these tests
-    attn_mock.assert_called_once_with(model, None)
+    # SDPA not called inside _patch_liger_kernel
+    attn_mock.assert_not_called()
+
 
 
 def test_liger_not_available(monkeypatch):
     """
     Asked for Liger but HAS_LIGER_KERNEL is False.
-    Expect: return untouched model, patch_attention still invoked,
+    Expect: return untouched model, _patch_attention still invoked,
             no exceptions thrown.
     """
-    import nemo_automodel._transformers.auto_model as tgt
+    import nemo_automodel.components._transformers.auto_model as tgt
+
     apply_mock, attn_mock = prepare_env(
         monkeypatch,
         tgt,
-        has_liger=False, # unavailable
-        apply_ok=True
+        has_liger=False,  # unavailable
+        apply_ok=True,
     )
 
     model = DummyModel()
-    out = tgt.patch_model(model, use_liger_kernel=True, use_sdpa_patching=True)
+    out = tgt._patch_liger_kernel(model)
 
     # untouched instance returned
     assert out is model
     assert model.called is False
     # _apply never called, because we short-circuit when HAS_LIGER_KERNEL==False
     apply_mock.assert_not_called()
-    attn_mock.assert_called_once()
+    attn_mock.assert_not_called()
 
 
 def test_liger_apply_failure_raises(monkeypatch):
     """
-    If _apply_liger_kernel_to_instance throws, patch_model must
+    If _apply_liger_kernel_to_instance throws, _patch_liger_kernel must
     clean up and raise RuntimeError.
     """
-    import nemo_automodel._transformers.auto_model as tgt
+    import nemo_automodel.components._transformers.auto_model as tgt
+
     prepare_env(
         monkeypatch,
         tgt,
         has_liger=True,
-        apply_ok=False   # force failure
+        apply_ok=False,  # force failure
     )
 
     with pytest.raises(RuntimeError, match="Failed to patch model"):
-        tgt.patch_model(DummyModel(), use_liger_kernel=True, use_sdpa_patching=False)
-
-
-def test_dtype_from_str_raises():
-    """
-    ensure dtype_from_str raises KeyError on non-dtype input
-    """
-    import nemo_automodel._transformers.auto_model as tgt
-    with pytest.raises(KeyError):
-        tgt.dtype_from_str('abc')
-
-def test_dtype_from_str_not_raises():
-    """
-    ensure dtype_from_str not raises KeyError on non-dtype input
-    """
-    import nemo_automodel._transformers.auto_model as tgt
-    res = tgt.dtype_from_str('torch.bfloat16')
-    assert res == torch.bfloat16
-
-
-def test_dtype_from_str_bypass():
-    """
-    ensure dtype_from_str bypasses lut on non-dtype input
-    """
-    import nemo_automodel._transformers.auto_model as tgt
-    res = tgt.dtype_from_str(torch.bfloat16)
-    assert res == torch.bfloat16
+        tgt._patch_liger_kernel(DummyModel())
