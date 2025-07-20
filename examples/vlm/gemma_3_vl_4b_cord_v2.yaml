@@ -36,6 +36,7 @@ model:
   torch_dtype: torch.bfloat16
   use_liger_kernel: false
   attn_implementation: eager
+  output_hidden_states: true
 
 checkpoint:
   enabled: true
@@ -50,7 +51,8 @@ distributed:
   cp_size: 1
   sequence_parallel: false
 
-loss_fn: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset
