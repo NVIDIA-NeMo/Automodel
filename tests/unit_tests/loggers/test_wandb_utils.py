@@ -75,7 +75,7 @@ def test_suppress_wandb_log_messages(monkeypatch):
     import wandb.sdk.internal.file_pusher as fp
     import wandb.sdk.internal.run as run_mod
 
-    import nemo_automodel.loggers.wandb_utils as suppress_wandb
+    import nemo_automodel.components.loggers.wandb_utils as suppress_wandb
 
     assert fp._footer_alpha() == "alpha"
     assert fp._footer_bravo() == "bravo"

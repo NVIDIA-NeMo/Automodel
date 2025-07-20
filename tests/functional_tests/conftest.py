@@ -37,6 +37,16 @@ _OVERRIDES = [
     "peft.dim",
     "peft.alpha",
     "peft.use_triton",
+    "peft._target_",
+    "distributed._target_",
+    "distributed.dp_size",
+    "distributed.tp_size",
+    "distributed.cp_size",
+    "distributed.sequence_parallel",
+    "dataset._target_",
+    "dataset.path_or_dataset",
+    "validation_dataset.path_or_dataset",
+    "validation_dataset.limit_dataset_samples",
 ]
 
 
