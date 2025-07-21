@@ -14,23 +14,21 @@ NeMo AutoModel supports various data-parallel and model-parallel deep learning w
 <!-- | **Pipeline**       | Model layers        | High           | High               | Models with many layers           | -->
 <!-- | **Expert**         | MoE experts only    | Medium         | Low                | Mixture-of-Experts models         | -->
 
-## Complete example
-The following YAML config shows how to enable various parallelism techniques:
-```yaml
-distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager   # uses FSDP2
-  dp_size: 8
-  tp_size: 2  # uses tensor-parallel = 2
-  cp_size: 4  # uses context-parallel = 2
-  sequence_parallel: true  # enables sequence parallelism
-```
 
-## Data Parallelism
+
+## Data Distributed Parallelism (DDP)
 
 DDP replicates the model across multiple GPUs while distributing batches evenly. Each GPU processes its portion independently, with gradients synchronized before parameter updates. This method:
 
 * Requires all-reduce communication for gradient synchronization
 * Works best when models fit comfortably in GPU memory
+
+### Complete example
+The following YAML config shows how to enable DDP:
+```yaml
+distributed:
+  _target_: nemo_automodel.components.distributed.ddp.DDPManager   # uses DDP
+```
 
 ## Fully-Sharded Data Parallel (FSDP2)
 FSDP2 is an advanced memory-optimized approach that shards all model components
@@ -50,7 +48,16 @@ To configure FSDP2:
 
 * Enable cpu_offload if needed
 
-
+### Complete example
+The following YAML config shows how to enable various parallelism techniques with FSDP2:
+```yaml
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager   # uses FSDP2
+  dp_size: 8
+  tp_size: 2  # uses tensor-parallel = 2
+  cp_size: 4  # uses context-parallel = 2
+  sequence_parallel: true  # enables sequence parallelism
+```
 
 <!-- 
 ### Distributed Data Parallelism
