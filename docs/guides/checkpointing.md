@@ -38,7 +38,7 @@ checkpoint:
 To ensure seamless integration with the Hugging Face ecosystem, NeMo Automodel saves checkpoints in the [Safetensors](https://github.com/huggingface/safetensors) format. Safetensors is a memory-safe, zero-copy alternative to Python's pickle (Pytorch .bin), natively supported by Hugging Face Transformers, offering both safety and performance advantages over Python pickle-based approaches.
 
 ### Key Benefits:
-- **Native Hugging Face Compatibility**: Checkpoints can be loaded directly into Hugging Face-compatible tools (e.g., vLLM, SGLang, etc).
+- **Native Hugging Face Compatibility**: Checkpoints can be loaded directly into Hugging Face-compatible tools, including vLLM, SGLang, and others.
 - **Memory Safety & Speed**: Safetensors format prohibits saving serialized python code and leverages zero-copying for speed.
 - **Optional Consolidation**: Sharded checkpoints can be merged into a standard Hugging Face model format for easier downstream use.
 
