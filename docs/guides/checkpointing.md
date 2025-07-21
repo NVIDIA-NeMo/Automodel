@@ -114,7 +114,7 @@ When training with Parameter-Efficient Fine-Tuning (PEFT) techniques, only a sma
 ### Why Consolidated Checkpoints?
 Because the PEFT state is so lightweight, sharded checkpointing adds unnecessary overhead. Instead, NeMo Automodel automatically saves a single, consolidated Hugging Face–compatible checkpoint when using PEFT. This makes it:
 
-- Easier to manage and share (just the adapters),
+- easier to manage and share (just the adapters),
 - Compatible with 🤗 Transformers out of the box,
 - Ideal for deployment and downstream evaluation.
 
