@@ -42,7 +42,7 @@ Label: 0  # First ending is correct
 NeMo Automodel provides the `SFTSingleTurnPreprocessor` class to handle completion datasets. This processor:
 
 1. **Extracts context and target** using `get_context()` and `get_target()`.
-2. **Tokenizes and cleans** context and target separately
+2. **Tokenizes and cleans** context and target separately.
 3. **Concatenates** them into one sequence
 4. **Creates loss mask**: `-100` for context, target IDs for target
 5. **Pads** sequences to equal length.
