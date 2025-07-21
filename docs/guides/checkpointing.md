@@ -174,7 +174,7 @@ uv run torchrun --nproc-per-node=2 examples/llm/finetune.py --step_scheduler.ckp
 > Saving checkpoint to checkpoints/epoch_0_step_20
 ...
 ```
-After 20 steps, the following checkpoint will be saved
+After 20 steps, the following checkpoint will be saved:
 
 ```
 checkpoints/
