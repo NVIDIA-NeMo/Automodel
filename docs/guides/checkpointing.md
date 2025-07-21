@@ -6,7 +6,7 @@ During machine-learning experiments, the model-training routine regularly saves 
 
 NeMo AutoModel checkpoints capture the complete state of a distributed training run across multiple GPUs or nodes. This reduces memory overhead, improves GPU utilization, and allows training to be resumed with a different parallelism strategy.
 
-NeMo AutoModel writes checkpoints in two formats ([🤗 Safetensors](https://github.com/huggingface/safetensors) and [PyTorch Distributed Checkpointing (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html)) and in two layouts:
+NeMo AutoModel writes checkpoints in two formats: [Hugging Face Safetensors](https://github.com/huggingface/safetensors) and [PyTorch Distributed Checkpointing (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html). It also supports two layouts:
 
 - **Consolidated** checkpoints: the complete model state is saved as a 🤗-compatible bundle, often a single file, or a small set of files and an index. Because no tensor is split across GPUs (unsharded), downstream tools like HuggingFace, vLLM, and SGLang can load it directly.
 
