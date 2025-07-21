@@ -13,7 +13,7 @@ to upgrade to the latest NeMo Automodel with:
 
    pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/Automodel.git
 
-For other installation options (e.g., uv) please see our [installation guide]([a link](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/installation.md)
+For other installation options (e.g., uv) please see our [installation guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/installation.md).
 
 ## Supported Models
 NeMo AutoModel interoperates with most LLMs available on the Hugging Face Hub.
