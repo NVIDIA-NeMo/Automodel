@@ -52,7 +52,7 @@ uv run torchrun --nproc-per-node=2 examples/llm/finetune.py --step_scheduler.ckp
 ```
 
 :::{tip}
-If you're running on a single GPU, you can run
+If you're running on a single GPU, you can run:
 ```
 uv run examples/llm/finetune.py --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors --checkpoint.save_consolidated True
 ```
