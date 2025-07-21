@@ -11,7 +11,7 @@ This guide shows you how to bring your own dataset into NeMo Automodel for train
 
 ## Types of Supported Datasets
 
-NeMo Automodel supports a variety of datasets depending on the task.
+NeMo Automodel supports a variety of datasets, depending on the task.
 ### Completion Datasets
 
 **Completion datasets** are single text sequences designed for language modeling where the model learns to predict the next token given a context. These datasets typically contain a context (prompt) and a target (completion) that the model should learn to generate.
