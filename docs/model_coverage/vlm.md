@@ -22,7 +22,8 @@ For other installation options (e.g., uv) please see our [installation guide](ht
 ## Supported Models
 
 
-While most VLM models from Hugging Face are compatible with NeMo AutoModel, we have specifically tested the following models (e.g., Gemma 3, Qwen 2, etc.) for convergence with the datasets mentioned above. You can find the script for running these models in the `NeMo repository <https://github.com/NVIDIA/NeMo/blob/main/scripts/vlm/automodel.py>`__.
+The following VLM models from Hugging Face have been tested and support both Supervised Fine-Tuning (SFT) and Parameter-Efficient Fine-Tuning (PEFT) with LoRA:
+
 
 | Model                              | Dataset                     | FSDP2      | PEFT       |
 |------------------------------------|-----------------------------|------------|------------|
