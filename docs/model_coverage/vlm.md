@@ -6,8 +6,6 @@ Vision Language Models (VLMs) are advanced models that integrate vision and lang
 
 NeMo AutoModel LLM APIs can be easily extended to support VLM tasks. While most of the training setup is the same, some additional steps are required to prepare the data and model for VLM training.
 
-In this guide, we will walk through the data preparation steps for two datasets and also provide a table of scripts and configurations that have been tested with NeMo AutoModel. The code for both the datasets is available in `Nemo Repository <https://github.com/NVIDIA/NeMo/blob/main/scripts/vlm/automodel_datasets.py>`__.
-
 ## Run LLMs with NeMo Automodel
 
 To run LLMs with NeMo AutoModel, please use at least version `25.07` of the NeMo container.
@@ -19,7 +17,7 @@ to upgrade to the latest NeMo Automodel with:
    pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/Automodel.git
 ```
 
-For other installation options (e.g., uv) please see our [installation guide]([a link](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/installation.md)
+For other installation options (e.g., uv) please see our [installation guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/installation.md).
 
 ## Supported Models
 
