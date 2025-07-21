@@ -222,7 +222,7 @@ Instead of padding each sequence to a fixed length (wasting computation on `[PAD
 - Separate sequences with special tokens (e.g., `[EOS]`).
 - Track lengths via a "attention mask" to prevent cross-sequence information leakage.
 
-### Benefits:
+### Benefits
 - Reduces redundant computation on padding tokens leading to faster training.
 - Enables larger effective batch sizes leading to better GPU utilization.
 - Especially useful for language modeling and text datasets.
