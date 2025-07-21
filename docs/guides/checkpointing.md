@@ -118,7 +118,7 @@ Because the PEFT state is so lightweight, sharded checkpointing adds unnecessary
 - compatible with Hugging Face Transformers out of the box,
 - ideal for deployment and downstream evaluation.
 
-### Example: PEFT finetuning on 2 GPUs
+### Example: PEFT Fine-Tuning on Two GPUs
 
 To fine-tune a model using PEFT and save a Hugging Face–ready checkpoint:
 ```
