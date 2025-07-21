@@ -179,7 +179,7 @@ For more detailed examples of how to process multi-modal datasets for VLMs, see 
 
 NeMo Automodel provides specialized collate functions for different VLM processors. The collate function is responsible for batching examples and preparing them for model input.
 
-Multi-modal models require custom collate functions to batch and process each sample correctly. If your model uses a HuggingFace `AutoProcessor`, you can use it directly. Otherwise, you can define your own collate logic and point to it in your YAML config. We provide [example custom collate functions](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/vlm/collate_fns.py) that you can use as references for your implementation. After you implement your own collate function, you can specify it in your YAML config.
+Multi-modal models require custom collate functions to batch and process each sample correctly. If your model uses a Hugging Face `AutoProcessor`, you can use it directly. Otherwise, you can define your own collate logic and point to it in your YAML config. We provide [example custom collate functions](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/vlm/collate_fns.py) that you can use as references for your implementation. After you implement your own collate function, you can specify it in your YAML config.
 
 
 ## YAML-based Custom Dataset Configuration
