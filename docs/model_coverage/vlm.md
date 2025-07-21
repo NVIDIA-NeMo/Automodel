@@ -46,7 +46,7 @@ The rdr items dataset [`quintend/rdr-items`](https://huggingface.co/datasets/qui
 ### cord-v2 dataset
 The cord-v2 dataset [`naver-clova-ix/cord-v2`](https://huggingface.co/naver-clova-ix/cord-v2) contains receipts with descriptions in JSON format. This demonstrates handling structured data in VLMs. The [Gemma Fine-Tuning Guide](guides/omni/gemma3-3n.md) provides detailed examples of custom preprocessing and collate functions for similar datasets.
 
-## Training VLM models
+## Train VLM Models
 All supported models can be fine-tuned using either full SFT or PEFT approaches. The [Gemma Fine-Tuning Guide](guides/omni/gemma3-3n.md) provides complete instructions for:
 * Configuring YAML-based training
 * Running single-GPU and multi-GPU training
