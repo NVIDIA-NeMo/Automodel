@@ -29,7 +29,7 @@ checkpoint:
     save_consolidated: true # Change to false if you want to save sharded checkpoints.
     ...
 ```
-> **Note:** We recommend using the above checkpoint configuration for maximum compatibility with the HF ecosystem (e.g., downstream tools vLLM, SGLang, etc).
+> **Note:** For optimal compatibility with the Hugging Face ecosystem, including downstream tools such as vLLM and SGLang, we recommend using the checkpoint configuration provided above.
 
 > **Note:** The optimizer states are _always_ saved in DCP (`.distcp` extension) format.
 
