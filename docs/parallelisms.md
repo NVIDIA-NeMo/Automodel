@@ -9,10 +9,10 @@ NeMo AutoModel supports various data-parallel and model-parallel deep learning w
 | **DDP**            | Entire model        | Low            | Moderate           | Small to medium models            |
 | **FSDP2**          | Entire model        | High           | High               | Large memory-constrained models   |
 | **Tensor**         | Layer parameters    | High           | Moderate           | Memory-intensive layers           |
-<!-- | **Pipeline**       | Model layers        | High           | High               | Models with many layers           | -->
-<!-- | **Expert**         | MoE experts only    | Medium         | Low                | Mixture-of-Experts models         | -->
 | **Sequence**       | Activations         | High           | Moderate           | Long sequence lengths             |
 | **Context**        | All activations     | Highest        | High               | Extreme sequence length scenarios |
+<!-- | **Pipeline**       | Model layers        | High           | High               | Models with many layers           | -->
+<!-- | **Expert**         | MoE experts only    | Medium         | Low                | Mixture-of-Experts models         | -->
 
 
 ## Data Parallelism
