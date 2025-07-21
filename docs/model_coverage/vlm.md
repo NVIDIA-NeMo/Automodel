@@ -51,4 +51,4 @@ All supported models can be fine-tuned using either full SFT or PEFT approaches.
 * Configuring YAML-based training
 * Running single-GPU and multi-GPU training.
 * Setting up parameter-efficient fine-tuning with LoRA
-* Model checkpointing and W&B integration
+* Model checkpointing and W&B integration.
