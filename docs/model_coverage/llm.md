@@ -115,15 +115,15 @@ This structure makes SQuAD ideal for training context-based question answering m
 To fine-tune any of the supported models:
 
 1. Choose your approach:
-* For parameter-efficient tuning: Follow the [PEFT Guide](guides/llm/peft.md)
-* For full model tuning: Follow the [SFT Guide](guides/llm/sft.md)
+  * For parameter-efficient tuning: Follow the [PEFT Guide](guides/llm/peft.md)
+  * For full model tuning: Follow the [SFT Guide](guides/llm/sft.md)
 
 2. Key steps in both guides:
-* Model and dataset configuration
-* Training recipe setup
-* Inference with fine-tuned models
-* Model sharing via Hugging Face Hub
-* Deployment with vLLM
+  * Model and dataset configuration
+  * Training recipe setup
+  * Inference with fine-tuned models
+  * Model sharing via Hugging Face Hub
+  * Deployment with vLLM
 
 3. Example launch commands:
 
@@ -136,7 +136,7 @@ automodel finetune llm -c sft_guide.yaml
 ```
 
 Both guides provide complete YAML configuration examples and explain how to:
-* Customize training parameters
-* Monitor progress
-* Save and share checkpoints
-* Deploy the finetuned model with optimized inference
+  * Customize training parameters
+  * Monitor progress
+  * Save and share checkpoints
+  * Deploy the finetuned model with optimized inference
