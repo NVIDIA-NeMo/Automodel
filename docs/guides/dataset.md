@@ -228,7 +228,7 @@ Instead of padding each sequence to a fixed length (wasting computation on `[PAD
 - Especially useful for language modeling and text datasets.
 
 
-### Enabling Packed Sequences in NeMo Automodel:
+### Enable Packed Sequences in NeMo Automodel
 
 To enable packed sequences, add these keys to your recipe's YAML config:
 ```
