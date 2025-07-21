@@ -109,8 +109,8 @@ This structure makes SQuAD ideal for training context-based question answering m
 To fine-tune any of the supported models:
 
 1. Choose your approach:
-  * For parameter-efficient tuning: Follow the [PEFT Guide](guides/llm/peft.md)
-  * For full model tuning: Follow the [SFT Guide](guides/llm/sft.md)
+   * For parameter-efficient tuning: Follow the [PEFT Guide](guides/llm/peft.md)
+   * For full model tuning: Follow the [SFT Guide](guides/llm/sft.md)
 
 2. Key steps in both guides:
   * Model and dataset configuration
