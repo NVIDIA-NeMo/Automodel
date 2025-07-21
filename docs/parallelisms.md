@@ -150,9 +150,9 @@ When configuring parallel strategies in NeMo AutoModel:
 
 1. Start with data parallelism (DDP or FSDP2) for basic scaling
 2. Add tensor parallelism for memory-intensive models
-3. Use pipeline parallelism for models with many layers
-4. Consider activation partitioning techniques for large sequences
-5. For MoE models, configure expert parallelism appropriately
+3. Consider activation partitioning techniques for large sequences
+<!-- 4. Use pipeline parallelism for models with many layers -->
+<!-- 5. For MoE models, configure expert parallelism appropriately -->
 
 The optimal configuration depends on your specific model architecture, hardware setup, and performance requirements. NeMo AutoModel provides flexible configuration options to tune these parameters for your use case.
 
