@@ -39,7 +39,7 @@ To ensure seamless integration with the Hugging Face ecosystem, NeMo Automodel s
 
 ### Key Benefits:
 - **Native Hugging Face Compatibility**: Checkpoints can be loaded directly into Hugging Face-compatible tools, including vLLM, SGLang, and others.
-- **Memory Safety & Speed**: Safetensors format prohibits saving serialized python code and leverages zero-copying for speed.
+- **Memory Safety and Speed**: The Safetensors format prohibits saving serialized Python code, ensuring memory safety, and supports zero-copy loading for improved performance.
 - **Optional Consolidation**: Sharded checkpoints can be merged into a standard Hugging Face model format for easier downstream use.
 
 **Most importantly**, the added advantage of this format is that we can optionally consolidate the various shards into a full HuggingFace format model.
