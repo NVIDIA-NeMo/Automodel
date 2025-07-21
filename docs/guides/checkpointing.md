@@ -190,7 +190,7 @@ checkpoints/
         ...
 ```
 
-If you run the same script again, NeMo AutoModel will automatically find and load the latest checkpoint back in
+If you rerun the script, NeMo AutoModel automatically detects and restores the most recent checkpoint.
 ```bash
 uv run torchrun --nproc-per-node=2 examples/llm/finetune.py --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format torch_save
 
