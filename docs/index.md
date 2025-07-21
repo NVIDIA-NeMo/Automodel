@@ -13,6 +13,14 @@ environment/cluster.md
 -->
 
 ```{toctree}
+:caption: Model Coverage
+:hidden:
+
+model_coverage/llm.rst
+model_coverage/vlm.rst
+```
+
+```{toctree}
 :caption: 🚀 E2E Examples
 :hidden:
 
