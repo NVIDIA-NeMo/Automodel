@@ -14,9 +14,10 @@ To run LLMs with NeMo AutoModel, please use at least version `25.07` of the NeMo
 If the model you want to finetune is available on a newer version of transformers, you may need
 to upgrade to the latest NeMo Automodel with:
 
-.. code-block:: bash
+```bash
 
    pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/Automodel.git
+```
 
 For other installation options (e.g., uv) please see our [installation guide]([a link](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/installation.md)
 
@@ -36,7 +37,7 @@ While most VLM models from Hugging Face are compatible with NeMo AutoModel, we h
 
 The `rdr items dataset <https://huggingface.co/datasets/quintend/rdr-items>`__ is a small dataset containing 48 images with descriptions. To make sure the data is in correct format, we apply a collate function with user instructions to describe the image.
 
-.. code-block:: python
+```python
 
         def collate_fn(examples, processor):
             def fmt(sample):
@@ -69,16 +70,16 @@ The `rdr items dataset <https://huggingface.co/datasets/quintend/rdr-items>`__ i
             labels[torch.isin(labels, skipped_tokens)] = -100
             batch["labels"] = labels
             return batch
-
+```
 This code block ensures that the images are processed correctly, and the text is tokenized along with the chat template.
 
 
 ## cord-v2 dataset
 
-The `cord-v2 dataset <https://huggingface.co/datasets/naver-clova-ix/cord-v2>`__ is a dataset containing receipts with descriptions in JSON format. 
+The `cord-v2 dataset <https://huggingface.co/datasets/naver-clova-ix/cord-v2>`__ is a dataset containing receipts with descriptions in JSON format.
 To ensure the data is in the correct format, we apply the following function to convert the input JSON to text tokens.
 
-.. code-block:: python
+```python3
 
     def json2token(obj, sort_json_key: bool = True):
         """
@@ -107,10 +108,11 @@ To ensure the data is in the correct format, we apply the following function to 
         else:
             obj = str(obj)
             return obj
+```
 
 Below is an example input and output of the above function:
 
-.. code-block:: python
+```python
 
     input:
 
@@ -119,12 +121,12 @@ Below is an example input and output of the above function:
     output:
 
     <s_total><s_total_price>1,591,600</s_total_price></s_total><s_sub_total><s_tax_price>144,695</s_tax_price><s_subtotal_price>1,346,000</s_subtotal_price><s_service_price>100,950</s_service_price><s_etc>-45</s_etc></s_sub_total><s_menu><s_price>75,000</s_price><s_nm>Nasi Campur Bali</s_nm><s_cnt>1 x</s_cnt><sep/><s_price>44,000</s_price><s_nm>Bebek Street</s_nm><s_cnt>1 x</s_cnt></s_menu>
-
+```
 
 
 We then apply the chat template to these text tokens along with images, and convert them to model tokens using a processor. While we do not add these special tokens to the tokenizer, it is possible to do so.
 
-.. code-block:: python
+```python
 
         def train_collate_fn(examples, processor):
             processed_examples = []
@@ -175,19 +177,19 @@ We then apply the chat template to these text tokens along with images, and conv
             labels[torch.isin(labels, skipped_tokens)] = -100
             batch["labels"] = labels
             return batch
-
+```
 
 ## Train the Model
 
 To train the model, we use the NeMo Fine-tuning API. The full script for training is available in `Nemo VLM Automodel <https://github.com/NVIDIA/NeMo/blob/main/scripts/vlm/automodel.py>`_.
 
 You can directly run the fine-tuning script using the following command:
-.. code-block:: bash
+```bash
     python scripts/vlm/automodel.py --model google/gemma-3-4b-it --data_path naver-clova-ix/cord-v2
 
 At the core of the fine-tuning script is the `llm.finetune` function defined below:
 
-.. code-block:: python
+```python
 
     llm.finetune(
         model=model,
@@ -216,3 +218,4 @@ At the core of the fine-tuning script is the `llm.finetune` function defined bel
         # Peft can be lora or none
         peft=peft,
     )
+```

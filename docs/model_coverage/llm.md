@@ -112,7 +112,9 @@ This structure is ideal for training models in context-based question answering,
 To train the model, we use the NeMo Fine-tuning API. The full script for training is available in `Nemo VLM Automodel <https://github.com/NVIDIA/NeMo/blob/main/scripts/vlm/automodel.py>`_.
 
 You can directly run the fine-tuning script using the following command:
-.. code-block:: bash
+
+```python3
     python scripts/vlm/automodel.py --model google/gemma-3-4b-it --data_path naver-clova-ix/cord-v2
+```
 
 At the core of the fine-tuning script is the `llm.finetune` function defined below:
