@@ -248,4 +248,4 @@ class NewState:
         self.another_value = state_dict["<another state you're tracking>"]
 ```
 
-Then inside the recipe, you can define it using `self.new_state = NewState(...)`.
+Inside your recipe class, define the new state as an instance attribute using `self.new_state = NewState(...)`.
