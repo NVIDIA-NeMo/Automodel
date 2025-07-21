@@ -8,7 +8,7 @@ NeMo AutoModel checkpoints capture the complete state of a distributed training 
 
 NeMo AutoModel writes checkpoints in two formats: [Hugging Face Safetensors](https://github.com/huggingface/safetensors) and [PyTorch Distributed Checkpointing (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html). It also supports two layouts:
 
-- **Consolidated** checkpoints: the complete model state is saved as a 🤗-compatible bundle, often a single file, or a small set of files and an index. Because no tensor is split across GPUs (unsharded), downstream tools like HuggingFace, vLLM, and SGLang can load it directly.
+- **Consolidated Checkpoints**: The complete model state is saved as a Hugging Face-compatible bundle, typically in a single file or a compact set of files with an index. Because tensors are not split across GPUs (unsharded), tools like Hugging Face, vLLM, and SGLang can load these checkpoints directly.
 
 - **Sharded** checkpoints: During distributed training with parameter sharing, typically each GPU holds a subset of the full state (e.g., model weights, optimizer states, and so on), also referred to as a "shard". During checkpointing each GPU saves its own shard of the full state, without reconstructing the full state.
 
