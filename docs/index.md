@@ -16,7 +16,7 @@ environment/cluster.md
 :caption: Model Coverage
 :hidden:
 
-model_coverage/llm.rst
+model_coverage/llm.md
 model_coverage/vlm.rst
 ```
 
