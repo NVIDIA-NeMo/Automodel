@@ -243,7 +243,7 @@ The `packed_sequence` has two options:
 - **split_across_pack**: If two will split a sequence across different packed sequences.
 
 
-## 🔧 Troubleshooting Tips
+## Troubleshooting Tips
 
 - **Tokenization Mismatch?** Ensure your tokenizer aligns with the model's expected inputs.
 - **Dataset too large?** Use `limit_dataset_samples` in your YAML config to load a subset, useful for quick debugging.
