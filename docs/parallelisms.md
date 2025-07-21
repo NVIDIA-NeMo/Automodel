@@ -91,6 +91,7 @@ Tensor Parallelism (TP) distributes parameter tensors of individual layers acros
 #### Enable Tensor Parallelism
 
 Configure the `tp_size` parameter in your model configuration. Set this to greater than 1 to enable intra-layer model parallelism.
+In the yaml file, under the `distributed` section:
 ```yaml
 distributed:
    tp_size: N
@@ -136,7 +137,7 @@ Context Parallelism (CP) partitions input tensors in the sequence dimension acro
 
 #### Enable Context Parallelism
 
-Set `cp_size` to a value greater than 1 to distribute sequence activations.
+Set `cp_size` to a value greater than 1 to distribute sequence activations. In the yaml file, under the `distributed` section:
 ```yaml
 distributed:
    cp_size: N
