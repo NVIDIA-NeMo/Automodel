@@ -144,7 +144,7 @@ checkpoints/
     ...
 ```
 
-The example below showcases the direct compatibility of NeMo AutoModel with HuggingFace and PEFT
+The example below showcases the direct compatibility of NeMo AutoModel with Hugging Face and PEFT:
 ```python
 from peft import AutoPeftModelForCausalLM
 from transformers import AutoTokenizer
