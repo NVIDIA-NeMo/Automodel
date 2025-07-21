@@ -14,9 +14,10 @@
 
 import importlib
 import signal
+from contextlib import contextmanager
 from functools import lru_cache
 from types import FunctionType
-from typing import Dict, List, Optional, Union, Any
+from typing import Dict, Generator, List, Optional, Union, Any
 
 import torch
 from torch import Tensor, nn
@@ -25,8 +26,13 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
+from torch.distributed.fsdp import (
+    fully_shard,
+    CPUOffloadPolicy,
+    FSDPModule,
+    MixedPrecisionPolicy,
+)
 from torch.distributed.device_mesh import DeviceMesh, _mesh_resources
-from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     ParallelStyle,
