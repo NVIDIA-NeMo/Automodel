@@ -105,7 +105,7 @@ Sample data format:
 ```
 This structure makes SQuAD ideal for training context-based question answering models. Both our PEFT and SFT guides use SQuAD v1.1 as an example, but you can substitute your own dataset as needed.
 
-### Getting Started with Fine-Tuning
+### Get Started with Fine-Tuning
 To fine-tune any of the supported models:
 
 1. Choose your approach:
