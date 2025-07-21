@@ -230,7 +230,7 @@ Instead of padding each sequence to a fixed length (wasting computation on `[PAD
 
 ### Enabling Packed Sequences in NeMo Automodel:
 
-Add these keys to your recipe's YAML config:
+To enable packed sequences, add these keys to your recipe's YAML config:
 ```
 packed_sequence:
    # Set packed_sequence_size > 0 to run with packed sequences
