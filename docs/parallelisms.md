@@ -161,8 +161,8 @@ The optimal configuration depends on your specific model architecture, hardware 
 1. Start with DDP for models <7B parameters
 2. Use FSDP2 when encountering memory limits
 3. Add tensor parallelism for memory-intensive layers
-4. Implement pipeline parallelism for very deep models
-5. Enable sequence parallelism for long sequences
+4. Enable sequence parallelism for long sequences
+<!-- 4. Implement pipeline parallelism for very deep models -->
 
 ### Troubleshooting Tips
 | Issue                     | Likely Fix                                     |
