@@ -46,7 +46,7 @@ To ensure seamless integration with the Hugging Face ecosystem, NeMo Automodel s
 
 ### Example
 
-The following example shows how to run the LLM finetune recipe using two GPUs and saves a checkpoint using the Safetensors format. Using the following command:
+The following command runs the LLM fine-tuning recipe on two GPUs and saves the resulting checkpoint in the Safetensors format:
 ```bash
 uv run torchrun --nproc-per-node=2 examples/llm/finetune.py --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors --checkpoint.save_consolidated True
 ```
