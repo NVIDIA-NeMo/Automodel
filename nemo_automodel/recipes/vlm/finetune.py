@@ -253,10 +253,13 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
 
         # find the lm_head in the model
         lm_head = None
-        for n, p in model.named_parameters(remove_duplicate=False):
-            if "lm_head" in n and n.endswith(".weight"):
-                lm_head = p
-                break
+        if hasattr(model, "get_output_embeddings"):
+            lm_head = model.get_output_embeddings().weight
+        else:
+            for n, p in model.named_parameters(remove_duplicate=False):
+                if "lm_head" in n and n.endswith(".weight"):
+                    lm_head = p
+                    break
         if lm_head is None:
             raise ValueError("lm_head.weight not found in model")
         loss_fn_kwargs.update(
@@ -418,11 +421,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels, loss_mask)
         with train_ctx():
-            out = self.model(**batch)
-            if isinstance(self.loss_fn, FusedLinearCrossEntropy) and "hidden_states" not in out:
-                raise ValueError(
-                    "FusedLinearCrossEntropy requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
-                )
+            if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                # use num_logits_to_keep to avoid full logits matrix in memory
+                out = self.model(logits_to_keep=1, **batch)
+                if "hidden_states" not in out:
+                    raise ValueError(
+                        "FusedLinearCrossEntropy requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
+                    )
+            else:
+                out = self.model(**batch)
             local_loss = calculate_loss(
                 self.loss_fn,
                 logits=out.logits,
