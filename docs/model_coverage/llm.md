@@ -76,8 +76,6 @@ The table below lists the main architectures we test against (FSDP2 + SFT/PEFT) 
 
 
 
-> [!TIP]
-> In this guide, we use the `SQuAD v1.1` dataset, but you can specify your own data as needed.
 
 ## Fine-Tuning LLMs with NeMo AutoModel
 
@@ -86,6 +84,9 @@ The models listed above can be fine-tuned using NeMo AutoModel to adapt them to 
 1. **Parameter-Efficient Fine-Tuning (PEFT)**: Updates only a small subset of parameters (typically <1%) using techniques like LoRA (Low-Rank Adapters). This is ideal for resource-constrained environments. See our [PEFT Guide](guides/llm/peft.md) for details.
 
 2. **Supervised Fine-Tuning (SFT)**: Updates all or most model parameters for deeper adaptation, suitable for high-precision applications. See our [SFT Guide](guides/llm/sft.md) for implementation details.
+
+> [!TIP]
+> In these guides, we use the `SQuAD v1.1` dataset, but you can specify your own data as needed.
 
 ### Example: Fine-Tuning with SQuAD Dataset
 
