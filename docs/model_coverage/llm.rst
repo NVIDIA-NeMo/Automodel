@@ -9,19 +9,21 @@ NeMo AutoModel provides a simple interface for loading and fine-tuning LLMs host
 
 Run LLMs with NeMo Automodel
 ------------------
-To run LLMs with NeMo AutoModel, please use at least version `25.02` of the NeMo container.
+To run LLMs with NeMo AutoModel, please use at least version `25.07` of the NeMo container.
 If the model you want to finetune is available on a newer version of transformers, you may need
-to upgrade to the latest library with:
+to upgrade to the latest NeMo Automodel with:
 
 .. code-block:: bash
 
-   pip3 install --upgrade git+https://github.com/huggingface/transformers.git
+   pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/Automodel.git
+
+For other installation options (e.g., uv) please see our [installation guide]([a link](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/installation.md)
 
 Supported Models
 ----------------
 NeMo AutoModel interoperates with most LLMs available on the Hugging Face Hub.
 
-During preprocessing, it leverages `transformers.AutoTokenizer`, sufficient for most cases.
+During preprocessing, it leverages `transformers.AutoTokenizer`, sufficient for most LLm cases.
 If your model needs custom text handling (e.g. reasoning model), you can override the
 default tokenizer in the data‑preparation stage.
 
