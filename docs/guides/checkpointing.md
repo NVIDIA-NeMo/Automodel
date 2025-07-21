@@ -224,7 +224,7 @@ checkpoints/
     └── step_scheduler.pt
 ```
 
-If the user wants to define a new state to be checkpointed in the recipe, the easiest way to do this is create a new attribute in the recipe class (i.e., defined using `self.` inside the recipe) and make sure the new attribute has `load_state_dict` and `state_dict` methods.
+If you want to define a new state to be checkpointed in the recipe, the easiest way is create a new attribute in the recipe class (defined using `self.` inside the recipe). Just make sure that the new attribute uses both the `load_state_dict` and `state_dict` methods.
 
 Here is a skeleton of what it might look like
 
