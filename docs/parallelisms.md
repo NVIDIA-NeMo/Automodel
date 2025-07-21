@@ -9,8 +9,8 @@ NeMo AutoModel supports various data-parallel and model-parallel deep learning w
 | **DDP**            | Entire model        | Low            | Moderate           | Small to medium models            |
 | **FSDP2**          | Entire model        | High           | High               | Large memory-constrained models   |
 | **Tensor**         | Layer parameters    | High           | Moderate           | Memory-intensive layers           |
-| **Pipeline**       | Model layers        | High           | High               | Models with many layers           |
-| **Expert**         | MoE experts only    | Medium         | Low                | Mixture-of-Experts models         |
+<!-- | **Pipeline**       | Model layers        | High           | High               | Models with many layers           | -->
+<!-- | **Expert**         | MoE experts only    | Medium         | Low                | Mixture-of-Experts models         | -->
 | **Sequence**       | Activations         | High           | Moderate           | Long sequence lengths             |
 | **Context**        | All activations     | Highest        | High               | Extreme sequence length scenarios |
 
@@ -23,11 +23,15 @@ DDP replicates the model across multiple GPUs while distributing batches evenly.
 * Works best when models fit comfortably in GPU memory
 
 ## Fully-Sharded Data Parallel (FSDP2)
-FSDP2 is an advanced memory-optimized approach that shards all model components (parameters, gradients, and optimizer states) across GPUs. Key characteristics:
+FSDP2 is an advanced memory-optimized approach that shards all model components
+(parameters, gradients, and optimizer states) across GPUs.
+
+Key characteristics:
 * Uses reduce-scatter for gradients and all-gather for parameters
 * Supports flexible precision control (bf16, fp16, fp32)
 * Enables CPU offloading for additional memory savings
 * Particularly effective for models >10B parameters
+
 To configure FSDP2:
 
 * Set sharding_strategy (FULL_SHARD for maximum memory savings)
@@ -86,19 +90,24 @@ Tensor Parallelism (TP) distributes parameter tensors of individual layers acros
 
 #### Enable Tensor Parallelism
 
-Configure the `tensor_model_parallel_size` parameter in your model configuration. Set this to greater than 1 to enable intra-layer model parallelism.
+Configure the `tp_size` parameter in your model configuration. Set this to greater than 1 to enable intra-layer model parallelism.
+```yaml
+distributed:
+   tp_size: N
+```
+Adjust `N` to the needed Tensor-parallel size, default: 1 (no tensor parallelism).
 
 ### Pipeline Parallelism
 
 Pipeline Parallelism (PP) assigns consecutive layers or network segments to different GPUs, enabling each GPU to process different stages sequentially.
-
+<!-- 
 #### Enable Pipeline Parallelism
 
 Set the `pipeline_model_parallel_size` parameter to a value greater than 1 to distribute layers across GPUs.
 
 #### Interleaved Pipeline Schedule
 
-This schedule divides computation on each GPU into multiple subsets of layers (model chunks) to minimize pipeline bubbles.
+This schedule divides computation on each GPU into multiple subsets of layers (model chunks) to minimize pipeline bubbles. 
 
 ### Expert Parallelism
 
@@ -107,6 +116,7 @@ Expert Parallelism (EP) distributes experts of an MoE model across GPUs, affecti
 #### Enable Expert Parallelism
 
 Set `expert_model_parallel_size` in your configuration. The number of experts should be divisible by this value.
+-->
 
 ## Activation Partitioning
 
@@ -126,7 +136,12 @@ Context Parallelism (CP) partitions input tensors in the sequence dimension acro
 
 #### Enable Context Parallelism
 
-Set `context_parallel_size` to a value greater than 1 to distribute sequence activations.
+Set `cp_size` to a value greater than 1 to distribute sequence activations.
+```yaml
+distributed:
+   cp_size: N
+```
+Adjust `N` to the needed context parallel size, default: 1 (no context parallel parallelism).
 
 ## Parallelism Configuration
 
