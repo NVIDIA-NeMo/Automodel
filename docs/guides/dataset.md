@@ -128,7 +128,7 @@ NeMo Automodel supports multi-modal dataset integration through flexible preproc
 #### Typical types in Multi-modal Datasets
 A multi-modal dataset typically contains:
 - **Images, videos, audios** or other non-text modalities.
-- **Textual inputs** such as questions, instructions or captions
+- **Textual inputs** such as questions, instructions, or captions.
 - **Answers** or expected outputs from the model
 
 These are formatted into structured conversations or instruction-response pairs for use with VLMs like BLIP, Llava, or Flamingo.
