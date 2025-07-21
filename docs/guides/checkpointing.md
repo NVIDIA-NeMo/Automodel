@@ -10,7 +10,7 @@ NeMo AutoModel writes checkpoints in two formats: [Hugging Face Safetensors](htt
 
 - **Consolidated Checkpoints**: The complete model state is saved as a Hugging Face-compatible bundle, typically in a single file or a compact set of files with an index. Because tensors are not split across GPUs (unsharded), tools like Hugging Face, vLLM, and SGLang can load these checkpoints directly.
 
-- **Sharded** checkpoints: During distributed training with parameter sharing, typically each GPU holds a subset of the full state (e.g., model weights, optimizer states, and so on), also referred to as a "shard". During checkpointing each GPU saves its own shard of the full state, without reconstructing the full state.
+- **Sharded Checkpoints**: During distributed training with parameter sharing, each GPU holds a subset (or "shard") of the full state, such as model weights and optimizer states. When checkpointing, each GPU writes its own shard independently without reconstructing the full model state.
 
 We provide an overview of the different types of available checkpoint formats in the table below.
 
