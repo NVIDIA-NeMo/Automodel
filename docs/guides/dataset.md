@@ -153,7 +153,7 @@ The [MedPix-VQA](https://huggingface.co/datasets/mmoukouba/MedPix-VQA) dataset i
 
 The example dataset preprocessing performs the following steps:
 
-1. Load the dataset using HuggingFace's `datasets` library
+1. Loads the dataset using Hugging Face's `datasets` library.
 2. Extract the `question` and `answer`
 3. Transform the data into a chat-like format suitable for Huggingface Autoprocessor's `apply_chat_template` function:
 
