@@ -98,10 +98,10 @@ distributed:
 ```
 Adjust `N` to the needed Tensor-parallel size, default: 1 (no tensor parallelism).
 
+<!-- 
 ### Pipeline Parallelism
 
 Pipeline Parallelism (PP) assigns consecutive layers or network segments to different GPUs, enabling each GPU to process different stages sequentially.
-<!-- 
 #### Enable Pipeline Parallelism
 
 Set the `pipeline_model_parallel_size` parameter to a value greater than 1 to distribute layers across GPUs.
