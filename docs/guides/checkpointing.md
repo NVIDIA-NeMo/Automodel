@@ -87,7 +87,7 @@ checkpoints/
 
 The `epoch_0_step_20/` directory stores the full training state from step `20` of the first epoch, including both the model and optimizer states.
 
-We can load and run the consolidated checkpoint using 🤗 Transformers API directly:
+We can load and run the consolidated checkpoint using the Hugging Face Transformers API directly:
 ```python
 import torch
 from transformers import pipeline
