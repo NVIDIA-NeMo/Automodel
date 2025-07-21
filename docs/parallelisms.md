@@ -2,10 +2,43 @@
 
 NeMo AutoModel supports various data-parallel and model-parallel deep learning workload deployment methods, which can be mixed together arbitrarily.
 
+## Parallelism Techniques Overview
+
+| Technique           | Scope               | Memory Savings | Communication Cost | Best For                          |
+|---------------------|---------------------|----------------|--------------------|-----------------------------------|
+| **DDP**            | Entire model        | Low            | Moderate           | Small to medium models            |
+| **FSDP2**          | Entire model        | High           | High               | Large memory-constrained models   |
+| **Tensor**         | Layer parameters    | High           | Moderate           | Memory-intensive layers           |
+| **Pipeline**       | Model layers        | High           | High               | Models with many layers           |
+| **Expert**         | MoE experts only    | Medium         | Low                | Mixture-of-Experts models         |
+| **Sequence**       | Activations         | High           | Moderate           | Long sequence lengths             |
+| **Context**        | All activations     | Highest        | High               | Extreme sequence length scenarios |
+
+
 ## Data Parallelism
 
-Data Parallelism (DP) replicates the model across multiple GPUs. Data batches are evenly distributed between GPUs and the data-parallel GPUs process them independently. While the computation workload is efficiently distributed across GPUs, inter-GPU communication is required to keep the model replicas consistent between training steps.
+DDP replicates the model across multiple GPUs while distributing batches evenly. Each GPU processes its portion independently, with gradients synchronized before parameter updates. This method:
 
+* Requires all-reduce communication for gradient synchronization
+* Works best when models fit comfortably in GPU memory
+
+## Fully-Sharded Data Parallel (FSDP2)
+FSDP2 is an advanced memory-optimized approach that shards all model components (parameters, gradients, and optimizer states) across GPUs. Key characteristics:
+* Uses reduce-scatter for gradients and all-gather for parameters
+* Supports flexible precision control (bf16, fp16, fp32)
+* Enables CPU offloading for additional memory savings
+* Particularly effective for models >10B parameters
+To configure FSDP2:
+
+* Set sharding_strategy (FULL_SHARD for maximum memory savings)
+
+* Configure mixed precision policies
+
+* Enable cpu_offload if needed
+
+
+
+<!-- 
 ### Distributed Data Parallelism
 
 Distributed Data Parallelism (DDP) keeps model copies consistent by synchronizing parameter gradients across data-parallel GPUs before each parameter update. It sums gradients of all model copies using all-reduce communication collectives.
@@ -41,9 +74,9 @@ Example configuration options:
 - `cpu_offload`: Offload parameters and gradients to CPU
 - `backward_prefetch`: Control backward prefetching strategy
 
-FSDP2 is particularly effective for very large models where memory constraints are critical.
+FSDP2 is particularly effective for very large models where memory constraints are critical. -->
 
-## Model Parallelism
+## Model-level Parallelism Techniques
 
 Model Parallelism (MP) partitions model parameters across GPUs to reduce per-GPU memory requirements. NeMo AutoModel supports various model-parallel methods.
 
@@ -106,3 +139,18 @@ When configuring parallel strategies in NeMo AutoModel:
 5. For MoE models, configure expert parallelism appropriately
 
 The optimal configuration depends on your specific model architecture, hardware setup, and performance requirements. NeMo AutoModel provides flexible configuration options to tune these parameters for your use case.
+
+## Implementation Guidance
+### Recommended Approach
+1. Start with DDP for models <7B parameters
+2. Use FSDP2 when encountering memory limits
+3. Add tensor parallelism for memory-intensive layers
+4. Implement pipeline parallelism for very deep models
+5. Enable sequence parallelism for long sequences
+
+### Troubleshooting Tips
+| Issue                     | Likely Fix                                     |
+|---------------------------|------------------------------------------------|
+| OOM errors                | Increase FSDP2 sharding or add TP              |
+| Low GPU utilization       | Reduce pipeline stages or increase batch size  |
+| Communication bottlenecks | Adjust parallel dimensions                     |
