@@ -29,7 +29,7 @@ The table below lists the main architectures we test against (FSDP2 + SFT/PEFT) 
 | Architecture                          | Models                                | Example HF Models                                                                 |
 |---------------------------------------|---------------------------------------|-----------------------------------------------------------------------------------|
 | `AquilaForCausalLM`                   | Aquila, Aquila2                       | `BAAI/Aquila-7B`, `BAAI/AquilaChat-7B`, etc.                                      |
-| `BaiChuanForCausalLM`                 | Baichuan2, Baichuan                   | `baichuan-inc/Baichuan2-13B-Chat`, `baichuan-inc/Baichuan-7B`, etc. XXX           |
+| `BaiChuanForCausalLM`                 | Baichuan2, Baichuan                   | `baichuan-inc/Baichuan2-13B-Chat`, `baichuan-inc/Baichuan-7B`, etc.            |
 | `BambaForCausalLM`                    | Bamba                                 | `ibm-ai-platform/Bamba-9B`                                                        |
 | `ChatGLMModel` / `ChatGLMForConditionalGeneration` | ChatGLM                      | `THUDM/chatglm2-6b`, `THUDM/chatglm3-6b`,  etc.                                   |
 | `CohereForCausalLM` / `Cohere2ForCausalLM` | Command‑R                        | `CohereForAI/c4ai-command-r-v01`, `CohereForAI/c4ai-command-r7b-12-2024`, etc.    |
