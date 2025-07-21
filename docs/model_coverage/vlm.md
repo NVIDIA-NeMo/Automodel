@@ -50,5 +50,5 @@ The cord-v2 dataset [`naver-clova-ix/cord-v2`](https://huggingface.co/naver-clov
 All supported models can be fine-tuned using either full SFT or PEFT approaches. The [Gemma Fine-Tuning Guide](guides/omni/gemma3-3n.md) provides complete instructions for:
 * Configuring YAML-based training
 * Running single-GPU and multi-GPU training.
-* Setting up parameter-efficient fine-tuning with LoRA
+* Setting up PEFT with LoRA.
 * Model checkpointing and W&B integration.
