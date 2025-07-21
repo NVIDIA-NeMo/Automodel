@@ -161,8 +161,6 @@ uv run torchrun --nproc-per-node=2 examples/vlm/finetune.py \
     --config examples/vlm/gemma_3n_vl_4b_medpix_vqa.yaml
 ```
 
-*Figure: Training loss curve showing convergence during fine-tuning.*
-
 #### Override Configuration Parameters
 
 You can override any configuration parameter using dot-notation without modifying the YAML file:
