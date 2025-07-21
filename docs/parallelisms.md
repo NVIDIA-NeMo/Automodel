@@ -27,7 +27,7 @@ DDP replicates the model across multiple GPUs while distributing batches evenly.
 The following YAML config shows how to enable DDP:
 ```yaml
 distributed:
-  _target_: nemo_automodel.components.distributed.ddp.DDPManager   # uses DDP
+    _target_: nemo_automodel.components.distributed.ddp.DDPManager   # uses DDP
 ```
 
 ## Fully-Sharded Data Parallel (FSDP2)
@@ -52,11 +52,11 @@ To configure FSDP2:
 The following YAML config shows how to enable various parallelism techniques with FSDP2:
 ```yaml
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager   # uses FSDP2
-  dp_size: 8
-  tp_size: 2  # uses tensor-parallel = 2
-  cp_size: 4  # uses context-parallel = 2
-  sequence_parallel: true  # enables sequence parallelism
+    _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager   # uses FSDP2
+    dp_size: 8
+    tp_size: 2  # uses tensor-parallel = 2
+    cp_size: 4  # uses context-parallel = 2
+    sequence_parallel: true  # enables sequence parallelism
 ```
 
 <!-- 
@@ -111,7 +111,8 @@ Configure the `tp_size` parameter in your model configuration. Set this to great
 In the yaml file, under the `distributed` section:
 ```yaml
 distributed:
-   tp_size: N
+    _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager   # uses FSDP2
+    tp_size: N
 ```
 Adjust `N` to the needed Tensor-parallel size, default: 1 (no tensor parallelism).
 
@@ -157,7 +158,8 @@ Context Parallelism (CP) partitions input tensors in the sequence dimension acro
 Set `cp_size` to a value greater than 1 to distribute sequence activations. In the yaml file, under the `distributed` section:
 ```yaml
 distributed:
-   cp_size: N
+    _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager   # uses FSDP2
+    cp_size: N
 ```
 Adjust `N` to the needed context parallel size, default: 1 (no context parallel parallelism).
 
