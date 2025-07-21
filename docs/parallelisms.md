@@ -14,6 +14,16 @@ NeMo AutoModel supports various data-parallel and model-parallel deep learning w
 <!-- | **Pipeline**       | Model layers        | High           | High               | Models with many layers           | -->
 <!-- | **Expert**         | MoE experts only    | Medium         | Low                | Mixture-of-Experts models         | -->
 
+## Complete example
+The following YAML config shows how to enable various parallelism techniques:
+```yaml
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager   # uses FSDP2
+  dp_size: 8
+  tp_size: 2  # uses tensor-parallel = 2
+  cp_size: 4  # uses context-parallel = 2
+  sequence_parallel: true  # enables sequence parallelism
+```
 
 ## Data Parallelism
 
