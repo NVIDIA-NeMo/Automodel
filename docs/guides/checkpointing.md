@@ -109,7 +109,7 @@ Although this example uses the Hugging Face Transformers API, the `consolidated/
 
 
 ## PEFT
-When training with PEFT (Parameter-Efficient Fine-Tuning) techniques, only a small subset of model weights are updated — the rest of the model remains frozen. This dramatically reduces the size of the checkpoint, often to just a few megabytes.
+When training with Parameter-Efficient Fine-Tuning (PEFT) techniques, only a small subset of model weights are updated — the rest of the model remains frozen. This dramatically reduces the size of the checkpoint, often to just a few megabytes.
 
 ### Why Consolidated Checkpoints?
 Because the PEFT state is so lightweight, sharded checkpointing adds unnecessary overhead. Instead, NeMo Automodel automatically saves a single, consolidated Hugging Face–compatible checkpoint when using PEFT. This makes it:
