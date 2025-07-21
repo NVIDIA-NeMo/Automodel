@@ -42,7 +42,7 @@ To ensure seamless integration with the Hugging Face ecosystem, NeMo Automodel s
 - **Memory Safety and Speed**: The Safetensors format prohibits saving serialized Python code, ensuring memory safety, and supports zero-copy loading for improved performance.
 - **Optional Consolidation**: Sharded checkpoints can be merged into a standard Hugging Face model format for easier downstream use.
 
-**Most importantly**, the added advantage of this format is that we can optionally consolidate the various shards into a full HuggingFace format model.
+**Most importantly**, this format offers the added advantage of optionally consolidating multiple shards into a complete Hugging Face format model.
 
 ### Example
 
