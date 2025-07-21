@@ -1,9 +1,6 @@
-==========================================
-Vision Language Models with NeMo AutoModel
-==========================================
+# Vision Language Models with NeMo AutoModel
 
-Introduction
-------------
+## Introduction
 
 Vision Language Models (VLMs) are advanced models that integrate vision and language processing capabilities. They are trained on extensive datasets containing both interleaved images and text data, allowing them to generate text descriptions of images and answer questions related to images.
 
@@ -11,8 +8,8 @@ NeMo AutoModel LLM APIs can be easily extended to support VLM tasks. While most 
 
 In this guide, we will walk through the data preparation steps for two datasets and also provide a table of scripts and configurations that have been tested with NeMo AutoModel. The code for both the datasets is available in `Nemo Repository <https://github.com/NVIDIA/NeMo/blob/main/scripts/vlm/automodel_datasets.py>`__.
 
-Run LLMs with NeMo Automodel
-------------------
+## Run LLMs with NeMo Automodel
+
 To run LLMs with NeMo AutoModel, please use at least version `25.07` of the NeMo container.
 If the model you want to finetune is available on a newer version of transformers, you may need
 to upgrade to the latest NeMo Automodel with:
@@ -23,38 +20,19 @@ to upgrade to the latest NeMo Automodel with:
 
 For other installation options (e.g., uv) please see our [installation guide]([a link](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/installation.md)
 
-Models
-------
+## Supported Models
+
 
 While most VLM models from Hugging Face are compatible with NeMo AutoModel, we have specifically tested the following models (e.g., Gemma 3, Qwen 2, etc.) for convergence with the datasets mentioned above. You can find the script for running these models in the `NeMo repository <https://github.com/NVIDIA/NeMo/blob/main/scripts/vlm/automodel.py>`__.
 
-.. list-table:: Supported Models
-   :widths: 20 20 20 20 20
-   :header-rows: 1
+| Model                              | Dataset                     | FSDP2      | PEFT       |
+|------------------------------------|-----------------------------|------------|------------|
+| Gemma 3-4B & 27B                   | naver-clova-ix & rdr-items  | Supported  | Supported  |
+| Gemma 3n                           | naver-clova-ix & rdr-items  | Supported  | Supported  |
+| Qwen2-VL-2B-Instruct & Qwen2.5-VL-3B-Instruct | cord-v2          | Supported  | Supported  |
+| llava-v1.6                         | cord-v2 & naver-clova-ix    | Supported  | Supported  |
 
-   * - Model
-     - Dataset
-     - FSDP2
-     - PEFT
-   * - Gemma 3-4B & 27B
-     - naver-clova-ix & rdr-items
-     - Supported
-     - Supported
-   * - Gemma 3n
-     - naver-clova-ix & rdr-items
-     - Supported
-     - Supported
-   * - Qwen2-VL-2B-Instruct & Qwen2.5-VL-3B-Instruct
-     - cord-v2
-     - Supported
-     - Supported
-   * - llava-v1.6
-     - cord-v2 & naver-clova-ix
-     - Supported
-     - Supported
-
-rdr items dataset
------------------
+## rdr items dataset
 
 The `rdr items dataset <https://huggingface.co/datasets/quintend/rdr-items>`__ is a small dataset containing 48 images with descriptions. To make sure the data is in correct format, we apply a collate function with user instructions to describe the image.
 
@@ -95,8 +73,7 @@ The `rdr items dataset <https://huggingface.co/datasets/quintend/rdr-items>`__ i
 This code block ensures that the images are processed correctly, and the text is tokenized along with the chat template.
 
 
-cord-v2 dataset
----------------
+## cord-v2 dataset
 
 The `cord-v2 dataset <https://huggingface.co/datasets/naver-clova-ix/cord-v2>`__ is a dataset containing receipts with descriptions in JSON format. 
 To ensure the data is in the correct format, we apply the following function to convert the input JSON to text tokens.
@@ -200,8 +177,7 @@ We then apply the chat template to these text tokens along with images, and conv
             return batch
 
 
-Train the Model
----------------
+## Train the Model
 
 To train the model, we use the NeMo Fine-tuning API. The full script for training is available in `Nemo VLM Automodel <https://github.com/NVIDIA/NeMo/blob/main/scripts/vlm/automodel.py>`_.
 
