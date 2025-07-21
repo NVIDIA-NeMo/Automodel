@@ -282,6 +282,13 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
     if isinstance(loss_fn, FusedLinearCrossEntropy):
         model = kwargs.pop("model")
 
+        # Replace labels with -100 where mask is 0 (don't compute loss for these positions)
+        # -100 is the default ignore index in PyTorch's cross entropy loss
+        labels = kwargs.pop("labels")
+        if "mask" in kwargs:
+            loss_mask = kwargs.pop("mask")
+            labels.masked_fill_(loss_mask == 0, -100)
+
         # find the lm_head in the model
         lm_head = None
         if hasattr(model, "get_output_embeddings"):
@@ -293,10 +300,13 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
                     break
         if lm_head is None:
             raise ValueError("lm_head.weight not found in model")
+
+        # unshard the possibly sharded lm_head
+        lm_head = lm_head.full_tensor() if hasattr(lm_head, "full_tensor") else lm_head
         loss_fn_kwargs.update(
             {
                 "hidden_states": kwargs.pop("hidden_states"),
-                "labels": kwargs.pop("labels"),
+                "labels": labels,
                 "lm_weight": lm_head,
             }
         )
