@@ -75,7 +75,7 @@ The table below lists the main architectures we test against (FSDP2 combined wit
 
 The models listed above can be fine-tuned using NeMo AutoModel to adapt them to specific tasks or domains. We support two primary fine-tuning approaches:
 
-1. **Parameter-Efficient Fine-Tuning (PEFT)**: Updates only a small subset of parameters (typically <1%) using techniques like LoRA (Low-Rank Adapters). This is ideal for resource-constrained environments. See our [PEFT Guide](guides/llm/peft.md) for details.
+1. **Parameter-Efficient Fine-Tuning (PEFT)**: Updates only a small subset of parameters (typically <1%) using techniques like Low-Rank Adaptation (LoRA). This is ideal for resource-constrained environments. See our [PEFT Guide](guides/llm/peft.md) for details.
 
 2. **Supervised Fine-Tuning (SFT)**: Updates all or most model parameters for deeper adaptation, suitable for high-precision applications. See our [SFT Guide](guides/llm/sft.md) for implementation details.
 
