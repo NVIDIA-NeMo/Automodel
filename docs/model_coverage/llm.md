@@ -113,11 +113,11 @@ To fine-tune any of the supported models:
    * For full model tuning: Follow the [SFT Guide](guides/llm/sft.md)
 
 2. Key steps in both guides:
-  * Model and dataset configuration
-  * Training recipe setup
-  * Inference with fine-tuned models
-  * Model sharing via Hugging Face Hub
-  * Deployment with vLLM
+   * Model and dataset configuration
+   * Training recipe setup
+   * Inference with fine-tuned models
+   * Model sharing via Hugging Face Hub
+   * Deployment with vLLM
 
 3. Example launch commands:
 
