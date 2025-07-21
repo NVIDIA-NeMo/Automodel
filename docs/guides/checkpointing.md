@@ -57,7 +57,7 @@ If you're running on a single GPU, you can run:
 uv run examples/llm/finetune.py --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors --checkpoint.save_consolidated True
 ```
 
-After running for a few seconds, the following should appear in the standard output:
+After running for a few seconds, the standard output should be:
 ```
 ...
 > Saving checkpoint to checkpoints/epoch_0_step_20
