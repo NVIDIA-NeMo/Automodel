@@ -116,7 +116,7 @@ Because the PEFT state is so lightweight, sharded checkpointing adds unnecessary
 
 - easier to manage and share (just the adapters),
 - compatible with Hugging Face Transformers out of the box,
-- Ideal for deployment and downstream evaluation.
+- ideal for deployment and downstream evaluation.
 
 ### Example: PEFT finetuning on 2 GPUs
 
