@@ -74,48 +74,68 @@ The table below lists the main architectures we test against (FSDP2 + SFT/PEFT) 
 | `Starcoder2ForCausalLM`               | Starcoder2                            | `bigcode/starcoder2-3b`, `bigcode/starcoder2-7b`, `bigcode/starcoder2-15b` etc.   |
 | `SolarForCausalLM`                    | Solar Pro                             | `upstage/solar-pro-preview-instruct` etc.                                          |
 
-## The SQuAD Dataset
-Stanford Question Answering Dataset (SQuAD) is a **reading comprehension dataset**, consisting of questions posed by crowdworkers on a set of Wikipedia articles, where the answer to every question is a segment of text, or span, from the corresponding reading passage, or the question might be unanswerable.
 
-There are two major versions:
-
-- **SQuAD v1.1**: All answers are guaranteed to be present in the context.
-
-- **SQuAD v2.0**: Introduces unanswerable questions, adding complexity and realism.
-
-In this tutorial, we’ll focus on **SQuAD v1.1**, which is more suitable for straightforward supervised fine-tuning without requiring additional handling of null answers.
-
-Here’s a glimpse of what the data looks like:
-``` json
-{
-
-    "id": "5733be284776f41900661182",
-    "title": "University_of_Notre_Dame",
-    "context": "Architecturally, the school has a Catholic character. Atop the Main Building's gold dome is a golden statue of the Virgin Mary. Immediately in front of the Main Building and facing it, is a copper statue of Christ with arms upraised with the legend Venite Ad Me Omnes. Next to the Main Building is the Basilica of the Sacred Heart. Immediately behind the basilica is the Grotto, a Marian place of prayer and reflection. It is a replica of the grotto at Lourdes, France where the Virgin Mary reputedly appeared to Saint Bernadette Soubirous in 1858. At the end of the main drive (and in a direct line that connects through 3 statues and the Gold Dome), is a simple, modern stone statue of Mary.",
-    "question": "To whom did the Virgin Mary allegedly appear in 1858 in Lourdes France?",
-    "answers": {
-        "text": [
-            "Saint Bernadette Soubirous"
-        ],
-        "answer_start": [
-            515
-        ]
-    }
-}
-```
-This structure is ideal for training models in context-based question answering, where the model learns to answer questions based on the input context.
 
 > [!TIP]
 > In this guide, we use the `SQuAD v1.1` dataset, but you can specify your own data as needed.
 
-## Train the Model
+## Fine-Tuning LLMs with NeMo AutoModel
 
-To train the model, we use the NeMo Fine-tuning API. The full script for training is available in `Nemo VLM Automodel <https://github.com/NVIDIA/NeMo/blob/main/scripts/vlm/automodel.py>`_.
+The models listed above can be fine-tuned using NeMo AutoModel to adapt them to specific tasks or domains. We support two primary fine-tuning approaches:
 
-You can directly run the fine-tuning script using the following command:
+1. **Parameter-Efficient Fine-Tuning (PEFT)**: Updates only a small subset of parameters (typically <1%) using techniques like LoRA (Low-Rank Adapters). This is ideal for resource-constrained environments. See our [PEFT Guide](guides/llm/peft.md) for details.
 
-```python3
-    python scripts/vlm/automodel.py --model google/gemma-3-4b-it --data_path naver-clova-ix/cord-v2
+2. **Supervised Fine-Tuning (SFT)**: Updates all or most model parameters for deeper adaptation, suitable for high-precision applications. See our [SFT Guide](guides/llm/sft.md) for implementation details.
+
+### Example: Fine-Tuning with SQuAD Dataset
+
+We demonstrate fine-tuning using the Stanford Question Answering Dataset (SQuAD) as an example. SQuAD is a reading comprehension dataset where models learn to answer questions based on given context passages.
+
+Key features of SQuAD:
+- **v1.1**: All answers are present in the context (simpler for basic fine-tuning)
+- **v2.0**: Includes unanswerable questions (more realistic but complex)
+
+Sample data format:
+```json
+{
+    "id": "5733be284776f41900661182",
+    "title": "University_of_Notre_Dame",
+    "context": "Architecturally, the school has...",
+    "question": "To whom did the Virgin Mary allegedly appear in 1858 in Lourdes France?",
+    "answers": {
+        "text": ["Saint Bernadette Soubirous"],
+        "answer_start": [515]
+    }
+}
+```
+This structure makes SQuAD ideal for training context-based question answering models. Both our PEFT and SFT guides use SQuAD v1.1 as an example, but you can substitute your own dataset as needed.
+
+### Getting Started with Fine-Tuning
+To fine-tune any of the supported models:
+
+1. Choose your approach:
+* For parameter-efficient tuning: Follow the [PEFT Guide](guides/llm/peft.md)
+* For full model tuning: Follow the [SFT Guide](guides/llm/sft.md)
+
+2. Key steps in both guides:
+* Model and dataset configuration
+* Training recipe setup
+* Inference with fine-tuned models
+* Model sharing via Hugging Face Hub
+* Deployment with vLLM
+
+3. Example launch commands:
+
+```bash
+# For PEFT
+automodel finetune llm -c peft_guide.yaml
+
+# For SFT
+automodel finetune llm -c sft_guide.yaml
 ```
 
-At the core of the fine-tuning script is the `llm.finetune` function defined below:
+Both guides provide complete YAML configuration examples and explain how to:
+* Customize training parameters
+* Monitor progress
+* Save and share checkpoints
+* Deploy the finetuned model with optimized inference
