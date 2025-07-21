@@ -147,7 +147,13 @@ Sequence Parallelism (SP) distributes computing load and activation memory along
 
 #### Enable Sequence Parallelism
 
-Set `sequence_parallel=True` in your configuration, which requires tensor_model_parallel_size > 1.
+Set `sequence_parallel=True` in your configuration, for example:
+
+```yaml
+distributed:
+    _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager   # uses FSDP2
+    sequence_parallel: true  # enables sequence parallelism
+```
 
 ### Context Parallelism
 
