@@ -142,8 +142,8 @@ jobs:
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
           - script: L2_HF_Consolidated_FSDP2_VLM_Checkpoint
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-#          - script: L2_HF_PEFT_Triton_FSDP2_Checkpoint
-#            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+          - script: L2_HF_PEFT_Triton_FSDP2_Checkpoint
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
           - script: L2_HF_PEFT_FSDP2_Checkpoint
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
           - script: L2_HF_Transformer_VLM_SFT
