@@ -19,6 +19,7 @@
 import dataclasses
 import json
 import queue
+import re
 from typing import Any, Optional
 
 import torch
@@ -391,7 +392,9 @@ def _extract_file_index(filename: str) -> int:
     return 1
 
 
-def get_fqn_to_file_index_mapping(reference_model_path: str) -> dict[str, int]:
+def get_fqn_to_file_index_mapping(
+    reference_model_path: str, key_mapping: Optional[dict[str, str]] = None
+) -> dict[str, int]:
     """
     Get the FQN to file index mapping from the metadata.
 
@@ -408,7 +411,25 @@ def get_fqn_to_file_index_mapping(reference_model_path: str) -> dict[str, int]:
 
     for md_index, storage_info in metadata.storage_data.items():
         fqn = getattr(md_index, "fqn", md_index)
+        fqn = _get_key_renaming_mapping(fqn, key_mapping)
         filename = storage_info.relative_path
         fqn_to_file_index_mapping[str(fqn)] = _extract_file_index(filename)
 
     return fqn_to_file_index_mapping
+
+
+# the following function is taken from https://github.com/huggingface/transformers/blob/b85ed49e0a5f1bd9fd887f497d055b22b9319a12/src/transformers/modeling_utils.py#L4989-L5047
+def _get_key_renaming_mapping(
+    key: str,
+    key_mapping: Optional[dict[str, str]] = None,
+) -> str:
+    if key_mapping is None:
+        return key
+
+    # Optionally map the key according to `key_mapping`
+    for pattern, replacement in key_mapping.items():
+        new_key, n_replace = re.subn(pattern, replacement, key)
+        # Early exit of the loop
+        if n_replace > 0:
+            return new_key
+    return key

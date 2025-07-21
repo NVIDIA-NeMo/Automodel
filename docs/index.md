@@ -27,6 +27,7 @@ guides/omni/gemma3-3n.md
 
 guides/dataset.md
 guides/checkpointing.md
+guides/gemma3n_blog.md
 ```
 
 ```{toctree}
