@@ -85,7 +85,7 @@ checkpoints/
     ...
 ```
 
-The `epoch_0_step_20/` directory contains the training state from step `20` of the first epoch. It includes the complete training state (i.e., model and optimizer state).
+The `epoch_0_step_20/` directory stores the full training state from step `20` of the first epoch, including both the model and optimizer states.
 
 We can load and run the consolidated checkpoint using 🤗 Transformers API directly:
 ```python
