@@ -11,16 +11,17 @@ NeMo AutoModel LLM APIs can be easily extended to support VLM tasks. While most 
 
 In this guide, we will walk through the data preparation steps for two datasets and also provide a table of scripts and configurations that have been tested with NeMo AutoModel. The code for both the datasets is available in `Nemo Repository <https://github.com/NVIDIA/NeMo/blob/main/scripts/vlm/automodel_datasets.py>`__.
 
-Installation Notes
+Run LLMs with NeMo Automodel
 ------------------
-
-To run the VLMs with NeMo AutoModel, please use NeMo container version `25.02.rc5` or higher. Additionally, you might have to install the latest
-version of `transformers` library using the following command:
+To run LLMs with NeMo AutoModel, please use at least version `25.07` of the NeMo container.
+If the model you want to finetune is available on a newer version of transformers, you may need
+to upgrade to the latest NeMo Automodel with:
 
 .. code-block:: bash
 
-    pip install git+https://github.com/huggingface/transformers.git
+   pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/Automodel.git
 
+For other installation options (e.g., uv) please see our [installation guide]([a link](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/installation.md)
 
 Models
 ------
@@ -34,21 +35,21 @@ While most VLM models from Hugging Face are compatible with NeMo AutoModel, we h
    * - Model
      - Dataset
      - FSDP2
-     - 4 bit model
      - PEFT
    * - Gemma 3-4B & 27B
      - naver-clova-ix & rdr-items
      - Supported
+     - Supported
+   * - Gemma 3n
+     - naver-clova-ix & rdr-items
      - Supported
      - Supported
    * - Qwen2-VL-2B-Instruct & Qwen2.5-VL-3B-Instruct
      - cord-v2
      - Supported
      - Supported
-     - Supported
    * - llava-v1.6
      - cord-v2 & naver-clova-ix
-     - Supported
      - Supported
      - Supported
 

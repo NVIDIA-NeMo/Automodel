@@ -1,14 +1,10 @@
-=========================================
-Large Language Models with NeMo AutoModel
-=========================================
+# Large Language Models with NeMo AutoModel
 
-Introduction
-------------
+## Introduction
 Large Language Models (LLMs) power a variety of tasks such as dialogue systems, text classification, summarization, and more.
 NeMo AutoModel provides a simple interface for loading and fine-tuning LLMs hosted on the Hugging Face Hub.
 
-Run LLMs with NeMo Automodel
-------------------
+## Run LLMs with NeMo Automodel
 To run LLMs with NeMo AutoModel, please use at least version `25.07` of the NeMo container.
 If the model you want to finetune is available on a newer version of transformers, you may need
 to upgrade to the latest NeMo Automodel with:
@@ -19,8 +15,7 @@ to upgrade to the latest NeMo Automodel with:
 
 For other installation options (e.g., uv) please see our [installation guide]([a link](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/installation.md)
 
-Supported Models
-----------------
+## Supported Models
 NeMo AutoModel interoperates with most LLMs available on the Hugging Face Hub.
 
 During preprocessing, it leverages `transformers.AutoTokenizer`, sufficient for most LLm cases.
@@ -172,3 +167,49 @@ The table below lists the main architectures we test against (FSDP2 + SFT/PEFT) 
    * - ``SolarForCausalLM``
      - Solar Pro
      - ``upstage/solar-pro-preview-instruct`` etc.
+
+
+
+## The SQuAD Dataset
+Stanford Question Answering Dataset (SQuAD) is a **reading comprehension dataset**, consisting of questions posed by crowdworkers on a set of Wikipedia articles, where the answer to every question is a segment of text, or span, from the corresponding reading passage, or the question might be unanswerable.
+
+There are two major versions:
+
+- **SQuAD v1.1**: All answers are guaranteed to be present in the context.
+
+- **SQuAD v2.0**: Introduces unanswerable questions, adding complexity and realism.
+
+In this tutorial, we’ll focus on **SQuAD v1.1**, which is more suitable for straightforward supervised fine-tuning without requiring additional handling of null answers.
+
+Here’s a glimpse of what the data looks like:
+``` json
+{
+
+    "id": "5733be284776f41900661182",
+    "title": "University_of_Notre_Dame",
+    "context": "Architecturally, the school has a Catholic character. Atop the Main Building's gold dome is a golden statue of the Virgin Mary. Immediately in front of the Main Building and facing it, is a copper statue of Christ with arms upraised with the legend Venite Ad Me Omnes. Next to the Main Building is the Basilica of the Sacred Heart. Immediately behind the basilica is the Grotto, a Marian place of prayer and reflection. It is a replica of the grotto at Lourdes, France where the Virgin Mary reputedly appeared to Saint Bernadette Soubirous in 1858. At the end of the main drive (and in a direct line that connects through 3 statues and the Gold Dome), is a simple, modern stone statue of Mary.",
+    "question": "To whom did the Virgin Mary allegedly appear in 1858 in Lourdes France?",
+    "answers": {
+        "text": [
+            "Saint Bernadette Soubirous"
+        ],
+        "answer_start": [
+            515
+        ]
+    }
+}
+```
+This structure is ideal for training models in context-based question answering, where the model learns to answer questions based on the input context.
+
+> [!TIP]
+> In this guide, we use the `SQuAD v1.1` dataset, but you can specify your own data as needed.
+
+## Train the Model
+
+To train the model, we use the NeMo Fine-tuning API. The full script for training is available in `Nemo VLM Automodel <https://github.com/NVIDIA/NeMo/blob/main/scripts/vlm/automodel.py>`_.
+
+You can directly run the fine-tuning script using the following command:
+.. code-block:: bash
+    python scripts/vlm/automodel.py --model google/gemma-3-4b-it --data_path naver-clova-ix/cord-v2
+
+At the core of the fine-tuning script is the `llm.finetune` function defined below:
