@@ -4,7 +4,7 @@
 
 During machine-learning experiments, the model-training routine regularly saves checkpoints. A checkpoint is a complete snapshot of a run that includes model weights, optimizer states, and other metadata required to resume training exactly where it left off. Writing these snapshots at regular intervals lets you recover quickly from crashes or pauses without losing progress.
 
-NeMo AutoModel checkpoints capture the complete state of a distributed training run (across multiple GPUs or nodes). This reduces memory overhead, improves GPU utilization, and allows training to be resumed with a different parallelism strategy
+NeMo AutoModel checkpoints capture the complete state of a distributed training run across multiple GPUs or nodes. This reduces memory overhead, improves GPU utilization, and allows training to be resumed with a different parallelism strategy.
 
 NeMo AutoModel writes checkpoints in two formats ([🤗 Safetensors](https://github.com/huggingface/safetensors) and [PyTorch Distributed Checkpointing (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html)) and in two layouts:
 
