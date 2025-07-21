@@ -105,7 +105,7 @@ print(pipe("The key to life is"))
 >>> [{'generated_text': 'The key to life is to be happy. The key to happiness is to be kind. The key to kindness is to be'}]
 ```
 
-While this uses the 🤗 Transformers API, we can use the `consolidated/` checkpoint with any of HF-compatible tool (e.g., vLLM, SGLang, etc).
+Although this example uses the Hugging Face Transformers API, the `consolidated/` checkpoint is compatible with any Hugging Face-compatible tool, such as vLLM, SGLang, and others.
 
 
 ## PEFT
