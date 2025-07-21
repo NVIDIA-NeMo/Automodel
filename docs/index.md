@@ -17,7 +17,7 @@ environment/cluster.md
 :hidden:
 
 model_coverage/llm.md
-model_coverage/vlm.rst
+model_coverage/vlm.md
 ```
 
 ```{toctree}
