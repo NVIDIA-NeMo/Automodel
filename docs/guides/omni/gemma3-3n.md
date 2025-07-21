@@ -256,7 +256,7 @@ After fine-tuning your Gemma 3 or Gemma 3n model, you can use it for inference o
 
 ### Generation Script
 
-The inference functionality is provided through [`examples/vlm/generate.py`](../../examples/vlm/generate.py), which supports loading fine-tuned checkpoints and performing image-text generation.
+The inference functionality is provided through [`examples/vlm/generate.py`](../../../examples/vlm/generate.py), which supports loading fine-tuned checkpoints and performing image-text generation.
 
 #### Basic Usage
 
