@@ -123,6 +123,7 @@ source = [".", "/workspace", "/home/runner/work/Automodel/Automodel"]
 omit = [
     "nemo_automodel/components/checkpoint/_backports/*.py",
     "tests/*",
+    "nemo_automodel/components/_peft/lora_kernel.py",
 ]
 
 [tool.ruff]

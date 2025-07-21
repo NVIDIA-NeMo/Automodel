@@ -393,13 +393,14 @@ def lora_da_dx_kernel(
     offs_la_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_dx_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_l = tl.arange(0, BLOCK_SIZE_L)
+
     dx_ptrs = dx_ptr + stride_dx_m * offs_dx_m[:, None] + stride_dx_l * offs_l[None, :]
-    dx_mask = (offs_dx_m[:, None] < M) & (offs_l[None, :] < L)
-
     la_ptrs = a_ptr + stride_loraa_n * offs_la_n[:, None] + stride_loraa_l * offs_l[None, :]
-    la_mask = (offs_la_n[:, None] < N) & (offs_l[None, :] < L)
 
-    for _ in tl.range(0, tl.cdiv(L, BLOCK_SIZE_L)):
+    for lx in tl.range(0, tl.cdiv(L, BLOCK_SIZE_L)):
+        dx_mask = (offs_dx_m[:, None] < M) & (offs_l[None, :] < L - lx * BLOCK_SIZE_L)
+        la_mask = (offs_la_n[:, None] < N) & (offs_l[None, :] < L - lx * BLOCK_SIZE_L)
+
         lora_a = tl.load(la_ptrs, mask=la_mask, other=0.0)
         dx = tl.dot(dyb, lora_a)
         dx = dx.to(a_ptr.dtype.element_ty)
