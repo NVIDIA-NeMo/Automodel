@@ -5,9 +5,7 @@ Large Language Models (LLMs) power a variety of tasks such as dialogue systems, 
 NeMo AutoModel provides a simple interface for loading and fine-tuning LLMs hosted on the Hugging Face Hub.
 
 ## Run LLMs with NeMo Automodel
-To run LLMs with NeMo AutoModel, please use at least version `25.07` of the NeMo container.
-If the model you want to finetune is available on a newer version of transformers, you may need
-to upgrade to the latest NeMo Automodel with:
+To run LLMs with NeMo AutoModel, make sure you're using NeMo container version `25.07` or later. If the model you intend to fine-tune requires a newer version of Transformers, you may need to upgrade to the latest version of NeMo AutoModel by using:
 
 ```bash
 
