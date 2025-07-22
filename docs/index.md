@@ -4,7 +4,7 @@
 
 ```{toctree}
 
-:caption: Getting Started
+:caption: Get Started
 :hidden:
 
 repository_structure.md
