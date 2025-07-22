@@ -19,7 +19,7 @@ This module provides utilities for handling tensor operations across different d
 and distributed tensor types, with optimizations for performance in distributed training scenarios.
 """
 
-from typing import Union, Iterable
+from typing import Iterable, Union
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -49,14 +49,13 @@ def get_cpu_state_dict(
         if len(val.shape) == 0:
             new_state_dict[k] = val.cpu()
         else:
-            cpu_tensor = torch.empty(
-                *val.shape, device="cpu", pin_memory=pin_memory, dtype=val.dtype
-            )
+            cpu_tensor = torch.empty(*val.shape, device="cpu", pin_memory=pin_memory, dtype=val.dtype)
             cpu_tensor.copy_(val, non_blocking=True)
             new_state_dict[k] = cpu_tensor
 
     torch.cuda.synchronize()
     return new_state_dict
+
 
 def to_cpu(v):
     """
@@ -97,6 +96,7 @@ def to_cpu(v):
         return v.cpu()
     else:
         return v
+
 
 def to_local_if_dtensor(tensor: Union[torch.Tensor, DTensor]) -> torch.Tensor:
     """Returns the local shard of the given tensor if it is a DTensor.

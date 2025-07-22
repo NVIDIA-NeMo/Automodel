@@ -17,22 +17,20 @@ import signal
 from contextlib import contextmanager
 from functools import lru_cache
 from types import FunctionType
-from typing import Dict, Generator, List, Optional, Union, Any
+from typing import Any, Dict, Generator, List, Optional, Union
 
 import torch
-from torch import Tensor, nn
-from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
+from torch.distributed.device_mesh import DeviceMesh, _mesh_resources
 from torch.distributed.fsdp import (
-    fully_shard,
     CPUOffloadPolicy,
     FSDPModule,
     MixedPrecisionPolicy,
+    fully_shard,
 )
-from torch.distributed.device_mesh import DeviceMesh, _mesh_resources
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     ParallelStyle,
@@ -40,6 +38,7 @@ from torch.distributed.tensor.parallel import (
     SequenceParallel,
     parallelize_module,
 )
+from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
 
 # Import model-specific tensor parallel plans from the dedicated module
@@ -135,9 +134,7 @@ def get_hf_tp_shard_plan(model):
         hf_tp_plan.update(model._tp_plan)
 
     if hasattr(inner_model, "_tp_plan") and inner_model._tp_plan is not None:
-        hf_tp_plan.update(
-            {f"{model_prefix}.{k}": v for k, v in inner_model._tp_plan.items()}
-        )
+        hf_tp_plan.update({f"{model_prefix}.{k}": v for k, v in inner_model._tp_plan.items()})
 
     assert len(hf_tp_plan) > 0, (
         f"Hugging Face tp plan is not supported for {model_cls}, please set dtensor_cfg.tensor_parallel_size to 1 or provide a custom_parallel_plan. "
@@ -145,22 +142,13 @@ def get_hf_tp_shard_plan(model):
     )
 
     # hf tp plan not contain embed_tokens, we add it and set to rowwise_rep
-    if (
-        f"{model_prefix}.embed_tokens" not in hf_tp_plan
-        and not model.config.tie_word_embeddings
-    ):
+    if f"{model_prefix}.embed_tokens" not in hf_tp_plan and not model.config.tie_word_embeddings:
         hf_tp_plan[f"{model_prefix}.embed_tokens"] = "rowwise_rep"
 
     for k, v in hf_tp_plan.items():
         # speed up the tp plan for lm_head
-        if (
-            k == "lm_head"
-            and v == "colwise_rep"
-            and not model.config.tie_word_embeddings
-        ):
-            hf_tp_plan[k] = ColwiseParallel(
-                output_layouts=Shard(-1), use_local_output=False
-            )
+        if k == "lm_head" and v == "colwise_rep" and not model.config.tie_word_embeddings:
+            hf_tp_plan[k] = ColwiseParallel(output_layouts=Shard(-1), use_local_output=False)
         else:
             hf_tp_plan[k] = translate_to_torch_parallel_style(v)
 
@@ -184,10 +172,10 @@ def import_class_from_path(name: str) -> Any:
 def import_classes_from_paths(class_paths: List[str]):
     """
     Helper function to import classes from string paths.
-    
+
     Args:
         class_paths (List[str]): The list of string paths to the classes.
-    
+
     Returns:
         List of imported classes.
     """
@@ -205,14 +193,12 @@ def import_classes_from_paths(class_paths: List[str]):
 def translate_to_torch_parallel_style(style: str):
     """
     Translates string descriptions to parallelism plans.
-    
+
     In model configurations, we use a neutral type (string) to specify parallel
     styles, here we translate them into torch.distributed tensor-parallel
     types.
     """
-    assert isinstance(style, str), (
-        f"parallel style type should be str, but got {type(style)}"
-    )
+    assert isinstance(style, str), f"parallel style type should be str, but got {type(style)}"
 
     if style == "colwise":
         return ColwiseParallel()
@@ -264,7 +250,7 @@ def fsdp2_strategy_parallelize(
         sequence_parallel (bool): Whether to use sequence parallelism. Defaults to False.
         activation_checkpointing (bool): Whether to use activation checkpointing. Defaults to False.
         cpu_offload (bool): Whether to enable cpu offloading for FSDP. Defaults to False.
-        tp_shard_plan (Optional[Union[Dict[str, ParallelStyle], str]]): 
+        tp_shard_plan (Optional[Union[Dict[str, ParallelStyle], str]]):
             Custom tensor parallel plan for the model. Can be:
             - A dictionary mapping module names to parallel styles
             - A string path to a dictionary or function that returns a dictionary
@@ -295,7 +281,11 @@ def fsdp2_strategy_parallelize(
 
     # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
     dp_mesh = device_mesh[
-        (dp_cp_mesh_name if dp_cp_mesh_name in _mesh_resources.root_to_flatten_mapping.get(device_mesh, {}) else dp_mesh_name)
+        (
+            dp_cp_mesh_name
+            if dp_cp_mesh_name in _mesh_resources.root_to_flatten_mapping.get(device_mesh, {})
+            else dp_mesh_name
+        )
     ]
 
     if dp_mesh.size() > 1:
@@ -349,24 +339,15 @@ def fsdp2_strategy_parallelize(
                 model_parallel_plan = func(model, sequence_parallel)
                 print("Using optimized parallel plan.")
             except Exception as e:
-                print(
-                    f"Optimized parallel plan is not available: {e}. Falling back to the HF tp plan."
-                )
-                assert not sequence_parallel, (
-                    "sequence_parallel is not supported in HF tp plan."
-                )
+                print(f"Optimized parallel plan is not available: {e}. Falling back to the HF tp plan.")
+                assert not sequence_parallel, "sequence_parallel is not supported in HF tp plan."
                 model_parallel_plan = get_hf_tp_shard_plan(model)
 
         # 3. Use HF TP plan as fallback
         else:
             if model_cls not in PARALLELIZE_FUNCTIONS:
-                print(
-                    f"Optimized parallel plan is not supported for {model_cls}. "
-                    "Falling back to the HF tp plan."
-                )
-            assert not sequence_parallel, (
-                "sequence_parallel is not supported in HF tp plan."
-            )
+                print(f"Optimized parallel plan is not supported for {model_cls}. Falling back to the HF tp plan.")
+            assert not sequence_parallel, "sequence_parallel is not supported in HF tp plan."
             model_parallel_plan = get_hf_tp_shard_plan(model)
 
         # Apply tensor parallelism
@@ -376,7 +357,7 @@ def fsdp2_strategy_parallelize(
     # Apply activation checkpointing to MLP layers if requested
     if activation_checkpointing:
         for i, layer in enumerate(layers):
-            if hasattr(layer, 'mlp'):
+            if hasattr(layer, "mlp"):
                 layers[i].mlp = checkpoint_wrapper(layer.mlp)
 
     # Set up mixed precision policy
@@ -389,11 +370,7 @@ def fsdp2_strategy_parallelize(
 
     # Set up offload policy
     if not offload_policy:
-        offload_policy = (
-            CPUOffloadPolicy(pin_memory=False)
-            if cpu_offload
-            else None
-        )
+        offload_policy = CPUOffloadPolicy(pin_memory=False) if cpu_offload else None
 
     # FSDP sharding
     assert dp_mesh.ndim == 1, "Hybrid-sharding not supported"
@@ -402,7 +379,7 @@ def fsdp2_strategy_parallelize(
     apply_fsdp_sharding_recursively(model, dp_mesh, mp_policy, offload_policy)
 
     # Apply FSDP to the root model
-    # Do not reshard after forward for root model because its parameters 
+    # Do not reshard after forward for root model because its parameters
     # will be used in backward immediately
     model = fully_shard(
         model,
@@ -436,7 +413,7 @@ def nvfsdp_strategy_parallelize(
     fsdp_double_buffer: bool = False,
     dp_mesh_name: str = "data_parallel",
     cp_mesh_name: str = "context_parallel",
-    tp_mesh_name: str = "tensor_parallel", 
+    tp_mesh_name: str = "tensor_parallel",
 ):
     """
     Apply tensor/data parallelism (nvFSDP) and optional activation-checkpointing to the model.
@@ -572,4 +549,3 @@ def unshard_fsdp2_model(model: nn.Module) -> Generator[None, None, None]:
         for module in model.modules():
             if isinstance(module, FSDPModule):
                 module.reshard()
-

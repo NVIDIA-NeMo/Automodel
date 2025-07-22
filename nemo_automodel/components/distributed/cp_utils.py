@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import contextlib
-from typing import List, Set, Optional
+from typing import List, Optional, Set
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh

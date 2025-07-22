@@ -118,7 +118,7 @@ class TestSlidingWindowOverwrite:
 
         for model_name in model_names:
             result = sliding_window_overwrite(model_name)
-            
+
             # Assert the expected override dictionary is returned
             assert result == {"sliding_window": None}
 
@@ -144,7 +144,7 @@ class TestSlidingWindowOverwrite:
         """Test that hasattr is used correctly to check for attributes."""
         # Create a mock config that behaves correctly with hasattr
         mock_config = Mock()
-        
+
         # Test case where hasattr returns False for use_sliding_window
         mock_config.configure_mock(**{"use_sliding_window": Mock(side_effect=AttributeError)})
         mock_from_pretrained.return_value = mock_config
@@ -164,4 +164,4 @@ class TestSlidingWindowOverwrite:
         result = sliding_window_overwrite(model_name)
 
         # Should return empty dict when use_sliding_window is not exactly False
-        assert result == {} 
+        assert result == {}

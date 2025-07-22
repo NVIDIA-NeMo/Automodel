@@ -43,11 +43,7 @@ def clip_grad_by_total_norm_(
         parameters = [parameters]
 
     # Grads.
-    grads = [
-        to_local_if_dtensor(p.grad.detach()).to(dtype)
-        for p in parameters
-        if p.grad is not None
-    ]
+    grads = [to_local_if_dtensor(p.grad.detach()).to(dtype) for p in parameters if p.grad is not None]
 
     # Scale.
     clip_coeff = max_grad_norm / (total_norm + 1.0e-6)
@@ -85,11 +81,7 @@ def get_grad_norm(
         parameters = [parameters]
 
     # Grads.
-    grads_for_norm = [
-        to_local_if_dtensor(p.grad.detach()).to(dtype)
-        for p in parameters
-        if p.grad is not None
-    ]
+    grads_for_norm = [to_local_if_dtensor(p.grad.detach()).to(dtype) for p in parameters if p.grad is not None]
 
     # Norm parameters.
     norm_type = float(norm_type)
@@ -98,17 +90,11 @@ def get_grad_norm(
     # Calculate norm.
     if norm_type == torch.inf:
         total_norm = max(grad.abs().max().item() for grad in grads_for_norm)
-        total_norm_cuda = torch.tensor(
-            [float(total_norm)], dtype=torch.float, device="cuda"
-        )
+        total_norm_cuda = torch.tensor([float(total_norm)], dtype=torch.float, device="cuda")
         # Take max across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
-        torch.distributed.all_reduce(
-            total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=dp_cp_group
-        )
+        torch.distributed.all_reduce(total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=dp_cp_group)
 
-        torch.distributed.all_reduce(
-            total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=tp_group
-        )
+        torch.distributed.all_reduce(total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=tp_group)
         total_norm = total_norm_cuda[0].item()
 
     else:
@@ -118,13 +104,9 @@ def get_grad_norm(
 
         total_norm = total_norm.cuda()  # type: ignore
         # Sum across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
-        torch.distributed.all_reduce(
-            total_norm, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group
-        )
+        torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group)
 
-        torch.distributed.all_reduce(
-            total_norm, op=torch.distributed.ReduceOp.SUM, group=tp_group
-        )
+        torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.SUM, group=tp_group)
         total_norm = total_norm.item() ** (1.0 / norm_type)  # type: ignore
 
     return total_norm

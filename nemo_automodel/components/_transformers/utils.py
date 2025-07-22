@@ -16,6 +16,7 @@ from typing import Any
 
 from transformers import AutoConfig
 
+
 def sliding_window_overwrite(model_name: str) -> dict[str, Any]:
     """Returns configuration overrides to handle sliding window settings based on model rules.
 
@@ -30,16 +31,11 @@ def sliding_window_overwrite(model_name: str) -> dict[str, Any]:
 
     # Override sliding_window setting to address a HF mismatch relevant to use_sliding_window
     # TODO(@zhiyul): remove this once the bug is fixed https://github.com/huggingface/transformers/issues/38002
-    if (
-        hasattr(hf_config, "use_sliding_window")
-        and hf_config.use_sliding_window == False
-    ):
+    if hasattr(hf_config, "use_sliding_window") and hf_config.use_sliding_window == False:
         assert hasattr(hf_config, "sliding_window")
         overwrite_dict = {
             "sliding_window": None,
         }
-        print(
-            f"use_sliding_window=False in config - overriding sliding_window parameter to None: {overwrite_dict}"
-        )
+        print(f"use_sliding_window=False in config - overriding sliding_window parameter to None: {overwrite_dict}")
 
     return overwrite_dict
