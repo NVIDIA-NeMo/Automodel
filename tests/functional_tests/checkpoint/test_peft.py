@@ -32,7 +32,7 @@ from transformers import AutoModelForCausalLM
 from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction
+from nemo_automodel.recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction, calculate_loss
 
 
 def load_dcp(ckpt_dir: Path | str) -> dict[str, torch.Tensor]:
@@ -99,7 +99,12 @@ def get_validation_loss(
 
     with torch.no_grad():
         out = model(**val_batch)
-        loss = loss_fn(out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum")
+        loss = calculate_loss(
+                loss_fn,
+                logits=out.logits,
+                labels=labels,
+                mask=loss_mask,
+            )
         return loss
 
 

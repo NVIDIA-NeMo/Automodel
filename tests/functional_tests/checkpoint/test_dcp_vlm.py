@@ -26,7 +26,7 @@ import torch.nn as nn
 
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
+from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM, calculate_loss
 
 
 def get_validation_loss(
@@ -42,7 +42,12 @@ def get_validation_loss(
 
     with torch.no_grad():
         out = model(**val_batch)
-        loss = loss_fn(out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum")
+        loss = calculate_loss(
+                loss_fn,
+                logits=out.logits,
+                labels=labels,
+                mask=loss_mask,
+            )
         return loss
 
 

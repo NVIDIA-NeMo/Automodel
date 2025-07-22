@@ -43,7 +43,8 @@ distributed:
   tp_size: 1
   cp_size: 1
 
-loss_fn: nemo_automodel.components.loss.masked_ce.masked_cross_entropy
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset

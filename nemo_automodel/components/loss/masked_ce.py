@@ -11,40 +11,61 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 
 
-def masked_cross_entropy(logits, targets, mask=None, fp32_upcast=True, ignore_index=-100, reduction="mean"):
-    """
-    Compute the masked cross-entropy loss between logits and targets.
+class MaskedCrossEntropy:
+    def __init__(self, fp32_upcast: bool = True, ignore_index: int = -100, reduction: str = "sum"):
+        """
+        Masked cross-entropy loss.
 
-    If a mask is provided, the loss is computed per element, multiplied by the mask,
-    and then averaged. If no mask is provided, the standard cross-entropy loss is used.
+        Args:
+            fp32_upcast (bool): if True it will cast logits to float32 before computing
+                cross entropy. Default: True.
+            ignore_index (int): label to ignore in CE calculation. Defaults to -100.
+            reduction (str): type of reduction. Defaults to "sum".
+        """
+        self.fp32_upcast = fp32_upcast
+        self.ignore_index = ignore_index
+        self.reduction = reduction
 
-    Args:
-        logits (torch.Tensor): The predicted logits with shape (N, C) where C is the number of classes.
-        targets (torch.Tensor): The ground truth class indices with shape (N,).
-        mask (torch.Tensor, optional): A tensor that masks the loss computation. Items marked with
-            1 will be used to calculate loss, otherwise ignored. Must be broadcastable to the shape
-            of the loss. Defaults to None.
-        fp32_upcast (bool, optional): if True it will cast logits to float32 before computing
-        cross entropy. Default: True.
-        ignore_index (int): label to ignore in CE calculation. Defaults to -100.
-        reduction (str): type of reduction. Defaults to "mean".
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute the masked cross-entropy loss between logits and targets.
 
-    Returns:
-        torch.Tensor: The computed loss as a scalar tensor.
-    """
-    # this may happen with CPUOffloadPolicy
-    if targets.device != logits.device:
-        targets = targets.to(logits.device)
-    if mask is not None:
-        with torch.no_grad():
-            if mask.device != targets.device:
-                mask = mask.to(targets.device)
-            targets.masked_fill_(mask.view(-1) == 0, ignore_index)
-            del mask
-    if fp32_upcast:
-        logits = logits.float()
-    return F.cross_entropy(logits, targets, reduction=reduction)
+        If a mask is provided, the loss is computed per element, multiplied by the mask,
+        and then averaged. If no mask is provided, the standard cross-entropy loss is used.
+
+        Args:
+            logits (torch.Tensor): The predicted logits with shape [batch_size, seq_len, vocab_size] where C is the number of classes.
+            labels (torch.Tensor): The ground truth class indices with shape [batch_size, seq_len].
+            mask (torch.Tensor, optional): A tensor that masks the loss computation. Items marked with
+                1 will be used to calculate loss, otherwise ignored. Must be broadcastable to the shape
+                of the loss. Defaults to None.
+
+        Returns:
+            torch.Tensor: The computed loss as a scalar tensor.
+        """
+        # this may happen with CPUOffloadPolicy
+        if labels.device != logits.device:
+            labels = labels.to(logits.device)
+        # reshape to (N, C) and (N,) respectively
+        logits = logits.view(-1, logits.size(-1))
+        labels = labels.view(-1)
+        if mask is not None:
+            with torch.no_grad():
+                if mask.device != labels.device:
+                    mask = mask.to(labels.device)
+                labels.masked_fill_(mask.view(-1) == 0, self.ignore_index)
+                del mask
+        if self.fp32_upcast:
+            logits = logits.float()
+        return F.cross_entropy(logits, labels, reduction=self.reduction)
