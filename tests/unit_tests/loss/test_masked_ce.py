@@ -15,12 +15,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.loss.masked_ce import masked_cross_entropy
+from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 
 
 def test_masked_cross_entropy_no_mask():
     """
-    Tests masked_cross_entropy with no mask against baseline.
+    Tests MaskedCrossEntropy with no mask against baseline.
     """
     # Create dummy data
     batch_size = 4
@@ -30,10 +30,10 @@ def test_masked_cross_entropy_no_mask():
     targets = torch.randint(high=num_classes, size=(batch_size,))
 
     # Compute loss with our function
-    loss_custom = masked_cross_entropy(logits, targets, mask=None)
+    loss_custom = MaskedCrossEntropy()(logits, targets, mask=None)
 
     # Compute baseline cross-entropy
-    loss_ref = F.cross_entropy(logits, targets)
+    loss_ref = F.cross_entropy(logits, targets, reduction="sum")
 
     # They should be very close
     assert torch.allclose(loss_custom, loss_ref), (
@@ -43,7 +43,7 @@ def test_masked_cross_entropy_no_mask():
 
 def test_masked_cross_entropy_with_mask():
     """
-    Tests masked_cross_entropy with mask against baseline.
+    Tests MaskedCrossEntropy with mask against baseline.
     """
     # Create dummy data
     batch_size = 4
@@ -54,12 +54,12 @@ def test_masked_cross_entropy_with_mask():
     mask = torch.tensor([1, 0, 1, 0])  # Only positions 0 and 2 are used
 
     # Our loss
-    loss_custom = masked_cross_entropy(logits, targets, mask=mask)
+    loss_custom = MaskedCrossEntropy()(logits, targets, mask=mask)
 
     # Reference: Manually mask out positions by setting target to -100
     targets_ref = targets.clone()
     targets_ref[mask == 0] = -100
-    loss_ref = F.cross_entropy(logits, targets_ref)
+    loss_ref = F.cross_entropy(logits, targets_ref, reduction="sum")
 
     assert torch.allclose(loss_custom, loss_ref), (
         f"Loss with mask expected {loss_ref.item():.4f}, but got {loss_custom.item():.4f}"
@@ -69,7 +69,7 @@ def test_masked_cross_entropy_with_mask():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_masked_cross_entropy_gpu():
     """
-    Tests masked_cross_entropy with mask against baseline on GPU.
+    Tests MaskedCrossEntropy with mask against baseline on GPU.
     """
     # Same test as above, but on GPU
     device = torch.device("cuda")
@@ -80,7 +80,7 @@ def test_masked_cross_entropy_gpu():
     targets = torch.randint(high=num_classes, size=(batch_size,), device=device)
     mask = torch.tensor([1, 0, 1, 1], device=device)
 
-    loss_gpu = masked_cross_entropy(logits, targets, mask=mask)
+    loss_gpu = MaskedCrossEntropy()(logits, targets, mask=mask)
     assert loss_gpu.dtype == torch.float32  # By default it should be FP32 once cast
 
     # Double-check it runs without error
