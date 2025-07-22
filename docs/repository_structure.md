@@ -32,7 +32,7 @@ $ tree -L 1 nemo_automodel/components/
 ├── checkpoint/     - Checkpoint save / load related logic.
 ├── config/         - Utils to load yamls and CLI parsing helpers.
 ├── datasets/       - LLM and VLM datasets and utils (collate functions, preprocessing).
-├── distributed/    - Distributed processing primited (DDP, FSDP2, nvFSDP).
+├── distributed/    - Distributed processing primitives (DDP, FSDP2, nvFSDP).
 ├── launcher/       - Job launcher for interactive and batch (slurm, k8s) processing.
 ├── loggers/        - Metric/event logging for Weights&Biases, etc.
 ├── loss/           - Loss function (e.g., cross-entropy, linear cross-entropy, etc).
