@@ -140,6 +140,5 @@ cd automodel_test_repo/
 automodel llm finetune -c examples/llm/llama_3_2_1b_squad.yaml --nproc-per-node=2
 ```
 
-Will launch the job using the source code contained in the `automodel_test_repo` directory, instead
-of the one contained in the docker image.
+This will launch the job using the source code contained in the `automodel_test_repo` directory instead of the version bundled in the Docker image.
 <!-- The [Automodel CLI guide](docs/automodel_cli.md) provides an in-depth explanation of the automodel util. -->
