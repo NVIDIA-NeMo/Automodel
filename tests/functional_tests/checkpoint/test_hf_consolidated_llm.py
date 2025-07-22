@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # pylint: disable=line-too-long
-"""Tests for consolidated HF safetensors checkpointing."""
+"""Tests for consolidated HF safetensors checkpointing for LLM."""
 
 import os
 import shutil
@@ -29,7 +29,7 @@ from transformers import AutoModelForCausalLM
 from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction
+from nemo_automodel.recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction, calculate_loss
 
 
 
@@ -97,13 +97,18 @@ def get_validation_loss(
 
     with torch.no_grad():
         out = model(**val_batch)
-        loss = loss_fn(out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum")
+        loss = calculate_loss(
+                loss_fn,
+                logits=out.logits,
+                labels=labels,
+                mask=loss_mask,
+            )
         return loss
 
 
-def test_hf_sharded_checkpoint():
+def test_consolidated_llm_checkpoint():
     """
-    Tests HF sharded checkpoint
+    Tests HF consolidated checkpoint for LLM.
     """
     expected_model_keys = {
         "model.embed_tokens.weight": ([16000, 512], torch.bfloat16, "cpu"),
@@ -779,6 +784,13 @@ def test_hf_sharded_checkpoint():
         "model/shard-00001-model-00001-of-00001.safetensors",
         "model/shard-00002-model-00001-of-00001.safetensors",
         "model/consolidated/model-00001-of-00001.safetensors",
+        "model/consolidated/config.json",
+        "model/consolidated/model.safetensors.index.json",
+        "model/consolidated/config.json",
+        "model/consolidated/tokenizer_config.json",
+        "model/consolidated/tokenizer.json",
+        "model/consolidated/special_tokens_map.json",
+        "model/consolidated/model.safetensors.index.json",
         "optim/__0_0.distcp",
         "optim/__1_0.distcp",
         "optim/.metadata",
@@ -908,11 +920,11 @@ def test_hf_sharded_checkpoint():
         v = model_state_dict[k]
         if isinstance(v, torch.distributed.tensor.DTensor):
             v = v.full_tensor().cpu()
-        assert k.replace("model.", "") if "lm_head" in k else k in restored_model_dict_consolidated, (
+        assert k in restored_model_dict_consolidated, (
             f"Key {k} not found in restored model state"
         )
         assert isinstance(
-            restored_model_dict_consolidated[k.replace("model.", "") if "lm_head" in k else k],
+            restored_model_dict_consolidated[k],
             torch.Tensor,
         ), f"Value for key {k} is not a tensor"
 
@@ -920,7 +932,7 @@ def test_hf_sharded_checkpoint():
         expected_shape, expected_dtype, expected_device = expected_model_keys[k]
         expected_shape[0] *= 2  # since the hardcoded shapes are for sharded Tensors
 
-        full_shard = restored_model_dict_consolidated[k.replace("model.", "") if "lm_head" in k else k]
+        full_shard = restored_model_dict_consolidated[k]
 
         assert list(full_shard.shape) == expected_shape, (
             f"Shape mismatch for key {k}. Expected shape {expected_shape} but got {full_shard.shape}"

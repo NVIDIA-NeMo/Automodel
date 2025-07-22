@@ -13,6 +13,14 @@ environment/cluster.md
 -->
 
 ```{toctree}
+:caption: Model Coverage
+:hidden:
+
+model_coverage/llm.md
+model_coverage/vlm.md
+```
+
+```{toctree}
 :caption: 🚀 E2E Examples
 :hidden:
 
@@ -26,6 +34,8 @@ guides/omni/gemma3-3n.md
 :hidden:
 
 guides/dataset.md
+guides/checkpointing.md
+guides/gemma3n_blog.md
 ```
 
 ```{toctree}

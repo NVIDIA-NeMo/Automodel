@@ -40,7 +40,7 @@ In this guide, we will fine-tune Meta’s `LLaMA 3.2 1B` model on the popular [S
 > ```bash
 > pip3 install nemo-automodel
 > ```
-> For a complete guide and additional options please consult the Automodel [installation guide](installation.md).
+> For a complete guide and additional options please consult the Automodel [installation guide](../installation.md).
 
 
 
@@ -190,7 +190,8 @@ distributed:
   cp_size: 1
   sequence_parallel: false
 
-loss_fn: nemo_automodel.components.loss.masked_ce.masked_cross_entropy
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

@@ -32,7 +32,7 @@ from transformers import AutoModelForCausalLM
 from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction
+from nemo_automodel.recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction, calculate_loss
 
 
 def load_dcp(ckpt_dir: Path | str) -> dict[str, torch.Tensor]:
@@ -99,11 +99,16 @@ def get_validation_loss(
 
     with torch.no_grad():
         out = model(**val_batch)
-        loss = loss_fn(out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum")
+        loss = calculate_loss(
+                loss_fn,
+                logits=out.logits,
+                labels=labels,
+                mask=loss_mask,
+            )
         return loss
 
 
-def test_hf_peft_checkpoint():
+def test_hf_peft_checkpoint(use_triton=False):
     """
     Tests HF PEFT checkpoint
     """
@@ -1833,6 +1838,10 @@ def test_hf_peft_checkpoint():
 
     script_path = Path(__file__).parent.resolve()
     cfg = parse_args_and_load_config(script_path / "llama_3_2_1b_hellaswag_peft.yaml")
+
+    # set use_triton value based on parsed input
+    expected_automodel_peft_config["use_triton"] = cfg.peft.use_triton
+
     trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
@@ -1860,6 +1869,9 @@ def test_hf_peft_checkpoint():
         "model/adapter_model.safetensors",
         "model/adapter_config.json",
         "model/automodel_peft_config.json",
+        "model/tokenizer_config.json",
+        "model/tokenizer.json",
+        "model/special_tokens_map.json",
         "optim/__0_0.distcp",
         "optim/__1_0.distcp",
         "optim/.metadata",

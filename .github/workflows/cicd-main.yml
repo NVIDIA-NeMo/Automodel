@@ -138,10 +138,12 @@ jobs:
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
           - script: L2_HF_DCP_FSDP2_Checkpoint
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_Consolidated_FSDP2_Checkpoint
+          - script: L2_HF_Consolidated_FSDP2_LLM_Checkpoint
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-#          - script: L2_HF_PEFT_Triton_FSDP2_Checkpoint
-#            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+          - script: L2_HF_Consolidated_FSDP2_VLM_Checkpoint
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+          - script: L2_HF_PEFT_Triton_FSDP2_Checkpoint
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
           - script: L2_HF_PEFT_FSDP2_Checkpoint
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
           - script: L2_HF_Transformer_VLM_SFT
@@ -153,6 +155,10 @@ jobs:
           - script: L2_HF_DCP_VLM_FSDP2_Checkpoint
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
           - script: L2_HF_PEFT_VLM_FSDP2_Checkpoint
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+          - script: L2_HF_Transformer_VLM_Fused_CE_SFT
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+          - script: L2_HF_Transformer_Fused_CE_SFT
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
     needs: [cicd-unit-tests]
     runs-on: ${{ matrix.runner }}

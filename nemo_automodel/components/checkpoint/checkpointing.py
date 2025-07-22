@@ -34,10 +34,14 @@ from nemo_automodel.components.checkpoint._backports.hf_storage import (
     _HuggingFaceStorageWriter,
     get_fqn_to_file_index_mapping,
 )
-from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
+from nemo_automodel.components.checkpoint.stateful_wrappers import (
+    ModelState,
+    OptimizerState,
+)
 
 if TYPE_CHECKING:
     from peft import PeftConfig
+    from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 
 @dataclass
@@ -67,6 +71,7 @@ def save_model(
     weights_path: str,
     checkpoint_config: CheckpointingConfig,
     peft_config: Optional["PeftConfig"] = None,
+    tokenizer: Optional["PreTrainedTokenizerBase"] = None,
 ):
     """
     Save a model state dictionary to a weights path.
@@ -79,6 +84,8 @@ def save_model(
         model: Model to save
         weights_path: Path to save model weights
         checkpoint_config: Checkpointing configuration
+        peft_config: PEFT config
+        tokenizer: Tokenizer. Only saved if checkpoint_config.save_consolidated is True.
     """
     # We also need to eventually add suport for HSDP, so we only save on non-duplicate ranks.
     model_path = os.path.join(weights_path, "model")
@@ -99,6 +106,10 @@ def save_model(
             with open(os.path.join(consolidated_model_path, "config.json"), "w") as f:
                 f.write(model.config.to_json_string())
 
+            # save the tokenizer
+            if tokenizer is not None:
+                tokenizer.save_pretrained(consolidated_model_path)
+
     # Ensure all ranks wait for rank 0 to handle directories
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
@@ -108,8 +119,13 @@ def save_model(
     if checkpoint_config.is_peft:
         assert peft_config is not None, "PEFT config needs to be provided when checkpointing PEFT models."
         _save_peft_adapters(model_state, peft_config, model_path)
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            # save the tokenizer
+            if tokenizer is not None:
+                tokenizer.save_pretrained(model_path)
 
     elif checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
+        model_state_dict = model_state.state_dict()
         fqn_to_file_index_mapping = None
         if checkpoint_config.save_consolidated:
             # we first need to find the FQN -> .safetensors mapping
@@ -118,20 +134,20 @@ def save_model(
                 checkpoint_config.model_repo_id,
             )
             if index_path:
-                fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(index_path)
+                # HF VLM models may contain a special checkpoint mapping attribute
+                fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(
+                    index_path, getattr(model, "_checkpoint_conversion_mapping", None)
+                )
+            else:
+                fqn_to_file_index_mapping = {k: 1 for k in model_state_dict.keys()}
 
-                # Add any missing keys from the model_state_dict
-                # These will go to the same file as the last file (or file 1 for single-file models)
-                default_index = max(fqn_to_file_index_mapping.values())
+            # Add any missing keys from the model_state_dict
+            # These will go to the same file as the last file (or file 1 for single-file models)
+            default_index = max(fqn_to_file_index_mapping.values())
 
-                # TODO:(@adil-a): This will need to change when we add PP. Maybe we can cache the keys in ModelState.
-                for fqn in list(model.state_dict().keys()):
-                    if fqn not in fqn_to_file_index_mapping:
-                        if model_state.is_tied_lm_head and fqn == "lm_head.weight":
-                            continue
-                        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                            print(f"Adding missing key to mapping: {fqn}")
-                        fqn_to_file_index_mapping[fqn] = default_index
+            # TODO:(@adil-a): This will need to change when we add PP. Maybe we can cache the keys in ModelState.
+            for fqn in list(model_state_dict.keys()):
+                fqn_to_file_index_mapping[fqn] = fqn_to_file_index_mapping.get(fqn, default_index)
 
         storage_writer = _HuggingFaceStorageWriter(
             path=model_path,
@@ -139,9 +155,8 @@ def save_model(
             consolidated_output_path=consolidated_model_path,
             fqn_to_index_mapping=fqn_to_file_index_mapping,
         )
-
         dcp.save(
-            model_state.state_dict(),
+            model_state_dict,
             checkpoint_id=model_path,
             storage_writer=storage_writer,
         )

@@ -93,7 +93,7 @@ def test_build_parser(monkeypatch):
     assert parser is not None
 
 
-def test_launch_with_slurm(monkeypatch):
+def test_launch_with_slurm(monkeypatch, tmp_path):
     mock_script = "some_script.py"
     mock_config = "some_config.yaml"
     mock_slurm_config = {"nodes": 1}
@@ -104,6 +104,11 @@ def test_launch_with_slurm(monkeypatch):
         domain="llm",
         command="finetune",
     )
+    
+    # Create a temporary repo_root directory that exists
+    repo_root = tmp_path / "repo_root"
+    repo_root.mkdir()
+    
     monkeypatch.setattr(module, "load_yaml", lambda x: {"slurm": mock_slurm_config})
     monkeypatch.setitem(
         sys.modules,
@@ -140,12 +145,15 @@ def test_launch_with_slurm(monkeypatch):
     import nemo_automodel.components.launcher.slurm.utils as slurm_utils
     monkeypatch.setattr(slurm_utils, "submit_slurm_job", fake_submit_slurm_job)
     job_dir = '/tmp/a/0123456789/'
-    module.launch_with_slurm(dummy_args, job_dir +'y.conf', job_dir, slurm_config={})
+    
+    # Provide a valid repo_root in slurm_config to avoid the path detection logic
+    slurm_config_with_repo = {"repo_root": str(repo_root)}
+    module.launch_with_slurm(dummy_args, job_dir +'y.conf', job_dir, slurm_config=slurm_config_with_repo)
 
     # maybe separate test?
     with pytest.raises(AssertionError, match='Expected last dir to be unix timestamp'):
         job_dir = '/tmp/a/123456789/'
-        module.launch_with_slurm(dummy_args, job_dir +'y.conf', job_dir, slurm_config={})
+        module.launch_with_slurm(dummy_args, job_dir +'y.conf', job_dir, slurm_config=slurm_config_with_repo)
 
 def test_main_single_node(monkeypatch, tmp_yaml_file):
     config_path = tmp_yaml_file

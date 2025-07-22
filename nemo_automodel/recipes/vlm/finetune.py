@@ -26,6 +26,7 @@ import wandb
 from torch.distributed.device_mesh import _mesh_resources
 from torch.utils.data import DataLoader
 from transformers import AutoProcessor
+from transformers.processing_utils import ProcessorMixin
 from wandb import Settings
 
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
@@ -37,6 +38,7 @@ from nemo_automodel.components.distributed.init_utils import initialize_distribu
 from nemo_automodel.components.distributed.nvfsdp import NVFSDPManager
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.training.base_recipe import BaseRecipe
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
@@ -123,26 +125,26 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
         cfg_ckpt = cfg_ckpt.to_dict()
         cfg_ckpt.pop("restore_from", None)
         ckpt_kwargs |= cfg_ckpt
+    if ckpt_kwargs.get("is_peft", False) and ckpt_kwargs.get("model_save_format") == "torch_save":
+        raise ValueError(
+            "PEFT checkpointing is not supported for torch_save format. Save using `safetensors` format instead."
+        )
     return CheckpointingConfig(**ckpt_kwargs)
 
 
-def build_loss_fn(device, cfg_loss):
+def build_loss_fn(cfg_loss):
     """Build a loss function.
 
     Args:
-        device: The target device.
-        cfg_loss: Loss function configuration or a callable loss function.
+        cfg_loss: Loss function configuration.
 
     Returns:
-        The instantiated loss function on the specified device.
+        The instantiated loss function.
     """
-    if callable(cfg_loss):
-        return cfg_loss
-    else:
-        return cfg_loss.instantiate().to(device)
+    return cfg_loss.instantiate()
 
 
-def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed) -> DataLoader:
+def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed) -> tuple[DataLoader, ProcessorMixin]:
     """Build a VLM dataloader."""
     dist_sampler_kwargs = {
         "shuffle": cfg_dl.get("shuffle", True),
@@ -179,7 +181,7 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed
                 logging.warning(f"You are using {processor_type} with default collate function.")
             collate_fn = lambda examples: COLLATE_FNS[processor_type](examples, processor)
 
-        return cfg_dl.instantiate(dataset=ds, sampler=sampler, collate_fn=collate_fn)
+        return cfg_dl.instantiate(dataset=ds, sampler=sampler, collate_fn=collate_fn), processor
 
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
@@ -235,6 +237,60 @@ def build_wandb(cfg):
     return run
 
 
+def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
+    """Calculate the loss.
+
+    Args:
+        loss_fn: Loss function.
+        **kwargs: Keyword arguments for the loss function.
+
+    Returns:
+        The loss.
+    """
+    loss_fn_kwargs = {}
+    if isinstance(loss_fn, FusedLinearCrossEntropy):
+        model = kwargs.pop("model")
+
+        # Replace labels with -100 where mask is 0 (don't compute loss for these positions)
+        # -100 is the default ignore index in PyTorch's cross entropy loss
+        labels = kwargs.pop("labels")
+        if "mask" in kwargs:
+            loss_mask = kwargs.pop("mask")
+            labels.masked_fill_(loss_mask == 0, -100)
+
+        # find the lm_head in the model
+        lm_head = None
+        if hasattr(model, "get_output_embeddings"):
+            lm_head = model.get_output_embeddings().weight
+        else:
+            for n, p in model.named_parameters(remove_duplicate=False):
+                if "lm_head" in n and n.endswith(".weight"):
+                    lm_head = p
+                    break
+        if lm_head is None:
+            raise ValueError("lm_head.weight not found in model")
+
+        # unshard the possibly sharded lm_head
+        lm_head = lm_head.full_tensor() if hasattr(lm_head, "full_tensor") else lm_head
+        loss_fn_kwargs.update(
+            {
+                "hidden_states": kwargs.pop("hidden_states"),
+                "labels": labels,
+                "lm_weight": lm_head,
+            }
+        )
+    else:
+        loss_fn_kwargs.update(
+            {
+                "logits": kwargs.pop("logits"),
+                "labels": kwargs.pop("labels"),
+                "mask": kwargs.pop("mask"),
+            }
+        )
+
+    return loss_fn(**loss_fn_kwargs)
+
+
 # ---------------------------------------------------------------------------
 #  Trainer class – orchestration only
 # ---------------------------------------------------------------------------
@@ -282,8 +338,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
             seed=self.cfg.get("seed", 42),
             tp_size=self.cfg.get("distributed.tp_size", 1),
         )
-        self.loss_fn = build_loss_fn(self.dist_env.device, self.cfg.loss_fn)
-        self.dataloader = build_dataloader(  # VLM-specific
+        self.loss_fn = build_loss_fn(self.cfg.loss_fn)
+        self.dataloader, self.processor = build_dataloader(  # VLM-specific
             self.cfg.dataset,
             self.cfg.dataloader,
             self.cfg.model,
@@ -295,7 +351,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Build validation dataloader if the config provides it
         self.val_dataloader = None
         if "validation_dataset" in self.cfg:
-            self.val_dataloader = build_dataloader(  # VLM-specific
+            self.val_dataloader, _ = build_dataloader(  # VLM-specific
                 self.cfg.validation_dataset,
                 self.cfg.validation_dataloader,
                 self.cfg.model,
@@ -375,9 +431,22 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels, loss_mask)
         with train_ctx():
-            out = self.model(**batch)
-            local_loss = self.loss_fn(
-                out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum"
+            if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                # use num_logits_to_keep to avoid full logits matrix in memory
+                out = self.model(logits_to_keep=1, **batch)
+                if "hidden_states" not in out:
+                    raise ValueError(
+                        "FusedLinearCrossEntropy requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
+                    )
+            else:
+                out = self.model(**batch)
+            local_loss = calculate_loss(
+                self.loss_fn,
+                logits=out.logits,
+                labels=labels,
+                mask=loss_mask,
+                model=self.model,
+                hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
             )
 
         local_num_tokens = loss_mask.sum().detach().to(torch.int)
@@ -474,9 +543,17 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                 train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels, loss_mask)
                 with train_ctx():
-                    out = self.model(**batch)
-                    local_loss = self.loss_fn(
-                        out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum"
+                    if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                        out = self.model(logits_to_keep=1, **batch)
+                    else:
+                        out = self.model(**batch)
+                    local_loss = calculate_loss(
+                        self.loss_fn,
+                        logits=out.logits,
+                        labels=labels,
+                        mask=loss_mask,
+                        model=self.model,
+                        hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
                     )
 
                 total_loss += local_loss.item()
