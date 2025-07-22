@@ -71,11 +71,11 @@ def test_chunked_cross_entropy_matches_compute_cross_entropy():
     targets = torch.randint(0, num_classes, (seq_len,))
 
     # Loss from normal compute_cross_entropy
-    loss_ref = compute_cross_entropy(logits, targets) / (targets != -100).sum().detach()
+    loss_ref = compute_cross_entropy(logits, targets).sum().detach()
 
     # Loss from ChunkedCrossEntropy when chunk_len = seq_len (effectively one chunk)
     chunk_len = seq_len  # so there's only one chunk
-    loss_chunked = ChunkedCrossEntropy()(logits, targets, chunk_len=chunk_len)
+    loss_chunked = ChunkedCrossEntropy(chunk_len=chunk_len)(logits, targets)
 
     assert torch.allclose(loss_chunked, loss_ref, atol=1e-6), (
         f"Expected chunked loss {loss_ref.item()}, but got {loss_chunked.item()}."
@@ -100,12 +100,11 @@ def test_chunked_cross_entropy_ignore_index_and_mask():
     # First compute the reference loss by manually applying ignore_index
     masked_targets = targets.clone()
     masked_targets[mask == 0] = ignore_idx
-    loss_ref = compute_cross_entropy(logits, masked_targets, ignore_index=ignore_idx)
-    loss_ref /= (masked_targets != ignore_idx).sum().detach()
+    loss_ref = compute_cross_entropy(logits, masked_targets, ignore_index=ignore_idx).sum().detach()
 
     # Now compute ChunkedCrossEntropy with mask
     chunk_len = 3  # just an arbitrary small chunk size
-    loss_chunked = ChunkedCrossEntropy()(logits, targets, mask=mask, chunk_len=chunk_len, ignore_index=ignore_idx)
+    loss_chunked = ChunkedCrossEntropy(chunk_len=chunk_len, ignore_index=ignore_idx)(logits, targets, mask=mask)
 
     assert torch.allclose(loss_chunked, loss_ref, atol=1e-6), (
         f"Expected chunked loss {loss_ref.item()}, but got {loss_chunked.item()}."
