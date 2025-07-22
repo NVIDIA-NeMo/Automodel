@@ -23,7 +23,7 @@ The `components/` directory contains isolated modules used in training loops.
 Each component is designed to be dependency-light and reusable without cross-module imports.
 
 #### Directory Structure
-The following directory listing shows all components with explaination of their contents:
+The following directory listing shows all components along with explanations of their contents.
 ```
 $ tree -L 1 nemo_automodel/components/
 
