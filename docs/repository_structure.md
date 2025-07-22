@@ -4,27 +4,31 @@ This introductory guide presents you with the NeMo Automodel repository's struct
 overview of its parts, introduces the concepts such as components and recipes and explains how everything fits together.
 
 ## What is NeMo Automodel?
-NeMo Automodel is a PyTorch-native machine learning framework/library for finetuning and pre-training models available on the Hugging Face Hub. The Hugging Face Hub integration provides day-0 support for nearly all LLMs and most VLMs, while seamlessly integrating with the rest of the HF ecosystem. NeMo Automodel provides optimized model implementations and training infrastructure.
+NeMo Automodel is a PyTorch library for fine-tuning and pre-training models from the Hugging Face Hub. It provides:
+    - **Day-0 support** for most LLMs/VLMs on Hugging Face.
+    - **Optimized implementations** (e.g., fused kernels, memory-efficient training).
+    - **Seamless integration** with the HF ecosystem (datasets, tokenizers, etc.).
+
+---
+
+## Key Concepts
+    - **PEFT**: Parameter-Efficient Fine-Tuning (e.g., LoRA) for adapting large models with minimal compute.
+    - **FSDP2/nvFSDP**: Distributed training strategies for multi-GPU/node workloads.
+    - **Recipes**: End-to-end workflows combining data prep, training, and evaluation.
 
 
-## Repository structure, components and recipes
-The Automodel source code is availabe under the `nemo_automodel` directory. It is organized in three main parts:
-- `components/`
-- `recipes/`
-- `cli/`
+## Repository Structure
+The Automodel source code is availabe under the `nemo_automodel` directory. It is organized into three parts:
+- `components/`  - Self-contained modules
+- `recipes/` - End-to-end training workflows
+- `cli/` - Jon launching utility.
 
-We will proceed with presenting each part.
 
 ### Components
-The `components/` directory contains self-contained modules used in training and fine-tuning loops.
-To keep dependencies minimal, maximize re-use, and localize bugs, each module is completely isolated,
-by not allowing cross-module imports. This guarantees that any component can be dropped into another project without pulling additional code from other modules.
+The `components/` directory contains isolated modules used in training loops.
+Each component is designed to be dependency-light and reusable without cross-module imports.
 
-Key points:
-- One directory per component.
-- Each component owns its own dependencies.
-- Unit tests live beside the component they cover.
-
+#### Directory Structure
 The following directory listing shows all components with explaination of their contents:
 ```
 $ tree -L 1 nemo_automodel/components/
@@ -43,10 +47,16 @@ $ tree -L 1 nemo_automodel/components/
 └── utils/          - Small, dependency-free helpers (seed, profiler, timing, fs).
 ```
 
-### Recipes
-In NeMo Automodel, the term "recipe" describes a full training/finetuning/knowledge distillation recipe,
-which includes data-preparation, model training/finetuning and evaluation.
+Key features:
+    - Each component can be used independently in other projects.
+    - Each component has its own dependencies, wihtout cross-module imports.
+    - Unit tests live beside the component they cover.
 
+### Recipes
+Recipes define **end-to-end workflows** (data → training → eval) for a variety of tasks, such as,
+training, finetuning and knowledge distillation, combining components into usable pipelines.
+
+#### Available Recipes
 The following directory listing shows all components with explaination of their contents:
 ```
 $ tree -L 2 nemo_automodel/recipes/
@@ -56,30 +66,47 @@ $ tree -L 2 nemo_automodel/recipes/
     └── finetune.py   - Finetune recipe for VLMs (SFT, PEFT).
 ```
 
+#### Run a Recipe
+
 Each recipe can be executed directly using torchrun, for example (from the root directory):
 ```bash
 torchrun --nproc-per-node=2 nemo_automodel/recipes/llm/finetune.py -c examples/llm/llama_3_2_1b_squad.yaml
 ```
 
 The above command will finetune the Llama3.2-1B model on the SQuaD dataset with two GPUs.
-While the main source of each recipes live under `nemo_automodel/recipes/`,
-to make them importable from third-party source, tiny utils also exist under `examples/` for convenience.
 
 Each recipe, imports the components it needs from the `nemo_automodel/components/` catalog.
 The recipe/components structure enables users to:
-- Decouple most components and replace them with their own if needed.
-- Avoid rigid, structured trainer classes and instead opt for linear scripts, which surface the training logic to users for maximum control and flexibility.
+    - Decouple most components and replace them with their own if needed.
+    - Avoid rigid, structured trainer classes and instead opt for linear scripts, which surface the training logic to users for maximum control and flexibility.
 
 <!-- For an in-depth explanation of the LLM recipe please also see the [LLM recipe deep-dive guide](docs/llm_recipe_deep_dive.md). -->
 
 #### Recipe configuration
+Example YAML configuration (complete config available [here](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm/llama_3_2_1b_squad.yaml)):
+```yaml
+step_scheduler:
+  grad_acc_steps: 4
+  ckpt_every_steps: 1000
+  val_every_steps: 10  # will run every x number of gradient steps
+  num_epochs: 1
 
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: train
+```
 
 ### Automodel CLI application
-The `automodel` CLI application enables users to run jobs from a single GPU to multiple nodes.
-Currently, it supports SLURM clusters, with Kuberneters support coming soon.
+The `automodel` CLI application simplifies job execution across different environments,
+single-GPU interactive to batch multi-node. Currently, it supports SLURM clusters, with Kuberneters support coming soon.
 
-For example, to run the torchrun llm finetune shown in the recipes section above:
+#### Basic Usage
+For example, to run the same torchrun llm finetune shown in the recipes section above:
 ```bash
 automodel llm finetune -c examples/llm/llama_3_2_1b_squad.yaml --nproc-per-node=2
 ```
