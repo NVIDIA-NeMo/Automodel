@@ -1,4 +1,4 @@
-# Introduction to automodel repository
+# Introduction to the Automodel repository
 
 This introductory guide presents you with the NeMo Automodel repository's structure, provides a brief
 overview of its parts, introduces the concepts such as components and recipes and explains how everything fits together.
