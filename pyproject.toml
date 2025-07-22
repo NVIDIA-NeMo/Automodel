@@ -71,7 +71,7 @@ classifiers = [
 dependencies = [
     "bitsandbytes==0.45.5; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@87a86ab",
-    "datasets",
+    "datasets<4.0.0",
     "liger-kernel==0.5.8; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "pyyaml",
     "torch",
@@ -123,6 +123,7 @@ source = [".", "/workspace", "/home/runner/work/Automodel/Automodel"]
 omit = [
     "nemo_automodel/components/checkpoint/_backports/*.py",
     "tests/*",
+    "nemo_automodel/components/_peft/lora_kernel.py",
 ]
 
 [tool.ruff]
