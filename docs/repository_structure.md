@@ -1,10 +1,10 @@
 # Introduction to automodel repository
 
 This introductory guide presents you with the NeMo Automodel repository's structure, provides a brief
-overview of the parts, introduces the concepts such as components and recipes and explains how everything fits together.
+overview of its parts, introduces the concepts such as components and recipes and explains how everything fits together.
 
 ## What is NeMo Automodel?
-NeMo Automodel is a PyTorch-native machine learning framework/library for finetuning and pre-training models available on the Hugging Face Hub. The Hugging Face Hub integration provides day-0 support for nearly all LLMs and most VLMs, while seamlessly playing with the rest of the HF ecosystem.
+NeMo Automodel is a PyTorch-native machine learning framework/library for finetuning and pre-training models available on the Hugging Face Hub. The Hugging Face Hub integration provides day-0 support for nearly all LLMs and most VLMs, while seamlessly integrating with the rest of the HF ecosystem. NeMo Automodel provides optimized model implementations and training infrastructure.
 
 
 ## Repository structure, components and recipes
