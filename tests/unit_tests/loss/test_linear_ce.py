@@ -37,7 +37,6 @@ def test_fused_cross_entropy():
     hidden_dim = 4096
     vocab_size = 128256
     dtype = torch.bfloat16
-
     # Create inputs on GPU
     hidden_states = torch.randn(batch_size, seq_length, hidden_dim, dtype=dtype, device=device)
     weight = torch.randn(vocab_size, hidden_dim, dtype=dtype, device=device)  # Note: transposed shape
