@@ -51,7 +51,6 @@ The following command runs the LLM fine-tuning recipe on two GPUs and saves the 
 uv run torchrun --nproc-per-node=2 examples/llm/finetune.py --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors --checkpoint.save_consolidated True
 ```
 
-:::{tip}
 If you're running on a single GPU, you can run:
 ```
 uv run examples/llm/finetune.py --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors --checkpoint.save_consolidated True
@@ -224,7 +223,7 @@ checkpoints/
     └── step_scheduler.pt
 ```
 
-If you want to define a new state to be checkpointed in the recipe, the easiest way is create a new attribute in the recipe class (defined using `self.` inside the recipe). Just make sure that the new attribute uses both the `load_state_dict` and `state_dict` methods.
+If you want to define a new state to be checkpointed in the recipe, the easiest way is to create a new attribute in the recipe class (defined using `self.` inside the recipe). Just make sure that the new attribute uses both the `load_state_dict` and `state_dict` methods.
 
 Here is an example of what it might look like:
 
