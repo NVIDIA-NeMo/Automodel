@@ -4,7 +4,7 @@ This introductory guide presents the structure of the NeMo Automodel repository,
 
 ## What is NeMo Automodel?
 NeMo Automodel is a PyTorch library for fine-tuning and pre-training models from the Hugging Face Hub. It provides:
-- **Day-0 support** for most LLMs/VLMs on Hugging Face Hub.
+- **Day-0 support** for most LLMs and VLMs on the Hugging Face Hub.
 - **Optimized implementations** for training efficiency, including fused kernels and memory-saving techniques.
 - **Seamless integration** with Hugging Face datasets, tokenizers, and related tools.
 - **Distributed training strategies** using FSDP2 and nvFSDP across multi-GPU and multi-node environments.
