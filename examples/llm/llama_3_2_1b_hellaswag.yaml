@@ -36,7 +36,6 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
-  output_hidden_states: true
 
 checkpoint:
   enabled: true

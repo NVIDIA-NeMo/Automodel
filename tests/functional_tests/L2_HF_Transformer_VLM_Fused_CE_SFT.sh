@@ -16,6 +16,7 @@ TRANSFORMERS_OFFLINE=1 coverage run -a --data-file=/workspace/.coverage --source
 examples/vlm/finetune.py \
   --config examples/vlm/gemma_3_vl_4b_cord_v2.yaml \
   --model.pretrained_model_name_or_path /home/TestData/huiyingl/hf_gemma3_2l/ \
+  --model.output_hidden_states true \
   --step_scheduler.max_steps 3 \
   --step_scheduler.grad_acc_steps 1 \
   --step_scheduler.val_every_steps 1 \
