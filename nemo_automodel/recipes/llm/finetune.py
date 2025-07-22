@@ -281,7 +281,6 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler):
     # Extract learning rate from optimizer
     base_lr = optimizer.param_groups[0]['lr']
     
-    import pdb; pdb.set_trace()
     # Set defaults for scheduler parameters
     default_kwargs = dict(
         optimizer=optimizer,

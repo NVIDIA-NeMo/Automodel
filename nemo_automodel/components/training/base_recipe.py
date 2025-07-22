@@ -28,6 +28,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     save_model,
     save_optimizer,
 )
+from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 
 
 def has_load_restore_state(object):
@@ -58,6 +59,19 @@ def is_tokenizer(object):
     return isinstance(object, (PreTrainedTokenizerBase, ProcessorMixin))
 
 
+def is_lr_scheduler(object):
+    """
+    Checks whether object is a learning rate scheduler.
+
+    Args:
+        object (any): the object to check.
+
+    Returns:
+        bool: returns True if object is an OptimizerParamScheduler.
+    """
+    return isinstance(object, OptimizerParamScheduler)
+
+
 class BaseRecipe:
     """
     BaseRecipe provides checkpoint load/save functionality for recipes.
@@ -81,7 +95,7 @@ class BaseRecipe:
         if "__state_tracked" not in self.__dict__:
             self.__dict__["__state_tracked"] = set()
         # Track stateful objects unless they are validation/eval components.
-        should_track = isinstance(value, (nn.Module, Optimizer)) or has_load_restore_state(value) or is_tokenizer(value)
+        should_track = isinstance(value, (nn.Module, Optimizer)) or has_load_restore_state(value) or is_tokenizer(value) or is_lr_scheduler(value)
 
         if should_track and not any(substr in key.lower() for substr in ("val", "eval", "test")):
             assert key not in self.__dict__["__state_tracked"]
@@ -117,7 +131,7 @@ class BaseRecipe:
                 model = getattr(self, key)
             elif isinstance(getattr(self, key), Optimizer):
                 optimizer = getattr(self, key)
-            elif hasattr(getattr(self, key), 'optimizer') and hasattr(getattr(self, key), 'step'):
+            elif is_lr_scheduler(getattr(self, key)):
                 scheduler = getattr(self, key)
             elif is_tokenizer(getattr(self, key)):
                 tokenizer = getattr(self, key)
@@ -162,7 +176,7 @@ class BaseRecipe:
                 model = getattr(self, key)
             elif isinstance(getattr(self, key), Optimizer):
                 optimizer = getattr(self, key)
-            elif hasattr(getattr(self, key), 'optimizer') and hasattr(getattr(self, key), 'step'):
+            elif is_lr_scheduler(getattr(self, key)):
                 scheduler = getattr(self, key)
             elif is_tokenizer(getattr(self, key)):
                 # we don't need to load the tokenizer from the checkpoint
