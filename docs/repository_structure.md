@@ -84,7 +84,7 @@ For example, to run the torchrun llm finetune shown in the recipes section above
 automodel llm finetune -c examples/llm/llama_3_2_1b_squad.yaml --nproc-per-node=2
 ```
 
-#### Launching jobs on SLURM
+#### Launching a batch job on SLURM
 
 The `automodel` CLI application further enables users to launch batch jobs. For example, to run
 a job on a SLURM cluster, the YAML file needs to be extended with:
@@ -104,8 +104,19 @@ slurm:
 The above section defines the SLURM hyper-parameters necessary to launch a batch job on a SLURM
 cluster using one node (`nodes` argument) and eight gpus (`ntasks_per_node`).
 
+#### Launching a batch job on SLURM with modified code
+
 The above `slurm` YAML configuration will use the automodel installation contained in the `container_image`.
 However, if the command is run from within a git repo (that is accessible from SLURM workers), then
 the SBATCH script will use the git repo for running the experiments, instead of installation in the container.
 
+For example,
+```bash
+git clone git@github.com:NVIDIA-NeMo/Automodel.git automodel_test_repo
+cd automodel_test_repo/
+automodel llm finetune -c examples/llm/llama_3_2_1b_squad.yaml --nproc-per-node=2
+```
+
+Will launch the job using the source code contained in the `automodel_test_repo` directory, instead
+of the one contained in the docker image.
 <!-- The [Automodel CLI guide](docs/automodel_cli.md) provides an in-depth explanation of the automodel util. -->
