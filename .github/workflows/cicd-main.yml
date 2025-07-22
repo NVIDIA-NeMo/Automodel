@@ -156,6 +156,10 @@ jobs:
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
           - script: L2_HF_PEFT_VLM_FSDP2_Checkpoint
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+          - script: L2_HF_Transformer_VLM_Fused_CE_SFT
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+          - script: L2_HF_Transformer_Fused_CE_SFT
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
     needs: [cicd-unit-tests]
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.script }}
