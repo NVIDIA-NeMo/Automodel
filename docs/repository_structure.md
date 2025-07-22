@@ -60,9 +60,10 @@ Each recipe can be executed directly using torchrun, for example (from the root 
 ```bash
 torchrun --nproc-per-node=2 nemo_automodel/recipes/llm/finetune.py -c examples/llm/llama_3_2_1b_squad.yaml
 ```
-Will finetune the Llama3.2-1B model on the SQuaD dataset with two GPUs. While the main recipes
-live under `nemo_automodel/recipes/`, to make them importable from third-party source, tiny utils
-also exist under `examples/` for convenience.
+
+The above command will finetune the Llama3.2-1B model on the SQuaD dataset with two GPUs.
+While the main source of each recipes live under `nemo_automodel/recipes/`,
+to make them importable from third-party source, tiny utils also exist under `examples/` for convenience.
 
 Each recipe, imports the components it needs from the `nemo_automodel/components/` catalog.
 The recipe/components structure enables users to:
@@ -72,8 +73,39 @@ The recipe/components structure enables users to:
 <!-- For an in-depth explanation of the LLM recipe please also see the [LLM recipe deep-dive guide](docs/llm_recipe_deep_dive.md). -->
 
 #### Recipe configuration
-For recipe 
 
-### CLI
-NeMo Automodel enables users to run jobs from a single GPU to multiple nodes. Currently, it supports
-SLURM clusters, with Kuberneters support coming soon.
+
+### Automodel CLI application
+The `automodel` CLI application enables users to run jobs from a single GPU to multiple nodes.
+Currently, it supports SLURM clusters, with Kuberneters support coming soon.
+
+For example, to run the torchrun llm finetune shown in the recipes section above:
+```bash
+automodel llm finetune -c examples/llm/llama_3_2_1b_squad.yaml --nproc-per-node=2
+```
+
+#### Launching jobs on SLURM
+
+The `automodel` CLI application further enables users to launch batch jobs. For example, to run
+a job on a SLURM cluster, the YAML file needs to be extended with:
+```yaml
+slurm:
+  job_name: llm-finetune  # if no job_name is provided will use {domain}_{command} from invocation
+  nodes: 1
+  ntasks_per_node: 8
+  time: 00:05:00
+  account: coreai_dlalgo_llm
+  partition: batch
+  container_image: nvcr.io/nvidia/nemo:dev # can also use path to sqsh, e.g.: /foo/bar/image.sqsh
+  gpus_per_node: 8
+  extra_mounts:
+    - /a/b/c:/d/e
+```
+The above section defines the SLURM hyper-parameters necessary to launch a batch job on a SLURM
+cluster using one node (`nodes` argument) and eight gpus (`ntasks_per_node`).
+
+The above `slurm` YAML configuration will use the automodel installation contained in the `container_image`.
+However, if the command is run from within a git repo (that is accessible from SLURM workers), then
+the SBATCH script will use the git repo for running the experiments, instead of installation in the container.
+
+<!-- The [Automodel CLI guide](docs/automodel_cli.md) provides an in-depth explanation of the automodel util. -->
