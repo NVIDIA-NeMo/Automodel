@@ -18,7 +18,7 @@ The Automodel source code is availabe under the [`nemo_automodel`](https://githu
 - [`cli/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/nemo_automodel/_cli_) - Jon launching utility.
 
 
-### Components
+### Components Directory
 The `components/` directory contains isolated modules used in training loops.
 Each component is designed to be dependency-light and reusable without cross-module imports.
 
