@@ -73,10 +73,12 @@ def build_model_and_optimizer(
         device: The target device.
         model_wrapper: Optional parallelism wrapper.
         cfg_model: Configuration for model instantiation.
+        cfg_opt: Configuration for optimizer instantiation.
         use_hf_fa2: Whether to use HF's flash_attention_2. This takes precedence over Pytorch's sdpa_methods for attn.
         cfg_peft: Configuration for PEFT.
         model_wrapper: Optional parallelism wrapper.
         seed: Random seed.
+        tp_size: Tensor parallel size.
 
     Returns:
         The instantiated model on the specified device.
@@ -127,8 +129,18 @@ def build_model_and_optimizer(
     return model, optimizer
 
 
-def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
-    """Build a checkpoint configuration."""
+def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
+    """Build a checkpoint configuration.
+
+    Args:
+        cfg_ckpt: Configuration for checkpointing.
+        cache_dir: Cache directory for the model.
+        model_repo_id: Model repository ID.
+        is_peft: Whether the model is PEFT.
+
+    Returns:
+        The instantiated checkpoint configuration.
+    """
     from transformers.utils import TRANSFORMERS_CACHE
 
     ckpt_kwargs = dict(
@@ -176,8 +188,10 @@ def build_dataloader(
     Args:
         cfg_ds: Dataset configuration.
         cfg_dl: DataLoader configuration.
+        cfg_model: Model configuration.
         cfg_ps: Packed sequence configuration.
-        distributed_sampler_kwargs: Additional arguments for the DistributedSampler.
+        device_mesh: Device mesh.
+        seed: Random seed.
 
     Returns:
         The instantiated DataLoader and tokenizer.
@@ -255,9 +269,14 @@ def build_step_scheduler(cfg, dataloader):
     return StepScheduler(**default_kwargs)
 
 
-def build_wandb(cfg):
-    """Instantiates wandb and returns the instance.
-    If no name is given, it will use the model name
+def build_wandb(cfg) -> wandb.Run:
+    """Instantiates wandb and returns the instance. If no name is given, it will use the model name.
+
+    Args:
+        cfg: Configuration for wandb.
+
+    Returns:
+        The wandb instance.
     """
     assert cfg.get("wandb", None) is not None
     kwargs = cfg.wandb.to_dict()
@@ -357,7 +376,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
 
         # Initialize metrics required for calculating loss
-        self.total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
+        self.total_local_num_loss_tokens = torch.zeros([], dtype=torch.int, device="cuda")
         self.forward_data_store = []
 
         # Scheduler
@@ -387,7 +406,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
         self.model.train()
         self.timestamp = time.perf_counter()
-        self.num_tokens = 0
+        self.num_nonpad_tokens = 0
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
             for batch_idx, batch in enumerate(self.step_scheduler):
@@ -405,9 +424,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         Args:
             batch: Batch of training data.
             is_optim_step: Flag indicating if a gradient step should be applied.
-
-        Returns:
-            Grad norm from the training step.
+            clip_norm: Gradient clipping norm.
         """
         self.model.train()
 
@@ -431,9 +448,13 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum"
             )
 
-        local_num_tokens = loss_mask.sum().detach().to(torch.int)
-        self.num_tokens += labels.numel() - count_tail_padding(labels)
-        self.total_num_tokens += local_num_tokens
+        # local_num_loss_tokens are the number of tokens that are used for loss calculation
+        # in pretraining, this excludes padding tokens. In SFT, this additionally
+        # excludes the context tokens.
+        local_num_loss_tokens = loss_mask.sum().detach().to(torch.int)
+        # num_nonpad_tokens are the number of non-padding tokens
+        self.num_nonpad_tokens += labels.numel() - count_tail_padding(labels)
+        self.total_local_num_loss_tokens += local_num_loss_tokens
         self.forward_data_store.append(local_loss.detach())
 
         with get_sync_ctx(self.model, is_optim_step):
@@ -443,7 +464,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if is_optim_step:
             rescale_gradients(
                 self.model,
-                self.total_num_tokens,
+                self.total_local_num_loss_tokens,
                 self.device_mesh[
                     (
                         "dp_cp"
@@ -479,8 +500,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             t = time.perf_counter()
             time_delta = t - self.timestamp
             self.timestamp = t
-            tps = self.num_tokens / time_delta
-            self.num_tokens = 0
+            tps = self.num_nonpad_tokens / time_delta
+            self.num_nonpad_tokens = 0
             # log
             reporting_loss = self.log_train_metrics(grad_norm, tps)
             logging.info(
@@ -496,8 +517,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             torch.cuda.reset_peak_memory_stats()
 
     @torch.no_grad()
-    def _run_validation_epoch(self) -> float:
-        """Run one pass over `self.val_dataloader` and return average loss per token."""
+    def _run_validation_epoch(self):
+        """Run one pass over `self.val_dataloader`."""
         with StatefulRNG(seed=1, ranked=True):
             self.model.eval()
 
@@ -549,11 +570,12 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
         )
 
-    def log_train_metrics(self, grad_norm, tps):
+    def log_train_metrics(self, grad_norm, tps) -> float:
         """Log metrics to wandb.
 
         Args:
             grad_norm: Grad norm from the training step.
+            tps: Tokens per second.
 
         Returns:
             Reporting loss.
@@ -565,12 +587,12 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         else:
             dp_group = self.device_mesh["data_parallel"].get_group()
 
-        total_loss, total_num_tokens = reduce_loss(
-            self.forward_data_store, self.total_num_tokens, per_token_loss=True, dp_group=dp_group
+        total_loss, total_num_loss_tokens = reduce_loss(
+            self.forward_data_store, self.total_local_num_loss_tokens, per_token_loss=True, dp_group=dp_group
         )
-        reporting_loss = (total_loss / total_num_tokens).item()
+        reporting_loss = (total_loss / total_num_loss_tokens).item()
         grad_norm = grad_norm.item() if not isinstance(grad_norm, float) else grad_norm  # TP WAR
-        self.total_num_tokens.zero_()
+        self.total_local_num_loss_tokens.zero_()
         self.forward_data_store = []
         log_data = {
             "train_loss": reporting_loss,
@@ -578,7 +600,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             "step": self.step_scheduler.step,
             "epoch": self.step_scheduler.epoch,
             "grad_norm": grad_norm,
-            "num_tokens_per_step": total_num_tokens,
+            "num_tokens_per_step": total_num_loss_tokens,
             "tps": tps,
         }
         if self.optimizer.param_groups:
