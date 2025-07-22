@@ -270,7 +270,7 @@ def build_step_scheduler(cfg, dataloader):
     return StepScheduler(**default_kwargs)
 
 
-def build_lr_scheduler(cfg, optimizer, step_scheduler):
+def build_lr_scheduler(cfg, optimizer, step_scheduler) -> OptimizerParamScheduler | None:  # noqa: F821
     """Build the learning rate scheduler.
 
     Args:
@@ -283,18 +283,18 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler):
     """
     if cfg is None:
         return None
-    
+
     # Calculate total steps for the training run
     total_epochs = step_scheduler.num_epochs
     epoch_len = len(step_scheduler.dataloader)
     grad_acc_steps = step_scheduler.grad_acc_steps
-    
+
     # Total optimizer steps (accounting for gradient accumulation)
     total_steps = (total_epochs * epoch_len) // grad_acc_steps
-    
+
     # Extract learning rate from optimizer
-    base_lr = optimizer.param_groups[0]['lr']
-    
+    base_lr = optimizer.param_groups[0]["lr"]
+
     # Set defaults for scheduler parameters
     default_kwargs = dict(
         optimizer=optimizer,
@@ -304,73 +304,23 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler):
         lr_warmup_steps=min(1000, total_steps // 10),  # 10% warmup or max 1000 steps
         lr_decay_steps=total_steps,
         lr_decay_style="cosine",
-        start_wd=optimizer.param_groups[0].get('weight_decay', 0.0),
-        end_wd=optimizer.param_groups[0].get('weight_decay', 0.0),
+        start_wd=optimizer.param_groups[0].get("weight_decay", 0.0),
+        end_wd=optimizer.param_groups[0].get("weight_decay", 0.0),
         wd_incr_steps=total_steps,
         wd_incr_style="constant",
     )
-    
+
     # Override with user-provided config
     if cfg is not None:
-        user_cfg = cfg.to_dict() if hasattr(cfg, 'to_dict') else dict(cfg)
+        user_cfg = cfg.to_dict() if hasattr(cfg, "to_dict") else dict(cfg)
         default_kwargs.update(user_cfg)
-    
-    logger.info(f"Building LR scheduler with total_steps={total_steps}, "
-               f"warmup_steps={default_kwargs['lr_warmup_steps']}, "
-               f"decay_style={default_kwargs['lr_decay_style']}")
-    
-    return OptimizerParamScheduler(**default_kwargs)
 
-
-def build_lr_scheduler(cfg, optimizer, step_scheduler):
-    """Build the learning rate scheduler.
-
-    Args:
-        cfg: Configuration for the OptimizerParamScheduler.
-        optimizer: The optimizer to be scheduled.
-        step_scheduler: The step scheduler to extract training parameters.
-
-    Returns:
-        OptimizerParamScheduler: The configured learning rate scheduler, or None if not configured.
-    """
-    if cfg is None:
-        return None
-    
-    # Calculate total steps for the training run
-    total_epochs = step_scheduler.num_epochs
-    epoch_len = len(step_scheduler.dataloader)
-    grad_acc_steps = step_scheduler.grad_acc_steps
-    
-    # Total optimizer steps (accounting for gradient accumulation)
-    total_steps = (total_epochs * epoch_len) // grad_acc_steps
-    
-    # Extract learning rate from optimizer
-    base_lr = optimizer.param_groups[0]['lr']
-    
-    # Set defaults for scheduler parameters
-    default_kwargs = dict(
-        optimizer=optimizer,
-        init_lr=base_lr * 0.1,  # Start warmup at 10% of base LR
-        max_lr=base_lr,
-        min_lr=base_lr * 0.01,  # End at 1% of base LR
-        lr_warmup_steps=min(1000, total_steps // 10),  # 10% warmup or max 1000 steps
-        lr_decay_steps=total_steps,
-        lr_decay_style="cosine",
-        start_wd=optimizer.param_groups[0].get('weight_decay', 0.0),
-        end_wd=optimizer.param_groups[0].get('weight_decay', 0.0),
-        wd_incr_steps=total_steps,
-        wd_incr_style="constant",
+    logger.info(
+        f"Building LR scheduler with total_steps={total_steps}, "
+        f"warmup_steps={default_kwargs['lr_warmup_steps']}, "
+        f"decay_style={default_kwargs['lr_decay_style']}"
     )
-    
-    # Override with user-provided config
-    if cfg is not None:
-        user_cfg = cfg.to_dict() if hasattr(cfg, 'to_dict') else dict(cfg)
-        default_kwargs.update(user_cfg)
-    
-    logger.info(f"Building LR scheduler with total_steps={total_steps}, "
-               f"warmup_steps={default_kwargs['lr_warmup_steps']}, "
-               f"decay_style={default_kwargs['lr_decay_style']}")
-    
+
     return OptimizerParamScheduler(**default_kwargs)
 
 
@@ -486,13 +436,9 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Scheduler
         self.step_scheduler = build_step_scheduler(self.cfg.get("step_scheduler", None), self.dataloader)
-        
+
         # Build learning rate scheduler
-        self.lr_scheduler = build_lr_scheduler(
-            self.cfg.get("lr_scheduler", None), 
-            self.optimizer, 
-            self.step_scheduler
-        )
+        self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
 
         # Build checkpointing config
         restore_from = self.cfg.get("checkpoint.restore_from", None)
@@ -601,8 +547,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             self.optimizer.step()
             self.optimizer.zero_grad()
-            
-            # Update learning rate scheduler
+
             if self.lr_scheduler is not None:
                 self.lr_scheduler.step(1)
 

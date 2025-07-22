@@ -48,7 +48,7 @@ loss_fn: nemo_automodel.components.loss.masked_ce.masked_cross_entropy
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
+  dataset_name: squad
   split: train
 
 packed_sequence:
@@ -62,7 +62,7 @@ dataloader:
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
+  dataset_name: squad
   split: validation
   limit_dataset_samples: 64
 

@@ -95,7 +95,12 @@ class BaseRecipe:
         if "__state_tracked" not in self.__dict__:
             self.__dict__["__state_tracked"] = set()
         # Track stateful objects unless they are validation/eval components.
-        should_track = isinstance(value, (nn.Module, Optimizer)) or has_load_restore_state(value) or is_tokenizer(value) or is_lr_scheduler(value)
+        should_track = (
+            isinstance(value, (nn.Module, Optimizer))
+            or has_load_restore_state(value)
+            or is_tokenizer(value)
+            or is_lr_scheduler(value)
+        )
 
         if should_track and not any(substr in key.lower() for substr in ("val", "eval", "test")):
             assert key not in self.__dict__["__state_tracked"]
@@ -124,7 +129,6 @@ class BaseRecipe:
 
         # TODO(@adil-a): Change this when we create a LR scheduler class
         model, optimizer, scheduler, tokenizer = None, None, None, None
-
 
         for key in self.__dict__["__state_tracked"]:
             if isinstance(getattr(self, key), nn.Module):
