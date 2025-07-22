@@ -46,7 +46,7 @@ Key features:
     - Each component has its own dependencies, wihtout cross-module imports.
     - Unit tests live beside the component they cover.
 
-### Recipes
+### Recipes Directory
 Recipes define **end-to-end workflows** (data → training → eval) for a variety of tasks, such as,
 training, finetuning and knowledge distillation, combining components into usable pipelines.
 
