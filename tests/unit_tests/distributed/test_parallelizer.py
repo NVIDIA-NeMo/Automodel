@@ -39,6 +39,7 @@ from nemo_automodel.components.distributed.parallelizer import (
     import_class_from_path,
     get_hf_tp_shard_plan,
     apply_fsdp_sharding_recursively,
+    unshard_fsdp2_model,
 )
 
 
@@ -1330,3 +1331,72 @@ class TestApplyFsdpShardingRecursively:
         )
         
         # Just verify it doesn't crash - leaf modules have no children to process
+
+
+class TestUnshardFsdp2Model:
+    """Test suite for unshard_fsdp2_model context manager."""
+
+    def test_unshard_fsdp2_model_basic_functionality(self):
+        """Test basic unshard/reshard functionality with FSDP modules."""
+        # Import the function to test
+        from nemo_automodel.components.distributed.parallelizer import unshard_fsdp2_model, FSDPModule
+        
+        # Create a simple test double that can pass isinstance checks
+        class TestFSDPModule:
+            def __init__(self):
+                self.unshard_called = False
+                self.reshard_called = False
+            
+            def unshard(self):
+                self.unshard_called = True
+            
+            def reshard(self):
+                self.reshard_called = True
+        
+        test_fsdp_module = TestFSDPModule()
+        
+        # Create a mock model that returns our test module
+        mock_model = MagicMock()
+        mock_model.modules.return_value = [test_fsdp_module, nn.Linear(10, 10)]
+        
+        # Patch FSDPModule to be our test class
+        with patch.object(sys.modules['nemo_automodel.components.distributed.parallelizer'], 'FSDPModule', TestFSDPModule):
+            # Test the context manager
+            with unshard_fsdp2_model(mock_model):
+                assert test_fsdp_module.unshard_called is True
+                assert test_fsdp_module.reshard_called is False
+            
+            # After exiting, reshard should be called
+            assert test_fsdp_module.reshard_called is True
+    
+    def test_unshard_fsdp2_model_exception_handling(self):
+        """Test that reshard is called even if an exception occurs."""
+        # Import the function to test
+        from nemo_automodel.components.distributed.parallelizer import unshard_fsdp2_model
+        
+        # Create a simple test double that can pass isinstance checks
+        class TestFSDPModule:
+            def __init__(self):
+                self.unshard_called = False
+                self.reshard_called = False
+            
+            def unshard(self):
+                self.unshard_called = True
+            
+            def reshard(self):
+                self.reshard_called = True
+        
+        test_fsdp_module = TestFSDPModule()
+        
+        mock_model = MagicMock()
+        mock_model.modules.return_value = [test_fsdp_module]
+        
+        # Patch FSDPModule to be our test class
+        with patch.object(sys.modules['nemo_automodel.components.distributed.parallelizer'], 'FSDPModule', TestFSDPModule):
+            with pytest.raises(ValueError):
+                with unshard_fsdp2_model(mock_model):
+                    raise ValueError("Test exception")
+            
+            # Verify reshard was still called despite the exception
+            assert test_fsdp_module.reshard_called is True
+    
