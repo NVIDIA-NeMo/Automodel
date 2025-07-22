@@ -92,7 +92,7 @@ def to_cpu(v):
             return v._local_tensor
         else:
             raise ValueError("Unknown device " + str(v.device))
-    elif isinstance(v, Tensor):
+    elif isinstance(v, torch.Tensor):
         return v.cpu()
     else:
         return v
