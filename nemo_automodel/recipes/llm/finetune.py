@@ -22,14 +22,13 @@ from typing import Any, Dict
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import wandb
 from torch.distributed.device_mesh import _mesh_resources
 from torch.utils.data import DataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from wandb import Settings
 
+import wandb
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -50,6 +49,7 @@ from nemo_automodel.components.utils.dist_utils import (
     reduce_loss,
     rescale_gradients,
 )
+from wandb import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -492,7 +492,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 labels=labels,
                 mask=loss_mask,
                 model=self.model,
-                hidden_states=out.hidden_states[-1],
+                hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
             )
 
         local_num_tokens = loss_mask.sum().detach().to(torch.int)
@@ -589,14 +589,17 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
                 train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels, loss_mask)
                 with train_ctx():
-                    out = self.model(**batch)
+                    if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                        out = self.model(logits_to_keep=1, **batch)
+                    else:
+                        out = self.model(**batch)
                     local_loss = calculate_loss(
                         self.loss_fn,
                         logits=out.logits,
                         labels=labels,
                         mask=loss_mask,
                         model=self.model,
-                        hidden_states=out.hidden_states[-1],
+                        hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
                     )
 
                 total_loss += local_loss.item()
