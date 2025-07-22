@@ -70,9 +70,9 @@ torchrun --nproc-per-node=2 nemo_automodel/recipes/llm/finetune.py -c examples/l
 The above command will finetune the Llama3.2-1B model on the SQuaD dataset with two GPUs.
 
 Each recipe, imports the components it needs from the `nemo_automodel/components/` catalog.
-The recipe/components structure enables users to:
-    - Decouple most components and replace them with their own if needed.
-    - Avoid rigid, structured trainer classes and instead opt for linear scripts, which surface the training logic to users for maximum control and flexibility.
+The recipe/components structure enables you to:
+- Decouple individual components and replace them with custom implementations when needed.
+- Avoid rigid, class-based trainer structures by using linear scripts that expose training logic for maximum flexibility and control.
 
 <!-- For an in-depth explanation of the LLM recipe please also see the [LLM recipe deep-dive guide](docs/llm_recipe_deep_dive.md). -->
 
