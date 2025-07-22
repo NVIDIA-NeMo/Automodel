@@ -109,7 +109,6 @@ def make_squad_dataset(
         assert isinstance(limit_dataset_samples, int), "Expected limit_dataset_samples to be an int"
         split = f"{split}[:{limit_dataset_samples}]"
 
-    import pdb; pdb.set_trace()
     dataset = load_dataset(dataset_name, split=split)
 
     fmt_fn = formatting_prompts_func

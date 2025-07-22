@@ -22,13 +22,12 @@ from typing import Any, Dict
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import wandb
 from torch.distributed.device_mesh import _mesh_resources
 from torch.utils.data import DataLoader
 from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
-from wandb import Settings
 
+import wandb
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -38,6 +37,7 @@ from nemo_automodel.components.distributed.init_utils import initialize_distribu
 from nemo_automodel.components.distributed.nvfsdp import NVFSDPManager
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.base_recipe import BaseRecipe
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
@@ -49,7 +49,7 @@ from nemo_automodel.components.utils.dist_utils import (
     rescale_gradients,
 )
 from nemo_automodel.components.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
-from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+from wandb import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -346,7 +346,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         Raises:
             NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
-        """        
+        """
         torch.cuda.reset_peak_memory_stats()
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
         setup_logging()
@@ -641,6 +641,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if wandb.run is not None:
             wandb.log(log_data)
         return reporting_loss
+
 
 # ---------------------------------------------------------------------------
 # Entry point
