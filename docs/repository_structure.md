@@ -8,7 +8,7 @@ NeMo Automodel is a PyTorch library for fine-tuning and pre-training models from
 - **Optimized implementations** for training efficiency, including fused kernels and memory-saving techniques.
 - **Seamless integration** with Hugging Face datasets, tokenizers, and related tools.
 - **Distributed training strategies** using FSDP2 and nvFSDP across multi-GPU and multi-node environments.
-- **Recipes**: End-to-end workflows combining data prep, training, and evaluation.
+- **End-to-end workflows** with recipes for data preparation, training, and evaluation.
 
 
 ## Repository Structure
