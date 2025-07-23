@@ -109,8 +109,8 @@ automodel llm finetune -c examples/llm/llama_3_2_1b_squad.yaml --nproc-per-node=
 
 #### Launch a Batch Job on Slurm
 
-The `automodel` CLI application further enables users to launch batch jobs. For example, to run
-a job on a SLURM cluster, the YAML file needs to be extended with:
+The automodel CLI application also lets you launch batch jobs across cluster environments. For example, to run a job on a Slurm cluster, extend your YAML configuration file with the following parameters:
+
 ```yaml
 slurm:
   job_name: llm-finetune  # if no job_name is provided will use {domain}_{command} from invocation
