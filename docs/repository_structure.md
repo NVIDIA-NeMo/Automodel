@@ -48,7 +48,7 @@ $ tree -L 1 nemo_automodel/components/
 
 ### Recipes Directory
 Recipes define **end-to-end workflows** (data → training → eval) for a variety of tasks, such as,
-training, finetuning and knowledge distillation, combining components into usable pipelines.
+training, fine-tuning, knowledge distillation, and combining components into usable pipelines.
 
 #### Available Recipes
 The following directory listing shows all components along with explanations of their contents.
