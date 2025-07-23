@@ -35,7 +35,7 @@ $ tree -L 1 nemo_automodel/components/
 ├── distributed/    - Distributed processing primitives (DDP, FSDP2, nvFSDP).
 ├── launcher/       - Job launcher for interactive and batch (Slurm, K8s) processing.
 ├── loggers/        - Metric/event logging for Weights & Biases and other tools
-├── loss/           - Loss function (e.g., cross-entropy, linear cross-entropy, etc).
+├── loss/           - Loss functions (such as cross-entropy and linear cross-entropy, etc.).
 ├── optim/          - Optimizers and LR schedulers, including fused or second-order variants.
 ├── training/       - Training and finetuning utils.
 └── utils/          - Small, dependency-free helpers (seed, profiler, timing, fs).
