@@ -102,7 +102,7 @@ The `automodel` CLI application simplifies job execution across different enviro
 single-GPU interactive sessions to batch multi-node runs. Currently, it supports Slurm clusters, with Kubernetes support coming soon.
 
 #### Run the LLM Fine-Tuning Recipe
-For example, to run the same torchrun llm finetune shown in the recipes section above:
+For example, to run the same torchrun LLM fine-tuning workflow described in the recipes section above, use the following command:
 ```bash
 automodel llm finetune -c examples/llm/llama_3_2_1b_squad.yaml --nproc-per-node=2
 ```
