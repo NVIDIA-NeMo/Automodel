@@ -68,21 +68,25 @@ jobs:
           lint-imports --debug --verbose --no-cache
 
   Nemo_Linting_Test:
-    needs: linting
+    needs: [linting, import_linting]
     runs-on: ubuntu-latest
     if: always()
     steps:
       - name: Main
         env:
-          RESULTS: ${{ toJson(needs.linting) }}
+          LINTING_RESULT: ${{ toJson(needs.linting) }}
+          IMPORT_LINTING_RESULT: ${{ toJson(needs.import_linting) }}
         run: |
-          RESULT=$(echo "$RESULTS" | jq -r '.result')
+          LINTING=$(echo "$LINTING_RESULT" | jq -r '.result')
+          IMPORT_LINTING=$(echo "$IMPORT_LINTING_RESULT" | jq -r '.result')
 
-          if [[ "$RESULT" == "success" ]]; then
-            echo "All passed."
+          if [[ "$LINTING" == "success" ]] && [[ "$IMPORT_LINTING" == "success" ]]; then
+            echo "All linting checks passed."
             exit 0
           else
-            echo "Some linting domains failed."
+            echo "Some linting checks failed:"
+            echo "  - linting: $LINTING"
+            echo "  - import_linting: $IMPORT_LINTING"
             exit 1
           fi
 
