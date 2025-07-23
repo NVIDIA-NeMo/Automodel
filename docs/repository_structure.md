@@ -95,7 +95,7 @@ dataset:
   split: train
 ```
 
-More recipe examples are availble under the [`examples/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples) directory.
+More recipe examples are available under the [`examples/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples) directory.
 
 ### CLI Directory
 The `automodel` CLI application simplifies job execution across different environments, from 
