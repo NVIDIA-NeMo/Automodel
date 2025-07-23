@@ -82,7 +82,7 @@ The [Common Voice 17](https://huggingface.co/datasets/ysdede/commonvoice_17_tr_f
 ```json
 {
   "audio": {
-    "path": "common_voice_tr_17528071.mp3"
+    "path": "common_voice_tr_17528071.mp3",
     "array": [-0.1600779, -0.13843077],
     "sampling_rate": 16000
   },
