@@ -30,12 +30,17 @@ guides/llm/sft.md
 guides/llm/peft.md
 guides/omni/gemma3-3n.md
 ```
+```{toctree}
+:caption: Datasets
+:hidden:
+guides/llm/dataset.md
+guides/vlm/dataset.md
+```
 
 ```{toctree}
 :caption: 📚 Guides
 :hidden:
 
-guides/dataset.md
 guides/checkpointing.md
 guides/gemma3n_blog.md
 ```

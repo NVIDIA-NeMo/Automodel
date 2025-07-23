@@ -1,13 +1,12 @@
 # Integrate Your Own Dataset
 
-This guide shows you how to integrate your own dataset into NeMo Automodel for training. You'll learn about three main dataset types: **completion datasets** for language modeling (like [HellaSwag](https://huggingface.co/datasets/rowan/hellaswag)), **instruction datasets** for question-answering tasks (like [SQuAD](https://huggingface.co/datasets/rajpurkar/squad)), and **multi-modal datasets** that combine text with images or other modalities. We'll cover how to create custom datasets by implementing the required methods and preprocessing functions, and finally show you how to specify your own data logic using YAML configuration with file paths—allowing you to define custom dataset processing without modifying the main codebase.
+This guide shows you how to integrate your own dataset into NeMo Automodel for training. You'll learn about two main dataset types: **completion datasets** for language modeling (like [HellaSwag](https://huggingface.co/datasets/rowan/hellaswag)) and **instruction datasets** for question-answering tasks (like [SQuAD](https://huggingface.co/datasets/rajpurkar/squad)). We'll cover how to create custom datasets by implementing the required methods and preprocessing functions, and finally show you how to specify your own data logic using YAML configuration with file paths—allowing you to define custom dataset processing without modifying the main codebase.
 
 ## Quick Start Summary
 | **Type**        |  **Use Case**    | **Example** | **Preprocessor**               | **Section**              |
 | --------------- | ------------------ | -------------- | --------------------------------- | --------------------------- |
 | ✍️ Completion   | Language modeling  | HellaSwag      | `SFTSingleTurnPreprocessor`       | [Jump](#completion-datasets)  |
 | 🗣️ Instruction  | Question answering | SQuAD          | `make_*` function                 | [Jump](#instruction-datasets) |
-| 🖼️ Multi-modal  | Vision + Language  | MedPix-VQA     | `apply_chat_template`, collate fn | [Jump](#multi-modal-datasets) |
 
 ## Types of Supported Datasets
 
@@ -118,69 +117,6 @@ def make_my_instruction_dataset(
         remove_columns=dataset.column_names,
     )
 ```
-
-### Multi-modal Datasets
-
-Multi-modal datasets combine text with other input types (e.g., images, audio or video) and are essential for training Vision-Language Models (VLMs). These datasets introduce specific challenges such as aligning modalities, batching diverse data types, and formatting prompts for multi-turn, multi-modal dialogue.
-
-NeMo Automodel supports multi-modal dataset integration through flexible preprocessing, custom formatting, and YAML-based configuration.
-
-#### Typical types in Multi-modal Datasets
-A multi-modal dataset typically contains:
-- **Images, videos, audios** or other non-text modalities.
-- **Textual inputs** such as questions, instructions, or captions.
-- **Answers** or expected outputs from the model.
-
-These are formatted into structured conversations or instruction-response pairs for use with VLMs like BLIP, Llava, or Flamingo.
-
-#### Example: MedPix-VQA Dataset
-
-The [MedPix-VQA](https://huggingface.co/datasets/mmoukouba/MedPix-VQA) dataset is a comprehensive medical Visual Question Answering dataset designed for training and evaluating VQA models in the medical domain. It contains radiological images (from MedPix; well-known medial image dataset) and associated QA pairs used for medical image interpretation.
-
-**Structure**:
-- 20,500 total examples
-- Columns: `image_id`, `mode`, `case_id`, `question`, `answer`
-
-```json
-{
-  "image_id": "medpix_0143.jpg",
-  "mode": "CT",
-  "case_id": "case_101",
-  "question": "What abnormality is visible in the left hemisphere?",
-  "answer": "Subdural hematoma"
-}
-```
-
-The example dataset preprocessing performs the following steps:
-
-1. Loads the dataset using Hugging Face's `datasets` library.
-2. Extracts the `question` and `answer`.
-3. Transforms the data into a chat-like format that is compatible with Hugging Face's Autoprocessor `apply_chat_template` function. For example:
-
-```python
-conversation = [
-    {
-        "role": "user",
-        "content": [
-            {"type": "image", "image": example["image_id"]},
-            {"type": "text", "text": example["question"]},
-        ],
-    },
-    {
-        "role": "assistant",
-        "content": [{"type": "text", "text": example["answer"]}]
-    },
-]
-```
-
-For more detailed examples of how to process multi-modal datasets for VLMs, see the examples in [`datasets.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/vlm/datasets.py).
-
-#### Collate Functions
-
-NeMo Automodel provides specialized collate functions for different VLM processors. The collate function is responsible for batching examples and preparing them for model input.
-
-Multi-modal models require custom collate functions to batch and process each sample correctly. If your model uses a Hugging Face `AutoProcessor`, you can use it directly. Otherwise, you can define your own collate logic and point to it in your YAML config. We provide [example custom collate functions](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/vlm/collate_fns.py) that you can use as references for your implementation. After you implement your own collate function, you can specify it in your YAML config.
-
 
 ## YAML-based Custom Dataset Configuration
 
