@@ -76,7 +76,7 @@ The recipe/components structure enables you to:
 
 <!-- For an in-depth explanation of the LLM recipe please also see the [LLM recipe deep-dive guide](docs/llm_recipe_deep_dive.md). -->
 
-#### Recipe configuration
+#### Configure a Recipe
 Example YAML configuration (complete config available [here](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm/llama_3_2_1b_squad.yaml)):
 ```yaml
 step_scheduler:
