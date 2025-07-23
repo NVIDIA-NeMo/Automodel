@@ -3,11 +3,13 @@
 ```
 
 ```{toctree}
-:caption: 🖥️  Environment Start
+:caption: 🖥️ Get Started
 :hidden:
+repository_structure.md
 guides/installation.md
 environment/local-workstation.md
 ```
+
 <!--
 environment/cluster.md
 -->
