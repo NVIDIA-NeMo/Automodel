@@ -3,7 +3,6 @@
 ```
 
 ```{toctree}
-
 :caption: Get Started
 :hidden:
 
