@@ -98,8 +98,8 @@ dataset:
 More recipe examples are availble under the [`examples/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples) directory.
 
 ### CLI Directory
-The `automodel` CLI application simplifies job execution across different environments,
-single-GPU interactive to batch multi-node. Currently, it supports SLURM clusters, with Kuberneters support coming soon.
+The `automodel` CLI application simplifies job execution across different environments, from 
+single-GPU interactive sessions to batch multi-node runs. Currently, it supports Slurm clusters, with Kubernetes support coming soon.
 
 #### Basic Usage
 For example, to run the same torchrun llm finetune shown in the recipes section above:
