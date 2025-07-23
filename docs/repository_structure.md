@@ -67,7 +67,7 @@ Each recipe can be executed directly using torchrun, for example, from the root 
 torchrun --nproc-per-node=2 nemo_automodel/recipes/llm/finetune.py -c examples/llm/llama_3_2_1b_squad.yaml
 ```
 
-The above command will finetune the Llama3.2-1B model on the SQuaD dataset with two GPUs.
+The above command will fine-tune the Llama3.2-1B model on the SQuaD dataset with two GPUs.
 
 Each recipe, imports the components it needs from the `nemo_automodel/components/` catalog.
 The recipe/components structure enables you to:
