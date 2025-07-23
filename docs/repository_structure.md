@@ -29,7 +29,7 @@ $ tree -L 1 nemo_automodel/components/
 
 ├── _peft/          - Implementations of PEFT methods, such as LoRA.
 ├── _transformers/  - Optimized model implementations for Hugging Face models.
-├── checkpoint/     - Checkpoint save / load related logic.
+├── checkpoint/     - Checkpoint save and load-related logic.
 ├── config/         - Utils to load yamls and CLI parsing helpers.
 ├── datasets/       - LLM and VLM datasets and utils (collate functions, preprocessing).
 ├── distributed/    - Distributed processing primitives (DDP, FSDP2, nvFSDP).
