@@ -128,9 +128,7 @@ The section above defines the Slurm hyperparameters required to launch a batch j
 
 #### Launch a Batch Job on Slurm with Modified Code
 
-The above `slurm` YAML configuration will use the automodel installation contained in the `container_image`.
-However, if the command is run from within a git repo (that is accessible from SLURM workers), then
-the SBATCH script will use the git repo for running the experiments, instead of installation in the container.
+The `slurm` YAML configuration above uses the Automodel installation provided in the `container_image`. However, if the command is executed from within a Git repository accessible to Slurm workers, the SBATCH script will prioritize the repository for running the experiments instead of using the container installation.
 
 For example,
 ```bash
