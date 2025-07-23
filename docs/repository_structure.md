@@ -97,7 +97,7 @@ dataset:
 
 More recipe examples are availble under the [`examples/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples) directory.
 
-### Automodel CLI application
+### CLI Directory
 The `automodel` CLI application simplifies job execution across different environments,
 single-GPU interactive to batch multi-node. Currently, it supports SLURM clusters, with Kuberneters support coming soon.
 
