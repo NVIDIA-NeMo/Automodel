@@ -37,7 +37,7 @@ $ tree -L 1 nemo_automodel/components/
 ├── loggers/        - Metric/event logging for Weights & Biases and other tools
 ├── loss/           - Loss functions (such as cross-entropy and linear cross-entropy, etc.).
 ├── optim/          - Optimizers and LR schedulers, including fused or second-order variants.
-├── training/       - Training and finetuning utils.
+├── training/       - Training and fine-tuning utils.
 └── utils/          - Small, dependency-free helpers (seed, profiler, timing, fs).
 ```
 
