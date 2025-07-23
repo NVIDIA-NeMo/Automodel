@@ -3,14 +3,24 @@
 ```
 
 ```{toctree}
-:caption: 🖥️  Environment Start
+:caption: 🖥️ Get Started
 :hidden:
+repository_structure.md
 guides/installation.md
 environment/local-workstation.md
 ```
+
 <!--
 environment/cluster.md
 -->
+
+```{toctree}
+:caption: Model Coverage
+:hidden:
+
+model_coverage/llm.md
+model_coverage/vlm.md
+```
 
 ```{toctree}
 :caption: 🚀 E2E Examples

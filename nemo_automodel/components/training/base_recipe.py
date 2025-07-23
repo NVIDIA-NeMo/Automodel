@@ -28,6 +28,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     save_model,
     save_optimizer,
 )
+from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 
 
 def has_load_restore_state(object):
@@ -58,6 +59,19 @@ def is_tokenizer(object):
     return isinstance(object, (PreTrainedTokenizerBase, ProcessorMixin))
 
 
+def is_lr_scheduler(object):
+    """
+    Checks whether object is a learning rate scheduler.
+
+    Args:
+        object (any): the object to check.
+
+    Returns:
+        bool: returns True if object is an OptimizerParamScheduler.
+    """
+    return isinstance(object, OptimizerParamScheduler)
+
+
 class BaseRecipe:
     """
     BaseRecipe provides checkpoint load/save functionality for recipes.
@@ -81,7 +95,12 @@ class BaseRecipe:
         if "__state_tracked" not in self.__dict__:
             self.__dict__["__state_tracked"] = set()
         # Track stateful objects unless they are validation/eval components.
-        should_track = isinstance(value, (nn.Module, Optimizer)) or has_load_restore_state(value) or is_tokenizer(value)
+        should_track = (
+            isinstance(value, (nn.Module, Optimizer))
+            or has_load_restore_state(value)
+            or is_tokenizer(value)
+            or is_lr_scheduler(value)
+        )
 
         if should_track and not any(substr in key.lower() for substr in ("val", "eval", "test")):
             assert key not in self.__dict__["__state_tracked"]
@@ -109,13 +128,15 @@ class BaseRecipe:
             print(f"Saving checkpoint to {path}", flush=True)
 
         # TODO(@adil-a): Change this when we create a LR scheduler class
-        model, optimizer, tokenizer = None, None, None
+        model, optimizer, scheduler, tokenizer = None, None, None, None
 
         for key in self.__dict__["__state_tracked"]:
             if isinstance(getattr(self, key), nn.Module):
                 model = getattr(self, key)
             elif isinstance(getattr(self, key), Optimizer):
                 optimizer = getattr(self, key)
+            elif is_lr_scheduler(getattr(self, key)):
+                scheduler = getattr(self, key)
             elif is_tokenizer(getattr(self, key)):
                 tokenizer = getattr(self, key)
             else:
@@ -128,7 +149,7 @@ class BaseRecipe:
                     torch.distributed.barrier()
 
         save_model(model, path, self.checkpoint_config, peft_config=self.peft_config, tokenizer=tokenizer)
-        save_optimizer(optimizer, model, path)
+        save_optimizer(optimizer, model, path, scheduler)
 
     def load_checkpoint(self, restore_from: str | None = None):
         """
@@ -152,14 +173,15 @@ class BaseRecipe:
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             print(f"Loading checkpoint from {ckpt_dir}", flush=True)
 
-        # TODO(@adil-a): Change this when we create a LR scheduler class
-        model, optimizer = None, None
+        model, optimizer, scheduler = None, None, None
 
         for key in self.__dict__["__state_tracked"]:
             if isinstance(getattr(self, key), nn.Module):
                 model = getattr(self, key)
             elif isinstance(getattr(self, key), Optimizer):
                 optimizer = getattr(self, key)
+            elif is_lr_scheduler(getattr(self, key)):
+                scheduler = getattr(self, key)
             elif is_tokenizer(getattr(self, key)):
                 # we don't need to load the tokenizer from the checkpoint
                 # we only save the tokenizer for consolidated checkpoints for downstream use
@@ -168,7 +190,7 @@ class BaseRecipe:
                 getattr(self, key).load_state_dict(torch.load(os.path.join(ckpt_dir, f"{key}.pt"), weights_only=False))
 
         load_model(model, ckpt_dir, self.checkpoint_config)
-        load_optimizer(optimizer, model, ckpt_dir)
+        load_optimizer(optimizer, model, ckpt_dir, scheduler)
 
 
 def _find_latest_checkpoint(checkpoint_dir):

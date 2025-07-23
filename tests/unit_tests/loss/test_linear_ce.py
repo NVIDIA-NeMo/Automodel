@@ -17,13 +17,13 @@ import torch.nn.functional as F
 
 from nemo_automodel.components.loss.linear_ce import (
     HAVE_CUT_CROSS_ENTROPY,
-    fused_linear_cross_entropy,
+    FusedLinearCrossEntropy,
 )
 
 
 @pytest.mark.skipif(not HAVE_CUT_CROSS_ENTROPY, reason="Linear loss CE is not installed")
 def test_fused_cross_entropy():
-    """Tests fused_linear_cross_entropy against PyTorch's CE.
+    """Tests FusedLinearCrossEntropy against PyTorch's CE.
 
     * has close output with PyTorch's cross_entropy
     * uses less memory than PyTorch's cross_entropy
@@ -37,7 +37,6 @@ def test_fused_cross_entropy():
     hidden_dim = 4096
     vocab_size = 128256
     dtype = torch.bfloat16
-
     # Create inputs on GPU
     hidden_states = torch.randn(batch_size, seq_length, hidden_dim, dtype=dtype, device=device)
     weight = torch.randn(vocab_size, hidden_dim, dtype=dtype, device=device)  # Note: transposed shape
@@ -51,7 +50,7 @@ def test_fused_cross_entropy():
         logits = torch.matmul(hidden_states_reshaped, weight.t())  # Use transpose for matmul
         # Reshape targets for loss: [batch_size, seq_length] -> [batch_size * seq_length]
         targets_reshaped = targets.reshape(-1)
-        pytorch_loss = F.cross_entropy(logits, targets_reshaped, reduction="mean")
+        pytorch_loss = F.cross_entropy(logits, targets_reshaped, reduction="sum")
     pytorch_memory = torch.cuda.max_memory_allocated()
 
     torch.cuda.empty_cache()  # Clear CUDA cache
@@ -62,7 +61,7 @@ def test_fused_cross_entropy():
     # Measure memory for fused implementation
     torch.cuda.reset_peak_memory_stats()
     with torch.amp.autocast(device_type="cuda", dtype=dtype):
-        fused_loss = fused_linear_cross_entropy(hidden_states, weight, targets)
+        fused_loss = FusedLinearCrossEntropy()(hidden_states, targets, weight)
     fused_memory = torch.cuda.max_memory_allocated()
 
     # Compare results and memory usage
