@@ -62,7 +62,7 @@ $ tree -L 2 nemo_automodel/recipes/
 
 #### Run a Recipe
 
-Each recipe can be executed directly using torchrun, for example (from the root directory):
+Each recipe can be executed directly using torchrun, for example, from the root directory:
 ```bash
 torchrun --nproc-per-node=2 nemo_automodel/recipes/llm/finetune.py -c examples/llm/llama_3_2_1b_squad.yaml
 ```
