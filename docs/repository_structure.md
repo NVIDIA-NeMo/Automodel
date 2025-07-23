@@ -124,8 +124,7 @@ slurm:
   extra_mounts:
     - /a/b/c:/d/e
 ```
-The above section defines the SLURM hyper-parameters necessary to launch a batch job on a SLURM
-cluster using one node (`nodes` argument) and eight gpus (`ntasks_per_node`).
+The section above defines the Slurm hyperparameters required to launch a batch job on a Slurm cluster using one node (`nodes` argument) and eight GPUs per node (`ntasks_per_node`).
 
 #### Launching a batch job on SLURM with modified code
 
