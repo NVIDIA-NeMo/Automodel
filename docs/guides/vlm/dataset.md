@@ -15,7 +15,7 @@ Multi-modal datasets combine text with other input types (e.g., images, audio, o
 
 NeMo Automodel supports multi-modal dataset integration through flexible preprocessing, custom formatting, and YAML-based configuration.
 
-### Typical types in Multi-modal Datasets
+### Typical Types in Multi-modal Datasets
 A multi-modal dataset typically contains:
 - **Images, videos, audios** or other non-text modalities.
 - **Textual inputs** such as questions, instructions, or captions.
