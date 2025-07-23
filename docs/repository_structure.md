@@ -107,7 +107,7 @@ For example, to run the same torchrun LLM fine-tuning workflow described in the 
 automodel llm finetune -c examples/llm/llama_3_2_1b_squad.yaml --nproc-per-node=2
 ```
 
-#### Launching a batch job on SLURM
+#### Launch a Batch Job on Slurm
 
 The `automodel` CLI application further enables users to launch batch jobs. For example, to run
 a job on a SLURM cluster, the YAML file needs to be extended with:
