@@ -51,7 +51,7 @@ Recipes define **end-to-end workflows** (data → training → eval) for a varie
 training, finetuning and knowledge distillation, combining components into usable pipelines.
 
 #### Available Recipes
-The following directory listing shows all components with explaination of their contents:
+The following directory listing shows all components along with explanations of their contents.
 ```
 $ tree -L 2 nemo_automodel/recipes/
 ├── llm
