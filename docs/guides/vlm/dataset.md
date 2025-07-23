@@ -7,15 +7,16 @@ You'll learn about **multi-modal datasets** that combine text with images or oth
 | **Type**        |  **Use Case**    | **Example** | **Preprocessor**               | **Section**              |
 | --------------- | ------------------ | -------------- | --------------------------------- | --------------------------- |
 | 🖼️ Multi-modal  | Vision + Language  | MedPix-VQA     | `apply_chat_template`, collate fn | [Jump](#multi-modal-datasets) |
+| 🎤 Audio        | Speech + Language  | Common Voice 17| `apply_chat_template`, collate fn | [Jump](#audio-datasets) |
 
 
 ## Multi-modal Datasets
 
-Multi-modal datasets combine text with other input types (e.g., images, audio, or video) and are essential for training Vision-Language Models (VLMs). These datasets introduce specific challenges such as aligning modalities, batching diverse data types, and formatting prompts for multi-turn, multi-modal dialogue.
+Multi-modal datasets combine text with other input types (e.g., images, audio or video) and are essential for training Vision-Language Models (VLMs). These datasets introduce specific challenges such as aligning modalities, batching diverse data types, and formatting prompts for multi-turn, multi-modal dialogue.
 
 NeMo Automodel supports multi-modal dataset integration through flexible preprocessing, custom formatting, and YAML-based configuration.
 
-### Typical Types in Multi-modal Datasets
+### Typical types in Multi-modal Datasets
 A multi-modal dataset typically contains:
 - **Images, videos, audios** or other non-text modalities.
 - **Textual inputs** such as questions, instructions, or captions.
@@ -64,6 +65,38 @@ conversation = [
 ```
 
 For more detailed examples of how to process multi-modal datasets for VLMs, see the examples in [`datasets.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/vlm/datasets.py).
+
+## Audio Datasets
+
+Audio datasets combine speech input with text transcriptions and are essential for training models capable of speech recognition and transcription tasks. NeMo Automodel supports audio dataset integration through specialized preprocessing functions and custom collate functions for multimodal models like Phi-4.
+
+### Example: Common Voice 17 Dataset
+
+The [Common Voice 17](https://huggingface.co/datasets/ysdede/commonvoice_17_tr_fixed) dataset is a comprehensive speech recognition dataset containing audio clips and corresponding transcriptions. This particular version focuses on Turkish speech data and has been preprocessed and fixed for compatibility with modern training frameworks.
+
+**Structure**:
+- **Audio**: Speech recordings in various formats
+- **Transcription**: Text transcriptions of the spoken content
+- **Use case**: Speech-to-text transcription for multimodal models
+
+```json
+{
+  "audio": {
+    "path": "common_voice_tr_17528071.mp3"
+    "array": [-0.1600779 , -0.13843077 ...],
+    "sampling_rate": 16000
+  },
+  "transcription": "Kosova başkentinswki yolcu sayısı arttı."
+}
+```
+
+The example dataset preprocessing performs the following steps:
+
+1. Loads the dataset using Hugging Face's `datasets` library.
+2. Extracts the `audio` and `transcription` fields.
+
+For more detailed examples of how to process multi-modal datasets, see the examples in [`datasets.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/vlm/datasets.py).
+
 
 ### Collate Functions
 
