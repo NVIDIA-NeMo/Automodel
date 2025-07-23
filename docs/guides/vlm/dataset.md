@@ -11,7 +11,7 @@ You'll learn about **multi-modal datasets** that combine text with images or oth
 
 ## Multi-modal Datasets
 
-Multi-modal datasets combine text with other input types (e.g., images, audio or video) and are essential for training Vision-Language Models (VLMs). These datasets introduce specific challenges such as aligning modalities, batching diverse data types, and formatting prompts for multi-turn, multi-modal dialogue.
+Multi-modal datasets combine text with other input types (e.g., images, audio, or video) and are essential for training Vision-Language Models (VLMs). These datasets introduce specific challenges such as aligning modalities, batching diverse data types, and formatting prompts for multi-turn, multi-modal dialogue.
 
 NeMo Automodel supports multi-modal dataset integration through flexible preprocessing, custom formatting, and YAML-based configuration.
 
