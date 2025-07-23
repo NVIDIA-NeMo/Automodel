@@ -50,6 +50,23 @@ jobs:
           ruff check . --verbose
           ruff format --check . --verbose
 
+  import_linting:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install import-liner
+        run: |
+          pip install import-linter
+
+      - name: Run import-linter
+        run: |
+          lint-imports --debug --verbose --no-cache
+
   Nemo_Linting_Test:
     needs: linting
     runs-on: ubuntu-latest
@@ -111,10 +128,7 @@ jobs:
       - name: main
         uses: ./.github/actions/test-template
         with:
-          script: |
-            pip3 install --break-system-packages import-linter
-            PYTHONPATH=$(pwd) lint-imports --debug --verbose --no-cache
-            ${{ matrix.script }}
+          script: ${{ matrix.script }}
           timeout: ${{ matrix.timeout || 10 }}
           is_unit_test: "true"
           cpu-only: ${{ matrix.cpu-only || false }}
