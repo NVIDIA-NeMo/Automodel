@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import contextlib
-from typing import List, Set
+from typing import List, Optional, Set
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -68,7 +68,7 @@ def create_context_parallel_ctx(
     cp_buffers: List[torch.Tensor],
     cp_seq_dims: List[int],
     cp_no_restore_buffers: Set[torch.Tensor],
-    cp_rotate_method: str,
+    cp_rotate_method: Optional[str] = None,
 ):
     """
     Create a context parallel context.
@@ -82,6 +82,10 @@ def create_context_parallel_ctx(
             such as "allgather" or "addtoall".
     """
     from torch.distributed.tensor.experimental import context_parallel
+    from torch.distributed.tensor.experimental._attention import set_rotate_method
+
+    if cp_rotate_method is not None:
+        set_rotate_method(cp_rotate_method)
 
     # TODO: uncomment this when torch.distributed.tensor.experimental._attention.set_rotate_method
     # is available
