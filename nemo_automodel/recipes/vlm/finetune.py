@@ -39,6 +39,7 @@ from nemo_automodel.components.distributed.nvfsdp import NVFSDPManager
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.base_recipe import BaseRecipe
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
@@ -108,8 +109,18 @@ def build_model_and_optimizer(
         return model, optimizer
 
 
-def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
-    """Build a checkpoint configuration."""
+def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
+    """Build a checkpoint configuration.
+
+    Args:
+        cfg_ckpt: Configuration for checkpointing.
+        cache_dir: Cache directory for the model.
+        model_repo_id: Model repository ID.
+        is_peft: Whether the model is PEFT.
+
+    Returns:
+        The instantiated checkpoint configuration.
+    """
     from transformers.utils import TRANSFORMERS_CACHE
 
     ckpt_kwargs = dict(
@@ -129,7 +140,8 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
         raise ValueError(
             "PEFT checkpointing is not supported for torch_save format. Save using `safetensors` format instead."
         )
-    return CheckpointingConfig(**ckpt_kwargs)
+    checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
+    return checkpoint_config
 
 
 def build_loss_fn(cfg_loss):
@@ -145,7 +157,19 @@ def build_loss_fn(cfg_loss):
 
 
 def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed) -> tuple[DataLoader, ProcessorMixin]:
-    """Build a VLM dataloader."""
+    """Build a DataLoader for the VLM dataset.
+
+    Args:
+        cfg_ds: Dataset configuration.
+        cfg_dl: DataLoader configuration.
+        cfg_model: Model configuration.
+        cfg_processor: Processor configuration or None.
+        device_mesh: Device mesh for distributed training.
+        seed: Random seed.
+
+    Returns:
+        The instantiated DataLoader and processor.
+    """
     dist_sampler_kwargs = {
         "shuffle": cfg_dl.get("shuffle", True),
     }
@@ -220,10 +244,68 @@ def build_step_scheduler(cfg, dataloader):
     return StepScheduler(**default_kwargs)
 
 
-def build_wandb(cfg):
-    """Instantiates wandb and returns the instance.
+def build_lr_scheduler(cfg, optimizer, step_scheduler) -> OptimizerParamScheduler | None:  # noqa: F821
+    """Build the learning rate scheduler.
 
-    If no name is given, it will use the model name.
+    Args:
+        cfg: Configuration for the OptimizerParamScheduler.
+        optimizer: The optimizer to be scheduled.
+        step_scheduler: The step scheduler to extract training parameters.
+
+    Returns:
+        OptimizerParamScheduler: The configured learning rate scheduler, or None if not configured.
+    """
+    if cfg is None:
+        return None
+
+    # Calculate total steps for the training run
+    total_epochs = step_scheduler.num_epochs
+    epoch_len = len(step_scheduler.dataloader)
+    grad_acc_steps = step_scheduler.grad_acc_steps
+
+    # Total optimizer steps (accounting for gradient accumulation)
+    total_steps = (total_epochs * epoch_len) // grad_acc_steps
+
+    # Extract learning rate from optimizer
+    base_lr = optimizer.param_groups[0]["lr"]
+
+    # Set defaults for scheduler parameters
+    default_kwargs = dict(
+        optimizer=optimizer,
+        init_lr=base_lr * 0.1,  # Start warmup at 10% of base LR
+        max_lr=base_lr,
+        min_lr=base_lr * 0.01,  # End at 1% of base LR
+        lr_warmup_steps=min(1000, total_steps // 10),  # 10% warmup or max 1000 steps
+        lr_decay_steps=total_steps,
+        lr_decay_style="cosine",
+        start_wd=optimizer.param_groups[0].get("weight_decay", 0.0),
+        end_wd=optimizer.param_groups[0].get("weight_decay", 0.0),
+        wd_incr_steps=total_steps,
+        wd_incr_style="constant",
+    )
+
+    # Override with user-provided config
+    if cfg is not None:
+        user_cfg = cfg.to_dict() if hasattr(cfg, "to_dict") else dict(cfg)
+        default_kwargs.update(user_cfg)
+
+    logger.info(
+        f"Building LR scheduler with total_steps={total_steps}, "
+        f"warmup_steps={default_kwargs['lr_warmup_steps']}, "
+        f"decay_style={default_kwargs['lr_decay_style']}"
+    )
+
+    return OptimizerParamScheduler(**default_kwargs)
+
+
+def build_wandb(cfg) -> wandb.Run:
+    """Instantiates wandb and returns the instance. If no name is given, it will use the model name.
+
+    Args:
+        cfg: Configuration for wandb.
+
+    Returns:
+        The wandb instance.
     """
     assert cfg.get("wandb", None) is not None
     kwargs = cfg.wandb.to_dict()
@@ -307,8 +389,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
         """
         self.cfg = cfg
 
+    # ------------------ build phase ------------------
     def setup(self):
-        """Override setup to use VLM-specific builders."""
+        """Builds all components needed for training/validation/logging/checkpointing/etc.
+
+        This is the last place where self.cfg should be referenced.
+
+        Raises:
+            NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
+        """
         torch.cuda.reset_peak_memory_stats()
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
         setup_logging()
@@ -332,14 +421,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.dist_env.device,
             self.cfg.model,
             self.cfg.optimizer,
-            self.cfg.get("freeze_config", None),  # VLM-specific
+            self.cfg.get("freeze_config", None),
             self.peft_config,
             self.model_wrapper,
             seed=self.cfg.get("seed", 42),
             tp_size=self.cfg.get("distributed.tp_size", 1),
         )
         self.loss_fn = build_loss_fn(self.cfg.loss_fn)
-        self.dataloader, self.processor = build_dataloader(  # VLM-specific
+        self.dataloader, self.processor = build_dataloader(
             self.cfg.dataset,
             self.cfg.dataloader,
             self.cfg.model,
@@ -351,7 +440,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Build validation dataloader if the config provides it
         self.val_dataloader = None
         if "validation_dataset" in self.cfg:
-            self.val_dataloader, _ = build_dataloader(  # VLM-specific
+            self.val_dataloader, _ = build_dataloader(
                 self.cfg.validation_dataset,
                 self.cfg.validation_dataloader,
                 self.cfg.model,
@@ -361,11 +450,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
             )
 
         # Initialize metrics required for calculating loss
-        self.total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
+        self.total_local_num_loss_tokens = torch.zeros([], dtype=torch.int, device="cuda")
         self.forward_data_store = []
 
         # Scheduler
         self.step_scheduler = build_step_scheduler(self.cfg.get("step_scheduler", None), self.dataloader)
+
+        # Build learning rate scheduler
+        self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
 
         # Build checkpointing config
         restore_from = self.cfg.get("checkpoint.restore_from", None)
@@ -391,7 +483,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         """
         self.model.train()
         self.timestamp = time.perf_counter()
-        self.num_tokens = 0
+        self.num_nonpad_tokens = 0
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
             for batch_idx, batch in enumerate(self.step_scheduler):
@@ -409,10 +501,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         Args:
             batch: Batch of training data.
             is_optim_step: Flag indicating if a gradient step should be applied.
-            clip_norm: Gradient clipping norm value.
-
-        Returns:
-            Grad norm from the training step.
+            clip_norm: Gradient clipping norm.
         """
         self.model.train()
 
@@ -449,9 +538,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
             )
 
-        local_num_tokens = loss_mask.sum().detach().to(torch.int)
-        self.num_tokens += labels.numel() - count_tail_padding(labels)
-        self.total_num_tokens += local_num_tokens
+        # local_num_loss_tokens are the number of tokens that are used for loss calculation
+        # in pretraining, this excludes padding tokens. In SFT, this additionally
+        # excludes the context tokens.
+        local_num_loss_tokens = loss_mask.sum().detach().to(torch.int)
+        # num_nonpad_tokens are the number of non-padding tokens
+        self.num_nonpad_tokens += labels.numel() - count_tail_padding(labels)
+        self.total_local_num_loss_tokens += local_num_loss_tokens
         self.forward_data_store.append(local_loss.detach())
 
         with get_sync_ctx(self.model, is_optim_step):
@@ -461,7 +554,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if is_optim_step:
             rescale_gradients(
                 self.model,
-                self.total_num_tokens,
+                self.total_local_num_loss_tokens,
                 self.device_mesh[
                     (
                         "dp_cp"
@@ -487,6 +580,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.optimizer.step()
             self.optimizer.zero_grad()
 
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step(1)
+
             # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
             # self.model.install_optimized_model_weights()
             # self.model.zero_grad_buffer()
@@ -497,16 +593,18 @@ class FinetuneRecipeForVLM(BaseRecipe):
             t = time.perf_counter()
             time_delta = t - self.timestamp
             self.timestamp = t
-            tps = self.num_tokens / time_delta
-            self.num_tokens = 0
+            tps = self.num_nonpad_tokens / time_delta
+            self.num_nonpad_tokens = 0
             # log
             reporting_loss = self.log_train_metrics(grad_norm, tps)
+            current_lr = self.optimizer.param_groups[0]["lr"]
             logging.info(
-                "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | mem: {:.2f} GiB | tps {:.2f}".format(
+                "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem: {:.2f} GiB | tps {:.2f}".format(
                     self.step_scheduler.step,
                     self.step_scheduler.epoch,
                     reporting_loss,
                     grad_norm,
+                    current_lr,
                     torch.cuda.max_memory_allocated() / 1024**3,
                     tps,
                 )
@@ -514,8 +612,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
             torch.cuda.reset_peak_memory_stats()
 
     @torch.no_grad()
-    def _run_validation_epoch(self) -> float:
-        """Run one pass over `self.val_dataloader` and return average loss per token."""
+    def _run_validation_epoch(self):
+        """Run one pass over `self.val_dataloader`."""
         with StatefulRNG(seed=1, ranked=True):
             self.model.eval()
 
@@ -569,18 +667,19 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if self.dist_env.is_main:
             if wandb.run is not None:
                 wandb.log({"val_loss": val_loss, "step": self.step_scheduler.step, "epoch": self.step_scheduler.epoch})
+        current_lr = self.optimizer.param_groups[0]["lr"]
         logging.info(
-            "[val] step {} | epoch {} | loss {:.4f}".format(
-                self.step_scheduler.step, self.step_scheduler.epoch, val_loss
+            "[val] step {} | epoch {} | loss {:.4f} | lr {:.2e}".format(
+                self.step_scheduler.step, self.step_scheduler.epoch, val_loss, current_lr
             )
         )
 
-    def log_train_metrics(self, grad_norm, tps):
+    def log_train_metrics(self, grad_norm, tps) -> float:
         """Log metrics to wandb.
 
         Args:
             grad_norm: Grad norm from the training step.
-            tps: Tokens per second throughput metric.
+            tps: Tokens per second.
 
         Returns:
             Reporting loss.
@@ -592,12 +691,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
         else:
             dp_group = self.device_mesh["data_parallel"].get_group()
 
-        total_loss, total_num_tokens = reduce_loss(
-            self.forward_data_store, self.total_num_tokens, per_token_loss=True, dp_group=dp_group
+        total_loss, total_num_loss_tokens = reduce_loss(
+            self.forward_data_store, self.total_local_num_loss_tokens, per_token_loss=True, dp_group=dp_group
         )
-        reporting_loss = (total_loss / total_num_tokens).item()
+        reporting_loss = (total_loss / total_num_loss_tokens).item()
         grad_norm = grad_norm.item() if not isinstance(grad_norm, float) else grad_norm  # TP WAR
-        self.total_num_tokens.zero_()
+        self.total_local_num_loss_tokens.zero_()
         self.forward_data_store = []
         log_data = {
             "train_loss": reporting_loss,
@@ -605,7 +704,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             "step": self.step_scheduler.step,
             "epoch": self.step_scheduler.epoch,
             "grad_norm": grad_norm,
-            "num_tokens_per_step": total_num_tokens,
+            "num_tokens_per_step": total_num_loss_tokens,
             "tps": tps,
         }
         if self.optimizer.param_groups:
@@ -621,13 +720,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
 # ---------------------------------------------------------------------------
 
 
-def main():
+def main(config_path=None):
     """Main entry point for the fine-tuning recipe.
 
     Loads the configuration, sets up the trainer, and initiates the training loop.
     """
-    script_path = pathlib.Path(__file__).parent.resolve()
-    cfg = parse_args_and_load_config(script_path / "gemma_3_vl_4b_cord_v2.yaml")
+    if config_path is None:
+        config_path = pathlib.Path(__file__).parent.resolve() / "gemma_3_vl_4b_cord_v2.yaml"
+    cfg = parse_args_and_load_config(config_path)
     trainer = FinetuneRecipeForVLM(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
