@@ -71,7 +71,9 @@ class ColumnMappedTextDataset(Dataset):
             column_mapping: A dictionary mapping the column names to the column indices.
             split: The split to load from the dataset.
         """
-        self.dataset = load_dataset(path_or_dataset_id)[split]
+        self.dataset = load_dataset(path_or_dataset_id)
+        if split:
+            self.dataset = self.dataset[split]
         self.column_mapping = column_mapping
         self.tokenizer = tokenizer
 
