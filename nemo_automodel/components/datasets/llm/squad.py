@@ -81,9 +81,9 @@ def make_squad_dataset(
 
         input_ids = context_ids + answer_ids
         return dict(
-            input_ids=input_ids[:-1],
-            labels=input_ids[1:],
-            loss_mask=[0] * (len(context_ids) - 1) + [1] * len(answer_ids),
+            input_ids=input_ids[:-1],  # remove EOS
+            labels=input_ids[1:],  # remove BOS
+            loss_mask=[0] * (len(context_ids) - 1) + [1] * len(answer_ids),  # remove EOS
         )
 
     def formatting_prompts_func_with_chat_template(example, start_of_turn_token=None):
@@ -100,9 +100,9 @@ def make_squad_dataset(
             response_start = 0
         loss_mask = [0] * response_start + [1] * (len(input_ids) - response_start)
         return dict(
-            input_ids=input_ids,
-            labels=input_ids[1:] + [getattr(tokenizer, "eos_token_id", None) or input_ids[-1]],
-            loss_mask=loss_mask,
+            input_ids=input_ids[:-1],  # remove EOS
+            labels=input_ids[1:],  # remove BOS
+            loss_mask=loss_mask[1:],  # remove EOS
         )
 
     if limit_dataset_samples is not None:
