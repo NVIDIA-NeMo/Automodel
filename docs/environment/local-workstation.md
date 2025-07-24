@@ -28,7 +28,8 @@ automodel finetune llm -c examples/llm/llama_3_2_1b_squad.yaml
 
 ### Multi-GPU Training
 
-The CLI automatically detects available GPUs and uses `torchrun` for multi-GPU training. To specify the number of GPUs:
+For interactive, single-node jobs, the CLI automatically detects the number of available GPUs and
+uses `torchrun` for multi-GPU training. You can specify manully the number of GPUs using the `--nproc-per-node` option, as follows:
 
 ```bash
 automodel finetune llm -c examples/llm/llama_3_2_1b_squad.yaml --nproc-per-node=2
