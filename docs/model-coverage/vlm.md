@@ -1,4 +1,4 @@
-# Vision Language Models with NeMo AutoModel
+# Vision Language Models (VLMs)
 
 ## Introduction
 

@@ -1,4 +1,4 @@
-# Large Language Models with NeMo AutoModel
+# Large Language Models (LLMs)
 
 ## Introduction
 Large Language Models (LLMs) power a variety of tasks such as dialogue systems, text classification, summarization, and more.
