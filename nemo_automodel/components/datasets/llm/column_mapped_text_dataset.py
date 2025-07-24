@@ -84,20 +84,38 @@ def _load_dataset(path_or_dataset_id: Union[str, List[str]]):
         raise ValueError(f"Invalid input type: {type(path_or_dataset_id)}")
 
 class ColumnMappedTextDataset(Dataset):
-    def __init__(self, path_or_dataset_id: Union[str, List[str]], column_mapping: Dict[str, str], tokenizer, split: Optional[str] = None):
+    def __init__(
+            self,
+            path_or_dataset_id: Union[str, List[str]],
+            column_mapping: Dict[str, str],
+            tokenizer,
+            split: Optional[str] = None,
+            answer_only_loss_mask: bool = True,
+            start_of_turn_token: Optional[str] = None
+        ):
         """
         Initialize a column mapped text dataset.
 
         Args:
             path_or_dataset_id: A single path or a list of paths to jsonl files.
             column_mapping: A dictionary mapping the column names to the column indices.
+            tokenizer: A tokenizer.
             split: The split to load from the dataset.
+            answer_only_loss_mask: Whether to use only the answer column for the loss mask.
+            start_of_turn_token: The string to use as the start of turn token.
+
+        Returns:
+            Instance of the ColumnMappedTextDataset class.
         """
         self.dataset = _load_dataset(path_or_dataset_id)
         if split:
             self.dataset = self.dataset[split]
         self.column_mapping = column_mapping
         self.tokenizer = tokenizer
+        if answer_only_loss_mask and start_of_turn_token_id is None:
+            raise ValueError("start_of_turn_token_id is required when answer_only_loss_mask is True")
+        self.answer_only_loss_mask = answer_only_loss_mask
+        self.start_of_turn_token = start_of_turn_token
 
     def __len__(self):
         return len(self.dataset)
