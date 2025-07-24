@@ -32,20 +32,20 @@ class ColumnTypes
     Question = "question"
     Answer = "answer"
 
-def listify(val: Union[str, List[str]]) -> List[str]:
+def make_iterable(val: Union[str, List[str]]) -> Iterator[str]:
     """
-    Convert a single string or list of strings to a list.
+    Convert a single string or list to a string iterator.
 
     Args:
         val: A single string or list of strings.
 
     Returns:
-        A list of strings.
+        An iterator over the strings.
     """
     if isinstance(val, str):
-        return [val]
+        yield val
     elif isinstance(val, list):
-        return val
+        yield from val
     else:
         raise ValueError(f"Invalid input type: {type(val)}")
 
@@ -63,7 +63,7 @@ def _load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str
     if isinstance(path_or_dataset_id, str) and not Path(path_or_dataset_id).exists():
         return load_dataset(path_or_dataset_id, split)
     if isinstance(path_or_dataset_id, (str, list)):
-        return Dataset.from_list(json.load(open(path)) for path in listify(path_or_dataset_id))
+        return Dataset.from_list(json.load(open(path)) for path in make_iterable(path_or_dataset_id))
     else:
         raise ValueError(f"Invalid input type: {type(path_or_dataset_id)}")
 
