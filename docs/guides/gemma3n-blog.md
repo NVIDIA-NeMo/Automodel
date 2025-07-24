@@ -30,7 +30,7 @@ Check out our [tutorial](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs
 ### Training Dynamics
 During the first hundred optimization steps we observed suspiciously large gradients that quickly stabilize. While the run remains numerically stable after this "warm-up," overall convergence still lags behind Gemma-3. We continue to investigate the source of this discrepancy.
 
-<img src="medpix_peft.jpg" width="400">
+<img src="guides/omni/medpix_peft.jpg" width="400">
 
 Our preliminary benchmark on vision and audio capabilities show some gap between Gemma 3n and existing alternatives. We will follow up with more concrete results later.
 
