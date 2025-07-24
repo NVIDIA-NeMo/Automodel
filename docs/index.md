@@ -51,13 +51,6 @@ guides/vlm/dataset.md
 guides/checkpointing.md
 guides/llm/dataset.md
 guides/vlm/dataset.md
-```
-
-
-
-```{toctree}
-:caption: API Reference
-:hidden:
 
 apidocs/index.rst
 ```
