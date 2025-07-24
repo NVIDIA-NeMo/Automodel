@@ -21,7 +21,7 @@ def make_squad_dataset(
     start_of_turn_token=None,
     fp8=False,
     split="train",
-    dataset_name="rajpurkar/squad",
+    dataset_name="squad",
 ):
     """
     Load and preprocess a SQuAD-style QA dataset for model fine-tuning.

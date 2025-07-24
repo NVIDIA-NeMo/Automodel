@@ -80,6 +80,10 @@ optimizer:
   weight_decay: 0
   # min_lr: 1.0e-5
 
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 1.0e-6
+
 # Uncomment and configure for W&B logging
 # wandb:
 #   project: <your_wandb_project>

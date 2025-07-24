@@ -70,8 +70,7 @@ classifiers = [
 ]
 dependencies = [
     "bitsandbytes==0.45.5; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
-    "cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@87a86ab",
-    "datasets>=4.0.0",
+    "datasets<4.0.0",
     "liger-kernel==0.5.8; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "pyyaml",
     "torch",
@@ -109,6 +108,8 @@ linting = [
 ]
 test = ["coverage", "pytest", "peft"]
 nvfsdp = ["nvfsdp"]
+dev = ["cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@87a86ab"]
+
 
 [tool.uv]
 default-groups = ["build", "docs", "test", "nvfsdp"]
@@ -174,3 +175,25 @@ convention = "google"
 
 [tool.ruff.lint.isort]
 known-third-party = ["datasets"]
+
+[tool.importlinter]
+root_package = "nemo_automodel"
+exclude_type_checking_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Components must not import each other"
+type = "independence"
+modules = [
+    "nemo_automodel.components._peft",
+    "nemo_automodel.components._transformers",
+    "nemo_automodel.components.checkpoint",
+    "nemo_automodel.components.config",
+    "nemo_automodel.components.datasets",
+    "nemo_automodel.components.distributed",
+    "nemo_automodel.components.launcher",
+    "nemo_automodel.components.loggers",
+    "nemo_automodel.components.loss",
+    "nemo_automodel.components.optim",
+    "nemo_automodel.components.training",
+    "nemo_automodel.components.utils",
+]
