@@ -68,6 +68,7 @@ def build_model_and_optimizer(
     model_wrapper,
     seed,
     tp_size=1,
+    freeze_embeddings=True,
 ) -> tuple[nn.Module, "Optimizer"]:  # noqa: F821
     """Build and initialize a model.
 
@@ -94,9 +95,11 @@ def build_model_and_optimizer(
                 "Setting model's attn_implementation to flash_attention_2"
             )
         model = cfg_model.instantiate(**kwargs)
-        for m in model.modules():
-            if isinstance(m, nn.Embedding):
-                m.weight.requires_grad_(False)
+        if freeze_embeddings:
+            logging.info("Freezing embeddings")
+            for m in model.modules():
+                if isinstance(m, nn.Embedding):
+                    m.weight.requires_grad_(False)
         # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
         if cfg_peft is not None:
             apply_lora_to_linear_modules(model, cfg_peft)
