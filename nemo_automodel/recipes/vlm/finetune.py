@@ -68,6 +68,7 @@ def build_model_and_optimizer(
     model_wrapper,
     seed,
     tp_size=1,
+    freeze_embeddings=True,
 ) -> tuple[nn.Module, "Optimizer"]:  # noqa: F821
     """Build and initialize a model for VLM."""
     with StatefulRNG(seed=seed, ranked=True):
@@ -75,7 +76,8 @@ def build_model_and_optimizer(
 
         if cfg_freeze is not None:
             apply_parameter_freezing(model, cfg_freeze)
-        else:
+        elif freeze_embeddings:
+            logging.info("Freezing embeddings")
             for m in model.modules():
                 if isinstance(m, nn.Embedding):
                     m.weight.requires_grad = False
