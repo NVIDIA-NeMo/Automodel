@@ -174,3 +174,25 @@ convention = "google"
 
 [tool.ruff.lint.isort]
 known-third-party = ["datasets"]
+
+[tool.importlinter]
+root_package = "nemo_automodel"
+exclude_type_checking_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Components must not import each other"
+type = "independence"
+modules = [
+    "nemo_automodel.components._peft",
+    "nemo_automodel.components._transformers",
+    "nemo_automodel.components.checkpoint",
+    "nemo_automodel.components.config",
+    "nemo_automodel.components.datasets",
+    "nemo_automodel.components.distributed",
+    "nemo_automodel.components.launcher",
+    "nemo_automodel.components.loggers",
+    "nemo_automodel.components.loss",
+    "nemo_automodel.components.optim",
+    "nemo_automodel.components.training",
+    "nemo_automodel.components.utils",
+]

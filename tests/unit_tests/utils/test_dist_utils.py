@@ -80,19 +80,6 @@ def patch_dist(monkeypatch):
     yield fake
 
 
-def test_rank_helpers_single_process(patch_dist):
-    """
-    get_rank_safe / get_world_size_safe / get_local_rank_preinit must fall back
-    to env-vars when the fake process group is initialised.
-    """
-    os.environ.pop("RANK", None)
-    os.environ.pop("WORLD_SIZE", None)
-    os.environ.pop("LOCAL_RANK", None)
-
-    assert du.get_rank_safe() == 0
-    assert du.get_world_size_safe() == 1
-    assert du.get_local_rank_preinit() == 0
-
 
 def test_first_rank_per_node_single_gpu(monkeypatch, patch_dist):
     """
@@ -106,24 +93,6 @@ def test_first_rank_per_node_single_gpu(monkeypatch, patch_dist):
     with du.FirstRankPerNode() as is_first:
         assert is_first is True
 
-
-def test_append_to_progress_log(tmp_path: Path, monkeypatch, patch_dist):
-    """
-    Verify that `progress.txt` is created and that the line contains the
-    time-stamp, (fake) Job-ID and GPU count.
-    """
-    # Patch helpers so the function thinks we are rank-0
-    monkeypatch.setattr(du, "get_rank_safe", lambda: 0)
-    monkeypatch.setattr(du, "get_world_size_safe", lambda: 4)
-    os.environ["SLURM_JOB_ID"] = "424242"
-
-    du.append_to_progress_log(str(tmp_path), "unit-test ✓", barrier=False)
-
-    log_file = tmp_path / "progress.txt"
-    content = log_file.read_text()
-    assert "unit-test ✓" in content
-    assert "424242" in content
-    assert "# GPUs: 4" in content
 
 
 def test_reduce_loss_no_dp(monkeypatch):
