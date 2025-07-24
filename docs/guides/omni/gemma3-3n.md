@@ -218,7 +218,15 @@ peft:
 
 The training loss should look similar to the example below:
 
-<img src="guides/omni/medpix_peft.jpg" alt="Training Loss Curve" width="400">
+![training_loss_curve](guides/omni/medpix_peft.jpg)
+
+```{image} guides/omni/medpix_peft.jpg
+:alt: Training Loss Curve.
+:class: bg-primary
+:width: 400px
+:align: center
+```
+
 
 ### Checkpointing
 
@@ -295,7 +303,13 @@ uv run examples/vlm/generate.py \
 
 Given the following image:
 
-<img src="guides/omni/medpix.jpg" width="200">
+```{image} guides/omni/medpix.jpg
+:alt: Sample image from the MedPix dataset.
+:class: bg-primary
+:width: 200px
+:align: center
+```
+
 
 And the prompt:
 
