@@ -62,7 +62,7 @@ def make_squad_dataset(
 
     def pad_to_seq_length(sample):
         seq_pad_len_ar = max(0, seq_length - len(next(iter(sample.values()))))
-        return {k: v + [eos_token_id if v != "loss_mask" else 0] * seq_pad_len_ar for k, v in sample.items()}
+        return {k: v + [eos_token_id if k != "loss_mask" else 0] * seq_pad_len_ar for k, v in sample.items()}
 
     def formatting_prompts_func(example):
         formatted_text = [
@@ -82,7 +82,7 @@ def make_squad_dataset(
         input_ids = context_ids + answer_ids
         return dict(
             input_ids=input_ids[:-1],
-            labels=input_ids[1:]
+            labels=input_ids[1:],
             loss_mask=[0] * (len(context_ids) - 1) + [1] * len(answer_ids),
         )
 
