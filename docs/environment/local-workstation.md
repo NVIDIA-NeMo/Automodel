@@ -29,7 +29,7 @@ automodel finetune llm -c examples/llm/llama_3_2_1b_squad.yaml
 ### Multi-GPU Training
 
 For interactive, single-node jobs, the CLI automatically detects the number of available GPUs and
-uses `torchrun` for multi-GPU training. You can specify manully the number of GPUs using the `--nproc-per-node` option, as follows:
+uses `torchrun` for multi-GPU training. You can specify manually the number of GPUs using the `--nproc-per-node` option, as follows:
 
 ```bash
 automodel finetune llm -c examples/llm/llama_3_2_1b_squad.yaml --nproc-per-node=2
@@ -70,12 +70,12 @@ slurm:
 
 Then submit the job:
 ```bash
-automodel llm finetune -c your_config_with_slurm.yaml
+automodel finetune llm -c your_config_with_slurm.yaml
 ```
 
 The CLI will automatically submit the job to Slurm and handle the distributed setup.
 
-## Run with UV (Development Mode)
+## Run with uv (Development Mode)
 
 When you need more control over the environment or are actively developing with the codebase, you can use `uv` to run training scripts directly. This approach gives you direct access to the underlying Python scripts and is ideal for debugging or customization.
 
@@ -93,20 +93,19 @@ For multi-GPU training, use `torchrun` directly:
 uv run torchrun --nproc-per-node=2 nemo_automodel/recipes/llm/finetune.py -c examples/llm/llama_3_2_1b_squad.yaml
 ```
 
-### Why Use UV?
+### Why use uv?
 
-UV provides several advantages for development and experimentation:
+uv provides several advantages for development and experimentation:
 
-- **Automatic environment management**: UV automatically creates and manages virtual environments, ensuring consistent dependencies without manual setup
+- **Automatic environment management**: uv automatically creates and manages virtual environments, ensuring consistent dependencies without manual setup
 - **Lock file synchronization**: Keeps your local environment perfectly synchronized with the project's `uv.lock` file
 - **No installation required**: Run scripts directly from the repository without installing packages system-wide
 - **Development flexibility**: Direct access to Python scripts for debugging, profiling, and customization
 - **Dependency isolation**: Each project gets its own isolated environment, preventing conflicts
-- **Fast and reliable**: UV is written in Rust and provides faster dependency resolution than traditional tools
 
 ## Direct Torchrun Execution
 
-If you have NeMo Automodel installed in your environment and prefer to run recipes directly without UV, you can use `torchrun` directly:
+If you have NeMo Automodel installed in your environment and prefer to run recipes directly without uv, you can use `torchrun` directly:
 
 ### Single GPU Training
 
@@ -129,7 +128,7 @@ All approaches use the same YAML configuration files. You can easily customize t
 1. **Command-line arguments**: Override config values directly.
 For example, if you want to finetune `Qwen/Qwen3-0.6B` instead of `meta-llama/Llama-3.2-1B`, you can use:
    ```bash
-   automodel llm finetune -c config.yaml --model.pretrained_model_name_or_path Qwen/Qwen3-0.6B
+   automodel finetune llm -c config.yaml --model.pretrained_model_name_or_path Qwen/Qwen3-0.6B
    ```
 
 2. **Editing the config file**: Modify the YAML directly for persistent changes
@@ -144,7 +143,7 @@ For example, if you want to finetune `Qwen/Qwen3-0.6B` instead of `meta-llama/Ll
 - You don't need to modify the underlying code
 - You prefer a higher-level abstraction
 
-**Use UV when:**
+**Use uv owhen:**
 - You're developing or debugging the codebase
 - You want automatic dependency management
 - You need maximum control over the execution
@@ -154,7 +153,7 @@ For example, if you want to finetune `Qwen/Qwen3-0.6B` instead of `meta-llama/Ll
 **Use Torchrun when:**
 - You have a stable, pre-configured environment
 - You prefer explicit control over Python execution
-- You're working in environments where UV is not available
+- You're working in environments where uv is not available
 - You're integrating with existing PyTorch workflows
 
 All approaches use the same configuration files and provide the same training capabilities - choose based on your workflow preferences and requirements.
