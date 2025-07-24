@@ -5,7 +5,7 @@
 ```{toctree}
 :caption: 🖥️ Get Started
 :hidden:
-repository_structure.md
+repository-structure.md
 guides/installation.md
 environment/local-workstation.md
 ```
@@ -18,8 +18,8 @@ environment/cluster.md
 :caption: Model Coverage
 :hidden:
 
-model_coverage/llm.md
-model_coverage/vlm.md
+model-coverage/llm.md
+model-coverage/vlm.md
 ```
 
 ```{toctree}
@@ -42,7 +42,7 @@ guides/vlm/dataset.md
 :hidden:
 
 guides/checkpointing.md
-guides/gemma3n_blog.md
+guides/gemma3n-blog.md
 ```
 
 ```{toctree}
