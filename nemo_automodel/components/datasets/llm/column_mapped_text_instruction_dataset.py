@@ -83,7 +83,7 @@ def _load_dataset(path_or_dataset_id: Union[str, List[str]]):
     else:
         raise ValueError(f"Invalid input type: {type(path_or_dataset_id)}")
 
-class ColumnMappedTextDataset(Dataset):
+class ColumnMappedTextInstructionDataset(Dataset):
     def __init__(
             self,
             path_or_dataset_id: Union[str, List[str]],
@@ -105,7 +105,7 @@ class ColumnMappedTextDataset(Dataset):
             start_of_turn_token: The string to use as the start of turn token.
 
         Returns:
-            Instance of the ColumnMappedTextDataset class.
+            Instance of the ColumnMappedTextInstructionDataset class.
         """
         self.dataset = _load_dataset(path_or_dataset_id)
         if split:
