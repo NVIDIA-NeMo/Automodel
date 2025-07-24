@@ -76,7 +76,7 @@ class TestNeMoAutoModelForCausalLM:
     def test_from_config_happy_path(self):
         """Test the basic from_config functionality works."""
         config = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
-        
+
         model = NeMoAutoModelForCausalLM.from_config(config, attn_implementation="eager")
         assert model.config.nemo_version == __version__
 
@@ -190,7 +190,7 @@ class TestNeMoAutoModelForImageTextToText:
     def test_from_config_happy_path(self):
         """Test the basic from_config functionality works."""
         config = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
-        
+
         model = NeMoAutoModelForImageTextToText.from_config(config, attn_implementation="eager")
         assert model.config.nemo_version == __version__
 

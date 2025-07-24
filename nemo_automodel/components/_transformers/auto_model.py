@@ -288,6 +288,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
               deleted and the method recurses once with
               `use_liger_kernel=False` or `use_sdpa_patching=False`
         """
+
         def _retry(**override):
             """Internal helper to re-enter this function with patched args."""
             return cls.from_config(
