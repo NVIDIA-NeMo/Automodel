@@ -13,12 +13,13 @@
 # limitations under the License.
 
 import json
-from enum import Enum
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Union
 
 from datasets import load_dataset
 from torch.utils.data import Dataset
+from enum import Enum
+import re
 
 # Supported cases:
 # Format:
@@ -28,12 +29,10 @@ from torch.utils.data import Dataset
 # - one or more paths to jsonl files
 # - dataset id from huggingface.
 
-
 class ColumnTypes(Enum):
     Context = "context"
     Question = "question"
     Answer = "answer"
-
 
 def make_iterable(val: Union[str, List[str]]) -> Iterator[str]:
     """
@@ -52,34 +51,40 @@ def make_iterable(val: Union[str, List[str]]) -> Iterator[str]:
     else:
         raise ValueError(f"Invalid input type: {type(val)}")
 
+def _str_is_hf_repo_id(val: str) -> bool:
+    """
+    Check if a string is a valid huggingface dataset id.
 
-def _load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str] = None):
+    Args:
+        val: A string to check.
+
+    Returns:
+        True if the string is a valid huggingface dataset id, False otherwise.
+    """
+    return val.count('/') == 1 \
+        and re.match(r'^[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+$', val) is not None \
+        and not Path(val).exists()
+
+
+def _load_dataset(path_or_dataset_id: Union[str, List[str]]):
     """
     Load a dataset from a single path or a list of paths.
 
     Args:
         path_or_dataset_id: A single path or a list of paths to jsonl files.
-        split: The split to load from the dataset.
 
     Returns:
         A dataset.
     """
-    if isinstance(path_or_dataset_id, str) and not Path(path_or_dataset_id).exists():
-        return load_dataset(path_or_dataset_id, split)
+    if isinstance(path_or_dataset_id, str) and _str_is_hf_repo_id(path_or_dataset_id):
+        return load_dataset(path_or_dataset_id)
     if isinstance(path_or_dataset_id, (str, list)):
         return Dataset.from_list(json.load(open(path)) for path in make_iterable(path_or_dataset_id))
     else:
         raise ValueError(f"Invalid input type: {type(path_or_dataset_id)}")
 
-
 class ColumnMappedTextDataset(Dataset):
-    def __init__(
-        self,
-        path_or_dataset_id: Union[str, List[str]],
-        column_mapping: Dict[str, str],
-        tokenizer,
-        split: Optional[str] = None,
-    ):
+    def __init__(self, path_or_dataset_id: Union[str, List[str]], column_mapping: Dict[str, str], tokenizer, split: Optional[str] = None):
         """
         Initialize a column mapped text dataset.
 
@@ -96,7 +101,7 @@ class ColumnMappedTextDataset(Dataset):
 
     def __len__(self):
         return len(self.dataset)
-
+    
     def __getitem__(self, idx):
         """
         Get an item from the dataset.
