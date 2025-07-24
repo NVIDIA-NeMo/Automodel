@@ -70,7 +70,23 @@ def build_model_and_optimizer(
     tp_size=1,
     freeze_embeddings=True,
 ) -> tuple[nn.Module, "Optimizer"]:  # noqa: F821
-    """Build and initialize a model for VLM."""
+    """
+    Build and initialize a model for VLM.
+
+    Args:
+        device: The target device.
+        cfg_model: Configuration for model instantiation.
+        cfg_opt: Configuration for optimizer instantiation.
+        cfg_freeze: Configuration for freezing parameters.
+        cfg_peft: Configuration for PEFT.
+        model_wrapper: Optional parallelism wrapper.
+        seed: Random seed.
+        tp_size: Tensor parallel size.
+        freeze_embeddings: Whether to freeze embeddings.
+
+    Returns:
+        The instantiated model on the specified device and optimizer.
+    """
     with StatefulRNG(seed=seed, ranked=True):
         model = cfg_model.instantiate()
 

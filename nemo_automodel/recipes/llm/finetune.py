@@ -70,7 +70,8 @@ def build_model_and_optimizer(
     tp_size=1,
     freeze_embeddings=True,
 ) -> tuple[nn.Module, "Optimizer"]:  # noqa: F821
-    """Build and initialize a model.
+    """
+    Build and initialize a model and optimizer.
 
     Args:
         device: The target device.
@@ -82,9 +83,10 @@ def build_model_and_optimizer(
         model_wrapper: Optional parallelism wrapper.
         seed: Random seed.
         tp_size: Tensor parallel size.
+        freeze_embeddings: Whether to freeze embeddings.
 
     Returns:
-        The instantiated model on the specified device.
+        The instantiated model on the specified device and optimizer.
     """
     with StatefulRNG(seed=seed, ranked=True):
         kwargs = {}
