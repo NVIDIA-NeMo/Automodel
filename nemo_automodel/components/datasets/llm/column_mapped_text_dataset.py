@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from torch.utils.data import Dataset
-from typing import Dict, Any, Union, List, Optional
-from pathlib import Path
-from datasets import load_dataset
 import json
+from enum import Enum
+from pathlib import Path
+from typing import Dict, Iterator, List, Optional, Union
 
+from datasets import load_dataset
+from torch.utils.data import Dataset
 
 # Supported cases:
 # Format:
@@ -27,10 +28,12 @@ import json
 # - one or more paths to jsonl files
 # - dataset id from huggingface.
 
-class ColumnTypes
+
+class ColumnTypes(Enum):
     Context = "context"
     Question = "question"
     Answer = "answer"
+
 
 def make_iterable(val: Union[str, List[str]]) -> Iterator[str]:
     """
@@ -48,6 +51,7 @@ def make_iterable(val: Union[str, List[str]]) -> Iterator[str]:
         yield from val
     else:
         raise ValueError(f"Invalid input type: {type(val)}")
+
 
 def _load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str] = None):
     """
@@ -67,8 +71,15 @@ def _load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str
     else:
         raise ValueError(f"Invalid input type: {type(path_or_dataset_id)}")
 
+
 class ColumnMappedTextDataset(Dataset):
-    def __init__(self, path_or_dataset_id: Union[str, List[str]], column_mapping: Dict[str, str], tokenizer, split: Optional[str] = None):
+    def __init__(
+        self,
+        path_or_dataset_id: Union[str, List[str]],
+        column_mapping: Dict[str, str],
+        tokenizer,
+        split: Optional[str] = None,
+    ):
         """
         Initialize a column mapped text dataset.
 
@@ -85,7 +96,7 @@ class ColumnMappedTextDataset(Dataset):
 
     def __len__(self):
         return len(self.dataset)
-    
+
     def __getitem__(self, idx):
         """
         Get an item from the dataset.
