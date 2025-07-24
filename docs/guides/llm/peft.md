@@ -34,14 +34,14 @@ AutoModel. -->
 ## Run PEFT with NeMo AutoModel
 In this guide, we will fine-tune Meta’s `LLaMA 3.2 1B` model on the popular [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/) (Stanford Question Answering Dataset).
 
-> [!IMPORTANT]
-> Before proceeding with this guide, please ensure that you have NeMo Automodel installed on your
-> machine. This can be achieved by running:
-> ```bash
-> pip3 install nemo-automodel
-> ```
-> For a complete guide and additional options please consult the Automodel [installation guide](../installation.md).
-
+:::{important}
+Before proceeding with this guide, please ensure that you have NeMo Automodel installed on your
+machine. This can be achieved by running:
+```bash
+pip3 install nemo-automodel
+```
+For a complete guide and additional options please consult the Automodel [installation guide](../installation.md).
+:::
 
 
 ### 🔍 LLaMA 3.2 1B Model
@@ -59,25 +59,25 @@ In this guide, we will fine-tune Meta’s `LLaMA 3.2 1B` model on the popular [S
 
 These design choices make LLaMA models highly competitive across various benchmarks, and their open weights make them a strong base for task-specific fine-tuning.
 
-> [!TIP]
-> In this guide, `meta-llama/Llama-3.2-1B` is used only as a placeholder
-> model ID. You can replace it with any valid Hugging Face model ID, such
-> as `Qwen/Qwen2.5-1.5B`, or any other checkpoint you have access to on
-> the Hugging Face Hub.
+:::{tip}
+In this guide, `meta-llama/Llama-3.2-1B` is used only as a placeholder
+model ID. You can replace it with any valid Hugging Face model ID, such
+as `Qwen/Qwen2.5-1.5B`, or any other checkpoint you have access to on
+the Hugging Face Hub.
+:::
 
-> [!IMPORTANT]
-> Some Hugging Face model repositories are **gated**, you must explicitly
-> request permission before you can download their files. If the model
-> page shows a "Request access" or "Agree and access" button:
->
-> 1.  Log in with your Hugging Face account.
-> 2.  Click the button and accept the license terms.
-> 3.  Wait for approval (usually instant; occasionally manual).
-> 4.  Ensure the token you pass to your script (via `huggingface-cli login` or the `HF_TOKEN` environment variable)
->    belongs to the account that was approved.
->
-> Trying to pull a gated model without an authorized token will trigger a 403 "permission denied" error.
+:::{important}
+Some Hugging Face model repositories are **gated**, you must explicitly
+request permission before you can download their files. If the model
+page shows a "Request access" or "Agree and access" button:
 
+1.  Log in with your Hugging Face account.
+2.  Click the button and accept the license terms.
+3.  Wait for approval (usually instant; occasionally manual).
+4.  Ensure the token you pass to your script (via `huggingface-cli login` or the `HF_TOKEN` environment variable)
+    belongs to the account that was approved.
+Trying to pull a gated model without an authorized token will trigger a 403 "permission denied" error.
+:::
 
 ### 📚 SQuAD Dataset
 Stanford Question Answering Dataset (SQuAD) is a **reading comprehension dataset**, consisting of questions posed by crowdworkers on a set of Wikipedia articles, where the answer to every question is a segment of text, or span, from the corresponding reading passage, or the question might be unanswerable.
@@ -110,8 +110,9 @@ Here’s a glimpse of what the data looks like:
 ```
 This structure is ideal for training models in context-based question answering, where the model learns to answer questions based on the input context.
 
-> [!TIP]
-> In this guide, we use the `SQuAD v1.1` dataset, but you can specify your own data as needed.
+:::{tip}
+In this guide, we use the `SQuAD v1.1` dataset, but you can specify your own data as needed.
+:::
 
 ## Use a Recipe to Fine-Tune the Model
 
@@ -132,8 +133,10 @@ The `FinetuneRecipeForNextTokenPrediction` class is one such recipe. It inherits
 
 - Misc: Checkpoint handling, logging, and RNG setup.
 
-> [!NOTE]
-> The recipe ensures stateless, config-driven orchestration where core components like the model, dataset, and optimizer are configured dynamically using Hydra-style `instantiate()` calls, avoiding hardcoded dependencies.
+
+:::{note}
+The recipe ensures stateless, config-driven orchestration where core components like the model, dataset, and optimizer are configured dynamically using Hydra-style `instantiate()` calls, avoiding hardcoded dependencies.
+:::
 
 ### Recipe Config
 ``` yaml
@@ -228,12 +231,12 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 ```
 
-> [!TIP]
-> To avoid using unnessary storage space and enable faster sharing, the
-> adapter checkpoint only contains the adapter weights. As a result, when
-> running inference, the adapter and base model weights need to match
-> those used for training.
-
+:::{tip}
+To avoid using unnessary storage space and enable faster sharing, the
+adapter checkpoint only contains the adapter weights. As a result, when
+running inference, the adapter and base model weights need to match
+those used for training.
+:::
 
 ## Run the Fine-Tune Recipe
 Assuming the above `yaml` is saved in a file named `peft_guide.yaml`, you can run the fine-tuning workflow either using the Automodel CLI or by directly invoking the recipe Python script.
@@ -433,9 +436,10 @@ process, ensuring compatibility with Hugging Face-based models.
 The following script demonstrates how to export a PEFT adapter for vLLM,
 allowing seamless deployment and efficient inference.
 
-> [!NOTE]
-> Make sure vLLM is installed (pip install vllm, or use the environment
-> that includes it) before proceeding with vLLMHFExporter.
+:::{note}
+Make sure vLLM is installed (pip install vllm, or use the environment
+that includes it) before proceeding with vLLMHFExporter.
+:::
 
 ``` python
 from nemo.export.vllm_hf_exporter import vLLMHFExporter

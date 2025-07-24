@@ -79,8 +79,9 @@ The models listed above can be fine-tuned using NeMo AutoModel to adapt them to 
 
 2. **Supervised Fine-Tuning (SFT)**: Updates all or most model parameters for deeper adaptation, suitable for high-precision applications. See our [SFT Guide](../guides/llm/sft.md) for implementation details.
 
-> [!TIP]
-> In these guides, we use the `SQuAD v1.1` dataset for demonstation purposes, but you can specify your own data as needed.
+:::{tip}
+In these guides, we use the `SQuAD v1.1` dataset for demonstation purposes, but you can specify your own data as needed.
+:::
 
 ### Example: Fine-Tuning with SQuAD Dataset
 

@@ -34,16 +34,18 @@ For most users, the easiest way to get started is using `pip3`.
 ```bash
 pip3 install nemo-Automodel
 ```
-> [!TIP]
-> This installs the latest stable release of NeMo Automodel from PyPI, along with all of its required dependencies.
+:::{tip}
+This installs the latest stable release of NeMo Automodel from PyPI, along with all of its required dependencies.
+:::
 
 ### Install via NeMo Docker Container
 You can use NeMo Automodel with the NeMo Docker container. You can pull the container by running:
 ```bash
 docker pull nvcr.io/nvidia/nemo:25.07
 ```
-> [!NOTE]
-> The above `docker` command uses the `25.07` container. Use the most recent container version to ensure you get the latest version of AutoModel and its dependencies like torch, transformers, etc.
+:::{note}
+The above `docker` command uses the `25.07` container. Use the most recent container version to ensure you get the latest version of AutoModel and its dependencies like torch, transformers, etc.
+:::
 
 Then you can enter the container using:
 ```bash
@@ -63,17 +65,17 @@ If you want the **latest features** from the `main` branch or want to contribute
 ```bash
 pip3 install git+https://github.com/NVIDIA-NeMo/Automodel.git
 ```
-> [!NOTE]
-> This installs the repo as a standard Python package (not editable).
-
+:::{note}
+This installs the repo as a standard Python package (not editable).
+:::
 
 #### Option B - Use `uv` with git repo:
 ```bash
 uv pip install git+https://github.com/NVIDIA-NeMo/Automodel.git
 ```
-> [!NOTE]
-> `uv` handles virtual environment transparently and enables more reproducible installs.
-
+:::{note}
+`uv` handles virtual environment transparently and enables more reproducible installs.
+:::
 
 ### 🧪 Install in Developer Mode (Editable Install)
 To contribute or modify the code:
@@ -83,9 +85,9 @@ cd Automodel
 pip3 install -e .
 ```
 
-> [!NOTE]
-> 🛠️ This installs Automodel in editable mode, so changes to the code are immediately reflected in Python.
-
+:::{note}
+🛠️ This installs Automodel in editable mode, so changes to the code are immediately reflected in Python.
+:::
 
 ### 🐳 Mount the Repo into a NeMo Docker Container
 To run `Automodel` inside a NeMo container while **mounting your local repo**, follow these steps:
@@ -107,9 +109,10 @@ docker run --gpus all -it --rm \
     pip install -e . && \                  # Install Automodel in editable mode
     python3 examples/llm/finetune.py" # Run a usage example
 ```
-> [!NOTE]
-> The above `docker` command uses the volume `-v` option to mount the local `Automodel` directory
-> under `/opt/Automodel`.
+:::{note}
+The above `docker` command uses the volume `-v` option to mount the local `Automodel` directory
+under `/opt/Automodel`.
+:::
 
 ## 🧪 Bonus: Install Extras
 Some functionality may require optional extras. You can install them like this:
