@@ -55,7 +55,7 @@ guides/vlm/dataset.md
 
 
 ```{toctree}
-:caption: 🛠️ Development
+:caption: API Reference
 :hidden:
 
 apidocs/index.rst
