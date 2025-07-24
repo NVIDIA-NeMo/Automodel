@@ -20,7 +20,6 @@ environment/cluster.md
 
 guides/llm/sft.md
 guides/llm/peft.md
-guides/omni/gemma3-3n.md
 ```
 
 ```{toctree}
