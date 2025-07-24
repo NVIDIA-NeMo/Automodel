@@ -48,11 +48,10 @@ checkpoint:
   save_consolidated: false
 
 # distributed:
-#   _target_: nemo_automodel.distributed.fsdp2.FSDP2Manager
+#   _target_: nemo_automodel.components.distributed.nvfsdp.NVFSDPManager
 #   dp_size: none
 #   tp_size: 1
 #   cp_size: 1
-#   sequence_parallel: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -64,7 +63,7 @@ dataset:
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  batch_size: 2
+  batch_size: 8
   num_workers: 0
   pin_memory: true
   collate_fn:
@@ -88,12 +87,12 @@ optimizer:
   betas: [0.9, 0.95]
 
 freeze_config:
-  freeze_embeddings: true
+  freeze_embeddings: false
   freeze_vision_tower: true
   freeze_language_model: false
   
 # Uncomment and configure for W&B logging
-# logger:
+# wandb:
 #   wandb_project:
 #   wandb_entity:
 #   wandb_exp_name:
