@@ -15,6 +15,13 @@ environment/cluster.md
 -->
 
 ```{toctree}
+:caption: 📚 Guides
+:hidden:
+
+guides/omni/gemma3-3n.md
+```
+
+```{toctree}
 :caption: 🚀 E2E Examples
 :hidden:
 
@@ -22,12 +29,6 @@ guides/llm/sft.md
 guides/llm/peft.md
 ```
 
-```{toctree}
-:caption: 📚 Guides
-:hidden:
-
-guides/omni/gemma3-3n.md
-```
 
 ```{toctree}
 :caption: Model Coverage
