@@ -13,7 +13,11 @@
 # limitations under the License.
 
 from torch.utils.data import Dataset
-from typing import Dict, Any
+from typing import Dict, Any, Union, List, Optional
+from pathlib import Path
+from datasets import load_dataset
+import json
+
 
 # Supported cases:
 # Format:
@@ -45,7 +49,7 @@ def listify(val: Union[str, List[str]]) -> List[str]:
     else:
         raise ValueError(f"Invalid input type: {type(val)}")
 
-def load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str] = None):
+def _load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str] = None):
     """
     Load a dataset from a single path or a list of paths.
 
@@ -56,6 +60,8 @@ def load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str]
     Returns:
         A dataset.
     """
+    if isinstance(path_or_dataset_id, str) and not Path(path_or_dataset_id).exists():
+        return load_dataset(path_or_dataset_id, split)
     if isinstance(path_or_dataset_id, (str, list)):
         return Dataset.from_list(json.load(open(path)) for path in listify(path_or_dataset_id))
     else:
@@ -71,7 +77,7 @@ class ColumnMappedTextDataset(Dataset):
             column_mapping: A dictionary mapping the column names to the column indices.
             split: The split to load from the dataset.
         """
-        self.dataset = load_dataset(path_or_dataset_id)
+        self.dataset = _load_dataset(path_or_dataset_id)
         if split:
             self.dataset = self.dataset[split]
         self.column_mapping = column_mapping
