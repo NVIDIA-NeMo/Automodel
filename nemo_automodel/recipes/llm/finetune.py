@@ -203,7 +203,8 @@ def build_dataloader(
             "rank": device_mesh["data_parallel"].get_local_rank(),
         }
     if "tokenizer" not in cfg_ds:
-        tokenizer = AutoTokenizer.from_pretrained(cfg_model.pretrained_model_name_or_path)
+        trust_remote_code = cfg_model.trust_remote_code if hasattr(cfg_model, 'trust_remote_code') else False
+        tokenizer = AutoTokenizer.from_pretrained(cfg_model.pretrained_model_name_or_path, trust_remote_code=trust_remote_code)
     elif "_target_" not in cfg_ds.tokenizer:
         tokenizer = AutoTokenizer.from_pretrained(**cfg_ds.tokenizer.to_dict())
     else:
