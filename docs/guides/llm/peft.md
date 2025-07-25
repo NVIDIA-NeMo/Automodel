@@ -1,4 +1,4 @@
-# Parameter-Efficient Fine-Tuning (PEFT) with NeMo AutoModel
+# Parameter-Efficient Fine-Tuning (PEFT) with NeMo Automodel
 
 ## Introduction
 
@@ -17,7 +17,7 @@ number of trainable parameters, often to less than 1%, while
 achieving performance comparable to full fine-tuning.
 
 This guide offers a comprehensive overview of fine-tuning models
-available on the Hugging Face Hub using NeMo AutoModel. In addition to
+available on the Hugging Face Hub using NeMo Automodel. In addition to
 fine-tuning, it illustrates how effortlessly you can generate text with
 the trained adapters, evaluate model performance with the [LM Eval Harness](https://github.com/EleutherAI/lm-evaluation-harness),
 publish your adapters to the Hugging Face Model Hub, and export
@@ -29,9 +29,9 @@ script](https://github.com/NVIDIA/NeMo/blob/main/examples/llm/peft/automodel.py)
 and a guided [Jupyter
 Notebook](https://github.com/NVIDIA/NeMo/blob/main/tutorials/llm/automodel/peft.ipynb),
 offering hands-on demonstrations for quickly getting started with NeMo
-AutoModel. -->
+Automodel. -->
 
-## Run PEFT with NeMo AutoModel
+## Run PEFT with NeMo Automodel
 In this guide, we will fine-tune Meta’s `LLaMA 3.2 1B` model on the popular [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/) (Stanford Question Answering Dataset).
 
 :::{important}
@@ -305,7 +305,7 @@ checkpoints/epoch_0_step_10/
 ```
 
 
-## Run PEFT Inference with NeMo AutoModel-Trained Adapters
+## Run PEFT Inference with NeMo Automodel-Trained Adapters
 
 Inference with adapters is supported through the Hugging Face generate API. To use it, replace the full model path with the path to a PEFT checkpoint, which should include all necessary configuration settings such as model type, adapter type, and base model checkpoint path.
 
@@ -392,7 +392,7 @@ sharing, reproducibility, and integration with downstream applications.
 <!-- ## Evaluate with the LM Evaluation Harness
 
 After fine-tuning the pretrained model on a domain-specific dataset
-using NeMo AutoModel, the process generates Hugging Face-native PEFT
+using NeMo Automodel, the process generates Hugging Face-native PEFT
 adapters. These adapters are fully compatible with the Hugging Face
 ecosystem, allowing seamless integration with evaluation tools.
 
@@ -417,7 +417,7 @@ python3 -m lm_eval --model hf \
     --batch_size 8
 ```
 
-This command will run lm_eval on hellaswag using [meta-llama/Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B) and the NeMo AutoModel-trained HF
+This command will run lm_eval on hellaswag using [meta-llama/Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B) and the NeMo Automodel-trained HF
 adapters. -->
 
 ## Export to vLLM
@@ -428,7 +428,7 @@ engine designed to optimize the deployment of large language models
 parallel processing and optimized memory management, vLLM accelerates
 inference while maintaining model accuracy.
 
-NeMo AutoModel provides support for exporting PEFT adapters for use with
+NeMo Automodel provides support for exporting PEFT adapters for use with
 vLLM, enabling optimized inference without requiring model architecture
 changes. The [vLLMHFExporter](https://github.com/NVIDIA/NeMo/blob/main/nemo/export/vllm_hf_exporter.py) utility facilitates this
 process, ensuring compatibility with Hugging Face-based models.
