@@ -2,7 +2,7 @@
 
 NeMo AutoModel supports various methods for launching jobs, allowing you to choose the approach that best fits your workflow and development needs. For setup details, refer to our [Installation Guide](../guides/installation.md).
 
-## Automodel CLI Application
+## Run with Automodel CLI
 
 The AutoModel CLI is the preferred method for most users. It offers a unified interface to launch training jobs locally or across distributed systems such as Slurm clusters, without requiring deep knowledge of the underlying infrastructure.
 
