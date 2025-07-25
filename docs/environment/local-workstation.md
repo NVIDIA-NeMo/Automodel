@@ -26,7 +26,7 @@ For simple fine-tuning on a single GPU:
 automodel finetune llm -c examples/llm/llama_3_2_1b_squad.yaml
 ```
 
-### Multi-GPU Training
+### Train on Multiple GPUs
 
 For interactive single-node jobs, the CLI automatically detects the number of available GPUs and
 uses `torchrun` for multi-GPU training. You can specify manually the number of GPUs using the `--nproc-per-node` option, as follows:
