@@ -18,7 +18,7 @@ Where:
 - `<domain>`: The model domain (`llm` or `vlm`)
 - `<config_file>`: Path to your YAML configuration file
 
-### Single GPU Training
+### Train on a Single GPU
 
 For simple fine-tuning on a single GPU:
 
