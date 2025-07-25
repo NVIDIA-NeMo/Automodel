@@ -14,7 +14,7 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_hellaswag.yaml
+# torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/qwen_3_0p6b_hellaswag.yaml
 # Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
 
