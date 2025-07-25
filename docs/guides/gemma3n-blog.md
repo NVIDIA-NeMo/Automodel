@@ -31,7 +31,7 @@ Check out our [tutorial](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs
 During the first hundred optimization steps we observed suspiciously large gradients.
 However, after a few iterations it quickly stabilize. While the run remains numerically stable after this "warm-up," overall convergence still lags behind Gemma-3. We continue to investigate the source of this discrepancy.
 
-```{image} medpix_peft.jpg
+```{image} omni/medpix_peft.jpg
 :alt: Training Loss Curve.
 :class: bg-primary
 :width: 400px
