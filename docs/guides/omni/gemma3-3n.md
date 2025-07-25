@@ -218,9 +218,7 @@ peft:
 
 The training loss should look similar to the example below:
 
-![training_loss_curve](guides/omni/medpix_peft.jpg)
-
-```{image} guides/omni/medpix_peft.jpg
+```{image} medpix_peft.jpg
 :alt: Training Loss Curve.
 :class: bg-primary
 :width: 400px
@@ -303,7 +301,7 @@ uv run examples/vlm/generate.py \
 
 Given the following image:
 
-```{image} guides/omni/medpix.jpg
+```{image} medpix.jpg
 :alt: Sample image from the MedPix dataset.
 :class: bg-primary
 :width: 200px
