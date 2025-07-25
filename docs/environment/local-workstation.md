@@ -121,7 +121,7 @@ torchrun --nproc-per-node=2 nemo_automodel/recipes/llm/finetune.py -c examples/l
 
 This approach requires that you have already installed NeMo Automodel and its dependencies in your Python environment (see the [installation guide](../guides/installation.md) for details).
 
-## Configuration
+## Customize Configuration Settings
 
 All approaches use the same YAML configuration files. You can easily customize training by:
 
