@@ -85,7 +85,7 @@ When you need more control over the environment or are actively developing with 
 uv run nemo_automodel/recipes/llm/finetune.py -c examples/llm/llama_3_2_1b_squad.yaml
 ```
 
-### Multi-GPU Training with Torchrun
+### Train on Multiple GPUs with Torchrun
 
 For multi-GPU training, use `torchrun` directly:
 
