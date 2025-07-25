@@ -99,7 +99,7 @@ uv provides several advantages for development and experimentation:
 
 - **Automatic environment management**: uv automatically creates and manages virtual environments, ensuring consistent dependencies without manual setup.
 - **Lock file synchronization**: Keeps your local environment perfectly synchronized with the project's `uv.lock` file.
-- **No installation required**: Run scripts directly from the repository without installing packages system-wide
+- **No installation required**: Run scripts directly from the repository without installing packages system-wide.
 - **Development flexibility**: Direct access to Python scripts for debugging, profiling, and customization
 - **Dependency isolation**: Each project gets its own isolated environment, preventing conflicts
 
