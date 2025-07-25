@@ -1,6 +1,6 @@
 # Run on Your Local Workstation
 
-There are multiple ways to launch jobs with NeMo Automodel, depending on your workflow and development needs. For installation instructions, see our [installation guide](../guides/installation.md).
+NeMo AutoModel supports various methods for launching jobs, allowing you to choose the approach that best fits your workflow and development needs. For setup details, refer to our [Installation Guide](../guides/installation.md).
 
 ## Automodel CLI Application
 
