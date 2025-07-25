@@ -62,6 +62,7 @@ def build_packed_dataset(
     vocab_size: int = 100,
     max_sentence_len: int = 64,
     seed: int = 0,
+    tokenizer=None,
 ):
     """
     Dataset builder.
