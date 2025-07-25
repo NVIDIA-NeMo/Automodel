@@ -58,6 +58,44 @@ logger = logging.getLogger(__name__)
 #  Stateless helper functions
 # ---------------------------
 
+def _freeze_model(model: nn.Module, cfg_freeze: Optional[Dict[str, Any]] = None, freeze_embeddings: bool = True):
+    """
+    Freeze the model.
+
+    Args:
+        model: The model to freeze.
+        cfg_freeze: The configuration for freezing the model.
+        freeze_embeddings: Whether to freeze embeddings.
+
+    Returns:
+        nn.Module: The frozen model.
+    """
+    if cfg_freeze is not None:
+        apply_parameter_freezing(model, cfg_freeze)
+    elif freeze_embeddings:
+        logging.info("Freezing embeddings")
+        for m in model.modules():
+            if isinstance(m, nn.Embedding):
+                m.weight.requires_grad = False
+    return model
+
+def _build_optimizer(model: nn.Module, cfg_opt: Dict[str, Any], tp_size: int):
+    """
+    Build the optimizer.
+
+    Args:
+        model: The model to build the optimizer for.
+        cfg_opt: The configuration for the optimizer.
+        tp_size: The tensor parallel size.
+
+    Returns:
+        torch.optim.Optimizer: The optimizer.
+    """
+    trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
+    assert len(trainable_params) > 0, "trainable_params cannot be empty"
+    if tp_size > 1:
+        cfg_opt.foreach = False
+    return cfg_opt.instantiate(params=trainable_params)
 
 def build_model_and_optimizer(
     device,
@@ -90,13 +128,7 @@ def build_model_and_optimizer(
     with StatefulRNG(seed=seed, ranked=True):
         model = cfg_model.instantiate()
 
-        if cfg_freeze is not None:
-            apply_parameter_freezing(model, cfg_freeze)
-        elif freeze_embeddings:
-            logging.info("Freezing embeddings")
-            for m in model.modules():
-                if isinstance(m, nn.Embedding):
-                    m.weight.requires_grad = False
+        model = _freeze_model(model, cfg_freeze, freeze_embeddings)
 
         # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
         if cfg_peft is not None:
@@ -118,11 +150,7 @@ def build_model_and_optimizer(
         else:
             model = model.to(device)
 
-        trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
-        assert len(trainable_params) > 0, "trainable_params cannot be empty"
-        if tp_size > 1:
-            cfg_opt.foreach = False
-        optimizer = cfg_opt.instantiate(params=trainable_params)
+        optimizer = _build_optimizer(model, cfg_opt, tp_size)
 
         return model, optimizer
 
