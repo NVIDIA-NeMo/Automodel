@@ -37,7 +37,7 @@ automodel finetune llm -c examples/llm/llama_3_2_1b_squad.yaml --nproc-per-node=
 
 If you don't specify `--nproc-per-node`, it will use all available GPUs on your system.
 
-### Batch Job Submission (Slurm)
+### Submit a Batch Job with Slurm
 
 For distributed training on Slurm clusters, add a `slurm` section to your YAML configuration:
 
