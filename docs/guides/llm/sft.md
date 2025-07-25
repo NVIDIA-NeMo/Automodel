@@ -1,4 +1,4 @@
-# Supervised Fine-Tuning (SFT) with NeMo AutoModel
+# Supervised Fine-Tuning (SFT) with NeMo Automodel
 
 ## Introduction
 
@@ -15,13 +15,13 @@ the model's weights. While this requires more computational resources,
 it allows for deeper adaptation, making it particularly useful for
 complex or high-precision applications.
 
-NeMo AutoModel simplifies the fine-tuning process by offering seamless
+NeMo Automodel simplifies the fine-tuning process by offering seamless
 integration with Hugging Face Transformers. It allows you to fine-tune
 models without converting checkpoints, ensuring full compatibility with
 the Hugging Face ecosystem.
 
 This guide walks you through the end-to-end process of fine-tuning
-models from the Hugging Face Hub using NeMo AutoModel. You'll learn how
+models from the Hugging Face Hub using NeMo Automodel. You'll learn how
 to prepare datasets, train models, generate text with fine-tuned
 checkpoints, evaluate performance using the LM Eval Harness, share your
 models on the Hugging Face Model Hub, and deploy them efficiently with
@@ -30,9 +30,9 @@ vLLM.
 <!-- In addition to this user guide, you can also explore our Quickstart,
 which features a [standalone python3
 recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py),
-offering hands-on demonstrations for quickly getting started with NeMo AutoModel. -->
+offering hands-on demonstrations for quickly getting started with NeMo Automodel. -->
 
-## Run SFT with NeMo AutoModel
+## Run SFT with NeMo Automodel
 
 In this guide, we will run supervised fine-tuning (SFT) on Meta’s `LLaMA 3.2 1B` model with
 the popular [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/) (Stanford Question Answering Dataset).
@@ -250,7 +250,7 @@ automodel finetune llm -c sft_guide.yaml
 
 where `finetune` is name the name of the recipe file (excluding the `.py` extension) and `llm` the domain of the model.
 
-### Invoking the Recipe Script Directly
+### Invoke the Recipe Script Directly
 
 Alternatively, you can run the recipe [script](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py) directly using [torchrun](https://docs.pytorch.org/docs/stable/elastic/run.html), as shown below.
 
@@ -304,7 +304,7 @@ checkpoints/epoch_0_step_10/
 4 directories, 11 files
 ```
 
-## Run Inference with the NeMo AutoModel Fine-Tuned Checkpoint
+## Run Inference with the NeMo Automodel Fine-Tuned Checkpoint
 
 Inference on the fine-tuned checkpoint is supported through the Hugging Face generate API. To use it, replace the path of the full model with the path to a SFT checkpoint.
 
@@ -345,7 +345,7 @@ a repository, ensuring that others can easily load and use it with
 transformer's [AutoModelForCausalLM](https://huggingface.co/docs/transformers/en/model_doc/auto#transformers.AutoModelForCausalLM).
 The following steps outline how to publish the fine-tuned checkpoint:
 
-1.  Install the Hugging Face Hub library (if not alredy installed):
+1.  Install the Hugging Face Hub library (if not already installed):
 
 ``` bash
 pip3 install huggingface_hub
@@ -411,8 +411,8 @@ python3 -m lm_eval --model hf \
     --batch_size 8
 ```
 
-This command will run lm_eval on hellaswag using NeMo
-AutoModel-finetuned checkpoint of [meta-llama/Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B).
+This command will run lm_eval on hellaswag using the NeMo
+Automodel fine-tuned checkpoint of [meta-llama/Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B).
 
 Before running this command, make sure you have specified the checkpoint
 path that you used during fine-tuning, we will use
