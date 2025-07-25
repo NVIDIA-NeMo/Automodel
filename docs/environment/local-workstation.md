@@ -126,7 +126,7 @@ This approach requires that you have already installed NeMo Automodel and its de
 All approaches use the same YAML configuration files. You can easily customize training by following the steps in this section.
 
 1. **Command-line arguments**: Override config values directly.
-For example, if you want to finetune `Qwen/Qwen3-0.6B` instead of `meta-llama/Llama-3.2-1B`, you can use:
+For example, if you want to fine-tune `Qwen/Qwen3-0.6B` instead of `meta-llama/Llama-3.2-1B`, you can use:
    ```bash
    automodel finetune llm -c config.yaml --model.pretrained_model_name_or_path Qwen/Qwen3-0.6B
    ```
