@@ -40,7 +40,7 @@ machine. This can be achieved by running:
 ```bash
 pip3 install nemo-automodel
 ```
-For a complete guide and additional options please consult the Automodel [installation guide](../installation.md).
+For a complete guide and additional options please consult the Automodel [Installation Guide](../installation.md).
 :::
 
 
