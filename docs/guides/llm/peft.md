@@ -67,9 +67,7 @@ the Hugging Face Hub.
 :::
 
 :::{important}
-Some Hugging Face model repositories are **gated**, you must explicitly
-request permission before you can download their files. If the model
-page shows a "Request access" or "Agree and access" button:
+Some Hugging Face model repositories are **gated**, requiring explicit permission before file downloads are allowed. If the model page displays a "Request access" or "Agree and access" button, you'll need to click it and follow the instructions to gain access.
 
 1.  Log in with your Hugging Face account.
 2.  Click the button and accept the license terms.
