@@ -133,7 +133,7 @@ For example, if you want to fine-tune `Qwen/Qwen3-0.6B` instead of `meta-llama/L
 
 2. **Edit the config file**: Modify the YAML directly for persistent changes.
 
-3. **Creating custom configs**: Copy and modify existing configurations from the `examples/` directory
+3. **Create custom configs**: Copy and modify existing configurations from the `examples/` directory.
 
 ## When to Use Which Approach
 
