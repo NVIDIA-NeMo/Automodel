@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 #  Stateless helper functions
 # ---------------------------
 
+
 def _freeze_model(model: nn.Module, cfg_freeze: Optional[Dict[str, Any]] = None, freeze_embeddings: bool = True):
     """
     Freeze the model.
@@ -79,6 +80,7 @@ def _freeze_model(model: nn.Module, cfg_freeze: Optional[Dict[str, Any]] = None,
                 m.weight.requires_grad = False
     return model
 
+
 def _build_optimizer(model: nn.Module, cfg_opt: Dict[str, Any], tp_size: int):
     """
     Build the optimizer.
@@ -96,6 +98,7 @@ def _build_optimizer(model: nn.Module, cfg_opt: Dict[str, Any], tp_size: int):
     if tp_size > 1:
         cfg_opt.foreach = False
     return cfg_opt.instantiate(params=trainable_params)
+
 
 def build_model_and_optimizer(
     device,
