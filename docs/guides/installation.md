@@ -1,4 +1,4 @@
-# 🤖 Install NeMo Automodel
+# Install NeMo Automodel
 
 This guide explains how to install NeMo Automodel for LLM, VLM, and OMNI models on various platforms and environments. Depending on your use case, there are several ways to install it:
 
