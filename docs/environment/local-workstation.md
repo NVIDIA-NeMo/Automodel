@@ -113,7 +113,7 @@ If you have NeMo Automodel installed in your environment and prefer to run recip
 python nemo_automodel/recipes/llm/finetune.py -c examples/llm/llama_3_2_1b_squad.yaml
 ```
 
-### Multi-GPU Training
+### Train on Multiple GPUs
 
 ```bash
 torchrun --nproc-per-node=2 nemo_automodel/recipes/llm/finetune.py -c examples/llm/llama_3_2_1b_squad.yaml
