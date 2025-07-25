@@ -95,8 +95,10 @@ def make_squad_dataset(
         if isinstance(start_of_turn_token, str):
             start_of_turn_token_id = tokenizer(start_of_turn_token, add_special_tokens=False)["input_ids"][0]
             first_start_of_turn_token_id = input_ids.index(start_of_turn_token_id)
-            # Find the second start of turn token and skip it.
-            response_start = input_ids.index(start_of_turn_token_id, first_start_of_turn_token_id + 1) + 1
+            # Loss mask is starting with the second start of turn token.
+            # labels    = [a b c S d e] ; S is the start of turn token.
+            # loss_mask = [0 0 0 1 1 1] ; 1 is the loss mask enabled for the answer.
+            response_start = input_ids.index(start_of_turn_token_id, first_start_of_turn_token_id + 1)
         else:
             response_start = 0
         loss_mask = [0] * response_start + [1] * (len(input_ids) - response_start)

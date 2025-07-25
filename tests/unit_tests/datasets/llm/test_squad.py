@@ -188,10 +188,10 @@ def test_chat_template_path():
     # The index of the *second* SOT token +1 is response_start
     idx_first = row["input_ids"].index(sot_id)
     idx_second = row["input_ids"].index(sot_id, idx_first + 1)
-    # in the squad.py dataset, the response_start points to the first token after the SOT token
-    # therefore, it is defined as `response_start = idx_second + 1`.
-    # However, here, the returned labels are already shifted by 1, so we can use `response_start = idx_second`.
-    response_start = idx_second
+    # in the squad.py dataset, the response_start points to the second SOT token (including).
+    # therefore, it is defined as `response_start = idx_second`.
+    # However, here, the returned labels are already shifted by 1, so we can use `response_start = idx_second - 1`.
+    response_start = idx_second - 1
 
     assert sum(row["loss_mask"][:response_start]) == 0
     assert sum(row["loss_mask"][response_start:]) == len(row["loss_mask"][response_start:])
