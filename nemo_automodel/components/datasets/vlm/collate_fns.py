@@ -11,11 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import io
 from unittest.mock import MagicMock
 
 import torch
-from transformers import BatchFeature
 
 from nemo_automodel.components.datasets.vlm.utils import extract_skipped_token_ids
 from nemo_automodel.shared.import_utils import MISSING_QWEN_VL_UTILS_MSG
