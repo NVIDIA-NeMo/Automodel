@@ -139,7 +139,7 @@ For example, if you want to fine-tune `Qwen/Qwen3-0.6B` instead of `meta-llama/L
 
 **Use the Automodel CLI when:**
 - You want a simple, unified interface
-- Running on production clusters (Slurm)
+- You are running on production clusters (Slurm)
 - You don't need to modify the underlying code
 - You prefer a higher-level abstraction
 
