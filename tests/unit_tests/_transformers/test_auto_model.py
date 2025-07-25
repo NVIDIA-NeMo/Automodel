@@ -73,6 +73,13 @@ class TestNeMoAutoModelForCausalLM:
             assert model is mock_model
             assert mock_from_config.call_count == 1
 
+    def test_from_config_happy_path(self):
+        """Test the basic from_config functionality works."""
+        config = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
+
+        model = NeMoAutoModelForCausalLM.from_config(config, attn_implementation="eager")
+        assert model.config.nemo_version == __version__
+
     def test_from_pretrained_runtimeerror_triggers_reload(self):
         """When _patch_liger_kernel raises, the loader should retry with
         use_liger_kernel=False and return the second model instance."""

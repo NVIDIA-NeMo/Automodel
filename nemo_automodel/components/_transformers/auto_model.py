@@ -270,10 +270,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 One or multiple SDPA back-ends to prefer when applying SDPA
                 patching. When ``None``, the default backend resolution logic is
                 used. Defaults to ``None``.
-            torch_dtype (Union[str, torch.dtype], optional):
-                The desired data type for model initialization
-                (e.g., ``"auto"``, ``torch.float16``). Passed through to
-                ``transformers.AutoModel``. Defaults to ``"auto"``.
             attn_implementation (str, optional):
                 Specifies which attention implementation to use (e.g.,
                 ``"flash_attention_2"``, ``"eager"``). Only applied when the
@@ -292,14 +288,12 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
               deleted and the method recurses once with
               `use_liger_kernel=False` or `use_sdpa_patching=False`
         """
-        torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
 
         def _retry(**override):
             """Internal helper to re-enter this function with patched args."""
             return cls.from_config(
                 config,
                 *model_args,
-                torch_dtype=torch_dtype,
                 attn_implementation=override.get("attn_implementation", attn_implementation),
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
@@ -315,7 +309,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             model = super().from_config(
                 config,
                 *model_args,
-                torch_dtype=torch_dtype,
                 attn_implementation=attn_implementation,
                 **kwargs,
             )
