@@ -131,7 +131,7 @@ For example, if you want to fine-tune `Qwen/Qwen3-0.6B` instead of `meta-llama/L
    automodel finetune llm -c config.yaml --model.pretrained_model_name_or_path Qwen/Qwen3-0.6B
    ```
 
-2. **Editing the config file**: Modify the YAML directly for persistent changes
+2. **Edit the config file**: Modify the YAML directly for persistent changes.
 
 3. **Creating custom configs**: Copy and modify existing configurations from the `examples/` directory
 
