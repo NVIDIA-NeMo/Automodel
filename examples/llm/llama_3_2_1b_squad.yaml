@@ -89,5 +89,5 @@ lr_scheduler:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir>
+#   dir: <your_wandb_dir>
 

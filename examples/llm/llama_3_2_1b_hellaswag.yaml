@@ -38,7 +38,7 @@ model:
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
 
 checkpoint:
-  enabled: true
+  enabled: false
   checkpoint_dir: checkpoints/
   model_save_format: torch_save # torch_save or safetensors
   save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
@@ -93,4 +93,4 @@ optimizer:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir>
+#   dir: <your_wandb_dir>

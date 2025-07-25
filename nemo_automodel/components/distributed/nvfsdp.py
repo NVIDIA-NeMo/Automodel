@@ -87,9 +87,9 @@ class NVFSDPManager:
     )
 
     # nvFSDP config
-    data_parallel_sharding_strategy: Optional[str] = field(
-        default="optim_grads_params",
-        metadata={"help": "Data parallel sharding strategy."},
+    zero_dp_strategy: Optional[int] = field(
+        default=3,
+        metadata={"help": "Zero DP strategy."},
     )
     init_nvfsdp_with_meta_device: Optional[bool] = field(
         default=False, metadata={"help": "Initialize nvFSDP with meta device if True."}
@@ -187,10 +187,10 @@ class NVFSDPManager:
         Raises:
             NotImplemented: If the required TP sharding plan is not supported.
         """
-        if self.data_parallel_sharding_strategy != "optim_grads_params":
+        if self.zero_dp_strategy != 3:
             if self.device_mesh.get_rank() == 0:
                 print(
-                    "Warning: nvFSDP data_parallel_sharding_strategy is not optim_grads_params. "
+                    "Warning: nvFSDP zero_dp_strategy != 3. "
                     "Parameters will not be sharded."
                 )
 
@@ -230,7 +230,7 @@ class NVFSDPManager:
             optimizer=optimizer,
             nvfsdp_unit_modules=self.nvfsdp_unit_modules,
             tp_shard_plan=tp_shard_plan,
-            data_parallel_sharding_strategy=self.data_parallel_sharding_strategy,
+            zero_dp_strategy=self.zero_dp_strategy,
             init_nvfsdp_with_meta_device=self.init_nvfsdp_with_meta_device,
             grad_reduce_in_fp32=self.grad_reduce_in_fp32,
             preserve_fp32_weights=self.preserve_fp32_weights,
