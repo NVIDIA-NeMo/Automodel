@@ -103,7 +103,7 @@ uv provides several advantages for development and experimentation:
 - **Development flexibility**: Direct access to Python scripts for debugging, profiling, and customization
 - **Dependency isolation**: Each project gets its own isolated environment, preventing conflicts
 
-## Direct Torchrun Execution
+## Run with Torchrun
 
 If you have NeMo Automodel installed in your environment and prefer to run recipes directly without uv, you can use `torchrun` directly:
 
