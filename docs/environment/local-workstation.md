@@ -79,7 +79,7 @@ The CLI will automatically submit the job to Slurm and handle the distributed se
 
 When you need more control over the environment or are actively developing with the codebase, you can use `uv` to run training scripts directly. This approach gives you direct access to the underlying Python scripts and is ideal for debugging or customization.
 
-### Single GPU Training
+### Train on a Single GPU
 
 ```bash
 uv run nemo_automodel/recipes/llm/finetune.py -c examples/llm/llama_3_2_1b_squad.yaml
