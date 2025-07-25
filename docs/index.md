@@ -29,7 +29,6 @@ guides/llm/sft.md
 guides/llm/peft.md
 ```
 
-
 ```{toctree}
 :caption: Model Coverage
 :hidden:
@@ -37,6 +36,15 @@ guides/llm/peft.md
 model-coverage/llm.md
 model-coverage/vlm.md
 ```
+
+```{toctree}
+:caption: Blogs
+:hidden:
+
+guides/gemma3n-blog.md
+```
+
+
 <!-- 
 ```{toctree}
 :caption: Datasets
