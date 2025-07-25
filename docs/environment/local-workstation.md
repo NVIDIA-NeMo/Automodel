@@ -107,7 +107,7 @@ uv provides several advantages for development and experimentation:
 
 If you have NeMo Automodel installed in your environment and prefer to run recipes directly without uv, you can use `torchrun` directly:
 
-### Single GPU Training
+### Train on a Single GPU
 
 ```bash
 python nemo_automodel/recipes/llm/finetune.py -c examples/llm/llama_3_2_1b_squad.yaml
