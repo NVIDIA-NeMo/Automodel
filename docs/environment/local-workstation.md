@@ -123,7 +123,7 @@ This approach requires that you have already installed NeMo Automodel and its de
 
 ## Customize Configuration Settings
 
-All approaches use the same YAML configuration files. You can easily customize training by:
+All approaches use the same YAML configuration files. You can easily customize training by following the steps in this section.
 
 1. **Command-line arguments**: Override config values directly.
 For example, if you want to finetune `Qwen/Qwen3-0.6B` instead of `meta-llama/Llama-3.2-1B`, you can use:
