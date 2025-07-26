@@ -1,4 +1,4 @@
-# Integrate Your Own Dataset
+# Integrate Your Own Multi-Modal Dataset
 
 This guide shows you how to integrate your own dataset into NeMo Automodel for training.
 You'll learn about **multi-modal datasets** that combine text with images or other modalities. We'll cover how to create custom datasets by implementing the required methods and preprocessing functions, and finally show you how to specify your own data logic using YAML configuration with file paths—allowing you to define custom dataset processing without modifying the main codebase.

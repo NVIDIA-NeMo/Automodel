@@ -1,21 +1,21 @@
-# Vision Language Models with NeMo AutoModel
+# Vision Language Models (VLMs)
 
 ## Introduction
 
 Vision Language Models (VLMs) are advanced models that integrate vision and language processing capabilities. They are trained on extensive datasets containing both interleaved images and text data, allowing them to generate text descriptions of images and answer questions related to images.
 
-NeMo AutoModel LLM APIs can be easily extended to support VLM tasks. While most of the training setup is the same, some additional steps are required to prepare the data and model for VLM training.
+NeMo Automodel LLM APIs can be easily extended to support VLM tasks. While most of the training setup is the same, some additional steps are required to prepare the data and model for VLM training.
 
 ## Run LLMs with NeMo Automodel
 
-To run LLMs with NeMo AutoModel, use NeMo container version `25.07` or later. If the model you want to fine-tune requires a newer version of Transformers, you may need to upgrade to the latest NeMo AutoModel using:
+To run LLMs with NeMo Automodel, use NeMo container version `25.07` or later. If the model you want to fine-tune requires a newer version of Transformers, you may need to upgrade to the latest NeMo Automodel using:
 
 ```bash
 
    pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/Automodel.git
 ```
 
-For other installation options (e.g., uv) please see our [installation guide](../guides/installation.md).
+For other installation options (e.g., uv) please see our [Installation Guide](../guides/installation.md).
 
 ## Supported Models
 
@@ -35,8 +35,9 @@ For detailed instructions on fine-tuning these models using both SFT and PEFT ap
 
 ## Dataset Examples
 
-> [!TIP]
-> In these guides, we use the `quintend/rdr-items` and `naver-clova-ix/cord-v2` datasets for demonstation purposes, but you can specify your own data as needed.
+:::{tip}
+In these guides, we use the `quintend/rdr-items` and `naver-clova-ix/cord-v2` datasets for demonstation purposes, but you can specify your own data as needed.
+:::
 
 ### rdr items dataset
 The rdr items dataset [`quintend/rdr-items`](https://huggingface.co/datasets/quintend/rdr-items) is a small dataset containing 48 images with descriptions. This dataset serves as an example of how to prepare image-text data for VLM fine-tuning. For complete instructions on dataset preprocessing and the collate functions used, see the [Gemma Fine-Tuning Guide](../guides/omni/gemma3-3n.md).

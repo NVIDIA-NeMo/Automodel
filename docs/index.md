@@ -3,7 +3,7 @@
 ```
 
 ```{toctree}
-:caption: 🖥️ Get Started
+:caption: Get Started
 :hidden:
 repository-structure.md
 guides/installation.md
@@ -15,6 +15,21 @@ environment/cluster.md
 -->
 
 ```{toctree}
+:caption: Guides
+:hidden:
+
+guides/omni/gemma3-3n.md
+```
+
+```{toctree}
+:caption: E2E Examples
+:hidden:
+
+guides/llm/sft.md
+guides/llm/peft.md
+```
+
+```{toctree}
 :caption: Model Coverage
 :hidden:
 
@@ -23,31 +38,27 @@ model-coverage/vlm.md
 ```
 
 ```{toctree}
-:caption: 🚀 E2E Examples
+:caption: Blogs
 :hidden:
 
-guides/llm/sft.md
-guides/llm/peft.md
-guides/omni/gemma3-3n.md
+guides/gemma3n-blog.md
 ```
+
+
+<!-- 
 ```{toctree}
 :caption: Datasets
 :hidden:
 guides/llm/dataset.md
 guides/vlm/dataset.md
-```
+``` -->
 
 ```{toctree}
-:caption: 📚 Guides
+:caption: Development
 :hidden:
-
 guides/checkpointing.md
-guides/gemma3n-blog.md
-```
-
-```{toctree}
-:caption: 🛠️ Development
-:hidden:
+guides/llm/dataset.md
+guides/vlm/dataset.md
 
 apidocs/index.rst
 ```
