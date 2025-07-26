@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 \
-examples/vlm/finetune.py \
+TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
+-m pytest examples/vlm/finetune.py \
   --config examples/vlm/gemma_3_vl_4b_cord_v2_nvfsdp.yaml \
-  --model.pretrained_model_name_or_path /home/TestData/huiyingl/hf_gemma3_2l/ \
+  --model.pretrained_model_name_or_path /home/TestData/huiyingl/hf_gemma3_2l_large/ \
   --step_scheduler.max_steps 3 \
   --step_scheduler.grad_acc_steps 1 \
   --dataset._target_=nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset \
@@ -24,4 +24,5 @@ examples/vlm/finetune.py \
   --distributed._target_ nemo_automodel.components.distributed.nvfsdp.NVFSDPManager \
   --distributed.dp_size none \
   --distributed.tp_size 2 \
-  --distributed.cp_size 1 \ 
+  --distributed.cp_size 1
+coverage combine
