@@ -24,7 +24,7 @@ from nemo_automodel.datasets.vlm.datasets import make_medpix_vqa_dataset
 
 # Load and preprocess the dataset
 dataset = make_medpix_vqa_dataset(
-    path_or_dataset="mmoukouba/MedPix-VQA", 
+    path_or_dataset="mmoukouba/MedPix-VQA",
     split="train"
 )
 ```
@@ -46,7 +46,7 @@ conversation = [
         ],
     },
     {
-        "role": "assistant", 
+        "role": "assistant",
         "content": [{"type": "text", "text": example["answer"]}]
     },
 ]
@@ -60,7 +60,7 @@ Both Gemma 3 and Gemma 3n models work seamlessly with the Hugging Face `AutoProc
 
 ```python
 processor = AutoProcessor.from_pretrained("google/gemma-3-4b-it")
-# For Gemma 3n, get processor: 
+# For Gemma 3n, get processor:
 # processor = AutoProcessor.from_pretrained("google/gemma-3n-e4b-it")
 
 # For Gemma 3 and Gemma 3n, use the default collate function
@@ -72,7 +72,7 @@ def default_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
         return_tensors="pt",
         return_dict=True,
     )
-    
+
     labels = batch["input_ids"].clone()[:, 1:]
     labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
     batch["labels"] = labels
@@ -80,7 +80,7 @@ def default_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
         batch["input_ids"], processor, start_of_response_token=start_of_response_token
     )
     batch["loss_mask"] = loss_mask
-    
+
     return batch
 ```
 
@@ -206,7 +206,7 @@ peft:
   match_all_linear: False
   exclude_modules:  # exclude all vision and audio modules and lm_head
     - "*vision_tower*"
-    - "*vision*" 
+    - "*vision*"
     - "*visual*"
     - "*audio*"
     - "*image_encoder*"
@@ -218,7 +218,13 @@ peft:
 
 The training loss should look similar to the example below:
 
-<img src="medpix_peft.jpg" alt="Training Loss Curve" width="400">
+```{image} medpix_peft.jpg
+:alt: Training Loss Curve.
+:class: bg-primary
+:width: 400px
+:align: center
+```
+
 
 ### Checkpointing
 
@@ -295,7 +301,13 @@ uv run examples/vlm/generate.py \
 
 Given the following image:
 
-<img src="medpix.jpg" width="200">
+```{image} medpix.jpg
+:alt: Sample image from the MedPix dataset.
+:class: bg-primary
+:width: 200px
+:align: center
+```
+
 
 And the prompt:
 
