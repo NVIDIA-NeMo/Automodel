@@ -146,7 +146,7 @@ class NVFSDPManager:
         # infer if not provided
         self.tp_size = self.tp_size or 1
         self.cp_size = self.cp_size or 1
-        
+
         if self.dp_size is None or self.dp_size <= 0:
             # Calculate dp_size to ensure dp_size * tp_size * cp_size == world_size
             total_parallel_ranks = self.tp_size * self.cp_size
