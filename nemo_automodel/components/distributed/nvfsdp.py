@@ -144,10 +144,18 @@ class NVFSDPManager:
             raise RuntimeError("expected torch.distributed to be initialized")
 
         # infer if not provided
-        self.dp_size = self.dp_size
-        if self.dp_size is None or self.dp_size <= 0:
-            self.dp_size = self.world_size
         self.tp_size = self.tp_size or 1
+        self.cp_size = self.cp_size or 1
+
+        if self.dp_size is None or self.dp_size <= 0:
+            # Calculate dp_size to ensure dp_size * tp_size * cp_size == world_size
+            total_parallel_ranks = self.tp_size * self.cp_size
+            if self.world_size % total_parallel_ranks != 0:
+                raise ValueError(
+                    f"world_size ({self.world_size}) must be divisible by (tp_size * cp_size) "
+                    f"({self.tp_size} * {self.cp_size} = {total_parallel_ranks})"
+                )
+            self.dp_size = self.world_size // total_parallel_ranks
 
         mesh_shape = (self.dp_size, self.cp_size, self.tp_size)
         mesh_names = ("data_parallel", "context_parallel", "tensor_parallel")
