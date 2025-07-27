@@ -59,6 +59,6 @@ guides/vlm/dataset.md
 guides/checkpointing.md
 guides/llm/dataset.md
 guides/vlm/dataset.md
-
+docs/parallelisms.md
 apidocs/index.rst
 ```
