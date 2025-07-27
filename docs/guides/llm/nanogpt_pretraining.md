@@ -65,6 +65,18 @@ python examples/llm/pretrain.py \
 torchrun --standalone --nproc-per-node 8 \
   examples/llm/pretrain.py \
   --config examples/llm/nanogpt_pretrain.yaml
+
+# Or using the **AutoModel CLI** (wraps the same logic under the hood):
+
+```bash
+# single-GPU
+automodel pretrain llm -c examples/llm/nanogpt_pretrain.yaml
+
+# multi-GPU (AutoModel CLI + torchrun on 8 GPUs)
+torchrun --standalone --nproc-per-node 8 \
+  $(which automodel) pretrain llm \
+  -c examples/llm/nanogpt_pretrain.yaml
+```
 ```
 
 The `PretrainRecipeForNextTokenPrediction` class handles:
