@@ -1,6 +1,6 @@
 # 🚀 Gradient (Activation) Checkpointing in NeMo-AutoModel
 
-Gradient checkpointing – also called _activation checkpointing_ – trades a little extra compute for a **large reduction in GPU memory** by recomputing intermediate activations during the backwards pass instead of storing them.  
+Gradient checkpointing - also called _activation checkpointing_ - trades a little extra compute for a **large reduction in GPU memory** by recomputing intermediate activations during the backwards pass instead of storing them.  
 It is especially powerful when combined with memory-efficient loss functions (e.g. Linear-Cut Cross-Entropy) and parameter sharding via FSDP.
 
 ---
@@ -24,7 +24,7 @@ Example (snippet):
    ...
 ```
 
-If you are using the FSDP2 strategy (for PyTorch 2.3+), set the flag in exactly the same place – the underlying manager will forward it to the `fsdp2_strategy_parallelize(...)` helper.
+If you are using the FSDP2 strategy (for PyTorch 2.3+), set the flag in exactly the same place - the underlying manager will forward it to the `fsdp2_strategy_parallelize(...)` helper.
 
 ### 1.2. Programmatically
 ```python
@@ -57,7 +57,7 @@ LC-CE and gradient checkpointing target **different memory hot-spots** (output l
 ## 3. Example Memory Savings (A100-80GB, Llama-3-8B)
 | Technique | Max GPU Mem (GB) | Δ vs Baseline |
 |-----------|-----------------|---------------|
-| Baseline (no sharding) | 71.2 | – |
+| Baseline (no sharding) | 71.2 | - |
 | + FSDP (dp=4, tp=2) | 22.5 | ↓ 68 % |
 | + LC-CE | 19.3 | ↓ 73 % |
 | + Gradient Checkpointing | 12.1 | ↓ 83 % |
@@ -71,9 +71,9 @@ Notes:
 ---
 
 ## 4. Performance Considerations
-1. **Extra compute** – Each checkpointed segment is recomputed once during the backward pass. In practice the wall-clock overhead is ≈ 5-10 % for transformer models.
-2. **Throughput vs Batch Size** – The goal is usually to _increase batch size_ or _sequence length_ while keeping throughput constant.
-3. **Selective Checkpointing** – For very long models you can checkpoint every _k_-th layer by replacing the boolean flag with an integer (e.g. `activation_checkpointing: 2` → every second layer). This is exposed via the same flag in the YAML.
+1. **Extra compute** - Each checkpointed segment is recomputed once during the backward pass. In practice the wall-clock overhead is ≈ 5-10 % for transformer models.
+2. **Throughput vs Batch Size** - The goal is usually to _increase batch size_ or _sequence length_ while keeping throughput constant.
+3. **Selective Checkpointing** - For very long models you can checkpoint every _k_-th layer by replacing the boolean flag with an integer (e.g. `activation_checkpointing: 2` → every second layer). This is exposed via the same flag in the YAML.
 
 ---
 
