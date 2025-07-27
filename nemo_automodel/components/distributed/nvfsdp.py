@@ -150,7 +150,7 @@ class NVFSDPManager:
         self.tp_size = self.tp_size or 1
 
         mesh_shape = (self.dp_size, self.cp_size, self.tp_size)
-        mesh_names = ("data_parallel", "context_parallel", "tensor_parallel")
+        mesh_names = ("dp", "cp", "tp")
         for shape, name in zip(mesh_shape, mesh_names):
             assert isinstance(shape, int), "Expected {} to be an int, but got {}".format(name, type(shape))
             assert shape > 0, "Expected {} > 0, {}".format(name, shape)
@@ -163,7 +163,7 @@ class NVFSDPManager:
         )
         # flatten dp+cp if cp>1
         if self.cp_size > 1:
-            self.device_mesh[("data_parallel", "context_parallel")]._flatten(mesh_dim_name="dp_cp")
+            self.device_mesh[("dp", "cp")]._flatten(mesh_dim_name="dp_cp")
         return self
 
     def parallelize(self, model, optimizer=None, use_hf_tp_plan=False):

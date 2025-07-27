@@ -226,8 +226,8 @@ def fsdp2_strategy_parallelize(
     activation_checkpointing: bool = False,
     cpu_offload: bool = False,
     tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
-    dp_mesh_name: str = "data_parallel",
-    tp_mesh_name: str = "tensor_parallel",
+    dp_mesh_name: str = "dp",
+    tp_mesh_name: str = "tp",
     dp_cp_mesh_name: str = "dp_cp",
 ):
     """
@@ -411,9 +411,9 @@ def nvfsdp_strategy_parallelize(
     keep_fp8_transpose_cache_when_using_custom_fsdp: bool = False,
     nccl_ub: bool = False,
     fsdp_double_buffer: bool = False,
-    dp_mesh_name: str = "data_parallel",
-    cp_mesh_name: str = "context_parallel",
-    tp_mesh_name: str = "tensor_parallel",
+    dp_mesh_name: str = "dp",
+    cp_mesh_name: str = "cp",
+    tp_mesh_name: str = "tp",
 ):
     """
     Apply tensor/data parallelism (nvFSDP) and optional activation-checkpointing to the model.
@@ -492,7 +492,7 @@ def nvfsdp_strategy_parallelize(
     if cp_mesh.size() > 1:
         dp_cp_mesh_name = "dp_cp"
     else:
-        dp_cp_mesh_name = "data_parallel"
+        dp_cp_mesh_name = "dp"
 
     # Import nvFSDP unit modules specified by the user.
     nvfsdp_unit_modules = import_classes_from_paths(nvfsdp_unit_modules)

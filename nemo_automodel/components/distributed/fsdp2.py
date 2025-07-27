@@ -45,6 +45,8 @@ class FSDP2Manager:
     Attributes:
         dp_size (Optional[int]): Data-parallel group size. If None or non-positive, it is
             inferred from WORLD_SIZE.
+        dp_replicate_size (Optional[int]): Data-parallel replicate group size. If None or non-positive, it is
+            inferred from dp_size. Must be a divisor of dp_size.
         tp_size (Optional[int]): Tensor-parallel group size. Defaults to 1 if zero/None.
         cp_size (int): Context-parallel group size for pipeline-like sharding.
         sequence_parallel (bool): Enables sequence parallelism in the TP plan when True.
@@ -68,6 +70,10 @@ class FSDP2Manager:
     dp_size: Optional[int] = field(
         default=None,
         metadata={"help": "Data-parallel group size; if None, infer from WORLD_SIZE."},
+    )
+    dp_replicate_size: Optional[int] = field(
+        default=None,
+        metadata={"help": "Data-parallel replicate group size; if None, infer from dp_size. Must be a divisor of dp_size."},
     )
     tp_size: Optional[int] = field(
         default=1,
@@ -131,13 +137,28 @@ class FSDP2Manager:
             raise RuntimeError("expected torch.distributed to be initialized")
 
         # infer if not provided
-        self.dp_size = self.dp_size
         if self.dp_size is None or self.dp_size <= 0:
             self.dp_size = self.world_size
-        self.tp_size = self.tp_size or 1
 
-        mesh_shape = (self.dp_size, self.cp_size, self.tp_size)
-        mesh_names = ("data_parallel", "context_parallel", "tensor_parallel")
+        if self.dp_replicate_size is None or self.dp_replicate_size <= 0:
+            self.dp_replicate_size = self.dp_size
+        assert self.dp_size % self.dp_replicate_size == 0, "dp_size must be a multiple of dp_replicate_size"
+
+        self.dp_shard_size = self.dp_size // self.dp_replicate_size
+
+        if self.tp_size is None or self.tp_size <= 0:
+            self.tp_size = 1
+
+        if self.cp_size is None or self.cp_size <= 0:
+            self.cp_size = 1
+        
+        self.device_mesh = self._get_device_mesh()
+
+        return self
+
+    def _get_device_mesh(self):
+        mesh_shape = (self.dp_replicate_size, self.dp_shard_size, self.cp_size, self.tp_size)
+        mesh_names = ("dp_replicate", "dp_shard", "cp", "tp")
         for shape, name in zip(mesh_shape, mesh_names):
             assert isinstance(shape, int), "Expected {} to be an int, but got {}".format(name, type(shape))
             assert shape > 0, "Expected {} > 0, {}".format(name, shape)
@@ -150,8 +171,38 @@ class FSDP2Manager:
         )
         # flatten dp+cp if cp>1
         if self.cp_size > 1:
-            self.device_mesh[("data_parallel", "context_parallel")]._flatten(mesh_dim_name="dp_cp")
-        return self
+            self.device_mesh[("dp", "cp")]._flatten(mesh_dim_name="dp_cp")
+        
+        # based on https://github.com/pytorch/torchtitan/blob/d282cf2ce9ca8049b4b8423c1d7578c80426576f/torchtitan/distributed/parallel_dims.py#L191
+        # Create all the submesh here to ensure all required process groups are
+        # initialized:
+        # Mesh for data loading (no communication on this mesh)
+        dp_mesh_dim_names = []
+        # Mesh for param sharding
+        dp_shard_cp_mesh_dim_names = []
+        # Mesh for loss all-reduce
+        dp_cp_mesh_dim_names = []
+
+        if self.dp_replicate_size > 1:
+            dp_mesh_dim_names.append("dp_replicate")
+            dp_cp_mesh_dim_names.append("dp_replicate")
+        if self.dp_shard_size > 1:
+            dp_mesh_dim_names.append("dp_shard")
+            dp_shard_cp_mesh_dim_names.append("dp_shard")
+            dp_cp_mesh_dim_names.append("dp_shard")
+        if self.cp_size > 1:
+            dp_shard_cp_mesh_dim_names.append("cp")
+            dp_cp_mesh_dim_names.append("cp")
+
+        if dp_mesh_dim_names != []:
+            self.device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
+        if dp_shard_cp_mesh_dim_names != []:
+            self.device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(
+                mesh_dim_name="dp_shard_cp"
+            )
+        if dp_cp_mesh_dim_names != []:
+            self.device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
+        return self.device_mesh
 
     def parallelize(self, model, use_hf_tp_plan=False):
         """
