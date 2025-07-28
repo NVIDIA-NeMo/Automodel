@@ -544,6 +544,27 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     self._run_validation_epoch()
 
     # ------------------ helpers ------------------
+    def _precompute_fp8_scales_if_enabled(self):
+        """Precompute FP8 scales for FSDP if the model has FP8 layers enabled.
+        
+        This optimizes FSDP communication by precomputing scales for all FP8 parameters
+        in a single all-reduce operation instead of many small ones.
+        """
+        try:
+            # Check if model has Float8Linear layers (indicating FP8 is enabled)
+            from torchao.float8 import Float8Linear
+            has_fp8_layers = any(isinstance(module, Float8Linear) for module in self.model.modules())
+            
+            if has_fp8_layers:
+                from nemo_automodel.components.quantization import precompute_fp8_scales_for_fsdp
+                precompute_fp8_scales_for_fsdp(self.model)
+        except ImportError:
+            # torchao not available or Float8Linear not found - skip silently
+            pass
+        except Exception as e:
+            # Log warning but don't fail training
+            logging.warning(f"Failed to precompute FP8 scales for FSDP: {e}")
+
     def _run_train_step(self, batch, is_optim_step, clip_norm=1.0):
         """Execute a single training step.
 
@@ -628,6 +649,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
             self.optimizer.step()
             self.optimizer.zero_grad()
+
+            # Precompute FP8 scales for FSDP if FP8 is enabled
+            self._precompute_fp8_scales_if_enabled()
 
             if self.lr_scheduler is not None:
                 self.lr_scheduler.step(1)

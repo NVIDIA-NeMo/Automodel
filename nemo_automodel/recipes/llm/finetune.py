@@ -532,6 +532,20 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     self._run_validation_epoch()
 
     # ------------------ helpers ------------------
+    def _precompute_fp8_scales_if_enabled(self):
+        """Precompute FP8 scales for FSDP if the model has FP8 layers enabled.
+        
+        This optimizes FSDP communication by precomputing scales for all FP8 parameters
+        in a single all-reduce operation instead of many small ones.
+        """
+        ## TODO: use precompute_fp8_scales_for_fsdp only when tensorwise and dp_shard>1 and fp8 all reduce is enabled
+        try:
+            from nemo_automodel.components.quantization import precompute_fp8_scales_for_fsdp
+            precompute_fp8_scales_for_fsdp(self.model)
+        except Exception as e:
+            # Log warning but don't fail training
+            logging.warning(f"Failed to precompute FP8 scales for FSDP: {e}")
+
     def _run_train_step(self, batch, is_optim_step, clip_norm=1.0):
         """Execute a single training step.
 
@@ -616,6 +630,10 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             self.optimizer.step()
             self.optimizer.zero_grad()
+
+            # Precompute FP8 scales for FSDP if FP8 is enabled
+            if self.cfg.get("model.use_fp8", False) and self.device_mesh['data_parallel'].size()>1:
+                self._precompute_fp8_scales_if_enabled()
 
             if self.lr_scheduler is not None:
                 self.lr_scheduler.step(1)

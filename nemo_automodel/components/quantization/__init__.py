@@ -1,0 +1,19 @@
+from .fp8 import (
+    apply_fp8_to_model, 
+    precompute_fp8_scales_for_fsdp,
+    HAVE_TORCHAO
+)
+
+# Import Float8LinearConfig only if available
+if HAVE_TORCHAO:
+    from .fp8 import Float8LinearConfig
+
+__all__ = [
+    "apply_fp8_to_model", 
+    "precompute_fp8_scales_for_fsdp",
+    "HAVE_TORCHAO"
+]
+
+# Add Float8LinearConfig to exports only if available
+if HAVE_TORCHAO:
+    __all__.append("Float8LinearConfig") 

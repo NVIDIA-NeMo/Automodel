@@ -30,6 +30,8 @@ from nemo_automodel.shared.utils import dtype_from_str
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 logger = logging.getLogger(__name__)
 
+from nemo_automodel.components.quantization import apply_fp8_to_model, HAVE_TORCHAO
+
 
 def _assert_same_signature(original, patched):
     """
@@ -111,6 +113,40 @@ def _patch_liger_kernel(model):
         raise RuntimeError("Failed to patch model")
 
 
+def _apply_fp8_quantization(model, recipe_name=None, filter_fqns=None, emulate=False):
+    """
+    Apply FP8 quantization to a model.
+    
+    Args:
+        model (nn.Module): The model to quantize
+        recipe_name (str, optional): FP8 recipe name ("tensorwise", "rowwise", etc.)
+        filter_fqns (list, optional): List of module names to exclude from FP8 conversion
+        emulate (bool): Use emulation instead of hardware acceleration
+        
+    Returns:
+        nn.Module: The FP8-quantized model
+        
+    Raises:
+        RuntimeError: If FP8 quantization fails
+    """
+    if not HAVE_TORCHAO:
+        logging.warning("Asked to use FP8 quantization, but torchao is not installed")
+        return model
+
+    try:
+        model = apply_fp8_to_model(
+            model, 
+            recipe_name=recipe_name, 
+            filter_fqns=filter_fqns or [], 
+            emulate=emulate
+        )
+        logging.info("Applied FP8 quantization to model")
+        return model
+    except Exception as e:
+        logging.warning(f"Failed to apply FP8 quantization to model: {e}")
+        raise RuntimeError("Failed to apply FP8 quantization")
+
+
 class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
     """
     Drop-in replacement for ``_BaseAutoModelClass`` that includes custom-kernels.
@@ -143,6 +179,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         sdpa_method: Optional[List[SDPBackend]] = None,
         torch_dtype="auto",
         attn_implementation: str = "flash_attention_2",
+        use_fp8: bool = False,
+        fp8_recipe_name: Optional[str] = "tensorwise",
+        fp8_filter_fqns: Optional[List[str]] = None,
+        fp8_emulate: bool = False,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -150,8 +190,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         This is a light wrapper around
         `transformers.AutoModelForCausalLM.from_pretrained` that can
-        automatically apply Liger and/or SDPA (scaled-dot-product
-        attention) kernel optimizations.
+        automatically apply Liger, SDPA, and/or FP8 quantization optimizations.
 
         Args:
             pretrained_model_name_or_path (str | os.PathLike): Hugging Face
@@ -169,6 +208,15 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 Data type passed to the underlying `from_pretrained` call.
             attn_implementation (str, default="flash_attention_2"): Desired
                 attention implementation; forwarded to the HF config.
+            use_fp8 (bool, default=False): If `True`, apply FP8 quantization
+                to the model for improved performance on supported hardware.
+            fp8_recipe_name (str, optional): FP8 recipe name to use
+                ("tensorwise", "rowwise", "rowwise_with_gw_hp"). If None,
+                uses tensorwise scaling.
+            fp8_filter_fqns (list[str], optional): List of module names to
+                exclude from FP8 conversion (e.g., ["lm_head", "embed_tokens"]).
+            fp8_emulate (bool, default=False): Use FP8 emulation for testing
+                on older hardware that doesn't support native FP8.
             **kwargs: Additional keyword arguments forwarded verbatim to
                 `AutoModelForCausalLM.from_pretrained`.
 
@@ -177,13 +225,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             model instance.
 
         Warns:
-            UserWarning: Emitted when `use_liger_kernel=True` but the Liger
-            package is unavailable.
+            UserWarning: Emitted when optimizations are requested but packages
+            are unavailable.
 
         Notes:
-            If kernel patching fails, the partially constructed model is
-              deleted and the method recurses once with
-              `use_liger_kernel=False` or `use_sdpa_patching=False`
+            If kernel patching or FP8 quantization fails, the partially constructed 
+            model is deleted and the method recurses once with the failing 
+            optimization disabled.
         """
         torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
 
@@ -197,6 +245,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
+                use_fp8=override.get("use_fp8", use_fp8),
+                fp8_recipe_name=fp8_recipe_name,
+                fp8_filter_fqns=fp8_filter_fqns,
+                fp8_emulate=fp8_emulate,
                 **kwargs,
             )
 
@@ -232,8 +284,21 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             if use_sdpa_patching:
                 model = _patch_attention(model, sdpa_method)
         except:
-            logging.warning("Retrying without Liger kernels.")
+            logging.warning("Retrying without SDPA patching.")
             return _retry(use_sdpa_patching=False)
+
+        # Apply FP8 quantization
+        try:
+            if use_fp8:
+                model = _apply_fp8_quantization(
+                    model, 
+                    recipe_name=fp8_recipe_name, 
+                    filter_fqns=fp8_filter_fqns, 
+                    emulate=fp8_emulate
+                )
+        except RuntimeError:
+            logging.warning("Retrying without FP8 quantization.")
+            return _retry(use_fp8=False)
 
         model.config.update({"nemo_version": __version__})
         return model
@@ -248,6 +313,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         sdpa_method: Optional[List[SDPBackend]] = None,
         torch_dtype: Union[str, torch.dtype] = "auto",
         attn_implementation: str = "flash_attention_2",
+        use_fp8: bool = False,
+        fp8_recipe_name: Optional[str] = None,
+        fp8_filter_fqns: Optional[List[str]] = None,
+        fp8_emulate: bool = False,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -298,6 +367,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
+                use_fp8=override.get("use_fp8", use_fp8),
+                fp8_recipe_name=fp8_recipe_name,
+                fp8_filter_fqns=fp8_filter_fqns,
+                fp8_emulate=fp8_emulate,
                 **kwargs,
             )
 
@@ -332,8 +405,21 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             if use_sdpa_patching:
                 model = _patch_attention(model, sdpa_method)
         except:
-            logging.warning("Retrying without Liger kernels.")
+            logging.warning("Retrying without SDPA patching.")
             return _retry(use_sdpa_patching=False)
+
+        # Apply FP8 quantization
+        try:
+            if use_fp8:
+                model = _apply_fp8_quantization(
+                    model, 
+                    recipe_name=fp8_recipe_name, 
+                    filter_fqns=fp8_filter_fqns, 
+                    emulate=fp8_emulate
+                )
+        except RuntimeError:
+            logging.warning("Retrying without FP8 quantization.")
+            return _retry(use_fp8=False)
 
         model.config.update({"nemo_version": __version__})
         return model
