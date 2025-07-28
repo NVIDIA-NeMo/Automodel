@@ -1,6 +1,6 @@
 # NanoGPT-style Pre-Training with NeMo Automodel
 
-This short guide walks you through **data preparation** and **model training** for a NanoGPT-like run using the new `BinTokenDataset` and pre-training recipe that we just added.
+This short guide walks you through **data preparation** and **model training** for a NanoGPT-like run using the new `BinTokenDataset` and pre-training recipe.
 
 ---
 
