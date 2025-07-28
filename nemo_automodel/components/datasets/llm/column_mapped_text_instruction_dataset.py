@@ -75,7 +75,7 @@ def _str_is_hf_repo_id(val: str) -> bool:
         and not Path(val).exists()
 
 
-def _load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str] = None):
+def _load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str] = None, streaming: bool = False):
     """Load a dataset either from the Hugging Face Hub or from local JSON/JSONL files.
 
     If *path_or_dataset_id* resembles a HF repo ID (i.e. of the form
@@ -95,13 +95,13 @@ def _load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str
         datasets.Dataset: The loaded dataset.
     """
     if isinstance(path_or_dataset_id, str) and _str_is_hf_repo_id(path_or_dataset_id):
-        return load_dataset(path_or_dataset_id, split=split or "train")
+        return load_dataset(path_or_dataset_id, split=split or "train", streaming=streaming)
 
     data_files = list(make_iterable(path_or_dataset_id))
     if not data_files:
         raise ValueError("No data files provided")
 
-    return load_dataset("json", data_files=data_files, split="train")
+    return load_dataset("json", data_files=data_files, split="train", streaming=streaming)
 
 class ColumnMappedTextInstructionDataset(Dataset):
     """Generic *instruction‐tuning* dataset that maps arbitrary column names.
@@ -122,6 +122,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
         tokenizer,
         *,
         split: Optional[str] = None,
+        streaming: bool = False,
         answer_only_loss_mask: bool = True,
         start_of_turn_token: Optional[str] = None,
     ) -> None:
@@ -132,7 +133,8 @@ class ColumnMappedTextInstructionDataset(Dataset):
 
         self.tokenizer = tokenizer
 
-        self.dataset = _load_dataset(path_or_dataset_id, split=split)
+        self.streaming = streaming
+        self.dataset = _load_dataset(path_or_dataset_id, split=split, streaming=streaming)
 
         # Keep mapping: dest -> source (i.e. public_field -> raw_column_name)
         self.column_mapping = column_mapping
@@ -141,9 +143,28 @@ class ColumnMappedTextInstructionDataset(Dataset):
         self.start_of_turn_token = start_of_turn_token
 
     def __len__(self) -> int:  # noqa: D401
+        if self.streaming:
+            raise TypeError("Streaming datasets do not have a defined length")
         return len(self.dataset)
 
     def __getitem__(self, idx):  # noqa: D401
+        if self.streaming:
+            raise TypeError("__getitem__ is not supported when `streaming=True`. Iterate over the dataset instead.")
         row = self.dataset[idx]
         mapped = {dest: row[src] for dest, src in self.column_mapping.items()}
         return mapped
+
+    def __iter__(self):  # noqa: D401
+        """Iterate over the dataset yielding rows with the requested column mapping.
+
+        When *streaming=True* the underlying Hugging Face ``IterableDataset`` is
+        consumed lazily. For in-memory datasets we simply iterate over the
+        indices to preserve the original semantics.
+        """
+        if self.streaming:
+            for row in self.dataset:
+                mapped = {dest: row[src] for dest, src in self.column_mapping.items()}
+                yield mapped
+        else:
+            for idx in range(len(self)):
+                yield self[idx]

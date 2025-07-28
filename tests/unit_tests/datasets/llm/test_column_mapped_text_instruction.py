@@ -85,4 +85,47 @@ def test_column_mapped_dataset_basic(tmp_path: Path):
     first = ds[0]
     assert set(first.keys()) == {"query", "response"}
     assert first["query"] == "Why is the sky blue?"
-    assert first["response"].startswith("Rayleigh") 
+    assert first["response"].startswith("Rayleigh")
+
+
+def test_column_mapped_dataset_streaming(tmp_path: Path):
+    """Verify behaviour when *streaming=True*.
+
+    In streaming mode the dataset becomes an ``IterableDataset`` – length and
+    random access are undefined, but iteration should lazily yield the mapped
+    rows.  We check that these constraints are enforced and that the mapping
+    logic still works.
+    """
+
+    import itertools
+
+    samples = [
+        {"question": "Who wrote Hamlet?", "answer": "Shakespeare"},
+        {"question": "Capital of France?", "answer": "Paris"},
+    ]
+
+    jsonl_path = tmp_path / "toy_stream.jsonl"
+    with jsonl_path.open("w", encoding="utf-8") as fp:
+        for row in samples:
+            fp.write(json.dumps(row) + "\n")
+
+    ds = ColumnMappedTextInstructionDataset(
+        path_or_dataset_id=str(jsonl_path),
+        column_mapping={"q": "question", "a": "answer"},
+        tokenizer=_DummyTokenizer(),
+        streaming=True,
+        answer_only_loss_mask=False,
+    )
+
+    # __len__ and __getitem__ are not supported in streaming mode
+    with pytest.raises(TypeError):
+        _ = len(ds)  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError):
+        _ = ds[0]  # type: ignore[index]
+
+    # But we can iterate and obtain the mapped columns
+    first_two = list(itertools.islice(ds, 2))
+    assert len(first_two) == 2
+    assert first_two[0]["q"] == "Who wrote Hamlet?"
+    assert first_two[1]["a"] == "Paris" 

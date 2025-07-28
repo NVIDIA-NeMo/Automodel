@@ -3,7 +3,7 @@
 The `ColumnMappedTextInstructionDataset` is a **light-weight, plug-and-play** helper that lets you train on *instruction-answer* style corpora **without writing custom Python for every new schema**.  
 You simply specify **which column in your source dataset maps to which logical field** (`context`, `question`, `answer`, *etc.*) and the loader does the rest.
 
-It supports two data sources out-of-the-box:
+It supports two data sources out-of-the-box **and optionally streams them so they never fully reside in memory**:
 
 1. **Hugging Face Hub** - point to any dataset repo (`org/dataset`) that contains your desired columns.
 2. **Local JSON/JSONL files** - pass one file path *or* a list of paths on disk (newline-delimited JSON works great).
@@ -49,6 +49,7 @@ remote_ds = ColumnMappedTextInstructionDataset(
     split="train[:5%]",        # demo slice; omit (i.e. `split="train",`) for full data
     answer_only_loss_mask=True,
     start_of_turn_token="<|assistant|>",
+    streaming=True,              # <── stream instead of download whole dataset
 )
 ```
 
@@ -123,6 +124,7 @@ You *don’t* need to use the enum in the mapping - plain strings work fine.  Th
 | Arg                     | Default | Description |
 |-------------------------|---------|-------------|
 | `split`                 | `None`  | Which split to pull from a HF repo (`train`, `validation`, *etc.*). Ignored for local files. |
+| `streaming`             | `False` | If `True`, loads the dataset in *streaming* mode (an HF `IterableDataset`). Useful for very large corpora or when you want to start training before the full download completes.  When enabled, `len(...)` and random access (`dataset[idx]`) are **not** available — iterate instead. |
 | `answer_only_loss_mask` | `True`  | Create a `loss_mask` where only the answer tokens contribute to the loss. Requires `start_of_turn_token`. |
 | `start_of_turn_token`   | `None`  | String token marking the assistant’s response. Required when `answer_only_loss_mask=True`. |
 
