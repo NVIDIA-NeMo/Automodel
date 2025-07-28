@@ -23,7 +23,7 @@ The dataset schema is `{task_name, id, definition, inputs, targets}`.
 
 Example lines (train split):
 
-```jsonl
+```json
 {"task_name":"task001_quoref_question_generation","id":"task001-abc123","definition":"In this task, you're given passages that...","inputs":"Passage: A man is sitting at a piano...","targets":"What is the first name of the person who doubted it would be explosive?"}
 {"task_name":"task002_math_word_problems","id":"task002-def456","definition":"Solve the following word problem.","inputs":"If there are 3 apples and you take 2...","targets":"1"}
 ```
@@ -58,7 +58,7 @@ remote_ds = ColumnMappedTextInstructionDataset(
 Assume you have a local newline-delimited JSON file at `/data/my_corpus.jsonl`
 with the simple schema `{instruction, output}`.  A few sample rows:
 
-```jsonl
+```json
 {"instruction": "Translate 'Hello' to French", "output": "Bonjour"}
 {"instruction": "Summarize the planet Neptune.", "output": "Neptune is the eighth planet from the Sun."}
 ```
