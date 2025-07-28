@@ -4,22 +4,19 @@ This short guide walks you through **data preparation** and **model training** f
 
 ---
 
-## 1️⃣ Environment Setup
+## 1. Environment setup
 
 ```bash
 # clone / install Automodel (editable for local hacks)
 cd /path/to/Automodel
 pip install -e .[all]    # installs NeMo Automodel + optional extras
-
-# (optional) performance goodies
-pip install tiktoken datasets tqdm
 ```
 
 > **GPU requirements**   A single modern GPU (24 GB+) is enough to run the tiny configuration in `examples/llm/nanogpt_pretrain.yaml`.  For larger models, launch multi-GPU with `torchrun` just like any other distributed PyTorch job.
 
 ---
 
-## 2️⃣ Pre-process the FineWeb dataset
+## 2. Pre-process the FineWeb dataset
 
 We provide a thin wrapper around NanoGPT’s original `fineweb.py`.  The script streams the dataset from the Hugging Face Hub, tokenises with GPT-2 BPE (`tiktoken`) and writes **memory-mapped binary shards** that `BinTokenDataset` can stream at training time.
 
@@ -32,17 +29,17 @@ python tools/data_preprocessing/fineweb.py \
   --split sample-10BT \
   --max-tokens 500M      # stop after 500 million tokens (≈ 2 GPU-hours)
 
-# ➟ shards end up in:  tools/data_preprocessing/fineweb_10BT_max_500M/
+# Shards are stored in:  tools/data_preprocessing/fineweb_10BT_max_500M/
 #    fineweb_train_000001.bin  fineweb_val_000000.bin  etc.
 ```
 
-Feel free to:
+Consider the following options:
 1. Drop the `--max-tokens` flag to stream the **entire** split (tens of billions of tokens).
 2. Adjust `--shard_size` for smaller or larger `.bin` files.
 
 ---
 
-## 3️⃣ Inspect / tweak the YAML config
+## 3. Inspect and adjust the YAML configuration
 
 `examples/llm/nanogpt_pretrain.yaml` is a **minimal** configuration that:
 * Defines a small GPT-2 12-layer model via `transformers.GPT2Config` (easy to scale up).
@@ -54,7 +51,7 @@ Scale **width/depth**, `batch_size`, or `seq_len` as needed – the recipe is mo
 
 ---
 
-## 4️⃣ Launch training
+## 4. Launch training
 
 ```bash
 # Single-GPU run (good for local testing)
@@ -77,7 +74,6 @@ torchrun --standalone --nproc-per-node 8 \
   $(which automodel) pretrain llm \
   -c examples/llm/nanogpt_pretrain.yaml
 ```
-```
 
 The `PretrainRecipeForNextTokenPrediction` class handles:
 * Distributed (FSDP / TP / CP) wrapping if requested in the YAML.
@@ -88,7 +84,7 @@ Checkpoints are written under `checkpoints/` by default as `safetensors` or `tor
 
 ---
 
-## 5️⃣ Monitoring & evaluation
+## 5. Monitoring and evaluation
 
 * **Throughput** and **loss** statistics print every optimisation step.
 * Enable `wandb` in the YAML for nice dashboards (`wandb.project`, `entity`, etc.).
@@ -96,11 +92,11 @@ Checkpoints are written under `checkpoints/` by default as `safetensors` or `tor
 
 ---
 
-## 6️⃣ Going further
+## 6. Further work
 
 1. **Scaling up** – swap `transformers.GPT2Config` for a `LlamaForCausalLM`, `Qwen2` or any HF-compatible causal model; increase `n_layer`, `n_embd`, etc.
 2. **Mixed precision** – FSDP 2 + `bfloat16` (`dtype: bfloat16` in distributed config) gives great memory savings.
 3. **Sequence packing** – set `packed_sequence.packed_sequence_size` > 0 to pack variable-length contexts and boost utilisation.
 4. **Custom datasets** – implement your own `IterableDataset` or convert existing corpora to the `.bin` format using the preprocessing script as a template.
 
-Happy training! 🎉 
+Happy training. 
