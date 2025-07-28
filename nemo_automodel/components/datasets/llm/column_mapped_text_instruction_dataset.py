@@ -71,8 +71,7 @@ def _str_is_hf_repo_id(val: str) -> bool:
     Returns:
         True if the string is a valid huggingface dataset id, False otherwise.
     """
-    return val.count('/') == 1 \
-        and re.match(r'^[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+$', val) is not None \
+    return re.match(r'^[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+$', val) is not None \
         and not Path(val).exists()
 
 
