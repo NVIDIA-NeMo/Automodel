@@ -12,14 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
+import re
+from enum import Enum
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Union
 
 from datasets import load_dataset
 from torch.utils.data import Dataset
-from enum import Enum
-import re
 
 # Supported cases:
 # Format:
@@ -29,10 +28,12 @@ import re
 # - one or more paths to jsonl files
 # - dataset id from huggingface.
 
+
 class ColumnTypes(Enum):
     Context = "context"
     Question = "question"
     Answer = "answer"
+
 
 def make_iterable(val: Union[str, List[str]]) -> Iterator[str]:
     """Utility that converts *val* into an iterator of strings.
@@ -61,6 +62,7 @@ def make_iterable(val: Union[str, List[str]]) -> Iterator[str]:
     else:
         raise ValueError(f"Expected str or list[str], got {type(val)}")
 
+
 def _str_is_hf_repo_id(val: str) -> bool:
     """
     Check if a string is a valid huggingface dataset id.
@@ -71,8 +73,7 @@ def _str_is_hf_repo_id(val: str) -> bool:
     Returns:
         True if the string is a valid huggingface dataset id, False otherwise.
     """
-    return re.match(r'^[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+$', val) is not None \
-        and not Path(val).exists()
+    return re.match(r"^[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+$", val) is not None and not Path(val).exists()
 
 
 def _load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str] = None, streaming: bool = False):
@@ -103,6 +104,7 @@ def _load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str
 
     return load_dataset("json", data_files=data_files, split="train", streaming=streaming)
 
+
 class ColumnMappedTextInstructionDataset(Dataset):
     """Generic *instruction‐tuning* dataset that maps arbitrary column names.
 
@@ -127,9 +129,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
         start_of_turn_token: Optional[str] = None,
     ) -> None:
         if answer_only_loss_mask and start_of_turn_token is None:
-            raise ValueError(
-                "start_of_turn_token must be provided when answer_only_loss_mask=True"
-            )
+            raise ValueError("start_of_turn_token must be provided when answer_only_loss_mask=True")
 
         self.tokenizer = tokenizer
 
