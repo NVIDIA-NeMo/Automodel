@@ -46,7 +46,7 @@ remote_ds = ColumnMappedTextInstructionDataset(
         "answer": "targets",          # expected answer string
     },
     tokenizer=tokenizer,
-    split="train[:5%]",        # demo slice; omit for full data
+    split="train[:5%]",        # demo slice; omit (i.e. `split="train",`) for full data
     answer_only_loss_mask=True,
     start_of_turn_token="<|assistant|>",
 )
