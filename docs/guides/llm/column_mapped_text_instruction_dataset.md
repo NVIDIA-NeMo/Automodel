@@ -110,23 +110,13 @@ dataset:
 ```
 
 ---
-## Column mapping cheat-sheet
-| **Logical field** | **Enum** (optional)          | **Typical meaning**                 |
-|-------------------|------------------------------|-------------------------------------|
-| `context`         | `ColumnTypes.Context`        | Additional supporting text          |
-| `question`        | `ColumnTypes.Question`       | The user’s instruction / query      |
-| `answer`          | `ColumnTypes.Answer`         | The model’s target answer / output  |
-
-You *don’t* need to use the enum in the mapping - plain strings work fine.  The enum is provided merely to avoid typos when building mappings in code.
-
----
 ## Advanced options
 | Arg                     | Default | Description |
 |-------------------------|---------|-------------|
 | `split`                 | `None`  | Which split to pull from a HF repo (`train`, `validation`, *etc.*). Ignored for local files. |
 | `streaming`             | `False` | If `True`, loads the dataset in *streaming* mode (an HF `IterableDataset`). Useful for very large corpora or when you want to start training before the full download completes.  When enabled, `len(...)` and random access (`dataset[idx]`) are **not** available — iterate instead. |
 | `answer_only_loss_mask` | `True`  | Create a `loss_mask` where only the answer tokens contribute to the loss. Requires `start_of_turn_token`. |
-| `start_of_turn_token`   | `None`  | String token marking the assistant’s response. Required when `answer_only_loss_mask=True`. |
+| `start_of_turn_token`   | `None`  | String token marking the assistant’s response. Required when `answer_only_loss_mask=True` for tokenizers with chat template. |
 
 ---
 ## Tokenisation paths
@@ -193,7 +183,7 @@ mapping:
 {"question": "question", "answer": "answer"}
 ```
 
-### Chat-style with context (HF)
+### Chat-style with context
 ```json
 {
   "context": "You are an AI writing assistant.",
