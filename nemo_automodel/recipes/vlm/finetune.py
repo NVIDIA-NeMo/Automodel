@@ -22,13 +22,12 @@ from typing import Any, Dict, Optional
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import wandb
 from torch.distributed.device_mesh import _mesh_resources
 from torch.utils.data import DataLoader
 from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
-from wandb import Settings
 
+import wandb
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -51,6 +50,7 @@ from nemo_automodel.components.utils.dist_utils import (
 )
 from nemo_automodel.components.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
 from nemo_automodel.recipes.base_recipe import BaseRecipe
+from wandb import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -605,11 +605,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 self.model,
                 self.total_local_num_loss_tokens,
                 self.device_mesh[
-                    (
-                        "dp_cp"
-                        if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(self.device_mesh, {})
-                        else "dp"
-                    )
+                    ("dp_cp" if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(self.device_mesh, {}) else "dp")
                 ].get_group()
                 if self.device_mesh is not None
                 else None,
@@ -679,10 +675,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if (
                     self.device_mesh
                     and "position_ids" not in batch
-                    and (
-                        self.device_mesh["cp"].size() > 1
-                        or self.device_mesh["tp"].size() > 1
-                    )
+                    and (self.device_mesh["cp"].size() > 1 or self.device_mesh["tp"].size() > 1)
                 ):
                     batch["position_ids"] = (
                         torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)

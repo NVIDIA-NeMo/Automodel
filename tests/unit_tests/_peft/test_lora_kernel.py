@@ -78,5 +78,3 @@ def test_db_kernel(lora_params):
     baseline_dlora_b = torch.matmul(dy.t(), torch.matmul(x, lora_a.t())) * scale
     triton_dlora_b = lora_db_update_wrapper(lora_a, x.t(), dy, scale, dtype=dtype)
     assert torch.allclose(baseline_dlora_b, triton_dlora_b, atol=6e-2, rtol=6e-2)
-
-

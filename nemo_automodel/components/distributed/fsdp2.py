@@ -73,7 +73,9 @@ class FSDP2Manager:
     )
     dp_replicate_size: Optional[int] = field(
         default=None,
-        metadata={"help": "Data-parallel replicate group size; if None, infer from dp_size. Must be a divisor of dp_size."},
+        metadata={
+            "help": "Data-parallel replicate group size; if None, infer from dp_size. Must be a divisor of dp_size."
+        },
     )
     tp_size: Optional[int] = field(
         default=1,
@@ -136,7 +138,6 @@ class FSDP2Manager:
         if not dist.is_initialized():
             raise RuntimeError("expected torch.distributed to be initialized")
 
-
         if self.tp_size is None or self.tp_size <= 0:
             self.tp_size = 1
 
@@ -162,7 +163,9 @@ class FSDP2Manager:
         # dp_shard_size < dp_size since ddp usecase is not supported by FSDP2, need to use DDPManager instead
         # TODO(boxiangw): Call DDPManager instead of FSDP2Manager for ddp usecase?
         assert self.dp_size % self.dp_replicate_size == 0, "dp_size must be a multiple of dp_replicate_size"
-        assert self.dp_replicate_size < self.dp_size, "dp_replicate_size must be less than dp_size since ddp usecase is not supported by FSDP2"
+        assert self.dp_replicate_size < self.dp_size, (
+            "dp_replicate_size must be less than dp_size since ddp usecase is not supported by FSDP2"
+        )
 
         self.dp_shard_size = self.dp_size // self.dp_replicate_size
 
@@ -186,7 +189,7 @@ class FSDP2Manager:
         # flatten dp+cp if cp>1
         if self.cp_size > 1:
             self.device_mesh[("dp", "cp")]._flatten(mesh_dim_name="dp_cp")
-        
+
         # based on https://github.com/pytorch/torchtitan/blob/d282cf2ce9ca8049b4b8423c1d7578c80426576f/torchtitan/distributed/parallel_dims.py#L191
         # Create all the submesh here to ensure all required process groups are
         # initialized:
@@ -211,9 +214,7 @@ class FSDP2Manager:
         if dp_mesh_dim_names != []:
             self.device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
         if dp_shard_cp_mesh_dim_names != []:
-            self.device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(
-                mesh_dim_name="dp_shard_cp"
-            )
+            self.device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_shard_cp")
         if dp_cp_mesh_dim_names != []:
             self.device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
         return self.device_mesh
