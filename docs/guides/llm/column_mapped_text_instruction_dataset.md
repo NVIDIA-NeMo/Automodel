@@ -83,7 +83,7 @@ print(local_ds[0].keys())   # {'question', 'answer'}
 ## 3 • YAML integration (NeMo Automodel recipe)
 You can configure the dataset **entirely from your recipe YAML**.  Example:
 ```yaml
-# ===== dataset section of your recipe.yaml =====
+# dataset section of your recipe's config.yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
   path_or_dataset_id: Muennighoff/natural-instructions
