@@ -258,4 +258,4 @@ answer: answer
 
 ---
 ### That’s it!
-With the mapping specified, the rest of the NeMo Automodel pipeline (pre-tokenisation, packing, collate-fn, *etc.*) works as usual.  Happy finetuning! 🚀 
+With the mapping specified, the rest of the NeMo Automodel pipeline (pre-tokenisation, packing, collate-fn, *etc.*) works as usual. 
