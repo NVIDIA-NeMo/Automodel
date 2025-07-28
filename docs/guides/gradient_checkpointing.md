@@ -14,7 +14,7 @@ Example (snippet):
 ```yaml
 # examples/llm/llama_3_2_1b_my_finetune.yaml
 ...
-# --- NVFSDP (GPU-centric, highly optimized) ---
+# NVFSDP
 distributed:
   _target_: nemo_automodel.components.distributed.nvfsdp.NVFSDPManager
   tp_size: 2                 # Tensor Parallel = 2
@@ -23,7 +23,7 @@ distributed:
   sequence_parallel: false
   ...
 
-# --- FSDP-2 (upstream PyTorch ≥ 2.3) ---
+# FSDP-2 (upstream PyTorch ≥ 2.3)
 # Uncomment this block *instead* if you wish to stay on stock PyTorch FSDP-2
 # distributed:
 #   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
