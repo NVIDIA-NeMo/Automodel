@@ -142,7 +142,13 @@ class FSDP2Manager:
 
         if self.dp_replicate_size is None or self.dp_replicate_size <= 0:
             self.dp_replicate_size = self.dp_size
+
+        # HSDP usecase
+        # dp_size = dp_replicate_size * dp_shard_size
+        # dp_shard_size < dp_size since ddp usecase is not supported by FSDP2, need to use DDPManager instead
+        # TODO(boxiangw): Call DDPManager instead of FSDP2Manager for ddp usecase?
         assert self.dp_size % self.dp_replicate_size == 0, "dp_size must be a multiple of dp_replicate_size"
+        assert self.dp_replicate_size < self.dp_size, "dp_replicate_size must be less than dp_size since ddp usecase is not supported by FSDP2"
 
         self.dp_shard_size = self.dp_size // self.dp_replicate_size
 
@@ -194,11 +200,14 @@ class FSDP2Manager:
             dp_shard_cp_mesh_dim_names.append("cp")
             dp_cp_mesh_dim_names.append("cp")
 
-        self.device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
-        self.device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(
+        if dp_mesh_dim_names != []:
+            self.device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
+        if dp_shard_cp_mesh_dim_names != []:
+            self.device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(
                 mesh_dim_name="dp_shard_cp"
             )
-        self.device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
+        if dp_cp_mesh_dim_names != []:
+            self.device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
         return self.device_mesh
 
     def parallelize(self, model, use_hf_tp_plan=False):
