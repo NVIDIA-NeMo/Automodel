@@ -70,7 +70,6 @@ classifiers = [
 ]
 dependencies = [
     "bitsandbytes==0.45.5; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
-    "cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@87a86ab",
     "datasets",
     "liger-kernel==0.5.8; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "pyyaml",
@@ -108,6 +107,7 @@ linting = [
 ]
 test = ["coverage", "pytest", "peft"]
 nvfsdp = ["nvfsdp"]
+dev = ["cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@87a86ab"]
 
 [tool.uv]
 default-groups = ["build", "docs", "test", "nvfsdp"]
