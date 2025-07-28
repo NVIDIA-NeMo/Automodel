@@ -18,8 +18,11 @@ It supports two data sources out-of-the-box **and optionally streams them so the
 | --- | --- |
 | [Quick-start](#quick-start) | Minimal runnable snippet to try the dataset |
 | [Usage examples](#usage-examples) | Remote, local, and YAML recipe variants |
-| [Reference](#reference) | Specification: options, tokenization paths, gotchas |
-| [Schema examples](#dataset-schema-examples) | Minimal JSONL rows with mappings |
+| [Tokenisation paths](#tokenisation-paths) | Explains how the dataset tokenizes input and output, and how it adapts to different tokenizers |
+| [Parameter gotchas](#parameter-gotchas) | Lists important requirements and caveats for correct usage |
+
+**Purpose:**  
+This guide explains how to use `ColumnMappedTextInstructionDataset` to quickly and flexibly load instruction-answer datasets for LLM fine-tuning, with minimal code changes and support for various data formats and tokenization strategies.
 
 ---
 ## Quick-start
@@ -60,7 +63,6 @@ The YAML approach allows for reproducible, maintainable, and scalable configurat
 
 ---
 ## Usage examples
-
 
 ### Local JSONL example
 
@@ -217,7 +219,7 @@ Regardless of the path, the output dict is always:
 ```
 
 ---
-### Parameter gotchas
+## Parameter gotchas
 
 * `answer_only_loss_mask=True` (**default**) requires *both*:
   - a **valid** `start_of_turn_token` string that exists in the tokenizer
@@ -228,33 +230,6 @@ Regardless of the path, the output dict is always:
 * At least **one** of `context` *or* `question` must be present in the mapping;
   passing a sample with both missing will raise a `ValueError`.
 
----
-## Dataset schema examples
-Below are two minimal JSONL rows and the corresponding `column_mapping` you would use.
-
-### Simple QA pair (local JSONL)
-```json
-{"question": "Who wrote *Pride and Prejudice*?", "answer": "Jane Austen."}
-```
-mapping:
-```python
-{"question": "question", "answer": "answer"}
-```
-
-### Chat-style with context
-```json
-{
-  "context": "You are an AI writing assistant.",
-  "question": "Rewrite the following sentence in active voice...",
-  "answer": "The cat chased the mouse."
-}
-```
-mapping:
-```yaml
-context: context
-question: question
-answer: answer
-```
 
 ---
 ### That’s it!
