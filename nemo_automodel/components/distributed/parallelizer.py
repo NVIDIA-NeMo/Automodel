@@ -26,7 +26,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import (
-    CPUOffloadPolicy,
+    OffloadPolicy,
     FSDPModule,
     MixedPrecisionPolicy,
     fully_shard,
@@ -58,7 +58,7 @@ def apply_fsdp_sharding_recursively(
     module: nn.Module,
     mesh: DeviceMesh,
     mp_policy: Optional[MixedPrecisionPolicy],
-    offload_policy: Optional[CPUOffloadPolicy] = None,
+    offload_policy: Optional[OffloadPolicy] = None,
 ) -> None:
     """
     Recursively apply FSDP sharding to modules, with optimizations for ModuleList.
@@ -72,7 +72,7 @@ def apply_fsdp_sharding_recursively(
         module (nn.Module): The module to apply FSDP sharding to.
         mesh (DeviceMesh): The device mesh for FSDP sharding.
         mp_policy (Optional[MixedPrecisionPolicy]): Mixed precision policy for FSDP.
-        offload_policy (Optional[CPUOffloadPolicy]): CPU offload policy for FSDP.
+        offload_policy (Optional[OffloadPolicy]): CPU offload policy for FSDP.
             Defaults to None.
 
     Note:
@@ -220,7 +220,7 @@ def fsdp2_strategy_parallelize(
     model,
     device_mesh: DeviceMesh,
     mp_policy: Optional[MixedPrecisionPolicy] = None,
-    offload_policy: Optional[CPUOffloadPolicy] = None,
+    offload_policy: Optional[OffloadPolicy] = None,
     sequence_parallel: bool = False,
     activation_checkpointing: bool = False,
     tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
@@ -243,7 +243,7 @@ def fsdp2_strategy_parallelize(
         device_mesh (DeviceMesh): The device mesh for distributed training.
         param_dtype (torch.dtype): Data type for model parameters. Defaults to torch.bfloat16.
         mp_policy (Optional[MixedPrecisionPolicy]): Mixed precision policy for model parallelism.
-        offload_policy (Optional[CPUOffloadPolicy]): The offload policy for FSDP.
+        offload_policy (Optional[OffloadPolicy]): The offload policy for FSDP.
         sequence_parallel (bool): Whether to use sequence parallelism. Defaults to False.
         activation_checkpointing (bool): Whether to use activation checkpointing. Defaults to False.
         tp_shard_plan (Optional[Union[Dict[str, ParallelStyle], str]]):
