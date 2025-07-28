@@ -14,14 +14,24 @@ Example (snippet):
 ```yaml
 # examples/llm/llama_3_2_1b_my_finetune.yaml
 ...
-# Distributed section
- distributed:
-   _target_: nemo_automodel.components.distributed.NVFSDPManager  # or FSDP2Manager
-   tp_size: 2                 # Tensor Parallel = 2
-   dp_size: 4                 # Data Parallel   = 4
-   activation_checkpointing: true   # <-- NEW FLAG
-   sequence_parallel: false
-   ...
+# --- NVFSDP (GPU-centric, highly optimized) ---
+distributed:
+  _target_: nemo_automodel.components.distributed.nvfsdp.NVFSDPManager
+  tp_size: 2                 # Tensor Parallel = 2
+  dp_size: 4                 # Data Parallel   = 4
+  activation_checkpointing: true   # <-- enable GC
+  sequence_parallel: false
+  ...
+
+# --- FSDP-2 (upstream PyTorch ≥ 2.3) ---
+# Uncomment this block *instead* if you wish to stay on stock PyTorch FSDP-2
+# distributed:
+#   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+#   tp_size: 2
+#   dp_size: 4
+#   activation_checkpointing: true
+#   sequence_parallel: false
+#   ...
 ```
 
 If you are using the FSDP2 strategy (for PyTorch 2.3+), set the flag in exactly the same place - the underlying manager will forward it to the `fsdp2_strategy_parallelize(...)` helper.
@@ -29,21 +39,24 @@ If you are using the FSDP2 strategy (for PyTorch 2.3+), set the flag in exactly 
 ### 1.2. Programmatically
 ```python
 from nemo_automodel.components.distributed.nvfsdp import NVFSDPManager
+# or for FSDP2
+# from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 
-model_parallel = NVFSDPManager(tp_size=2,
-                               dp_size=4,
-                               activation_checkpointing=True)
+# -- NVFSDP --
+nv_manager = NVFSDPManager(tp_size=2, dp_size=4, activation_checkpointing=True)
+model, optimizer = nv_manager.parallelize(model, optimizer)
 
-model = ...  # create model
-model, optimizer = model_parallel.parallelize(model, optimizer)
+# -- OR: FSDP-2 --
+# fsdp2_manager = FSDP2Manager(tp_size=2, dp_size=4, activation_checkpointing=True)
+# model = fsdp2_manager.parallelize(model)
 ```
 
 ---
 
 ## 2. Combining with Linear-Cut Cross-Entropy (LC-CE)
 
-Linear-Cut Cross-Entropy (LC-CE) reduces the hidden-state memory required to compute the loss by slicing the vocabulary matrix.  
-It is already available via `nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy` and is enabled in most example recipes:
+Linear-Cut Cross-Entropy (LC-CE) reduces the hidden-state memory required to compute the loss by calculating the softmax on-the-fly, thus avoiding to allocate memory for the logits.
+It is already available via `nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy` and can be enabled in recipes by using the following:
 
 ```yaml
 loss_fn:
