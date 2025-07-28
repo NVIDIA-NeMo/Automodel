@@ -5,16 +5,104 @@ You simply specify **which column in your source dataset maps to which logical f
 
 It supports two data sources out-of-the-box **and optionally streams them so they never fully reside in memory**:
 
-1. **Hugging Face Hub** - point to any dataset repo (`org/dataset`) that contains your desired columns.
-2. **Local JSON/JSONL files** - pass one file path *or* a list of paths on disk (newline-delimited JSON works great).
+1. **Local JSON/JSONL files** - pass one file path *or* a list of paths on disk (newline-delimited JSON works great).
+2. **Hugging Face Hub** - point to any dataset repo (`org/dataset`) that contains your desired columns.
 
-> **When to use it?**
-> - Quick prototyping across many instruction datasets.  
-> - No need to edit the codebase for each new schema.  
-> - Unified field names downstream ‑- your training loop can rely on the same keys regardless of origin.
+## Why use ColumnMappedTextInstructionDataset?
+* Quick prototyping across many instruction datasets.  
+* No need to edit the codebase for each new schema.  
+* Unified field names downstream – your training loop can rely on the same keys regardless of origin.
+
+### Section overview
+| Section | Purpose |
+| --- | --- |
+| [Quick-start](#quick-start) | Minimal runnable snippet to try the dataset |
+| [Usage examples](#usage-examples) | Remote, local, and YAML recipe variants |
+| [Reference](#reference) | Specification: options, tokenization paths, gotchas |
+| [Schema examples](#dataset-schema-examples) | Minimal JSONL rows with mappings |
 
 ---
-## Basic Python usage
+## Quick-start
+The fastest way to sanity-check the loader is to point it at an existing Hugging Face dataset and print the first sample:
+
+```python
+from transformers import AutoTokenizer
+from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import ColumnMappedTextInstructionDataset
+
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B")
+
+ds = ColumnMappedTextInstructionDataset(
+    path_or_dataset_id="Muennighoff/natural-instructions",
+    column_mapping={"instruction": "definition", "question": "inputs", "answer": "targets"},
+    tokenizer=tokenizer,
+    streaming=True,
+    answer_only_loss_mask=False,
+)
+
+print(next(iter(ds)))
+
+# The above command will print:
+# {
+#   'input_ids': [128000, 12465, 425, 25, 578, 38413, 61941, ... 78863, 36373, 7217],
+#   'labels':    [12465, 425, 25, 578, 38413, 61941, ..., 78863, 36373, 7217, 30],
+#   'loss_mask': [1, 1, 1, 1, ..., 1, 1, 1, 1]
+# }
+
+# if you disable streaming (i.e., pass `streaming=False`), then you can inspect samples with
+# print(ds[0])
+# or inspect the length of the dataset
+# print(len(ds))
+```
+
+The above code is intended only for a quick sanity test of the dataset and its tokenization output.
+For actual training or production use, you should configure the dataset via YAML as shown in the examples below.
+The YAML approach allows for reproducible, maintainable, and scalable configuration of datasets and tokenization options.
+
+---
+## Usage examples
+
+
+### Local JSONL example
+
+Assume you have a local newline-delimited JSON file at `/data/my_corpus.jsonl`
+with the simple schema `{instruction, output}`.  A few sample rows:
+
+```json
+{"instruction": "Translate 'Hello' to French", "output": "Bonjour"}
+{"instruction": "Summarize the planet Neptune.", "output": "Neptune is the eighth planet from the Sun."}
+```
+
+You can load it using python code like:
+
+```python
+local_ds = ColumnMappedTextInstructionDataset(
+    path_or_dataset_id=["/data/my_corpus_1.jsonl", "/data/my_corpus_2.jsonl"]  # can also be a single path (string)
+    column_mapping={
+        "question": "instruction",
+        "answer": "output",
+    },
+    tokenizer=tokenizer,
+    answer_only_loss_mask=False,  # compute loss over full sequence
+)
+
+print(remote_ds[0].keys())  # {'context', 'question', 'answer'}
+print(local_ds[0].keys())   # {'question', 'answer'}
+```
+
+You can configure the dataset **entirely from your recipe YAML**.  Example:
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
+  path_or_dataset_id: 
+    - /data/my_corpus_1.jsonl
+    - /data/my_corpus_2.jsonl
+  column_mapping:
+    question: instruction
+    answer: output
+  answer_only_loss_mask: false
+```
+
+
 ### Remote dataset example
 
 Below we demonstrate how to load the instruction-tuning corpus
@@ -24,8 +112,20 @@ The dataset schema is `{task_name, id, definition, inputs, targets}`.
 Example lines (train split):
 
 ```json
-{"task_name":"task001_quoref_question_generation","id":"task001-abc123","definition":"In this task, you're given passages that...","inputs":"Passage: A man is sitting at a piano...","targets":"What is the first name of the person who doubted it would be explosive?"}
-{"task_name":"task002_math_word_problems","id":"task002-def456","definition":"Solve the following word problem.","inputs":"If there are 3 apples and you take 2...","targets":"1"}
+{
+  "task_name": "task001_quoref_question_generation",
+  "id": "task001-abc123",
+  "definition": "In this task, you're given passages that...",
+  "inputs": "Passage: A man is sitting at a piano...",
+  "targets": "What is the first name of the person who doubted it would be explosive?"
+}
+{
+  "task_name": "task002_math_word_problems",
+  "id": "task002-def456",
+  "definition": "Solve the following word problem.",
+  "inputs": "If there are 3 apples and you take 2...",
+  "targets": "1"
+}
 ```
 
 For basic QA fine-tuning we usually map `definition → instruction`, `inputs → question`, and `targets → answer`:
@@ -53,35 +153,6 @@ remote_ds = ColumnMappedTextInstructionDataset(
 )
 ```
 
-### Local JSONL example
-
-Assume you have a local newline-delimited JSON file at `/data/my_corpus.jsonl`
-with the simple schema `{instruction, output}`.  A few sample rows:
-
-```json
-{"instruction": "Translate 'Hello' to French", "output": "Bonjour"}
-{"instruction": "Summarize the planet Neptune.", "output": "Neptune is the eighth planet from the Sun."}
-```
-
-You can load it like so:
-
-```python
-local_ds = ColumnMappedTextInstructionDataset(
-    path_or_dataset_id="/data/my_corpus.jsonl",  # can also be [list_of_paths]
-    column_mapping={
-        "question": "instruction",
-        "answer": "output",
-    },
-    tokenizer=tokenizer,
-    answer_only_loss_mask=False,  # compute loss over full sequence
-)
-
-print(remote_ds[0].keys())  # {'context', 'question', 'answer'}
-print(local_ds[0].keys())   # {'question', 'answer'}
-```
-
----
-## YAML integration (NeMo Automodel recipe)
 You can configure the dataset **entirely from your recipe YAML**.  Example:
 ```yaml
 # dataset section of your recipe's config.yaml
@@ -96,21 +167,8 @@ dataset:
   answer_only_loss_mask: true
   start_of_turn_token: "<|assistant|>"
 ```
-For a local file you would write:
-```yaml
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
-  path_or_dataset_id: 
-    - /data/alpaca_part1.jsonl
-    - /data/alpaca_part2.jsonl
-  column_mapping:
-    question: instruction
-    answer: output
-  answer_only_loss_mask: false
-```
 
----
-## Advanced options
+### Advanced options
 | Arg                     | Default | Description |
 |-------------------------|---------|-------------|
 | `split`                 | `None`  | Which split to pull from a HF repo (`train`, `validation`, *etc.*). Ignored for local files. |
