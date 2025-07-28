@@ -100,7 +100,7 @@ def _load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str
 
     data_files = list(make_iterable(path_or_dataset_id))
     if not data_files:
-        raise ValueError("No data files provided")
+        raise RuntimeError("No data files provided")
 
     return load_dataset("json", data_files=data_files, split="train", streaming=streaming)
 
@@ -128,6 +128,19 @@ class ColumnMappedTextInstructionDataset(Dataset):
         answer_only_loss_mask: bool = True,
         start_of_turn_token: Optional[str] = None,
     ) -> None:
+        """
+        Initialize the dataset.
+
+        Args:
+            path_or_dataset_id: The path or dataset id of the dataset.
+            column_mapping: The mapping of the columns.
+            tokenizer: The tokenizer to use.
+            split: The split of the dataset to load.
+            streaming: Whether to load the dataset in streaming mode.
+            answer_only_loss_mask: Whether to compute the loss mask only on the answer tokens.
+            start_of_turn_token: The token to use to indicate the start of a turn.
+        """
+
         if answer_only_loss_mask and start_of_turn_token is None:
             raise ValueError("start_of_turn_token must be provided when answer_only_loss_mask=True")
 
@@ -143,28 +156,197 @@ class ColumnMappedTextInstructionDataset(Dataset):
         self.start_of_turn_token = start_of_turn_token
 
     def __len__(self) -> int:  # noqa: D401
+        """
+        Returns the length of the dataset.
+
+        Returns:
+            The length of the dataset.
+
+        Raises:
+            RuntimeError: If streaming is enabled.
+        """
         if self.streaming:
-            raise TypeError("Streaming datasets do not have a defined length")
+            raise RuntimeError("Streaming datasets do not have a defined length")
         return len(self.dataset)
 
     def __getitem__(self, idx):  # noqa: D401
+        """
+        Returns the item at the given index.
+
+        Args:
+            idx: The index of the item to return.
+
+        Returns:
+            A dictionary with the mapped columns.
+        
+        Raises:
+            RuntimeError: If streaming is enabled.
+        """
         if self.streaming:
-            raise TypeError("__getitem__ is not supported when `streaming=True`. Iterate over the dataset instead.")
+            raise RuntimeError("__getitem__ is not supported when `streaming=True`. Iterate over the dataset instead.")
         row = self.dataset[idx]
         mapped = {dest: row[src] for dest, src in self.column_mapping.items()}
+        if self.tokenizer is not None:
+            mapped = self._apply_tokenizer(mapped)
         return mapped
 
     def __iter__(self):  # noqa: D401
-        """Iterate over the dataset yielding rows with the requested column mapping.
+        """
+        Iterate over the dataset yielding rows with the requested column mapping.
 
-        When *streaming=True* the underlying Hugging Face ``IterableDataset`` is
-        consumed lazily. For in-memory datasets we simply iterate over the
-        indices to preserve the original semantics.
+        When *streaming=True* the underlying dataset is consumed lazily.
+
+        If the tokenizer is provided, it will be used to tokenize the dataset.
+
+        Returns:
+            An iterator over the dataset.
+
+        Raises:
+            RuntimeError: If streaming is enabled.
         """
         if self.streaming:
             for row in self.dataset:
                 mapped = {dest: row[src] for dest, src in self.column_mapping.items()}
+                if self.tokenizer is not None:
+                    mapped = self._apply_tokenizer(mapped)
                 yield mapped
         else:
             for idx in range(len(self)):
+                # Reuse __getitem__ to avoid duplicating logic.
                 yield self[idx]
+
+    def _apply_tokenizer(self, sample: Dict[str, str]) -> Dict[str, List[int]]:
+        """
+        Tokenize a mapped *sample* and compute auxiliary fields.
+
+        If the tokenizer is provided:
+        - If the tokenizer supports a chat template, the dataset will be tokenized in a conversation style.
+        - Otherwise, the dataset will be tokenized in a simple prompt-completion style.
+
+        Args:
+            sample: A dictionary with the mapped columns.
+
+        Returns:
+            A dictionary with the tokenized columns.
+        """
+
+        def _get_first(keys):
+            for k in keys:
+                if k in sample:
+                    return sample[k]
+            return None
+
+        context = _get_first([ColumnTypes.Context.value, "ctx", "context"])
+        question = _get_first([ColumnTypes.Question.value, "question", "query", "prompt", "instruction"])
+        answer = _get_first([ColumnTypes.Answer.value, "answer", "response", "output"])
+
+        if getattr(self.tokenizer, "chat_template", None) is not None and callable(
+            getattr(self.tokenizer, "apply_chat_template", None)
+        ):
+            return self._apply_tokenizer_with_chat_template(context, question, answer)
+
+        return self._apply_tokenizer_plain(context, question, answer)
+
+
+    def _apply_tokenizer_with_chat_template(self, context: str, question: str, answer: str) -> Dict[str, List[int]]:
+        """
+        Tokenization path when the tokenizer supports a chat template.
+
+        Args:
+            context: The context of the sample.
+            question: The question of the sample.
+            answer: The answer of the sample.
+
+        Returns:
+            A dictionary with the tokenized columns.
+        """
+
+        # Build conversation
+        user_prompt = "".join(filter(None, [context, " " if context and question else "", question])).strip()
+        messages = [
+            {"role": "user", "content": user_prompt},
+            {"role": "assistant", "content": answer},
+        ]
+
+        input_ids: List[int] = self.tokenizer.apply_chat_template(messages)
+
+        # Loss mask computation
+        loss_mask: Optional[List[int]] = None
+        if self.answer_only_loss_mask:
+            if isinstance(self.start_of_turn_token, str):
+                start_ids = self.tokenizer(self.start_of_turn_token, add_special_tokens=False)["input_ids"]
+                start_id = start_ids[0]
+                first_idx = input_ids.index(start_id) if start_id in input_ids else 0
+                if input_ids.count(start_id) >= 2:
+                    response_start = input_ids.index(start_id, first_idx + 1)
+                else:
+                    response_start = 0
+            else:
+                response_start = 0
+            loss_mask = [0] * response_start + [1] * (len(input_ids) - response_start)
+
+        # Build labels/attention mask
+        labels = input_ids[1:]
+        input_ids = input_ids[:-1]
+        if loss_mask is not None:
+            loss_mask = loss_mask[1:]  # Shift together with labels
+        else:
+            loss_mask = [1] * len(input_ids)
+
+        out: Dict[str, List[int]] = {
+            "input_ids": input_ids,
+            "loss_mask": loss_mask,
+            "labels": labels,
+        }
+        return out
+
+    def _apply_tokenizer_plain(self, context: str, question: str, answer: str) -> Dict[str, List[int]]:
+        """
+        Tokenization path when *chat_template* is not available.
+
+        Args:
+            context: The context of the sample.
+            question: The question of the sample.
+            answer: The answer of the sample.
+
+        Returns:
+            A dictionary with the tokenized columns.
+        """
+
+        if context and question:
+            prompt_text = f"{context} {question} "
+        elif context:
+            prompt_text = f"{context} "
+        elif question:
+            prompt_text = f"{question} "
+        else:
+            raise ValueError("Context and question are both missing")
+
+        # Tokenize
+        eos_id = getattr(self.tokenizer, "eos_token_id", None)
+        bos_id = getattr(self.tokenizer, "bos_token_id", None)
+
+        prompt_ids: List[int] = self.tokenizer(prompt_text)["input_ids"]
+        answer_ids: List[int] = self.tokenizer(str(answer).strip())["input_ids"]
+
+        # Strip trailing EOS from prompt and leading BOS from answer
+        if prompt_ids and eos_id is not None and prompt_ids[-1] == eos_id:
+            prompt_ids = prompt_ids[:-1]
+        if answer_ids and bos_id is not None and answer_ids[0] == bos_id:
+            answer_ids = answer_ids[1:]
+
+        input_ids = prompt_ids + answer_ids
+        labels = input_ids[1:]
+        input_ids = input_ids[:-1]
+
+        if self.answer_only_loss_mask:
+            loss_mask = [0] * (len(prompt_ids) - 1) + [1] * len(answer_ids)
+        else:
+            loss_mask = [1] * len(input_ids)
+
+        out: Dict[str, List[int]] = {
+            "input_ids": input_ids,
+            "labels": labels,
+            "loss_mask": loss_mask,
+        }
+        return out
