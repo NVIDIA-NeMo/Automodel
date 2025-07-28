@@ -15,10 +15,13 @@
 import re
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, Iterator, List, Optional, Union
 
 from datasets import load_dataset
 from torch.utils.data import Dataset
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizer
 
 # Supported cases:
 # Format:
@@ -105,6 +108,120 @@ def _load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str
     return load_dataset("json", data_files=data_files, split="train", streaming=streaming)
 
 
+def _apply_tokenizer_with_chat_template(
+    tokenizer: "PreTrainedTokenizer",
+    context: str,
+    question: str,
+    answer: str,
+    start_of_turn_token: Optional[str] = None,
+    answer_only_loss_mask: bool = True,
+) -> Dict[str, List[int]]:
+    """
+    Tokenization path when the tokenizer supports a chat template.
+
+    Args:
+        context: The context of the sample.
+        question: The question of the sample.
+        answer: The answer of the sample.
+
+    Returns:
+        A dictionary with the tokenized columns.
+    """
+
+    # Build conversation
+    user_prompt = "".join(filter(None, [context, " " if context and question else "", question])).strip()
+    messages = [
+        {"role": "user", "content": user_prompt},
+        {"role": "assistant", "content": answer},
+    ]
+
+    input_ids: List[int] = tokenizer.apply_chat_template(messages)
+
+    # Loss mask computation
+    loss_mask: Optional[List[int]] = None
+    if answer_only_loss_mask:
+        if isinstance(start_of_turn_token, str):
+            start_ids = tokenizer(start_of_turn_token, add_special_tokens=False)["input_ids"]
+            start_id = start_ids[0]
+            first_idx = input_ids.index(start_id) if start_id in input_ids else 0
+            if input_ids.count(start_id) >= 2:
+                response_start = input_ids.index(start_id, first_idx + 1)
+            else:
+                response_start = 0
+        else:
+            response_start = 0
+        loss_mask = [0] * response_start + [1] * (len(input_ids) - response_start)
+
+    # Build labels/attention mask
+    labels = input_ids[1:]
+    input_ids = input_ids[:-1]
+    if loss_mask is not None:
+        loss_mask = loss_mask[1:]  # Shift together with labels
+    else:
+        loss_mask = [1] * len(input_ids)
+
+    out: Dict[str, List[int]] = {
+        "input_ids": input_ids,
+        "loss_mask": loss_mask,
+        "labels": labels,
+    }
+    return out
+
+
+def _apply_tokenizer_plain(
+    tokenizer: "PreTrainedTokenizer", context: str, question: str, answer: str, answer_only_loss_mask: bool = True
+) -> Dict[str, List[int]]:
+    """
+    Tokenization path when *chat_template* is not available.
+
+    Args:
+        context: The context of the sample.
+        question: The question of the sample.
+        answer: The answer of the sample.
+
+    Returns:
+        A dictionary with the tokenized columns.
+    """
+
+    if context and question:
+        prompt_text = f"{context} {question} "
+    elif context:
+        prompt_text = f"{context} "
+    elif question:
+        prompt_text = f"{question} "
+    else:
+        raise ValueError("Context and question are both missing")
+
+    # Tokenize
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    bos_id = getattr(tokenizer, "bos_token_id", None)
+
+    prompt_ids: List[int] = tokenizer(prompt_text)["input_ids"]
+    answer_ids: List[int] = tokenizer(str(answer).strip())["input_ids"]
+
+    # Strip trailing EOS from prompt and leading BOS from answer
+    if prompt_ids and eos_id is not None and prompt_ids[-1] == eos_id:
+        prompt_ids = prompt_ids[:-1]
+    if answer_ids and bos_id is not None and answer_ids[0] == bos_id:
+        answer_ids = answer_ids[1:]
+
+    input_ids = prompt_ids + answer_ids
+    labels = input_ids[1:]
+    input_ids = input_ids[:-1]
+
+    if answer_only_loss_mask:
+        loss_mask = [0] * (len(prompt_ids) - 1) + [1] * len(answer_ids)
+    else:
+        loss_mask = [1] * len(input_ids)
+
+    out: Dict[str, List[int]] = {
+        "input_ids": input_ids,
+        "labels": labels,
+        "loss_mask": loss_mask,
+    }
+    return out
+
+
 class ColumnMappedTextInstructionDataset(Dataset):
     """Generic *instruction‐tuning* dataset that maps arbitrary column names.
 
@@ -178,7 +295,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
 
         Returns:
             A dictionary with the mapped columns.
-        
+
         Raises:
             RuntimeError: If streaming is enabled.
         """
@@ -243,110 +360,8 @@ class ColumnMappedTextInstructionDataset(Dataset):
         if getattr(self.tokenizer, "chat_template", None) is not None and callable(
             getattr(self.tokenizer, "apply_chat_template", None)
         ):
-            return self._apply_tokenizer_with_chat_template(context, question, answer)
+            return self._apply_tokenizer_with_chat_template(
+                self.tokenizer, context, question, answer, self.start_of_turn_token, self.answer_only_loss_mask
+            )
 
-        return self._apply_tokenizer_plain(context, question, answer)
-
-
-    def _apply_tokenizer_with_chat_template(self, context: str, question: str, answer: str) -> Dict[str, List[int]]:
-        """
-        Tokenization path when the tokenizer supports a chat template.
-
-        Args:
-            context: The context of the sample.
-            question: The question of the sample.
-            answer: The answer of the sample.
-
-        Returns:
-            A dictionary with the tokenized columns.
-        """
-
-        # Build conversation
-        user_prompt = "".join(filter(None, [context, " " if context and question else "", question])).strip()
-        messages = [
-            {"role": "user", "content": user_prompt},
-            {"role": "assistant", "content": answer},
-        ]
-
-        input_ids: List[int] = self.tokenizer.apply_chat_template(messages)
-
-        # Loss mask computation
-        loss_mask: Optional[List[int]] = None
-        if self.answer_only_loss_mask:
-            if isinstance(self.start_of_turn_token, str):
-                start_ids = self.tokenizer(self.start_of_turn_token, add_special_tokens=False)["input_ids"]
-                start_id = start_ids[0]
-                first_idx = input_ids.index(start_id) if start_id in input_ids else 0
-                if input_ids.count(start_id) >= 2:
-                    response_start = input_ids.index(start_id, first_idx + 1)
-                else:
-                    response_start = 0
-            else:
-                response_start = 0
-            loss_mask = [0] * response_start + [1] * (len(input_ids) - response_start)
-
-        # Build labels/attention mask
-        labels = input_ids[1:]
-        input_ids = input_ids[:-1]
-        if loss_mask is not None:
-            loss_mask = loss_mask[1:]  # Shift together with labels
-        else:
-            loss_mask = [1] * len(input_ids)
-
-        out: Dict[str, List[int]] = {
-            "input_ids": input_ids,
-            "loss_mask": loss_mask,
-            "labels": labels,
-        }
-        return out
-
-    def _apply_tokenizer_plain(self, context: str, question: str, answer: str) -> Dict[str, List[int]]:
-        """
-        Tokenization path when *chat_template* is not available.
-
-        Args:
-            context: The context of the sample.
-            question: The question of the sample.
-            answer: The answer of the sample.
-
-        Returns:
-            A dictionary with the tokenized columns.
-        """
-
-        if context and question:
-            prompt_text = f"{context} {question} "
-        elif context:
-            prompt_text = f"{context} "
-        elif question:
-            prompt_text = f"{question} "
-        else:
-            raise ValueError("Context and question are both missing")
-
-        # Tokenize
-        eos_id = getattr(self.tokenizer, "eos_token_id", None)
-        bos_id = getattr(self.tokenizer, "bos_token_id", None)
-
-        prompt_ids: List[int] = self.tokenizer(prompt_text)["input_ids"]
-        answer_ids: List[int] = self.tokenizer(str(answer).strip())["input_ids"]
-
-        # Strip trailing EOS from prompt and leading BOS from answer
-        if prompt_ids and eos_id is not None and prompt_ids[-1] == eos_id:
-            prompt_ids = prompt_ids[:-1]
-        if answer_ids and bos_id is not None and answer_ids[0] == bos_id:
-            answer_ids = answer_ids[1:]
-
-        input_ids = prompt_ids + answer_ids
-        labels = input_ids[1:]
-        input_ids = input_ids[:-1]
-
-        if self.answer_only_loss_mask:
-            loss_mask = [0] * (len(prompt_ids) - 1) + [1] * len(answer_ids)
-        else:
-            loss_mask = [1] * len(input_ids)
-
-        out: Dict[str, List[int]] = {
-            "input_ids": input_ids,
-            "labels": labels,
-            "loss_mask": loss_mask,
-        }
-        return out
+        return self._apply_tokenizer_plain(self.tokenizer, context, question, answer, self.answer_only_loss_mask)
