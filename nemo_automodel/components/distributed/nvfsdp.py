@@ -194,7 +194,7 @@ class NVFSDPManager:
                     "Parameters will not be sharded."
                 )
 
-        if self.device_mesh["tensor_parallel"].size() > 1:
+        if self.device_mesh["tp"].size() > 1:
             if use_hf_tp_plan:
                 tp_shard_plan = get_hf_tp_shard_plan(model)
             else:

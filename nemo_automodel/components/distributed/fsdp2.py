@@ -194,14 +194,11 @@ class FSDP2Manager:
             dp_shard_cp_mesh_dim_names.append("cp")
             dp_cp_mesh_dim_names.append("cp")
 
-        if dp_mesh_dim_names != []:
-            self.device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
-        if dp_shard_cp_mesh_dim_names != []:
-            self.device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(
+        self.device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
+        self.device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(
                 mesh_dim_name="dp_shard_cp"
             )
-        if dp_cp_mesh_dim_names != []:
-            self.device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
+        self.device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
         return self.device_mesh
 
     def parallelize(self, model, use_hf_tp_plan=False):
@@ -222,7 +219,7 @@ class FSDP2Manager:
         Raises:
             NotImplemented: If the required TP sharding plan is not supported.
         """
-        if self.device_mesh["tensor_parallel"].size() > 1:
+        if self.device_mesh["tp"].size() > 1:
             if use_hf_tp_plan:
                 tp_shard_plan = get_hf_tp_shard_plan(model)
             else:

@@ -514,7 +514,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if (
             "position_ids" not in batch
             and self.device_mesh is not None
-            and (self.device_mesh["context_parallel"].size() > 1 or self.device_mesh["tensor_parallel"].size() > 1)
+            and (self.device_mesh["cp"].size() > 1 or self.device_mesh["tp"].size() > 1)
         ):
             batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
 
@@ -559,7 +559,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     (
                         "dp_cp"
                         if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(self.device_mesh, {})
-                        else "data_parallel"
+                        else "dp"
                     )
                 ].get_group()
                 if self.device_mesh is not None
@@ -568,7 +568,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
             # Clip gradients **after** any rescaling.
             # TODO(@boxiangw): Fix TP gradient clipping
-            if not self.device_mesh or self.device_mesh["tensor_parallel"].size() == 1:
+            if not self.device_mesh or self.device_mesh["tp"].size() == 1:
                 grad_norm = clip_gradients(self.model, clip_norm)
             else:
                 # TODO: TP WAR
@@ -631,8 +631,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     self.device_mesh
                     and "position_ids" not in batch
                     and (
-                        self.device_mesh["context_parallel"].size() > 1
-                        or self.device_mesh["tensor_parallel"].size() > 1
+                        self.device_mesh["cp"].size() > 1
+                        or self.device_mesh["tp"].size() > 1
                     )
                 ):
                     batch["position_ids"] = (
@@ -686,10 +686,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
         """
         if not self.device_mesh:
             dp_group = None
-        elif self.device_mesh["context_parallel"].size() > 1:
+        elif self.device_mesh["cp"].size() > 1:
             dp_group = self.device_mesh["dp_cp"].get_group()
         else:
-            dp_group = self.device_mesh["data_parallel"].get_group()
+            dp_group = self.device_mesh["dp"].get_group()
 
         total_loss, total_num_loss_tokens = reduce_loss(
             self.forward_data_store, self.total_local_num_loss_tokens, per_token_loss=True, dp_group=dp_group
