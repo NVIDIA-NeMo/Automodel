@@ -12,7 +12,13 @@ cd /path/to/Automodel
 pip install -e .[all]    # installs NeMo Automodel + optional extras
 ```
 
-> **GPU requirements**   A single modern GPU (24 GB+) is enough to run the tiny configuration in `examples/llm/nanogpt_pretrain.yaml`.  For larger models, launch multi-GPU with `torchrun` just like any other distributed PyTorch job.
+:::note
+For this guide we will use a single machine equiped with 8xH100 NVIDIA GPUs.
+:::
+
+:::tip
+You can run this guide with a single GPU, by changing the config.
+:::
 
 ---
 
