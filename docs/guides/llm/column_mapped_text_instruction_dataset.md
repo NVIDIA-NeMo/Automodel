@@ -8,7 +8,7 @@ It supports two data sources out-of-the-box:
 1. **Hugging Face Hub** - point to any dataset repo (`org/dataset`) that contains your desired columns.
 2. **Local JSON/JSONL files** - pass one file path *or* a list of paths on disk (newline-delimited JSON works great).
 
-> **Why use it?**
+> **When to use it?**
 > - Quick prototyping across many instruction datasets.  
 > - No need to edit the codebase for each new schema.  
 > - Unified field names downstream ‑- your training loop can rely on the same keys regardless of origin.
