@@ -15,15 +15,6 @@ It supports two data sources out-of-the-box:
 
 ---
 ## Basic Python usage
-```python
-from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import (
-    ColumnMappedTextInstructionDataset,
-    ColumnTypes,  # optional enum helper
-)
-from transformers import AutoTokenizer
-
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B")
-
 ### Remote dataset example
 
 Below we demonstrate how to load the instruction-tuning corpus
@@ -40,6 +31,14 @@ Example lines (train split):
 For basic QA fine-tuning we usually map `definition → instruction`, `inputs → question`, and `targets → answer`:
 
 ```python
+from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import (
+    ColumnMappedTextInstructionDataset,
+    ColumnTypes,  # optional enum helper
+)
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B")
+
 remote_ds = ColumnMappedTextInstructionDataset(
     path_or_dataset_id="Muennighoff/natural-instructions",  # Hugging Face repo ID
     column_mapping={
