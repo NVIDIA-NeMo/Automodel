@@ -33,7 +33,6 @@ For basic QA fine-tuning we usually map `definition â†’ instruction`, `inputs â†
 ```python
 from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import (
     ColumnMappedTextInstructionDataset,
-    ColumnTypes,  # optional enum helper
 )
 from transformers import AutoTokenizer
 
