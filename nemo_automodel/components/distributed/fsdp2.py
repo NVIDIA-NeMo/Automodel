@@ -136,12 +136,26 @@ class FSDP2Manager:
         if not dist.is_initialized():
             raise RuntimeError("expected torch.distributed to be initialized")
 
+
+        if self.tp_size is None or self.tp_size <= 0:
+            self.tp_size = 1
+
+        if self.cp_size is None or self.cp_size <= 0:
+            self.cp_size = 1
+
         # infer if not provided
         if self.dp_size is None or self.dp_size <= 0:
-            self.dp_size = self.world_size
+            # Calculate dp_size to ensure dp_size * tp_size * cp_size == world_size
+            total_parallel_ranks = self.tp_size * self.cp_size
+            if self.world_size % total_parallel_ranks != 0:
+                raise ValueError(
+                    f"world_size ({self.world_size}) must be divisible by (tp_size * cp_size) "
+                    f"({self.tp_size} * {self.cp_size} = {total_parallel_ranks})"
+                )
+            self.dp_size = self.world_size // total_parallel_ranks
 
         if self.dp_replicate_size is None or self.dp_replicate_size <= 0:
-            self.dp_replicate_size = self.dp_size
+            self.dp_replicate_size = 1
 
         # HSDP usecase
         # dp_size = dp_replicate_size * dp_shard_size
@@ -152,12 +166,6 @@ class FSDP2Manager:
 
         self.dp_shard_size = self.dp_size // self.dp_replicate_size
 
-        if self.tp_size is None or self.tp_size <= 0:
-            self.tp_size = 1
-
-        if self.cp_size is None or self.cp_size <= 0:
-            self.cp_size = 1
-        
         self.device_mesh = self._get_device_mesh()
 
         return self

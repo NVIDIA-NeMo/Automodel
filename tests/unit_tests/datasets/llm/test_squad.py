@@ -180,16 +180,21 @@ def test_chat_template_path():
         seq_length=None,  # no padding
     )
     row = ds[0]
+    n = len(row['input_ids'])
+    for k, v in row.items():
+        assert len(v) == n, f"{k} has length {len(v)} but should have length {n}"
     sot_id = tok(start_token, add_special_tokens=False)["input_ids"][0]
 
     # The index of the *second* SOT token +1 is response_start
     idx_first = row["input_ids"].index(sot_id)
     idx_second = row["input_ids"].index(sot_id, idx_first + 1)
-    response_start = idx_second + 1
+    # in the squad.py dataset, the response_start points to the second SOT token (including).
+    # therefore, it is defined as `response_start = idx_second`.
+    # However, here, the returned labels are already shifted by 1, so we can use `response_start = idx_second - 1`.
+    response_start = idx_second - 1
 
-    # Everything before response_start must have loss_mask==0; after ==>1
-    assert all(v == 0 for v in row["loss_mask"][:response_start])
-    assert all(v == 1 for v in row["loss_mask"][response_start:])
+    assert sum(row["loss_mask"][:response_start]) == 0
+    assert sum(row["loss_mask"][response_start:]) == len(row["loss_mask"][response_start:])
 
 
 def test_fp8_flag_is_noop():

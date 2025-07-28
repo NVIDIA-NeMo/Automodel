@@ -1,21 +1,21 @@
-# Large Language Models with NeMo AutoModel
+# Large Language Models (LLMs)
 
 ## Introduction
 Large Language Models (LLMs) power a variety of tasks such as dialogue systems, text classification, summarization, and more.
-NeMo AutoModel provides a simple interface for loading and fine-tuning LLMs hosted on the Hugging Face Hub.
+NeMo Automodel provides a simple interface for loading and fine-tuning LLMs hosted on the Hugging Face Hub.
 
 ## Run LLMs with NeMo Automodel
-To run LLMs with NeMo AutoModel, make sure you're using NeMo container version `25.07` or later. If the model you intend to fine-tune requires a newer version of Transformers, you may need to upgrade to the latest version of NeMo AutoModel by using:
+To run LLMs with NeMo Automodel, make sure you're using NeMo container version `25.07` or later. If the model you intend to fine-tune requires a newer version of Transformers, you may need to upgrade to the latest version of NeMo Automodel by using:
 
 ```bash
 
    pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/Automodel.git
 ```
 
-For other installation options (e.g., uv) please see our [installation guide](../guides/installation.md).
+For other installation options (e.g., uv), please see our [Installation Guide](../guides/installation.md).
 
 ## Supported Models
-NeMo AutoModel interoperates with most LLMs available on the Hugging Face Hub. During preprocessing, it uses `transformers.AutoTokenizer`, which is sufficient for most LLM cases. If your model requires custom text handling, such as for reasoning tasks, you can override the default tokenizer during the data preparation stage.
+NeMo Automodel interoperates with most LLMs available on the Hugging Face Hub. During preprocessing, it uses `transformers.AutoTokenizer`, which is sufficient for most LLM cases. If your model requires custom text handling, such as for reasoning tasks, you can override the default tokenizer during the data preparation stage.
 
 The table below lists the main architectures we test against (FSDP2 combined with SFT/PEFT) and includes a representative checkpoint for each.
 
@@ -71,16 +71,17 @@ The table below lists the main architectures we test against (FSDP2 combined wit
 
 
 
-## Fine-Tuning LLMs with NeMo AutoModel
+## Fine-Tuning LLMs with NeMo Automodel
 
-The models listed above can be fine-tuned using NeMo AutoModel to adapt them to specific tasks or domains. We support two primary fine-tuning approaches:
+The models listed above can be fine-tuned using NeMo Automodel to adapt them to specific tasks or domains. We support two primary fine-tuning approaches:
 
 1. **Parameter-Efficient Fine-Tuning (PEFT)**: Updates only a small subset of parameters (typically <1%) using techniques like Low-Rank Adaptation (LoRA). This is ideal for resource-constrained environments. See our [PEFT Guide](../guides/llm/peft.md) for details.
 
 2. **Supervised Fine-Tuning (SFT)**: Updates all or most model parameters for deeper adaptation, suitable for high-precision applications. See our [SFT Guide](../guides/llm/sft.md) for implementation details.
 
-> [!TIP]
-> In these guides, we use the `SQuAD v1.1` dataset for demonstation purposes, but you can specify your own data as needed.
+:::{tip}
+In these guides, we use the `SQuAD v1.1` dataset for demonstation purposes, but you can specify your own data as needed.
+:::
 
 ### Example: Fine-Tuning with SQuAD Dataset
 
@@ -133,4 +134,4 @@ Both guides provide complete YAML configuration examples and explain how to:
   * Customize training parameters
   * Monitor progress
   * Save and share checkpoints
-  * Deploy the finetuned model with optimized inference
+  * Deploy the fine-tuned model with optimized inference

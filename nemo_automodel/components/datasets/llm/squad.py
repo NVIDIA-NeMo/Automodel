@@ -62,7 +62,7 @@ def make_squad_dataset(
 
     def pad_to_seq_length(sample):
         seq_pad_len_ar = max(0, seq_length - len(next(iter(sample.values()))))
-        return {k: v + [eos_token_id if v != "loss_mask" else 0] * seq_pad_len_ar for k, v in sample.items()}
+        return {k: v + [eos_token_id if k != "loss_mask" else 0] * seq_pad_len_ar for k, v in sample.items()}
 
     def formatting_prompts_func(example):
         formatted_text = [
@@ -81,9 +81,9 @@ def make_squad_dataset(
 
         input_ids = context_ids + answer_ids
         return dict(
-            input_ids=input_ids,
-            labels=input_ids[1:] + [eos_token_id or input_ids[-1]],
-            loss_mask=[0] * len(context_ids) + [1] * len(answer_ids),
+            input_ids=input_ids[:-1],  # remove EOS
+            labels=input_ids[1:],  # remove BOS
+            loss_mask=[0] * (len(context_ids) - 1) + [1] * len(answer_ids),  # remove EOS
         )
 
     def formatting_prompts_func_with_chat_template(example, start_of_turn_token=None):
@@ -95,14 +95,17 @@ def make_squad_dataset(
         if isinstance(start_of_turn_token, str):
             start_of_turn_token_id = tokenizer(start_of_turn_token, add_special_tokens=False)["input_ids"][0]
             first_start_of_turn_token_id = input_ids.index(start_of_turn_token_id)
-            response_start = input_ids.index(start_of_turn_token_id, first_start_of_turn_token_id + 1) + 1
+            # Loss mask is starting with the second start of turn token.
+            # labels    = [a b c S d e] ; S is the start of turn token.
+            # loss_mask = [0 0 0 1 1 1] ; 1 is the loss mask enabled for the answer.
+            response_start = input_ids.index(start_of_turn_token_id, first_start_of_turn_token_id + 1)
         else:
             response_start = 0
         loss_mask = [0] * response_start + [1] * (len(input_ids) - response_start)
         return dict(
-            input_ids=input_ids,
-            labels=input_ids[1:] + [getattr(tokenizer, "eos_token_id", None) or input_ids[-1]],
-            loss_mask=loss_mask,
+            input_ids=input_ids[:-1],  # remove EOS
+            labels=input_ids[1:],  # remove BOS
+            loss_mask=loss_mask[1:],  # remove EOS
         )
 
     if limit_dataset_samples is not None:
