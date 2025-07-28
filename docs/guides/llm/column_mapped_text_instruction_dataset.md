@@ -80,7 +80,7 @@ print(local_ds[0].keys())   # {'question', 'answer'}
 ```
 
 ---
-## 3 • YAML integration (NeMo Automodel recipe)
+## YAML integration (NeMo Automodel recipe)
 You can configure the dataset **entirely from your recipe YAML**.  Example:
 ```yaml
 # dataset section of your recipe's config.yaml
@@ -109,7 +109,7 @@ dataset:
 ```
 
 ---
-## 4 • Column mapping cheat-sheet
+## Column mapping cheat-sheet
 | **Logical field** | **Enum** (optional)          | **Typical meaning**                 |
 |-------------------|------------------------------|-------------------------------------|
 | `context`         | `ColumnTypes.Context`        | Additional supporting text          |
@@ -119,7 +119,7 @@ dataset:
 You *don’t* need to use the enum in the mapping - plain strings work fine.  The enum is provided merely to avoid typos when building mappings in code.
 
 ---
-## 5 • Advanced options
+## Advanced options
 | Arg                     | Default | Description |
 |-------------------------|---------|-------------|
 | `split`                 | `None`  | Which split to pull from a HF repo (`train`, `validation`, *etc.*). Ignored for local files. |
@@ -127,10 +127,10 @@ You *don’t* need to use the enum in the mapping - plain strings work fine.  Th
 | `start_of_turn_token`   | `None`  | String token marking the assistant’s response. Required when `answer_only_loss_mask=True`. |
 
 ---
-## 6 • Dataset schema examples
+## Dataset schema examples
 Below are two minimal JSONL rows and the corresponding `column_mapping` you would use.
 
-### 6.1 Simple QA pair (local JSONL)
+### Simple QA pair (local JSONL)
 ```json
 {"question": "Who wrote *Pride and Prejudice*?", "answer": "Jane Austen."}
 ```
@@ -139,7 +139,7 @@ mapping:
 {"question": "question", "answer": "answer"}
 ```
 
-### 6.2 Chat-style with context (HF)
+### Chat-style with context (HF)
 ```json
 {
   "context": "You are an AI writing assistant.",
