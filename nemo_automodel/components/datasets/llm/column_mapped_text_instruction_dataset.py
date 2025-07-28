@@ -35,21 +35,31 @@ class ColumnTypes(Enum):
     Answer = "answer"
 
 def make_iterable(val: Union[str, List[str]]) -> Iterator[str]:
-    """
-    Convert a single string or list to a string iterator.
+    """Utility that converts *val* into an iterator of strings.
+
+    The helper accepts either a single string or a list of strings and
+    yields its contents. This is handy when we want to treat the two cases
+    uniformly downstream (e.g. when iterating over *data_files* that can be
+    provided as either a single path or a collection of paths).
 
     Args:
-        val: A single string or list of strings.
+        val: Either a single string or a list/tuple of strings.
 
-    Returns:
-        An iterator over the strings.
+    Yields:
+        str: The individual strings contained in *val*.
+
+    Raises:
+        ValueError: If *val* is neither a string nor an iterable of strings.
     """
     if isinstance(val, str):
         yield val
-    elif isinstance(val, list):
-        yield from val
+    elif isinstance(val, (list, tuple)):
+        for item in val:
+            if not isinstance(item, str):
+                raise ValueError("All elements must be strings")
+            yield item
     else:
-        raise ValueError(f"Invalid input type: {type(val)}")
+        raise ValueError(f"Expected str or list[str], got {type(val)}")
 
 def _str_is_hf_repo_id(val: str) -> bool:
     """
@@ -66,68 +76,75 @@ def _str_is_hf_repo_id(val: str) -> bool:
         and not Path(val).exists()
 
 
-def _load_dataset(path_or_dataset_id: Union[str, List[str]]):
-    """
-    Load a dataset from a single path or a list of paths.
+def _load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str] = None):
+    """Load a dataset either from the Hugging Face Hub or from local JSON/JSONL files.
+
+    If *path_or_dataset_id* resembles a HF repo ID (i.e. of the form
+    ``org/dataset`` and the path does **not** exist on the local filesystem),
+    we defer to ``datasets.load_dataset`` directly. Otherwise, we assume the
+    argument points to one or more local JSON/JSONL files and let
+    ``datasets.load_dataset`` with the *"json"* script handle the parsing.
 
     Args:
-        path_or_dataset_id: A single path or a list of paths to jsonl files.
+        path_or_dataset_id: Either a HF dataset identifier (``org/name``) or
+            a path / list of paths to local ``.json`` / ``.jsonl`` files.
+        split: Optional split to load when retrieving a remote dataset. This
+            parameter is ignored for local files as the *json* script always
+            returns a single split.
 
     Returns:
-        A dataset.
+        datasets.Dataset: The loaded dataset.
     """
     if isinstance(path_or_dataset_id, str) and _str_is_hf_repo_id(path_or_dataset_id):
-        return load_dataset(path_or_dataset_id)
-    if isinstance(path_or_dataset_id, (str, list)):
-        return Dataset.from_list(json.load(open(path)) for path in make_iterable(path_or_dataset_id))
-    else:
-        raise ValueError(f"Invalid input type: {type(path_or_dataset_id)}")
+        return load_dataset(path_or_dataset_id, split=split or "train")
+
+    data_files = list(make_iterable(path_or_dataset_id))
+    if not data_files:
+        raise ValueError("No data files provided")
+
+    return load_dataset("json", data_files=data_files, split="train")
 
 class ColumnMappedTextInstructionDataset(Dataset):
+    """Generic *instruction‐tuning* dataset that maps arbitrary column names.
+
+    The class is intentionally lightweight: it simply loads the raw samples
+    (either from HF or from local JSON/JSONL files) and remaps the columns so
+    that downstream components can rely on a consistent field interface.
+
+    Optionally, if *answer_only_loss_mask* is requested, the dataset will also
+    compute a *loss_mask* indicating which tokens should contribute to the
+    loss (typically only those belonging to the assistant answer).
+    """
+
     def __init__(
-            self,
-            path_or_dataset_id: Union[str, List[str]],
-            column_mapping: Dict[str, str],
-            tokenizer,
-            split: Optional[str] = None,
-            answer_only_loss_mask: bool = True,
-            start_of_turn_token: Optional[str] = None
-        ):
-        """
-        Initialize a column mapped text dataset.
+        self,
+        path_or_dataset_id: Union[str, List[str]],
+        column_mapping: Dict[str, str],
+        tokenizer,
+        *,
+        split: Optional[str] = None,
+        answer_only_loss_mask: bool = True,
+        start_of_turn_token: Optional[str] = None,
+    ) -> None:
+        if answer_only_loss_mask and start_of_turn_token is None:
+            raise ValueError(
+                "start_of_turn_token must be provided when answer_only_loss_mask=True"
+            )
 
-        Args:
-            path_or_dataset_id: A single path or a list of paths to jsonl files.
-            column_mapping: A dictionary mapping the column names to the column indices.
-            tokenizer: A tokenizer.
-            split: The split to load from the dataset.
-            answer_only_loss_mask: Whether to use only the answer column for the loss mask.
-            start_of_turn_token: The string to use as the start of turn token.
-
-        Returns:
-            Instance of the ColumnMappedTextInstructionDataset class.
-        """
-        self.dataset = _load_dataset(path_or_dataset_id)
-        if split:
-            self.dataset = self.dataset[split]
-        self.column_mapping = column_mapping
         self.tokenizer = tokenizer
-        if answer_only_loss_mask and start_of_turn_token_id is None:
-            raise ValueError("start_of_turn_token_id is required when answer_only_loss_mask is True")
+
+        self.dataset = _load_dataset(path_or_dataset_id, split=split)
+
+        # Keep mapping: dest -> source (i.e. public_field -> raw_column_name)
+        self.column_mapping = column_mapping
+
         self.answer_only_loss_mask = answer_only_loss_mask
         self.start_of_turn_token = start_of_turn_token
 
-    def __len__(self):
+    def __len__(self) -> int:  # noqa: D401
         return len(self.dataset)
-    
-    def __getitem__(self, idx):
-        """
-        Get an item from the dataset.
 
-        Args:
-            idx: The index of the item to get.
-
-        Returns:
-            A dictionary with the mapped columns.
-        """
-        return {k: v[idx] for k, v in self.column_mapping.items()}
+    def __getitem__(self, idx):  # noqa: D401
+        row = self.dataset[idx]
+        mapped = {dest: row[src] for dest, src in self.column_mapping.items()}
+        return mapped
