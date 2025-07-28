@@ -49,11 +49,11 @@ Consider the following options:
 
 `examples/llm/nanogpt_pretrain.yaml` is a **minimal** configuration that:
 * Defines a small GPT-2 12-layer model via `transformers.GPT2Config` (easy to scale up).
-* Points `file_pattern` at `tools/data_preprocessing/fineweb_10BT_max_500M/fineweb_train_*.bin` – update this path if you used a different output directory.
+* Points `file_pattern` at `tools/data_preprocessing/fineweb_10BT_max_500M/fineweb_train_*.bin` - update this path if you used a different output directory.
 * Uses the new `BinTokenDataset` with `seq_len=1024`.
 * Sets a vanilla `AdamW` optimiser with a learning rate of `2e-4`.
 
-Scale **width/depth**, `batch_size`, or `seq_len` as needed – the recipe is model-agnostic.
+Scale **width/depth**, `batch_size`, or `seq_len` as needed - the recipe is model-agnostic.
 
 ---
 
@@ -100,9 +100,9 @@ Checkpoints are written under `checkpoints/` by default as `safetensors` or `tor
 
 ## 6. Further work
 
-1. **Scaling up** – swap `transformers.GPT2Config` for a `LlamaForCausalLM`, `Qwen2` or any HF-compatible causal model; increase `n_layer`, `n_embd`, etc.
-2. **Mixed precision** – FSDP 2 + `bfloat16` (`dtype: bfloat16` in distributed config) gives great memory savings.
-3. **Sequence packing** – set `packed_sequence.packed_sequence_size` > 0 to pack variable-length contexts and boost utilisation.
-4. **Custom datasets** – implement your own `IterableDataset` or convert existing corpora to the `.bin` format using the preprocessing script as a template.
+1. **Scaling up** - swap `transformers.GPT2Config` for a `LlamaForCausalLM`, `Qwen2` or any HF-compatible causal model; increase `n_layer`, `n_embd`, etc.
+2. **Mixed precision** - FSDP 2 + `bfloat16` (`dtype: bfloat16` in distributed config) gives great memory savings.
+3. **Sequence packing** - set `packed_sequence.packed_sequence_size` > 0 to pack variable-length contexts and boost utilisation.
+4. **Custom datasets** - implement your own `IterableDataset` or convert existing corpora to the `.bin` format using the preprocessing script as a template.
 
 Happy training. 
