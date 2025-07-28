@@ -38,7 +38,7 @@ from nemo_automodel.components.distributed.parallelizer import (
     nvfsdp_strategy_parallelize,
     import_class_from_path,
     get_hf_tp_shard_plan,
-    apply_fsdp_sharding_recursively,
+    apply_fsdp2_sharding_recursively,
     unshard_fsdp2_model,
 )
 
@@ -1171,7 +1171,7 @@ class TestFSDP2StrategyEndToEnd:
 
 
 class TestApplyFsdpShardingRecursively:
-    """Test class for apply_fsdp_sharding_recursively utility function."""
+    """Test class for apply_fsdp2_sharding_recursively utility function."""
 
     @pytest.fixture
     def mock_module_list(self):
@@ -1215,12 +1215,12 @@ class TestApplyFsdpShardingRecursively:
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     def test_apply_fsdp_sharding_module_list(self, mock_fully_shard, mock_module_list, mock_mesh, mock_mp_policy, mock_offload_policy):
-        """Test apply_fsdp_sharding_recursively with a ModuleList."""
+        """Test apply_fsdp2_sharding_recursively with a ModuleList."""
         # Set up mock return values
         mock_fully_shard.side_effect = lambda x, **kwargs: x  # Return the module unchanged
 
         # Call the function
-        apply_fsdp_sharding_recursively(
+        apply_fsdp2_sharding_recursively(
             module=mock_module_list,
             mesh=mock_mesh,
             mp_policy=mock_mp_policy,
@@ -1245,12 +1245,12 @@ class TestApplyFsdpShardingRecursively:
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     def test_apply_fsdp_sharding_module_list_without_offload_policy(self, mock_fully_shard, mock_module_list, mock_mesh, mock_mp_policy):
-        """Test apply_fsdp_sharding_recursively with a ModuleList and no offload policy."""
+        """Test apply_fsdp2_sharding_recursively with a ModuleList and no offload policy."""
         # Set up mock return values
         mock_fully_shard.side_effect = lambda x, **kwargs: x
 
         # Call the function without offload_policy
-        apply_fsdp_sharding_recursively(
+        apply_fsdp2_sharding_recursively(
             module=mock_module_list,
             mesh=mock_mesh,
             mp_policy=mock_mp_policy
@@ -1264,12 +1264,12 @@ class TestApplyFsdpShardingRecursively:
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     def test_apply_fsdp_sharding_regular_module(self, mock_fully_shard, mock_single_module, mock_mesh, mock_mp_policy, mock_offload_policy):
-        """Test apply_fsdp_sharding_recursively with a regular module (not ModuleList)."""
+        """Test apply_fsdp2_sharding_recursively with a regular module (not ModuleList)."""
         # Set up mock return values
         mock_fully_shard.side_effect = lambda x, **kwargs: x
 
         # Call the function
-        apply_fsdp_sharding_recursively(
+        apply_fsdp2_sharding_recursively(
             module=mock_single_module,
             mesh=mock_mesh,
             mp_policy=mock_mp_policy,
@@ -1283,11 +1283,11 @@ class TestApplyFsdpShardingRecursively:
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     def test_apply_fsdp_sharding_empty_module_list(self, mock_fully_shard, mock_mesh, mock_mp_policy, mock_offload_policy):
-        """Test apply_fsdp_sharding_recursively with an empty ModuleList."""
+        """Test apply_fsdp2_sharding_recursively with an empty ModuleList."""
         empty_module_list = nn.ModuleList([])
 
         # Call the function
-        apply_fsdp_sharding_recursively(
+        apply_fsdp2_sharding_recursively(
             module=empty_module_list,
             mesh=mock_mesh,
             mp_policy=mock_mp_policy,
@@ -1299,12 +1299,12 @@ class TestApplyFsdpShardingRecursively:
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     def test_apply_fsdp_sharding_single_item_module_list(self, mock_fully_shard, mock_mesh, mock_mp_policy, mock_offload_policy):
-        """Test apply_fsdp_sharding_recursively with a single-item ModuleList."""
+        """Test apply_fsdp2_sharding_recursively with a single-item ModuleList."""
         single_module_list = nn.ModuleList([nn.Linear(10, 10)])
         mock_fully_shard.side_effect = lambda x, **kwargs: x
 
         # Call the function
-        apply_fsdp_sharding_recursively(
+        apply_fsdp2_sharding_recursively(
             module=single_module_list,
             mesh=mock_mesh,
             mp_policy=mock_mp_policy,
@@ -1319,11 +1319,11 @@ class TestApplyFsdpShardingRecursively:
         assert call_args[1]["reshard_after_forward"] is False
 
     def test_apply_fsdp_sharding_no_children(self, mock_mesh, mock_mp_policy, mock_offload_policy):
-        """Test apply_fsdp_sharding_recursively with a module that has no children."""
+        """Test apply_fsdp2_sharding_recursively with a module that has no children."""
         leaf_module = nn.Linear(10, 10)
 
         # This should complete without error (no children to recurse on)
-        apply_fsdp_sharding_recursively(
+        apply_fsdp2_sharding_recursively(
             module=leaf_module,
             mesh=mock_mesh,
             mp_policy=mock_mp_policy,
