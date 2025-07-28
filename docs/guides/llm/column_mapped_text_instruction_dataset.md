@@ -129,6 +129,58 @@ You *don’t* need to use the enum in the mapping - plain strings work fine.  Th
 | `start_of_turn_token`   | `None`  | String token marking the assistant’s response. Required when `answer_only_loss_mask=True`. |
 
 ---
+## Tokenisation paths
+
+`ColumnMappedTextInstructionDataset` automatically picks *one of two* tokenization
+strategies depending on the capabilities of the provided tokenizer:
+
+1. **Chat-template path**: if the tokenizer exposes a
+   `chat_template` attribute **and** an `apply_chat_template` method, the
+   dataset will:
+
+   a. build a list of messages in the form
+      `[{"role": "user", "content": <prompt>}, {"role": "assistant", "content": <answer>}]`,
+   b. call `tokenizer.apply_chat_template(messages)` to convert them to
+      `input_ids`,
+   c. derive `labels` by shifting `input_ids` one position to the right, and
+   d. compute `loss_mask` by locating the *second* occurrence of
+      `start_of_turn_token` (this marks the assistant response boundary).  All
+      tokens that belong to the user prompt are set to **0**, while the answer
+      tokens are **1**.
+
+2. **Plain prompt/completion path**: if the tokenizer has no chat template the
+   dataset falls back to a classic *prompt + answer* concatenation:
+
+   ```text
+   "<context> <question> " + "<answer>"
+   ```
+
+   The helper strips any trailing *eos* from the prompt and leading *bos* from
+   the answer so that the two halves join cleanly.
+
+Regardless of the path, the output dict is always:
+
+```python
+{
+    "input_ids": [...],  # one token shorter than the full sequence
+    "labels":     [...], # next-token targets
+    "loss_mask":  [...], # 1 for tokens contributing to the loss
+}
+```
+
+---
+### Parameter gotchas
+
+* `answer_only_loss_mask=True` (**default**) requires *both*:
+  - a **valid** `start_of_turn_token` string that exists in the tokenizer
+    vocabulary, and
+  - the tokenizer to be able to encode that token when the helper looks it up.
+
+  Otherwise a `ValueError` is raised at instantiation time.
+* At least **one** of `context` *or* `question` must be present in the mapping;
+  passing a sample with both missing will raise a `ValueError`.
+
+---
 ## Dataset schema examples
 Below are two minimal JSONL rows and the corresponding `column_mapping` you would use.
 
