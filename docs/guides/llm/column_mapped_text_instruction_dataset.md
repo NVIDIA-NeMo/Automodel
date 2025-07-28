@@ -1,0 +1,161 @@
+# ColumnMappedTextInstructionDataset
+
+The `ColumnMappedTextInstructionDataset` is a **light-weight, plug-and-play** helper that lets you train on *instruction-answer* style corpora **without writing custom Python for every new schema**.  
+You simply specify **which column in your source dataset maps to which logical field** (`context`, `question`, `answer`, *etc.*) and the loader does the rest.
+
+It supports two data sources out-of-the-box:
+
+1. **Hugging Face Hub** - point to any dataset repo (`org/dataset`) that contains your desired columns.
+2. **Local JSON/JSONL files** - pass one file path *or* a list of paths on disk (newline-delimited JSON works great).
+
+> **Why use it?**
+> - Quick prototyping across many instruction datasets.  
+> - No need to edit the codebase for each new schema.  
+> - Unified field names downstream ‑- your training loop can rely on the same keys regardless of origin.
+
+---
+## Basic Python usage
+```python
+from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import (
+    ColumnMappedTextInstructionDataset,
+    ColumnTypes,  # optional enum helper
+)
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B")
+
+### Remote dataset example
+
+Below we demonstrate how to load the instruction-tuning corpus
+[`Muennighoff/natural-instructions`](https://huggingface.co/datasets/Muennighoff/natural-instructions).
+The dataset schema is `{task_name, id, definition, inputs, targets}`.
+
+Example lines (train split):
+
+```jsonl
+{"task_name":"task001_quoref_question_generation","id":"task001-abc123","definition":"In this task, you're given passages that...","inputs":"Passage: A man is sitting at a piano...","targets":"What is the first name of the person who doubted it would be explosive?"}
+{"task_name":"task002_math_word_problems","id":"task002-def456","definition":"Solve the following word problem.","inputs":"If there are 3 apples and you take 2...","targets":"1"}
+```
+
+For basic QA fine-tuning we usually map `definition → instruction`, `inputs → question`, and `targets → answer`:
+
+```python
+remote_ds = ColumnMappedTextInstructionDataset(
+    path_or_dataset_id="Muennighoff/natural-instructions",  # Hugging Face repo ID
+    column_mapping={
+        "instruction": "definition",  # high-level instruction
+        "question": "inputs",         # the actual prompt / input
+        "answer": "targets",          # expected answer string
+    },
+    tokenizer=tokenizer,
+    split="train[:5%]",        # demo slice; omit for full data
+    answer_only_loss_mask=True,
+    start_of_turn_token="<|assistant|>",
+)
+```
+
+### Local JSONL example
+
+Assume you have a local newline-delimited JSON file at `/data/my_corpus.jsonl`
+with the simple schema `{instruction, output}`.  A few sample rows:
+
+```jsonl
+{"instruction": "Translate 'Hello' to French", "output": "Bonjour"}
+{"instruction": "Summarize the planet Neptune.", "output": "Neptune is the eighth planet from the Sun."}
+```
+
+You can load it like so:
+
+```python
+local_ds = ColumnMappedTextInstructionDataset(
+    path_or_dataset_id="/data/my_corpus.jsonl",  # can also be [list_of_paths]
+    column_mapping={
+        "question": "instruction",
+        "answer": "output",
+    },
+    tokenizer=tokenizer,
+    answer_only_loss_mask=False,  # compute loss over full sequence
+)
+
+print(remote_ds[0].keys())  # {'context', 'question', 'answer'}
+print(local_ds[0].keys())   # {'question', 'answer'}
+```
+
+---
+## 3 • YAML integration (NeMo Automodel recipe)
+You can configure the dataset **entirely from your recipe YAML**.  Example:
+```yaml
+# ===== dataset section of your recipe.yaml =====
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
+  path_or_dataset_id: Muennighoff/natural-instructions
+  split: train
+  column_mapping:
+    context: context
+    question: question
+    answer: answer
+  answer_only_loss_mask: true
+  start_of_turn_token: "<|assistant|>"
+```
+For a local file you would write:
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
+  path_or_dataset_id: 
+    - /data/alpaca_part1.jsonl
+    - /data/alpaca_part2.jsonl
+  column_mapping:
+    question: instruction
+    answer: output
+  answer_only_loss_mask: false
+```
+
+---
+## 4 • Column mapping cheat-sheet
+| **Logical field** | **Enum** (optional)          | **Typical meaning**                 |
+|-------------------|------------------------------|-------------------------------------|
+| `context`         | `ColumnTypes.Context`        | Additional supporting text          |
+| `question`        | `ColumnTypes.Question`       | The user’s instruction / query      |
+| `answer`          | `ColumnTypes.Answer`         | The model’s target answer / output  |
+
+You *don’t* need to use the enum in the mapping - plain strings work fine.  The enum is provided merely to avoid typos when building mappings in code.
+
+---
+## 5 • Advanced options
+| Arg                     | Default | Description |
+|-------------------------|---------|-------------|
+| `split`                 | `None`  | Which split to pull from a HF repo (`train`, `validation`, *etc.*). Ignored for local files. |
+| `answer_only_loss_mask` | `True`  | Create a `loss_mask` where only the answer tokens contribute to the loss. Requires `start_of_turn_token`. |
+| `start_of_turn_token`   | `None`  | String token marking the assistant’s response. Required when `answer_only_loss_mask=True`. |
+
+---
+## 6 • Dataset schema examples
+Below are two minimal JSONL rows and the corresponding `column_mapping` you would use.
+
+### 6.1 Simple QA pair (local JSONL)
+```json
+{"question": "Who wrote *Pride and Prejudice*?", "answer": "Jane Austen."}
+```
+mapping:
+```python
+{"question": "question", "answer": "answer"}
+```
+
+### 6.2 Chat-style with context (HF)
+```json
+{
+  "context": "You are an AI writing assistant.",
+  "question": "Rewrite the following sentence in active voice...",
+  "answer": "The cat chased the mouse."
+}
+```
+mapping:
+```yaml
+context: context
+question: question
+answer: answer
+```
+
+---
+### That’s it!
+With the mapping specified, the rest of the NeMo Automodel pipeline (pre-tokenisation, packing, collate-fn, *etc.*) works as usual.  Happy finetuning! 🚀 
