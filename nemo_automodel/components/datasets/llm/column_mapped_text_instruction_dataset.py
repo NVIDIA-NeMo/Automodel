@@ -360,8 +360,8 @@ class ColumnMappedTextInstructionDataset(Dataset):
         if getattr(self.tokenizer, "chat_template", None) is not None and callable(
             getattr(self.tokenizer, "apply_chat_template", None)
         ):
-            return self._apply_tokenizer_with_chat_template(
+            return _apply_tokenizer_with_chat_template(
                 self.tokenizer, context, question, answer, self.start_of_turn_token, self.answer_only_loss_mask
             )
 
-        return self._apply_tokenizer_plain(self.tokenizer, context, question, answer, self.answer_only_loss_mask)
+        return _apply_tokenizer_plain(self.tokenizer, context, question, answer, self.answer_only_loss_mask)
