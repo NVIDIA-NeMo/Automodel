@@ -15,7 +15,7 @@ It supports two data sources out-of-the-box and optionally streams them so they 
 
 ---
 ## Quickstart
-The fastest way to sanity-check the loader is to point it at an existing Hugging Face dataset and print the first sample:
+The fastest way to sanity-check the loader is to point it at an existing Hugging Face dataset and print the first sample. This section provides a minimal, runnable example to help you quickly try out the dataset.
 
 ```python
 from transformers import AutoTokenizer
