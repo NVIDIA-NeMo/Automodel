@@ -208,8 +208,9 @@ Regardless of the path, the output dict is always:
 ```
 
 ---
-## Parameter gotchas
+## Parameter Requirements
 
+The following section lists important requirements and caveats for correct usage.
 * `answer_only_loss_mask=True` (**default**) requires *both*:
   - a **valid** `start_of_turn_token` string that exists in the tokenizer
     vocabulary, and
