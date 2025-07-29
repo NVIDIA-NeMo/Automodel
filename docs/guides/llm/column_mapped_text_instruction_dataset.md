@@ -144,7 +144,7 @@ remote_ds = ColumnMappedTextInstructionDataset(
 )
 ```
 
-You can configure the dataset **entirely from your recipe YAML**.  Example:
+You can configure the entire dataset directly from your recipe YAML. For example:
 ```yaml
 # dataset section of your recipe's config.yaml
 dataset:
