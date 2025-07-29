@@ -159,7 +159,7 @@ dataset:
   start_of_turn_token: "<|assistant|>"
 ```
 
-### Advanced options
+### Advanced Options
 | Arg                     | Default | Description |
 |-------------------------|---------|-------------|
 | `split`                 | `None`  | Which split to pull from a HF repo (`train`, `validation`, *etc.*). Ignored for local files. |
