@@ -51,7 +51,9 @@ For actual training or production use, you should configure the dataset via YAML
 The YAML approach allows for reproducible, maintainable, and scalable configuration of datasets and tokenization options.
 
 ---
-## Usage examples
+## Usage Examples
+
+This section provides practical usage examples, including how to load remote datasets, work with local files, and configure pipelines using YAML recipes.
 
 ### Local JSONL example
 
