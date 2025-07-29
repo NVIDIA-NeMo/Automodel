@@ -170,7 +170,7 @@ dataset:
 ---
 ## Tokenisation Paths
 This section explains how the dataset tokenizes both inputs and outputs, and how it adapts to different tokenizers.
-`ColumnMappedTextInstructionDataset` automatically picks *one of two* tokenization
+`ColumnMappedTextInstructionDataset` automatically picks one of two tokenization
 strategies depending on the capabilities of the provided tokenizer:
 
 1. **Chat-template path**: if the tokenizer exposes a
