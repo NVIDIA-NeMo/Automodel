@@ -187,8 +187,8 @@ strategies depending on the capabilities of the provided tokenizer:
       tokens that belong to the user prompt are set to `0`, while the answer
       tokens are `1`.
 
-2. **Plain prompt/completion path**: if the tokenizer has no chat template the
-   dataset falls back to a classic *prompt + answer* concatenation:
+2. **Plain prompt/completion path**: if the tokenizer has no chat template, the
+   dataset falls back to a classic prompt and answer concatenation:
 
    ```text
    "<context> <question> " + "<answer>"
