@@ -55,7 +55,7 @@ The YAML approach allows for reproducible, maintainable, and scalable configurat
 
 This section provides practical usage examples, including how to load remote datasets, work with local files, and configure pipelines using YAML recipes.
 
-### Local JSONL example
+### Local JSONL Example
 
 Assume you have a local newline-delimited JSON file at `/data/my_corpus.jsonl`
 with the simple schema `{instruction, output}`.  A few sample rows:
