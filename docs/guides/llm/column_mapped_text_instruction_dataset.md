@@ -46,9 +46,7 @@ print(next(iter(ds)))
 # print(len(ds))
 ```
 
-The above code is intended only for a quick sanity test of the dataset and its tokenization output.
-For actual training or production use, you should configure the dataset via YAML as shown in the examples below.
-The YAML approach allows for reproducible, maintainable, and scalable configuration of datasets and tokenization options.
+The code above is intended only for a quick sanity check of the dataset and its tokenization output. For training or production use, configure the dataset using YAML as shown below. YAML offers a reproducible, maintainable, and scalable way to specify dataset and tokenization settings.
 
 ---
 ## Usage Examples
