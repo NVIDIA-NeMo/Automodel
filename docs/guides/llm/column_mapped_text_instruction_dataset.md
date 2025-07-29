@@ -1,28 +1,17 @@
 # Use the ColumnMappedTextInstructionDataset
 
-The `ColumnMappedTextInstructionDataset` is a **light-weight, plug-and-play** helper that lets you train on *instruction-answer* style corpora **without writing custom Python for every new schema**.  
-You simply specify **which column in your source dataset maps to which logical field** (`context`, `question`, `answer`, *etc.*) and the loader does the rest.
-
-It supports two data sources out-of-the-box **and optionally streams them so they never fully reside in memory**:
-
-1. **Local JSON/JSONL files** - pass one file path *or* a list of paths on disk (newline-delimited JSON works great).
-2. **Hugging Face Hub** - point to any dataset repo (`org/dataset`) that contains your desired columns.
-
-## Why use ColumnMappedTextInstructionDataset?
-* Quick prototyping across many instruction datasets.  
-* No need to edit the codebase for each new schema.  
-* Unified field names downstream – your training loop can rely on the same keys regardless of origin.
-
-### Section overview
-| Section | Purpose |
-| --- | --- |
-| [Quick-start](#quick-start) | Minimal runnable snippet to try the dataset |
-| [Usage examples](#usage-examples) | Remote, local, and YAML recipe variants |
-| [Tokenisation paths](#tokenisation-paths) | Explains how the dataset tokenizes input and output, and how it adapts to different tokenizers |
-| [Parameter gotchas](#parameter-gotchas) | Lists important requirements and caveats for correct usage |
-
-**Purpose:**  
 This guide explains how to use `ColumnMappedTextInstructionDataset` to quickly and flexibly load instruction-answer datasets for LLM fine-tuning, with minimal code changes and support for various data formats and tokenization strategies.
+
+The `ColumnMappedTextInstructionDataset` is a lightweight, plug-and-play helper that lets you train on instruction–answer style corpora without writing custom Python for every new schema. You simply specify which columns map to logical fields like `context`, `question`, and `answer`, and the loader handles the rest automatically. This enables:
+
+* Quick prototyping across diverse instruction datasets
+* Schema flexibility without needing codebase changes
+* Consistent field names for training loops, regardless of dataset source
+
+It supports two data sources out-of-the-box and optionally streams them so they never fully reside in memory:
+
+1. **Local JSON/JSONL files** - pass a single file path or a list of paths on disk. The newline-delimited JSON works great.
+2. **Hugging Face Hub** - point to any dataset repo (`org/dataset`) that contains the required columns.
 
 ---
 ## Quick-start
