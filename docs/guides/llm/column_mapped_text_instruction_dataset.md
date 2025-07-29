@@ -211,12 +211,7 @@ Regardless of the path, the output dict is always:
 ## Parameter Requirements
 
 The following section lists important requirements and caveats for correct usage.
-* `answer_only_loss_mask=True` (**default**) requires *both*:
-  - a **valid** `start_of_turn_token` string that exists in the tokenizer
-    vocabulary, and
-  - the tokenizer to be able to encode that token when the helper looks it up.
-
-  Otherwise a `ValueError` is raised at instantiation time.
+* `answer_only_loss_mask=True` requires a start_of_turn_token string that exists in the tokenizer’s vocabulary and can be successfully encoded when the helper performs a lookup. Otherwise, a `ValueError` is raised at instantiation time.
 * At least **one** of `context` *or* `question` must be present in the mapping;
   passing a sample with both missing will raise a `ValueError`.
 
