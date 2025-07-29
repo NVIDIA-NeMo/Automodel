@@ -68,11 +68,10 @@ def _module_filter_fn(module, name, filter_fqns: List[str] = None):
 
 def apply_fp8_to_model(
     model: nn.Module, 
-    config: Optional["Float8LinearConfig"] = None,
     filter_fqns: Optional[List[str]] = None,
     recipe_name: Optional[str] = None,
-    dp_shard_enabled: bool = False,
-    precompute_fp8_dynamic_scale_for_fsdp: bool = False,
+    force_recompute_fp8_weight_in_bwd: bool = False,
+    enable_fsdp_float8_all_gather: bool = False,
     emulate: bool = False
 ) -> nn.Module:
     """
@@ -84,7 +83,8 @@ def apply_fp8_to_model(
         filter_fqns: List of module names to exclude from FP8 conversion
         recipe_name: Recipe name for FP8 configuration ("tensorwise", "rowwise", etc.)
         dp_shard_enabled: Whether data parallel sharding is enabled
-        precompute_fp8_dynamic_scale_for_fsdp: Whether to precompute FP8 scales for FSDP
+        force_recompute_fp8_weight_in_bwd: Whether to force recompute FP8 weight in backward pass
+        enable_fsdp_float8_all_gather: Whether to enable FSDP FP8 all-gather
         emulate: Use emulation instead of hardware acceleration (for testing on older GPUs)
         
     Returns:
@@ -99,25 +99,22 @@ def apply_fp8_to_model(
         raise ImportError(MISSING_TORCHAO_MSG)
     
     # Handle config creation or recipe-based configuration
-    if config is None:
-        if recipe_name is not None:
-            config = Float8LinearConfig.from_recipe_name(recipe_name)
-            logger.info(f"Using FP8 recipe: {recipe_name}")
-            
-            # Enable inductor precision cast emulation for rowwise recipe
-            if recipe_name == "rowwise":
-                torch._inductor.config.emulate_precision_casts = True
-                logger.debug("Enabled torch._inductor.config.emulate_precision_casts for rowwise recipe")
-        else:
-            # Manual configuration for tensorwise scaling
-            enable_fsdp_float8_all_gather = dp_shard_enabled
-            
-            config = Float8LinearConfig(
-                enable_fsdp_float8_all_gather=enable_fsdp_float8_all_gather,
-                force_recompute_fp8_weight_in_bwd=False,
-                emulate=emulate,
-            )
-            logger.info("Using FP8 tensorwise scaling")
+    if recipe_name is not None and recipe_name != "tensorwise":
+        config = Float8LinearConfig.from_recipe_name(recipe_name)
+        logger.info(f"Using FP8 recipe: {recipe_name}")
+        
+        # Enable inductor precision cast emulation for rowwise recipe
+        if recipe_name == "rowwise":
+            torch._inductor.config.emulate_precision_casts = True
+            logger.debug("Enabled torch._inductor.config.emulate_precision_casts for rowwise recipe")
+    else:
+        # Manual configuration for tensorwise scaling        
+        config = Float8LinearConfig(
+            enable_fsdp_float8_all_gather=enable_fsdp_float8_all_gather,
+            force_recompute_fp8_weight_in_bwd=force_recompute_fp8_weight_in_bwd,
+            emulate=emulate,
+        )
+        logger.info("Using FP8 tensorwise scaling")
     
     # Check hardware capability if not using emulation
     config_emulate = getattr(config, 'emulate', emulate)
@@ -138,13 +135,14 @@ def apply_fp8_to_model(
         config=config,
         module_filter_fn=filter_fn,
     )
-    
-    enable_fsdp_fp8_all_gather = getattr(config, 'enable_fsdp_fp8_all_gather', False)
+
     logger.info(
-        f"Successfully converted model to FP8. "
-        f"Recipe: {recipe_name or 'tensorwise'}, "
-        f"FSDP all-gather enabled: {enable_fsdp_fp8_all_gather}"
+        f"**Successfully converted model to FP8. \n"
+        f"**Recipe: {recipe_name or 'tensorwise'}\n"
+        f"**FSDP all-gather enabled: {config.enable_fsdp_float8_all_gather}\n"
+        f"**Force recompute FP8 weight in backward pass: {config.force_recompute_fp8_weight_in_bwd}\n"
     )
+    verify_fp8_conversion(model)
     
     return model
 
@@ -188,7 +186,9 @@ def verify_fp8_conversion(model: nn.Module) -> dict:
                 })
                 logger.debug(f"Found Float8Linear by name: {name} ({module_type})")
     
+    logger.info(f"-"*50)
     logger.info(f"FP8 verification: {len(fp8_modules)} Float8Linear modules, {total_linear} total linear modules")
+    logger.info(f"-"*50+"\n")
     return {
         'linear_count': total_linear,
         'fp8_count': len(fp8_modules),
@@ -208,6 +208,4 @@ def precompute_fp8_scales_for_fsdp(model: nn.Module) -> None:
     Args:
         model: Model with FP8 linear layers
     """
-    # Implementation would depend on torchao's specific APIs
-    # This is a placeholder for future implementation
     precompute_float8_dynamic_scale_for_fsdp(model)

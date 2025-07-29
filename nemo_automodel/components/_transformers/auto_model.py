@@ -112,41 +112,6 @@ def _patch_liger_kernel(model):
         del model
         raise RuntimeError("Failed to patch model")
 
-
-def _apply_fp8_quantization(model, recipe_name=None, filter_fqns=None, emulate=False):
-    """
-    Apply FP8 quantization to a model.
-    
-    Args:
-        model (nn.Module): The model to quantize
-        recipe_name (str, optional): FP8 recipe name ("tensorwise", "rowwise", etc.)
-        filter_fqns (list, optional): List of module names to exclude from FP8 conversion
-        emulate (bool): Use emulation instead of hardware acceleration
-        
-    Returns:
-        nn.Module: The FP8-quantized model
-        
-    Raises:
-        RuntimeError: If FP8 quantization fails
-    """
-    if not HAVE_TORCHAO:
-        logging.warning("Asked to use FP8 quantization, but torchao is not installed")
-        return model
-
-    try:
-        model = apply_fp8_to_model(
-            model, 
-            recipe_name=recipe_name, 
-            filter_fqns=filter_fqns or [], 
-            emulate=emulate
-        )
-        logging.info("Applied FP8 quantization to model")
-        return model
-    except Exception as e:
-        logging.warning(f"Failed to apply FP8 quantization to model: {e}")
-        raise RuntimeError("Failed to apply FP8 quantization")
-
-
 class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
     """
     Drop-in replacement for ``_BaseAutoModelClass`` that includes custom-kernels.
@@ -181,6 +146,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         attn_implementation: str = "flash_attention_2",
         use_fp8: bool = False,
         fp8_recipe_name: Optional[str] = "tensorwise",
+        enable_fsdp_float8_all_gather: bool = False,
+        precompute_float8_dynamic_scale_for_fsdp: bool = False,
+        force_recompute_fp8_weight_in_bwd: bool = False,
         fp8_filter_fqns: Optional[List[str]] = None,
         fp8_emulate: bool = False,
         **kwargs,
@@ -247,6 +215,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 sdpa_method=sdpa_method,
                 use_fp8=override.get("use_fp8", use_fp8),
                 fp8_recipe_name=fp8_recipe_name,
+                enable_fsdp_float8_all_gather=enable_fsdp_float8_all_gather,
+                precompute_float8_dynamic_scale_for_fsdp=precompute_float8_dynamic_scale_for_fsdp,
+                force_recompute_fp8_weight_in_bwd=force_recompute_fp8_weight_in_bwd,
                 fp8_filter_fqns=fp8_filter_fqns,
                 fp8_emulate=fp8_emulate,
                 **kwargs,
@@ -290,11 +261,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         # Apply FP8 quantization
         try:
             if use_fp8:
-                model = _apply_fp8_quantization(
+                model = apply_fp8_to_model(
                     model, 
                     recipe_name=fp8_recipe_name, 
-                    filter_fqns=fp8_filter_fqns, 
-                    emulate=fp8_emulate
+                    filter_fqns=fp8_filter_fqns or [], 
+                    emulate=fp8_emulate,
+                    enable_fsdp_float8_all_gather=enable_fsdp_float8_all_gather,
+                    force_recompute_fp8_weight_in_bwd=force_recompute_fp8_weight_in_bwd
                 )
         except RuntimeError:
             logging.warning("Retrying without FP8 quantization.")
@@ -315,6 +288,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         attn_implementation: str = "flash_attention_2",
         use_fp8: bool = False,
         fp8_recipe_name: Optional[str] = None,
+        enable_fsdp_float8_all_gather: bool = False,
+        precompute_float8_dynamic_scale_for_fsdp: bool = False,
+        force_recompute_fp8_weight_in_bwd: bool = False,
         fp8_filter_fqns: Optional[List[str]] = None,
         fp8_emulate: bool = False,
         **kwargs,
@@ -369,6 +345,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 sdpa_method=sdpa_method,
                 use_fp8=override.get("use_fp8", use_fp8),
                 fp8_recipe_name=fp8_recipe_name,
+                enable_fsdp_float8_all_gather=enable_fsdp_float8_all_gather,
+                precompute_float8_dynamic_scale_for_fsdp=precompute_float8_dynamic_scale_for_fsdp,
+                force_recompute_fp8_weight_in_bwd=force_recompute_fp8_weight_in_bwd,
                 fp8_filter_fqns=fp8_filter_fqns,
                 fp8_emulate=fp8_emulate,
                 **kwargs,
@@ -411,11 +390,14 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         # Apply FP8 quantization
         try:
             if use_fp8:
-                model = _apply_fp8_quantization(
+                model = apply_fp8_to_model(
                     model, 
                     recipe_name=fp8_recipe_name, 
-                    filter_fqns=fp8_filter_fqns, 
-                    emulate=fp8_emulate
+                    filter_fqns=fp8_filter_fqns or [], 
+                    dp_shard_enabled=enable_fsdp_float8_all_gather,  # Assume FSDP sharding if all-gather is requested
+                    emulate=fp8_emulate,
+                    enable_fsdp_float8_all_gather=enable_fsdp_float8_all_gather,
+                    force_recompute_fp8_weight_in_bwd=force_recompute_fp8_weight_in_bwd
                 )
         except RuntimeError:
             logging.warning("Retrying without FP8 quantization.")
