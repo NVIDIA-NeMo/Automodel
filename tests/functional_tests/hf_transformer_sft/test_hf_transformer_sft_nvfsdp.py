@@ -1,3 +1,4 @@
+
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,17 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-#!/bin/bash
-set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
+import os
 
-export CUDA_VISIBLE_DEVICES="0,1"
+HF_TRANSFORMER_SFT_FILENAME = "L2_HF_Transformer_SFT_nvfsdp.sh"
 
-coverage run \
-    --data-file=/workspace/.coverage \
-    --source=/workspace/ \
-    --parallel-mode \
-    -m pytest \
-    -o log_cli=true \
-    -o log_cli_level=INFO \
-    -vs -m "not pleasefixme" --tb=short tests/functional_tests/hf_transformer_sft
-coverage combine
+
+class TestHFTransformerSFTnvFSDP:
+    def test_hf_transformer_sft_nvfsdp(self):
+        dir_path = os.path.dirname(os.path.realpath(__file__))
+        test_file_path = os.path.join(dir_path, HF_TRANSFORMER_SFT_FILENAME)
+        with open(test_file_path, 'r') as file:
+            test_cmd = file.read() 
+
+        subprocess.run(test_cmd, check=True)

@@ -13,45 +13,15 @@
 # limitations under the License.
 
 import os
-import pytest
 
 HF_TRANSFORMER_SFT_FILENAME = "L2_HF_Transformer_SFT.sh"
-HF_TRANSFORMER_SFT_NVFSDP_FILENAME = "L2_HF_Transformer_SFT.sh"
 
 
-class HFTransformerSFT:
-    """
-    Test running HuggingFAce transformer SFT
-    """
-
+class TestHFTransformerSFT:
     def test_hf_transformer_sft(self):
         dir_path = os.path.dirname(os.path.realpath(__file__))
-        test_file_path = os.join(dir_path, HF_TRANSFORMER_SFT_FILENAME)
+        test_file_path = os.path.join(dir_path, HF_TRANSFORMER_SFT_FILENAME)
         with open(test_file_path, 'r') as file:
             test_cmd = file.read() 
 
-        result = subprocess.run(
-            test_cmd, capture_output=True, text=True, cwd=Path(__file__).parent.parent.parent.parent
-        )
-        # Write output to file for debugging
-        with open(output_file, "w") as f:
-            f.write("STDOUT:\n")
-            f.write(result.stdout)
-            f.write("\nSTDERR:\n")
-            f.write(result.stderr)
-   
-    def test_hf_transformer_sft_nvfsdp(self):
-        dir_path = os.path.dirname(os.path.realpath(__file__))
-        test_file_path = os.join(dir_path, HF_TRANSFORMER_SFT_NVFSDP_FILENAME)
-        with open(test_file_path, 'r') as file:
-            test_cmd = file.read() 
-
-        result = subprocess.run(
-            test_cmd, capture_output=True, text=True, cwd=Path(__file__).parent.parent.parent.parent
-        )
-        # Write output to file for debugging
-        with open(output_file, "w") as f:
-            f.write("STDOUT:\n")
-            f.write(result.stdout)
-            f.write("\nSTDERR:\n")
-            f.write(result.stderr)
+        subprocess.run(test_cmd, check=True)
