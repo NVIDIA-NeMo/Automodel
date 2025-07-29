@@ -216,5 +216,5 @@ The following section lists important requirements and caveats for correct usage
 
 
 ---
-### That’s it!
+### That’s It!
 With the mapping specified, the rest of the NeMo Automodel pipeline (pre-tokenisation, packing, collate-fn, *etc.*) works as usual. 
