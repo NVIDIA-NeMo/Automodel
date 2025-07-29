@@ -174,18 +174,18 @@ This section explains how the dataset tokenizes both inputs and outputs, and how
 strategies depending on the capabilities of the provided tokenizer:
 
 1. **Chat-template path**: if the tokenizer exposes a
-   `chat_template` attribute **and** an `apply_chat_template` method, the
+   `chat_template` attribute and an `apply_chat_template` method, the
    dataset will:
 
-   a. build a list of messages in the form
+   * build a list of messages in the form
       `[{"role": "user", "content": <prompt>}, {"role": "assistant", "content": <answer>}]`,
-   b. call `tokenizer.apply_chat_template(messages)` to convert them to
+   * call `tokenizer.apply_chat_template(messages)` to convert them to
       `input_ids`,
-   c. derive `labels` by shifting `input_ids` one position to the right, and
-   d. compute `loss_mask` by locating the *second* occurrence of
+   * derive `labels` by shifting `input_ids` one position to the right, and
+   * compute `loss_mask` by locating the second occurrence of
       `start_of_turn_token` (this marks the assistant response boundary).  All
-      tokens that belong to the user prompt are set to **0**, while the answer
-      tokens are **1**.
+      tokens that belong to the user prompt are set to `0`, while the answer
+      tokens are `1`.
 
 2. **Plain prompt/completion path**: if the tokenizer has no chat template the
    dataset falls back to a classic *prompt + answer* concatenation:
