@@ -1,4 +1,4 @@
-# ColumnMappedTextInstructionDataset
+# Use the ColumnMappedTextInstructionDataset
 
 The `ColumnMappedTextInstructionDataset` is a **light-weight, plug-and-play** helper that lets you train on *instruction-answer* style corpora **without writing custom Python for every new schema**.  
 You simply specify **which column in your source dataset maps to which logical field** (`context`, `question`, `answer`, *etc.*) and the loader does the rest.
