@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+import subprocess
 
 HF_TRANSFORMER_SFT_FILENAME = "L2_HF_Transformer_SFT_nvfsdp.sh"
 
