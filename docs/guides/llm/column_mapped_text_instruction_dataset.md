@@ -14,7 +14,7 @@ It supports two data sources out-of-the-box and optionally streams them so they 
 2. **Hugging Face Hub** - point to any dataset repo (`org/dataset`) that contains the required columns.
 
 ---
-## Quick-start
+## Quickstart
 The fastest way to sanity-check the loader is to point it at an existing Hugging Face dataset and print the first sample:
 
 ```python
