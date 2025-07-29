@@ -96,7 +96,7 @@ dataset:
 ```
 
 
-### Remote dataset example
+### Remote Dataset Example
 
 Below we demonstrate how to load the instruction-tuning corpus
 [`Muennighoff/natural-instructions`](https://huggingface.co/datasets/Muennighoff/natural-instructions).
