@@ -119,7 +119,7 @@ The following are examples from the training split:
 }
 ```
 
-For basic QA fine-tuning we usually map `definition → instruction`, `inputs → question`, and `targets → answer`:
+For basic QA fine-tuning, we usually map `definition → instruction`, `inputs → question`, and `targets → answer` as follows:
 
 ```python
 from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import (
