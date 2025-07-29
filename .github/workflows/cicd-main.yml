@@ -146,6 +146,7 @@ jobs:
         include:
           - script: L2_HF_Transformer_SFT
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+            timeout: 20
     needs: [cicd-unit-tests]
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.script }}
@@ -164,6 +165,7 @@ jobs:
         uses: ./.github/actions/test-template
         with:
           script: ${{ matrix.script }}
+          timeout: ${{ matrix.timeout }}
           is_unit_test: "false"
           has-azure-credentials: "true"
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
