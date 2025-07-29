@@ -102,7 +102,7 @@ Below we demonstrate how to load the instruction-tuning corpus
 [`Muennighoff/natural-instructions`](https://huggingface.co/datasets/Muennighoff/natural-instructions).
 The dataset schema is `{task_name, id, definition, inputs, targets}`.
 
-Example lines (train split):
+The following are examples from the training split:
 
 ```json
 {
