@@ -24,7 +24,6 @@ class HFTransformerSFT:
     Test running HuggingFAce transformer SFT
     """
 
-    @pytest.mark.run_only_on("GPU")
     def test_hf_transformer_sft(self):
         dir_path = os.path.dirname(os.path.realpath(__file__))
         test_file_path = os.join(dir_path, HF_TRANSFORMER_SFT_FILENAME)
@@ -41,7 +40,6 @@ class HFTransformerSFT:
             f.write("\nSTDERR:\n")
             f.write(result.stderr)
    
-    @pytest.mark.run_only_on("GPU")
     def test_hf_transformer_sft_nvfsdp(self):
         dir_path = os.path.dirname(os.path.realpath(__file__))
         test_file_path = os.join(dir_path, HF_TRANSFORMER_SFT_NVFSDP_FILENAME)
