@@ -233,7 +233,14 @@ def build_dataloader(
             drop_last=True,
             **dist_sampler_kwargs,
         )
-        return cfg_dl.instantiate(dataset=ds, sampler=sampler), tokenizer
+        
+        # Handle collate_fn instantiation if it's a ConfigNode
+        dl_kwargs = {"dataset": ds, "sampler": sampler}
+        if hasattr(cfg_dl, "collate_fn") and hasattr(cfg_dl.collate_fn, "_target_"):
+            collate_cfg = cfg_dl.collate_fn
+            dl_kwargs["collate_fn"] = lambda batch: collate_cfg.instantiate(batch=batch)
+        
+        return cfg_dl.instantiate(**dl_kwargs), tokenizer
 
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
