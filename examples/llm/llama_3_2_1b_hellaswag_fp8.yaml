@@ -21,8 +21,8 @@
 
 step_scheduler:
   grad_acc_steps: 4
-  ckpt_every_steps: 20
-  val_every_steps: 10  # will run every x number of gradient steps
+  ckpt_every_steps: 200
+  val_every_steps: 200  # will run every x number of gradient steps
   num_epochs: 1
 
 dist_env:
@@ -36,18 +36,22 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+  pretrained_model_name_or_path: meta-llama/Meta-Llama-3.1-8B
   torch_dtype: bf16
   # FP8 quantization configuration
-  use_fp8: true
+  use_fp8: true #if false, all config below will be ignored
   fp8_recipe_name: tensorwise  # Options: tensorwise, rowwise, rowwise_with_gw_hp
-  fp8_filter_fqns: ["lm_head", "embed_tokens"]  # Exclude these modules from FP8 conversion
+  enable_fsdp_float8_all_gather: true
+  precompute_float8_dynamic_scale_for_fsdp: true
+  force_recompute_fp8_weight_in_bwd: false
+  # More comprehensive filtering to avoid dimension alignment issues
+  fp8_filter_fqns: ["lm_head"]
   fp8_emulate: false  # Set to true for testing on older GPUs without native FP8 support
 
 checkpoint:
   enabled: true
-  checkpoint_dir: checkpoints/
-  model_save_format: safetensors # torch_save or safetensors
+  checkpoint_dir: checkpoints_fp8/
+  model_save_format: torch_save # torch_save or safetensors
   save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 distributed:
@@ -72,8 +76,10 @@ packed_sequence:
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  batch_size: 8
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 16 # fp8 requires divisible by 16
+  batch_size: 1  # for benchmark, increase for better throughput
   shuffle: false
 
 validation_dataset:
@@ -84,8 +90,10 @@ validation_dataset:
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  batch_size: 8
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 16
+  batch_size: 1
   
 optimizer:
   _target_: torch.optim.Adam
