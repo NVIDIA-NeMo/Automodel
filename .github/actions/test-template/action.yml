@@ -19,9 +19,9 @@ inputs:
     description: "Max runtime of test in minutes"
     required: false
     default: "10"
-  test-name:
+  test-folder:
     description: "Name of the folder containg tests suite"
-    required: true
+    required: false
   is-optional:
     description: "Failure will cancel all other tests if set to true"
     required: false
@@ -181,7 +181,7 @@ runs:
           
           . /opt/venv/env.sh
 
-          bash tests/run_test.sh --UNIT_TEST=${{ inputs.is-unit-test }} --CPU=${{ inputs.cpu-only}} --TEST_NAME=${{ inputs.test-name }}
+          bash tests/run_test.sh --UNIT_TEST=${{ inputs.is-unit-test }} --CPU=${{ inputs.cpu-only}} --TEST_NAME=${{ inputs.test-folder }}
 
         '
 

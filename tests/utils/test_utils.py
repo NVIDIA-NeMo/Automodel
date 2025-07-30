@@ -12,16 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import test.test_utils.run_test_script as run_test_script
+import os
+import subprocess
 
-TEST_FOLDER = "hf_transformer_sft"
-HF_TRANSFORMER_SFT_FILENAME = "L2_HF_Transformer_SFT.sh"
-HF_TRANSFORMER_SFT_NVFSDP_FILENAME = "L2_HF_Transformer_SFT_nvfsdp.sh"
-
-
-class TestHFTransformerSFT:
-    def test_hf_transformer_sft(self):
-        run_test_script(TEST_FOLDER, HF_TRANSFORMER_SFT_FILENAME)
-
-    def test_hf_transformer_sft_nvfsdp(self):
-        run_test_script(TEST_FOLDER, HF_TRANSFORMER_SFT_NVFSDP_FILENAME)
+def run_test_script(folder, filepath):
+    dir_path = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    test_file_path = os.path.join(dir_path, 'functional_tests', folder, test_filename)
+    test_cmd = ["bash", test_file_path]
+    subprocess.run(test_cmd, check=True)

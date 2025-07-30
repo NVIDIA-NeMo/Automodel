@@ -11,17 +11,3 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-import test.test_utils.run_test_script as run_test_script
-
-TEST_FOLDER = "hf_transformer_sft"
-HF_TRANSFORMER_SFT_FILENAME = "L2_HF_Transformer_SFT.sh"
-HF_TRANSFORMER_SFT_NVFSDP_FILENAME = "L2_HF_Transformer_SFT_nvfsdp.sh"
-
-
-class TestHFTransformerSFT:
-    def test_hf_transformer_sft(self):
-        run_test_script(TEST_FOLDER, HF_TRANSFORMER_SFT_FILENAME)
-
-    def test_hf_transformer_sft_nvfsdp(self):
-        run_test_script(TEST_FOLDER, HF_TRANSFORMER_SFT_NVFSDP_FILENAME)
