@@ -184,7 +184,7 @@ def test_main_multi_node(monkeypatch, tmp_yaml_file):
     run_mod = importlib.import_module("torch.distributed.run")
     monkeypatch.setattr(run_mod, "run", lambda *a, **kw: 0)
     import torch.distributed.run as trn
-    monkeypatch.setattr(trn, "get_args_parser", lambda: argparse.Namespace(parse_args=lambda: DummyArgs()))
+    monkeypatch.setattr(trn, "get_args_parser", lambda: argparse.Namespace(parse_known_args=lambda: (DummyArgs(), None)))
     monkeypatch.setattr(trn, "determine_local_world_size", lambda **kwargs: 4)
 
     # Simulate torchrun parser and arguments

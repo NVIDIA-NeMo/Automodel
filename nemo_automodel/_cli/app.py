@@ -236,7 +236,7 @@ def run_interactive(args):
         logging.info(f"Launching job locally on {num_devices} devices")
         # run the job on multiple ranks on this node.
         torchrun_parser = get_args_parser()
-        torchrun_args = torchrun_parser.parse_args()
+        torchrun_args, extra = torchrun_parser.parse_known_args()
         # overwrite the training script with the actual recipe path
         torchrun_args.training_script = str(script_path)
         # training_script_args=['finetune', '--config', 'examples/llm/llama_3_2_1b_squad.yaml']
@@ -261,7 +261,7 @@ def main():
     Returns:
         int: Job's status code
     """
-    args = build_parser().parse_args()
+    args, extra = build_parser().parse_known_args()
     logging.info(f"Domain:  {args.domain}")
     logging.info(f"Command: {args.command}")
     logging.info(f"Config:  {args.config.resolve()}")
