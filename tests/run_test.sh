@@ -34,7 +34,7 @@ done
 if [[ "$CPU" == "false" ]]; then
     export CUDA_VISIBLE_DEVICES="0,1"
 else
-    export ADDITIONAL_ARGS="--cpu $ADDITIONAL_ARGS"
+    export ADDITIONAL_ARGS="--cpu --with_downloads"
 fi
 
 if [[ "$UNIT_TEST" == "true" ]]; then
@@ -48,10 +48,9 @@ coverage run \
     --source=/workspace/ \
     --parallel-mode \
     -m pytest \
+    $TEST_DIR \
     -o log_cli=true \
     -o log_cli_level=INFO \
     -vs -m "not pleasefixme" --tb=short \
-    --with_downloads \
     $ADDITIONAL_ARGS \
-    $TEST_DIR
 coverage combine
