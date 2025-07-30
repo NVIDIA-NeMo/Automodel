@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import test.test_utils.run_test_script as run_test_script
+from tests.utils.test_utils import run_test_script
 
 TEST_FOLDER = "hf_transformer_sft"
 HF_TRANSFORMER_SFT_FILENAME = "L2_HF_Transformer_SFT.sh"
