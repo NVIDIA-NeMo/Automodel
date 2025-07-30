@@ -241,7 +241,6 @@ def fsdp2_strategy_parallelize(
     Args:
         model: The model to be parallelized.
         device_mesh (DeviceMesh): The device mesh for distributed training.
-        param_dtype (torch.dtype): Data type for model parameters. Defaults to torch.bfloat16.
         mp_policy (Optional[MixedPrecisionPolicy]): Mixed precision policy for model parallelism.
         offload_policy (Optional[OffloadPolicy]): The offload policy for FSDP.
         sequence_parallel (bool): Whether to use sequence parallelism. Defaults to False.
