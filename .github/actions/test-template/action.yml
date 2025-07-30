@@ -181,7 +181,7 @@ runs:
           
           . /opt/venv/env.sh
 
-          base tests/run_test..sh --UNIT_TEST=${{ inputs.is-unit-test }} --CPU=${{ inputs.cpu-only}} --TEST_NAME=${{ inputs.test-name }}
+          bash tests/run_test.sh --UNIT_TEST=${{ inputs.is-unit-test }} --CPU=${{ inputs.cpu-only}} --TEST_NAME=${{ inputs.test-name }}
 
         '
 
