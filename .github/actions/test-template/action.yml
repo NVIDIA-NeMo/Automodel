@@ -19,14 +19,14 @@ inputs:
     description: "Max runtime of test in minutes"
     required: false
     default: "10"
-  script:
-    description: "Test script to execute"
+  test-name:
+    description: "Name of the folder containg tests suite"
     required: true
-  is_optional:
+  is-optional:
     description: "Failure will cancel all other tests if set to true"
     required: false
     default: "false"
-  is_unit_test:
+  is-unit-test:
     description: "Upload coverage as unit test"
     required: false
     default: "false"
@@ -68,7 +68,7 @@ runs:
         subscription-id: ${{ inputs.azure-subscription-id }}
 
     - name: Azure Fileshare
-      if: ${{ inputs.has-azure-credentials == 'true' && inputs.is_unit_test == 'false' }}
+      if: ${{ inputs.has-azure-credentials == 'true' && inputs.is-unit-test == 'false' }}
       shell: bash
       id: azure-fileshare
       run: |
@@ -170,7 +170,7 @@ runs:
       id: create
       shell: bash
       run: |
-        COVERAGE_PREFIX=$([[ "${{ inputs.is_unit_test }}" == "true" ]] && echo "unit-test" || echo "e2e")
+        COVERAGE_PREFIX=$([[ "${{ inputs.is-unit-test }}" == "true" ]] && echo "unit-test" || echo "e2e")
         echo "coverage-prefix=$COVERAGE_PREFIX" | tee -a "$GITHUB_OUTPUT"
 
         cmd=$(cat <<'RUN_TEST_EOF'
@@ -181,9 +181,10 @@ runs:
           
           . /opt/venv/env.sh
 
-          bash tests/${{ inputs.is_unit_test == 'true' && 'unit_tests' || 'functional_tests' }}/${{ inputs.script }}.sh
-          
+          base tests/run_test..sh --UNIT_TEST=${{ inputs.is-unit-test }} --CPU=${{ inputs.cpu-only}} --TEST_NAME=${{ inputs.test-name }}
+
         '
+
 
         RUN_TEST_EOF
         )

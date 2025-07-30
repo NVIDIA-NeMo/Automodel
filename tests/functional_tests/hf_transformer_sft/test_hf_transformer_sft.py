@@ -16,7 +16,7 @@ import os
 import subprocess
 
 HF_TRANSFORMER_SFT_FILENAME = "L2_HF_Transformer_SFT.sh"
-HF_TRANSFORMER_SFT_FILENAME = "L2_HF_Transformer_SFT_nvfsdp.sh"
+HF_TRANSFORMER_SFT_NVFSDP_FILENAME = "L2_HF_Transformer_SFT_nvfsdp.sh"
 
 
 class TestHFTransformerSFT:
@@ -28,6 +28,6 @@ class TestHFTransformerSFT:
 
     def test_hf_transformer_sft_nvfsdp(self):
         dir_path = os.path.dirname(os.path.realpath(__file__))
-        test_file_path = os.path.join(dir_path, HF_TRANSFORMER_SFT_FILENAME)
+        test_file_path = os.path.join(dir_path, HF_TRANSFORMER_SFT_NVFSDP_FILENAME)
         test_cmd = ["bash", test_file_path]
         subprocess.run(test_cmd, check=True)
