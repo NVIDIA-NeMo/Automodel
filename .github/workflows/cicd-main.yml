@@ -112,11 +112,9 @@ jobs:
           - test-name: L0_Unit_Tests_CPU
             runner: linux-amd64-cpu16
             cpu-only: true
-            is-unit-test: true
           - test-name: L0_Unit_Tests_GPU
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
             cpu-only: false
-            is-unit-test: true
             timeout: 30
     needs: [pre-flight, cicd-wait-in-queue]
     runs-on: ${{ matrix.runner }}
@@ -137,7 +135,7 @@ jobs:
         with:
           script: ${{ matrix.script }}
           timeout: ${{ matrix.timeout || 10 }}
-          is_unit_test: "true"
+          is-unit-test: "true"
           cpu-only: ${{ matrix.cpu-only || false }}
           has-azure-credentials: "true"
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
