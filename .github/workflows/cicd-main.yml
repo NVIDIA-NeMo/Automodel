@@ -129,7 +129,6 @@ jobs:
       - name: main
         uses: ./.github/actions/test-template
         with:
-          script: ${{ matrix.script }}
           timeout: ${{ matrix.timeout || 10 }}
           is-unit-test: "true"
           cpu-only: ${{ matrix.cpu-only || false }}
@@ -165,7 +164,7 @@ jobs:
       - name: main
         uses: ./.github/actions/test-template
         with:
-          script: ${{ matrix.script }}
+          test-folder: ${{ matrix.test-folder }}
           timeout: ${{ matrix.timeout }}
           is_unit_test: "false"
           has-azure-credentials: "true"
