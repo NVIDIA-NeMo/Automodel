@@ -104,11 +104,11 @@ def test_launch_with_slurm(monkeypatch, tmp_path):
         domain="llm",
         command="finetune",
     )
-    
+
     # Create a temporary repo_root directory that exists
     repo_root = tmp_path / "repo_root"
     repo_root.mkdir()
-    
+
     monkeypatch.setattr(module, "load_yaml", lambda x: {"slurm": mock_slurm_config})
     monkeypatch.setitem(
         sys.modules,
@@ -145,7 +145,7 @@ def test_launch_with_slurm(monkeypatch, tmp_path):
     import nemo_automodel.components.launcher.slurm.utils as slurm_utils
     monkeypatch.setattr(slurm_utils, "submit_slurm_job", fake_submit_slurm_job)
     job_dir = '/tmp/a/0123456789/'
-    
+
     # Provide a valid repo_root in slurm_config to avoid the path detection logic
     slurm_config_with_repo = {"repo_root": str(repo_root)}
     module.launch_with_slurm(dummy_args, job_dir +'y.conf', job_dir, slurm_config=slurm_config_with_repo)
@@ -282,13 +282,17 @@ def test_repo_structure():
     inside the nemo_automodel/_cli/app.py we assume a specific directory structure.
     This test ensures the directory structure is preserved.
     """
-    cwd = Path.cwd()
+    # Find the Automodel repository root relative to this test file
+    # This test file is at: tests/unit_tests/_cli/test_app.py
+    # So we need to go up 3 levels to reach the repo root
+    repo_root = Path(__file__).parents[3]
+
     with pytest.raises(AssertionError):
-        assert (cwd / "nemo_automodel_abc").exists()
-    assert (cwd / "nemo_automodel").exists()
-    assert (cwd / "nemo_automodel" / "components").exists()
-    assert (cwd / "nemo_automodel" / "_cli").exists()
-    assert (cwd / "nemo_automodel" / "recipes").exists()
-    assert (cwd / "nemo_automodel" / "shared").exists()
-    assert (cwd / "docs").exists()
-    assert (cwd / "examples").exists()
+        assert (repo_root / "nemo_automodel_abc").exists()
+    assert (repo_root / "nemo_automodel").exists()
+    assert (repo_root / "nemo_automodel" / "components").exists()
+    assert (repo_root / "nemo_automodel" / "_cli").exists()
+    assert (repo_root / "nemo_automodel" / "recipes").exists()
+    assert (repo_root / "nemo_automodel" / "shared").exists()
+    assert (repo_root / "docs").exists()
+    assert (repo_root / "examples").exists()

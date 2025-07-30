@@ -18,7 +18,12 @@ examples/llm/finetune.py \
   --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
   --step_scheduler.max_steps 3 \
   --step_scheduler.grad_acc_steps 1 \
+  --step_scheduler.val_every_steps 1 \
+  --loss_fn._target_ nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy \
   --dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
   --validation_dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
   --dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
-  --dataset.limit_dataset_samples 10
+  --dataset.limit_dataset_samples 10 \
+  --validation_dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
+  --validation_dataset.limit_dataset_samples 10 \
+
