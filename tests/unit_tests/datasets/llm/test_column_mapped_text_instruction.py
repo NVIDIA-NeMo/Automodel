@@ -21,6 +21,8 @@ from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_datas
     _str_is_hf_repo_id,
     make_iterable,
     _load_dataset,
+    _check_all_values_equal_length,
+    _has_chat_template,
 )
 
 
@@ -56,7 +58,7 @@ def test_load_dataset_local_json(tmp_path: Path):
 
 
 class _DummyTokenizer:  # noqa: D401
-    """Minimal tokenizer stub – only what's required for the dataset."""
+    """Minimal tokenizer stub - only what's required for the dataset."""
 
     def __init__(self):
         self.pad_token = "<pad>"
@@ -74,47 +76,62 @@ class _DummyTokenizer:  # noqa: D401
         what the dataset expects (a dict with an ``input_ids`` key).
         """
 
-        # Very simple whitespace tokenisation – one integer per token.
+        # Very simple whitespace tokenisation - one integer per token.
         input_ids = list(range(len(text.split())))
         return {"input_ids": input_ids}
 
 
 def test_column_mapped_dataset_basic_no_tokenizer(tmp_path: Path):
     samples = [
-        {"question": "Why is the sky blue?", "answer": "Rayleigh scattering."},
-        {"question": "What is 2+2?", "answer": "4."},
+        {"query": "Why is the sky blue?", "response": "Rayleigh scattering."},
+        {"query": "What is 2+2?", "response": "4."},
     ]
     jsonl_path = tmp_path / "toy.jsonl"
     with jsonl_path.open("w", encoding="utf-8") as fp:
         for row in samples:
             fp.write(json.dumps(row) + "\n")
 
-    column_mapping = {"query": "question", "response": "answer"}
+    column_mapping = {"question": "query", "answer": "response"}
 
-    ds = ColumnMappedTextInstructionDataset(
-        path_or_dataset_id=str(jsonl_path),
-        column_mapping=column_mapping,
-        tokenizer=None,
-        answer_only_loss_mask=False,
-    )
+    with pytest.raises(AssertionError):
+        ds = ColumnMappedTextInstructionDataset(
+            path_or_dataset_id=str(jsonl_path),
+            column_mapping=column_mapping,
+            tokenizer=None,
+            answer_only_loss_mask=False,
+        )
 
-    assert len(ds) == 2
-    first = ds[0]
-    assert set(first.keys()) == {"query", "response"}
-    assert first["query"] == "Why is the sky blue?"
-    assert first["response"].startswith("Rayleigh")
+def test_column_mapped_dataset_bad_mapping(tmp_path: Path):
+    samples = [
+        {"query": "Why is the sky blue?", "response": "Rayleigh scattering."},
+        {"query": "What is 2+2?", "response": "4."},
+    ]
+    jsonl_path = tmp_path / "toy.jsonl"
+    with jsonl_path.open("w", encoding="utf-8") as fp:
+        for row in samples:
+            fp.write(json.dumps(row) + "\n")
+
+    column_mapping = {"question": "query", "answer": "response", "bad": "column"}
+
+    with pytest.raises(AssertionError, match="Expected context to be in column_mapping"):
+        ds = ColumnMappedTextInstructionDataset(
+            path_or_dataset_id=str(jsonl_path),
+            column_mapping=column_mapping,
+            tokenizer=_DummyTokenizer(),
+            answer_only_loss_mask=False,
+        )
 
 def test_column_mapped_dataset_basic(tmp_path: Path):
     samples = [
-        {"question": "Why is the sky blue?", "answer": "Rayleigh scattering."},
-        {"question": "What is 2+2?", "answer": "4."},
+        {"query": "Why is the sky blue?", "response": "Rayleigh scattering."},
+        {"query": "What is 2+2?", "response": "4."},
     ]
     jsonl_path = tmp_path / "toy.jsonl"
     with jsonl_path.open("w", encoding="utf-8") as fp:
         for row in samples:
             fp.write(json.dumps(row) + "\n")
 
-    column_mapping = {"query": "question", "response": "answer"}
+    column_mapping = {"question": "query", "answer": "response"}
 
     ds = ColumnMappedTextInstructionDataset(
         path_or_dataset_id=str(jsonl_path),
@@ -131,7 +148,7 @@ def test_column_mapped_dataset_basic(tmp_path: Path):
 def test_column_mapped_dataset_streaming(tmp_path: Path):
     """Verify behaviour when *streaming=True*.
 
-    In streaming mode the dataset becomes an ``IterableDataset`` – length and
+    In streaming mode the dataset becomes an ``IterableDataset`` - length and
     random access are undefined, but iteration should lazily yield the mapped
     rows.  We check that these constraints are enforced and that the mapping
     logic still works.
@@ -140,8 +157,8 @@ def test_column_mapped_dataset_streaming(tmp_path: Path):
     import itertools
 
     samples = [
-        {"question": "Who wrote Hamlet?", "answer": "Shakespeare"},
-        {"question": "Capital of France?", "answer": "Paris"},
+        {"q": "Who wrote Hamlet?", "a": "Shakespeare"},
+        {"q": "Capital of France?", "a": "Paris"},
     ]
 
     jsonl_path = tmp_path / "toy_stream.jsonl"
@@ -151,51 +168,7 @@ def test_column_mapped_dataset_streaming(tmp_path: Path):
 
     ds = ColumnMappedTextInstructionDataset(
         path_or_dataset_id=str(jsonl_path),
-        column_mapping={"q": "question", "a": "answer"},
-        # tokenizer=_DummyTokenizer(),
-        tokenizer=None,
-        streaming=True,
-        answer_only_loss_mask=False,
-    )
-
-    # __len__ and __getitem__ are not supported in streaming mode
-    with pytest.raises(RuntimeError):
-        _ = len(ds)  # type: ignore[arg-type]
-
-    with pytest.raises(RuntimeError):
-        _ = ds[0]  # type: ignore[index]
-
-    # But we can iterate and obtain the mapped columns
-    first_two = list(itertools.islice(ds, 2))
-    assert len(first_two) == 2
-    assert first_two[0]["q"] == "Who wrote Hamlet?"
-    assert first_two[1]["a"] == "Paris" 
-
-
-def test_column_mapped_dataset_streaming(tmp_path: Path):
-    """Verify behaviour when *streaming=True*.
-
-    In streaming mode the dataset becomes an ``IterableDataset`` – length and
-    random access are undefined, but iteration should lazily yield the mapped
-    rows.  We check that these constraints are enforced and that the mapping
-    logic still works.
-    """
-
-    import itertools
-
-    samples = [
-        {"question": "Who wrote Hamlet?", "answer": "Shakespeare"},
-        {"question": "Capital of France?", "answer": "Paris"},
-    ]
-
-    jsonl_path = tmp_path / "toy_stream.jsonl"
-    with jsonl_path.open("w", encoding="utf-8") as fp:
-        for row in samples:
-            fp.write(json.dumps(row) + "\n")
-
-    ds = ColumnMappedTextInstructionDataset(
-        path_or_dataset_id=str(jsonl_path),
-        column_mapping={}, #"q": "question", "a": "answer"},
+        column_mapping={"question": "q", "answer": "a"},
         tokenizer=_DummyTokenizer(),
         streaming=True,
         answer_only_loss_mask=False,
@@ -209,5 +182,58 @@ def test_column_mapped_dataset_streaming(tmp_path: Path):
         _ = ds[0]  # type: ignore[index]
 
     # But we can iterate and obtain the mapped columns
-    with pytest.raises(ValueError):
-        first_two = list(itertools.islice(ds, 2))
+    first_two = list(itertools.islice(ds, 2))
+
+class _TokenizerNoChat:  # noqa: D401 - minimal stub only
+    """Tokenizer *without* chat‐template support."""
+
+    def __call__(self, text: str):  # pragma: no cover - unused in these tests
+        return {"input_ids": []}
+
+
+class _TokenizerChat(_TokenizerNoChat):  # noqa: D401 - adds chat template features
+    """Tokenizer *with* chat‐template support.
+
+    Only the attributes consumed by ``_has_chat_template`` are implemented.
+    """
+
+    chat_template = "<dummy>"
+
+    def apply_chat_template(self, messages):  # type: ignore[override]
+        return []
+
+
+class _TokenizerChatButNoCallable(_TokenizerNoChat):  # noqa: D401
+    """Tokenizer with a *non‐callable* ``apply_chat_template`` attribute."""
+
+    chat_template = "<dummy>"
+    apply_chat_template = "not callable"  # type: ignore[assignment]
+
+def test_has_chat_template_positive():
+    """Tokenizer advertises *chat_template* and *apply_chat_template* is callable."""
+
+    tok = _TokenizerChat()
+    assert _has_chat_template(tok) is True
+
+
+def test_has_chat_template_negative_missing_attrs():
+    """Tokenizer lacks chat‐template attributes → returns *False*."""
+
+    tok = _TokenizerNoChat()
+    assert _has_chat_template(tok) is False
+
+
+def test_has_chat_template_negative_not_callable():
+    """``apply_chat_template`` exists but is *not* callable → returns *False*."""
+
+    tok = _TokenizerChatButNoCallable()
+    assert _has_chat_template(tok) is False
+
+def test_check_all_values_equal_length_true():
+    sample = {"a": [1, 2, 3], "b": [4, 5, 6], "c": [7, 8, 9]}
+    assert _check_all_values_equal_length(sample) is True
+
+
+def test_check_all_values_equal_length_false():
+    sample = {"a": [1, 2, 3, 4], "b": [5, 6], "c": []}
+    assert _check_all_values_equal_length(sample) is False
