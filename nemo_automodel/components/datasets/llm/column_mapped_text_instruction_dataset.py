@@ -299,9 +299,12 @@ class ColumnMappedTextInstructionDataset(Dataset):
         # Keep mapping: dest -> source (i.e. public_field -> raw_column_name)
 
         assert isinstance(column_mapping, dict), "Expected column_mapping to be a dictionary"
-        allowed_col_names = set(map(lambda x: x.value, ColumnTypes))
-        for key in column_mapping.keys():
-            assert key in allowed_col_names, f"Invalid column name: {key}"
+        # Ensure required columns are present
+        assert ColumnTypes.Question.value in column_mapping, ("Expected question to be in column_mapping", column_mapping)
+        assert ColumnTypes.Answer.value in column_mapping, ("Expected answer to be in column_mapping", column_mapping)
+        if len(column_mapping) == 3:
+            assert ColumnTypes.Context.value in column_mapping, ("Expected context to be in column_mapping", column_mapping)
+
         self.column_mapping = column_mapping
 
         self.answer_only_loss_mask = answer_only_loss_mask
@@ -381,7 +384,8 @@ class ColumnMappedTextInstructionDataset(Dataset):
         Returns:
             A dictionary with the tokenized columns.
         """
-
+        assert isinstance(sample, dict), "Expected sample to be a dictionary"
+        assert len(sample) >= 2, "Expected at least two columns"
         context = sample.get(ColumnTypes.Context.value, None)
         question = sample[ColumnTypes.Question.value]
         answer = sample[ColumnTypes.Answer.value]
