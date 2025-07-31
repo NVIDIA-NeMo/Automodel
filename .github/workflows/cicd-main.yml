@@ -143,10 +143,34 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - test-name: L2_HF_Transformer_SFT
-            test-folder: hf_transformer_sft
+          - test-name: L2_HF_CONSOLIDATED_FSDP
+            test-folder: hf_consolidated_fsdp
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
             timeout: 20
+          - test-name: L2_HF_DCP
+            test-folder: hf_dcp
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+            timeout: 40
+          - test-name: L2_HF_PEFT
+            test-folder: hf_peft
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+            timeout: 30
+          - test-name: L2_HF_TRANSFORMER
+            test-folder: hf_transformer
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+            timeout: 20
+          - test-name: L2_HF_TRANSFORMER_FINETUNE
+            test-folder: hf_transformer_finetune
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+            timeout: 40
+          - test-name: L2_HF_TRANSFORMER_LLM
+            test-folder: hf_transformer_llm
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+            timeout: 20
+          - test-name: L2_HF_TRANSFORMER_VLM
+            test-folder: hf_transformer_vlm
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+            timeout: 60
     needs: [cicd-unit-tests]
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.test-name }}
