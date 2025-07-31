@@ -112,6 +112,10 @@ jobs:
           - test-name: L0_Unit_Tests_CPU
             runner: linux-amd64-cpu16
             cpu-only: true
+          - test-name: L0_Unit_Tests_GPU
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+            cpu-only: false
+            timeout: 30
     needs: [pre-flight, cicd-wait-in-queue]
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.test-name }}
@@ -355,8 +359,3 @@ jobs:
        - name: codecov_placeholder
          run: |
            echo "This is a placeholder status check for when no tests are ran but the codecov status is expected"
-
-#           - test-name: L0_Unit_Tests_GPU
-#             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-#             cpu-only: false
-#             timeout: 30
