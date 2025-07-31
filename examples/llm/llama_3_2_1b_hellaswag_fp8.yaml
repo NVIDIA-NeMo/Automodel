@@ -43,7 +43,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints_fp8/
   model_save_format: torch_save # torch_save or safetensors
-  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  save_consolidated: false 
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
@@ -58,7 +58,7 @@ fp8:
   enable_fsdp_float8_all_gather: true
   precompute_float8_dynamic_scale_for_fsdp: true
   force_recompute_fp8_weight_in_bwd: false
-  filter_fqns: ["lm_head"]  # More comprehensive filtering to avoid dimension alignment issues
+  filter_fqns: ["lm_head"]
   emulate: false  # Set to true for testing on older GPUs without native FP8 support
 
 loss_fn:
@@ -79,7 +79,7 @@ dataloader:
   collate_fn:
     _target_: nemo_automodel.components.datasets.utils.default_collater
     pad_seq_len_divisible: 16 # fp8 requires divisible by 16
-  batch_size: 1  # for benchmark, increase for better throughput
+  batch_size: 1  # 1 for benchmark, increase it for better throughput
   shuffle: false
 
 validation_dataset:

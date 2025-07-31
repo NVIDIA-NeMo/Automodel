@@ -22,12 +22,13 @@ from typing import Any, Dict, Optional
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import wandb
 from torch.distributed.device_mesh import _mesh_resources
 from torch.utils.data import DataLoader
 from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
+from wandb import Settings
 
-import wandb
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -50,7 +51,6 @@ from nemo_automodel.components.utils.dist_utils import (
 )
 from nemo_automodel.components.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from wandb import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -558,22 +558,19 @@ class FinetuneRecipeForVLM(BaseRecipe):
         This optimizes FSDP communication by precomputing scales for all FP8 parameters
         in a single all-reduce operation instead of many small ones.
         """
-        try:
-            # Check if model has Float8Linear layers (indicating FP8 is enabled)
-            from torchao.float8 import Float8Linear
-
-            has_fp8_layers = any(isinstance(module, Float8Linear) for module in self.model.modules())
-
-            if has_fp8_layers:
+        if (
+            self.cfg.get("model.use_fp8", False)
+            and self.cfg.get("model.fp8_recipe_name", None) == "tensorwise"
+            and self.cfg.get("model.enable_fsdp_float8_all_gather", False)
+            and self.cfg.get("model.precompute_float8_dynamic_scale_for_fsdp", False)
+            and self.device_mesh["data_parallel"].size() > 1
+        ):  # TODO: make sure it's dp_shard>1 instead of dp_replicate>1
+            try:
                 from nemo_automodel.components.quantization import precompute_fp8_scales_for_fsdp
 
                 precompute_fp8_scales_for_fsdp(self.model)
-        except ImportError:
-            # torchao not available or Float8Linear not found - skip silently
-            pass
-        except Exception as e:
-            # Log warning but don't fail training
-            logging.warning(f"Failed to precompute FP8 scales for FSDP: {e}")
+            except Exception as e:
+                logging.warning(f"Failed to precompute FP8 scales for FSDP: {e}")
 
     def _run_train_step(self, batch, is_optim_step, clip_norm=1.0):
         """Execute a single training step.
@@ -660,8 +657,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.optimizer.step()
             self.optimizer.zero_grad()
 
-            # Precompute FP8 scales for FSDP if FP8 is enabled
-            self._precompute_fp8_scales_if_enabled()
+            # Precompute FP8 scales
+            if self.cfg.get("model.use_fp8", False):
+                self._precompute_fp8_scales_if_enabled()
 
             if self.lr_scheduler is not None:
                 self.lr_scheduler.step(1)

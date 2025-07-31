@@ -154,7 +154,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         This is a light wrapper around
         `transformers.AutoModelForCausalLM.from_pretrained` that can
-        automatically apply Liger, SDPA, and/or FP8 quantization optimizations.
+        automatically apply Liger and/or SDPA (scaled-dot-product
+        attention) kernel optimizations.
 
         Args:
             pretrained_model_name_or_path (str | os.PathLike): Hugging Face
@@ -184,13 +185,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             model instance.
 
         Warns:
-            UserWarning: Emitted when optimizations are requested but packages
-            are unavailable.
+            UserWarning: Emitted when `use_liger_kernel=True` but the Liger
+            package is unavailable.
 
         Notes:
-            If kernel patching or FP8 quantization fails, the partially constructed
-            model is deleted and the method recurses once with the failing
-            optimization disabled.
+            If kernel patching fails, the partially constructed model is
+              deleted and the method recurses once with
+              `use_liger_kernel=False` or `use_sdpa_patching=False`
         """
         torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
 
@@ -253,12 +254,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 from nemo_automodel.components.quantization.fp8 import FP8Config
 
                 if hasattr(fp8_config, "from_config_node"):
-                    # ConfigNode to FP8Config conversion
                     fp8_settings = FP8Config.from_config_node(fp8_config)
                 elif isinstance(fp8_config, FP8Config):
                     fp8_settings = fp8_config
                 else:
-                    # Assume it's a dict-like object
                     fp8_settings = FP8Config(**fp8_config.to_dict() if hasattr(fp8_config, "to_dict") else fp8_config)
 
                 model = apply_fp8_to_model(
@@ -386,7 +385,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 from nemo_automodel.components.quantization.fp8 import FP8Config
 
                 if hasattr(fp8_config, "from_config_node"):
-                    # ConfigNode to FP8Config conversion
                     fp8_settings = FP8Config.from_config_node(fp8_config)
                 elif isinstance(fp8_config, FP8Config):
                     fp8_settings = fp8_config

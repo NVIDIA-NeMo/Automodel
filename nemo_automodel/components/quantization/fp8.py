@@ -16,7 +16,6 @@ from nemo_automodel.shared.import_utils import MISSING_TORCHAO_MSG
 
 logger = logging.getLogger(__name__)
 
-# Safe imports for torchao components
 try:
     from torchao.float8 import Float8LinearConfig, convert_to_float8_training, precompute_float8_dynamic_scale_for_fsdp
 
@@ -132,10 +131,8 @@ def apply_fp8_to_model(
 
     Args:
         model: The model to convert
-        config: Float8LinearConfig from torchao (if None, will be created)
         filter_fqns: List of module names to exclude from FP8 conversion
         recipe_name: Recipe name for FP8 configuration ("tensorwise", "rowwise", etc.)
-        dp_shard_enabled: Whether data parallel sharding is enabled
         force_recompute_fp8_weight_in_bwd: Whether to force recompute FP8 weight in backward pass
         enable_fsdp_float8_all_gather: Whether to enable FSDP FP8 all-gather
         emulate: Use emulation instead of hardware acceleration (for testing on older GPUs)
@@ -177,7 +174,6 @@ def apply_fp8_to_model(
             "To enable testing on older hardware, set emulate=True in Float8LinearConfig or pass emulate=True."
         )
 
-    # Create module filter function
     if filter_fqns is None:
         filter_fqns = []
     filter_fn = partial(_module_filter_fn, filter_fqns=filter_fqns)
