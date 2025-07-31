@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import re
 from enum import Enum
 from pathlib import Path
@@ -222,6 +223,29 @@ def _apply_tokenizer_plain(
     return out
 
 
+def _has_chat_template(tokenizer: "PreTrainedTokenizer") -> bool:
+    """
+    Check if the tokenizer supports a chat template.
+
+    Args:
+        tokenizer: The tokenizer to check.
+
+    Returns:
+        True if the tokenizer supports a chat template, False otherwise.
+    """
+    return getattr(tokenizer, "chat_template", None) is not None and callable(
+        getattr(tokenizer, "apply_chat_template", None)
+    )
+
+
+def _check_all_values_equal_length(sample: Dict[str, List[int]]) -> bool:
+    """
+    Check if all values in the sample are of the same length.
+    """
+    len0 = len(sample[next(iter(sample))])
+    return all(map(lambda v: len(v) == len0, sample.values()))
+
+
 class ColumnMappedTextInstructionDataset(Dataset):
     """Generic *instruction‐tuning* dataset that maps arbitrary column names.
 
@@ -258,15 +282,26 @@ class ColumnMappedTextInstructionDataset(Dataset):
             start_of_turn_token: The token to use to indicate the start of a turn.
         """
 
-        if answer_only_loss_mask and start_of_turn_token is None:
-            raise ValueError("start_of_turn_token must be provided when answer_only_loss_mask=True")
+        if _has_chat_template(tokenizer):
+            if not answer_only_loss_mask:
+                logging.warning(
+                    "answer_only_loss_mask=False but tokenizer has chat template. Consider providing `answer_only_loss_mask` and `start_of_turn_token`."
+                )
+            elif start_of_turn_token is None:
+                raise ValueError("start_of_turn_token must be provided when answer_only_loss_mask=True")
 
+        assert tokenizer is not None, "Tokenizer is required"
         self.tokenizer = tokenizer
 
         self.streaming = streaming
         self.dataset = _load_dataset(path_or_dataset_id, split=split, streaming=streaming)
 
         # Keep mapping: dest -> source (i.e. public_field -> raw_column_name)
+
+        assert isinstance(column_mapping, dict), "Expected column_mapping to be a dictionary"
+        allowed_col_names = set(map(lambda x: x.value, ColumnTypes))
+        for key in column_mapping.keys():
+            assert key in allowed_col_names, f"Invalid column name: {key}"
         self.column_mapping = column_mapping
 
         self.answer_only_loss_mask = answer_only_loss_mask
@@ -303,8 +338,8 @@ class ColumnMappedTextInstructionDataset(Dataset):
             raise RuntimeError("__getitem__ is not supported when `streaming=True`. Iterate over the dataset instead.")
         row = self.dataset[idx]
         mapped = {dest: row[src] for dest, src in self.column_mapping.items()}
-        if self.tokenizer is not None:
-            mapped = self._apply_tokenizer(mapped)
+        mapped = self._apply_tokenizer(mapped)
+        assert _check_all_values_equal_length(mapped), "All values must be of the same length"
         return mapped
 
     def __iter__(self):  # noqa: D401
@@ -324,8 +359,8 @@ class ColumnMappedTextInstructionDataset(Dataset):
         if self.streaming:
             for row in self.dataset:
                 mapped = {dest: row[src] for dest, src in self.column_mapping.items()}
-                if self.tokenizer is not None:
-                    mapped = self._apply_tokenizer(mapped)
+                mapped = self._apply_tokenizer(mapped)
+                assert _check_all_values_equal_length(mapped), "All values must be of the same length"
                 yield mapped
         else:
             for idx in range(len(self)):
@@ -347,19 +382,11 @@ class ColumnMappedTextInstructionDataset(Dataset):
             A dictionary with the tokenized columns.
         """
 
-        def _get_first(keys):
-            for k in keys:
-                if k in sample:
-                    return sample[k]
-            return None
+        context = sample.get(ColumnTypes.Context.value, None)
+        question = sample[ColumnTypes.Question.value]
+        answer = sample[ColumnTypes.Answer.value]
 
-        context = _get_first([ColumnTypes.Context.value, "ctx", "context"])
-        question = _get_first([ColumnTypes.Question.value, "question", "query", "prompt", "instruction"])
-        answer = _get_first([ColumnTypes.Answer.value, "answer", "response", "output"])
-
-        if getattr(self.tokenizer, "chat_template", None) is not None and callable(
-            getattr(self.tokenizer, "apply_chat_template", None)
-        ):
+        if _has_chat_template(self.tokenizer):
             return _apply_tokenizer_with_chat_template(
                 self.tokenizer, context, question, answer, self.start_of_turn_token, self.answer_only_loss_mask
             )
