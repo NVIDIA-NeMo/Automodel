@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Optional
 
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
@@ -46,6 +46,13 @@ class NVFSDPManager:
         sequence_parallel (bool): Enables sequence parallelism in the TP plan when True.
         backend (str): Distributed backend to use (e.g., 'nccl' for GPUs or 'gloo' for CPUs).
         world_size (int): Total number of processes.
+        zero_dp_strategy (int): Zero DP strategy. Default is 3.
+        data_parallel_sharding_strategy (str): Data parallel sharding strategy. Default is "optim_grads_params".
+        init_nvfsdp_with_meta_device (bool): Initialize nvFSDP with meta device if True. Default is False.
+        grad_reduce_in_fp32 (bool): Reduce gradients in fp32 if True. Default is False.
+        preserve_fp32_weights (bool): Preserve fp32 weights if True. Default is False.
+        overlap_grad_reduce (bool): Overlap gradient reduction if True. Default is True.
+        overlap_param_gather (bool): Overlap parameter gathering if True. Default is True.
 
     Methods:
         __post_init__():
@@ -79,11 +86,9 @@ class NVFSDPManager:
         # init=False,
         metadata={"help": "Total number of processes."},
     )
-    nvfsdp_unit_modules: Optional[List[str]] = field(
-        default_factory=lambda: [
-            "transformers.models.llama.modeling_llama.LlamaDecoderLayer",
-        ],
-        metadata={"help": "List of unit modules to be wrapped with nvFSDP."},
+    zero_dp_strategy: Optional[int] = field(
+        default=3,
+        metadata={"help": "Zero DP strategy."},
     )
 
     # nvFSDP config
@@ -195,12 +200,9 @@ class NVFSDPManager:
         Raises:
             NotImplemented: If the required TP sharding plan is not supported.
         """
-        if self.data_parallel_sharding_strategy != "optim_grads_params":
+        if self.zero_dp_strategy != 3:
             if self.device_mesh.get_rank() == 0:
-                print(
-                    "Warning: nvFSDP data_parallel_sharding_strategy is not optim_grads_params. "
-                    "Parameters will not be sharded."
-                )
+                print("Warning: nvFSDP zero_dp_strategy != 3. Parameters will not be sharded.")
 
         if self.device_mesh["tensor_parallel"].size() > 1:
             if use_hf_tp_plan:
@@ -238,7 +240,7 @@ class NVFSDPManager:
             optimizer=optimizer,
             nvfsdp_unit_modules=self.nvfsdp_unit_modules,
             tp_shard_plan=tp_shard_plan,
-            data_parallel_sharding_strategy=self.data_parallel_sharding_strategy,
+            zero_dp_strategy=self.zero_dp_strategy,
             init_nvfsdp_with_meta_device=self.init_nvfsdp_with_meta_device,
             grad_reduce_in_fp32=self.grad_reduce_in_fp32,
             preserve_fp32_weights=self.preserve_fp32_weights,

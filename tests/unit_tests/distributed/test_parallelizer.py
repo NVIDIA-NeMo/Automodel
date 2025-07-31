@@ -712,9 +712,9 @@ class TestNvFSDPStrategyParallelize:
         # Verify nvfsdp_fully_shard was called with default mesh names
         mock_nvfsdp_env["nvfsdp"].fully_shard.assert_called_once()
         call_kwargs = mock_nvfsdp_env["nvfsdp"].fully_shard.call_args[1]
-        assert call_kwargs["dp_mesh_name"] == "data_parallel"
-        assert call_kwargs["tp_mesh_name"] == "tensor_parallel"
-        assert call_kwargs["cp_mesh_name"] == "context_parallel"
+        assert call_kwargs["dp_mesh_dim_name"] == "data_parallel"
+        assert call_kwargs["tp_mesh_dim_name"] == "tensor_parallel"
+        assert call_kwargs["cp_mesh_dim_name"] == "context_parallel"
 
     def test_nvfsdp_with_custom_mesh_names(self, mock_nvfsdp_env):
         """Test nvFSDP with custom mesh names."""
@@ -756,9 +756,9 @@ class TestNvFSDPStrategyParallelize:
         # Verify nvfsdp_fully_shard was called with custom mesh names
         mock_nvfsdp_env["nvfsdp"].fully_shard.assert_called_once()
         call_kwargs = mock_nvfsdp_env["nvfsdp"].fully_shard.call_args[1]
-        assert call_kwargs["dp_mesh_name"] == "my_dp"
-        assert call_kwargs["tp_mesh_name"] == "my_tp"
-        assert call_kwargs["cp_mesh_name"] == "my_cp"
+        assert call_kwargs["dp_mesh_dim_name"] == "my_dp"
+        assert call_kwargs["tp_mesh_dim_name"] == "my_tp"
+        assert call_kwargs["cp_mesh_dim_name"] == "my_cp"
 
     def test_nvfsdp_with_tensor_parallelism_custom_names(self, mock_nvfsdp_env):
         """Test nvFSDP with tensor parallelism and custom mesh names."""
@@ -805,9 +805,9 @@ class TestNvFSDPStrategyParallelize:
         # Verify nvfsdp_fully_shard was called with custom mesh names
         mock_nvfsdp_env["nvfsdp"].fully_shard.assert_called_once()
         call_kwargs = mock_nvfsdp_env["nvfsdp"].fully_shard.call_args[1]
-        assert call_kwargs["dp_mesh_name"] == "custom_data"
-        assert call_kwargs["tp_mesh_name"] == "custom_tensor"
-        assert call_kwargs["cp_mesh_name"] == "custom_context"
+        assert call_kwargs["dp_mesh_dim_name"] == "custom_data"
+        assert call_kwargs["tp_mesh_dim_name"] == "custom_tensor"
+        assert call_kwargs["cp_mesh_dim_name"] == "custom_context"
 
     def test_nvfsdp_with_context_parallelism_custom_names(self, mock_nvfsdp_env):
         """Test nvFSDP with context parallelism and custom mesh names."""
@@ -849,7 +849,7 @@ class TestNvFSDPStrategyParallelize:
         # Verify nvfsdp_fully_shard was called with dp_cp_mesh_name set correctly
         mock_nvfsdp_env["nvfsdp"].fully_shard.assert_called_once()
         call_kwargs = mock_nvfsdp_env["nvfsdp"].fully_shard.call_args[1]
-        assert call_kwargs["dp_cp_mesh_name"] == "dp_cp"  # Should use default when CP > 1
+        assert call_kwargs["dp_cp_mesh_dim_name"] == "dp_cp"  # Should use default when CP > 1
 
     def test_nvfsdp_backward_compatibility(self, mock_device_mesh, mock_nvfsdp_env):
         """Test nvFSDP maintains backward compatibility with existing code."""
@@ -863,7 +863,7 @@ class TestNvFSDPStrategyParallelize:
             model=model,
             device_mesh=mesh,
             optimizer=optimizer,
-            data_parallel_sharding_strategy="optim_grads_params",
+            zero_dp_strategy=3,
             grad_reduce_in_fp32=True,
         )
 
@@ -875,9 +875,9 @@ class TestNvFSDPStrategyParallelize:
         # Verify nvfsdp_fully_shard was called with default names
         mock_nvfsdp_env["nvfsdp"].fully_shard.assert_called_once()
         call_kwargs = mock_nvfsdp_env["nvfsdp"].fully_shard.call_args[1]
-        assert call_kwargs["dp_mesh_name"] == "data_parallel"
-        assert call_kwargs["tp_mesh_name"] == "tensor_parallel"
-        assert call_kwargs["cp_mesh_name"] == "context_parallel"
+        assert call_kwargs["dp_mesh_dim_name"] == "data_parallel"
+        assert call_kwargs["tp_mesh_dim_name"] == "tensor_parallel"
+        assert call_kwargs["cp_mesh_dim_name"] == "context_parallel"
         assert call_kwargs["grad_reduce_in_fp32"] is True
 
     def test_nvfsdp_not_available_error(self, mock_device_mesh, monkeypatch):
