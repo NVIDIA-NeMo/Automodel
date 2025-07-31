@@ -14,7 +14,7 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_hellaswag_peft.yaml
+# torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_hellaswag_nvfsdp.yaml
 # Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
 
@@ -35,30 +35,19 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
-  torch_dtype: bf16
+  pretrained_model_name_or_path: meta-llama/Llama-3.1-70B
 
 checkpoint:
-  enabled: true
+  enabled: false
   checkpoint_dir: checkpoints/
-  model_save_format: safetensors # torch_save or safetensors
+  model_save_format: torch_save # torch_save or safetensors
   save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
-peft:
-  _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
-  dim: 8
-  alpha: 32
-  use_triton: True
-  # dtype needs a fix to resolve to type instead of string
-  # lora_dtype: torch.bfloat16
-
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  _target_: nemo_automodel.components.distributed.nvfsdp.NVFSDPManager
   dp_size: none
   tp_size: 1
   cp_size: 1
-  sequence_parallel: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -89,7 +78,7 @@ validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
   batch_size: 8
-  
+
 optimizer:
   _target_: torch.optim.Adam
   betas: [0.9, 0.999]
@@ -99,8 +88,8 @@ optimizer:
   # min_lr: 1.0e-5
 
 # Uncomment and configure for W&B logging
-# wandb:
-#   project: <your_wandb_project>
-#   entity: <your_wandb_entity>
-#   name: <your_wandb_exp_name>
-#   dir: <your_wandb_dir>
+wandb:
+  project: automodel-benchmark-boxiangw
+  entity: nvidia
+  name: nemo-automodel-llama31-70b-hellaswag-nvfsdp
+  dir: /lustre/fsw/portfolios/coreai/users/boxiangw/logs/
