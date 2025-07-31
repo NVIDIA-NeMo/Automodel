@@ -181,6 +181,8 @@ jobs:
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
           - script: L2_HF_Transformer_Fused_CE_SFT
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+          - script: L2_JSONL_Dataset_Checkpoint
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
           - script: L2_HF_Transformer_LLM_FSDP2_TP2
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
           - script: L2_HF_Transformer_LLM_nvFSDP_TP2

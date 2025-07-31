@@ -52,7 +52,7 @@ class StepScheduler(Stateful):
         self.step = start_step
         self.epoch = start_epoch
         self.num_epochs = num_epochs
-        self.epoch_len = len(dataloader)
+        self.epoch_len = getattr(dataloader, "epoch_len", None)
         self.grad_step = 0  # number of optimizer steps taken
         self.val_every_steps = val_every_steps
         self.max_steps = max_steps
@@ -78,7 +78,8 @@ class StepScheduler(Stateful):
         Set the epoch for the dataloader.
         """
         self.epoch = epoch
-        self.dataloader.sampler.set_epoch(epoch)
+        if hasattr(self.dataloader, "sampler"):
+            self.dataloader.sampler.set_epoch(epoch)
 
     @property
     def is_optim_step(self):
@@ -110,6 +111,10 @@ class StepScheduler(Stateful):
         Returns:
             bool: if true, the checkpoint should run.
         """
+        # For iterable datasets without epoch_len, only checkpoint based on steps
+        if self.epoch_len is None:
+            return (self.step % self.ckpt_every_steps) == 0 and self.step != 0
+
         batch_idx = self.step % self.epoch_len
         last_batch = self.epoch_len is not None and batch_idx == self.epoch_len - 1
         return ((self.step % self.ckpt_every_steps) == 0 and self.step != 0) or last_batch

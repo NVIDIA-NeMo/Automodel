@@ -19,16 +19,33 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
+from torch.utils.data import Dataset, IterableDataset
+from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 from nemo_automodel.components.checkpoint.checkpointing import (
+    load_dataloader,
     load_model,
     load_optimizer,
+    save_dataloader,
     save_model,
     save_optimizer,
 )
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+
+
+def is_dataloader(object):
+    """
+    Checks whether object is a dataloader.
+
+    Args:
+        object (any): the object to check.
+
+    Returns:
+        bool: returns True if object is a dataloader.
+    """
+    return isinstance(object, (StatefulDataLoader, IterableDataset, Dataset)) and has_load_restore_state(object)
 
 
 def has_load_restore_state(object):
@@ -107,7 +124,7 @@ class BaseRecipe:
             self.__dict__["__state_tracked"].add(key)
         super().__setattr__(key, value)
 
-    def save_checkpoint(self, epoch: int, step: int):
+    def save_checkpoint(self, epoch: int, step: int, device_mesh: torch.distributed.DeviceMesh):
         """
         Save the current training state as a checkpoint.
 
@@ -128,7 +145,7 @@ class BaseRecipe:
             print(f"Saving checkpoint to {path}", flush=True)
 
         # TODO(@adil-a): Change this when we create a LR scheduler class
-        model, optimizer, scheduler, tokenizer = None, None, None, None
+        model, optimizer, scheduler, tokenizer, dataloader = None, None, None, None, None
 
         for key in self.__dict__["__state_tracked"]:
             if isinstance(getattr(self, key), nn.Module):
@@ -139,6 +156,8 @@ class BaseRecipe:
                 scheduler = getattr(self, key)
             elif is_tokenizer(getattr(self, key)):
                 tokenizer = getattr(self, key)
+            elif is_dataloader(getattr(self, key)):
+                dataloader = getattr(self, key)
             else:
                 if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                     torch.save(
@@ -150,8 +169,9 @@ class BaseRecipe:
 
         save_model(model, path, self.checkpoint_config, peft_config=self.peft_config, tokenizer=tokenizer)
         save_optimizer(optimizer, model, path, scheduler)
+        save_dataloader(dataloader, path, device_mesh)
 
-    def load_checkpoint(self, restore_from: str | None = None):
+    def load_checkpoint(self, restore_from: str | None = None, device_mesh: torch.distributed.DeviceMesh = None):
         """
         Loads the latest checkpoint.
         """
@@ -173,7 +193,7 @@ class BaseRecipe:
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             print(f"Loading checkpoint from {ckpt_dir}", flush=True)
 
-        model, optimizer, scheduler = None, None, None
+        model, optimizer, scheduler, dataloader = None, None, None, None
 
         for key in self.__dict__["__state_tracked"]:
             if isinstance(getattr(self, key), nn.Module):
@@ -182,6 +202,8 @@ class BaseRecipe:
                 optimizer = getattr(self, key)
             elif is_lr_scheduler(getattr(self, key)):
                 scheduler = getattr(self, key)
+            elif is_dataloader(getattr(self, key)):
+                dataloader = getattr(self, key)
             elif is_tokenizer(getattr(self, key)):
                 # we don't need to load the tokenizer from the checkpoint
                 # we only save the tokenizer for consolidated checkpoints for downstream use
@@ -191,6 +213,7 @@ class BaseRecipe:
 
         load_model(model, ckpt_dir, self.checkpoint_config)
         load_optimizer(optimizer, model, ckpt_dir, scheduler)
+        load_dataloader(dataloader, ckpt_dir, device_mesh)
 
 
 def _find_latest_checkpoint(checkpoint_dir):

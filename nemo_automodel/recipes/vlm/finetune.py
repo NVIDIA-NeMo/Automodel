@@ -521,7 +521,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
         # Optionally resume
-        self.load_checkpoint(restore_from)
+        self.load_checkpoint(restore_from, self.device_mesh)
 
     # ------------------ main loop ------------------
     def run_train_validation_loop(self):
@@ -538,7 +538,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             for batch_idx, batch in enumerate(self.step_scheduler):
                 self._run_train_step(batch, self.step_scheduler.is_optim_step, 1.0)
                 if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(epoch, self.step_scheduler.step)
+                    self.save_checkpoint(epoch, self.step_scheduler.step, self.device_mesh)
 
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     self._run_validation_epoch()

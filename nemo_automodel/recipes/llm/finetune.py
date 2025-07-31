@@ -33,6 +33,7 @@ from wandb import Settings
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.llm.jsonl_dataset import JSONLDataset
 from nemo_automodel.components.datasets.llm.packed_sequence import PackedSequence
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
@@ -200,13 +201,18 @@ def build_dataloader(
         The instantiated DataLoader and tokenizer.
     """
     dist_sampler_kwargs = {
-        "shuffle": cfg_dl.get("shuffle", True),
+        "shuffle": cfg_dl.get("shuffle", True) if cfg_dl is not None else True,
     }
     if device_mesh is not None:
         dist_sampler_kwargs |= {
             "num_replicas": device_mesh["data_parallel"].size(),
             "rank": device_mesh["data_parallel"].get_local_rank(),
         }
+        jsonl_kwargs = {
+            "rank": device_mesh["data_parallel"].get_local_rank(),
+            "world_size": device_mesh["data_parallel"].size(),
+        }
+
     if "tokenizer" not in cfg_ds:
         tokenizer = AutoTokenizer.from_pretrained(cfg_model.pretrained_model_name_or_path)
     elif "_target_" not in cfg_ds.tokenizer:
@@ -215,7 +221,11 @@ def build_dataloader(
         tokenizer = cfg_ds.tokenizer.instantiate()
 
     with StatefulRNG(seed=seed, ranked=True):
-        ds = cfg_ds.instantiate(tokenizer=tokenizer)
+        if cfg_ds._target_ is JSONLDataset:
+            ds = cfg_ds.instantiate(tokenizer=tokenizer, seed=seed, **jsonl_kwargs)
+            return ds, tokenizer
+        else:
+            ds = cfg_ds.instantiate(tokenizer=tokenizer)
         # Apply packing if configured
         if getattr(cfg_ps, "packed_sequence_size", 0) > 0:
             logger.info(f"Packing dataset with size: {cfg_ps.packed_sequence_size}")
@@ -465,7 +475,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.loss_fn = build_loss_fn(self.cfg.loss_fn)
         self.dataloader, self.tokenizer = build_dataloader(
             self.cfg.dataset,
-            self.cfg.dataloader,
+            self.cfg.get("dataloader", None),
             self.cfg.model,
             self.cfg.get("packed_sequence", None),
             device_mesh=self.device_mesh,
@@ -479,7 +489,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             self.val_dataloader, _ = build_dataloader(
                 self.cfg.validation_dataset,
-                self.cfg.validation_dataloader,
+                self.cfg.get("validation_dataloader", None),
                 self.cfg.model,
                 cfg_ps=None,  # Use unpacked config for validation
                 device_mesh=self.device_mesh,
@@ -509,7 +519,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
         # Optionally resume
-        self.load_checkpoint(restore_from)
+        self.load_checkpoint(restore_from, self.device_mesh)
 
     # ------------------ main loop ------------------
     def run_train_validation_loop(self):
@@ -526,7 +536,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             for batch_idx, batch in enumerate(self.step_scheduler):
                 self._run_train_step(batch, self.step_scheduler.is_optim_step, 1.0)
                 if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(epoch, self.step_scheduler.step)
+                    self.save_checkpoint(epoch, self.step_scheduler.step, self.device_mesh)
 
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     self._run_validation_epoch()
