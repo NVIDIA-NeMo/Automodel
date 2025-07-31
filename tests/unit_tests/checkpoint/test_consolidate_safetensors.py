@@ -16,7 +16,6 @@ import os
 
 import pytest
 from fsspec.implementations.local import LocalFileSystem
-from pathlib import Path
 
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
     _write_sub_tensor_to_file_optimized,
@@ -38,7 +37,7 @@ def test_write_scalar_tensor(tmp_path):
     output_file = tmp_path / "scalar_tensor.bin"
     output_file.write_bytes(b"")  # create the file
 
-    # Fake scalar tensor payload (2-byte BF16 value 0x1234)
+    # Fake scalar tensor payload (2-byte BF16 value)
     sub_tensor_bytes = b"\x34\x12"
     element_size = len(sub_tensor_bytes)  # 2 bytes for BF16
 
