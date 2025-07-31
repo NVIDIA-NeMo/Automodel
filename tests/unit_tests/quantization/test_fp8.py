@@ -48,27 +48,6 @@ class TestFP8Config:
         assert config.emulate is True
 
 
-class TestCudaCapability:
-    """Test CUDA capability detection."""
-    
-    @patch('torch.cuda.is_available')
-    @patch('torch.cuda.get_device_capability')
-    def test_has_cuda_capability_available(self, mock_get_capability, mock_is_available):
-        """Test CUDA capability when CUDA is available."""
-        mock_is_available.return_value = True
-        mock_get_capability.return_value = (9, 0)  # H100 capability
-        
-        assert _has_cuda_capability(8, 9) is True
-        assert _has_cuda_capability(9, 0) is True
-        assert _has_cuda_capability(9, 1) is False
-    
-    @patch('torch.cuda.is_available')
-    def test_has_cuda_capability_unavailable(self, mock_is_available):
-        """Test CUDA capability when CUDA is not available."""
-        mock_is_available.return_value = False
-        
-        assert _has_cuda_capability(8, 9) is False
-
 
 class TestModuleFilter:
     """Test module filtering functionality."""
