@@ -24,11 +24,13 @@ HF_TRANSFORMER_VLM_SFT_NVFSDP_FILENAME = "L2_HF_Transformer_VLM_SFT_nvfsdp.sh"
 
 
 class TestHFTransformerVLM:
-    # def test_hf_transformer_vlm_fsdp2_tp2(self):
-    #     run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_FSDP2_TP2_FILENAME)
+    @pytest.mark.pleasefixme
+    def test_hf_transformer_vlm_fsdp2_tp2(self):
+        run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_FSDP2_TP2_FILENAME)
 
-    # def test_hf_transformer_vlm_nvfsdp_tp2(self):
-    #     run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_NVFSDP_TP2_FILENAME)
+    @pytest.mark.pleasefixme
+    def test_hf_transformer_vlm_nvfsdp_tp2(self):
+        run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_NVFSDP_TP2_FILENAME)
 
     def test_hf_transformer_vlm_fused_ce_sft(self):
         run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_FUSED_CE_SFT_FILENAME)
@@ -39,5 +41,6 @@ class TestHFTransformerVLM:
     def test_hf_transformer_vlm_sft(self):
         run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_SFT_FILENAME)
 
-    # def test_hf_transformer_vlm_sft_nvfsdp(self):
-    #     run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_SFT_NVFSDP_FILENAME)
+    @pytest.mark.pleasefixme
+    def test_hf_transformer_vlm_sft_nvfsdp(self):
+        run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_SFT_NVFSDP_FILENAME)
