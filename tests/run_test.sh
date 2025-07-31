@@ -53,8 +53,4 @@ coverage run \
     -o log_cli_level=INFO \
     -vs -m "not pleasefixme" --tb=short \
     $ADDITIONAL_ARGS
-
-if [[ $? -ne 0 ]]; then
-    echo "Pytest failure"
-    exit 1
-fi
+coverage combine

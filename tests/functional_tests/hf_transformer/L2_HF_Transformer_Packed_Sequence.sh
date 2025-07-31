@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+#!/bin/bash
+set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
+
 ## 12 packs get crated with 100 samples from squad dataset and packed sequence size 2048
 TRANSFORMERS_OFFLINE=1 coverage run -a --data-file=/workspace/.coverage --source=/workspace \
 examples/llm/finetune.py \

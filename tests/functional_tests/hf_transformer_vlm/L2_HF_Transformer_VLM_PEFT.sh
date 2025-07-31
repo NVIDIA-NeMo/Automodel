@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+#!/bin/bash
+set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
+
 TRANSFORMERS_OFFLINE=1 coverage run -a --data-file=/workspace/.coverage --source=/workspace \
 examples/vlm/finetune.py \
   --config examples/vlm/gemma_3_vl_4b_cord_v2_peft.yaml \

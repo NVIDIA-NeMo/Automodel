@@ -38,4 +38,3 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --distributed.tp_size 1 \
     --distributed.cp_size 1 \
     --distributed.sequence_parallel false
-coverage combine

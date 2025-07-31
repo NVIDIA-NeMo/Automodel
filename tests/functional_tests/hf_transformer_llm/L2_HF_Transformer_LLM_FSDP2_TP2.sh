@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+#!/bin/bash
+set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
+
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
 -m pytest examples/llm/finetune.py \
   --config examples/llm/llama_3_2_1b_squad.yaml \
@@ -31,4 +34,3 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
   --distributed.tp_size 2 \
   --distributed.cp_size 1 \
   --distributed.sequence_parallel false
-coverage combine
