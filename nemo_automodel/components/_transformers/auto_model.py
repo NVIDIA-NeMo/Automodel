@@ -30,7 +30,7 @@ from nemo_automodel.shared.utils import dtype_from_str
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 logger = logging.getLogger(__name__)
 
-from nemo_automodel.components.quantization import apply_fp8_to_model, HAVE_TORCHAO
+from nemo_automodel.components.quantization import apply_fp8_to_model
 
 
 def _assert_same_signature(original, patched):
@@ -113,7 +113,6 @@ def _patch_liger_kernel(model):
         raise RuntimeError("Failed to patch model")
 
 
-
 class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
     """
     Drop-in replacement for ``_BaseAutoModelClass`` that includes custom-kernels.
@@ -189,8 +188,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             are unavailable.
 
         Notes:
-            If kernel patching or FP8 quantization fails, the partially constructed 
-            model is deleted and the method recurses once with the failing 
+            If kernel patching or FP8 quantization fails, the partially constructed
+            model is deleted and the method recurses once with the failing
             optimization disabled.
         """
         torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
@@ -250,24 +249,25 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             if use_fp8:
                 if fp8_config is None:
                     raise ValueError("fp8_config must be provided when use_fp8=True")
-                
+
                 from nemo_automodel.components.quantization.fp8 import FP8Config
-                if hasattr(fp8_config, 'from_config_node'):
+
+                if hasattr(fp8_config, "from_config_node"):
                     # ConfigNode to FP8Config conversion
                     fp8_settings = FP8Config.from_config_node(fp8_config)
                 elif isinstance(fp8_config, FP8Config):
                     fp8_settings = fp8_config
                 else:
                     # Assume it's a dict-like object
-                    fp8_settings = FP8Config(**fp8_config.to_dict() if hasattr(fp8_config, 'to_dict') else fp8_config)
-                
+                    fp8_settings = FP8Config(**fp8_config.to_dict() if hasattr(fp8_config, "to_dict") else fp8_config)
+
                 model = apply_fp8_to_model(
                     model,
                     recipe_name=fp8_settings.recipe_name,
                     filter_fqns=fp8_settings.filter_fqns,
                     enable_fsdp_float8_all_gather=fp8_settings.enable_fsdp_float8_all_gather,
                     force_recompute_fp8_weight_in_bwd=fp8_settings.force_recompute_fp8_weight_in_bwd,
-                    emulate=fp8_settings.emulate
+                    emulate=fp8_settings.emulate,
                 )
         except RuntimeError:
             logging.warning("Retrying without FP8 quantization.")
@@ -382,23 +382,24 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             if use_fp8:
                 if fp8_config is None:
                     raise ValueError("fp8_config must be provided when use_fp8=True")
-                
+
                 from nemo_automodel.components.quantization.fp8 import FP8Config
-                if hasattr(fp8_config, 'from_config_node'):
+
+                if hasattr(fp8_config, "from_config_node"):
                     # ConfigNode to FP8Config conversion
                     fp8_settings = FP8Config.from_config_node(fp8_config)
                 elif isinstance(fp8_config, FP8Config):
                     fp8_settings = fp8_config
                 else:
-                    fp8_settings = FP8Config(**fp8_config.to_dict() if hasattr(fp8_config, 'to_dict') else fp8_config)
-                
+                    fp8_settings = FP8Config(**fp8_config.to_dict() if hasattr(fp8_config, "to_dict") else fp8_config)
+
                 model = apply_fp8_to_model(
                     model,
                     recipe_name=fp8_settings.recipe_name,
                     filter_fqns=fp8_settings.filter_fqns,
                     enable_fsdp_float8_all_gather=fp8_settings.enable_fsdp_float8_all_gather,
                     force_recompute_fp8_weight_in_bwd=fp8_settings.force_recompute_fp8_weight_in_bwd,
-                    emulate=fp8_settings.emulate
+                    emulate=fp8_settings.emulate,
                 )
         except RuntimeError:
             logging.warning("Retrying without FP8 quantization.")

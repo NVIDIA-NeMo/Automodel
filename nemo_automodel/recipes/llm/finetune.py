@@ -22,14 +22,13 @@ from typing import Any, Dict
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import wandb
 from torch.distributed.device_mesh import _mesh_resources
 from torch.utils.data import DataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from wandb import Settings
 
+import wandb
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -51,6 +50,7 @@ from nemo_automodel.components.utils.dist_utils import (
     rescale_gradients,
 )
 from nemo_automodel.recipes.base_recipe import BaseRecipe
+from wandb import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -99,9 +99,9 @@ def build_model_and_optimizer(
             )
         # Add FP8 config if provided
         if cfg_fp8 is not None:
-            kwargs['fp8_config'] = cfg_fp8.instantiate()
-            kwargs['use_fp8'] = True
-        
+            kwargs["fp8_config"] = cfg_fp8.instantiate()
+            kwargs["use_fp8"] = True
+
         model = cfg_model.instantiate(**kwargs)
         if freeze_embeddings:
             logging.info("Freezing embeddings")
@@ -239,13 +239,13 @@ def build_dataloader(
             drop_last=True,
             **dist_sampler_kwargs,
         )
-        
+
         # Handle collate_fn instantiation if it's a ConfigNode
         dl_kwargs = {"dataset": ds, "sampler": sampler}
         if hasattr(cfg_dl, "collate_fn") and hasattr(cfg_dl.collate_fn, "_target_"):
             collate_cfg = cfg_dl.collate_fn
             dl_kwargs["collate_fn"] = lambda batch: collate_cfg.instantiate(batch=batch)
-        
+
         return cfg_dl.instantiate(**dl_kwargs), tokenizer
 
 
@@ -548,17 +548,20 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
     # ------------------ helpers ------------------
     def _precompute_fp8_scales_if_enabled(self):
         """Precompute FP8 scales for FSDP if the model has FP8 layers enabled.
-        
+
         This optimizes FSDP communication by precomputing scales for all FP8 parameters
         in a single all-reduce operation instead of many small ones.
         """
-        if self.cfg.get("model.use_fp8", False) \
-        and self.cfg.get("model.fp8_recipe_name", None) == "tensorwise" \
-        and self.cfg.get("model.enable_fsdp_float8_all_gather", False) \
-        and self.cfg.get("model.precompute_float8_dynamic_scale_for_fsdp", False) \
-        and self.device_mesh['data_parallel'].size()>1: #TODO: make sure it's dp_shard>1 instead of dp_replicate>1
+        if (
+            self.cfg.get("model.use_fp8", False)
+            and self.cfg.get("model.fp8_recipe_name", None) == "tensorwise"
+            and self.cfg.get("model.enable_fsdp_float8_all_gather", False)
+            and self.cfg.get("model.precompute_float8_dynamic_scale_for_fsdp", False)
+            and self.device_mesh["data_parallel"].size() > 1
+        ):  # TODO: make sure it's dp_shard>1 instead of dp_replicate>1
             try:
                 from nemo_automodel.components.quantization import precompute_fp8_scales_for_fsdp
+
                 precompute_fp8_scales_for_fsdp(self.model)
             except Exception as e:
                 # Log warning but don't fail training
