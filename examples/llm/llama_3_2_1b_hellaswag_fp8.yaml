@@ -38,15 +38,6 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Meta-Llama-3.1-8B
   torch_dtype: bf16
-  # FP8 quantization configuration
-  use_fp8: true #if false, all config below will be ignored
-  fp8_recipe_name: tensorwise  # Options: tensorwise, rowwise, rowwise_with_gw_hp
-  enable_fsdp_float8_all_gather: true
-  precompute_float8_dynamic_scale_for_fsdp: true
-  force_recompute_fp8_weight_in_bwd: false
-  # More comprehensive filtering to avoid dimension alignment issues
-  fp8_filter_fqns: ["lm_head"]
-  fp8_emulate: false  # Set to true for testing on older GPUs without native FP8 support
 
 checkpoint:
   enabled: true
@@ -60,6 +51,15 @@ distributed:
   tp_size: 1
   cp_size: 1
   sequence_parallel: false
+
+fp8:
+  _target_: nemo_automodel.components.quantization.fp8.FP8Config
+  recipe_name: tensorwise  # Options: tensorwise, rowwise, rowwise_with_gw_hp
+  enable_fsdp_float8_all_gather: true
+  precompute_float8_dynamic_scale_for_fsdp: true
+  force_recompute_fp8_weight_in_bwd: false
+  filter_fqns: ["lm_head"]  # More comprehensive filtering to avoid dimension alignment issues
+  emulate: false  # Set to true for testing on older GPUs without native FP8 support
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
