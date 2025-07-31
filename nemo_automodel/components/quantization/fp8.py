@@ -7,8 +7,9 @@
 import logging
 import torch
 import torch.nn as nn
+from dataclasses import dataclass, field
 from functools import partial
-from typing import Optional, List
+from typing import Optional, List, Literal
 
 from nemo_automodel.shared.import_utils import MISSING_TORCHAO_MSG
 
@@ -20,6 +21,56 @@ try:
     HAVE_TORCHAO = True
 except ImportError:
     HAVE_TORCHAO = False
+
+
+@dataclass
+class FP8Config:
+    """Configuration for FP8 quantization settings."""
+    
+    recipe_name: Optional[Literal["tensorwise", "rowwise", "rowwise_with_gw_hp"]] = None
+    """FP8 recipe to use. If None, uses tensorwise scaling with manual configuration."""
+    
+    enable_fsdp_float8_all_gather: bool = False
+    """Whether to enable float8 all-gather in FSDP, recommended for tensorwise scaling."""
+    
+    precompute_float8_dynamic_scale_for_fsdp: bool = False
+    """Whether to precompute float8 scales dynamically for FSDP, recommended for tensorwise scaling."""
+    
+    force_recompute_fp8_weight_in_bwd: bool = False
+    """Whether to force the recomputation of FP8 weights during backward pass."""
+    
+    filter_fqns: List[str] = field(default_factory=list)
+    """
+    List of fully qualified names of modules to skip applying float8 training to.
+    nn.Linear modules with any dim size not divisible by 16 are always skipped due to hardware requirements.
+    Example: ["attention.wq", "attention.wk", "attention.wv", "lm_head"]
+    """
+    
+    emulate: bool = False
+    """If True, emulation is used instead of hardware accelerated gemm. This is for test purpose only"""
+    
+    @classmethod
+    def from_config_node(cls, config_node):
+        """Create FP8Config from a configuration node."""
+        if config_node is None:
+            return cls()
+        
+        kwargs = {}
+        for field_name in cls.__dataclass_fields__:
+            if hasattr(config_node, field_name):
+                kwargs[field_name] = getattr(config_node, field_name)
+        
+        return cls(**kwargs)
+    
+    def to_dict(self):
+        return {
+            'fp8_recipe_name': self.recipe_name,
+            'enable_fsdp_float8_all_gather': self.enable_fsdp_float8_all_gather,
+            'precompute_float8_dynamic_scale_for_fsdp': self.precompute_float8_dynamic_scale_for_fsdp,
+            'force_recompute_fp8_weight_in_bwd': self.force_recompute_fp8_weight_in_bwd,
+            'fp8_filter_fqns': self.filter_fqns,
+            'fp8_emulate': self.emulate,
+        }
 
 
 def _has_cuda_capability(major: int, minor: int) -> bool:

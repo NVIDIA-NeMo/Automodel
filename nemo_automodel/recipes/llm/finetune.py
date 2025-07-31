@@ -69,6 +69,7 @@ def build_model_and_optimizer(
     seed,
     tp_size=1,
     freeze_embeddings=True,
+    cfg_fp8=None,
 ) -> tuple[nn.Module, "Optimizer"]:  # noqa: F821
     """
     Build and initialize a model and optimizer.
@@ -96,6 +97,11 @@ def build_model_and_optimizer(
                 "Packed sequence is supported only with Flash Attention. "
                 "Setting model's attn_implementation to flash_attention_2"
             )
+        # Add FP8 config if provided
+        if cfg_fp8 is not None:
+            kwargs['fp8_config'] = cfg_fp8.instantiate()
+            kwargs['use_fp8'] = True
+        
         model = cfg_model.instantiate(**kwargs)
         if freeze_embeddings:
             logging.info("Freezing embeddings")
@@ -468,6 +474,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.model_wrapper,
             seed=self.cfg.get("seed", 42),
             tp_size=self.cfg.get("distributed.tp_size", 1),
+            cfg_fp8=self.cfg.get("fp8", None),
         )
         self.loss_fn = build_loss_fn(self.cfg.loss_fn)
         self.dataloader, self.tokenizer = build_dataloader(
