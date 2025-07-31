@@ -188,10 +188,9 @@ def apply_fp8_to_model(
     )
 
     logger.info(
-        f"**Successfully converted model to FP8. \n"
-        f"**Recipe: {recipe_name or 'tensorwise'}\n"
-        f"**FSDP all-gather enabled: {config.enable_fsdp_float8_all_gather}\n"
-        f"**Force recompute FP8 weight in backward pass: {config.force_recompute_fp8_weight_in_bwd}\n"
+        f"Successfully converted model to FP8 with torchAO, recipe: {recipe_name or 'tensorwise'}, "
+        f"fp8 all-gather enabled: {config.enable_fsdp_float8_all_gather}, "
+        f"force recompute FP8 weight in backward pass: {config.force_recompute_fp8_weight_in_bwd}"
     )
     verify_fp8_conversion(model)
     
@@ -237,9 +236,7 @@ def verify_fp8_conversion(model: nn.Module) -> dict:
                 })
                 logger.debug(f"Found Float8Linear by name: {name} ({module_type})")
     
-    logger.info(f"-"*50)
-    logger.info(f"FP8 verification: {len(fp8_modules)} Float8Linear modules, {total_linear} total linear modules")
-    logger.info(f"-"*50+"\n")
+    logger.info(f"FP8 conversion: {len(fp8_modules)} Float8Linear modules, {total_linear} total linear modules")
     return {
         'linear_count': total_linear,
         'fp8_count': len(fp8_modules),
