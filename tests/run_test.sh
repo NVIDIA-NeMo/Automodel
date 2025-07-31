@@ -53,4 +53,3 @@ coverage run \
     -o log_cli_level=INFO \
     -vs -m "not pleasefixme" --tb=short \
     $ADDITIONAL_ARGS
-coverage combine
