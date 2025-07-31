@@ -300,10 +300,16 @@ class ColumnMappedTextInstructionDataset(Dataset):
 
         assert isinstance(column_mapping, dict), "Expected column_mapping to be a dictionary"
         # Ensure required columns are present
-        assert ColumnTypes.Question.value in column_mapping, ("Expected question to be in column_mapping", column_mapping)
+        assert ColumnTypes.Question.value in column_mapping, (
+            "Expected question to be in column_mapping",
+            column_mapping,
+        )
         assert ColumnTypes.Answer.value in column_mapping, ("Expected answer to be in column_mapping", column_mapping)
         if len(column_mapping) == 3:
-            assert ColumnTypes.Context.value in column_mapping, ("Expected context to be in column_mapping", column_mapping)
+            assert ColumnTypes.Context.value in column_mapping, (
+                "Expected context to be in column_mapping",
+                column_mapping,
+            )
 
         self.column_mapping = column_mapping
 
