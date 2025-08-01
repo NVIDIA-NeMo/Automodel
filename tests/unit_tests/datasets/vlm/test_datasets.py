@@ -183,13 +183,13 @@ def test_make_cv17_dataset(monkeypatch):
         def __init__(self, data):
             self.data = data
             self.column_names = ["audio", "transcription", "extra_col1", "extra_col2", "unwanted_col"]
-        
+
         def remove_columns(self, columns_to_remove):
             # Simulate column removal
             expected_removed = ["extra_col1", "extra_col2", "unwanted_col"]
             assert set(columns_to_remove) == set(expected_removed)
             return self.data
-        
+
         def __iter__(self):
             return iter(self.data)
 
@@ -209,7 +209,7 @@ def test_make_cv17_dataset(monkeypatch):
             "transcription": "Bu bir test cümlesidir."
         },
     ]
-    
+
     mock_dataset = MockDataset(fake_audio_data)
 
     # Patch `load_dataset` so no network call is issued

@@ -466,26 +466,10 @@ class TestFSDP2StrategyParallelize:
         result = fsdp2_strategy_parallelize(
             model=model,
             device_mesh=mesh,
-            param_dtype=torch.float16,
         )
 
         assert result is model
         # Verify mixed precision policy was created
-        mock_distributed_env["fsdp"].fully_shard.assert_called()
-
-    def test_cpu_offload_policy(self, mock_device_mesh, mock_distributed_env):
-        """Test CPU offload policy configuration."""
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
-
-        model = MockModel()
-
-        result = fsdp2_strategy_parallelize(
-            model=model,
-            device_mesh=mesh,
-            cpu_offload=True,
-        )
-
-        assert result is model
         mock_distributed_env["fsdp"].fully_shard.assert_called()
 
     def test_sequence_parallel_with_optimized_plan(self, mock_device_mesh, mock_distributed_env, mock_optimized_tp_plans):
@@ -596,7 +580,6 @@ class TestFSDP2StrategyParallelize:
             device_mesh=mesh,
             dp_mesh_name="custom_dp",
             tp_mesh_name="custom_tp",
-            dp_cp_mesh_name="custom_dp_cp",
         )
 
         assert result is model
@@ -640,7 +623,6 @@ class TestFSDP2StrategyParallelize:
             device_mesh=mesh,
             dp_mesh_name="my_dp",
             tp_mesh_name="my_tp",
-            dp_cp_mesh_name="my_dp_cp",
         )
 
         assert result is model
@@ -677,7 +659,6 @@ class TestFSDP2StrategyParallelize:
             tp_shard_plan=custom_plan,
             dp_mesh_name="my_data_parallel",
             tp_mesh_name="my_tensor_parallel",
-            dp_cp_mesh_name="my_dp_cp",
         )
 
         assert result is model
@@ -1175,10 +1156,8 @@ class TestFSDP2StrategyEndToEnd:
             result = fsdp2_strategy_parallelize(
                 model=model,
                 device_mesh=mesh,
-                param_dtype=torch.bfloat16,
                 sequence_parallel=False,
                 activation_checkpointing=True,
-                cpu_offload=False,
             )
 
         assert result is model

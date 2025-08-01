@@ -453,17 +453,17 @@ class DummyPhi4Processor:
         """Process text and audio inputs."""
         assert return_tensors == "pt"
         bs = len(text)
-        
+
         # Create deterministic input_ids that include both user and assistant parts
         # User part: [1, 2, 3] Assistant part: [4, 5]
         input_ids = torch.tensor([[1, 2, 3, 4, 5] for _ in range(bs)])
-        
+
         # Mock audio embeddings
         audio_embed_dim = 64
         audio_seq_len = 10
         input_audio_embeds = torch.randn(bs, audio_seq_len, audio_embed_dim)
         audio_embed_sizes = torch.tensor([audio_seq_len] * bs)
-        
+
         return {
             "input_ids": input_ids,
             "input_audio_embeds": input_audio_embeds,
@@ -474,10 +474,10 @@ class DummyPhi4Processor:
 
 class DummyPhi4Tokenizer:
     """Mock tokenizer for phi4 processor."""
-    
+
     def __init__(self):
         self.pad_token_id = 0
-    
+
     def __call__(self, text, add_special_tokens=False):
         """Tokenize text content - used for finding assistant content in input_ids."""
         # Map common assistant responses to token sequences
@@ -487,7 +487,7 @@ class DummyPhi4Tokenizer:
             return {"input_ids": [4, 5]}  # Same tokens for simplicity
         else:
             return {"input_ids": [10, 11]}  # Default tokens that won't match
-    
+
     def decode(self, tokens, skip_special_tokens=False):
         """Mock decode method."""
         return f"decoded:{tokens.tolist()}"
@@ -496,7 +496,7 @@ class DummyPhi4Tokenizer:
 def test_phi4_mm_collate_fn(collate_mod):
     """Test basic functionality of phi4_mm_collate_fn."""
     processor = DummyPhi4Processor()
-    
+
     examples = [
         {
             "conversation": [
@@ -519,30 +519,30 @@ def test_phi4_mm_collate_fn(collate_mod):
             }
         }
     ]
-    
+
     batch = collate_mod.phi4_mm_collate_fn(examples, processor)
-    
+
     # Check basic structure
     assert "input_ids" in batch
     assert "labels" in batch
     assert "loss_mask" in batch
     assert "input_audio_embeds" in batch
     assert "audio_embed_sizes" in batch
-    
+
     # Check shapes - labels and loss_mask should have same length as input_ids
     assert batch["input_ids"].shape == batch["labels"].shape
     assert batch["input_ids"].shape == batch["loss_mask"].shape
-    
+
     # Check batch size
     assert batch["input_ids"].shape[0] == 2
-    
+
     # Check that labels are properly created with -100 padding
     assert batch["labels"].shape[1] == batch["input_ids"].shape[1]
-    
+
     # Check audio embeddings
     assert batch["input_audio_embeds"].dim() == 3  # (batch, seq_len, embed_dim)
     assert batch["audio_embed_sizes"].shape[0] == 2
-    
+
     # Verify no unwanted keys remain
     assert "input_image_embeds" not in batch
     assert "image_sizes" not in batch
@@ -552,7 +552,7 @@ def test_phi4_mm_collate_fn(collate_mod):
 def test_phi4_mm_collate_fn_labels_and_loss_mask(collate_mod):
     """Test that labels and loss_mask are created correctly."""
     processor = DummyPhi4Processor()
-    
+
     examples = [
         {
             "conversation": [
@@ -565,23 +565,22 @@ def test_phi4_mm_collate_fn_labels_and_loss_mask(collate_mod):
             }
         }
     ]
-    
+
     batch = collate_mod.phi4_mm_collate_fn(examples, processor)
-    
+
     # Check that input_ids, labels, and loss_mask have same length
     input_ids = batch["input_ids"][0]
-    labels = batch["labels"][0]  
+    labels = batch["labels"][0]
     loss_mask = batch["loss_mask"][0]
-    
+
     assert len(input_ids) == len(labels) == len(loss_mask)
-    
+
     # Loss mask should have 1s where assistant tokens are found
     # Our mock sets assistant tokens [4, 5] to be at positions 3, 4 in input_ids [1, 2, 3, 4, 5]
     expected_loss_mask = [0, 0, 0, 1, 1]  # Only assistant tokens unmasked
     assert loss_mask.tolist() == expected_loss_mask
-    
+
     # Labels should have -100 where loss_mask is 0
     for i, mask_val in enumerate(loss_mask):
         if mask_val == 0:
             assert labels[i] == -100
-

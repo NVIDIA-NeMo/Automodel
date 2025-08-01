@@ -168,4 +168,4 @@ def test_build_model_and_optimizer_basic():
     # Optimizer should hold only trainable parameters
     trainable_param_count = _count_trainable(model.parameters())
     optim_param_count = sum(p.numel() for group in optim.param_groups for p in group["params"])
-    assert trainable_param_count == optim_param_count 
+    assert trainable_param_count == optim_param_count

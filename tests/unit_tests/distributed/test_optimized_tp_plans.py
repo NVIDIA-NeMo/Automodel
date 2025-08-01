@@ -257,7 +257,7 @@ class TestParallelizeFunctions:
             "model.rotary_emb_local",
             "model.layers.*.input_layernorm",
             "model.norm",
-            "model.lm_head",
+            "lm_head",
         ]
 
         for pattern in sequence_patterns:
@@ -294,14 +294,16 @@ class TestParallelizeFunctions:
         assert isinstance(result["model.embed_tokens"], RowwiseParallel)
         assert isinstance(result["lm_head"], ColwiseParallel)
 
-    def test_parallelize_llama_tied_embeddings_error(self):
-        """Test _parallelize_llama raises error with tied embeddings."""
+    def test_parallelize_llama_tied_embeddings_works(self):
+        """Test _parallelize_llama works with tied embeddings."""
         model = MockModel("llama", tie_word_embeddings=True)
 
-        with pytest.raises(AssertionError) as exc_info:
-            _parallelize_llama(model, sequence_parallel=False)
+        # Should not raise an error
+        result = _parallelize_llama(model, sequence_parallel=False)
 
-        assert "Tie word embeddings not supported" in str(exc_info.value)
+        # Should return a valid parallelization plan
+        assert isinstance(result, dict)
+        assert len(result) > 0
 
     def test_parallelize_llama_with_sequence_parallel(self):
         """Test _parallelize_llama with sequence parallelism."""
@@ -345,14 +347,16 @@ class TestParallelizeFunctions:
         for pattern in expected_patterns:
             assert pattern in result
 
-    def test_parallelize_qwen_tied_embeddings_error(self):
-        """Test _parallelize_qwen raises error with tied embeddings."""
+    def test_parallelize_qwen_tied_embeddings_works(self):
+        """Test _parallelize_qwen works with tied embeddings."""
         model = MockModel("qwen2", tie_word_embeddings=True)
 
-        with pytest.raises(AssertionError) as exc_info:
-            _parallelize_qwen(model, sequence_parallel=False)
+        # Should not raise an error
+        result = _parallelize_qwen(model, sequence_parallel=False)
 
-        assert "Tie word embeddings not supported" in str(exc_info.value)
+        # Should return a valid parallelization plan
+        assert isinstance(result, dict)
+        assert len(result) > 0
 
     def test_parallelize_qwen_with_sequence_parallel(self):
         """Test _parallelize_qwen with sequence parallelism."""
