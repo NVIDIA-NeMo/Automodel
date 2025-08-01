@@ -226,8 +226,6 @@ def fsdp2_strategy_parallelize(
     activation_checkpointing: bool = False,
     cpu_offload: bool = False,
     tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
-    dp_mesh_name: str = "dp",
-    dp_cp_mesh_name: str = "dp_cp",
     dp_replicate_mesh_name: str = "dp_replicate",
     dp_shard_cp_mesh_name: str = "dp_shard_cp",
     tp_mesh_name: str = "tp",
@@ -257,16 +255,12 @@ def fsdp2_strategy_parallelize(
             - A dictionary mapping module names to parallel styles
             - A string path to a dictionary or function that returns a dictionary
             If provided, this takes precedence over automatic plan generation.
-        dp_mesh_name (str): Key name for the data parallel mesh in device_mesh.
-            Defaults to "data_parallel".
-        dp_cp_mesh_name (str): Key name for the data parallel + context parallel mesh in device_mesh.
-            Used when context parallelism is enabled. Defaults to "dp_cp".
         dp_replicate_mesh_name (str): Key name for the data parallel replicate mesh in device_mesh.
             Used when data parallel replicate is enabled. Defaults to "dp_replicate".
         dp_shard_cp_mesh_name (str): Key name for the data parallel shard + context parallel mesh in device_mesh.
             Used when data parallel shard is enabled. Defaults to "dp_shard_cp".
         tp_mesh_name (str): Key name for the tensor parallel mesh in device_mesh.
-            Defaults to "tensor_parallel".
+            Defaults to "tp".
 
     Returns:
         The parallelized model.
