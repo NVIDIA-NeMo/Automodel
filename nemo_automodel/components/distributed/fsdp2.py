@@ -163,7 +163,7 @@ class FSDP2Manager:
         # dp_shard_size < dp_size since ddp usecase is not supported by FSDP2, need to use DDPManager instead
         # TODO(boxiangw): Call DDPManager instead of FSDP2Manager for ddp usecase?
         assert self.dp_size % self.dp_replicate_size == 0, "dp_size must be a multiple of dp_replicate_size"
-        assert self.dp_replicate_size < self.dp_size, (
+        assert self.dp_replicate_size < self.dp_size or self.dp_replicate_size == 1, (
             "dp_replicate_size must be less than dp_size since ddp usecase is not supported by FSDP2"
         )
 
