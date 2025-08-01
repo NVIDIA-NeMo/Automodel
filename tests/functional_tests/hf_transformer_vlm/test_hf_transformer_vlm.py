@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from tests.utils.test_utils import run_test_script
 
 TEST_FOLDER = "hf_transformer_vlm"
