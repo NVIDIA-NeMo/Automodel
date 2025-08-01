@@ -202,7 +202,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 attn_implementation=override.get("attn_implementation", attn_implementation),
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
-                                sdpa_method=sdpa_method,
+                sdpa_method=sdpa_method,
                 fp8_config=override.get("fp8_config", fp8_config),
                 **kwargs,
             )
@@ -246,7 +246,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         try:
             if fp8_config is not None:
                 # Ensure precompute is only True when recipe is tensorwise and enable_fsdp_float8_all_gather is True
-                model.precompute_float8_dynamic_scale_for_fsdp = fp8_config.precompute_float8_dynamic_scale_for_fsdp and fp8_config.recipe_name == "tensorwise" and fp8_config.enable_fsdp_float8_all_gather
+                model.precompute_float8_dynamic_scale_for_fsdp = (
+                    fp8_config.precompute_float8_dynamic_scale_for_fsdp
+                    and fp8_config.recipe_name == "tensorwise"
+                    and fp8_config.enable_fsdp_float8_all_gather
+                )
                 model = apply_fp8_to_model(
                     model,
                     recipe_name=fp8_config.recipe_name,
@@ -255,7 +259,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     force_recompute_fp8_weight_in_bwd=fp8_config.force_recompute_fp8_weight_in_bwd,
                     emulate=fp8_config.emulate,
                 )
-                
+
         except RuntimeError:
             logging.warning("Retrying without FP8 quantization.")
             return _retry(fp8_config=None)
@@ -323,7 +327,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 attn_implementation=override.get("attn_implementation", attn_implementation),
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
-                                sdpa_method=sdpa_method,
+                sdpa_method=sdpa_method,
                 fp8_config=override.get("fp8_config", fp8_config),
                 **kwargs,
             )
@@ -366,7 +370,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         try:
             if fp8_config is not None:
                 # Ensure precompute is only True when recipe is tensorwise and enable_fsdp_float8_all_gather is True
-                fp8_config.precompute_float8_dynamic_scale_for_fsdp = fp8_config.precompute_float8_dynamic_scale_for_fsdp and fp8_config.recipe_name == "tensorwise" and fp8_config.enable_fsdp_float8_all_gather
+                fp8_config.precompute_float8_dynamic_scale_for_fsdp = (
+                    fp8_config.precompute_float8_dynamic_scale_for_fsdp
+                    and fp8_config.recipe_name == "tensorwise"
+                    and fp8_config.enable_fsdp_float8_all_gather
+                )
                 model = apply_fp8_to_model(
                     model,
                     recipe_name=fp8_config.recipe_name,

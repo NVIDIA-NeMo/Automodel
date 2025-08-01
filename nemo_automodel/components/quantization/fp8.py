@@ -17,7 +17,7 @@ from nemo_automodel.shared.import_utils import MISSING_TORCHAO_MSG
 logger = logging.getLogger(__name__)
 
 try:
-    from torchao.float8 import Float8LinearConfig, convert_to_float8_training, precompute_float8_dynamic_scale_for_fsdp
+    from torchao.float8 import Float8LinearConfig, convert_to_float8_training
 
     HAVE_TORCHAO = True
 except ImportError:
@@ -246,4 +246,3 @@ def verify_fp8_conversion(model: nn.Module) -> dict:
         "fp8_modules": fp8_modules,
         "success": len(fp8_modules) > 0,
     }
-

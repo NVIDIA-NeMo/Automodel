@@ -23,9 +23,9 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import wandb
-from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torch.distributed.device_mesh import _mesh_resources
 from torch.utils.data import DataLoader
+from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 from wandb import Settings
@@ -551,7 +551,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     self._run_validation_epoch()
 
-
     def _run_train_step(self, batch, is_optim_step, clip_norm=1.0):
         """Execute a single training step.
 
@@ -639,7 +638,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
             # Precompute FP8 scales
             # TODO: make sure it's dp_shard>1 instead of dp_replicate>1
-            if self.cfg.get("fp8", None) is not None and self.model.precompute_float8_dynamic_scale_for_fsdp and self.device_mesh["data_parallel"].size() > 1:
+            if (
+                self.cfg.get("fp8", None) is not None
+                and self.model.precompute_float8_dynamic_scale_for_fsdp
+                and self.device_mesh["data_parallel"].size() > 1
+            ):
                 precompute_float8_dynamic_scale_for_fsdp(self.model)
 
             if self.lr_scheduler is not None:

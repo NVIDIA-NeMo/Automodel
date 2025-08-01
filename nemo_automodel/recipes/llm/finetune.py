@@ -23,9 +23,9 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import wandb
-from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torch.distributed.device_mesh import _mesh_resources
 from torch.utils.data import DataLoader
+from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -633,7 +633,11 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             # Precompute FP8 scales
             # TODO: make sure it's dp_shard>1 instead of dp_replicate>1
-            if self.cfg.get("fp8", None) is not None and self.model.precompute_float8_dynamic_scale_for_fsdp and self.device_mesh["data_parallel"].size() > 1:
+            if (
+                self.cfg.get("fp8", None) is not None
+                and self.model.precompute_float8_dynamic_scale_for_fsdp
+                and self.device_mesh["data_parallel"].size() > 1
+            ):
                 precompute_float8_dynamic_scale_for_fsdp(self.model)
 
             if self.lr_scheduler is not None:
