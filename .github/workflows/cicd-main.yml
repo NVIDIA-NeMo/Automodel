@@ -109,15 +109,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - script: L0_Unit_Tests_GPU
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-            timeout: 30
-          - script: L0_Unit_Tests_CPU
+          - test-name: L0_Unit_Tests_CPU
             runner: linux-amd64-cpu16
             cpu-only: true
+          - test-name: L0_Unit_Tests_GPU
+            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+            cpu-only: false
+            timeout: 30
     needs: [pre-flight, cicd-wait-in-queue]
     runs-on: ${{ matrix.runner }}
-    name: ${{ matrix.script }}
+    name: ${{ matrix.test-name }}
     environment: nemo-ci
     if: |
       (
@@ -132,9 +133,8 @@ jobs:
       - name: main
         uses: ./.github/actions/test-template
         with:
-          script: ${{ matrix.script }}
           timeout: ${{ matrix.timeout || 10 }}
-          is_unit_test: "true"
+          is-unit-test: "true"
           cpu-only: ${{ matrix.cpu-only || false }}
           has-azure-credentials: "true"
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -147,53 +147,37 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - script: L2_HF_Transformer_SFT
+          - test-name: L2_HF_Consolidated_FSDP
+            test-folder: hf_consolidated_fsdp
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_Transformer_SFT_nvfsdp
+            timeout: 20
+          - test-name: L2_HF_DCP
+            test-folder: hf_dcp
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_Transformer_PEFT
+            timeout: 40
+          - test-name: L2_HF_PEFT
+            test-folder: hf_peft
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_Transformer_PEFT_nvfsdp
+            timeout: 30
+          - test-name: L2_HF_Transformer
+            test-folder: hf_transformer
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_DCP_FSDP2_Checkpoint
+            timeout: 20
+          - test-name: L2_HF_Transformer_Finetune
+            test-folder: hf_transformer_finetune
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_DCP_FSDP2_Checkpoint
+            timeout: 40
+          # - test-name: L2_HF_Transformer_LLM
+          #   test-folder: hf_transformer_llm
+          #   runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+          #   timeout: 20
+          - test-name: L2_HF_Transformer_VLM
+            test-folder: hf_transformer_vlm
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_Consolidated_FSDP2_LLM_Checkpoint
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_Consolidated_FSDP2_VLM_Checkpoint
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_PEFT_Triton_FSDP2_Checkpoint
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_PEFT_FSDP2_Checkpoint
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_Transformer_VLM_SFT
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_Transformer_VLM_PEFT
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_DCP_VLM_FSDP2_Checkpoint
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_DCP_VLM_FSDP2_Checkpoint
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_PEFT_VLM_FSDP2_Checkpoint
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_Transformer_VLM_Fused_CE_SFT
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_Transformer_Fused_CE_SFT
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_Transformer_LLM_FSDP2_TP2
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_Transformer_LLM_nvFSDP_TP2
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_Transformer_VLM_FSDP2_TP2
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_Transformer_VLM_nvFSDP_TP2
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_Transformer_VLM_SFT_nvfsdp
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+            timeout: 60
     needs: [cicd-unit-tests]
     runs-on: ${{ matrix.runner }}
-    name: ${{ matrix.script }}
+    name: ${{ matrix.test-name }}
     environment: nemo-ci
     if: |
       (
@@ -208,7 +192,8 @@ jobs:
       - name: main
         uses: ./.github/actions/test-template
         with:
-          script: ${{ matrix.script }}
+          test-folder: ${{ matrix.test-folder }}
+          timeout: ${{ matrix.timeout }}
           is_unit_test: "false"
           has-azure-credentials: "true"
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
