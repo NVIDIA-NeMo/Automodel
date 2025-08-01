@@ -27,6 +27,7 @@ from nemo_automodel.components._transformers.auto_model import (
     _patch_attention,
 )
 from nemo_automodel import __version__
+from nemo_automodel.components.quantization.fp8 import FP8Config
 
 
 class TestNeMoAutoModelForCausalLM:
@@ -507,3 +508,319 @@ def test_liger_apply_failure_raises(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Failed to patch model"):
         tgt._patch_liger_kernel(DummyModel())
+
+
+class TestNeMoAutoModelFP8Integration:
+    """Test cases for FP8 functionality in NeMo auto models."""
+    
+    def test_from_pretrained_without_fp8_config_works(self):
+        """Test that from_pretrained works normally without fp8_config."""
+        with (
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_from_pretrained,
+        ):
+            mock_model = MagicMock()
+            mock_model.config = {}
+            mock_from_pretrained.return_value = mock_model
+
+            # Should work fine without fp8_config - no FP8 will be applied
+            result = NeMoAutoModelForCausalLM.from_pretrained(
+                "hf-internal-testing/tiny-random-gpt2",
+                fp8_config=None
+            )
+            
+            assert result == mock_model
+            assert result.config["nemo_version"] == __version__
+    
+    def test_from_config_without_fp8_config_works(self):
+        """Test that from_config works normally without fp8_config."""
+        config = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
+        
+        with (
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch.object(transformers.AutoModelForCausalLM, "from_config") as mock_from_config,
+        ):
+            mock_model = MagicMock()
+            mock_model.config = {}
+            mock_from_config.return_value = mock_model
+
+            # Should work fine without fp8_config - no FP8 will be applied
+            result = NeMoAutoModelForCausalLM.from_config(
+                config,
+                fp8_config=None
+            )
+            
+            assert result == mock_model
+            assert result.config["nemo_version"] == __version__
+    
+    def test_from_pretrained_with_fp8_config_object(self):
+        """Test from_pretrained with FP8Config object."""
+        fp8_config = FP8Config(
+            recipe_name="tensorwise",
+            enable_fsdp_float8_all_gather=True,
+            filter_fqns=["lm_head"]
+        )
+        
+        with (
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_from_pretrained,
+            patch("nemo_automodel.components._transformers.auto_model.apply_fp8_to_model") as mock_apply_fp8,
+        ):
+            mock_model = MagicMock()
+            mock_model.config = {}
+            mock_from_pretrained.return_value = mock_model
+            mock_apply_fp8.return_value = mock_model
+
+            result = NeMoAutoModelForCausalLM.from_pretrained(
+                "hf-internal-testing/tiny-random-gpt2",
+                fp8_config=fp8_config
+            )
+
+            # Should call apply_fp8_to_model with correct parameters
+            mock_apply_fp8.assert_called_once()
+            call_kwargs = mock_apply_fp8.call_args[1]
+            assert call_kwargs['recipe_name'] == "tensorwise"
+            assert call_kwargs['enable_fsdp_float8_all_gather'] is True
+            assert call_kwargs['filter_fqns'] == ["lm_head"]
+            assert result.config["nemo_version"] == __version__
+    
+    def test_from_config_with_fp8_config_object(self):
+        """Test from_config with FP8Config object."""
+        config = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
+        fp8_config = FP8Config(
+            recipe_name="rowwise",
+            emulate=True,
+            filter_fqns=["embed_tokens"]
+        )
+        
+        with (
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch.object(transformers.AutoModelForCausalLM, "from_config") as mock_from_config,
+            patch("nemo_automodel.components._transformers.auto_model.apply_fp8_to_model") as mock_apply_fp8,
+        ):
+            mock_model = MagicMock()
+            mock_model.config = {}
+            mock_from_config.return_value = mock_model
+            mock_apply_fp8.return_value = mock_model
+
+            result = NeMoAutoModelForCausalLM.from_config(
+                config,
+                fp8_config=fp8_config
+            )
+
+            mock_apply_fp8.assert_called_once()
+            call_kwargs = mock_apply_fp8.call_args[1]
+            assert call_kwargs['recipe_name'] == "rowwise"
+            assert call_kwargs['emulate'] is True
+            assert call_kwargs['filter_fqns'] == ["embed_tokens"]
+            assert result.config["nemo_version"] == __version__
+    
+    def test_from_pretrained_with_fp8_config_direct_access(self):
+        """Test from_pretrained with fp8_config accessing attributes directly."""
+        fp8_config = FP8Config(
+            recipe_name="tensorwise",
+            emulate=False,
+            enable_fsdp_float8_all_gather=True,
+            precompute_float8_dynamic_scale_for_fsdp=True,
+            filter_fqns=["lm_head"]
+        )
+        
+        with (
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_from_pretrained,
+            patch("nemo_automodel.components._transformers.auto_model.apply_fp8_to_model") as mock_apply_fp8,
+        ):
+            mock_model = MagicMock()
+            mock_model.config = {}
+            mock_from_pretrained.return_value = mock_model
+            mock_apply_fp8.return_value = mock_model
+
+            result = NeMoAutoModelForCausalLM.from_pretrained(
+                "hf-internal-testing/tiny-random-gpt2",
+                fp8_config=fp8_config
+            )
+
+            mock_apply_fp8.assert_called_once()
+            call_kwargs = mock_apply_fp8.call_args[1]
+            assert call_kwargs['recipe_name'] == "tensorwise"
+            assert call_kwargs['emulate'] is False
+            assert call_kwargs['enable_fsdp_float8_all_gather'] is True
+            assert call_kwargs['filter_fqns'] == ["lm_head"]
+            
+            assert mock_model.precompute_float8_dynamic_scale_for_fsdp is True
+    
+    def test_from_pretrained_with_dict_like_object(self):
+        """Test from_pretrained with dict-like object."""
+        class MockDictLikeObject:
+            def __init__(self):
+                self.recipe_name = 'rowwise'
+                self.emulate = True
+                self.filter_fqns = ['lm_head']
+                self.enable_fsdp_float8_all_gather = False
+                self.force_recompute_fp8_weight_in_bwd = False
+                self.precompute_float8_dynamic_scale_for_fsdp = True
+                
+            def to_dict(self):
+                return {
+                    'recipe_name': self.recipe_name,
+                    'emulate': self.emulate,
+                    'filter_fqns': self.filter_fqns,
+                    'enable_fsdp_float8_all_gather': self.enable_fsdp_float8_all_gather,
+                    'force_recompute_fp8_weight_in_bwd': self.force_recompute_fp8_weight_in_bwd,
+                    'precompute_float8_dynamic_scale_for_fsdp': self.precompute_float8_dynamic_scale_for_fsdp
+                }
+        
+        mock_dict_obj = MockDictLikeObject()
+        
+        with (
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_from_pretrained,
+            patch("nemo_automodel.components._transformers.auto_model.apply_fp8_to_model") as mock_apply_fp8,
+        ):
+            mock_model = MagicMock()
+            mock_model.config = {}
+            mock_from_pretrained.return_value = mock_model
+            mock_apply_fp8.return_value = mock_model
+
+            result = NeMoAutoModelForCausalLM.from_pretrained(
+                "hf-internal-testing/tiny-random-gpt2",
+                fp8_config=mock_dict_obj
+            )
+
+            # Should call apply_fp8_to_model
+            mock_apply_fp8.assert_called_once()
+            call_kwargs = mock_apply_fp8.call_args[1]
+            assert call_kwargs['recipe_name'] == "rowwise"
+            assert call_kwargs['emulate'] is True
+            assert call_kwargs['filter_fqns'] == ['lm_head']
+            assert call_kwargs['enable_fsdp_float8_all_gather'] is False
+            assert call_kwargs['force_recompute_fp8_weight_in_bwd'] is False
+            
+            # Should set precompute flag on model (precompute=True, but recipe!=tensorwise and all_gather=False -> False)
+            assert mock_model.precompute_float8_dynamic_scale_for_fsdp is False
+    
+    def test_from_pretrained_precompute_logic_validation(self):
+        """Test that precompute is only True when recipe=tensorwise AND enable_fsdp_float8_all_gather=True."""
+        test_cases = [
+            # (precompute, recipe, all_gather, expected_result)
+            (True, "tensorwise", True, True),     # All conditions met -> True
+            (True, "tensorwise", False, False),   # Missing all_gather -> False
+            (True, "rowwise", True, False),       # Wrong recipe -> False
+            (True, "rowwise", False, False),      # Wrong recipe and missing all_gather -> False
+            (False, "tensorwise", True, False),   # precompute disabled -> False
+        ]
+        
+        for precompute, recipe, all_gather, expected in test_cases:
+            fp8_config = FP8Config(
+                recipe_name=recipe,
+                enable_fsdp_float8_all_gather=all_gather,
+                precompute_float8_dynamic_scale_for_fsdp=precompute,
+            )
+            
+            with (
+                patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+                patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_from_pretrained,
+                patch("nemo_automodel.components._transformers.auto_model.apply_fp8_to_model") as mock_apply_fp8,
+            ):
+                mock_model = MagicMock()
+                mock_model.config = {}
+                mock_from_pretrained.return_value = mock_model
+                mock_apply_fp8.return_value = mock_model
+
+                result = NeMoAutoModelForCausalLM.from_pretrained(
+                    "hf-internal-testing/tiny-random-gpt2",
+                    fp8_config=fp8_config
+                )
+
+                assert mock_model.precompute_float8_dynamic_scale_for_fsdp is expected, \
+                    f"Failed for precompute={precompute}, recipe={recipe}, all_gather={all_gather}. Expected {expected}, got {mock_model.precompute_float8_dynamic_scale_for_fsdp}"
+    
+    def test_from_pretrained_no_fp8_when_config_none(self):
+        """Test that no FP8 is applied when fp8_config is None."""
+        with (
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_from_pretrained,
+            patch("nemo_automodel.components._transformers.auto_model.apply_fp8_to_model") as mock_apply_fp8,
+        ):
+            mock_model = MagicMock()
+            mock_model.config = {}
+            mock_from_pretrained.return_value = mock_model
+
+            # Should work fine without fp8_config - no FP8 should be applied
+            result = NeMoAutoModelForCausalLM.from_pretrained(
+                "hf-internal-testing/tiny-random-gpt2",
+                fp8_config=None
+            )
+
+            assert result == mock_model
+            assert result.config["nemo_version"] == __version__
+            # The auto_model may have retry logic, so just check it was called
+            assert mock_from_pretrained.call_count >= 1
+            # FP8 should not be applied when fp8_config is None
+            mock_apply_fp8.assert_not_called()
+    
+    def test_from_pretrained_fp8_runtime_error_retry(self):
+        """Test that FP8 RuntimeError triggers retry without FP8."""
+        fp8_config = FP8Config(recipe_name="tensorwise")
+        
+        with (
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_from_pretrained,
+            patch("nemo_automodel.components._transformers.auto_model.apply_fp8_to_model") as mock_apply_fp8,
+        ):
+            mock_model = MagicMock()
+            mock_model.config = {}
+            mock_from_pretrained.return_value = mock_model
+            
+            # First call raises RuntimeError, second call (retry) should succeed
+            mock_apply_fp8.side_effect = [RuntimeError("FP8 failed"), mock_model]
+
+            with patch('logging.warning') as mock_warning:
+                result = NeMoAutoModelForCausalLM.from_pretrained(
+                    "hf-internal-testing/tiny-random-gpt2",
+                    fp8_config=fp8_config
+                )
+
+            # Should log warning about retrying without FP8
+            mock_warning.assert_called_with("Retrying without FP8 quantization.")
+            
+            # Should call from_pretrained multiple times due to retry logic
+            assert mock_from_pretrained.call_count >= 2
+            
+            # The FP8 application should only happen once (before the retry)
+            assert mock_apply_fp8.call_count == 1
+            
+            assert result.config["nemo_version"] == __version__
+    
+    def test_vlm_model_fp8_integration(self):
+        """Test that VLM models also support FP8 integration."""
+        fp8_config = FP8Config(
+            recipe_name="rowwise", 
+            emulate=True,
+            precompute_float8_dynamic_scale_for_fsdp=False,
+            enable_fsdp_float8_all_gather=False
+        )
+        
+        with (
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch.object(transformers.AutoModelForImageTextToText, "from_pretrained") as mock_from_pretrained,
+            patch("nemo_automodel.components._transformers.auto_model.apply_fp8_to_model") as mock_apply_fp8,
+        ):
+            mock_model = MagicMock()
+            mock_model.config = {}
+            mock_from_pretrained.return_value = mock_model
+            mock_apply_fp8.return_value = mock_model
+
+            result = NeMoAutoModelForImageTextToText.from_pretrained(
+                "microsoft/Phi-3.5-vision-instruct", 
+                fp8_config=fp8_config
+            )
+
+            mock_apply_fp8.assert_called_once()
+            call_kwargs = mock_apply_fp8.call_args[1]
+            assert call_kwargs['recipe_name'] == "rowwise"
+            assert call_kwargs['emulate'] is True
+            assert call_kwargs['enable_fsdp_float8_all_gather'] is False
+            assert result.config["nemo_version"] == __version__
+            
+            assert mock_model.precompute_float8_dynamic_scale_for_fsdp is False

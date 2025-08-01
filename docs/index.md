@@ -59,6 +59,7 @@ guides/vlm/dataset.md
 guides/checkpointing.md
 guides/llm/dataset.md
 guides/vlm/dataset.md
+guides/llm/column-mapped-text-instruction-dataset.md
 
 apidocs/index.rst
 ```

@@ -156,28 +156,30 @@ def mock_device_mesh():
     mesh.device_type = "cuda"
 
     # Mock submeshes
-    dp_mesh = MagicMock()
-    tp_mesh = MagicMock()
+    dp_replicate_mesh = MagicMock()
+    dp_shard_mesh = MagicMock()
     cp_mesh = MagicMock()
+    tp_mesh = MagicMock()
 
-    dp_mesh.size.return_value = 2
+    dp_replicate_mesh.size.return_value = 1
+    dp_shard_mesh.size.return_value = 2
     tp_mesh.size.return_value = 1
     cp_mesh.size.return_value = 1
 
-    dp_mesh.ndim = 1
+    dp_replicate_mesh.ndim = 1
+    dp_shard_mesh.ndim = 1
     tp_mesh.ndim = 1
     cp_mesh.ndim = 1
 
     # Configure mesh access
     mesh.__getitem__.side_effect = lambda key: {
-        "dp": dp_mesh,
+        "dp_replicate": dp_replicate_mesh,
+        "dp_shard": dp_shard_mesh,
         "tp": tp_mesh,
         "cp": cp_mesh,
-        "dp_cp": dp_mesh,
-        "dp_shard_cp": dp_mesh,
     }[key]
 
-    return mesh, dp_mesh, tp_mesh, cp_mesh
+    return mesh, dp_replicate_mesh, dp_shard_mesh, tp_mesh, cp_mesh
 
 
 @pytest.fixture
