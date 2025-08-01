@@ -532,8 +532,8 @@ class TestNeMoAutoModelFP8Integration:
             assert result == mock_model
             assert result.config["nemo_version"] == __version__
     
-    def test_from_config_use_fp8_requires_config(self):
-        """Test that use_fp8=True requires fp8_config parameter in from_config."""
+    def test_from_config_without_fp8_config_works(self):
+        """Test that from_config works normally without fp8_config."""
         config = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
         
         with (
@@ -544,13 +544,14 @@ class TestNeMoAutoModelFP8Integration:
             mock_model.config = {}
             mock_from_config.return_value = mock_model
 
-            # Should raise ValueError when use_fp8=True but fp8_config=None
-            with pytest.raises(ValueError, match="fp8_config must be provided when use_fp8=True"):
-                NeMoAutoModelForCausalLM.from_config(
-                    config,
-                    use_fp8=True,
-                    fp8_config=None
-                )
+            # Should work fine without fp8_config - no FP8 will be applied
+            result = NeMoAutoModelForCausalLM.from_config(
+                config,
+                fp8_config=None
+            )
+            
+            assert result == mock_model
+            assert result.config["nemo_version"] == __version__
     
     def test_from_pretrained_with_fp8_config_object(self):
         """Test from_pretrained with FP8Config object."""
@@ -572,7 +573,6 @@ class TestNeMoAutoModelFP8Integration:
 
             result = NeMoAutoModelForCausalLM.from_pretrained(
                 "hf-internal-testing/tiny-random-gpt2",
-                use_fp8=True,
                 fp8_config=fp8_config
             )
 
@@ -605,7 +605,6 @@ class TestNeMoAutoModelFP8Integration:
 
             result = NeMoAutoModelForCausalLM.from_config(
                 config,
-                use_fp8=True,
                 fp8_config=fp8_config
             )
 
@@ -646,7 +645,6 @@ class TestNeMoAutoModelFP8Integration:
 
             result = NeMoAutoModelForCausalLM.from_pretrained(
                 "hf-internal-testing/tiny-random-gpt2",
-                use_fp8=True,
                 fp8_config=mock_config_node
             )
 
@@ -685,7 +683,6 @@ class TestNeMoAutoModelFP8Integration:
 
             result = NeMoAutoModelForCausalLM.from_pretrained(
                 "hf-internal-testing/tiny-random-gpt2",
-                use_fp8=True,
                 fp8_config=mock_dict_obj
             )
 
@@ -696,20 +693,20 @@ class TestNeMoAutoModelFP8Integration:
             assert call_kwargs['emulate'] is True
             assert call_kwargs['filter_fqns'] == ['lm_head']
     
-    def test_from_pretrained_fp8_disabled_works_without_config(self):
-        """Test that use_fp8=False works without fp8_config."""
+    def test_from_pretrained_no_fp8_when_config_none(self):
+        """Test that no FP8 is applied when fp8_config is None."""
         with (
             patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
             patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_from_pretrained,
+            patch("nemo_automodel.components._transformers.auto_model.apply_fp8_to_model") as mock_apply_fp8,
         ):
             mock_model = MagicMock()
             mock_model.config = {}
             mock_from_pretrained.return_value = mock_model
 
-            # Should work fine without fp8_config when use_fp8=False
+            # Should work fine without fp8_config - no FP8 should be applied
             result = NeMoAutoModelForCausalLM.from_pretrained(
                 "hf-internal-testing/tiny-random-gpt2",
-                use_fp8=False,
                 fp8_config=None
             )
 
@@ -717,6 +714,8 @@ class TestNeMoAutoModelFP8Integration:
             assert result.config["nemo_version"] == __version__
             # The auto_model may have retry logic, so just check it was called
             assert mock_from_pretrained.call_count >= 1
+            # FP8 should not be applied when fp8_config is None
+            mock_apply_fp8.assert_not_called()
     
     def test_from_pretrained_fp8_runtime_error_retry(self):
         """Test that FP8 RuntimeError triggers retry without FP8."""
@@ -737,7 +736,6 @@ class TestNeMoAutoModelFP8Integration:
             with patch('logging.warning') as mock_warning:
                 result = NeMoAutoModelForCausalLM.from_pretrained(
                     "hf-internal-testing/tiny-random-gpt2",
-                    use_fp8=True,
                     fp8_config=fp8_config
                 )
 
@@ -768,7 +766,6 @@ class TestNeMoAutoModelFP8Integration:
 
             result = NeMoAutoModelForImageTextToText.from_pretrained(
                 "microsoft/Phi-3.5-vision-instruct", 
-                use_fp8=True,
                 fp8_config=fp8_config
             )
 

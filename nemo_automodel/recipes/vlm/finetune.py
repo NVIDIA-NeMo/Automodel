@@ -558,10 +558,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
         in a single all-reduce operation instead of many small ones.
         """
         if (
-            self.cfg.get("model.use_fp8", False)
-            and self.cfg.get("model.fp8_recipe_name", None) == "tensorwise"
-            and self.cfg.get("model.enable_fsdp_float8_all_gather", False)
-            and self.cfg.get("model.precompute_float8_dynamic_scale_for_fsdp", False)
+            self.cfg.get("fp8", None) is not None
+            and self.cfg.get("fp8.recipe_name", None) == "tensorwise"
+            and self.cfg.get("fp8.enable_fsdp_float8_all_gather", False)
+            and self.cfg.get("fp8.precompute_float8_dynamic_scale_for_fsdp", False)
             and self.device_mesh["data_parallel"].size() > 1
         ):  # TODO: make sure it's dp_shard>1 instead of dp_replicate>1
             try:
@@ -657,7 +657,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.optimizer.zero_grad()
 
             # Precompute FP8 scales
-            if self.cfg.get("model.use_fp8", False):
+            if self.cfg.get("fp8", None) is not None:
                 self._precompute_fp8_scales_if_enabled()
 
             if self.lr_scheduler is not None:
