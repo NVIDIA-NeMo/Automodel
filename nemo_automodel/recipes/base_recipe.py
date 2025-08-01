@@ -21,6 +21,7 @@ import torch.nn as nn
 from torch.optim import Optimizer
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils import PreTrainedTokenizerBase
+from torch.utils.data import DataLoader
 
 from nemo_automodel.components.checkpoint.checkpointing import (
     load_model,
@@ -94,15 +95,21 @@ class BaseRecipe:
             raise ValueError("cannot set __state_tracked")
         if "__state_tracked" not in self.__dict__:
             self.__dict__["__state_tracked"] = set()
-        # Track stateful objects unless they are validation/eval components.
+        # Explicitly treat DataLoader subclasses with state_dict support as stateful, regardless of attribute name.
+        from torch.utils.data import DataLoader  # Local import to avoid circular deps.
+
+        is_dataloader = isinstance(value, DataLoader) and has_load_restore_state(value)
+
         should_track = (
             isinstance(value, (nn.Module, Optimizer))
+            or is_dataloader
             or has_load_restore_state(value)
             or is_tokenizer(value)
             or is_lr_scheduler(value)
         )
 
-        if should_track and not any(substr in key.lower() for substr in ("val", "eval", "test")):
+        # Keep historical behavior of skipping val/eval/test components **except** for dataloaders.
+        if should_track and (is_dataloader or not any(substr in key.lower() for substr in ("val", "eval", "test"))):
             assert key not in self.__dict__["__state_tracked"]
             self.__dict__["__state_tracked"].add(key)
         super().__setattr__(key, value)
@@ -131,25 +138,90 @@ class BaseRecipe:
         model, optimizer, scheduler, tokenizer = None, None, None, None
 
         for key in self.__dict__["__state_tracked"]:
-            if isinstance(getattr(self, key), nn.Module):
-                model = getattr(self, key)
-            elif isinstance(getattr(self, key), Optimizer):
-                optimizer = getattr(self, key)
-            elif is_lr_scheduler(getattr(self, key)):
-                scheduler = getattr(self, key)
-            elif is_tokenizer(getattr(self, key)):
-                tokenizer = getattr(self, key)
+            obj = getattr(self, key)
+
+            if isinstance(obj, nn.Module):
+                model = obj
+            elif isinstance(obj, Optimizer):
+                optimizer = obj
+            elif is_lr_scheduler(obj):
+                scheduler = obj
+            elif is_tokenizer(obj):
+                tokenizer = obj
+
+            # ---- General stateful components (incl. DataLoaders) ----
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if isinstance(obj, DataLoader) and has_load_restore_state(obj):
+                # Each DP rank writes its own file – avoid collisions with rank suffix
+                filename = f"{key}_rank{rank}.pt" if torch.distributed.is_initialized() else f"{key}.pt"
+                torch.save(obj.state_dict(), os.path.join(path, filename))
+                # Make sure all ranks finish writing before proceeding
+                if torch.distributed.is_initialized():
+                    torch.distributed.barrier()
             else:
-                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                    torch.save(
-                        getattr(self, key).state_dict(),
-                        os.path.join(path, f"{key}.pt"),
-                    )
+                # Historical behaviour: only rank0 writes
+                if not torch.distributed.is_initialized() or rank == 0:
+                    torch.save(obj.state_dict(), os.path.join(path, f"{key}.pt"))
                 if torch.distributed.is_initialized():
                     torch.distributed.barrier()
 
         save_model(model, path, self.checkpoint_config, peft_config=self.peft_config, tokenizer=tokenizer)
         save_optimizer(optimizer, model, path, scheduler)
+
+        # -------------------- Save config YAML --------------------
+        if (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0:
+            try:
+                import yaml
+                # Prefer attribute `cfg` if it exists (OmegaConf or dict)
+                cfg_obj = getattr(self, "cfg", None)
+                if cfg_obj is not None:
+                    # Handle OmegaConf configs gracefully
+                    try:
+                        from omegaconf import OmegaConf
+
+                        cfg_dict = OmegaConf.to_container(cfg_obj, resolve=True)
+                    except ModuleNotFoundError:
+                        cfg_dict = cfg_obj if isinstance(cfg_obj, dict) else None
+
+                    if cfg_dict is not None:
+                        with open(os.path.join(path, "config.yaml"), "w") as f:
+                            yaml.safe_dump(cfg_dict, f, sort_keys=False)
+            except Exception as e:  # pylint: disable=broad-except
+                # Do not fail training if config serialization fails
+                if (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0:
+                    print(f"Warning: failed to save config.yaml – {e}", flush=True)
+
+        # -------------------- Save generation config if present --------------------
+        if (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0:
+            try:
+                import shutil
+
+                repo_dir = None
+                if (
+                    hasattr(self, "checkpoint_config")
+                    and self.checkpoint_config.model_cache_dir
+                    and self.checkpoint_config.model_repo_id
+                ):
+                    repo_dir = os.path.join(
+                        str(self.checkpoint_config.model_cache_dir), str(self.checkpoint_config.model_repo_id)
+                    )
+
+                # Look for generation_config.json or generate.json
+                if repo_dir and os.path.exists(repo_dir):
+                    target_file = None
+                    for root, _dirs, files in os.walk(repo_dir):
+                        for fname in files:
+                            if fname in ("generation_config.json", "generate.json"):
+                                target_file = os.path.join(root, fname)
+                                break
+                        if target_file:
+                            break
+
+                    if target_file and os.path.isfile(target_file):
+                        shutil.copy2(target_file, os.path.join(path, os.path.basename(target_file)))
+            except Exception as e:  # pylint: disable=broad-except
+                if (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0:
+                    print(f"Warning: failed to copy generation config – {e}", flush=True)
 
     def load_checkpoint(self, restore_from: str | None = None):
         """
@@ -176,18 +248,32 @@ class BaseRecipe:
         model, optimizer, scheduler = None, None, None
 
         for key in self.__dict__["__state_tracked"]:
-            if isinstance(getattr(self, key), nn.Module):
-                model = getattr(self, key)
-            elif isinstance(getattr(self, key), Optimizer):
-                optimizer = getattr(self, key)
-            elif is_lr_scheduler(getattr(self, key)):
-                scheduler = getattr(self, key)
-            elif is_tokenizer(getattr(self, key)):
-                # we don't need to load the tokenizer from the checkpoint
-                # we only save the tokenizer for consolidated checkpoints for downstream use
+            obj = getattr(self, key)
+
+            if isinstance(obj, nn.Module):
+                model = obj
                 continue
-            else:
-                getattr(self, key).load_state_dict(torch.load(os.path.join(ckpt_dir, f"{key}.pt"), weights_only=False))
+            if isinstance(obj, Optimizer):
+                optimizer = obj
+                continue
+            if is_lr_scheduler(obj):
+                scheduler = obj
+                continue
+            if is_tokenizer(obj):
+                # tokenizer is saved only for consolidated checkpoints
+                continue
+
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+            # DataLoader: look for rank-specific file first, fall back to shared file (back-compat)
+            preferred_fname = (
+                f"{key}_rank{rank}.pt" if torch.distributed.is_initialized() and isinstance(obj, DataLoader) else f"{key}.pt"
+            )
+            path_preferred = os.path.join(ckpt_dir, preferred_fname)
+            fallback_path = os.path.join(ckpt_dir, f"{key}.pt")
+
+            load_path = path_preferred if os.path.exists(path_preferred) else fallback_path
+            obj.load_state_dict(torch.load(load_path, weights_only=False))
 
         load_model(model, ckpt_dir, self.checkpoint_config)
         load_optimizer(optimizer, model, ckpt_dir, scheduler)
