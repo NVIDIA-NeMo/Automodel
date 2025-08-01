@@ -633,11 +633,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.optimizer.zero_grad()
 
             # Precompute FP8 scales
-            # TODO: make sure it's dp_shard>1 instead of dp_replicate>1
             if (
                 self.cfg.get("fp8", None) is not None
                 and self.model.precompute_float8_dynamic_scale_for_fsdp
-                and self.device_mesh["data_parallel"].size() > 1
+                and self.device_mesh["dp_shard"].size() > 1
             ):
                 precompute_float8_dynamic_scale_for_fsdp(self.model)
 
