@@ -245,24 +245,17 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         # Apply FP8 quantization
         try:
             if fp8_config is not None:
-
-                from nemo_automodel.components.quantization.fp8 import FP8Config
-
-                if hasattr(fp8_config, "from_config_node"):
-                    fp8_settings = FP8Config.from_config_node(fp8_config)
-                elif isinstance(fp8_config, FP8Config):
-                    fp8_settings = fp8_config
-                else:
-                    fp8_settings = FP8Config(**fp8_config.to_dict() if hasattr(fp8_config, "to_dict") else fp8_config)
-
+                # Ensure precompute is only True when recipe is tensorwise and enable_fsdp_float8_all_gather is True
+                model.precompute_float8_dynamic_scale_for_fsdp = fp8_config.precompute_float8_dynamic_scale_for_fsdp and fp8_config.recipe_name == "tensorwise" and fp8_config.enable_fsdp_float8_all_gather
                 model = apply_fp8_to_model(
                     model,
-                    recipe_name=fp8_settings.recipe_name,
-                    filter_fqns=fp8_settings.filter_fqns,
-                    enable_fsdp_float8_all_gather=fp8_settings.enable_fsdp_float8_all_gather,
-                    force_recompute_fp8_weight_in_bwd=fp8_settings.force_recompute_fp8_weight_in_bwd,
-                    emulate=fp8_settings.emulate,
+                    recipe_name=fp8_config.recipe_name,
+                    filter_fqns=fp8_config.filter_fqns,
+                    enable_fsdp_float8_all_gather=fp8_config.enable_fsdp_float8_all_gather,
+                    force_recompute_fp8_weight_in_bwd=fp8_config.force_recompute_fp8_weight_in_bwd,
+                    emulate=fp8_config.emulate,
                 )
+                
         except RuntimeError:
             logging.warning("Retrying without FP8 quantization.")
             return _retry(fp8_config=None)
@@ -372,23 +365,15 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         # Apply FP8 quantization
         try:
             if fp8_config is not None:
-
-                from nemo_automodel.components.quantization.fp8 import FP8Config
-
-                if hasattr(fp8_config, "from_config_node"):
-                    fp8_settings = FP8Config.from_config_node(fp8_config)
-                elif isinstance(fp8_config, FP8Config):
-                    fp8_settings = fp8_config
-                else:
-                    fp8_settings = FP8Config(**fp8_config.to_dict() if hasattr(fp8_config, "to_dict") else fp8_config)
-
+                # Ensure precompute is only True when recipe is tensorwise and enable_fsdp_float8_all_gather is True
+                fp8_config.precompute_float8_dynamic_scale_for_fsdp = fp8_config.precompute_float8_dynamic_scale_for_fsdp and fp8_config.recipe_name == "tensorwise" and fp8_config.enable_fsdp_float8_all_gather
                 model = apply_fp8_to_model(
                     model,
-                    recipe_name=fp8_settings.recipe_name,
-                    filter_fqns=fp8_settings.filter_fqns,
-                    enable_fsdp_float8_all_gather=fp8_settings.enable_fsdp_float8_all_gather,
-                    force_recompute_fp8_weight_in_bwd=fp8_settings.force_recompute_fp8_weight_in_bwd,
-                    emulate=fp8_settings.emulate,
+                    recipe_name=fp8_config.recipe_name,
+                    filter_fqns=fp8_config.filter_fqns,
+                    enable_fsdp_float8_all_gather=fp8_config.enable_fsdp_float8_all_gather,
+                    force_recompute_fp8_weight_in_bwd=fp8_config.force_recompute_fp8_weight_in_bwd,
+                    emulate=fp8_config.emulate,
                 )
         except RuntimeError:
             logging.warning("Retrying without FP8 quantization.")

@@ -23,6 +23,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import wandb
+from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torch.distributed.device_mesh import _mesh_resources
 from torch.utils.data import DataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
@@ -559,7 +560,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             and self.device_mesh["data_parallel"].size() > 1
         ):  # TODO: make sure it's dp_shard>1 instead of dp_replicate>1
             try:
-                from nemo_automodel.components.quantization import precompute_fp8_scales_for_fsdp
+                
 
                 precompute_fp8_scales_for_fsdp(self.model)
             except Exception as e:
@@ -651,8 +652,10 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.optimizer.zero_grad()
 
             # Precompute FP8 scales
-            if self.cfg.get("fp8", None) is not None:
-                self._precompute_fp8_scales_if_enabled()
+            # TODO: make sure it's dp_shard>1 instead of dp_replicate>1
+            if self.cfg.get("fp8", None) is not None and self.model.precompute_float8_dynamic_scale_for_fsdp and self.device_mesh["data_parallel"].size() > 1:
+                print("====precompute fp8 scales=====")
+                precompute_float8_dynamic_scale_for_fsdp(self.model)
 
             if self.lr_scheduler is not None:
                 self.lr_scheduler.step(1)

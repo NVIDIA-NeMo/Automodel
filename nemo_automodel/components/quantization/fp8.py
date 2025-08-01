@@ -247,15 +247,3 @@ def verify_fp8_conversion(model: nn.Module) -> dict:
         "success": len(fp8_modules) > 0,
     }
 
-
-def precompute_fp8_scales_for_fsdp(model: nn.Module) -> None:
-    """
-    Precompute FP8 scales for FSDP optimization.
-
-    This function should be called after FSDP setup to optimize
-    scale computation for distributed training.
-
-    Args:
-        model: Model with FP8 linear layers
-    """
-    precompute_float8_dynamic_scale_for_fsdp(model)

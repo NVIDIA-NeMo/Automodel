@@ -23,6 +23,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import wandb
+from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torch.distributed.device_mesh import _mesh_resources
 from torch.utils.data import DataLoader
 from transformers import AutoProcessor
@@ -550,26 +551,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     self._run_validation_epoch()
 
-    # ------------------ helpers ------------------
-    def _precompute_fp8_scales_if_enabled(self):
-        """Precompute FP8 scales for FSDP if the model has FP8 layers enabled.
-
-        This optimizes FSDP communication by precomputing scales for all FP8 parameters
-        in a single all-reduce operation instead of many small ones.
-        """
-        if (
-            self.cfg.get("fp8", None) is not None
-            and self.cfg.get("fp8.recipe_name", None) == "tensorwise"
-            and self.cfg.get("fp8.enable_fsdp_float8_all_gather", False)
-            and self.cfg.get("fp8.precompute_float8_dynamic_scale_for_fsdp", False)
-            and self.device_mesh["data_parallel"].size() > 1
-        ):  # TODO: make sure it's dp_shard>1 instead of dp_replicate>1
-            try:
-                from nemo_automodel.components.quantization import precompute_fp8_scales_for_fsdp
-
-                precompute_fp8_scales_for_fsdp(self.model)
-            except Exception as e:
-                logging.warning(f"Failed to precompute FP8 scales for FSDP: {e}")
 
     def _run_train_step(self, batch, is_optim_step, clip_norm=1.0):
         """Execute a single training step.
@@ -657,8 +638,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.optimizer.zero_grad()
 
             # Precompute FP8 scales
-            if self.cfg.get("fp8", None) is not None:
-                self._precompute_fp8_scales_if_enabled()
+            # TODO: make sure it's dp_shard>1 instead of dp_replicate>1
+            if self.cfg.get("fp8", None) is not None and self.model.precompute_float8_dynamic_scale_for_fsdp and self.device_mesh["data_parallel"].size() > 1:
+                precompute_float8_dynamic_scale_for_fsdp(self.model)
 
             if self.lr_scheduler is not None:
                 self.lr_scheduler.step(1)
