@@ -148,7 +148,7 @@ def create_gemma3_mock():
 
 
 @pytest.fixture
-def mock_device_mesh():
+def mock_device_mesh_fsdp2():
     """Create a mock device mesh."""
     mesh = MagicMock(spec=DeviceMesh)
 
@@ -180,6 +180,37 @@ def mock_device_mesh():
     }[key]
 
     return mesh, dp_replicate_mesh, dp_shard_mesh, tp_mesh, cp_mesh
+
+@pytest.fixture
+def mock_device_mesh_nvfsdp():
+    """Create a mock device mesh."""
+    mesh = MagicMock(spec=DeviceMesh)
+
+    # Mock device_type to return a valid string
+    mesh.device_type = "cuda"
+
+    # Mock submeshes
+    dp_mesh = MagicMock()
+    cp_mesh = MagicMock()
+    tp_mesh = MagicMock()
+
+    dp_mesh.size.return_value = 2
+    tp_mesh.size.return_value = 1
+    cp_mesh.size.return_value = 1
+
+    dp_mesh.ndim = 1
+    tp_mesh.ndim = 1
+    cp_mesh.ndim = 1
+
+    # Configure mesh access
+    mesh.__getitem__.side_effect = lambda key: {
+        "dp": dp_mesh,
+        "tp": tp_mesh,
+        "cp": cp_mesh,
+        "dp_cp": dp_mesh,
+    }[key]
+
+    return mesh, dp_mesh, tp_mesh, cp_mesh
 
 
 @pytest.fixture
@@ -290,9 +321,9 @@ class TestNvFSDPStrategyParallelize:
             "import_classes": import_classes_mock,
         }
 
-    def test_basic_nvfsdp_with_default_mesh_names(self, mock_device_mesh, mock_nvfsdp_env):
+    def test_basic_nvfsdp_with_default_mesh_names(self, mock_device_mesh_nvfsdp, mock_nvfsdp_env):
         """Test basic nvFSDP with default mesh names."""
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
+        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh_nvfsdp
         tp_mesh.size.return_value = 1  # No tensor parallelism
         cp_mesh.size.return_value = 1  # No context parallelism
 
@@ -447,12 +478,12 @@ class TestNvFSDPStrategyParallelize:
         call_kwargs = mock_nvfsdp_env["nvfsdp"].fully_shard.call_args[1]
         assert call_kwargs["dp_cp_mesh_name"] == "dp_cp"  # Should use default when CP > 1
 
-    def test_nvfsdp_not_available_error(self, mock_device_mesh, monkeypatch):
+    def test_nvfsdp_not_available_error(self, mock_device_mesh_nvfsdp, monkeypatch):
         """Test error when nvFSDP is not available."""
         # Mock HAVE_NVFSDP as False
         monkeypatch.setattr("nemo_automodel.components.distributed.parallelizer.HAVE_NVFSDP", False, raising=False)
 
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
+        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh_nvfsdp
         model = MockModel()
 
         with pytest.raises(AssertionError, match="nvFSDP is not installed"):
