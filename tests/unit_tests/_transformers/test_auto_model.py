@@ -513,8 +513,8 @@ def test_liger_apply_failure_raises(monkeypatch):
 class TestNeMoAutoModelFP8Integration:
     """Test cases for FP8 functionality in NeMo auto models."""
     
-    def test_from_pretrained_use_fp8_requires_config(self):
-        """Test that use_fp8=True requires fp8_config parameter."""
+    def test_from_pretrained_without_fp8_config_works(self):
+        """Test that from_pretrained works normally without fp8_config."""
         with (
             patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
             patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_from_pretrained,
@@ -523,13 +523,14 @@ class TestNeMoAutoModelFP8Integration:
             mock_model.config = {}
             mock_from_pretrained.return_value = mock_model
 
-            # Should raise ValueError when use_fp8=True but fp8_config=None
-            with pytest.raises(ValueError, match="fp8_config must be provided when use_fp8=True"):
-                NeMoAutoModelForCausalLM.from_pretrained(
-                    "hf-internal-testing/tiny-random-gpt2",
-                    use_fp8=True,
-                    fp8_config=None
-                )
+            # Should work fine without fp8_config - no FP8 will be applied
+            result = NeMoAutoModelForCausalLM.from_pretrained(
+                "hf-internal-testing/tiny-random-gpt2",
+                fp8_config=None
+            )
+            
+            assert result == mock_model
+            assert result.config["nemo_version"] == __version__
     
     def test_from_config_use_fp8_requires_config(self):
         """Test that use_fp8=True requires fp8_config parameter in from_config."""

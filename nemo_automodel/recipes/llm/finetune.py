@@ -100,7 +100,6 @@ def build_model_and_optimizer(
         # Add FP8 config if provided
         if cfg_fp8 is not None:
             kwargs["fp8_config"] = cfg_fp8.instantiate()
-            kwargs["use_fp8"] = True
 
         model = cfg_model.instantiate(**kwargs)
         if freeze_embeddings:

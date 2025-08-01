@@ -145,7 +145,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         sdpa_method: Optional[List[SDPBackend]] = None,
         torch_dtype="auto",
         attn_implementation: str = "flash_attention_2",
-        use_fp8: bool = False,
         fp8_config: Optional[object] = None,
         **kwargs,
     ) -> PreTrainedModel:
@@ -173,10 +172,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 Data type passed to the underlying `from_pretrained` call.
             attn_implementation (str, default="flash_attention_2"): Desired
                 attention implementation; forwarded to the HF config.
-            use_fp8 (bool, default=False): If `True`, apply FP8 quantization
-                to the model for improved performance on supported hardware.
             fp8_config (FP8Config, optional): FP8 configuration object that
-                specifies all FP8 quantization settings. Required when use_fp8=True.
+                specifies all FP8 quantization settings. If provided, FP8 quantization
+                will be applied to the model for improved performance on supported hardware.
             **kwargs: Additional keyword arguments forwarded verbatim to
                 `AutoModelForCausalLM.from_pretrained`.
 
@@ -204,8 +202,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 attn_implementation=override.get("attn_implementation", attn_implementation),
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
-                sdpa_method=sdpa_method,
-                use_fp8=override.get("use_fp8", use_fp8),
+                                sdpa_method=sdpa_method,
                 fp8_config=override.get("fp8_config", fp8_config),
                 **kwargs,
             )
@@ -247,9 +244,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         # Apply FP8 quantization
         try:
-            if use_fp8:
-                if fp8_config is None:
-                    raise ValueError("fp8_config must be provided when use_fp8=True")
+            if fp8_config is not None:
 
                 from nemo_automodel.components.quantization.fp8 import FP8Config
 
@@ -270,7 +265,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 )
         except RuntimeError:
             logging.warning("Retrying without FP8 quantization.")
-            return _retry(use_fp8=False)
+            return _retry(fp8_config=None)
 
         model.config.update({"nemo_version": __version__})
         return model
@@ -285,7 +280,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         sdpa_method: Optional[List[SDPBackend]] = None,
         torch_dtype: Union[str, torch.dtype] = "auto",
         attn_implementation: str = "flash_attention_2",
-        use_fp8: bool = False,
         fp8_config: Optional[object] = None,
         **kwargs,
     ) -> PreTrainedModel:
@@ -336,8 +330,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 attn_implementation=override.get("attn_implementation", attn_implementation),
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
-                sdpa_method=sdpa_method,
-                use_fp8=override.get("use_fp8", use_fp8),
+                                sdpa_method=sdpa_method,
                 fp8_config=override.get("fp8_config", fp8_config),
                 **kwargs,
             )
@@ -378,9 +371,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         # Apply FP8 quantization
         try:
-            if use_fp8:
-                if fp8_config is None:
-                    raise ValueError("fp8_config must be provided when use_fp8=True")
+            if fp8_config is not None:
 
                 from nemo_automodel.components.quantization.fp8 import FP8Config
 
@@ -401,7 +392,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 )
         except RuntimeError:
             logging.warning("Retrying without FP8 quantization.")
-            return _retry(use_fp8=False)
+            return _retry(fp8_config=None)
 
         model.config.update({"nemo_version": __version__})
         return model
