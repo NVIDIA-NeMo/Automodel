@@ -24,11 +24,11 @@ from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
-from torch.distributed.device_mesh import DeviceMesh, _mesh_resources
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import (
-    CPUOffloadPolicy,
     FSDPModule,
     MixedPrecisionPolicy,
+    OffloadPolicy,
     fully_shard,
 )
 from torch.distributed.tensor.parallel import (
@@ -58,7 +58,7 @@ def apply_fsdp_sharding_recursively(
     module: nn.Module,
     mesh: DeviceMesh,
     mp_policy: Optional[MixedPrecisionPolicy],
-    offload_policy: Optional[CPUOffloadPolicy] = None,
+    offload_policy: Optional[OffloadPolicy] = None,
 ) -> None:
     """
     Recursively apply FSDP sharding to modules, with optimizations for ModuleList.
@@ -72,7 +72,7 @@ def apply_fsdp_sharding_recursively(
         module (nn.Module): The module to apply FSDP sharding to.
         mesh (DeviceMesh): The device mesh for FSDP sharding.
         mp_policy (Optional[MixedPrecisionPolicy]): Mixed precision policy for FSDP.
-        offload_policy (Optional[CPUOffloadPolicy]): CPU offload policy for FSDP.
+        offload_policy (Optional[OffloadPolicy]): CPU offload policy for FSDP.
             Defaults to None.
 
     Note:
@@ -219,16 +219,13 @@ def translate_to_torch_parallel_style(style: str):
 def fsdp2_strategy_parallelize(
     model,
     device_mesh: DeviceMesh,
-    param_dtype: torch.dtype = torch.bfloat16,
     mp_policy: Optional[MixedPrecisionPolicy] = None,
-    offload_policy: Optional[CPUOffloadPolicy] = None,
+    offload_policy: Optional[OffloadPolicy] = None,
     sequence_parallel: bool = False,
     activation_checkpointing: bool = False,
-    cpu_offload: bool = False,
     tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
     dp_mesh_name: str = "data_parallel",
     tp_mesh_name: str = "tensor_parallel",
-    dp_cp_mesh_name: str = "dp_cp",
 ):
     """
     Apply parallelisms and activation checkpointing to the model.
@@ -244,12 +241,10 @@ def fsdp2_strategy_parallelize(
     Args:
         model: The model to be parallelized.
         device_mesh (DeviceMesh): The device mesh for distributed training.
-        param_dtype (torch.dtype): Data type for model parameters. Defaults to torch.bfloat16.
         mp_policy (Optional[MixedPrecisionPolicy]): Mixed precision policy for model parallelism.
-        offload_policy (Optional[CPUOffloadPolicy]): The offload policy for FSDP.
+        offload_policy (Optional[OffloadPolicy]): The offload policy for FSDP.
         sequence_parallel (bool): Whether to use sequence parallelism. Defaults to False.
         activation_checkpointing (bool): Whether to use activation checkpointing. Defaults to False.
-        cpu_offload (bool): Whether to enable cpu offloading for FSDP. Defaults to False.
         tp_shard_plan (Optional[Union[Dict[str, ParallelStyle], str]]):
             Custom tensor parallel plan for the model. Can be:
             - A dictionary mapping module names to parallel styles
@@ -257,8 +252,6 @@ def fsdp2_strategy_parallelize(
             If provided, this takes precedence over automatic plan generation.
         dp_mesh_name (str): Key name for the data parallel mesh in device_mesh.
             Defaults to "data_parallel".
-        dp_cp_mesh_name (str): Key name for the data parallel + context parallel mesh in device_mesh.
-            Used when context parallelism is enabled. Defaults to "dp_cp".
         tp_mesh_name (str): Key name for the tensor parallel mesh in device_mesh.
             Defaults to "tensor_parallel".
 
@@ -280,13 +273,7 @@ def fsdp2_strategy_parallelize(
         num_key_value_heads = model.config.num_key_value_heads
 
     # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
-    dp_mesh = device_mesh[
-        (
-            dp_cp_mesh_name
-            if dp_cp_mesh_name in _mesh_resources.root_to_flatten_mapping.get(device_mesh, {})
-            else dp_mesh_name
-        )
-    ]
+    dp_mesh = device_mesh[dp_mesh_name]
 
     if dp_mesh.size() > 1:
         assert dp_mesh.ndim == 1, "Hybrid-sharding not supported"
@@ -363,14 +350,10 @@ def fsdp2_strategy_parallelize(
     # Set up mixed precision policy
     if not mp_policy:
         mp_policy = MixedPrecisionPolicy(
-            param_dtype=param_dtype,
+            param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
             output_dtype=torch.float32,
         )
-
-    # Set up offload policy
-    if not offload_policy:
-        offload_policy = CPUOffloadPolicy(pin_memory=False) if cpu_offload else None
 
     # FSDP sharding
     assert dp_mesh.ndim == 1, "Hybrid-sharding not supported"
