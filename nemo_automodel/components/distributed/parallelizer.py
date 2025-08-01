@@ -24,7 +24,7 @@ from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
-from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.device_mesh import DeviceMesh, _mesh_resources
 from torch.distributed.fsdp import (
     FSDPModule,
     MixedPrecisionPolicy,
