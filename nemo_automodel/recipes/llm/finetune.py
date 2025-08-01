@@ -25,6 +25,7 @@ import torch.nn as nn
 import wandb
 from torch.distributed.device_mesh import _mesh_resources
 from torch.utils.data import DataLoader
+from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -69,6 +70,7 @@ def build_model_and_optimizer(
     seed,
     tp_size=1,
     freeze_embeddings=True,
+    cfg_fp8=None,
 ) -> tuple[nn.Module, "Optimizer"]:  # noqa: F821
     """
     Build and initialize a model and optimizer.
@@ -96,6 +98,10 @@ def build_model_and_optimizer(
                 "Packed sequence is supported only with Flash Attention. "
                 "Setting model's attn_implementation to flash_attention_2"
             )
+        # Add FP8 config if provided
+        if cfg_fp8 is not None:
+            kwargs["fp8_config"] = cfg_fp8.instantiate()
+
         model = cfg_model.instantiate(**kwargs)
         if freeze_embeddings:
             logging.info("Freezing embeddings")
@@ -233,7 +239,14 @@ def build_dataloader(
             drop_last=True,
             **dist_sampler_kwargs,
         )
-        return cfg_dl.instantiate(dataset=ds, sampler=sampler), tokenizer
+
+        # Handle collate_fn instantiation if it's a ConfigNode
+        dl_kwargs = {"dataset": ds, "sampler": sampler}
+        if hasattr(cfg_dl, "collate_fn") and hasattr(cfg_dl.collate_fn, "_target_"):
+            collate_cfg = cfg_dl.collate_fn
+            dl_kwargs["collate_fn"] = lambda batch: collate_cfg.instantiate(batch=batch)
+
+        return cfg_dl.instantiate(**dl_kwargs), tokenizer
 
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
@@ -461,6 +474,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.model_wrapper,
             seed=self.cfg.get("seed", 42),
             tp_size=self.cfg.get("distributed.tp_size", 1),
+            cfg_fp8=self.cfg.get("fp8", None),
         )
         self.loss_fn = build_loss_fn(self.cfg.loss_fn)
         self.dataloader, self.tokenizer = build_dataloader(
@@ -616,6 +630,15 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             self.optimizer.step()
             self.optimizer.zero_grad()
+
+            # Precompute FP8 scales
+            # TODO: make sure it's dp_shard>1 instead of dp_replicate>1
+            if (
+                self.cfg.get("fp8", None) is not None
+                and self.model.precompute_float8_dynamic_scale_for_fsdp
+                and self.device_mesh["data_parallel"].size() > 1
+            ):
+                precompute_float8_dynamic_scale_for_fsdp(self.model)
 
             if self.lr_scheduler is not None:
                 self.lr_scheduler.step(1)

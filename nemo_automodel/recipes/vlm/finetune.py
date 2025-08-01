@@ -25,6 +25,7 @@ import torch.nn as nn
 import wandb
 from torch.distributed.device_mesh import _mesh_resources
 from torch.utils.data import DataLoader
+from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 from wandb import Settings
@@ -110,6 +111,7 @@ def build_model_and_optimizer(
     seed,
     tp_size=1,
     freeze_embeddings=True,
+    cfg_fp8=None,
 ) -> tuple[nn.Module, "Optimizer"]:  # noqa: F821
     """
     Build and initialize a model for VLM.
@@ -129,7 +131,12 @@ def build_model_and_optimizer(
         The instantiated model on the specified device and optimizer.
     """
     with StatefulRNG(seed=seed, ranked=True):
-        model = cfg_model.instantiate()
+        # Add FP8 config if provided
+        kwargs = {}
+        if cfg_fp8 is not None:
+            kwargs["fp8_config"] = cfg_fp8.instantiate()
+
+        model = cfg_model.instantiate(**kwargs)
 
         model = _freeze_model(model, cfg_freeze, freeze_embeddings)
 
@@ -475,6 +482,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.model_wrapper,
             seed=self.cfg.get("seed", 42),
             tp_size=self.cfg.get("distributed.tp_size", 1),
+            cfg_fp8=self.cfg.get("fp8", None),
         )
         self.loss_fn = build_loss_fn(self.cfg.loss_fn)
         self.dataloader, self.processor = build_dataloader(
@@ -543,7 +551,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     self._run_validation_epoch()
 
-    # ------------------ helpers ------------------
     def _run_train_step(self, batch, is_optim_step, clip_norm=1.0):
         """Execute a single training step.
 
@@ -628,6 +635,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
             self.optimizer.step()
             self.optimizer.zero_grad()
+
+            # Precompute FP8 scales
+            # TODO: make sure it's dp_shard>1 instead of dp_replicate>1
+            if (
+                self.cfg.get("fp8", None) is not None
+                and self.model.precompute_float8_dynamic_scale_for_fsdp
+                and self.device_mesh["data_parallel"].size() > 1
+            ):
+                precompute_float8_dynamic_scale_for_fsdp(self.model)
 
             if self.lr_scheduler is not None:
                 self.lr_scheduler.step(1)
