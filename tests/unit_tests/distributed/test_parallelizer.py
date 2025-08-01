@@ -48,10 +48,15 @@ class MockModel(nn.Module):
 
     def __init__(self, model_type="llama", num_attention_heads=8, num_key_value_heads=8):
         super().__init__()
-        self.config = SimpleNamespace(
-            num_attention_heads=num_attention_heads,
-            num_key_value_heads=num_key_value_heads,
-        )
+        if model_type == "baichuan2":
+            self.config = SimpleNamespace(
+                num_attention_heads=num_attention_heads,
+            )
+        else:
+            self.config = SimpleNamespace(
+                num_attention_heads=num_attention_heads,
+                num_key_value_heads=num_key_value_heads,
+            )
 
         # Create mock model as a proper nn.Module so it gets picked up by named_children()
         class MockInnerModel(nn.Module):
@@ -302,6 +307,20 @@ class TestFSDP2StrategyParallelize:
         mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
 
         model = create_gemma3_mock()
+
+        result = fsdp2_strategy_parallelize(
+            model=model,
+            device_mesh=mesh,
+        )
+
+        assert result is model
+        mock_distributed_env["fsdp"].fully_shard.assert_called()
+
+    def test_baichuan2_model_handling(self, mock_device_mesh, mock_distributed_env):
+        """Test Gemma3 model type handling."""
+        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
+
+        model = MockModel(model_type="baichuan2")
 
         result = fsdp2_strategy_parallelize(
             model=model,

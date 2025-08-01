@@ -214,6 +214,31 @@ def translate_to_torch_parallel_style(style: str):
         raise ValueError(f"Unknown parallel style: {style}")
 
 
+def validate_tp_mesh(model, tp_mesh):
+    """
+    Validate that attention heads and key value heads are divisible by TP size
+    """
+    if isinstance(model, Gemma3ForConditionalGeneration):
+        num_attention_heads = model.config.text_config.num_attention_heads
+        num_key_value_heads = model.config.text_config.num_key_value_heads
+    else:
+        num_attention_heads = model.config.num_attention_heads
+        if hasattr(model.config, "num_key_value_heads"):
+            num_key_value_heads = model.config.num_key_value_heads
+        else:
+            num_key_value_heads = 0
+
+    # TP sharding with enhanced plan generation
+    if tp_mesh.size() > 1:
+        # Validate that attention heads are divisible by TP size
+        assert num_key_value_heads % tp_mesh.size() == 0, (
+            f"num_key_value_heads ({num_key_value_heads}) must be divisible by TP size ({tp_mesh.size()})"
+        )
+        assert num_attention_heads % tp_mesh.size() == 0, (
+            f"num_attention_heads ({num_attention_heads}) must be divisible by TP size ({tp_mesh.size()})"
+        )
+
+
 # Taken and modified from torchtitan
 # https://github.com/pytorch/torchtitan/blob/main/torchtitan/parallelisms/parallelize_llama.py
 def fsdp2_strategy_parallelize(
@@ -268,17 +293,6 @@ def fsdp2_strategy_parallelize(
     NOTE: The passed-in model preferably should be on meta device. Otherwise,
     the model must fit on GPU or CPU memory.
     """
-    # Get model layers for later use
-    model_cls = type(model)
-    if isinstance(model, Gemma3ForConditionalGeneration):
-        layers = model.language_model.layers
-        num_attention_heads = model.config.text_config.num_attention_heads
-        num_key_value_heads = model.config.text_config.num_key_value_heads
-    else:
-        layers = model.model.layers
-        num_attention_heads = model.config.num_attention_heads
-        num_key_value_heads = model.config.num_key_value_heads
-
     # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
     dp_mesh = device_mesh[
         (
@@ -292,17 +306,18 @@ def fsdp2_strategy_parallelize(
         assert dp_mesh.ndim == 1, "Hybrid-sharding not supported"
 
     tp_mesh = device_mesh[tp_mesh_name]
+    try:
+        validate_tp_mesh(model, tp_mesh)
+    except AssertionError:
+        raise
+    except Exception:
+        pass
+
+    # Get model layers for later use
+    model_cls = type(model)
 
     # TP sharding with enhanced plan generation
     if tp_mesh.size() > 1:
-        # Validate that attention heads are divisible by TP size
-        assert num_key_value_heads % tp_mesh.size() == 0, (
-            f"num_key_value_heads ({num_key_value_heads}) must be divisible by TP size ({tp_mesh.size()})"
-        )
-        assert num_attention_heads % tp_mesh.size() == 0, (
-            f"num_attention_heads ({num_attention_heads}) must be divisible by TP size ({tp_mesh.size()})"
-        )
-
         # Generate or use tensor parallel plan
         model_parallel_plan = None
 
@@ -356,6 +371,10 @@ def fsdp2_strategy_parallelize(
 
     # Apply activation checkpointing to MLP layers if requested
     if activation_checkpointing:
+        if isinstance(model, Gemma3ForConditionalGeneration):
+            layers = model.language_model.layers
+        else:
+            layers = model.model.layers
         for i, layer in enumerate(layers):
             if hasattr(layer, "mlp"):
                 layers[i].mlp = checkpoint_wrapper(layer.mlp)
