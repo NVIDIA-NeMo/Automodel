@@ -165,16 +165,16 @@ class BinaryDataWriter:
         """
         self.filename = filename
         self.bos_token_id = bos_token_id
+        # allow both instance and type
+        if type(dtype) is type:
+            dtype = dtype()
+        self.dtype = dtype
         # header
         self.header = np.zeros(256, dtype=np.int32)
         self.header[0] = 2788_95051  # magic
         self.header[1] = 1  # version
         self.header[3] = dtype.itemsize  # bytes per token
         self.header[2] = 0  # number of tokens in *toks*
-        # allow both instance and type
-        if type(dtype) is type:
-            dtype = dtype()
-        self.dtype = dtype
 
         self.bin_fp = None
         self.idx_fp = None
