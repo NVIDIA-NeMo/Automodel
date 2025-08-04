@@ -41,6 +41,19 @@ import numpy as np
 from functools import lru_cache
 from transformers import PreTrainedTokenizer
 
+try:
+    from nemo_automodel.components.datasets.llm.bin_dataset import (
+        MAGIC as BIN_MAGIC_NUMBER,
+        HEADER_SIZE as BIN_HEADER_SIZE,
+        VERSION as BIN_VERSION,
+    )
+except ImportError:
+    # Fallback to local constants if nemo_automodel is not installed
+    print("nemo_automodel not installed, using local constants")
+    BIN_MAGIC_NUMBER = 2788_95051
+    BIN_HEADER_SIZE = 256
+    BIN_VERSION = 1
+
 
 class _parse_tokens_arg(int):
     """An int subclass that can parse human-friendly token counts (e.g. 500M)."""
@@ -174,10 +187,6 @@ def make_parser():
     )
     return parser
 
-
-BIN_MAGIC_NUMBER = 2788_95051
-BIN_HEADER_SIZE = 256
-BIN_VERSION = 1
 
 class BinaryDataWriter:
     def __init__(self, filename, bos_token_id, vocab_size):
