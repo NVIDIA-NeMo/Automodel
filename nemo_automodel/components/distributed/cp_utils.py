@@ -116,7 +116,6 @@ def make_cp_batch_and_ctx(device_mesh, batch, labels, loss_mask=None):
     """
     from contextlib import nullcontext
 
-
     if device_mesh is None:
         cp_mesh = None
     else:
