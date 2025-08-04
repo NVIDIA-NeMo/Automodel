@@ -96,6 +96,21 @@ class StepScheduler(Stateful):
         self.epoch = epoch
         if hasattr(getattr(self.dataloader, "sampler", None), "set_epoch"):
             self.dataloader.sampler.set_epoch(epoch)
+        else:
+            logging.warning("Dataloader sampler does not support setting epoch")
+
+    @property
+    def is_optim_step(self):
+        """
+        Returns whether this step needs to call the optimizer step.
+
+        Returns:
+            bool: if true, the optimizer should run.
+        """
+        is_grad = (self.step % self.grad_acc_steps) == 0
+        self.grad_step += int(is_grad)
+        return is_grad
+>>>>>>> 28ebf14 (set_epoch guard)
 
     @property
     def is_val_step(self):
