@@ -200,23 +200,23 @@ class FSDP2Manager:
         # Mesh for loss all-reduce
         dp_cp_mesh_dim_names = []
 
-        if self.dp_replicate_size > 1:
-            dp_mesh_dim_names.append("dp_replicate")
-            dp_cp_mesh_dim_names.append("dp_replicate")
-        if self.dp_shard_size > 1:
-            dp_mesh_dim_names.append("dp_shard")
-            dp_shard_cp_mesh_dim_names.append("dp_shard")
-            dp_cp_mesh_dim_names.append("dp_shard")
-        if self.cp_size > 1:
-            dp_shard_cp_mesh_dim_names.append("cp")
-            dp_cp_mesh_dim_names.append("cp")
+        # for dp_replicate:
+        dp_mesh_dim_names.append("dp_replicate")
+        dp_cp_mesh_dim_names.append("dp_replicate")
+        # for dp_shard:
+        dp_mesh_dim_names.append("dp_shard")
+        dp_shard_cp_mesh_dim_names.append("dp_shard")
+        dp_cp_mesh_dim_names.append("dp_shard")
+        # for cp:
+        dp_shard_cp_mesh_dim_names.append("cp")
+        dp_cp_mesh_dim_names.append("cp")
 
-        if dp_mesh_dim_names != []:
-            self.device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
-        if dp_shard_cp_mesh_dim_names != []:
-            self.device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_shard_cp")
-        if dp_cp_mesh_dim_names != []:
-            self.device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
+        # submesh for dp
+        self.device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
+        # submesh for dp_shard_cp
+        self.device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_shard_cp")
+        # submesh for dp_cp
+        self.device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
         return self.device_mesh
 
     def parallelize(self, model, use_hf_tp_plan=False):
