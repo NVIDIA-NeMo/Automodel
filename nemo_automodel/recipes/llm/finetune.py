@@ -210,8 +210,8 @@ def build_dataloader(
     }
     if device_mesh is not None:
         dist_sampler_kwargs |= {
-            "num_replicas": device_mesh["dp_replicate"].size(),
-            "rank": device_mesh["dp_replicate"].get_local_rank(),
+            "num_replicas": device_mesh["dp"].size(),
+            "rank": device_mesh["dp"].get_local_rank(),
         }
     if "tokenizer" not in cfg_ds:
         tokenizer = AutoTokenizer.from_pretrained(cfg_model.pretrained_model_name_or_path)
