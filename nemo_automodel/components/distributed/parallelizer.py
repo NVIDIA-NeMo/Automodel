@@ -24,7 +24,7 @@ from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
-from torch.distributed.device_mesh import DeviceMesh, _mesh_resources
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import (
     FSDPModule,
     MixedPrecisionPolicy,
@@ -351,8 +351,6 @@ def fsdp2_strategy_parallelize(
             reduce_dtype=torch.float32,
             output_dtype=torch.float32,
         )
-
-    
 
     # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
     # if dp_replicate_size > 1, use HSDP, else use FSDP
