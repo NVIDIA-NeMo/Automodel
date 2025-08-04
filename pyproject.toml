@@ -109,7 +109,10 @@ linting = [
 ]
 test = ["coverage", "pytest", "peft"]
 nvfsdp = ["nvfsdp"]
-dev = ["cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@87a86ab"]
+dev = [
+    "cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@87a86ab",
+    "transformer-engine @ git+https://github.com/NVIDIA/TransformerEngine.git@f05f12c9"
+]
 
 
 [tool.uv]
