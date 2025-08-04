@@ -144,11 +144,17 @@ def make_parser():
         default=128,
         help="Number of chunks to prefetch from the dataset",
     )
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=32768,
+        help="Maximum length of the tokens to encode. If the text's token length exceeds this, it will be truncated.",
+    )
     return parser
 
 
 class BinaryDataWriter:
-    def __init__(self, filename, bos_token_id, dtype=np.uint16):
+    def __init__(self, filename, bos_token_id, vocab_size):
         """
         Initialize the binary data writer.
 
@@ -160,14 +166,21 @@ class BinaryDataWriter:
                 Name of the binary file to write to.
             dtype: np.dtype
                 Data type of the tokens.
-            bos_token_id: int
-                Token ID of the beginning of sentence token.
+            vocab_size: int
+                Size of the vocabulary.
         """
         self.filename = filename
         self.bos_token_id = bos_token_id
         # allow both instance and type
-        if type(dtype) is type:
-            dtype = dtype()
+        if vocab_size < 2**16:
+            dtype = np.uint16()
+            print(f"Using uint16 for vocab size {vocab_size}")
+        elif vocab_size < 2**32:
+            dtype = np.uint32()
+            print(f"Using uint32 for vocab size {vocab_size}")
+        else:
+            raise ValueError(f"Vocab size {vocab_size} is too large for uint32")
+
         self.dtype = dtype
         # header
         self.header = np.zeros(256, dtype=np.int32)
@@ -292,14 +305,14 @@ def _get_tokenizer(tokenizer_name: str) -> tuple[PreTrainedTokenizer, int]:
         tuple[PreTrainedTokenizer, int]
             A tuple containing the tokenizer and the end-of-text token ID.
     """
-    import tiktoken
+    from transformers import AutoTokenizer
 
-    enc = tiktoken.get_encoding(tokenizer_name)
-    eot = enc._special_tokens["<|endoftext|>"]
-    return enc, eot
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    bos_token_id = tokenizer.bos_token_id
+    return tokenizer, bos_token_id
 
 
-def tokenize_chunk(chunk: list[dict], tokenizer_name: str) -> list[list[int]]:
+def tokenize_chunk(chunk: list[dict], tokenizer_name: str, max_length: int) -> list[list[int]]:
     """
     Tokenize a chunk of text.
 
@@ -308,15 +321,19 @@ def tokenize_chunk(chunk: list[dict], tokenizer_name: str) -> list[list[int]]:
             A list of dictionaries, each containing a "text" key.
         tokenizer_name: str
             The name of the tokenizer to use.
+        max_length: int
+            The maximum length of the tokens to encode. If the text's token length exceeds this, it will be truncated.
 
     Returns:
         list[list[int]]
             A list of lists of token IDs.
     """
-    enc, eot = _get_tokenizer(tokenizer_name)  # first call builds, later calls reuse
+    tokenizer, bos_token_id = _get_tokenizer(tokenizer_name)  # first call builds, later calls reuse
     out = []
     for doc in chunk:
-        tokens = [eot] + enc.encode_ordinary(doc["text"])
+        tokens = tokenizer.encode(doc["text"], max_length=max_length, truncation=False)
+        if tokens and tokens[0] != bos_token_id:
+            tokens = [bos_token_id] + tokens
         out.append(tokens)
     return out
 
@@ -372,7 +389,14 @@ def main(args):
     reader_proc.start()
 
     # This process writes the binary data to disk.
-    writer = BinaryDataWriter(os.path.join(output_dir, "dataset.bin"), bos_token_id=50256)
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    writer = BinaryDataWriter(
+        os.path.join(output_dir, "dataset.bin"),
+        bos_token_id=tokenizer.bos_token_id,
+        vocab_size=tokenizer.vocab_size
+    )
+    del tokenizer
 
     # Parallel tokenisation workers
     futures: list[concurrent.futures.Future] = []
@@ -389,7 +413,7 @@ def main(args):
                 if chunk is None:  # Sentinel received - no more data coming.
                     stream_finished = True
                     break
-                futures.append(executor.submit(tokenize_chunk, chunk, args.tokenizer))
+                futures.append(executor.submit(tokenize_chunk, chunk, args.tokenizer, args.max_length))
 
             # Consume completed futures to write tokens to disk
             max_i = 0
