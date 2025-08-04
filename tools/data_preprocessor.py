@@ -48,6 +48,16 @@ class _parse_tokens_arg(int):
     _UNIT_MULTIPLIER = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000}
 
     def __new__(cls, value):
+        """
+        Parse a human-friendly token count (e.g. 500M) into an integer.
+
+        Args:
+            value: str | int
+                The token count to parse.
+
+        Returns:
+            int: The parsed token count.
+        """
         if isinstance(value, int):
             return super().__new__(cls, value)
         if value is None:
@@ -68,6 +78,12 @@ class _parse_tokens_arg(int):
         )
 
     def __repr__(self):
+        """
+        Return a human-readable string representation of the token count.
+
+        Returns:
+            str: The human-readable string representation of the token count.
+        """
         value = int(self)
         if value >= 1_000_000_000 and value % 1_000_000_000 == 0:
             return f"{value // 1_000_000_000}B"
@@ -79,6 +95,12 @@ class _parse_tokens_arg(int):
 
 
 def make_parser():
+    """
+    Create an argument parser for the data preprocessing script.
+
+    Returns:
+        argparse.ArgumentParser: The argument parser.
+    """
     parser = argparse.ArgumentParser(description="Dataset preprocessing script")
     parser.add_argument(
         "--dataset",
@@ -239,6 +261,11 @@ class BinaryDataWriter:
         return len(tok_bytes)
 
     def __del__(self):
+        """
+        Close the binary and index files.
+
+        Writes the number of tokens written to the header.
+        """
         if self.bin_fp is not None:
             # Write the number of tokens written to the header
             self.bin_fp.seek(2 * 4, 0)
@@ -251,6 +278,9 @@ class BinaryDataWriter:
 
     @property
     def items_written(self):
+        """
+        Return the number of tokens written (bytes / dtype.itemsize)
+        """
         return self.bytes_written // self.dtype.itemsize
 
 
