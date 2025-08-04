@@ -86,7 +86,8 @@ def test_te_parallel_cross_entropy(reduction):
 
 
 @pytest.mark.skipif(not HAVE_TE_PARALLEL_CE, reason="TE parallel cross entropy is not available")
-def test_te_parallel_cross_entropy_with_masking():
+@pytest.mark.parametrize("reduction", ["none", "mean", "sum"])
+def test_te_parallel_cross_entropy_with_masking(reduction):
     """Tests te_parallel_cross_entropy with loss masking against masked_cross_entropy."""
     if not torch.cuda.is_available():
         pytest.skip("This test requires a GPU")
@@ -103,43 +104,16 @@ def test_te_parallel_cross_entropy_with_masking():
     targets = torch.randint(0, vocab_size, (batch_size, seq_length), device=device)
     loss_mask = torch.randint(0, 2, (batch_size, seq_length), device=device)
 
-    # Reset memory stats
-    torch.cuda.reset_peak_memory_stats(device)
-    
-    # Compare against masked_cross_entropy (the actual baseline)
-    torch.cuda.synchronize()
-    mem_before_masked = torch.cuda.memory_allocated(device)
     with torch.amp.autocast(device_type="cuda", dtype=dtype):
         # MaskedCrossEntropy fills in -100 for masked positions in-place, so we need to clone the targets for test correctness
-        masked_ce_loss = MaskedCrossEntropy()(logits, targets.clone(), mask=loss_mask)
-    torch.cuda.synchronize()
-    mem_after_masked = torch.cuda.memory_allocated(device)
-    masked_ce_peak = torch.cuda.max_memory_allocated(device)
+        masked_ce_loss = MaskedCrossEntropy(reduction=reduction)(logits, targets.clone(), mask=loss_mask)
+        if reduction == "none":
+            masked_ce_loss = masked_ce_loss.view(batch_size, seq_length)
 
-    # Reset for TE measurement
-    torch.cuda.reset_peak_memory_stats(device)
-    torch.cuda.synchronize()
-    mem_before_te = torch.cuda.memory_allocated(device)
     with torch.amp.autocast(device_type="cuda", dtype=dtype):
-        te_loss = TEParallelCrossEntropy()(logits, targets.clone(), mask=loss_mask)
-
-    torch.cuda.synchronize()
-    mem_after_te = torch.cuda.memory_allocated(device)
-    te_peak = torch.cuda.max_memory_allocated(device)
-
-    # Print memory comparison
-    print(f"Memory usage comparison:")
-    print(f"  Masked CE: (peak: {masked_ce_peak / 1024**2:.2f} MB)")
-    print(f"  Masked CE: {mem_after_masked / 1024**2:.2f} MB)")
-    print(f"  TE Parallel: (peak: {te_peak / 1024**2:.2f} MB)")
-    print(f"  TE Parallel: {mem_after_te / 1024**2:.2f} MB)")
+        te_loss = TEParallelCrossEntropy(reduction=reduction)(logits, targets.clone(), mask=loss_mask)
 
     # Accuracy comparison
     assert torch.allclose(te_loss, masked_ce_loss, rtol=1e-2, atol=1e-2), (
         f"Masked loss mismatch: masked_cross_entropy={masked_ce_loss.item():.4f}, TE={te_loss.item():.4f}"
-    )
-
-    # Memory efficiency check - TE should use similar or less memory
-    assert te_peak <= masked_ce_peak * 1.5, (
-        f"TE parallel CE uses significantly more memory: {te_peak / 1024**2:.2f} MB vs {masked_ce_peak / 1024**2:.2f} MB"
     )

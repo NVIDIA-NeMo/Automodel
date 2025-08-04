@@ -64,11 +64,14 @@ class TEParallelCrossEntropy:
         if not HAVE_TE_PARALLEL_CE:
             raise ImportError(MISSING_TE_PARALLEL_CE_MSG)
 
+        non_zero_num = None 
+
         if mask is not None:
             with torch.no_grad():
                 if mask.device != labels.device:
                     mask = mask.to(labels.device)
                 labels.masked_fill_(mask == 0, self.ignore_index)
+                non_zero_num = mask.sum().clamp(min=1.0)
                 del mask
 
         # Compute TE parallel cross entropy
@@ -78,9 +81,9 @@ class TEParallelCrossEntropy:
         if self.reduction == "none":
             return te_loss
         elif self.reduction == "mean":
-            if mask is not None:
+            if non_zero_num is not None:
                 # Mean over valid (non-masked) positions
-                return te_loss.sum() / mask.sum().clamp(min=1.0)
+                return te_loss.sum() / non_zero_num
             else:
                 return te_loss.mean()
         elif self.reduction == "sum":
