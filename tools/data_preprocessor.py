@@ -37,9 +37,8 @@ import json
 import multiprocessing as mp
 import os
 import queue  # for Empty exception handling
-from functools import lru_cache
-
 import numpy as np
+from functools import lru_cache
 from transformers import PreTrainedTokenizer
 
 
