@@ -153,6 +153,10 @@ def make_parser():
     return parser
 
 
+BIN_MAGIC_NUMBER = 2788_95051
+BIN_HEADER_SIZE = 256
+BIN_VERSION = 1
+
 class BinaryDataWriter:
     def __init__(self, filename, bos_token_id, vocab_size):
         """
@@ -183,11 +187,11 @@ class BinaryDataWriter:
 
         self.dtype = dtype
         # header
-        self.header = np.zeros(256, dtype=np.int32)
-        self.header[0] = 2788_95051  # magic
-        self.header[1] = 1  # version
-        self.header[3] = dtype.itemsize  # bytes per token
+        self.header = np.zeros(BIN_HEADER_SIZE, dtype=np.int32)
+        self.header[0] = BIN_MAGIC_NUMBER
+        self.header[1] = BIN_VERSION  # version
         self.header[2] = 0  # number of tokens in *toks*
+        self.header[3] = dtype.itemsize  # bytes per token
 
         self.bin_fp = None
         self.idx_fp = None
@@ -233,6 +237,17 @@ class BinaryDataWriter:
         self.idx_fp.write((pos + np.where(tokens == self.bos_token_id)[0].astype(np.int32)).tobytes())
         self.bytes_written += len(tok_bytes)
         return len(tok_bytes)
+
+    def __del__(self):
+        if self.bin_fp is not None:
+            # Write the number of tokens written to the header
+            self.bin_fp.seek(2 * 4, 0)
+            b = np.zeros(1, dtype=np.int32)
+            b[0] = self.items_written
+            self.bin_fp.write(b.tobytes())
+            self.bin_fp.close()
+        if self.idx_fp is not None:
+            self.idx_fp.close()
 
     @property
     def items_written(self):
