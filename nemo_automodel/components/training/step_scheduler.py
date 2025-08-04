@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
-from torch.distributed.checkpoint.stateful import Stateful
-
 import logging
+from typing import Optional
+
+from torch.distributed.checkpoint.stateful import Stateful
 
 
 class StepScheduler(Stateful):
@@ -79,9 +79,8 @@ class StepScheduler(Stateful):
         Set the epoch for the dataloader.
         """
         self.epoch = epoch
-        if (
-            getattr(self.dataloader, 'sampler', None) is not None
-            and callable(getattr(self.dataloader.sampler, 'set_epoch', None))
+        if getattr(self.dataloader, "sampler", None) is not None and callable(
+            getattr(self.dataloader.sampler, "set_epoch", None)
         ):
             self.dataloader.sampler.set_epoch(epoch)
         else:
