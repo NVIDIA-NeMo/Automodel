@@ -86,30 +86,30 @@ def load_bin_shard(path: str | os.PathLike) -> torch.Tensor:
 
 
 class BinTokenDataset(IterableDataset):
-    """Stream *seq_len* token slices from a set of *.bin* shards.
+    """
+    Stream *seq_len* token slices from a set of *.bin* shards.
 
-    Parameters
-    ----------
-    file_pattern : str | Sequence[str]
-        Glob pattern (e.g. ``"data/fineweb_*_train_*.bin"``) **or** an explicit
-        list of file paths.
-    seq_len : int
-        Length of the training sample returned (not counting the next-token
-        target).  Targets are simply ``inputs[1:]``.
-    shuffle_files : bool, default False
-        Shuffle the order of shards each epoch/iteration.
-    align_to_bos : bool, default True
-        Ensure that every slice starts with ``bos_token``.  When enabled, the
-        dataset searches forward from the current position until it finds the
-        next BOS token and starts there.
-    bos_token : int, default 50256
-        Token ID marking beginning-of-document.
-    drop_last : bool, default True
-        If the end of a shard does not have enough tokens for a full slice,
-        skip the remainder rather than crossing the shard boundary.
-    infinite : bool, default True
-        Stream forever (wrap around shards).  When ``False``, stop after the
-        last shard is exhausted.
+    Args:
+        file_pattern : str | Sequence[str]
+            Glob pattern (e.g. ``"data/fineweb_*_train_*.bin"``) **or** an explicit
+            list of file paths.
+        seq_len : int
+            Length of the training sample returned (not counting the next-token
+            target).  Targets are simply ``inputs[1:]``.
+        shuffle_files : bool, default False
+            Shuffle the order of shards each epoch/iteration.
+        align_to_bos : bool, default True
+            Ensure that every slice starts with ``bos_token``.  When enabled, the
+            dataset searches forward from the current position until it finds the
+            next BOS token and starts there.
+        bos_token : int, default 50256
+            Token ID marking beginning-of-document.
+        drop_last : bool, default True
+            If the end of a shard does not have enough tokens for a full slice,
+            skip the remainder rather than crossing the shard boundary.
+        infinite : bool, default True
+            Stream forever (wrap around shards).  When ``False``, stop after the
+            last shard is exhausted.
     """
 
     def __init__(
