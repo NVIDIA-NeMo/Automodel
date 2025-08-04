@@ -78,7 +78,13 @@ class StepScheduler(Stateful):
         Set the epoch for the dataloader.
         """
         self.epoch = epoch
-        self.dataloader.sampler.set_epoch(epoch)
+        if (
+            getattr(self.dataloader, 'sampler', None) is not None
+            and callable(getattr(self.dataloader.sampler, 'set_epoch', None))
+        ):
+            self.dataloader.sampler.set_epoch(epoch)
+        else:
+            logging.warning("Dataloader sampler does not support setting epoch")
 
     @property
     def is_optim_step(self):
