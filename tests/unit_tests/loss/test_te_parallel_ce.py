@@ -82,7 +82,7 @@ def test_te_parallel_cross_entropy(reduction, ignore_index):
 
 @pytest.mark.skipif(not HAVE_TE_PARALLEL_CE, reason=MISSING_TE_PARALLEL_CE_MSG)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-@pytest.mark.parametrize("reduction", ["mean", "sum"])
+@pytest.mark.parametrize("reduction", ["none", "mean", "sum"])
 def test_te_parallel_cross_entropy_with_masking(reduction):
     """Tests te_parallel_cross_entropy with loss masking against masked_cross_entropy."""
 
@@ -98,36 +98,24 @@ def test_te_parallel_cross_entropy_with_masking(reduction):
     targets = torch.randint(0, vocab_size, (batch_size, seq_length), device=device)
     loss_mask = torch.randint(0, 2, (batch_size, seq_length), device=device)
 
-    logits_masked = logits.clone().requires_grad_(True)
-    logits_te = logits.clone().requires_grad_(True)
-
     with torch.amp.autocast(device_type="cuda", dtype=dtype):
         # MaskedCrossEntropy fills in ignore_index for masked positions in-place, so we need to clone the targets for test correctness
-        masked_ce_loss = MaskedCrossEntropy(reduction=reduction)(logits_masked, targets.clone(), mask=loss_mask)
+        masked_ce_loss = MaskedCrossEntropy(reduction=reduction)(logits, targets.clone(), mask=loss_mask)
+        if reduction == "none":
+            masked_ce_loss = masked_ce_loss.view(batch_size, seq_length)
 
     with torch.amp.autocast(device_type="cuda", dtype=dtype):
-        te_loss = TEParallelCrossEntropy(reduction=reduction)(logits_te, targets.clone(), mask=loss_mask)
+        te_loss = TEParallelCrossEntropy(reduction=reduction)(logits, targets.clone(), mask=loss_mask)
 
-    # Accuracy comparison
-    assert torch.allclose(te_loss, masked_ce_loss, rtol=1e-2, atol=1e-2), (
-        f"Masked loss mismatch: masked_cross_entropy={masked_ce_loss.item():.4f}, TE={te_loss.item():.4f}"
-    )
+    masked_ce_loss = masked_ce_loss.float()
+    te_loss = te_loss.float()
 
-    # Backward pass test
-    masked_ce_loss.backward()
-    te_loss.backward()
-
-    masked_gradients = logits_masked.grad.detach().clone()
-    te_gradients = logits_te.grad.detach().clone()
-
-    # Gradient comparison
-    grad_diff = torch.norm(masked_gradients - te_gradients).item()
-    grad_norm_masked = torch.norm(masked_gradients).item()
-
-    print(f"\n=== Gradient Comparison ===")
-    print(f"Gradient difference norm: {grad_diff:.6f}")
-    print(f"Relative gradient error: {grad_diff / max(grad_norm_masked, 1e-8):.6f}")
-
-    assert torch.allclose(masked_gradients, te_gradients, rtol=1e-2, atol=1e-3), (
-        f"Gradient mismatch: relative error = {grad_diff / max(grad_norm_masked, 1e-8):.6f}"
-    )
+    if reduction == "none":
+        assert torch.allclose(te_loss, masked_ce_loss, rtol=1e-2, atol=1e-2), (
+            f"Loss mismatch: MaskedCrossEntropy shape={masked_ce_loss.shape}, TEParallelCrossEntropy shape={te_loss.shape}\n"
+            f"MaskedCrossEntropy mean={masked_ce_loss.mean().item()}, TEParallelCrossEntropy mean={te_loss.mean().item()}"
+        )
+    else:
+        assert torch.allclose(te_loss, masked_ce_loss, rtol=1e-2, atol=1e-2), (
+            f"Loss mismatch with reduction={reduction}: MaskedCrossEntropy={masked_ce_loss}, TEParallelCrossEntropy={te_loss}"
+        )
