@@ -56,28 +56,28 @@ def _get_device_type(device_or_backend_type: str) -> str:
 
 @dataclass
 class ParallelDims:
-    dp_replicate: int
-    dp_shard: int
-    cp: int
-    tp: int
-    pp: int
+    dp_replicate_size: int
+    dp_shard_size: int
+    cp_size: int
+    tp_size: int
+    pp_size: int
     world_size: int
-    pp_dynamic_shape: bool
-    ep: int = 1
+    pp_dynamic_shape: bool = False
+    ep_size: int = 1
     # When ep is enabled, we can have different dp shard for the MoE module.
     # For example, suppose we have 64 GPUs, then we can have dp_shard equal
     # to 64 for the attention module, and have ep = 4, dp_shard_with_ep = 16
     # for the MoE module.
-    dp_shard_with_ep: int = -1
+    dp_shard_with_ep_size: int = -1
 
     mesh: str = field(init=False, default=None)
 
     def __post_init__(self):
-        if self.pp > 1:
+        if self.pp_size > 1:
             raise ValueError("Pipeline parallelism is not supported yet.")
-        if self.ep > 1:
+        if self.ep_size > 1:
             raise ValueError("Exponential parallelism is not supported yet.")
-        if self.dp_shard_with_ep > 1:
+        if self.dp_shard_with_ep_size > 1:
             raise ValueError("Exponential parallelism is not supported yet.")
         if self.pp_dynamic_shape:
             raise ValueError("Pipeline parallelism dynamic shape is not supported yet.")
@@ -87,13 +87,13 @@ class ParallelDims:
 
     def _validate(self):
         dp_replicate, dp_shard, cp, tp, pp, ep, dp_shard_with_ep = (
-            self.dp_replicate,
-            self.dp_shard,
-            self.cp,
-            self.tp,
-            self.pp,
-            self.ep,
-            self.dp_shard_with_ep,
+            self.dp_replicate_size,
+            self.dp_shard_size,
+            self.cp_size,
+            self.tp_size,
+            self.pp_size,
+            self.ep_size,
+            self.dp_shard_with_ep_size,
         )
         for d in (dp_replicate, cp, tp, pp, ep):
             assert d >= 1, "Parallelism degree should be >= 1, except for dp_shard"
@@ -115,7 +115,7 @@ class ParallelDims:
                     "dp_shard_with_ep is set to -1, will be automatically determined based "
                     f"on self.world_size {self.world_size} // {pp * ep * tp}."
                 )
-                self.dp_shard_with_ep = dp_shard_with_ep = self.world_size // (pp * ep * tp)
+                self.dp_shard_with_ep_size = dp_shard_with_ep = self.world_size // (pp * ep * tp)
                 logging.info(f"dp_shard_with_ep is set to {dp_shard_with_ep}.")
             assert dp_shard_with_ep >= 1, (
                 f"WORLD_SIZE({self.world_size}) is not a multiple of pp({pp}) * ep({ep}) * tp({tp})"
@@ -141,7 +141,7 @@ class ParallelDims:
         dims = []
         names = []
         for d, name in zip(
-            [self.pp, self.dp_replicate, self.dp_shard, self.cp, self.tp],
+            [self.pp_size, self.dp_replicate_size, self.dp_shard_size, self.cp_size, self.tp_size],
             [
                 DimNames.PP,
                 DimNames.DP_REPLICATE,
@@ -229,88 +229,89 @@ class ParallelDims:
 
     @property
     def dp_enabled(self) -> bool:
-        return self.dp_replicate > 1 or self.dp_shard > 1
+        return self.dp_replicate_size > 1 or self.dp_shard_size > 1
 
     @property
     def dp_replicate_enabled(self) -> bool:
-        return self.dp_replicate > 1
+        return self.dp_replicate_size > 1
 
     @property
     def dp_shard_enabled(self) -> bool:
-        return self.dp_shard > 1
+        return self.dp_shard_size > 1
 
     @property
     def cp_enabled(self) -> bool:
-        return self.cp > 1
+        return self.cp_size > 1
 
     @property
     def tp_enabled(self) -> bool:
-        return self.tp > 1
+        return self.tp_size > 1
 
     @property
     def pp_enabled(self) -> bool:
-        return self.pp > 1
+        return self.pp_size > 1
 
     @property
     def ep_enabled(self) -> bool:
-        return self.ep > 1
+        return self.ep_size > 1
 
     @property
     def dp_shard_with_ep_enabled(self) -> bool:
-        return self.dp_shard_with_ep > 1
+        return self.dp_shard_with_ep_size > 1
 
     @property
     def pp_dynamic_shape_enabled(self) -> bool:
-        return self.pp > 1 and self.pp_dynamic_shape
+        return self.pp_size > 1 and self.pp_dynamic_shape
 
     def non_data_parallel_size(self):
-        return self.cp * self.tp * self.pp
+        return self.cp_size * self.tp_size * self.pp_size
 
     @property
     def dp_replicate_coord(self):
         if not self.dp_replicate_enabled:
             return 0, 1
-        return (self.mesh.get_local_rank(mesh_dim="dp_replicate"), self.dp_replicate)
+        return (self.mesh.get_local_rank(mesh_dim=DimNames.DP_REPLICATE), self.dp_replicate_size)
 
     @property
     def tp_coord(self):
         if not self.tp_enabled:
             return 0, 1
-        return (self.mesh.get_local_rank(mesh_dim="tp"), self.tp)
+        return (self.mesh.get_local_rank(mesh_dim=DimNames.TP), self.tp_size)
 
     @property
     def pp_coord(self):
         if not self.pp_enabled:
             return 0, 1
-        return (self.mesh.get_local_rank(mesh_dim="pp"), self.pp)
+        return (self.mesh.get_local_rank(mesh_dim=DimNames.PP), self.pp_size)
 
     @property
     def dp_shard_coord(self):
         if not self.dp_shard_enabled:
             return 0, 1
-        return (self.mesh.get_local_rank(mesh_dim="dp_shard"), self.dp_shard)
+        return (self.mesh.get_local_rank(mesh_dim=DimNames.DP_SHARD), self.dp_shard_size)
 
     @property
     def cp_coord(self):
         if not self.cp_enabled:
             return 0, 1
-        return (self.mesh.get_local_rank(mesh_dim="cp"), self.cp)
+        return (self.mesh.get_local_rank(mesh_dim=DimNames.CP), self.cp_size)
 
     @property
     def dp_shard_cp_coord(self):
         if not self.dp_shard_enabled and not self.cp_enabled:
             return 0, 1
         else:
-            return self.mesh[tuple(("dp_shard_cp",))].get_local_rank(), self.mesh[tuple(("dp_shard_cp",))].size()
+            return self.mesh[tuple((DimsNames.DP_SHARD_CP,))].get_local_rank(), \
+                self.mesh[tuple((DimsNames.DP_SHARD_CP,))].size()
 
     def build_mesh_info(self):
         dims = [DimNames.PP, DimNames.DP_REPLICATE, DimNames.DP_SHARD, DimNames.CP, DimNames.TP]
         dim_paras = {
-            DimNames.PP: self.pp,
-            DimNames.DP_REPLICATE: self.dp_replicate,
-            DimNames.DP_SHARD: self.dp_shard,
-            DimNames.CP: self.cp,
-            DimNames.TP: self.tp,
+            DimNames.PP: self.pp_size,
+            DimNames.DP_REPLICATE: self.dp_replicate_size,
+            DimNames.DP_SHARD: self.dp_shard_size,
+            DimNames.CP: self.cp_size,
+            DimNames.TP: self.tp_size,
         }
         info = [{} for i in range(self.world_size)]
         meshes = [range(self.world_size)]
@@ -328,22 +329,22 @@ class ParallelDims:
         # {'pp': 0, 'dp_replicate': 0, 'dp_shard': 0, 'cp': 0, 'tp': 1, 'dp_shard_cp': 0, 'dp': 0}]
         self.full_rank_info = info
         self.full_world_size_info = dim_paras
-        self.full_world_size_info[DimNames.DP_SHARD_CP] = self.dp_shard * self.cp
-        self.full_world_size_info[DimNames.DP] = self.dp_replicate * self.dp_shard
-        self.full_world_size_info[DimNames.DP_CP_TP] = self.dp_replicate * self.dp_shard * self.cp * self.tp
+        self.full_world_size_info[DimNames.DP_SHARD_CP] = self.dp_shard_size * self.cp_size
+        self.full_world_size_info[DimNames.DP] = self.dp_replicate_size * self.dp_shard_size
+        self.full_world_size_info[DimNames.DP_CP_TP] = self.dp_replicate_size * self.dp_shard_size * self.cp_size * self.tp_size
 
         for i in range(self.world_size):
             self.full_rank_info[i][DimNames.DP_CP_TP] = (
-                self.full_rank_info[i][DimNames.DP_REPLICATE] * self.dp_shard * self.cp * self.tp
-                + self.full_rank_info[i][DimNames.DP_SHARD] * self.cp * self.tp
-                + self.full_rank_info[i][DimNames.CP] * self.tp
+                self.full_rank_info[i][DimNames.DP_REPLICATE] * self.dp_shard_size * self.cp_size * self.tp_size
+                + self.full_rank_info[i][DimNames.DP_SHARD] * self.cp_size * self.tp_size
+                + self.full_rank_info[i][DimNames.CP] * self.tp_size
                 + self.full_rank_info[i][DimNames.TP]
             )
             self.full_rank_info[i][DimNames.DP_SHARD_CP] = (
-                self.full_rank_info[i][DimNames.DP_SHARD] * self.cp + self.full_rank_info[i][DimNames.CP]
+                self.full_rank_info[i][DimNames.DP_SHARD] * self.cp_size + self.full_rank_info[i][DimNames.CP]
             )
             self.full_rank_info[i][DimNames.DP] = (
-                self.full_rank_info[i][DimNames.DP_REPLICATE] * self.dp_shard
+                self.full_rank_info[i][DimNames.DP_REPLICATE] * self.dp_shard_size
                 + self.full_rank_info[i][DimNames.DP_SHARD]
             )
 
