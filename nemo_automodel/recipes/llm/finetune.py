@@ -338,6 +338,7 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> OptimizerParamSchedule
 
     return OptimizerParamScheduler(**default_kwargs)
 
+
 def build_wandb(cfg) -> wandb.Run:
     """Instantiates wandb and returns the instance. If no name is given, it will use the model name.
 
@@ -351,7 +352,6 @@ def build_wandb(cfg) -> wandb.Run:
     kwargs = cfg.wandb.to_dict()
     if kwargs.get("name", "") == "":
         kwargs["name"] = "_".join(cfg.get("model.pretrained_model_name_or_path").split("/")[-2:])
-    
     run = wandb.init(
         **kwargs,
         config=cfg,
