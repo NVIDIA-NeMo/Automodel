@@ -35,6 +35,24 @@ class DimNames(str, Enum):
     DP_CP = "dp_cp"
     DP_CP_TP = "dp_cp_tp"
 
+def _get_device_type(device_or_backend_type: str) -> str:
+    """
+    Get the device type from the device or backend type.
+
+    Args:
+        device_or_backend_type (str): The device or backend type.
+
+    Returns:
+        str: The backend type.
+    """
+    if device_or_backend_type in ("cuda", "cpu"):
+        return device_or_backend_type
+    elif device_or_backend_type == "nccl":
+        return "cuda"
+    elif device_or_backend_type == "gloo":
+        return "cpu"
+    else:
+        raise ValueError(f"Invalid device or backend type: {device_or_backend_type}")
 
 @dataclass(frozen=True)
 class ParallelDims:
@@ -116,14 +134,7 @@ class ParallelDims:
                 )
 
     def build_mesh(self, device_or_backend_type: str) -> DeviceMesh:
-        if device_or_backend_type in ("cuda", "cpu"):
-            device_type = device_or_backend_type
-        elif device_or_backend_type == "nccl":
-            device_type = "cuda"
-        elif device_or_backend_type == "gloo":
-            device_type = "cpu"
-        else:
-            raise ValueError(f"Invalid device or backend type: {device_or_backend_type}")
+        device_type = _get_device_type(device_or_backend_type)
 
         dims = []
         names = []
