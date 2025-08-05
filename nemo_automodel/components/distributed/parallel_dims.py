@@ -16,7 +16,7 @@
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy
@@ -54,7 +54,7 @@ def _get_device_type(device_or_backend_type: str) -> str:
     else:
         raise ValueError(f"Invalid device or backend type: {device_or_backend_type}")
 
-@dataclass(frozen=True)
+@dataclass
 class ParallelDims:
     dp_replicate: int
     dp_shard: int
@@ -69,6 +69,8 @@ class ParallelDims:
     # to 64 for the attention module, and have ep = 4, dp_shard_with_ep = 16
     # for the MoE module.
     dp_shard_with_ep: int = -1
+
+    mesh: str = field(init=False, default=None)
 
     def __post_init__(self):
         if self.pp > 1:
@@ -199,6 +201,7 @@ class ParallelDims:
         if dp_cp_mesh_dim_names != []:
             mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name=DimNames.DP_CP)
 
+        assert self.mesh is None, "mesh is already set"
         self.mesh = mesh
         return mesh
 
