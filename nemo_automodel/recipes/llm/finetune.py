@@ -350,32 +350,7 @@ def build_wandb(cfg) -> wandb.Run:
     assert cfg.get("wandb", None) is not None
     kwargs = cfg.wandb.to_dict()
     if kwargs.get("name", "") == "":
-        # Build run name with model and training parameters
-        name_parts = []
-        
-        loss_fn_name = cfg.get("loss_fn._target_", None)
-        if loss_fn_name:
-            class_name = loss_fn_name.__name__
-            name_parts.append(class_name)
-
-        # Dataset name
-        dataset_name = cfg.get("dataset.name", None) or cfg.get("data.dataset_name", None)
-        if dataset_name:
-            name_parts.append(dataset_name)
-        
-        # Model name
-        model_name = "_".join(cfg.get("model.pretrained_model_name_or_path").split("/")[-2:])
-        name_parts.append(model_name)
-
-        batch_size = cfg.get("dataloader.batch_size", None)
-        if batch_size:
-            name_parts.append(f"bs{batch_size}")
-        
-        grad_acc_steps = cfg.get("step_scheduler.grad_acc_steps", None)
-        if grad_acc_steps:
-            name_parts.append(f"gas{grad_acc_steps}")
-        
-        kwargs["name"] = "_".join(name_parts)
+        kwargs["name"] = "_".join(cfg.get("model.pretrained_model_name_or_path").split("/")[-2:])
     
     run = wandb.init(
         **kwargs,
