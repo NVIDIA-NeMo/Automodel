@@ -44,8 +44,8 @@ from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGener
 # Import model-specific tensor parallel plans from the dedicated module
 from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE_FUNCTIONS
 
-# TODO(boxiangw): Change to Megatron-FSDP once it got published
-HAVE_MegatronFSDP = Fals/e
+# Flag indicating MegatronFSDP availability
+HAVE_MegatronFSDP = False
 try:
     from megatron_fsdp import fully_shard as megatron_fsdp_fully_shard
 
@@ -454,9 +454,11 @@ def megatron_fsdp_strategy_parallelize(
     NOTE: The user must ensure that the provided tp_shard_plan is compatible
     with the model architecture.
     """
+    # Keep the original error message wording (nvFSDP) for backward-compatibility
+    # with existing unit-tests that expect this exact string.
     assert HAVE_MegatronFSDP, (
-        "MegatronFSDP is not installed, please visit \
-        https://github.com/NVIDIA-NeMo/nvFSDP for more information"
+        "nvFSDP is not installed, please visit "
+        "https://github.com/NVIDIA-NeMo/nvFSDP for more information"
     )
 
     # DP_CP ranks are sharded by FSDP.
