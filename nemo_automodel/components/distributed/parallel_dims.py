@@ -52,6 +52,15 @@ class ParallelDims:
     dp_shard_with_ep: int = -1
 
     def __post_init__(self):
+        if self.pp > 1:
+            raise ValueError("Pipeline parallelism is not supported yet.")
+        if self.ep > 1:
+            raise ValueError("Exponential parallelism is not supported yet.")
+        if self.dp_shard_with_ep > 1:
+            raise ValueError("Exponential parallelism is not supported yet.")
+        if self.pp_dynamic_shape:
+            raise ValueError("Pipeline parallelism dynamic shape is not supported yet.")
+
         self._validate()
         self.build_mesh_info()
 

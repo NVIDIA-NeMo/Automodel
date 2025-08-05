@@ -60,18 +60,6 @@ class NVFSDPManager:
 
     parallel_dims: ParallelDims = field(default_factory=ParallelDims)
 
-    # dp_size: Optional[int] = field(
-    #     default=None,
-    #     metadata={"help": "Data-parallel group size; if None, infer from WORLD_SIZE."},
-    # )
-    # tp_size: Optional[int] = field(
-    #     default=1,
-    #     metadata={"help": "Tensor-parallel group size; if None, defaults to 1."},
-    # )
-    # cp_size: Optional[int] = field(
-    #     default=1,
-    #     metadata={"help": "Context-parallel group size (for pipeline-like sharding)."},
-    # )
     sequence_parallel: Optional[bool] = field(
         default=False,
         metadata={"help": "Enable sequence parallelism in TP plan if True. Not supported with nvFSDP right now."},
