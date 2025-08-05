@@ -31,6 +31,7 @@ from nemo_automodel.components.distributed.parallelizer import (
     get_hf_tp_shard_plan,
 )
 
+from nemo_automodel.components.distributed.dim_names import DimNames
 
 @dataclass
 class FSDP2Manager:
@@ -175,7 +176,7 @@ class FSDP2Manager:
 
     def _get_device_mesh(self):
         mesh_shape = (self.dp_replicate_size, self.dp_shard_size, self.cp_size, self.tp_size)
-        mesh_names = ("dp_replicate", "dp_shard", "cp", "tp")
+        mesh_names = (DimNames.DP_REPLICATE, DimNames.DP_SHARD, DimNames.CP, DimNames.TP)
         for shape, name in zip(mesh_shape, mesh_names):
             assert isinstance(shape, int), "Expected {} to be an int, but got {}".format(name, type(shape))
             assert shape > 0, "Expected {} > 0, {}".format(name, shape)
@@ -188,7 +189,7 @@ class FSDP2Manager:
         )
         # flatten dp+cp if cp>1
         if self.cp_size > 1:
-            self.device_mesh[("dp", "cp")]._flatten(mesh_dim_name="dp_cp")
+            self.device_mesh[(DimNames.DP, DimNames.CP)]._flatten(mesh_dim_name=DimNames.DP_CP)
 
         # based on https://github.com/pytorch/torchtitan/blob/d282cf2ce9ca8049b4b8423c1d7578c80426576f/torchtitan/distributed/parallel_dims.py#L191
         # Create all the submesh here to ensure all required process groups are
@@ -201,22 +202,22 @@ class FSDP2Manager:
         dp_cp_mesh_dim_names = []
 
         # for dp_replicate:
-        dp_mesh_dim_names.append("dp_replicate")
-        dp_cp_mesh_dim_names.append("dp_replicate")
+        dp_mesh_dim_names.append(DimNames.DP_REPLICATE)
+        dp_cp_mesh_dim_names.append(DimNames.DP_REPLICATE)
         # for dp_shard:
-        dp_mesh_dim_names.append("dp_shard")
-        dp_shard_cp_mesh_dim_names.append("dp_shard")
-        dp_cp_mesh_dim_names.append("dp_shard")
+        dp_mesh_dim_names.append(DimNames.DP_SHARD)
+        dp_shard_cp_mesh_dim_names.append(DimNames.DP_SHARD)
+        dp_cp_mesh_dim_names.append(DimNames.DP_SHARD)
         # for cp:
-        dp_shard_cp_mesh_dim_names.append("cp")
-        dp_cp_mesh_dim_names.append("cp")
+        dp_shard_cp_mesh_dim_names.append(DimNames.CP)
+        dp_cp_mesh_dim_names.append(DimNames.CP)
 
         # submesh for dp
-        self.device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
+        self.device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name=DimNames.DP)
         # submesh for dp_shard_cp
-        self.device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_shard_cp")
+        self.device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name=DimNames.DP_SHARD_CP)
         # submesh for dp_cp
-        self.device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
+        self.device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name=DimNames.DP_CP)
         return self.device_mesh
 
     def parallelize(self, model, use_hf_tp_plan=False):

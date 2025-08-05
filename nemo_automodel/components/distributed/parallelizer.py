@@ -43,6 +43,7 @@ from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGener
 
 # Import model-specific tensor parallel plans from the dedicated module
 from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE_FUNCTIONS
+from nemo_automodel.components.distributed.dim_names import DimNames
 
 # TODO(boxiangw): Change to nvFSDP once it got published
 HAVE_NVFSDP = False
@@ -224,9 +225,9 @@ def fsdp2_strategy_parallelize(
     sequence_parallel: bool = False,
     activation_checkpointing: bool = False,
     tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
-    dp_replicate_mesh_name: str = "dp_replicate",
-    dp_shard_cp_mesh_name: str = "dp_shard_cp",
-    tp_mesh_name: str = "tp",
+    dp_replicate_mesh_name: str = DimNames.DP_REPLICATE,
+    dp_shard_cp_mesh_name: str = DimNames.DP_SHARD_CP,
+    tp_mesh_name: str = DimNames.TP,
 ):
     """
     Apply parallelisms and activation checkpointing to the model.
@@ -394,9 +395,9 @@ def nvfsdp_strategy_parallelize(
     keep_fp8_transpose_cache_when_using_custom_fsdp: bool = False,
     nccl_ub: bool = False,
     fsdp_double_buffer: bool = False,
-    dp_mesh_name: str = "dp",
-    cp_mesh_name: str = "cp",
-    tp_mesh_name: str = "tp",
+    dp_mesh_name: str = DimNames.DP,
+    cp_mesh_name: str = DimNames.CP,
+    tp_mesh_name: str = DimNames.TP,
 ):
     """
     Apply tensor/data parallelism (nvFSDP) and optional activation-checkpointing to the model.
@@ -473,9 +474,9 @@ def nvfsdp_strategy_parallelize(
         parallelize_module(model, tp_mesh, tp_shard_plan)
 
     if cp_mesh.size() > 1:
-        dp_cp_mesh_name = "dp_cp"
+        dp_cp_mesh_name = DimNames.DP_CP
     else:
-        dp_cp_mesh_name = "dp"
+        dp_cp_mesh_name = DimNames.DP
 
     # Import nvFSDP unit modules specified by the user.
     nvfsdp_unit_modules = import_classes_from_paths(nvfsdp_unit_modules)
