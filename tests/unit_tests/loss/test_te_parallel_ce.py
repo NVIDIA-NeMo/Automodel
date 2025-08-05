@@ -15,20 +15,16 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.loss.te_parallel_ce import (
-    HAVE_TE_PARALLEL_CE,
-    TEParallelCrossEntropy,
-)
+from nemo_automodel.components.loss.te_parallel_ce import TEParallelCrossEntropy
 
-@pytest.mark.skipif(not HAVE_TE_PARALLEL_CE, reason="TE parallel cross entropy is not available")
 @pytest.mark.parametrize("reduction", ["none", "mean", "sum"])
-def test_te_parallel_cross_entropy(reduction):
+@pytest.mark.parametrize("ignore_index", [-100, -199])
+def test_te_parallel_cross_entropy(reduction, ignore_index):
     """Tests te_parallel_cross_entropy against PyTorch's CE.
 
     * has close output with PyTorch's cross_entropy
-    * handles strided label format correctly
-    * works with tensor parallel groups
     * works with different reduction methods
+    * works with different ignore_index values
     """
     if not torch.cuda.is_available():
         pytest.skip("This test requires a GPU")
@@ -45,7 +41,7 @@ def test_te_parallel_cross_entropy(reduction):
     # Measure memory for PyTorch implementation
     torch.cuda.reset_peak_memory_stats()
     with torch.amp.autocast(device_type="cuda", dtype=dtype):
-        pytorch_loss = F.cross_entropy(logits.view(-1, vocab_size), targets.view(-1), reduction=reduction)
+        pytorch_loss = F.cross_entropy(logits.view(-1, vocab_size), targets.view(-1), reduction=reduction, ignore_index=ignore_index)
         if reduction == "none":
             pytorch_loss = pytorch_loss.view(batch_size, seq_length)
 
@@ -58,7 +54,7 @@ def test_te_parallel_cross_entropy(reduction):
     # Measure memory for TE implementation
     torch.cuda.reset_peak_memory_stats()
     with torch.amp.autocast(device_type="cuda", dtype=dtype):
-        te_loss = TEParallelCrossEntropy(tp_group=None, reduction=reduction)(logits, targets)
+        te_loss = TEParallelCrossEntropy(tp_group=None, reduction=reduction, ignore_index=ignore_index)(logits, targets)
 
     te_memory = torch.cuda.max_memory_allocated()
 
@@ -85,7 +81,6 @@ def test_te_parallel_cross_entropy(reduction):
         )
 
 
-@pytest.mark.skipif(not HAVE_TE_PARALLEL_CE, reason="TE parallel cross entropy is not available")
 @pytest.mark.parametrize("reduction", ["none", "mean", "sum"])
 def test_te_parallel_cross_entropy_with_masking(reduction):
     """Tests te_parallel_cross_entropy with loss masking against masked_cross_entropy."""
@@ -104,16 +99,40 @@ def test_te_parallel_cross_entropy_with_masking(reduction):
     targets = torch.randint(0, vocab_size, (batch_size, seq_length), device=device)
     loss_mask = torch.randint(0, 2, (batch_size, seq_length), device=device)
 
-    with torch.amp.autocast(device_type="cuda", dtype=dtype):
-        # MaskedCrossEntropy fills in -100 for masked positions in-place, so we need to clone the targets for test correctness
-        masked_ce_loss = MaskedCrossEntropy(reduction=reduction)(logits, targets.clone(), mask=loss_mask)
-        if reduction == "none":
-            masked_ce_loss = masked_ce_loss.view(batch_size, seq_length)
+    logits_masked = logits.clone().requires_grad_(True)
+    logits_te = logits.clone().requires_grad_(True)
 
     with torch.amp.autocast(device_type="cuda", dtype=dtype):
-        te_loss = TEParallelCrossEntropy(reduction=reduction)(logits, targets.clone(), mask=loss_mask)
+        # MaskedCrossEntropy fills in ignore_index for masked positions in-place, so we need to clone the targets for test correctness
+        masked_ce_loss = MaskedCrossEntropy(reduction=reduction)(logits_masked, targets.clone(), mask=loss_mask)
+        if reduction == "none":
+            masked_ce_loss = masked_ce_loss.view(batch_size, seq_length)
+        masked_ce_loss_scalar = masked_ce_loss.sum() if reduction == "none" else masked_ce_loss
+
+    with torch.amp.autocast(device_type="cuda", dtype=dtype):
+        te_loss = TEParallelCrossEntropy(reduction=reduction)(logits_te, targets.clone(), mask=loss_mask)
+        te_loss_scalar = te_loss.sum() if reduction == "none" else te_loss
 
     # Accuracy comparison
     assert torch.allclose(te_loss, masked_ce_loss, rtol=1e-2, atol=1e-2), (
         f"Masked loss mismatch: masked_cross_entropy={masked_ce_loss.item():.4f}, TE={te_loss.item():.4f}"
+    )
+
+    # Backward pass test
+    masked_ce_loss_scalar.backward()
+    te_loss_scalar.backward()
+
+    masked_gradients = logits_masked.grad.detach().clone()
+    te_gradients = logits_te.grad.detach().clone()
+
+    # Gradient comparison
+    grad_diff = torch.norm(masked_gradients - te_gradients).item()
+    grad_norm_masked = torch.norm(masked_gradients).item()
+    
+    print(f"\n=== Gradient Comparison ===")
+    print(f"Gradient difference norm: {grad_diff:.6f}")
+    print(f"Relative gradient error: {grad_diff / max(grad_norm_masked, 1e-8):.6f}")
+
+    assert torch.allclose(masked_gradients, te_gradients, rtol=1e-2, atol=1e-3), (
+        f"Gradient mismatch: relative error = {grad_diff / max(grad_norm_masked, 1e-8):.6f}"
     )
