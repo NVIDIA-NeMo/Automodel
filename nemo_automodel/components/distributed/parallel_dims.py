@@ -301,8 +301,8 @@ class ParallelDims:
         if not self.dp_shard_enabled and not self.cp_enabled:
             return 0, 1
         else:
-            return self.mesh[tuple((DimsNames.DP_SHARD_CP,))].get_local_rank(), \
-                self.mesh[tuple((DimsNames.DP_SHARD_CP,))].size()
+            return self.mesh[tuple((DimNames.DP_SHARD_CP,))].get_local_rank(), \
+                self.mesh[tuple((DimNames.DP_SHARD_CP,))].size()
 
     def build_mesh_info(self):
         dims = [DimNames.PP, DimNames.DP_REPLICATE, DimNames.DP_SHARD, DimNames.CP, DimNames.TP]
