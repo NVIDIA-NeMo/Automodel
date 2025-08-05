@@ -54,19 +54,19 @@ except:
     pass
 
 
-def apply_fsdp_sharding_recursively(
+def apply_fsdp2_sharding_recursively(
     module: nn.Module,
     mesh: DeviceMesh,
     mp_policy: Optional[MixedPrecisionPolicy],
     offload_policy: Optional[OffloadPolicy] = None,
 ) -> None:
     """
-    Recursively apply FSDP sharding to modules, with optimizations for ModuleList.
+    Recursively apply FSDP2 sharding to modules, with optimizations for ModuleList.
 
-    This utility function traverses a model hierarchy and applies FSDP sharding
+    This utility function traverses a model hierarchy and applies FSDP2 sharding
     to each module. For ModuleList instances (commonly used for transformer layers),
     it applies an optimization where the last layer doesn't reshard after forward
-    since FSDP will prefetch it immediately.
+    since FSDP2 will prefetch it immediately.
 
     Args:
         module (nn.Module): The module to apply FSDP sharding to.
@@ -77,7 +77,7 @@ def apply_fsdp_sharding_recursively(
 
     Note:
         This function modifies the module in-place by replacing modules with their
-        FSDP-wrapped versions.
+        FSDP2-subclassed versions.
     """
     if isinstance(module, nn.ModuleList):
         for layer_id, transformer_block in enumerate(module):
@@ -94,7 +94,7 @@ def apply_fsdp_sharding_recursively(
             module[layer_id] = transformer_block
     else:
         for name, sub_module in module.named_children():
-            apply_fsdp_sharding_recursively(sub_module, mesh, mp_policy, offload_policy)
+            apply_fsdp2_sharding_recursively(sub_module, mesh, mp_policy, offload_policy)
 
 
 def get_hf_tp_shard_plan(model):
@@ -224,8 +224,9 @@ def fsdp2_strategy_parallelize(
     sequence_parallel: bool = False,
     activation_checkpointing: bool = False,
     tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
-    dp_mesh_name: str = "data_parallel",
-    tp_mesh_name: str = "tensor_parallel",
+    dp_replicate_mesh_name: str = "dp_replicate",
+    dp_shard_cp_mesh_name: str = "dp_shard_cp",
+    tp_mesh_name: str = "tp",
 ):
     """
     Apply parallelisms and activation checkpointing to the model.
@@ -250,10 +251,12 @@ def fsdp2_strategy_parallelize(
             - A dictionary mapping module names to parallel styles
             - A string path to a dictionary or function that returns a dictionary
             If provided, this takes precedence over automatic plan generation.
-        dp_mesh_name (str): Key name for the data parallel mesh in device_mesh.
-            Defaults to "data_parallel".
+        dp_replicate_mesh_name (str): Key name for the data parallel replicate mesh in device_mesh.
+            Used when data parallel replicate is enabled. Defaults to "dp_replicate".
+        dp_shard_cp_mesh_name (str): Key name for the data parallel shard + context parallel mesh in device_mesh.
+            Used when data parallel shard is enabled. Defaults to "dp_shard_cp".
         tp_mesh_name (str): Key name for the tensor parallel mesh in device_mesh.
-            Defaults to "tensor_parallel".
+            Defaults to "tp".
 
     Returns:
         The parallelized model.
@@ -271,12 +274,6 @@ def fsdp2_strategy_parallelize(
         layers = model.model.layers
         num_attention_heads = model.config.num_attention_heads
         num_key_value_heads = model.config.num_key_value_heads
-
-    # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
-    dp_mesh = device_mesh[dp_mesh_name]
-
-    if dp_mesh.size() > 1:
-        assert dp_mesh.ndim == 1, "Hybrid-sharding not supported"
 
     tp_mesh = device_mesh[tp_mesh_name]
 
@@ -355,11 +352,14 @@ def fsdp2_strategy_parallelize(
             output_dtype=torch.float32,
         )
 
-    # FSDP sharding
-    assert dp_mesh.ndim == 1, "Hybrid-sharding not supported"
+    # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
+    # if dp_replicate_size > 1, use HSDP, else use FSDP
+    dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
+
+    dp_mesh = device_mesh[dp_mesh_dim_names]
 
     # Find transformer layers and apply parallelisms
-    apply_fsdp_sharding_recursively(model, dp_mesh, mp_policy, offload_policy)
+    apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy)
 
     # Apply FSDP to the root model
     # Do not reshard after forward for root model because its parameters
@@ -394,9 +394,9 @@ def nvfsdp_strategy_parallelize(
     keep_fp8_transpose_cache_when_using_custom_fsdp: bool = False,
     nccl_ub: bool = False,
     fsdp_double_buffer: bool = False,
-    dp_mesh_name: str = "data_parallel",
-    cp_mesh_name: str = "context_parallel",
-    tp_mesh_name: str = "tensor_parallel",
+    dp_mesh_name: str = "dp",
+    cp_mesh_name: str = "cp",
+    tp_mesh_name: str = "tp",
 ):
     """
     Apply tensor/data parallelism (nvFSDP) and optional activation-checkpointing to the model.
@@ -475,7 +475,7 @@ def nvfsdp_strategy_parallelize(
     if cp_mesh.size() > 1:
         dp_cp_mesh_name = "dp_cp"
     else:
-        dp_cp_mesh_name = "data_parallel"
+        dp_cp_mesh_name = "dp"
 
     # Import nvFSDP unit modules specified by the user.
     nvfsdp_unit_modules = import_classes_from_paths(nvfsdp_unit_modules)
