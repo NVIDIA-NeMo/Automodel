@@ -15,8 +15,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.loss.te_parallel_ce import TEParallelCrossEntropy
+from nemo_automodel.components.loss.te_parallel_ce import TEParallelCrossEntropy, HAVE_TE_PARALLEL_CE, MISSING_TE_PARALLEL_CE_MSG
 
+@pytest.mark.skipif(not HAVE_TE_PARALLEL_CE, reason=MISSING_TE_PARALLEL_CE_MSG)
 @pytest.mark.parametrize("reduction", ["none", "mean", "sum"])
 @pytest.mark.parametrize("ignore_index", [-100, -199])
 def test_te_parallel_cross_entropy(reduction, ignore_index):
@@ -80,7 +81,7 @@ def test_te_parallel_cross_entropy(reduction, ignore_index):
             f"Loss mismatch with reduction={reduction}: PyTorch={pytorch_loss}, TE={te_loss}"
         )
 
-
+@pytest.mark.skipif(not HAVE_TE_PARALLEL_CE, reason=MISSING_TE_PARALLEL_CE_MSG)
 @pytest.mark.parametrize("reduction", ["none", "mean", "sum"])
 def test_te_parallel_cross_entropy_with_masking(reduction):
     """Tests te_parallel_cross_entropy with loss masking against masked_cross_entropy."""

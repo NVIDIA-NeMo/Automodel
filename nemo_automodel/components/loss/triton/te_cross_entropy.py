@@ -25,10 +25,22 @@ from operator import mul
 
 import torch
 import torch.distributed as dist
+from unittest.mock import MagicMock
+from nemo_automodel.shared.import_utils import MISSING_TRITON_MSG, null_decorator
 
-import triton
-import triton.language as tl
+try:
+    import triton
+    import triton.language as tl
+    HAVE_TRITON = True
+except ImportError:
+    HAVE_TRITON = False
 
+if not HAVE_TRITON:
+    triton = MagicMock()
+    triton.jit = null_decorator
+    triton.autotune = null_decorator
+    triton.heuristics = null_decorator
+    tl = MagicMock()
 
 @triton.jit
 def online_softmax_kernel(
@@ -56,7 +68,6 @@ def online_softmax_kernel(
     n_cols (int): The number of columns in the input tensor.
     BLOCK_SIZE (int): The block size for Triton operations.
     """
-
     program_id = tl.program_id(0).to(tl.int64)
 
     # locate the start index
@@ -138,7 +149,6 @@ def cross_entropy_kernel(
     label_smoothing (float): The amount of smoothing when computing the loss, where 0.0 means no smoothing.
     BLOCK_SIZE (int): The block size for Triton operations.
     """
-
     program_id = tl.program_id(0).to(tl.int64)
 
     # locate the start index
@@ -261,7 +271,6 @@ def element_mul_kernel(
     n_cols (int): The number of columns in the input tensor.
     BLOCK_SIZE (int): The block size for Triton operations.
     """
-
     # Get the program ID and convert it to int64 to avoid overflow
     program_id = tl.program_id(0).to(tl.int64)
 
@@ -287,6 +296,8 @@ def cross_entropy_forward(
     ignore_idx: int,
 ):
     """Forward implementation of Cross Entropy kernel"""
+    if not HAVE_TRITON:
+        raise ImportError(MISSING_TRITON_MSG)
 
     B, SQ, V = _input.shape
     n_rows = B * SQ
@@ -362,6 +373,8 @@ def cross_entropy_forward(
 
 def cross_entropy_backward(_input: torch.Tensor, grad_output: torch.Tensor):
     """Backward implementation of cross entropy loss kernel"""
+    if not HAVE_TRITON:
+        raise ImportError(MISSING_TRITON_MSG)
 
     # If cross entropy is the last layer, grad_output is 1.0. Skip the mul to save time
     if torch.equal(grad_output, torch.tensor(1.0, device=grad_output.device)):

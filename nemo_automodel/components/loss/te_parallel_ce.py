@@ -14,8 +14,12 @@
 
 import torch
 from typing import Optional
+from nemo_automodel.shared.import_utils import MISSING_TRITON_MSG
 
-import nemo_automodel.components.loss.triton.te_cross_entropy as triton_cross_entropy
+from nemo_automodel.components.loss.triton.te_cross_entropy import HAVE_TRITON, cross_entropy_forward, cross_entropy_backward
+
+HAVE_TE_PARALLEL_CE = HAVE_TRITON    
+MISSING_TE_PARALLEL_CE_MSG = MISSING_TRITON_MSG
 
 
 """Cross Entropy Loss API from NVIDIA's TransformerEngine, available under the Apache License 2.0:
@@ -55,7 +59,7 @@ class CrossEntropyFunction(torch.autograd.Function):
         Returns:
         tensor: The computed loss.
         """
-        loss, _input = triton_cross_entropy.cross_entropy_forward(
+        loss, _input = cross_entropy_forward(
             _input, target, label_smoothing, reduce_loss, dist_process_group, ignore_idx
         )
 
@@ -75,7 +79,7 @@ class CrossEntropyFunction(torch.autograd.Function):
         tuple: A tuple with the gradients with respect to the inputs. The elements are tensors or None.
         """
         (_input,) = ctx.saved_tensors
-        _input = triton_cross_entropy.cross_entropy_backward(_input, grad_output)
+        _input = cross_entropy_backward(_input, grad_output)
         return (
             _input,
             None,
@@ -124,6 +128,8 @@ class TEParallelCrossEntropy:
         Returns:
             Computed loss tensor
         """
+        if not HAVE_TE_PARALLEL_CE:
+            raise ImportError(MISSING_TE_PARALLEL_CE_MSG)
 
         if mask is not None:
             with torch.no_grad():
