@@ -126,7 +126,6 @@ def make_cp_batch_and_ctx(device_mesh, batch, labels, loss_mask=None):
 
     if (
         "position_ids" not in batch
-        and "input_ids" in batch
         and device_mesh is not None
         and (device_mesh["context_parallel"].size() > 1 or device_mesh["tensor_parallel"].size() > 1)
     ):
