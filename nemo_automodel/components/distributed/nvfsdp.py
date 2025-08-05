@@ -141,7 +141,7 @@ class NVFSDPManager:
         if self.dp_size is None or self.dp_size <= 0:
             # Calculate dp_size to ensure dp_size * tp_size * cp_size == world_size
             total_parallel_ranks = self.tp_size * self.cp_size
-            if self.world_size % total_parallel_ranks != 0:
+            if self.parallel_dims.world_size % total_parallel_ranks != 0:
                 raise ValueError(
                     f"world_size ({self.world_size}) must be divisible by (tp_size * cp_size) "
                     f"({self.tp_size} * {self.cp_size} = {total_parallel_ranks})"
