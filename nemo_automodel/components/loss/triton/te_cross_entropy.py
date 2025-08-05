@@ -19,13 +19,14 @@ This implementation is from NVIDIA's TransformerEngine, available under the Apac
 https://github.com/NVIDIA/TransformerEngine
 """
 
-from typing import Union
 from functools import reduce
 from operator import mul
+from typing import Union
+from unittest.mock import MagicMock
 
 import torch
 import torch.distributed as dist
-from unittest.mock import MagicMock
+
 from nemo_automodel.shared.import_utils import MISSING_TRITON_MSG, null_decorator
 
 try:

@@ -12,11 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
 from typing import Optional
-from nemo_automodel.shared.import_utils import MISSING_TRITON_MSG
 
-from nemo_automodel.components.loss.triton.te_cross_entropy import HAVE_TRITON, cross_entropy_forward, cross_entropy_backward
+import torch
+
+from nemo_automodel.components.loss.triton.te_cross_entropy import (
+    HAVE_TRITON,
+    cross_entropy_backward,
+    cross_entropy_forward,
+)
+from nemo_automodel.shared.import_utils import MISSING_TRITON_MSG
 
 HAVE_TE_PARALLEL_CE = HAVE_TRITON    
 MISSING_TE_PARALLEL_CE_MSG = MISSING_TRITON_MSG
