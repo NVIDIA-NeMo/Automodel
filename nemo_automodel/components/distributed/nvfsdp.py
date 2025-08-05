@@ -22,12 +22,12 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
 )
 
+from nemo_automodel.components.distributed.parallel_dims import DimNames, ParallelDims
 from nemo_automodel.components.distributed.parallelizer import (
     get_hf_tp_shard_plan,
     nvfsdp_strategy_parallelize,
 )
 
-from nemo_automodel.components.distributed.parallel_dims import DimNames, ParallelDims
 
 @dataclass
 class NVFSDPManager:
