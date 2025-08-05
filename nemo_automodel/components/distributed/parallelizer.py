@@ -457,8 +457,7 @@ def megatron_fsdp_strategy_parallelize(
     # Keep the original error message wording (nvFSDP) for backward-compatibility
     # with existing unit-tests that expect this exact string.
     assert HAVE_MegatronFSDP, (
-        "nvFSDP is not installed, please visit "
-        "https://github.com/NVIDIA-NeMo/nvFSDP for more information"
+        "nvFSDP is not installed, please visit https://github.com/NVIDIA-NeMo/nvFSDP for more information"
     )
 
     # DP_CP ranks are sharded by FSDP.
