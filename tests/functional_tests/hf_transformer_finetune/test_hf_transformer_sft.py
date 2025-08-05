@@ -16,20 +16,20 @@ from tests.utils.test_utils import run_test_script
 
 TEST_FOLDER = "hf_transformer_finetune"
 HF_TRANSFORMER_SFT_FILENAME = "L2_HF_Transformer_SFT.sh"
-HF_TRANSFORMER_SFT_NVFSDP_FILENAME = "L2_HF_Transformer_SFT_nvfsdp.sh"
+HF_TRANSFORMER_SFT_MegatronFSDP_FILENAME = "L2_HF_Transformer_SFT_megatronfsdp.sh"
 HF_TRANSFORMER_PEFT_FILENAME = "L2_HF_Transformer_PEFT.sh"
-HF_TRANSFORMER_PEFT_NVFSDP_FILENAME = "L2_HF_Transformer_PEFT_nvfsdp.sh"
+HF_TRANSFORMER_PEFT_MegatronFSDP_FILENAME = "L2_HF_Transformer_PEFT_megatronfsdp.sh"
 
 
 class TestHFTransformerFinetune:
     def test_hf_transformer_sft(self):
         run_test_script(TEST_FOLDER, HF_TRANSFORMER_SFT_FILENAME)
 
-    def test_hf_transformer_sft_nvfsdp(self):
-        run_test_script(TEST_FOLDER, HF_TRANSFORMER_SFT_NVFSDP_FILENAME)
+    def test_hf_transformer_sft_megatronfsdp(self):
+        run_test_script(TEST_FOLDER, HF_TRANSFORMER_SFT_MegatronFSDP_FILENAME)
 
     def test_hf_transformer_peft(self):
         run_test_script(TEST_FOLDER, HF_TRANSFORMER_PEFT_FILENAME)
 
-    def test_hf_transformer_peft_nvfsdp(self):
-        run_test_script(TEST_FOLDER, HF_TRANSFORMER_PEFT_NVFSDP_FILENAME)
+    def test_hf_transformer_peft_megatronfsdp(self):
+        run_test_script(TEST_FOLDER, HF_TRANSFORMER_PEFT_MegatronFSDP_FILENAME)
