@@ -104,7 +104,7 @@ def test_chunked_cross_entropy_ignore_index_and_mask():
 
     # Now compute ChunkedCrossEntropy with mask
     chunk_len = 3  # just an arbitrary small chunk size
-    loss_chunked = ChunkedCrossEntropy(chunk_len=chunk_len, ignore_index=ignore_idx)(logits, targets, mask=mask)
+    loss_chunked = ChunkedCrossEntropy(chunk_len=chunk_len, ignore_index=ignore_idx)(logits, targets, loss_mask=mask)
 
     assert torch.allclose(loss_chunked, loss_ref, atol=1e-6), (
         f"Expected chunked loss {loss_ref.item()}, but got {loss_chunked.item()}."
