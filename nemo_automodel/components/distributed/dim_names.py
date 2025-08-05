@@ -21,4 +21,7 @@ class DimNames(str, Enum):
     DP = "dp"
     CP = "cp"
     TP = "tp"
+    EP = "ep"
+    PP = "pp"
     DP_CP = "dp_cp"
+    DP_CP_TP = "dp_cp_tp"

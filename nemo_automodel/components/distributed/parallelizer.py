@@ -43,7 +43,7 @@ from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGener
 
 # Import model-specific tensor parallel plans from the dedicated module
 from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE_FUNCTIONS
-from nemo_automodel.components.distributed.dim_names import DimNames
+from nemo_automodel.components.distributed.parallel_dims import DimNames
 
 # TODO(boxiangw): Change to nvFSDP once it got published
 HAVE_NVFSDP = False
