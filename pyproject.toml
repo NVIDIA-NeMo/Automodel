@@ -77,7 +77,8 @@ dependencies = [
     "torchdata",
     "transformers",
     "wandb",
-    "torchao"
+    "torchao",
+    "triton>=3.0.0; (platform_machine == 'x86_64' and platform_system != 'Darwin')"
 ]
 
 [project.optional-dependencies]
