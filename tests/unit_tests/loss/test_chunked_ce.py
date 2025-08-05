@@ -82,6 +82,12 @@ def test_chunked_cross_entropy_matches_compute_cross_entropy():
     )
 
 
+
+# Function to check for GPU availability
+def has_gpu():
+    return torch.cuda.is_available()
+
+@pytest.mark.skipif(not has_gpu(), reason="GPU not available for this test.")
 def test_chunked_cross_entropy_ignore_index_and_mask():
     """
     Tests that ChunkedCrossEntropy properly ignores indices and respects masks.
