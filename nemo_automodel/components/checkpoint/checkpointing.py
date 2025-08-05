@@ -25,6 +25,7 @@ import torch
 import torch.distributed
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
+import yaml
 from safetensors import safe_open
 from safetensors.torch import save_file
 
@@ -42,6 +43,8 @@ from nemo_automodel.components.checkpoint.stateful_wrappers import (
 if TYPE_CHECKING:
     from peft import PeftConfig
     from transformers.tokenization_utils import PreTrainedTokenizerBase
+
+    from nemo_automodel.components.config.loader import ConfigNode
 
 
 @dataclass
@@ -105,6 +108,9 @@ def save_model(
             # save the config.json file
             with open(os.path.join(consolidated_model_path, "config.json"), "w") as f:
                 f.write(model.config.to_json_string())
+            # save the generation_config.json file
+            with open(os.path.join(consolidated_model_path, "generation_config.json"), "w") as f:
+                f.write(model.generation_config.to_json_string())
 
             # save the tokenizer
             if tokenizer is not None:
@@ -258,6 +264,18 @@ def load_optimizer(
     reinstated_state_dict = optimizer_state.state_dict()
     dcp.load(reinstated_state_dict, checkpoint_id=optimizer_path)
     optimizer_state.load_state_dict(reinstated_state_dict)
+
+
+def save_config(config: "ConfigNode", weights_path: str):
+    """
+    Save a config to a weights path.
+
+    Args:
+        config: Config to save
+        weights_path: Path to save config
+    """
+    with open(os.path.join(weights_path, "config.yaml"), "w") as f:
+        yaml.safe_dump(config.to_dict(), f)
 
 
 def _get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
