@@ -17,7 +17,6 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
-from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
@@ -26,12 +25,12 @@ from torch.distributed.tensor.parallel import (
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
+from nemo_automodel.components.distributed.parallel_dims import ParallelDims
 from nemo_automodel.components.distributed.parallelizer import (
     fsdp2_strategy_parallelize,
     get_hf_tp_shard_plan,
 )
 
-from nemo_automodel.components.distributed.parallel_dims import DimNames, ParallelDims
 
 @dataclass
 class FSDP2Manager:
@@ -67,6 +66,7 @@ class FSDP2Manager:
         parallelize(model):
             Applies FSDP2 and Tensor-Parallel sharding strategies to the given model.
     """
+
     parallel_dims: ParallelDims = field(default_factory=ParallelDims)
 
     sequence_parallel: Optional[bool] = field(
@@ -156,7 +156,6 @@ class FSDP2Manager:
         self.device_mesh = self.parallel_dims.build_mesh(self.backend)
 
         return self
-
 
     def parallelize(self, model, use_hf_tp_plan=False):
         """
