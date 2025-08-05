@@ -32,6 +32,7 @@ from nemo_automodel.shared.import_utils import MISSING_TRITON_MSG, null_decorato
 try:
     import triton
     import triton.language as tl
+
     HAVE_TRITON = True
 except ImportError:
     HAVE_TRITON = False
@@ -42,6 +43,7 @@ if not HAVE_TRITON:
     triton.autotune = null_decorator
     triton.heuristics = null_decorator
     tl = MagicMock()
+
 
 @triton.jit
 def online_softmax_kernel(
@@ -96,9 +98,7 @@ def online_softmax_kernel(
 
     for i in range(0, n_cols, BLOCK_SIZE):
         X_offsets = i + tl.arange(0, BLOCK_SIZE)
-        X_block = tl.load(X_ptr + X_offsets, mask=X_offsets < n_cols, other=float("-inf")).to(
-            tl.float32
-        )
+        X_block = tl.load(X_ptr + X_offsets, mask=X_offsets < n_cols, other=float("-inf")).to(tl.float32)
         block_max = tl.max(X_block)
         m_new = tl.maximum(m, block_max)
         d = d * tl.exp(m - m_new) + tl.sum(tl.exp(X_block - m_new))
@@ -337,9 +337,7 @@ def cross_entropy_forward(
     world_size = 1 if dist_process_group is None else dist.get_world_size(dist_process_group)
 
     if world_size > 1:
-        m_d_X_y_gathered = torch.zeros(
-            n_rows * 3 * world_size, dtype=torch.float32, device=_input.device
-        )
+        m_d_X_y_gathered = torch.zeros(n_rows * 3 * world_size, dtype=torch.float32, device=_input.device)
         dist.all_gather_into_tensor(m_d_X_y_gathered, m_d_X_y, group=dist_process_group)
     else:
         m_d_X_y_gathered = m_d_X_y

@@ -61,7 +61,7 @@ def test_te_parallel_cross_entropy(reduction, ignore_index):
     print("\nTE Parallel CE Memory usage comparison:")
     print(f"PyTorch implementation: {pytorch_memory / 1024**2:.2f} MB")
     print(f"TE parallel implementation: {te_memory / 1024**2:.2f} MB")
-    
+
     if te_memory < pytorch_memory:
         print(f"Memory savings: {(pytorch_memory - te_memory) / 1024**2:.2f} MB")
     else:
@@ -123,7 +123,7 @@ def test_te_parallel_cross_entropy_with_masking(reduction):
     # Gradient comparison
     grad_diff = torch.norm(masked_gradients - te_gradients).item()
     grad_norm_masked = torch.norm(masked_gradients).item()
-    
+
     print(f"\n=== Gradient Comparison ===")
     print(f"Gradient difference norm: {grad_diff:.6f}")
     print(f"Relative gradient error: {grad_diff / max(grad_norm_masked, 1e-8):.6f}")

@@ -23,7 +23,7 @@ from nemo_automodel.components.loss.triton.te_cross_entropy import (
 )
 from nemo_automodel.shared.import_utils import MISSING_TRITON_MSG
 
-HAVE_TE_PARALLEL_CE = HAVE_TRITON    
+HAVE_TE_PARALLEL_CE = HAVE_TRITON
 MISSING_TE_PARALLEL_CE_MSG = MISSING_TRITON_MSG
 
 
@@ -97,12 +97,13 @@ class CrossEntropyFunction(torch.autograd.Function):
 
 parallel_cross_entropy = CrossEntropyFunction.apply
 
+
 class TEParallelCrossEntropy:
     def __init__(
-        self, 
-        ignore_index: int = -100, 
+        self,
+        ignore_index: int = -100,
         reduction: str = "sum",
-        tp_group: Optional[torch.distributed.ProcessGroup] = None
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """
         Cross entropy loss module based on TransformerEngine's parallel cross entropy triton kernel.
