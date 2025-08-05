@@ -210,8 +210,8 @@ def build_dataloader(
     }
     if device_mesh is not None:
         dist_sampler_kwargs |= {
-            "num_replicas": device_mesh["data_parallel"].size(),
-            "rank": device_mesh["data_parallel"].get_local_rank(),
+            "num_replicas": device_mesh["dp"].size(),
+            "rank": device_mesh["dp"].get_local_rank(),
         }
     if "tokenizer" not in cfg_ds:
         tokenizer = AutoTokenizer.from_pretrained(cfg_model.pretrained_model_name_or_path)
@@ -565,7 +565,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if (
             "position_ids" not in batch
             and self.device_mesh is not None
-            and (self.device_mesh["context_parallel"].size() > 1 or self.device_mesh["tensor_parallel"].size() > 1)
+            and (self.device_mesh["cp"].size() > 1 or self.device_mesh["tp"].size() > 1)
         ):
             batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
 
@@ -607,11 +607,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 self.model,
                 self.total_local_num_loss_tokens,
                 self.device_mesh[
-                    (
-                        "dp_cp"
-                        if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(self.device_mesh, {})
-                        else "data_parallel"
-                    )
+                    ("dp_cp" if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(self.device_mesh, {}) else "dp")
                 ].get_group()
                 if self.device_mesh is not None
                 else None,
@@ -619,7 +615,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             # Clip gradients **after** any rescaling.
             # TODO(@boxiangw): Fix TP gradient clipping
-            if not self.device_mesh or self.device_mesh["tensor_parallel"].size() == 1:
+            if not self.device_mesh or self.device_mesh["tp"].size() == 1:
                 grad_norm = clip_gradients(self.model, clip_norm)
             else:
                 # TODO: TP WAR
@@ -632,11 +628,10 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.optimizer.zero_grad()
 
             # Precompute FP8 scales
-            # TODO: make sure it's dp_shard>1 instead of dp_replicate>1
             if (
                 self.cfg.get("fp8", None) is not None
                 and self.model.precompute_float8_dynamic_scale_for_fsdp
-                and self.device_mesh["data_parallel"].size() > 1
+                and self.device_mesh["dp_shard"].size() > 1
             ):
                 precompute_float8_dynamic_scale_for_fsdp(self.model)
 
@@ -690,10 +685,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 if (
                     self.device_mesh
                     and "position_ids" not in batch
-                    and (
-                        self.device_mesh["context_parallel"].size() > 1
-                        or self.device_mesh["tensor_parallel"].size() > 1
-                    )
+                    and (self.device_mesh["cp"].size() > 1 or self.device_mesh["tp"].size() > 1)
                 ):
                     batch["position_ids"] = (
                         torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
@@ -746,10 +738,10 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
         if not self.device_mesh:
             dp_group = None
-        elif self.device_mesh["context_parallel"].size() > 1:
+        elif self.device_mesh["cp"].size() > 1:
             dp_group = self.device_mesh["dp_cp"].get_group()
         else:
-            dp_group = self.device_mesh["data_parallel"].get_group()
+            dp_group = self.device_mesh["dp"].get_group()
 
         total_loss, total_num_loss_tokens = reduce_loss(
             self.forward_data_store, self.total_local_num_loss_tokens, per_token_loss=True, dp_group=dp_group
