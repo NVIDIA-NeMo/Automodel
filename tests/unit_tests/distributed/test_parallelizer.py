@@ -38,7 +38,7 @@ from nemo_automodel.components.distributed.parallelizer import (
     nvfsdp_strategy_parallelize,
     import_class_from_path,
     get_hf_tp_shard_plan,
-    apply_fsdp_sharding_recursively,
+    apply_fsdp2_sharding_recursively,
     unshard_fsdp2_model,
 )
 
@@ -148,7 +148,41 @@ def create_gemma3_mock():
 
 
 @pytest.fixture
-def mock_device_mesh():
+def mock_device_mesh_fsdp2():
+    """Create a mock device mesh."""
+    mesh = MagicMock(spec=DeviceMesh)
+
+    # Mock device_type to return a valid string
+    mesh.device_type = "cuda"
+
+    # Mock submeshes
+    dp_replicate_mesh = MagicMock()
+    dp_shard_mesh = MagicMock()
+    cp_mesh = MagicMock()
+    tp_mesh = MagicMock()
+
+    dp_replicate_mesh.size.return_value = 1
+    dp_shard_mesh.size.return_value = 2
+    tp_mesh.size.return_value = 1
+    cp_mesh.size.return_value = 1
+
+    dp_replicate_mesh.ndim = 1
+    dp_shard_mesh.ndim = 1
+    tp_mesh.ndim = 1
+    cp_mesh.ndim = 1
+
+    # Configure mesh access
+    mesh.__getitem__.side_effect = lambda key: {
+        "dp_replicate": dp_replicate_mesh,
+        "dp_shard": dp_shard_mesh,
+        "tp": tp_mesh,
+        "cp": cp_mesh,
+    }[key]
+
+    return mesh, dp_replicate_mesh, dp_shard_mesh, tp_mesh, cp_mesh
+
+@pytest.fixture
+def mock_device_mesh_nvfsdp():
     """Create a mock device mesh."""
     mesh = MagicMock(spec=DeviceMesh)
 
@@ -157,8 +191,8 @@ def mock_device_mesh():
 
     # Mock submeshes
     dp_mesh = MagicMock()
-    tp_mesh = MagicMock()
     cp_mesh = MagicMock()
+    tp_mesh = MagicMock()
 
     dp_mesh.size.return_value = 2
     tp_mesh.size.return_value = 1
@@ -170,9 +204,9 @@ def mock_device_mesh():
 
     # Configure mesh access
     mesh.__getitem__.side_effect = lambda key: {
-        "data_parallel": dp_mesh,
-        "tensor_parallel": tp_mesh,
-        "context_parallel": cp_mesh,
+        "dp": dp_mesh,
+        "tp": tp_mesh,
+        "cp": cp_mesh,
         "dp_cp": dp_mesh,
     }[key]
 
@@ -259,394 +293,6 @@ def mock_optimized_tp_plans(monkeypatch):
         mock_plans[type(create_gemma3_mock())] = mock_gemma3_plan
         yield mock_plans
 
-
-class TestFSDP2StrategyParallelize:
-    """Test suite for fsdp2_strategy_parallelize function."""
-
-    def test_basic_parallelization_dp_only(self, mock_device_mesh, mock_distributed_env):
-        """Test basic parallelization with data parallelism only."""
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
-        tp_mesh.size.return_value = 1  # No tensor parallelism
-
-        model = MockModel()
-
-        result = fsdp2_strategy_parallelize(
-            model=model,
-            device_mesh=mesh,
-        )
-
-        assert result is model
-        mock_distributed_env["fsdp"].fully_shard.assert_called()
-        mock_distributed_env["tensor_parallel"].parallelize_module.assert_not_called()
-
-    def test_tensor_parallelism_with_custom_plan(self, mock_device_mesh, mock_distributed_env):
-        """Test tensor parallelism with custom parallel plan."""
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
-        tp_mesh.size.return_value = 2  # Enable tensor parallelism
-
-        model = MockModel()
-        custom_plan = {"model.layers.0.self_attn.q_proj": ColwiseParallel()}
-
-        result = fsdp2_strategy_parallelize(
-            model=model,
-            device_mesh=mesh,
-            tp_shard_plan=custom_plan,
-        )
-
-        assert result is model
-        mock_distributed_env["tensor_parallel"].parallelize_module.assert_called_once()
-        mock_distributed_env["fsdp"].fully_shard.assert_called()
-
-    def test_gemma3_model_handling(self, mock_device_mesh, mock_distributed_env):
-        """Test Gemma3 model type handling."""
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
-
-        model = create_gemma3_mock()
-
-        result = fsdp2_strategy_parallelize(
-            model=model,
-            device_mesh=mesh,
-        )
-
-        assert result is model
-        mock_distributed_env["fsdp"].fully_shard.assert_called()
-
-    def test_attention_heads_validation_error(self, mock_device_mesh, mock_distributed_env):
-        """Test validation error when attention heads not divisible by TP size."""
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
-        tp_mesh.size.return_value = 3  # Not divisible by 8 heads
-
-        model = MockModel(num_attention_heads=8, num_key_value_heads=8)
-
-        with pytest.raises(AssertionError, match="num_key_value_heads.*must be divisible"):
-            fsdp2_strategy_parallelize(
-                model=model,
-                device_mesh=mesh,
-                tp_shard_plan={"dummy": ColwiseParallel()},
-            )
-
-    def test_activation_checkpointing(self, mock_device_mesh, mock_distributed_env):
-        """Test activation checkpointing application."""
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
-
-        model = MockModel()
-
-        result = fsdp2_strategy_parallelize(
-            model=model,
-            device_mesh=mesh,
-            activation_checkpointing=True,
-        )
-
-        assert result is model
-        # Verify checkpoint_wrapper was called for MLP layers
-        mock_distributed_env["tensor_parallel"].checkpoint_wrapper.assert_called()
-
-    def test_optimized_tp_plan_usage(self, mock_device_mesh, mock_distributed_env, mock_optimized_tp_plans):
-        """Test usage of optimized TP plan based on model type."""
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
-        tp_mesh.size.return_value = 2
-
-        model = MockModel()
-
-        # Mock the PARALLELIZE_FUNCTIONS to include our model type
-        with patch("nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS", mock_optimized_tp_plans):
-            result = fsdp2_strategy_parallelize(
-                model=model,
-                device_mesh=mesh,
-            )
-
-        assert result is model
-        mock_distributed_env["tensor_parallel"].parallelize_module.assert_called_once()
-
-    def test_hf_tp_plan_fallback(self, mock_device_mesh, mock_distributed_env):
-        """Test fallback to HuggingFace TP plan."""
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
-        tp_mesh.size.return_value = 2
-
-        model = MockModel()
-
-        with patch("nemo_automodel.components.distributed.parallelizer.get_hf_tp_shard_plan") as mock_hf_plan:
-            mock_hf_plan.return_value = {"model.layers.0.self_attn.q_proj": ColwiseParallel()}
-
-            result = fsdp2_strategy_parallelize(
-                model=model,
-                device_mesh=mesh,
-            )
-
-        assert result is model
-        mock_hf_plan.assert_called_once_with(model)
-        mock_distributed_env["tensor_parallel"].parallelize_module.assert_called_once()
-
-    def test_string_tp_plan_import(self, mock_device_mesh, mock_distributed_env):
-        """Test importing TP plan from string path."""
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
-        tp_mesh.size.return_value = 2
-
-        model = MockModel()
-
-        with patch("nemo_automodel.components.distributed.parallelizer.import_class_from_path") as mock_import:
-            mock_plan = {"model.layers.0.self_attn.q_proj": ColwiseParallel()}
-            mock_import.return_value = mock_plan
-
-            result = fsdp2_strategy_parallelize(
-                model=model,
-                device_mesh=mesh,
-                tp_shard_plan="path.to.parallel.plan",
-            )
-
-        assert result is model
-        mock_import.assert_called_once_with("path.to.parallel.plan")
-        mock_distributed_env["tensor_parallel"].parallelize_module.assert_called_once()
-
-    def test_function_tp_plan_import(self, mock_device_mesh, mock_distributed_env):
-        """Test importing TP plan from function path."""
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
-        tp_mesh.size.return_value = 2
-
-        model = MockModel()
-
-        def mock_plan_function():
-            return {"model.layers.0.self_attn.q_proj": ColwiseParallel()}
-
-        with patch("nemo_automodel.components.distributed.parallelizer.import_class_from_path") as mock_import:
-            mock_import.return_value = mock_plan_function
-
-            result = fsdp2_strategy_parallelize(
-                model=model,
-                device_mesh=mesh,
-                tp_shard_plan="path.to.plan.function",
-            )
-
-        assert result is model
-        mock_import.assert_called_once_with("path.to.plan.function")
-        mock_distributed_env["tensor_parallel"].parallelize_module.assert_called_once()
-
-    def test_invalid_tp_plan_error(self, mock_device_mesh, mock_distributed_env):
-        """Test error handling for invalid TP plan."""
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
-        tp_mesh.size.return_value = 2
-
-        model = MockModel()
-
-        with patch("nemo_automodel.components.distributed.parallelizer.import_class_from_path") as mock_import:
-            mock_import.side_effect = ImportError("Module not found")
-
-            with pytest.raises(ValueError, match="Custom parallel plan.*is not valid"):
-                fsdp2_strategy_parallelize(
-                    model=model,
-                    device_mesh=mesh,
-                    tp_shard_plan="invalid.path",
-                )
-
-    def test_mixed_precision_policy_creation(self, mock_device_mesh, mock_distributed_env):
-        """Test mixed precision policy creation when not provided."""
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
-
-        model = MockModel()
-
-        result = fsdp2_strategy_parallelize(
-            model=model,
-            device_mesh=mesh,
-        )
-
-        assert result is model
-        # Verify mixed precision policy was created
-        mock_distributed_env["fsdp"].fully_shard.assert_called()
-
-    def test_sequence_parallel_with_optimized_plan(self, mock_device_mesh, mock_distributed_env, mock_optimized_tp_plans):
-        """Test sequence parallel with optimized plan."""
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
-        tp_mesh.size.return_value = 2
-
-        model = MockModel()
-
-        with patch("nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS", mock_optimized_tp_plans):
-            result = fsdp2_strategy_parallelize(
-                model=model,
-                device_mesh=mesh,
-                sequence_parallel=True,
-            )
-
-        assert result is model
-        mock_distributed_env["tensor_parallel"].parallelize_module.assert_called_once()
-
-    def test_sequence_parallel_with_hf_plan_error(self, mock_device_mesh, mock_distributed_env):
-        """Test error when sequence parallel is used with HF plan."""
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
-        tp_mesh.size.return_value = 2
-
-        model = MockModel()
-
-        with patch("nemo_automodel.components.distributed.parallelizer.get_hf_tp_shard_plan"):
-            with pytest.raises(AssertionError, match="sequence_parallel is not supported in HF tp plan"):
-                fsdp2_strategy_parallelize(
-                    model=model,
-                    device_mesh=mesh,
-                    sequence_parallel=True,
-                )
-
-    def test_dp_cp_mesh_selection(self, mock_device_mesh, mock_distributed_env):
-        """Test proper data parallel mesh selection when CP > 1."""
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
-
-        # Mock mesh resources to simulate dp_cp mesh
-        mock_distributed_env["mesh_resources"].root_to_flatten_mapping.get.return_value = {"dp_cp": True}
-
-        model = MockModel()
-
-        result = fsdp2_strategy_parallelize(
-            model=model,
-            device_mesh=mesh,
-        )
-
-        assert result is model
-        mock_distributed_env["fsdp"].fully_shard.assert_called()
-
-    def test_hybrid_sharding_not_supported_error(self, mock_device_mesh, mock_distributed_env):
-        """Test error when hybrid sharding is attempted."""
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
-        dp_mesh.ndim = 2  # Multi-dimensional mesh (hybrid sharding)
-
-        model = MockModel()
-
-        with pytest.raises(AssertionError, match="Hybrid-sharding not supported"):
-            fsdp2_strategy_parallelize(
-                model=model,
-                device_mesh=mesh,
-            )
-
-    def test_reshard_optimization(self, mock_device_mesh, mock_distributed_env):
-        """Test reshard_after_forward optimization for transformer layers."""
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
-
-        model = MockModel()
-        # Add more layers to test the optimization
-        model.model.layers.extend([model._create_mock_layer() for _ in range(3)])
-
-        result = fsdp2_strategy_parallelize(
-            model=model,
-            device_mesh=mesh,
-        )
-
-        assert result is model
-        # Verify fully_shard was called multiple times (once per layer + root)
-        assert mock_distributed_env["fsdp"].fully_shard.call_count > 1
-
-    def test_custom_mesh_names(self, mock_distributed_env):
-        """Test custom mesh names functionality."""
-        # Create a mock device mesh with custom keys
-        mesh = MagicMock(spec=DeviceMesh)
-        mesh.device_type = "cuda"
-
-        # Mock custom submeshes
-        custom_dp_mesh = MagicMock()
-        custom_tp_mesh = MagicMock()
-
-        custom_dp_mesh.size.return_value = 2
-        custom_tp_mesh.size.return_value = 1
-        custom_dp_mesh.ndim = 1
-        custom_tp_mesh.ndim = 1
-
-        # Configure mesh access with custom names
-        mesh.__getitem__.side_effect = lambda key: {
-            "custom_dp": custom_dp_mesh,
-            "custom_tp": custom_tp_mesh,
-            "custom_dp_cp": custom_dp_mesh,
-        }[key]
-
-        model = MockModel()
-
-        result = fsdp2_strategy_parallelize(
-            model=model,
-            device_mesh=mesh,
-            dp_mesh_name="custom_dp",
-            tp_mesh_name="custom_tp",
-        )
-
-        assert result is model
-        mock_distributed_env["fsdp"].fully_shard.assert_called()
-        # Verify that mesh was accessed with custom keys
-        mesh.__getitem__.assert_called()
-
-    def test_custom_mesh_names_with_dp_cp_fallback(self, mock_distributed_env):
-        """Test custom mesh names with dp_cp mesh fallback logic."""
-        # Create a mock device mesh with custom keys
-        mesh = MagicMock(spec=DeviceMesh)
-        mesh.device_type = "cuda"
-
-        # Mock custom submeshes
-        custom_dp_mesh = MagicMock()
-        custom_tp_mesh = MagicMock()
-        custom_dp_cp_mesh = MagicMock()
-
-        custom_dp_mesh.size.return_value = 2
-        custom_tp_mesh.size.return_value = 1
-        custom_dp_cp_mesh.size.return_value = 2
-
-        custom_dp_mesh.ndim = 1
-        custom_tp_mesh.ndim = 1
-        custom_dp_cp_mesh.ndim = 1
-
-        # Configure mesh access with custom names
-        mesh.__getitem__.side_effect = lambda key: {
-            "my_dp": custom_dp_mesh,
-            "my_tp": custom_tp_mesh,
-            "my_dp_cp": custom_dp_cp_mesh,
-        }[key]
-
-        # Mock mesh resources to simulate dp_cp mesh exists
-        mock_distributed_env["mesh_resources"].root_to_flatten_mapping.get.return_value = {"my_dp_cp": True}
-
-        model = MockModel()
-
-        result = fsdp2_strategy_parallelize(
-            model=model,
-            device_mesh=mesh,
-            dp_mesh_name="my_dp",
-            tp_mesh_name="my_tp",
-        )
-
-        assert result is model
-        mock_distributed_env["fsdp"].fully_shard.assert_called()
-
-    def test_custom_mesh_names_with_tensor_parallelism(self, mock_distributed_env):
-        """Test custom mesh names with tensor parallelism enabled."""
-        # Create a mock device mesh with custom keys
-        mesh = MagicMock(spec=DeviceMesh)
-        mesh.device_type = "cuda"
-
-        # Mock custom submeshes
-        custom_dp_mesh = MagicMock()
-        custom_tp_mesh = MagicMock()
-
-        custom_dp_mesh.size.return_value = 2
-        custom_tp_mesh.size.return_value = 2  # Enable TP
-        custom_dp_mesh.ndim = 1
-        custom_tp_mesh.ndim = 1
-
-        # Configure mesh access with custom names
-        mesh.__getitem__.side_effect = lambda key: {
-            "my_data_parallel": custom_dp_mesh,
-            "my_tensor_parallel": custom_tp_mesh,
-            "my_dp_cp": custom_dp_mesh,
-        }[key]
-
-        model = MockModel()
-        custom_plan = {"model.layers.0.self_attn.q_proj": ColwiseParallel()}
-
-        result = fsdp2_strategy_parallelize(
-            model=model,
-            device_mesh=mesh,
-            tp_shard_plan=custom_plan,
-            dp_mesh_name="my_data_parallel",
-            tp_mesh_name="my_tensor_parallel",
-        )
-
-        assert result is model
-        mock_distributed_env["tensor_parallel"].parallelize_module.assert_called_once()
-        mock_distributed_env["fsdp"].fully_shard.assert_called()
-
-
 class TestNvFSDPStrategyParallelize:
     """Test suite for nvfsdp_strategy_parallelize function."""
 
@@ -675,9 +321,9 @@ class TestNvFSDPStrategyParallelize:
             "import_classes": import_classes_mock,
         }
 
-    def test_basic_nvfsdp_with_default_mesh_names(self, mock_device_mesh, mock_nvfsdp_env):
+    def test_basic_nvfsdp_with_default_mesh_names(self, mock_device_mesh_nvfsdp, mock_nvfsdp_env):
         """Test basic nvFSDP with default mesh names."""
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
+        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh_nvfsdp
         tp_mesh.size.return_value = 1  # No tensor parallelism
         cp_mesh.size.return_value = 1  # No context parallelism
 
@@ -693,9 +339,9 @@ class TestNvFSDPStrategyParallelize:
         # Verify nvfsdp_fully_shard was called with default mesh names
         mock_nvfsdp_env["nvfsdp"].fully_shard.assert_called_once()
         call_kwargs = mock_nvfsdp_env["nvfsdp"].fully_shard.call_args[1]
-        assert call_kwargs["dp_mesh_name"] == "data_parallel"
-        assert call_kwargs["tp_mesh_name"] == "tensor_parallel"
-        assert call_kwargs["cp_mesh_name"] == "context_parallel"
+        assert call_kwargs["dp_mesh_name"] == "dp"
+        assert call_kwargs["tp_mesh_name"] == "tp"
+        assert call_kwargs["cp_mesh_name"] == "cp"
 
     def test_nvfsdp_with_custom_mesh_names(self, mock_nvfsdp_env):
         """Test nvFSDP with custom mesh names."""
@@ -832,41 +478,12 @@ class TestNvFSDPStrategyParallelize:
         call_kwargs = mock_nvfsdp_env["nvfsdp"].fully_shard.call_args[1]
         assert call_kwargs["dp_cp_mesh_name"] == "dp_cp"  # Should use default when CP > 1
 
-    def test_nvfsdp_backward_compatibility(self, mock_device_mesh, mock_nvfsdp_env):
-        """Test nvFSDP maintains backward compatibility with existing code."""
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
-
-        model = MockModel()
-        optimizer = MagicMock()
-
-        # Call without specifying mesh names (should use defaults)
-        result_model, result_optimizer = nvfsdp_strategy_parallelize(
-            model=model,
-            device_mesh=mesh,
-            optimizer=optimizer,
-            data_parallel_sharding_strategy="optim_grads_params",
-            grad_reduce_in_fp32=True,
-        )
-
-        # Verify mesh was accessed with default keys
-        mesh.__getitem__.assert_any_call("data_parallel")
-        mesh.__getitem__.assert_any_call("tensor_parallel")
-        mesh.__getitem__.assert_any_call("context_parallel")
-
-        # Verify nvfsdp_fully_shard was called with default names
-        mock_nvfsdp_env["nvfsdp"].fully_shard.assert_called_once()
-        call_kwargs = mock_nvfsdp_env["nvfsdp"].fully_shard.call_args[1]
-        assert call_kwargs["dp_mesh_name"] == "data_parallel"
-        assert call_kwargs["tp_mesh_name"] == "tensor_parallel"
-        assert call_kwargs["cp_mesh_name"] == "context_parallel"
-        assert call_kwargs["grad_reduce_in_fp32"] is True
-
-    def test_nvfsdp_not_available_error(self, mock_device_mesh, monkeypatch):
+    def test_nvfsdp_not_available_error(self, mock_device_mesh_nvfsdp, monkeypatch):
         """Test error when nvFSDP is not available."""
         # Mock HAVE_NVFSDP as False
         monkeypatch.setattr("nemo_automodel.components.distributed.parallelizer.HAVE_NVFSDP", False, raising=False)
 
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
+        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh_nvfsdp
         model = MockModel()
 
         with pytest.raises(AssertionError, match="nvFSDP is not installed"):
@@ -1123,34 +740,8 @@ class TestGetHfTpShardPlan:
         assert "model.embed_tokens" not in result
 
 
-class TestFSDP2StrategyEndToEnd:
-    """End-to-end tests that verify the FSDP2 strategy parallelization works with all components integrated."""
-
-    def test_full_pipeline_mock(self, mock_device_mesh, mock_distributed_env, mock_optimized_tp_plans):
-        """Test the full pipeline with all components mocked."""
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh
-        tp_mesh.size.return_value = 2
-
-        model = MockModel()
-
-        with patch("nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS", mock_optimized_tp_plans):
-            result = fsdp2_strategy_parallelize(
-                model=model,
-                device_mesh=mesh,
-                sequence_parallel=False,
-                activation_checkpointing=True,
-            )
-
-        assert result is model
-
-        # Verify all expected calls were made
-        mock_distributed_env["tensor_parallel"].parallelize_module.assert_called_once()
-        mock_distributed_env["tensor_parallel"].checkpoint_wrapper.assert_called()
-        mock_distributed_env["fsdp"].fully_shard.assert_called()
-
-
 class TestApplyFsdpShardingRecursively:
-    """Test class for apply_fsdp_sharding_recursively utility function."""
+    """Test class for apply_fsdp2_sharding_recursively utility function."""
 
     @pytest.fixture
     def mock_module_list(self):
@@ -1194,12 +785,12 @@ class TestApplyFsdpShardingRecursively:
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     def test_apply_fsdp_sharding_module_list(self, mock_fully_shard, mock_module_list, mock_mesh, mock_mp_policy, mock_offload_policy):
-        """Test apply_fsdp_sharding_recursively with a ModuleList."""
+        """Test apply_fsdp2_sharding_recursively with a ModuleList."""
         # Set up mock return values
         mock_fully_shard.side_effect = lambda x, **kwargs: x  # Return the module unchanged
 
         # Call the function
-        apply_fsdp_sharding_recursively(
+        apply_fsdp2_sharding_recursively(
             module=mock_module_list,
             mesh=mock_mesh,
             mp_policy=mock_mp_policy,
@@ -1224,12 +815,12 @@ class TestApplyFsdpShardingRecursively:
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     def test_apply_fsdp_sharding_module_list_without_offload_policy(self, mock_fully_shard, mock_module_list, mock_mesh, mock_mp_policy):
-        """Test apply_fsdp_sharding_recursively with a ModuleList and no offload policy."""
+        """Test apply_fsdp2_sharding_recursively with a ModuleList and no offload policy."""
         # Set up mock return values
         mock_fully_shard.side_effect = lambda x, **kwargs: x
 
         # Call the function without offload_policy
-        apply_fsdp_sharding_recursively(
+        apply_fsdp2_sharding_recursively(
             module=mock_module_list,
             mesh=mock_mesh,
             mp_policy=mock_mp_policy
@@ -1243,12 +834,12 @@ class TestApplyFsdpShardingRecursively:
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     def test_apply_fsdp_sharding_regular_module(self, mock_fully_shard, mock_single_module, mock_mesh, mock_mp_policy, mock_offload_policy):
-        """Test apply_fsdp_sharding_recursively with a regular module (not ModuleList)."""
+        """Test apply_fsdp2_sharding_recursively with a regular module (not ModuleList)."""
         # Set up mock return values
         mock_fully_shard.side_effect = lambda x, **kwargs: x
 
         # Call the function
-        apply_fsdp_sharding_recursively(
+        apply_fsdp2_sharding_recursively(
             module=mock_single_module,
             mesh=mock_mesh,
             mp_policy=mock_mp_policy,
@@ -1262,11 +853,11 @@ class TestApplyFsdpShardingRecursively:
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     def test_apply_fsdp_sharding_empty_module_list(self, mock_fully_shard, mock_mesh, mock_mp_policy, mock_offload_policy):
-        """Test apply_fsdp_sharding_recursively with an empty ModuleList."""
+        """Test apply_fsdp2_sharding_recursively with an empty ModuleList."""
         empty_module_list = nn.ModuleList([])
 
         # Call the function
-        apply_fsdp_sharding_recursively(
+        apply_fsdp2_sharding_recursively(
             module=empty_module_list,
             mesh=mock_mesh,
             mp_policy=mock_mp_policy,
@@ -1278,12 +869,12 @@ class TestApplyFsdpShardingRecursively:
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     def test_apply_fsdp_sharding_single_item_module_list(self, mock_fully_shard, mock_mesh, mock_mp_policy, mock_offload_policy):
-        """Test apply_fsdp_sharding_recursively with a single-item ModuleList."""
+        """Test apply_fsdp2_sharding_recursively with a single-item ModuleList."""
         single_module_list = nn.ModuleList([nn.Linear(10, 10)])
         mock_fully_shard.side_effect = lambda x, **kwargs: x
 
         # Call the function
-        apply_fsdp_sharding_recursively(
+        apply_fsdp2_sharding_recursively(
             module=single_module_list,
             mesh=mock_mesh,
             mp_policy=mock_mp_policy,
@@ -1298,11 +889,11 @@ class TestApplyFsdpShardingRecursively:
         assert call_args[1]["reshard_after_forward"] is False
 
     def test_apply_fsdp_sharding_no_children(self, mock_mesh, mock_mp_policy, mock_offload_policy):
-        """Test apply_fsdp_sharding_recursively with a module that has no children."""
+        """Test apply_fsdp2_sharding_recursively with a module that has no children."""
         leaf_module = nn.Linear(10, 10)
 
         # This should complete without error (no children to recurse on)
-        apply_fsdp_sharding_recursively(
+        apply_fsdp2_sharding_recursively(
             module=leaf_module,
             mesh=mock_mesh,
             mp_policy=mock_mp_policy,
