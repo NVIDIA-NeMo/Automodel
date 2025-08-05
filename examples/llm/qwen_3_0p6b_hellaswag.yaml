@@ -50,6 +50,7 @@ distributed:
   tp_size: 1
   cp_size: 1
   sequence_parallel: false
+  use_hf_tp_plan: false # if true, will attempt to get the TP plan from hf model.
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
