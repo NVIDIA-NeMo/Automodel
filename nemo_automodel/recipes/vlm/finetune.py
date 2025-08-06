@@ -369,7 +369,7 @@ def build_wandb(cfg) -> wandb.Run:
         kwargs["name"] = "_".join(cfg.get("model.pretrained_model_name_or_path").split("/")[-2:])
     run = wandb.init(
         **kwargs,
-        config=cfg,
+        config=cfg.to_dict(),
         settings=Settings(silent=True),
     )
     return run
