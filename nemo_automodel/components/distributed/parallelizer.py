@@ -116,6 +116,7 @@ def get_hf_tp_shard_plan(model):
         AssertionError: If no TP plan is found
     """
     from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
+
     model_cls = type(model)
 
     if isinstance(model, Gemma3ForConditionalGeneration):
@@ -214,15 +215,16 @@ def translate_to_torch_parallel_style(style: str):
     else:
         raise ValueError(f"Unknown parallel style: {style}")
 
+
 def validate_tp_mesh(model, tp_mesh):
     """
     Validate that attention heads and key value heads are divisible by TP size
     """
     if tp_mesh.size() == 1:
-        return # if tp_mesh.size() == 1, we don't need to validate
+        return  # if tp_mesh.size() == 1, we don't need to validate
     try:
         from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
-    except ImportError: # if transformers is not installed, we don't need to validate
+    except ImportError:  # if transformers is not installed, we don't need to validate
         return
 
     if isinstance(model, Gemma3ForConditionalGeneration):
@@ -244,21 +246,23 @@ def validate_tp_mesh(model, tp_mesh):
         f"num_attention_heads ({num_attention_heads}) must be divisible by TP size ({tp_mesh.size()})"
     )
 
+
 def get_lm_ac_layers(model):
     """
     Returns repeated layer blocks for activation checkpointing
     """
     try:
         from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
-    except ImportError: # if transformers is not installed, we don't need to validate
+    except ImportError:  # if transformers is not installed, we don't need to validate
         return []
     if isinstance(model, Gemma3ForConditionalGeneration):
         return model.language_model.layers
-    elif hasattr(getattr(model, 'model', None), 'layers'):
+    elif hasattr(getattr(model, "model", None), "layers"):
         return model.model.layers
     else:
         # TODO: scan model for nn.Sequential or ModuleList and return it
         return []
+
 
 # Taken and modified from torchtitan
 # https://github.com/pytorch/torchtitan/blob/main/torchtitan/parallelisms/parallelize_llama.py
@@ -313,7 +317,6 @@ def fsdp2_strategy_parallelize(
     # Get model layers for later use
     model_cls = type(model)
     tp_mesh = device_mesh[tp_mesh_name]
-
 
     # TP sharding with enhanced plan generation
     if tp_mesh.size() > 1:
