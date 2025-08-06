@@ -113,7 +113,7 @@ jobs:
             runner: linux-amd64-cpu16
             cpu-only: true
           - test-name: L0_Unit_Tests_GPU
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+            runner: self-hosted-nemo
             cpu-only: false
             timeout: 30
     needs: [pre-flight, cicd-wait-in-queue]
@@ -149,23 +149,23 @@ jobs:
         include:
           - test-name: L2_HF_Consolidated_FSDP
             test-folder: hf_consolidated_fsdp
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+            runner: self-hosted-nemo
             timeout: 20
           - test-name: L2_HF_DCP
             test-folder: hf_dcp
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+            runner: self-hosted-nemo
             timeout: 40
           - test-name: L2_HF_PEFT
             test-folder: hf_peft
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+            runner: self-hosted-nemo
             timeout: 30
           - test-name: L2_HF_Transformer
             test-folder: hf_transformer
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+            runner: self-hosted-nemo
             timeout: 20
           - test-name: L2_HF_Transformer_Finetune
             test-folder: hf_transformer_finetune
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+            runner: self-hosted-nemo
             timeout: 40
           # - test-name: L2_HF_Transformer_LLM
           #   test-folder: hf_transformer_llm
@@ -173,7 +173,7 @@ jobs:
           #   timeout: 20
           - test-name: L2_HF_Transformer_VLM
             test-folder: hf_transformer_vlm
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+            runner: self-hosted-nemo
             timeout: 60
     needs: [cicd-unit-tests]
     runs-on: ${{ matrix.runner }}
