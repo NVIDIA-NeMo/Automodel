@@ -110,7 +110,7 @@ jobs:
       matrix:
         include:
           - test-name: L0_Unit_Tests_CPU
-            runner: self-hosted-nemo
+            runner: linux-amd64-cpu16
             cpu-only: true
           - test-name: L0_Unit_Tests_GPU
             runner: self-hosted-nemo
@@ -169,7 +169,7 @@ jobs:
             timeout: 40
           # - test-name: L2_HF_Transformer_LLM
           #   test-folder: hf_transformer_llm
-          #   runner: self-hosted-nemo
+          #   runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
           #   timeout: 20
           - test-name: L2_HF_Transformer_VLM
             test-folder: hf_transformer_vlm
