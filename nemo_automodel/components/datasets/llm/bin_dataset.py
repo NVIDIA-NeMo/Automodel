@@ -160,8 +160,6 @@ class BinTokenDataset(IterableDataset):
         self.drop_last = drop_last
         self.infinite = infinite
         self.device_mesh = device_mesh
-        print(f"device_mesh: {self.device_mesh}")
-        quit()
 
     def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:  # noqa: C901
         # Worker-specific setup
