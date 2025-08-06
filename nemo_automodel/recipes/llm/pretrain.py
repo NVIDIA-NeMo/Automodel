@@ -70,11 +70,9 @@ def build_model_and_optimizer(
     cfg_model,
     cfg_opt,
     use_hf_fa2,
-    cfg_peft,
     model_wrapper,
     seed,
     tp_size: int = 1,
-    freeze_embeddings: bool = True,
 ):
     """Instantiate model and optimizer (copied)."""
     with StatefulRNG(seed=seed, ranked=True):
@@ -86,13 +84,6 @@ def build_model_and_optimizer(
                 "Setting model's attn_implementation to flash_attention_2"
             )
         model = cfg_model.instantiate(**kwargs)
-        if freeze_embeddings:
-            logging.info("Freezing embeddings")
-            for m in model.modules():
-                if isinstance(m, nn.Embedding):
-                    m.weight.requires_grad_(False)
-        if cfg_peft is not None:
-            apply_lora_to_linear_modules(model, cfg_peft)
 
     if callable(getattr(model_wrapper, "parallelize", None)):
         if isinstance(model_wrapper, NVFSDPManager):
@@ -158,7 +149,7 @@ def build_dataloader(
             "num_replicas": device_mesh["data_parallel"].size(),
             "rank": device_mesh["data_parallel"].get_local_rank(),
         }
-
+    from torch.utils.data import IterableDataset
 
     with StatefulRNG(seed=seed, ranked=True):
         ds = cfg_ds.instantiate()
@@ -171,12 +162,17 @@ def build_dataloader(
                 split_across_pack=getattr(cfg_ps, "split_across_pack", False),
                 max_packs=getattr(cfg_ps, "max_packs", None),
             ).pack()
-        sampler = StatefulDistributedSampler(
-            ds,
-            seed=seed,
-            drop_last=True,
-            **dist_sampler_kwargs,
-        )
+        # If the dataset is an IterableDataset, we don't need to use a sampler
+        if isinstance(ds, IterableDataset):
+            logging.info(f"Using IterableDataset; will not use sampler")
+            sampler = None
+        else:
+            sampler = StatefulDistributedSampler(
+                ds,
+                seed=seed,
+                drop_last=True,
+                **dist_sampler_kwargs,
+            )
         return cfg_dl.instantiate(dataset=ds, sampler=sampler)
 
 
@@ -304,7 +300,6 @@ class PretrainRecipeForNextTokenPrediction(BaseRecipe):
             self.cfg.model,
             self.cfg.optimizer,
             use_hf_fa2,
-            self.peft_config,
             self.model_wrapper,
             seed=self.cfg.get("seed", 42),
             tp_size=self.cfg.get("distributed.tp_size", 1),
@@ -341,8 +336,8 @@ class PretrainRecipeForNextTokenPrediction(BaseRecipe):
         self.checkpoint_config = build_checkpoint_config(
             self.cfg.get("checkpoint", None),
             self.cfg.get("model.cache_dir", None),
-            self.cfg.model.pretrained_model_name_or_path,
-            True if self.cfg.get("peft", None) else False,
+            self.cfg.get('model.pretrained_model_name_or_path', None),
+            self.cfg.get("peft", None) is not None,
         )
 
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
@@ -376,17 +371,22 @@ class PretrainRecipeForNextTokenPrediction(BaseRecipe):
             batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels, loss_mask)
         with train_ctx():
+
             if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                 out = self.model(logits_to_keep=1, **batch)
             else:
                 out = self.model(**batch)
+
+            if not isinstance(out, torch.Tensor) and hasattr(out, 'logits'):
+                out = out.logits
+
             local_loss = calculate_loss(
                 self.loss_fn,
-                logits=out.logits,
+                logits=out,
                 labels=labels,
                 mask=loss_mask,
                 model=self.model,
-                hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
+                hidden_states=getattr(out, 'hidden_states', [None])[-1],
             )
         local_num_loss_tokens = loss_mask.sum().detach().to(torch.int)
         self.num_nonpad_tokens += labels.numel() - count_tail_padding(labels)
