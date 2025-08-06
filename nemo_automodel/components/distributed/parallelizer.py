@@ -230,7 +230,7 @@ def validate_tp_mesh(model, tp_mesh):
         num_key_value_heads = model.config.text_config.num_key_value_heads
     elif hasattr(model, "config"):
         num_attention_heads = getattr(model.config, "num_attention_heads", 0)
-        num_key_value_heads = getatrr(model.config, "num_key_value_heads", 0)
+        num_key_value_heads = getattr(model.config, "num_key_value_heads", 0)
     else:
         num_attention_heads = 0
         num_key_value_heads = 0
