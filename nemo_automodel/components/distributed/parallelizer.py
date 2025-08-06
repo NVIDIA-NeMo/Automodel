@@ -244,6 +244,21 @@ def validate_tp_mesh(model, tp_mesh):
         f"num_attention_heads ({num_attention_heads}) must be divisible by TP size ({tp_mesh.size()})"
     )
 
+def get_lm_ac_layers(model):
+    """
+    Returns repeated layer blocks for activation checkpointing
+    """
+    try:
+        from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
+    except ImportError: # if transformers is not installed, we don't need to validate
+        return []
+    if isinstance(model, Gemma3ForConditionalGeneration):
+        return model.language_model.layers
+    elif hasattr(getattr(model, 'model', None), 'layers'):
+        return model.model.layers
+    else:
+        # TODO: scan model for nn.Sequential or ModuleList and return it
+        return []
 
 # Taken and modified from torchtitan
 # https://github.com/pytorch/torchtitan/blob/main/torchtitan/parallelisms/parallelize_llama.py
@@ -358,6 +373,7 @@ def fsdp2_strategy_parallelize(
 
     # Apply activation checkpointing to MLP layers if requested
     if activation_checkpointing:
+        layers = get_lm_ac_layers(model)
         for i, layer in enumerate(layers):
             if hasattr(layer, "mlp"):
                 layers[i].mlp = checkpoint_wrapper(layer.mlp)
