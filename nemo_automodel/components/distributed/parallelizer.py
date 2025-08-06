@@ -47,7 +47,8 @@ from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE
 # Flag indicating MegatronFSDP availability
 HAVE_MegatronFSDP = False
 try:
-    from megatron_fsdp import fully_shard as megatron_fsdp_fully_shard
+    # TODO: Change to megatron_fsdp once nvFSDP is merged back to MCore
+    from nvFSDP import fully_shard as megatron_fsdp_fully_shard
 
     HAVE_MegatronFSDP = True
 except:

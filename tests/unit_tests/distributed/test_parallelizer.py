@@ -182,7 +182,7 @@ def mock_device_mesh_fsdp2():
     return mesh, dp_replicate_mesh, dp_shard_mesh, tp_mesh, cp_mesh
 
 @pytest.fixture
-def mock_device_mesh_nvfsdp():
+def mock_device_mesh_megatronfsdp():
     """Create a mock device mesh."""
     mesh = MagicMock(spec=DeviceMesh)
 
@@ -300,8 +300,8 @@ class TestMegatronFSDPStrategyParallelize:
     def mock_megatron_env(self, monkeypatch):
         """Mock MegatronFSDP environment and dependencies."""
         # Mock MegatronFSDP module
-        nvfsdp_mock = SimpleNamespace()
-        nvfsdp_mock.fully_shard = MagicMock(return_value=(MagicMock(), None))
+        megatronfsdp_mock = SimpleNamespace()
+        megatronfsdp_mock.fully_shard = MagicMock(return_value=(MagicMock(), None))
 
         # Mock HAVE_MegatronFSDP flag
         monkeypatch.setattr("nemo_automodel.components.distributed.parallelizer.HAVE_MegatronFSDP", True, raising=False)
@@ -309,12 +309,7 @@ class TestMegatronFSDPStrategyParallelize:
         # legacy alias) and any new code paths are intercepted by this mock.
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.parallelizer.megatron_fsdp_fully_shard",
-            nvfsdp_mock.fully_shard,
-            raising=False,
-        )
-        monkeypatch.setattr(
-            "nemo_automodel.components.distributed.parallelizer.nvfsdp_fully_shard",
-            nvfsdp_mock.fully_shard,
+            megatronfsdp_mock.fully_shard,
             raising=False,
         )
 
@@ -327,14 +322,14 @@ class TestMegatronFSDPStrategyParallelize:
         monkeypatch.setattr("nemo_automodel.components.distributed.parallelizer.import_classes_from_paths", import_classes_mock, raising=False)
 
         return {
-            "megatron": nvfsdp_mock,
+            "megatron": megatronfsdp_mock,
             "parallelize_module": parallelize_module_mock,
             "import_classes": import_classes_mock,
         }
 
-    def test_basic_megatron_with_default_mesh_names(self, mock_device_mesh_nvfsdp, mock_megatron_env):
+    def test_basic_megatron_with_default_mesh_names(self, mock_device_mesh_megatronfsdp, mock_megatron_env):
         """Test basic MegatronFSDP with default mesh names."""
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh_nvfsdp
+        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh_megatronfsdp
         tp_mesh.size.return_value = 1  # No tensor parallelism
         cp_mesh.size.return_value = 1  # No context parallelism
 
@@ -489,15 +484,15 @@ class TestMegatronFSDPStrategyParallelize:
         call_kwargs = mock_megatron_env["megatron"].fully_shard.call_args[1]
         assert call_kwargs["dp_cp_mesh_name"] == "dp_cp"  # Should use default when CP > 1
 
-    def test_megatron_not_available_error(self, mock_device_mesh_nvfsdp, monkeypatch):
+    def test_megatron_not_available_error(self, mock_device_mesh_megatronfsdp, monkeypatch):
         """Test error when MegatronFSDP is not available."""
         # Mock HAVE_MegatronFSDP as False
         monkeypatch.setattr("nemo_automodel.components.distributed.parallelizer.HAVE_MegatronFSDP", False, raising=False)
 
-        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh_nvfsdp
+        mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh_megatronfsdp
         model = MockModel()
 
-        with pytest.raises(AssertionError, match="nvFSDP is not installed"):
+        with pytest.raises(AssertionError, match="Megatron FSDP is not installed"):
             megatron_fsdp_strategy_parallelize(
                 model=model,
                 device_mesh=mesh,
