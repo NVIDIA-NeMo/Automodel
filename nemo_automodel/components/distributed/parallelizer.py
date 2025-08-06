@@ -39,7 +39,6 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
-from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
 
 # Import model-specific tensor parallel plans from the dedicated module
 from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE_FUNCTIONS
@@ -116,7 +115,9 @@ def get_hf_tp_shard_plan(model):
     Raises:
         AssertionError: If no TP plan is found
     """
+    from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
     model_cls = type(model)
+
     if isinstance(model, Gemma3ForConditionalGeneration):
         inner_model = model.language_model
         model_prefix = "language_model"
@@ -213,6 +214,36 @@ def translate_to_torch_parallel_style(style: str):
     else:
         raise ValueError(f"Unknown parallel style: {style}")
 
+def validate_tp_mesh(model, tp_mesh):
+    """
+    Validate that attention heads and key value heads are divisible by TP size
+    """
+    if tp_mesh.size() == 1:
+        return # if tp_mesh.size() == 1, we don't need to validate
+    try:
+        from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
+    except ImportError: # if transformers is not installed, we don't need to validate
+        return
+
+    if isinstance(model, Gemma3ForConditionalGeneration):
+        num_attention_heads = model.config.text_config.num_attention_heads
+        num_key_value_heads = model.config.text_config.num_key_value_heads
+    elif hasattr(model, "config"):
+        num_attention_heads = getattr(model.config, "num_attention_heads", 0)
+        num_key_value_heads = getatrr(model.config, "num_key_value_heads", 0)
+    else:
+        num_attention_heads = 0
+        num_key_value_heads = 0
+
+    # TP sharding with enhanced plan generation
+    # Validate that attention heads are divisible by TP size
+    assert num_key_value_heads % tp_mesh.size() == 0, (
+        f"num_key_value_heads ({num_key_value_heads}) must be divisible by TP size ({tp_mesh.size()})"
+    )
+    assert num_attention_heads % tp_mesh.size() == 0, (
+        f"num_attention_heads ({num_attention_heads}) must be divisible by TP size ({tp_mesh.size()})"
+    )
+
 
 # Taken and modified from torchtitan
 # https://github.com/pytorch/torchtitan/blob/main/torchtitan/parallelisms/parallelize_llama.py
@@ -266,26 +297,13 @@ def fsdp2_strategy_parallelize(
     """
     # Get model layers for later use
     model_cls = type(model)
-    if isinstance(model, Gemma3ForConditionalGeneration):
-        layers = model.language_model.layers
-        num_attention_heads = model.config.text_config.num_attention_heads
-        num_key_value_heads = model.config.text_config.num_key_value_heads
-    else:
-        layers = model.model.layers
-        num_attention_heads = model.config.num_attention_heads
-        num_key_value_heads = model.config.num_key_value_heads
-
     tp_mesh = device_mesh[tp_mesh_name]
+
 
     # TP sharding with enhanced plan generation
     if tp_mesh.size() > 1:
         # Validate that attention heads are divisible by TP size
-        assert num_key_value_heads % tp_mesh.size() == 0, (
-            f"num_key_value_heads ({num_key_value_heads}) must be divisible by TP size ({tp_mesh.size()})"
-        )
-        assert num_attention_heads % tp_mesh.size() == 0, (
-            f"num_attention_heads ({num_attention_heads}) must be divisible by TP size ({tp_mesh.size()})"
-        )
+        validate_tp_mesh(model, tp_mesh)
 
         # Generate or use tensor parallel plan
         model_parallel_plan = None

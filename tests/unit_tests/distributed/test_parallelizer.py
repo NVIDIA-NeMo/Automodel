@@ -48,10 +48,15 @@ class MockModel(nn.Module):
 
     def __init__(self, model_type="llama", num_attention_heads=8, num_key_value_heads=8):
         super().__init__()
-        self.config = SimpleNamespace(
-            num_attention_heads=num_attention_heads,
-            num_key_value_heads=num_key_value_heads,
-        )
+        if model_type == "baichuan2":
+            self.config = SimpleNamespace(
+                num_attention_heads=num_attention_heads,
+            )
+        else:
+            self.config = SimpleNamespace(
+                num_attention_heads=num_attention_heads,
+                num_key_value_heads=num_key_value_heads,
+            )
 
         # Create mock model as a proper nn.Module so it gets picked up by named_children()
         class MockInnerModel(nn.Module):
@@ -969,3 +974,69 @@ class TestUnshardFsdp2Model:
 
             # Verify reshard was still called despite the exception
             assert test_fsdp_module.reshard_called is True
+
+
+from nemo_automodel.components.distributed.parallelizer import validate_tp_mesh
+
+# Optional import – tests are skipped automatically if transformers is not available
+pytest.importorskip("transformers")
+from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration  # noqa: E402
+
+
+class _MockGemma3Model(nn.Module):
+    """Minimal mock that mimics the attribute structure of Gemma3 models."""
+
+    def __init__(self, num_attention_heads=8, num_key_value_heads=8):
+        nn.Module.__init__(self)
+        # Match the nested config expected by validate_tp_mesh when a Gemma3 model is detected
+        self.config = SimpleNamespace(
+            text_config=SimpleNamespace(
+                num_attention_heads=num_attention_heads,
+                num_key_value_heads=num_key_value_heads,
+            )
+        )
+
+
+class MockGemma3ModelWithTypeCheck(_MockGemma3Model, Gemma3ForConditionalGeneration):
+    """Hybrid class that passes `isinstance(model, Gemma3ForConditionalGeneration)` checks."""
+
+    def __init__(self, num_attention_heads=8, num_key_value_heads=8):
+        # Replace super() with direct nn.Module.__init__ to avoid Gemma3ForConditionalGeneration.__init__
+        nn.Module.__init__(self)
+
+        # Intentionally *avoid* calling Gemma3ForConditionalGeneration.__init__ because it
+        # requires a full HF config and large model initialization. We only need the
+        # `config` attribute for `validate_tp_mesh`.
+        _MockGemma3Model.__init__(self, num_attention_heads, num_key_value_heads)
+
+
+def _make_tp_mesh(size: int):
+    """Utility to create a MagicMock that behaves like a DeviceMesh of given size."""
+    mesh = MagicMock(spec=DeviceMesh)
+    mesh.size.return_value = size
+    return mesh
+
+
+class TestValidateTpMesh:
+    """Unit tests for `validate_tp_mesh` utility."""
+
+    def test_skip_validation_when_tp_size_is_one(self):
+        """Function should exit early (no assertion) when TP mesh size == 1."""
+        model = object()  # Model details are irrelevant when TP size == 1
+        tp_mesh = _make_tp_mesh(1)
+        # Should not raise
+        validate_tp_mesh(model, tp_mesh)
+
+    def test_validation_passes_for_divisible_heads(self):
+        """No AssertionError when attention heads are divisible by TP mesh size."""
+        model = MockGemma3ModelWithTypeCheck(num_attention_heads=8, num_key_value_heads=8)
+        tp_mesh = _make_tp_mesh(2)  # 8 % 2 == 0
+        # Should not raise
+        validate_tp_mesh(model, tp_mesh)
+
+    def test_validation_raises_for_non_divisible_heads(self):
+        """AssertionError is raised when heads are *not* divisible by TP mesh size."""
+        model = MockGemma3ModelWithTypeCheck(num_attention_heads=8, num_key_value_heads=8)
+        tp_mesh = _make_tp_mesh(3)  # 8 % 3 != 0
+        with pytest.raises(AssertionError):
+            validate_tp_mesh(model, tp_mesh)
