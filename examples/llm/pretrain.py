@@ -34,4 +34,4 @@ def main(default_config_path="examples/llm/nanogpt_pretrain.yaml"):
 
 
 if __name__ == "__main__":
-    main() 
+    main()
