@@ -200,6 +200,7 @@ def test_clip_grad_by_total_norm_single_tensor_input():
     assert torch.allclose(param.grad, original_grad * scaling)
 
 # The threaded PG wrapper ensures *DeviceMesh* can operate without a real backend.
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required for *inf* norm path.")
 @spawn_threads_and_init_comms(world_size=2)
 def test_clip_grad_by_total_norm_with_dtensor():
     """Integration test exercising *clip_grad_by_total_norm_* with real DTensor."""
@@ -213,7 +214,7 @@ def test_clip_grad_by_total_norm_with_dtensor():
     from torch.distributed._tensor import DeviceMesh, Replicate
 
     # Build a minimal 1-D mesh on CPU to avoid NCCL initialisation.
-    mesh = DeviceMesh("cpu", torch.arange(2))  # size 1 mesh is communication-free.
+    mesh = DeviceMesh("cuda", torch.arange(2))  # size 1 mesh is communication-free.
 
     local_grad = torch.tensor([1.0, -1.0], dtype=torch.float32, device="cuda")
     from_local_dt = DTensor.from_local(local_grad, mesh, [Replicate()])
