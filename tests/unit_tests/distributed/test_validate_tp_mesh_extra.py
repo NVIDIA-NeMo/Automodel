@@ -32,6 +32,38 @@ from unittest.mock import MagicMock
 
 from nemo_automodel.components.distributed.parallelizer import validate_tp_mesh
 
+# -----------------------------------------------------------------------------
+# Lightweight "transformers" stub for environments without the package
+# -----------------------------------------------------------------------------
+
+
+def _install_fake_gemma3(monkeypatch):
+    """Install a minimal stub of the Gemma3 import hierarchy if missing.
+
+    We only need the class object to satisfy the ``import`` statement inside
+    ``validate_tp_mesh``; no actual functionality is required.
+    """
+
+    import sys, types  # Local import to avoid polluting global namespace
+
+    module_chain = [
+        "transformers",
+        "transformers.models",
+        "transformers.models.gemma3",
+        "transformers.models.gemma3.modeling_gemma3",
+    ]
+
+    for name in module_chain:
+        if name not in sys.modules:
+            sys.modules[name] = types.ModuleType(name)
+
+    modeling = sys.modules[module_chain[-1]]
+
+    class _StubGemma3:  # pragma: no cover – behaviour irrelevant
+        pass
+
+    modeling.Gemma3ForConditionalGeneration = _StubGemma3
+
 def _make_tp_mesh(size: int):
     """Create a ``MagicMock`` that mimics the minimal DeviceMesh interface."""
 
@@ -89,6 +121,9 @@ def test_validate_tp_mesh_basic_divisibility(monkeypatch, num_heads, tp_size, sh
 
     model = _DummyModel(num_heads)
     tp_mesh = _make_tp_mesh(tp_size)
+
+    # Ensure the Gemma3 import inside helper resolves even without transformers
+    _install_fake_gemma3(monkeypatch)
 
     if should_raise:
         with pytest.raises(AssertionError):
