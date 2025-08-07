@@ -12,14 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pretraining recipe for next-token prediction using NanoGPT-style datasets.
-
-This module reuses the bulk of the fine-tuning recipe implementation
-(`finetune.py`) but removes PEFT-specific paths and ensures the embedding
-layers remain **trainable**.  It is designed to work out-of-the-box with the
-``BinTokenDataset`` that streams token sequences from the binary shards
-produced by the *modded-NanoGPT* preprocessing script.
 """
+Pretraining recipe for next-token prediction.
+"""
+
 from __future__ import annotations
 
 import logging
