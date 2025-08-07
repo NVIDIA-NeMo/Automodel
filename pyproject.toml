@@ -128,6 +128,7 @@ omit = [
     "nemo_automodel/components/checkpoint/_backports/*.py",
     "tests/*",
     "nemo_automodel/components/_peft/lora_kernel.py",
+    "nemo_automodel/components/loss/triton/te_cross_entropy.py",
 ]
 
 [tool.ruff]
