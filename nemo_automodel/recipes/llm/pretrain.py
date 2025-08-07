@@ -36,11 +36,8 @@ import wandb
 from torch.distributed.device_mesh import _mesh_resources
 from torch.utils.data import DataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
-from transformers import AutoTokenizer
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from wandb import Settings
 
-from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.packed_sequence import PackedSequence
@@ -143,16 +140,10 @@ def build_dataloader(
     device_mesh,
     seed,
 ):
-    dist_sampler_kwargs = {"shuffle": cfg_dl.get("shuffle", True)}
-    if device_mesh is not None:
-        dist_sampler_kwargs |= {
-            "num_replicas": device_mesh["data_parallel"].size(),
-            "rank": device_mesh["data_parallel"].get_local_rank(),
-        }
     from torch.utils.data import IterableDataset
 
     with StatefulRNG(seed=seed, ranked=True):
-        ds = cfg_ds.instantiate()
+        ds = cfg_ds.instantiate(device_mesh=device_mesh)
         if getattr(cfg_ps, "packed_sequence_size", 0) > 0:
             logging.info(f"Packing dataset with size: {cfg_ps.packed_sequence_size}")
             ds = PackedSequence(
@@ -162,18 +153,25 @@ def build_dataloader(
                 split_across_pack=getattr(cfg_ps, "split_across_pack", False),
                 max_packs=getattr(cfg_ps, "max_packs", None),
             ).pack()
+
         # If the dataset is an IterableDataset, we don't need to use a sampler
         if isinstance(ds, IterableDataset):
             logging.info(f"Using IterableDataset; will not use sampler")
             sampler = None
         else:
+            dist_sampler_kwargs = {"shuffle": cfg_dl.get("shuffle", True)}
+            if device_mesh is not None:
+                dist_sampler_kwargs |= {
+                    "num_replicas": device_mesh["data_parallel"].size(),
+                    "rank": device_mesh["data_parallel"].get_local_rank(),
+                }
             sampler = StatefulDistributedSampler(
                 ds,
                 seed=seed,
                 drop_last=True,
                 **dist_sampler_kwargs,
             )
-        return cfg_dl.instantiate(dataset=ds, sampler=sampler)
+        return cfg_dl.instantiate(dataset=ds, sampler=sampler) #, num_workers=10)
 
 
 def build_distributed(cfg_dist: Dict[str, Any]):
@@ -225,7 +223,7 @@ def build_wandb(cfg):
     kwargs = cfg.wandb.to_dict()
     if kwargs.get("name", "") == "":
         kwargs["name"] = "_".join(cfg.get("model.pretrained_model_name_or_path").split("/")[-2:])
-    return wandb.init(**kwargs, config=cfg, settings=Settings(silent=True))
+    return wandb.init(**kwargs, config=cfg.to_dict(), settings=Settings(silent=True))
 
 
 def calculate_loss(loss_fn, **kwargs):
@@ -274,7 +272,8 @@ class PretrainRecipeForNextTokenPrediction(BaseRecipe):
         self.cfg = cfg
 
     def setup(self):
-        torch.cuda.reset_peak_memory_stats()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
         setup_logging()
 
@@ -366,7 +365,7 @@ class PretrainRecipeForNextTokenPrediction(BaseRecipe):
         if (
             "position_ids" not in batch
             and self.device_mesh is not None
-            and (self.device_mesh["context_parallel"].size() > 1 or self.device_mesh["tensor_parallel"].size() > 1)
+            and (self.device_mesh["cp"].size() > 1 or self.device_mesh["tp"].size() > 1)
         ):
             batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels, loss_mask)
@@ -409,7 +408,7 @@ class PretrainRecipeForNextTokenPrediction(BaseRecipe):
                 if self.device_mesh is not None
                 else None,
             )
-            if not self.device_mesh or self.device_mesh["tensor_parallel"].size() == 1:
+            if not self.device_mesh or self.device_mesh["tp"].size() == 1:
                 grad_norm = clip_gradients(self.model, clip_norm)
             else:
                 grad_norm = 0.0
@@ -424,6 +423,9 @@ class PretrainRecipeForNextTokenPrediction(BaseRecipe):
             self.num_nonpad_tokens = 0
             reporting_loss = self.log_train_metrics(grad_norm, tps)
             current_lr = self.optimizer.param_groups[0]["lr"]
+            mem_gib = (
+                torch.cuda.max_memory_allocated() / 1024**3 if torch.cuda.is_available() else 0.0
+            )
             logging.info(
                 "step %s | epoch %s | loss %.4f | grad_norm %.4f | lr %.2e | mem: %.2f GiB | tps %.2f",
                 self.step_scheduler.step,
@@ -431,10 +433,11 @@ class PretrainRecipeForNextTokenPrediction(BaseRecipe):
                 reporting_loss,
                 grad_norm,
                 current_lr,
-                torch.cuda.max_memory_allocated() / 1024**3,
+                mem_gib,
                 tps,
             )
-            torch.cuda.reset_peak_memory_stats()
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
 
     @torch.no_grad()
     def _run_validation_epoch(self):
@@ -452,8 +455,8 @@ class PretrainRecipeForNextTokenPrediction(BaseRecipe):
                     self.device_mesh
                     and "position_ids" not in batch
                     and (
-                        self.device_mesh["context_parallel"].size() > 1
-                        or self.device_mesh["tensor_parallel"].size() > 1
+                        self.device_mesh["cp"].size() > 1
+                        or self.device_mesh["tp"].size() > 1
                     )
                 ):
                     batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
@@ -463,13 +466,17 @@ class PretrainRecipeForNextTokenPrediction(BaseRecipe):
                         out = self.model(logits_to_keep=1, **batch)
                     else:
                         out = self.model(**batch)
+                    if not isinstance(out, torch.Tensor) and hasattr(out, "logits"):
+                        logits = out.logits
+                    else:
+                        logits = out
                     local_loss = calculate_loss(
                         self.loss_fn,
-                        logits=out.logits,
+                        logits=logits,
                         labels=labels,
                         mask=loss_mask,
                         model=self.model,
-                        hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
+                        hidden_states=getattr(out, "hidden_states", [None])[-1],
                     )
                 total_loss += local_loss.item()
                 total_tokens += loss_mask.sum().item()
@@ -493,10 +500,10 @@ class PretrainRecipeForNextTokenPrediction(BaseRecipe):
     def log_train_metrics(self, grad_norm, tps):
         if not self.device_mesh:
             dp_group = None
-        elif self.device_mesh["context_parallel"].size() > 1:
+        elif self.device_mesh["cp"].size() > 1:
             dp_group = self.device_mesh["dp_cp"].get_group()
         else:
-            dp_group = self.device_mesh["data_parallel"].get_group()
+            dp_group = self.device_mesh["dp_replicate"].get_group()
         total_loss, total_num_loss_tokens = reduce_loss(
             self.forward_data_store, self.total_local_num_loss_tokens, per_token_loss=True, dp_group=dp_group
         )
@@ -531,7 +538,7 @@ def main(config_path=None):
     Loads the configuration, sets up the trainer, and initiates the training loop.
     """
     if config_path is None:
-        config_path = pathlib.Path(__file__).parent.resolve() / "llama_3_2_1b_hellaswag.yaml"
+        config_path = pathlib.Path(__file__).parents[2].resolve() / "examples" / "llm" / "nanogpt_pretrain.yaml"
     cfg = parse_args_and_load_config(config_path)
     trainer = PretrainRecipeForNextTokenPrediction(cfg)
     trainer.setup()
