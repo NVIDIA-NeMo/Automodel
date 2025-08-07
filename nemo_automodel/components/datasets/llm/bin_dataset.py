@@ -164,7 +164,6 @@ class BinTokenDataset(IterableDataset):
     def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:  # noqa: C901
         # Worker-specific setup
         worker = get_worker_info()
-        print(f"worker: {worker}")
         rng = random.Random()
         if worker is not None:
             # Ensure each worker gets a *different* but deterministic view by seeding based on worker_id.
@@ -254,7 +253,6 @@ class BinTokenDataset(IterableDataset):
         is raised because DataLoader would otherwise create an *epoch* concept
         that never terminates[].
         """
-        return 1024 * 10
         if self.infinite:
             raise TypeError("`__len__` is undefined when `infinite=True`.")
 
