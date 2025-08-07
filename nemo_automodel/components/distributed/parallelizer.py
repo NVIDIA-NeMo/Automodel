@@ -114,7 +114,6 @@ def get_hf_tp_shard_plan(model):
     Raises:
         AssertionError: If no TP plan is found
     """
-    from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
 
     hf_tp_plan = {}
 
