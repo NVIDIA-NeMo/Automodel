@@ -53,7 +53,10 @@ class StepScheduler(Stateful):
         self.step = start_step
         self.epoch = start_epoch
         self.num_epochs = num_epochs
-        self.epoch_len = len(dataloader)
+        try:
+            self.epoch_len = len(dataloader)
+        except Exception:
+            self.epoch_len = None
         self.grad_step = 0  # number of optimizer steps taken
         self.val_every_steps = val_every_steps
         self.max_steps = max_steps
@@ -116,8 +119,10 @@ class StepScheduler(Stateful):
         Returns:
             bool: if true, the checkpoint should run.
         """
-        batch_idx = self.step % self.epoch_len
-        last_batch = self.epoch_len is not None and batch_idx == self.epoch_len - 1
+        last_batch = False
+        if isinstance(self.epoch_len, int) and self.epoch_len > 0:
+            batch_idx = self.step % self.epoch_len
+            last_batch = batch_idx == self.epoch_len - 1
         return ((self.step % self.ckpt_every_steps) == 0 and self.step != 0) or last_batch
 
     @property
