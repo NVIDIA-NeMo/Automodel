@@ -157,7 +157,7 @@ class BaseRecipe:
         save_model(model, path, self.checkpoint_config, peft_config=self.peft_config, tokenizer=tokenizer)
         save_optimizer(optimizer, model, path, scheduler)
         with safe_yaml_representers():
-            save_config(config, path)
+            save_config(config.to_dict(), path)
 
     def load_checkpoint(self, restore_from: str | None = None):
         """
@@ -190,8 +190,8 @@ class BaseRecipe:
                 optimizer = getattr(self, key)
             elif is_lr_scheduler(getattr(self, key)):
                 scheduler = getattr(self, key)
-            elif is_tokenizer(getattr(self, key)):
-                # we don't need to load the tokenizer from the checkpoint
+            elif is_tokenizer(getattr(self, key)) or isinstance(getattr(self, key), ConfigNode):
+                # we don't need to load the tokenizer or config from the checkpoint
                 # we only save the tokenizer for consolidated checkpoints for downstream use
                 continue
             else:

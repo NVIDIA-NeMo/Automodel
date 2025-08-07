@@ -44,8 +44,6 @@ if TYPE_CHECKING:
     from peft import PeftConfig
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
-    from nemo_automodel.components.config.loader import ConfigNode
-
 
 @dataclass
 class CheckpointingConfig:
@@ -268,7 +266,7 @@ def load_optimizer(
     optimizer_state.load_state_dict(reinstated_state_dict)
 
 
-def save_config(config: "ConfigNode", weights_path: str):
+def save_config(config: dict[str, Any], weights_path: str):
     """
     Save a config to a weights path.
 
@@ -277,7 +275,7 @@ def save_config(config: "ConfigNode", weights_path: str):
         weights_path: Path to save config
     """
     with open(os.path.join(weights_path, "config.yaml"), "w") as f:
-        yaml.safe_dump(config.to_dict(), f)
+        yaml.safe_dump(config, f, sort_keys=False)
 
 
 def _get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
