@@ -123,6 +123,7 @@ def test_to_cpu_passthrough_other_types():
     sentinel = object()
     assert to_cpu(sentinel) is sentinel
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required for *inf* norm path.")
 @pytest.mark.parametrize("pin_memory", [True, False])
 def test_get_cpu_state_dict_scalar(pin_memory):
     """Handles 0-dim tensors correctly."""
@@ -136,7 +137,7 @@ def test_get_cpu_state_dict_scalar(pin_memory):
     assert torch.allclose(out["bias"], bias)
     assert out["bias"].device.type == "cpu"
 
-
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required for *inf* norm path.")
 @pytest.mark.parametrize("pin_memory", [True, False])
 def test_get_cpu_state_dict_multi_dim(pin_memory):
     """Multi-dimensional tensors are copied element-wise to CPU."""
