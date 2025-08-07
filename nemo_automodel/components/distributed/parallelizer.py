@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import importlib
-import signal
 from contextlib import contextmanager
 from functools import lru_cache
 from types import FunctionType
@@ -264,13 +263,18 @@ def get_lm_ac_layers(model: nn.Module) -> List[nn.Module]:
         return []
 
 
-def _get_parallel_plan(model: nn.Module, sequence_parallel: bool = False, tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None) -> Dict[str, ParallelStyle]:
+def _get_parallel_plan(
+    model: nn.Module,
+    sequence_parallel: bool = False,
+    tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+) -> Dict[str, ParallelStyle]:
     """
     Get the parallel plan for the model.
     """
 
     # Generate or use tensor parallel plan
     model_parallel_plan = None
+    model_cls = type(model)
 
     # 1. Use custom parallel plan if provided
     if tp_shard_plan is not None:
@@ -370,7 +374,6 @@ def fsdp2_strategy_parallelize(
     the model must fit on GPU or CPU memory.
     """
     # Get model layers for later use
-    model_cls = type(model)
     tp_mesh = device_mesh[tp_mesh_name]
 
     # TP sharding with enhanced plan generation
