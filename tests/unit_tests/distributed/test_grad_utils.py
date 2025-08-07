@@ -15,6 +15,8 @@
 from typing import Iterable, List
 from unittest.mock import Mock
 
+import types
+
 import math
 
 import pytest
@@ -59,6 +61,20 @@ def _make_param(data: Iterable[float] | torch.Tensor, *, requires_grad: bool = T
     tensor.requires_grad_(requires_grad)
     tensor.grad = tensor.clone().detach() if requires_grad else None  # type: ignore[attr-defined]
     return tensor
+
+def _make_dtensor(local: torch.Tensor) -> DTensor:  # type: ignore[return-type]
+    """Create a minimal *DTensor* instance wrapping *local* without distributed init."""
+
+    dt = object.__new__(DTensor)
+
+    dt._local_tensor = local  # type: ignore[attr-defined]
+    dt.device = local.device  # type: ignore[attr-defined]
+
+    # Attach required methods.
+    dt.to_local = types.MethodType(lambda self: self._local_tensor, dt)  # type: ignore[arg-type]
+    dt.detach = types.MethodType(lambda self: self, dt)  # type: ignore[arg-type]
+
+    return dt  # type: ignore[return-value]
 
 @pytest.mark.parametrize(
     "max_grad_norm,total_norm,scaling_expected", [(1.0, 5.0, 0.2), (10.0, 5.0, 1.0)],
@@ -106,32 +122,25 @@ def test_clip_grad_by_total_norm_single_tensor_input():
 
 
 def test_clip_grad_by_total_norm_with_dtensor(monkeypatch):
-    """Ensure DTensor gradients go through *to_local_if_dtensor* helper.
+    """Integration test exercising *clip_grad_by_total_norm_* with real DTensor."""
 
-    We spy on the helper to assert it was invoked exactly once.  No numerical
-    assertions are made because the helper returns a detached copy whose
-    changes don't propagate back to the original mock.
-    """
+    if not torch.cuda.is_available():
+        pytest.skip("DTensor path requires CUDA device.")
 
-    param = _make_param([1.0, -1.0])
-    dtensor_mock: DTensor = Mock(spec=DTensor)
-    dtensor_mock.detach.return_value = dtensor_mock  # Used inside the util.
-    param.grad = dtensor_mock  # type: ignore[assignment]
+    # Parameter itself is irrelevant – only its gradient is used/modified.
+    param = _make_param([0.0, 0.0])
 
-    call_count = 0
+    local_grad = torch.tensor([1.0, -1.0], dtype=torch.float32, device="cuda")
+    dt = _make_dtensor(local_grad)
+    param.grad = dt  # type: ignore[assignment]
 
-    def _spy(t):
-        nonlocal call_count
-        call_count += 1
-        # Return a clone so mul_ doesn't error on a Mock instance.
-        return torch.ones_like(param)
+    total_norm = torch.norm(local_grad).item()
+    max_grad_norm = total_norm * 0.5  # Force scaling (< 1)
+    expected_coeff = max_grad_norm / (total_norm + 1e-6)
 
-    monkeypatch.setattr(grad_utils, "to_local_if_dtensor", _spy)
+    grad_utils.clip_grad_by_total_norm_(param, max_grad_norm=max_grad_norm, total_norm=total_norm)
 
-    # Should execute without error and invoke the spy.
-    grad_utils.clip_grad_by_total_norm_(param, max_grad_norm=1.0, total_norm=5.0)
-
-    assert call_count == 1
+    assert torch.allclose(dt._local_tensor, local_grad * expected_coeff)  # type: ignore[attr-defined]
 
 
 def _expected_l2_norm(*grads: List[torch.Tensor | torch.Tensor]):  # noqa: D401 – helper
