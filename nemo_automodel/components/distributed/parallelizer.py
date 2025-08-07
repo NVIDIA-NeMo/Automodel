@@ -247,7 +247,7 @@ def validate_tp_mesh(model, tp_mesh):
     )
 
 
-def get_lm_ac_layers(model):
+def get_lm_ac_layers(model: nn.Module) -> List[nn.Module]:
     """
     Returns repeated layer blocks for activation checkpointing
     """
@@ -262,6 +262,61 @@ def get_lm_ac_layers(model):
     else:
         # TODO: scan model for nn.Sequential or ModuleList and return it
         return []
+
+
+def _get_parallel_plan(model: nn.Module, sequence_parallel: bool = False, tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None) -> Dict[str, ParallelStyle]:
+    """
+    Get the parallel plan for the model.
+    """
+
+    # Generate or use tensor parallel plan
+    model_parallel_plan = None
+
+    # 1. Use custom parallel plan if provided
+    if tp_shard_plan is not None:
+        if isinstance(tp_shard_plan, dict):
+            model_parallel_plan = tp_shard_plan
+            print("Using provided parallel plan (dictionary).")
+        else:
+            try:
+                plan_obj = import_class_from_path(tp_shard_plan)
+                if isinstance(plan_obj, FunctionType):
+                    model_parallel_plan = plan_obj()
+                else:
+                    model_parallel_plan = plan_obj
+                assert isinstance(model_parallel_plan, dict), (
+                    f"Parallel plan must be a dictionary, got {type(model_parallel_plan)}"
+                )
+                print("Using provided parallel plan (from path).")
+            except Exception as e:
+                raise ValueError(
+                    f"Custom parallel plan '{tp_shard_plan}' is not valid. "
+                    f"Please ensure it is one of the following:\n"
+                    "1. A dictionary mapping module names to parallel styles\n"
+                    "2. A path to a dictionary\n"
+                    "3. A path to a function that returns a dictionary\n"
+                    f"Error: {e}"
+                )
+
+    # 2. Use optimized parallel plan based on model type
+    elif model_cls in PARALLELIZE_FUNCTIONS:
+        try:
+            func = PARALLELIZE_FUNCTIONS[model_cls]
+            model_parallel_plan = func(model, sequence_parallel)
+            print("Using optimized parallel plan.")
+        except Exception as e:
+            print(f"Optimized parallel plan is not available: {e}. Falling back to the HF tp plan.")
+            assert not sequence_parallel, "sequence_parallel is not supported in HF tp plan."
+            model_parallel_plan = get_hf_tp_shard_plan(model)
+
+    # 3. Use HF TP plan as fallback
+    else:
+        if model_cls not in PARALLELIZE_FUNCTIONS:
+            print(f"Optimized parallel plan is not supported for {model_cls}. Falling back to the HF tp plan.")
+        assert not sequence_parallel, "sequence_parallel is not supported in HF tp plan."
+        model_parallel_plan = get_hf_tp_shard_plan(model)
+
+    return model_parallel_plan
 
 
 # Taken and modified from torchtitan
@@ -324,51 +379,7 @@ def fsdp2_strategy_parallelize(
         validate_tp_mesh(model, tp_mesh)
 
         # Generate or use tensor parallel plan
-        model_parallel_plan = None
-
-        # 1. Use custom parallel plan if provided
-        if tp_shard_plan is not None:
-            if isinstance(tp_shard_plan, dict):
-                model_parallel_plan = tp_shard_plan
-                print("Using provided parallel plan (dictionary).")
-            else:
-                try:
-                    plan_obj = import_class_from_path(tp_shard_plan)
-                    if isinstance(plan_obj, FunctionType):
-                        model_parallel_plan = plan_obj()
-                    else:
-                        model_parallel_plan = plan_obj
-                    assert isinstance(model_parallel_plan, dict), (
-                        f"Parallel plan must be a dictionary, got {type(model_parallel_plan)}"
-                    )
-                    print("Using provided parallel plan (from path).")
-                except Exception as e:
-                    raise ValueError(
-                        f"Custom parallel plan '{tp_shard_plan}' is not valid. "
-                        f"Please ensure it is one of the following:\n"
-                        "1. A dictionary mapping module names to parallel styles\n"
-                        "2. A path to a dictionary\n"
-                        "3. A path to a function that returns a dictionary\n"
-                        f"Error: {e}"
-                    )
-
-        # 2. Use optimized parallel plan based on model type
-        elif model_cls in PARALLELIZE_FUNCTIONS:
-            try:
-                func = PARALLELIZE_FUNCTIONS[model_cls]
-                model_parallel_plan = func(model, sequence_parallel)
-                print("Using optimized parallel plan.")
-            except Exception as e:
-                print(f"Optimized parallel plan is not available: {e}. Falling back to the HF tp plan.")
-                assert not sequence_parallel, "sequence_parallel is not supported in HF tp plan."
-                model_parallel_plan = get_hf_tp_shard_plan(model)
-
-        # 3. Use HF TP plan as fallback
-        else:
-            if model_cls not in PARALLELIZE_FUNCTIONS:
-                print(f"Optimized parallel plan is not supported for {model_cls}. Falling back to the HF tp plan.")
-            assert not sequence_parallel, "sequence_parallel is not supported in HF tp plan."
-            model_parallel_plan = get_hf_tp_shard_plan(model)
+        model_parallel_plan = _get_parallel_plan(model, sequence_parallel, tp_shard_plan)
 
         # Apply tensor parallelism
         if model_parallel_plan:
@@ -544,17 +555,6 @@ def nvfsdp_strategy_parallelize(
     )
 
     return model, optimizer
-
-
-def _destroy_dist_connection() -> None:
-    """
-    Destroy process group.
-    """
-    # Don't allow Ctrl+C to interrupt this handler
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        torch.distributed.destroy_process_group()
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 
 @contextmanager
