@@ -116,26 +116,24 @@ def get_hf_tp_shard_plan(model):
     """
     from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
 
-    model_cls = type(model)
-
-    if isinstance(model, Gemma3ForConditionalGeneration):
-        inner_model = model.language_model
-        model_prefix = "language_model"
-    else:
-        inner_model = model.model
-        model_prefix = "model"
-
     hf_tp_plan = {}
 
     # model_cls._tp_plan will override model_cls after xxxForCausalLM.post_init() (transformers==4.51.3)
+    model_cls = type(model)
     if hasattr(model_cls, "_tp_plan") and model_cls._tp_plan is not None:
         hf_tp_plan.update(model_cls._tp_plan)
 
     if hasattr(model, "_tp_plan") and model._tp_plan is not None:
         hf_tp_plan.update(model._tp_plan)
 
-    if hasattr(inner_model, "_tp_plan") and inner_model._tp_plan is not None:
-        hf_tp_plan.update({f"{model_prefix}.{k}": v for k, v in inner_model._tp_plan.items()})
+    model_prefix = "model"
+    inner_model_attrs = ("language_model", "model")
+    for attr in inner_model_attrs:
+        if hasattr(getattr(model, attr, None), "_tp_plan"):
+            model_prefix = attr
+            _tp_plan = getattr(getattr(model, attr), "_tp_plan")
+            hf_tp_plan.update({f"{model_prefix}.{k}": v for k, v in _tp_plan.items()})
+            break
 
     assert len(hf_tp_plan) > 0, (
         f"Hugging Face tp plan is not supported for {model_cls}, please set dtensor_cfg.tensor_parallel_size to 1 or provide a custom_parallel_plan. "
