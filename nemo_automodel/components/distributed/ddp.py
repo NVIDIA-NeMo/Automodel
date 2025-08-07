@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-
+from nemo_automodel.components.distributed.parallel_dims import ParallelDims
 
 @dataclass
 class DDPManager:
@@ -33,10 +33,7 @@ class DDPManager:
 
     backend: str = field(default="nccl", metadata={"help": "Distributed backend, e.g. 'nccl' or 'gloo'."})
 
-    world_size: int = field(default_factory=lambda: int, metadata={"help": "Total number of distributed processes."})
-
-    # This is populated in setup_distributed(), not by user:
-    rank: int = field(init=False, default_factory=lambda: int, metadata={"help": "Global rank of this process."})
+    parallel_dims: ParallelDims = field(default_factory=ParallelDims)
 
     def setup_distributed(self):
         """
@@ -58,8 +55,8 @@ class DDPManager:
             os.environ.setdefault("MASTER_PORT", os.environ.get("MASTER_PORT", "29500"))
             dist.init_process_group(self.backend, rank=rank, world_size=world)
 
-        self.rank = dist.get_rank()
-        self.world_size = dist.get_world_size()
+        self.rank = self.parallel_dims.rank
+        self.world_size = self.parallel_dims.world_size
 
         # Pin GPU if using NCCL
         if self.backend == "nccl":

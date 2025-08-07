@@ -22,6 +22,7 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
 )
 
+from nemo_automodel.components.distributed.parallel_dims import DimNames, ParallelDims
 from nemo_automodel.components.distributed.parallelizer import (
     get_hf_tp_shard_plan,
     nvfsdp_strategy_parallelize,
@@ -57,18 +58,8 @@ class NVFSDPManager:
             Applies FSDP2 and Tensor-Parallel sharding strategies to the given model.
     """
 
-    dp_size: Optional[int] = field(
-        default=None,
-        metadata={"help": "Data-parallel group size; if None, infer from WORLD_SIZE."},
-    )
-    tp_size: Optional[int] = field(
-        default=1,
-        metadata={"help": "Tensor-parallel group size; if None, defaults to 1."},
-    )
-    cp_size: Optional[int] = field(
-        default=1,
-        metadata={"help": "Context-parallel group size (for pipeline-like sharding)."},
-    )
+    parallel_dims: ParallelDims = field(default_factory=ParallelDims)
+
     sequence_parallel: Optional[bool] = field(
         default=False,
         metadata={"help": "Enable sequence parallelism in TP plan if True. Not supported with nvFSDP right now."},
@@ -150,7 +141,7 @@ class NVFSDPManager:
         if self.dp_size is None or self.dp_size <= 0:
             # Calculate dp_size to ensure dp_size * tp_size * cp_size == world_size
             total_parallel_ranks = self.tp_size * self.cp_size
-            if self.world_size % total_parallel_ranks != 0:
+            if self.parallel_dims.world_size % total_parallel_ranks != 0:
                 raise ValueError(
                     f"world_size ({self.world_size}) must be divisible by (tp_size * cp_size) "
                     f"({self.tp_size} * {self.cp_size} = {total_parallel_ranks})"
@@ -158,7 +149,7 @@ class NVFSDPManager:
             self.dp_size = self.world_size // total_parallel_ranks
 
         mesh_shape = (self.dp_size, self.cp_size, self.tp_size)
-        mesh_names = ("dp", "cp", "tp")
+        mesh_names = (DimNames.DP, DimNames.CP, DimNames.TP)
         for shape, name in zip(mesh_shape, mesh_names):
             assert isinstance(shape, int), "Expected {} to be an int, but got {}".format(name, type(shape))
             assert shape > 0, "Expected {} > 0, {}".format(name, shape)
@@ -171,7 +162,7 @@ class NVFSDPManager:
         )
         # flatten dp+cp if cp>1
         if self.cp_size > 1:
-            self.device_mesh[("dp", "cp")]._flatten(mesh_dim_name="dp_cp")
+            self.device_mesh[(DimNames.DP, DimNames.CP)]._flatten(mesh_dim_name=DimNames.DP_CP)
         return self
 
     def parallelize(self, model, optimizer=None, use_hf_tp_plan=False):
@@ -202,7 +193,7 @@ class NVFSDPManager:
                     "Parameters will not be sharded."
                 )
 
-        if self.device_mesh["tp"].size() > 1:
+        if self.device_mesh[DimNames.TP].size() > 1:
             if use_hf_tp_plan:
                 tp_shard_plan = get_hf_tp_shard_plan(model)
             else:
