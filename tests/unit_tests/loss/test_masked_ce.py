@@ -30,7 +30,7 @@ def test_masked_cross_entropy_no_mask():
     targets = torch.randint(high=num_classes, size=(batch_size,))
 
     # Compute loss with our function
-    loss_custom = MaskedCrossEntropy()(logits, targets, mask=None)
+    loss_custom = MaskedCrossEntropy()(logits, targets, loss_mask=None)
 
     # Compute baseline cross-entropy
     loss_ref = F.cross_entropy(logits, targets, reduction="sum")
@@ -54,7 +54,7 @@ def test_masked_cross_entropy_with_mask():
     mask = torch.tensor([1, 0, 1, 0])  # Only positions 0 and 2 are used
 
     # Our loss
-    loss_custom = MaskedCrossEntropy()(logits, targets, mask=mask)
+    loss_custom = MaskedCrossEntropy()(logits, targets, loss_mask=mask)
 
     # Reference: Manually mask out positions by setting target to -100
     targets_ref = targets.clone()
@@ -80,7 +80,7 @@ def test_masked_cross_entropy_gpu():
     targets = torch.randint(high=num_classes, size=(batch_size,), device=device)
     mask = torch.tensor([1, 0, 1, 1], device=device)
 
-    loss_gpu = MaskedCrossEntropy()(logits, targets, mask=mask)
+    loss_gpu = MaskedCrossEntropy()(logits, targets, loss_mask=mask)
     assert loss_gpu.dtype == torch.float32  # By default it should be FP32 once cast
 
     # Double-check it runs without error

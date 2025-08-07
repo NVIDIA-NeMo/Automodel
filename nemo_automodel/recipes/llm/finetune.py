@@ -377,8 +377,8 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
         # Replace labels with -100 where mask is 0 (don't compute loss for these positions)
         # -100 is the default ignore index in PyTorch's cross entropy loss
         labels = kwargs.pop("labels")
-        if "mask" in kwargs:
-            loss_mask = kwargs.pop("mask")
+        if "loss_mask" in kwargs:
+            loss_mask = kwargs.pop("loss_mask")
             labels.masked_fill_(loss_mask == 0, -100)
 
         # find the lm_head in the model
@@ -407,7 +407,7 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
             {
                 "logits": kwargs.pop("logits"),
                 "labels": kwargs.pop("labels"),
-                "mask": kwargs.pop("mask"),
+                "loss_mask": kwargs.pop("loss_mask"),
             }
         )
 
@@ -562,13 +562,6 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if loss_mask is None:
             loss_mask = (labels.detach() != -100).to(torch.int)
 
-        if (
-            "position_ids" not in batch
-            and self.device_mesh is not None
-            and (self.device_mesh["cp"].size() > 1 or self.device_mesh["tp"].size() > 1)
-        ):
-            batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
-
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels, loss_mask)
         with train_ctx():
             if isinstance(self.loss_fn, FusedLinearCrossEntropy):
@@ -584,7 +577,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 self.loss_fn,
                 logits=out.logits,
                 labels=labels,
-                mask=loss_mask,
+                loss_mask=loss_mask,
                 model=self.model,
                 hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
             )
@@ -701,7 +694,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         self.loss_fn,
                         logits=out.logits,
                         labels=labels,
-                        mask=loss_mask,
+                        loss_mask=loss_mask,
                         model=self.model,
                         hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
                     )

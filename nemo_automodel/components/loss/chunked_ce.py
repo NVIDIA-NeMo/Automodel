@@ -59,14 +59,14 @@ class ChunkedCrossEntropy:
         self,
         logits: torch.Tensor,
         labels: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
+        loss_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Computes cross-entropy loss in chunks to handle long sequences more efficiently.
 
         Args:
             logits (torch.Tensor): Model output logits of shape [batch_size, seq_len, vocab_size].
             labels (torch.Tensor): Ground-truth labels of shape [batch_size, seq_len].
-            mask (torch.Tensor, optional): Boolean mask indicating valid positions (1) and
+            loss_mask (torch.Tensor, optional): Boolean mask indicating valid positions (1) and
                 positions to ignore (0). Defaults to None.
 
         Returns:
@@ -79,12 +79,12 @@ class ChunkedCrossEntropy:
         # reshape to (N, C) and (N,) respectively
         logits = logits.view(-1, logits.size(-1))
         labels = labels.view(-1)
-        if mask is not None:
+        if loss_mask is not None:
             with torch.no_grad():
-                if mask.device != labels.device:
-                    mask = mask.to(labels.device)
-                labels.masked_fill_(mask.view(-1) == 0, self.ignore_index)
-                del mask
+                if loss_mask.device != labels.device:
+                    loss_mask = loss_mask.to(labels.device)
+                labels.masked_fill_(loss_mask.view(-1) == 0, self.ignore_index)
+                del loss_mask
 
         # maybe refactor if this is moved to a class?
         global _compiled_compute_cross_entropy

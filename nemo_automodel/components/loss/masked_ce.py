@@ -36,7 +36,7 @@ class MaskedCrossEntropy:
         self,
         logits: torch.Tensor,
         labels: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
+        loss_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute the masked cross-entropy loss between logits and targets.
@@ -47,7 +47,7 @@ class MaskedCrossEntropy:
         Args:
             logits (torch.Tensor): The predicted logits with shape [batch_size, seq_len, vocab_size] where C is the number of classes.
             labels (torch.Tensor): The ground truth class indices with shape [batch_size, seq_len].
-            mask (torch.Tensor, optional): A tensor that masks the loss computation. Items marked with
+            loss_mask (torch.Tensor, optional): A tensor that masks the loss computation. Items marked with
                 1 will be used to calculate loss, otherwise ignored. Must be broadcastable to the shape
                 of the loss. Defaults to None.
 
@@ -60,12 +60,12 @@ class MaskedCrossEntropy:
         # reshape to (N, C) and (N,) respectively
         logits = logits.view(-1, logits.size(-1))
         labels = labels.view(-1)
-        if mask is not None:
+        if loss_mask is not None:
             with torch.no_grad():
-                if mask.device != labels.device:
-                    mask = mask.to(labels.device)
-                labels.masked_fill_(mask.view(-1) == 0, self.ignore_index)
-                del mask
+                if loss_mask.device != labels.device:
+                    loss_mask = loss_mask.to(labels.device)
+                labels.masked_fill_(loss_mask.view(-1) == 0, self.ignore_index)
+                del loss_mask
         if self.fp32_upcast:
             logits = logits.float()
         return F.cross_entropy(logits, labels, reduction=self.reduction)
