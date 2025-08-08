@@ -51,6 +51,10 @@ from nemo_automodel.components.utils.dist_utils import (
     rescale_gradients,
 )
 from nemo_automodel.components.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
+from nemo_automodel.components.utils.compile_utils import (
+    build_compile_config,
+    compile_model,
+)
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 logger = logging.getLogger(__name__)
@@ -112,6 +116,7 @@ def build_model_and_optimizer(
     tp_size=1,
     freeze_embeddings=True,
     cfg_fp8=None,
+    cfg_compile=None,
 ) -> tuple[nn.Module, "Optimizer"]:  # noqa: F821
     """
     Build and initialize a model for VLM.
@@ -126,6 +131,8 @@ def build_model_and_optimizer(
         seed: Random seed.
         tp_size: Tensor parallel size.
         freeze_embeddings: Whether to freeze embeddings.
+        cfg_fp8: Configuration for FP8.
+        cfg_compile: Configuration for torch.compile.
 
     Returns:
         The instantiated model on the specified device and optimizer.
@@ -161,6 +168,11 @@ def build_model_and_optimizer(
             model = model.to(device)
 
         optimizer = _build_optimizer(model, cfg_opt, tp_size)
+
+        # Apply torch.compile if configured
+        if cfg_compile is not None:
+            compile_config = build_compile_config(cfg_compile)
+            model = compile_model(model, compile_config)
 
         return model, optimizer
 
@@ -483,6 +495,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             seed=self.cfg.get("seed", 42),
             tp_size=self.cfg.get("distributed.tp_size", 1),
             cfg_fp8=self.cfg.get("fp8", None),
+            cfg_compile=self.cfg.get("compile", None),
         )
         self.loss_fn = build_loss_fn(self.cfg.loss_fn)
         self.dataloader, self.processor = build_dataloader(
