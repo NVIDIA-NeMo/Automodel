@@ -37,13 +37,12 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: openai/gpt-oss-20b
   attn_implementation: eager
-#  torch_dtype: torch.bfloat16
   quantization_config:
     _target_: transformers.Mxfp4Config
     dequantize: True
   use_cache: False
   use_sdpa_patching: False
-#  device_map: auto
+  enable_gradient_checkpointing: True
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
