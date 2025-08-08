@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib
+import logging
 from contextlib import contextmanager
 from functools import lru_cache
 from types import FunctionType
@@ -50,6 +51,8 @@ try:
     HAVE_NVFSDP = True
 except:
     pass
+
+logger = logging.getLogger(__name__)
 
 
 def apply_fsdp2_sharding_recursively(
@@ -235,12 +238,12 @@ def validate_tp_mesh(model, tp_mesh):
 
     # TP sharding with enhanced plan generation
     # Validate that attention heads are divisible by TP size
-    assert num_key_value_heads % tp_mesh.size() == 0, (
-        f"num_key_value_heads ({num_key_value_heads}) must be divisible by TP size ({tp_mesh.size()})"
-    )
-    assert num_attention_heads % tp_mesh.size() == 0, (
-        f"num_attention_heads ({num_attention_heads}) must be divisible by TP size ({tp_mesh.size()})"
-    )
+    assert (
+        num_key_value_heads % tp_mesh.size() == 0
+    ), f"num_key_value_heads ({num_key_value_heads}) must be divisible by TP size ({tp_mesh.size()})"
+    assert (
+        num_attention_heads % tp_mesh.size() == 0
+    ), f"num_attention_heads ({num_attention_heads}) must be divisible by TP size ({tp_mesh.size()})"
 
 
 def get_lm_ac_layers(model: nn.Module) -> List[nn.Module]:
@@ -285,9 +288,9 @@ def _get_parallel_plan(
                     model_parallel_plan = plan_obj()
                 else:
                     model_parallel_plan = plan_obj
-                assert isinstance(model_parallel_plan, dict), (
-                    f"Parallel plan must be a dictionary, got {type(model_parallel_plan)}"
-                )
+                assert isinstance(
+                    model_parallel_plan, dict
+                ), f"Parallel plan must be a dictionary, got {type(model_parallel_plan)}"
                 print("Using provided parallel plan (from path).")
             except Exception as e:
                 raise ValueError(
@@ -370,7 +373,6 @@ def fsdp2_strategy_parallelize(
     NOTE: The passed-in model preferably should be on meta device. Otherwise,
     the model must fit on GPU or CPU memory.
     """
-    # Get model layers for later use
     tp_mesh = device_mesh[tp_mesh_name]
 
     # TP sharding with enhanced plan generation
@@ -405,6 +407,9 @@ def fsdp2_strategy_parallelize(
     dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
 
     dp_mesh = device_mesh[dp_mesh_dim_names]
+    if dp_mesh.size() <= 1:
+        logger.info("DP mesh size is 1, skipping FSDP sharding")
+        return model
 
     # Find transformer layers and apply parallelisms
     apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy)
@@ -502,10 +507,8 @@ def nvfsdp_strategy_parallelize(
     NOTE: The user must ensure that the provided tp_shard_plan is compatible
     with the model architecture.
     """
-    assert HAVE_NVFSDP, (
-        "nvFSDP is not installed, please visit \
+    assert HAVE_NVFSDP, "nvFSDP is not installed, please visit \
         https://github.com/NVIDIA-NeMo/nvFSDP for more information"
-    )
 
     # DP_CP ranks are sharded by FSDP.
     dp_mesh = device_mesh[dp_mesh_name]

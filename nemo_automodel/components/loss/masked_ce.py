@@ -15,6 +15,7 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
 
 
 class MaskedCrossEntropy:
@@ -68,4 +69,11 @@ class MaskedCrossEntropy:
                 del mask
         if self.fp32_upcast:
             logits = logits.float()
+
+        if isinstance(logits, DTensor):
+            logits = logits.full_tensor()
+
+        if isinstance(labels, DTensor):
+            labels = labels.full_tensor()
+
         return F.cross_entropy(logits, labels, reduction=self.reduction)

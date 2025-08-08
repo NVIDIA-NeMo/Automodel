@@ -85,6 +85,10 @@ class FSDP2Manager:
         default=1,
         metadata={"help": "Context-parallel group size (for pipeline-like sharding)."},
     )
+    pp_size: Optional[int] = field(
+        default=1,
+        metadata={"help": "Pipeline-parallel group size (for pipeline-like sharding)."},
+    )
     sequence_parallel: Optional[bool] = field(
         default=False,
         metadata={"help": "Enable sequence parallelism in TP plan if True."},
@@ -144,10 +148,13 @@ class FSDP2Manager:
         if self.cp_size is None or self.cp_size <= 0:
             self.cp_size = 1
 
+        if self.pp_size is None or self.pp_size <= 0:
+            self.pp_size = 1
+
         # infer if not provided
         if self.dp_size is None or self.dp_size <= 0:
             # Calculate dp_size to ensure dp_size * tp_size * cp_size == world_size
-            total_parallel_ranks = self.tp_size * self.cp_size
+            total_parallel_ranks = self.tp_size * self.cp_size * self.pp_size
             if self.world_size % total_parallel_ranks != 0:
                 raise ValueError(
                     f"world_size ({self.world_size}) must be divisible by (tp_size * cp_size) "
@@ -174,8 +181,8 @@ class FSDP2Manager:
         return self
 
     def _get_device_mesh(self):
-        mesh_shape = (self.dp_replicate_size, self.dp_shard_size, self.cp_size, self.tp_size)
-        mesh_names = ("dp_replicate", "dp_shard", "cp", "tp")
+        mesh_shape = (self.pp_size, self.dp_replicate_size, self.dp_shard_size, self.cp_size, self.tp_size)
+        mesh_names = ("pp", "dp_replicate", "dp_shard", "cp", "tp")
         for shape, name in zip(mesh_shape, mesh_names):
             assert isinstance(shape, int), "Expected {} to be an int, but got {}".format(name, type(shape))
             assert shape > 0, "Expected {} > 0, {}".format(name, shape)
