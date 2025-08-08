@@ -206,6 +206,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
                 fp8_config=override.get("fp8_config", fp8_config),
+                enable_gradient_checkpointing=override.get("enable_gradient_checkpointing", enable_gradient_checkpointing),
                 **kwargs,
             )
 
@@ -227,9 +228,14 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 logging.warning("Falling back to eager attention.")
                 return _retry(attn_implementation="eager")
             raise e
-        if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
-            model.gradient_checkpointing_enable()
-            logging.info("Enabled gradient checkpointing")
+
+        if enable_gradient_checkpointing:
+            if hasattr(model, "gradient_checkpointing_enable"):
+                model.gradient_checkpointing_enable()
+                logging.info("Enabled gradient checkpointing")
+            else:
+                logging.warning("Gradient checkpointing is not supported by this model")
+
         # Kernel patching
         try:
             if use_liger_kernel:
