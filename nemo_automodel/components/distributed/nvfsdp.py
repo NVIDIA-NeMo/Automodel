@@ -44,6 +44,7 @@ class NVFSDPManager:
         tp_size (Optional[int]): Tensor-parallel group size. Defaults to 1 if zero/None.
         cp_size (int): Context-parallel group size for pipeline-like sharding.
         sequence_parallel (bool): Enables sequence parallelism in the TP plan when True.
+        use_hf_tp_plan (bool): Use Hugging Face TP plan if True.
         backend (str): Distributed backend to use (e.g., 'nccl' for GPUs or 'gloo' for CPUs).
         world_size (int): Total number of processes.
 
@@ -72,6 +73,10 @@ class NVFSDPManager:
     sequence_parallel: Optional[bool] = field(
         default=False,
         metadata={"help": "Enable sequence parallelism in TP plan if True. Not supported with nvFSDP right now."},
+    )
+    use_hf_tp_plan: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Use Hugging Face TP plan if True."},
     )
     backend: Optional[str] = field(default="nccl", metadata={"help": "Distributed backend, e.g. 'nccl' or 'gloo'."})
     world_size: Optional[int] = field(
@@ -174,7 +179,7 @@ class NVFSDPManager:
             self.device_mesh[("dp", "cp")]._flatten(mesh_dim_name="dp_cp")
         return self
 
-    def parallelize(self, model, optimizer=None, use_hf_tp_plan=False):
+    def parallelize(self, model, optimizer=None):
         """
         Parallelizes the given model using FSDP2 and TP sharding strategies.
 
@@ -187,7 +192,6 @@ class NVFSDPManager:
             optimizer: The optimizer for the model. If None, user need to call model.finish_grad_sync()
                 before optimizer.step(), model.install_optimized_model_weights() and model.zero_grad_buffer()
                 after optimizer.zero_grad()
-            use_hf_tp_plan (bool): if true, will query the model for the TP plan.
 
         Returns:
             The parallelized model.
@@ -203,7 +207,7 @@ class NVFSDPManager:
                 )
 
         if self.device_mesh["tp"].size() > 1:
-            if use_hf_tp_plan:
+            if self.use_hf_tp_plan:
                 tp_shard_plan = get_hf_tp_shard_plan(model)
             else:
                 # Parallelize the first embedding and the last linear out projection
