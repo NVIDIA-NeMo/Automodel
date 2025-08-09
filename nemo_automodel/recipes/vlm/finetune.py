@@ -17,7 +17,8 @@ from __future__ import annotations
 import logging
 import pathlib
 import time
-from typing import Any, Dict, Optional
+from contextlib import nullcontext
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 import torch.distributed as dist
@@ -28,10 +29,11 @@ from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
+from transformers.utils import TRANSFORMERS_CACHE
 from wandb import Settings
 
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
-from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
+from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig, load_model_from_base_checkpoint
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
@@ -52,6 +54,11 @@ from nemo_automodel.components.utils.dist_utils import (
 )
 from nemo_automodel.components.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
 from nemo_automodel.recipes.base_recipe import BaseRecipe
+
+if TYPE_CHECKING:
+    from torch.optim import Optimizer
+
+    from nemo_automodel.components.distributed.init_utils import DistInfo
 
 logger = logging.getLogger(__name__)
 
@@ -130,19 +137,28 @@ def build_model_and_optimizer(
     Returns:
         The instantiated model on the specified device and optimizer.
     """
+    is_meta_device = False
+    init_ctx = nullcontext()
+    if hasattr(cfg_model, "is_meta_device"):
+        is_meta_device = cfg_model.is_meta_device
+        if is_meta_device and isinstance(model_wrapper, NVFSDPManager):
+            raise ValueError("Meta device initialization is not supported with NVFSDPManager")
+        init_ctx = torch.device("meta") if is_meta_device else init_ctx
+        del cfg_model.is_meta_device
+
     with StatefulRNG(seed=seed, ranked=True):
         # Add FP8 config if provided
         kwargs = {}
         if cfg_fp8 is not None:
             kwargs["fp8_config"] = cfg_fp8.instantiate()
 
-        model = cfg_model.instantiate(**kwargs)
-
-        model = _freeze_model(model, cfg_freeze, freeze_embeddings)
-
-        # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
-        if cfg_peft is not None:
-            apply_lora_to_linear_modules(model, cfg_peft)
+        # Instantiate the model in meta device to avoid OOM
+        with init_ctx:
+            model = cfg_model.instantiate(**kwargs)
+            model = _freeze_model(model, cfg_freeze, freeze_embeddings)
+            # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
+            if cfg_peft is not None:
+                apply_lora_to_linear_modules(model, cfg_peft)
 
         print_trainable_parameters(model)
 
@@ -157,6 +173,17 @@ def build_model_and_optimizer(
                 return model, optimizer
             else:
                 model = model_wrapper.parallelize(model)
+
+                if is_meta_device:
+                    # Load the weights into the model in parallel.
+                    load_model_from_base_checkpoint(
+                        model,
+                        device,
+                        cfg_peft is not None,
+                        cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
+                        cfg_model.pretrained_model_name_or_path,
+                        getattr(cfg_peft, "lora_A_init", None),
+                    )
         else:
             model = model.to(device)
 
@@ -177,8 +204,6 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
     Returns:
         The instantiated checkpoint configuration.
     """
-    from transformers.utils import TRANSFORMERS_CACHE
-
     ckpt_kwargs = dict(
         enabled=False,
         checkpoint_dir="checkpoints/",

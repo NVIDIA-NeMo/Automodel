@@ -120,6 +120,20 @@ class LinearLoRA(nn.Linear):
         )
 
     @torch.no_grad
+    def init_lora_weights(self, init_method: str):
+        """
+        Initialize the LoRA weights.
+
+        Args:
+            init_method (str): Method to initialize the LoRA weights.
+        """
+        if init_method == "xavier":
+            torch.nn.init.uniform_(self.lora_A.weight.data)
+        else:
+            nn.init.kaiming_uniform_(self.lora_A.weight.data, a=math.sqrt(5))
+        self.lora_B.weight.data.fill_(0)
+
+    @torch.no_grad
     @staticmethod
     def _init_adapter(
         obj,
@@ -161,11 +175,7 @@ class LinearLoRA(nn.Linear):
 
         obj.lora_A = nn.Linear(in_features, dim, bias=False, dtype=dtype, device=device)
         obj.lora_B = nn.Linear(dim, out_features, bias=False, dtype=dtype, device=device)
-        if lora_A_init_method == "xavier":
-            torch.nn.init.uniform_(obj.lora_A.weight.data)
-        else:
-            nn.init.kaiming_uniform_(obj.lora_A.weight.data, a=math.sqrt(5))
-        obj.lora_B.weight.data.fill_(0)
+        LinearLoRA.init_lora_weights(obj, lora_A_init_method)
         obj.dropout = nn.Dropout(p=dropout)
         assert dropout_position in ["pre", "post"], ("dropout position can only be pre/post", dropout_position)
         obj.dropout_position = dropout_position
