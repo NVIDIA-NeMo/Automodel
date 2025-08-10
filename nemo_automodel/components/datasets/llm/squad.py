@@ -76,23 +76,37 @@ def make_squad_dataset(
 
         # Tokenize separately to locate answer start
         prompt_ids = tokenizer(prompt)["input_ids"]
+        tokenizer.pad_token = tokenizer.eos_token
         input_ids = tokenizer(full_text)["input_ids"]
+        # llama3 tokenizer does not add eos token
+        # see: https://github.com/huggingface/transformers/issues/22794
+        if input_ids[-1] != tokenizer.eos_token_id:
+            input_ids = input_ids + [tokenizer.eos_token_id]
 
         # Labels: mask out prompt tokens
         labels = input_ids.copy()
         labels[:len(prompt_ids)] = [-100] * len(prompt_ids)
+        i = len(labels) - 1
+        while i > 1 and labels[i] == labels[i-1] == tokenizer.pad_token_id:
+            labels[i] = -100
+            i -= 1
 
         # remove EOS and BOS
+        last_token = input_ids[-1]
         input_ids = input_ids[:-1]
         labels = labels[1:]
 
         if isinstance(seq_length, int):
-            input_ids = pad_to_seq_length(input_ids, labels[-1])
+            input_ids = pad_to_seq_length(input_ids, last_token)
             labels = pad_to_seq_length(labels, -100)
 
         return {
             "input_ids": input_ids,
-            "labels": labels
+            "labels": labels,
+            "___PAD_TOKEN_IDS___": {
+                "input_ids": tokenizer.pad_token_id,
+                "labels": -100,
+            }
         }
 
     def formatting_prompts_func_with_chat_template(example, seq_length=None, start_of_turn_token=None):
