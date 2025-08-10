@@ -67,11 +67,19 @@ class StepScheduler(Stateful):
         Yields:
             dict: batch
         """
+        batch_buffer = []
         for batch in self.dataloader:
-            self.step += 1
-            if isinstance(self.max_steps, int) and self.step > self.max_steps:
-                return
-            yield batch
+            batch_buffer.append(batch)
+            if len(batch_buffer) == self.grad_acc_steps:
+                yield batch_buffer
+                batch_buffer = []
+                self.step += 1
+                if isinstance(self.max_steps, int) and self.step > self.max_steps:
+                    if batch_buffer:
+                        yield batch_buffer
+                    return
+        if batch_buffer:
+            yield batch_buffer
 
     def set_epoch(self, epoch: int):
         """
@@ -81,24 +89,12 @@ class StepScheduler(Stateful):
         self.dataloader.sampler.set_epoch(epoch)
 
     @property
-    def is_optim_step(self):
-        """
-        Returns whether this step needs to call the optimizer step.
-
-        Returns:
-            bool: if true, the optimizer should run.
-        """
-        is_grad = (self.step % self.grad_acc_steps) == 0
-        self.grad_step += int(is_grad)
-        return is_grad
-
-    @property
     def is_val_step(self):
         """
         Returns whether this step needs to call the validation.
         """
         is_val = False
-        if self.val_every_steps and self.val_every_steps > 0 and self.is_optim_step:
+        if self.val_every_steps and self.val_every_steps > 0:
             is_val = (self.grad_step % self.val_every_steps) == 0
         return is_val
 
