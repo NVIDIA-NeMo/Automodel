@@ -76,11 +76,13 @@ def make_squad_dataset(
 
         # Tokenize separately to locate answer start
         prompt_ids = tokenizer(prompt)["input_ids"]
-        tokenizer.pad_token = tokenizer.eos_token
+        if not hasattr(tokenizer, "pad_token"):
+            tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.pad_token_id = tokenizer.eos_token_id
         input_ids = tokenizer(full_text)["input_ids"]
         # llama3 tokenizer does not add eos token
         # see: https://github.com/huggingface/transformers/issues/22794
-        if input_ids[-1] != tokenizer.eos_token_id:
+        if input_ids[-1] not in (tokenizer.eos_token_id, tokenizer.pad_token_id):
             input_ids = input_ids + [tokenizer.eos_token_id]
 
         # Labels: mask out prompt tokens
@@ -93,6 +95,10 @@ def make_squad_dataset(
 
         # remove EOS and BOS
         last_token = input_ids[-1]
+        for i in range(len(input_ids)-1, -1, -1):
+            if input_ids[i] == tokenizer.eos_token_id:
+                input_ids[i] = tokenizer.pad_token_id
+                break
         input_ids = input_ids[:-1]
         labels = labels[1:]
 
