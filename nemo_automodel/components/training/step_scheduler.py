@@ -83,10 +83,11 @@ class StepScheduler(Stateful):
 
     def set_epoch(self, epoch: int):
         """
-        Set the epoch for the dataloader.
+        Set the epoch for the sampler.
         """
         self.epoch = epoch
-        self.dataloader.sampler.set_epoch(epoch)
+        if hasattr(getattr(self.dataloader, 'sampler', None), 'set_epoch'):
+            self.dataloader.sampler.set_epoch(epoch)
 
     @property
     def is_val_step(self):
