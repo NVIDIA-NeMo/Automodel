@@ -31,7 +31,7 @@ class StepScheduler(Stateful):
         start_step: int = 0,
         start_epoch: int = 0,
         num_epochs: int = 10,
-        max_steps: Optional[int] = 9223372036854775807,
+        max_steps: int = 9223372036854775807,
     ):
         """
         Initialize the StepScheduler.
