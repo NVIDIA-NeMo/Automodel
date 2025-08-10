@@ -271,3 +271,48 @@ def test_full_process_pipeline(dummy_tokenizer: DummyTokenizer) -> None:
 
     first_len = len(processed[0]["input_ids"])
     assert all(len(r["input_ids"]) == first_len for r in processed)
+
+@pytest.mark.parametrize(
+    "lst,value,expected",
+    [
+        ([], -100, None),
+        ([0, -100], -100, 0),
+        ([0, -100, -100], -100, 0),
+        ([0, 1, -100, -100], -100, 1),
+        ([0, 1, 2, -100, -100], -100, 2),
+        ([0, 1, 2, -100, -100, -100], -100, 2),
+        ([-100, 0, 1, 2, -100, -100, -100], -100, 3),
+        ([-100], -100, None),
+        ([0], -100, None),
+    ],
+)
+def test_find_last_non_pad_token(lst, value, expected):
+    assert sftp.find_last_non_pad_token(lst, value) == expected
+
+@pytest.mark.parametrize(
+    "val,expected",
+    [
+        ("abcd", None),
+        ("labels", -100),
+        ("attention_mask", 0),
+        ("loss_mask", 0),
+    ],
+)
+def test_get_pad_token_from_key(val, expected):
+    assert sftp.get_pad_token_from_key(val) == expected
+
+
+@pytest.mark.parametrize(
+    "ids,expected",
+    [
+        ([], []),
+        ([1, 2, 3], [1, 1, 1]),
+        ([1, 2, 3, -100], [1, 1, 1, 0]),
+        ([1, 2, 3, -100, -100], [1, 1, 1, 0, 0]),
+        ([1, 2, 3, -100, -100, -100], [1, 1, 1, 0, 0, 0]),
+        ([-100, 1, 2, 3, -100, -100, -100], [1, 1, 1, 1, 0, 0, 0]),
+        ([-100, -100, -100, -100], [1, 1, 1, 1]),
+    ],
+)
+def test_make_attention_mask_from_labels(ids, expected):
+    assert sftp.make_attention_mask_from_labels(ids) == expected
