@@ -31,7 +31,7 @@ class StepScheduler(Stateful):
         start_step: int = 0,
         start_epoch: int = 0,
         num_epochs: int = 10,
-        max_steps: Optional[int] = None,
+        max_steps: Optional[int] = 9223372036854775807,
     ):
         """
         Initialize the StepScheduler.
@@ -44,7 +44,7 @@ class StepScheduler(Stateful):
             start_step (int): Initial global step.
             start_epoch (int): Initial epoch.
             num_epochs (int): Total number of epochs.
-            max_steps (int): Total number of steps to run.
+            max_steps (int): Total number of steps to run. Default is 2^63-1.
         """
         self.grad_acc_steps = grad_acc_steps
         self.ckpt_every_steps = ckpt_every_steps
@@ -53,9 +53,9 @@ class StepScheduler(Stateful):
         self.epoch = start_epoch
         self.num_epochs = num_epochs
         self.epoch_len = len(dataloader)
-        self.grad_step = 0  # number of optimizer steps taken
         self.val_every_steps = val_every_steps
         self.max_steps = max_steps
+
 
     def __iter__(self):
         """
@@ -74,9 +74,7 @@ class StepScheduler(Stateful):
                 yield batch_buffer
                 batch_buffer = []
                 self.step += 1
-                if isinstance(self.max_steps, int) and self.step > self.max_steps:
-                    if batch_buffer:
-                        yield batch_buffer
+                if self.step == self.max_steps:
                     return
         if batch_buffer:
             yield batch_buffer
@@ -96,7 +94,7 @@ class StepScheduler(Stateful):
         """
         is_val = False
         if self.val_every_steps and self.val_every_steps > 0:
-            is_val = (self.grad_step % self.val_every_steps) == 0
+            is_val = (self.step % self.val_every_steps) == 0
         return is_val
 
     @property
