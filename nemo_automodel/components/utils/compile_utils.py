@@ -34,6 +34,7 @@ class CompileConfig:
     dynamic: bool = False
     backend: Optional[str] = None
     options: Optional[Dict[str, Any]] = None
+    dynamo_cache_size_limit: int = 256
 
     def __init__(
         self,
@@ -43,6 +44,7 @@ class CompileConfig:
         dynamic: bool = False,
         backend: Optional[str] = None,
         options: Optional[Dict[str, Any]] = None,
+        dynamo_cache_size_limit: int = 256,
     ):
         self.enabled = enabled
         self.mode = mode
@@ -50,6 +52,7 @@ class CompileConfig:
         self.dynamic = dynamic
         self.backend = backend
         self.options = options or {}
+        self.dynamo_cache_size_limit = dynamo_cache_size_limit
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -60,7 +63,31 @@ class CompileConfig:
             "dynamic": self.dynamic,
             "backend": self.backend,
             "options": self.options,
+            "dynamo_cache_size_limit": self.dynamo_cache_size_limit,
         }
+
+
+def configure_torch_dynamo(cache_size_limit: int = 256, capture_scalar_outputs: bool = True):
+    """Configure torch._dynamo settings for compilation.
+    
+    Args:
+        cache_size_limit: Cache size limit for dynamo compilation
+        capture_scalar_outputs: Whether to capture scalar outputs for Flash Attention compatibility
+    """
+    try:
+        import torch._dynamo as dynamo
+        
+        # Set cache size limit
+        dynamo.config.cache_size_limit = cache_size_limit
+        logger.debug(f"Set torch._dynamo cache_size_limit to {cache_size_limit}")
+        
+        # Configure scalar output capture if requested
+        if capture_scalar_outputs:
+            dynamo.config.capture_scalar_outputs = True
+            logger.debug("Enabled torch._dynamo scalar output capture")
+            
+    except ImportError:
+        logger.warning("torch._dynamo not available, skipping dynamo configuration")
 
 
 def enable_torch_dynamo_scalar_outputs():
@@ -106,7 +133,6 @@ def patch_prepare_fa2_from_position_ids():
                 )
             )
 
-            # KEY FIX: This is the exact fix from the user's request
             # The .item() call ensures we get an integer instead of a FakeTensor during torch.compile
             max_length = position_ids.max().item() + 1
 
@@ -127,8 +153,10 @@ def apply_flash_attention_compile_fix():
     Apply the Flash Attention + torch.compile compatibility fix.
 
     This enables scalar output capture and patches the key function that causes issues.
+    Note: This function is focused solely on Flash Attention compatibility.
+    For dynamo configuration (cache size, etc.), use configure_torch_dynamo() separately.
     """
-    # Enable scalar output capture
+    # Enable scalar output capture for Flash Attention compatibility
     enable_torch_dynamo_scalar_outputs()
 
     # Apply the targeted patch
@@ -153,6 +181,9 @@ def compile_model(model: nn.Module, config: CompileConfig) -> nn.Module:
     if not config.enabled:
         logger.info("torch.compile is disabled")
         return model
+
+    # Configure torch._dynamo settings
+    configure_torch_dynamo(cache_size_limit=config.dynamo_cache_size_limit)
 
     # Apply Flash Attention compatibility fix
     apply_flash_attention_compile_fix()
@@ -196,6 +227,7 @@ def create_compile_config_from_dict(config_dict: Dict[str, Any]) -> CompileConfi
         dynamic=config_dict.get("dynamic", False),
         backend=config_dict.get("backend", None),
         options=config_dict.get("options", {}),
+        dynamo_cache_size_limit=config_dict.get("dynamo_cache_size_limit", 256),
     )
 
 
@@ -214,5 +246,5 @@ def build_compile_config(cfg: Optional[Dict[str, Any]]) -> CompileConfig:
         return create_compile_config_from_dict(cfg)
 
 
-# Apply the fix immediately when this module is imported
+# Apply Flash Attention fix when module is imported (dynamo config happens per-compilation)
 _FLASH_ATTENTION_FIX_APPLIED = apply_flash_attention_compile_fix()

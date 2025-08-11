@@ -47,7 +47,6 @@ def flush_block(block, block_size):
         pos = 0 if tid == 1 else pos + 1  # 1 == <eos>
     return {
         "input_ids": block,
-        "attention_mask": [1] * block_size,
         "labels": block.copy(),
         "position_ids": pos_ids,
     }
@@ -89,7 +88,6 @@ def build_packed_dataset(
     features = Features(
         {
             "input_ids": Sequence(Value("int64")),
-            "attention_mask": Sequence(Value("int8")),
             "labels": Sequence(Value("int64")),
             "position_ids": Sequence(Value("int64")),
         }
