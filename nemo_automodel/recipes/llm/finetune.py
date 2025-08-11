@@ -606,7 +606,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # number of tokens in the batch, excluding any tail padding.
         num_tokens_in_batch = sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches)
 
-        for batch in batches:
+        num_batches = len(batches)
+        for i, batch in enumerate(batches):
             batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
             labels = batch.pop("labels")
 
@@ -619,7 +620,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
 
-            with train_ctx():
+            with train_ctx(), get_sync_ctx(self.model, i == num_batches - 1):
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
                     out = self.model(logits_to_keep=1, **batch)
@@ -630,17 +631,16 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 else:
                     out = self.model(**batch)
 
-                with get_sync_ctx(self.model, True):
-                    local_loss = calculate_loss(
-                        self.loss_fn,
-                        logits=out.logits,
-                        labels=labels,
-                        model=self.model,
-                        hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
-                        num_label_tokens=num_label_tokens,
-                    )
-                    loss_buffer.append(local_loss.clone().detach())
-                    local_loss.backward()
+                local_loss = calculate_loss(
+                    self.loss_fn,
+                    logits=out.logits,
+                    labels=labels,
+                    model=self.model,
+                    hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
+                    num_label_tokens=num_label_tokens,
+                )
+                loss_buffer.append(local_loss.clone().detach())
+                local_loss.backward()
 
         # do the optimization step
         grad_norm = None
