@@ -123,10 +123,12 @@ nvfsdp = { git = "https://github.com/NVIDIA-NeMo/nvFSDP.git", rev = "d97136886a6
 source = [".", "/workspace", "/home/runner/work/Automodel/Automodel"]
 
 [tool.coverage.run]
+concurrency = ["thread", "multiprocessing"]
 omit = [
     "nemo_automodel/components/checkpoint/_backports/*.py",
     "tests/*",
     "nemo_automodel/components/_peft/lora_kernel.py",
+    "nemo_automodel/components/loss/triton/te_cross_entropy.py",
 ]
 
 [tool.ruff]
