@@ -47,6 +47,8 @@ from nemo_automodel.components.training.utils import count_tail_padding
 from nemo_automodel.components.utils.dist_utils import get_sync_ctx
 from nemo_automodel.components.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
 from nemo_automodel.recipes.base_recipe import BaseRecipe
+from transformers import AutoProcessor
+from transformers.processing_utils import ProcessorMixin
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -389,7 +391,6 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
         # -100 is the default ignore index in PyTorch's cross entropy loss
         labels = kwargs.pop("labels")
 
-
         # find the lm_head in the model
         lm_head = None
         if hasattr(model, "get_output_embeddings"):
@@ -548,7 +549,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.step_scheduler.set_epoch(epoch)
             self.model.train()
             for batch_idx, batches in enumerate(self.step_scheduler):
-                reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens = self._run_train_optim_step(batches, 1.0)
+                reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens = self._run_train_optim_step(
+                    batches, 1.0
+                )
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step(1)
 
@@ -577,7 +580,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         num_batches = len(batches)
         for i, batch in enumerate(batches):
-
             batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
             labels = batch.pop("labels")
 
@@ -745,7 +747,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             )
         )
         torch.cuda.reset_peak_memory_stats()
-
 
 
 # ---------------------------------------------------------------------------
