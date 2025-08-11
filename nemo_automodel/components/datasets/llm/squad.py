@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from datasets import load_dataset
-
+import logging
 
 def _pad_to_seq_length(sample, pad_token_id, seq_length):
     n = seq_length - len(sample)
@@ -152,7 +152,10 @@ def make_squad_dataset(
 
     if limit_dataset_samples is not None:
         assert isinstance(limit_dataset_samples, int), "Expected limit_dataset_samples to be an int"
-        split = f"{split}[:{limit_dataset_samples}]"
+        if not "[" in split:
+            split = f"{split}[:{limit_dataset_samples}]"
+        else:
+            logging.warning(f"Dataset split {split} already has a slice, skipping limit_dataset_samples")
     dataset = load_dataset(dataset_name, split=split)
 
     # format the dataset
