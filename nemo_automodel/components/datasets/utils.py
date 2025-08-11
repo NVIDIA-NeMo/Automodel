@@ -116,12 +116,11 @@ def make_attention_mask_from_labels(ids: list[int], ignore_token: int = -100) ->
     return ans
 
 
-def default_collater(batch, add_attention_mask=True, pad_seq_len_divisible=None):
+def default_collater(batch, pad_seq_len_divisible=None):
     """
     Default batch collator that handles padding and batching.
 
     Args:
-        add_attention_mask: Whether to add an attention mask to the batch.
         batch: A batch of examples.
         pad_seq_len_divisible: If provided, pad sequence length to be divisible by this value.
 
@@ -140,13 +139,6 @@ def default_collater(batch, add_attention_mask=True, pad_seq_len_divisible=None)
         )
         for key in batch[0].keys()
     }
-
-    # add attention mask if requested
-    if add_attention_mask:
-        ans["attention_mask"] = [
-            make_attention_mask_from_labels(ids)
-            for ids in ans["labels"]
-        ]
 
     # convert to tensors
     return {
