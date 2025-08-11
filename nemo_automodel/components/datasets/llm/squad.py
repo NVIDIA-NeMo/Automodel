@@ -57,7 +57,6 @@ def make_squad_dataset(
         - `loss_mask`: List of 0/1 flags indicating which tokens contribute
           to the loss (answers only).
     """
-    eos_token_id = getattr(tokenizer, "eos_token_id", 0)
     chat_template = getattr(tokenizer, "chat_template", None)
 
     def pad_to_seq_length(sample, pad_token_id):
@@ -87,15 +86,15 @@ def make_squad_dataset(
 
         # Labels: mask out prompt tokens
         labels = input_ids.copy()
-        labels[:len(prompt_ids)] = [-100] * len(prompt_ids)
+        labels[: len(prompt_ids)] = [-100] * len(prompt_ids)
         i = len(labels) - 1
-        while i > 1 and labels[i] == labels[i-1] == tokenizer.pad_token_id:
+        while i > 1 and labels[i] == labels[i - 1] == tokenizer.pad_token_id:
             labels[i] = -100
             i -= 1
 
         # remove EOS and BOS
         last_token = input_ids[-1]
-        for i in range(len(input_ids)-1, -1, -1):
+        for i in range(len(input_ids) - 1, -1, -1):
             if input_ids[i] == tokenizer.eos_token_id:
                 input_ids[i] = tokenizer.pad_token_id
                 break
@@ -112,7 +111,7 @@ def make_squad_dataset(
             "___PAD_TOKEN_IDS___": {
                 "input_ids": tokenizer.pad_token_id,
                 "labels": -100,
-            }
+            },
         }
 
     def formatting_prompts_func_with_chat_template(example, seq_length=None, start_of_turn_token=None):
@@ -141,10 +140,7 @@ def make_squad_dataset(
             input_ids = pad_to_seq_length(input_ids, labels[-1])
             labels = pad_to_seq_length(labels, -100)
 
-        return dict(
-            input_ids=input_ids,
-            labels=labels
-        )
+        return dict(input_ids=input_ids, labels=labels)
 
     if limit_dataset_samples is not None:
         assert isinstance(limit_dataset_samples, int), "Expected limit_dataset_samples to be an int"

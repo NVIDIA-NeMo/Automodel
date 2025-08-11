@@ -18,13 +18,12 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Dict
+from typing import TYPE_CEHCKING, Any, Dict, Optional
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import wandb
-from torch.distributed.device_mesh import _mesh_resources
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
@@ -47,13 +46,11 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import count_tail_padding
-from nemo_automodel.components.utils.dist_utils import (
-    get_sync_ctx,
-    reduce_loss,
-    rescale_gradients,
-)
 from nemo_automodel.components.utils.model_utils import print_trainable_parameters
+from nemo_automodel.components.utils.dist_utils import get_sync_ctx
 from nemo_automodel.recipes.base_recipe import BaseRecipe
+from transformers import AutoTokenizer
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -407,9 +404,7 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
     Returns:
         The loss.
     """
-    loss_fn_kwargs = {
-        'num_label_tokens': kwargs.pop('num_label_tokens', None)
-    }
+    loss_fn_kwargs = {"num_label_tokens": kwargs.pop("num_label_tokens", None)}
     if isinstance(loss_fn, FusedLinearCrossEntropy):
         model = kwargs.pop("model")
         labels = kwargs.pop("labels")
@@ -579,19 +574,15 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # 1. len(batches) == grad_acc_steps
             # 2. len(batches[0]) == batch_size
             for i, batches in enumerate(self.step_scheduler):
-                reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens = self._run_train_optim_step(batches, 1.0)
+                reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens = self._run_train_optim_step(
+                    batches, 1.0
+                )
 
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step(1)
 
                 # log
-                self.log_train_metrics(
-                    reporting_loss,
-                    grad_norm,
-                    num_tokens_in_batch,
-                    tps,
-                    num_label_tokens
-                )
+                self.log_train_metrics(reporting_loss, grad_norm, num_tokens_in_batch, tps, num_label_tokens)
 
                 # Save the checkpoint every ckpt_every_steps
                 if self.step_scheduler.is_ckpt_step:
@@ -611,14 +602,11 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
         """
 
-        num_label_tokens = sum((batch['labels'] != -100).sum().item() for batch in batches)
+        num_label_tokens = sum((batch["labels"] != -100).sum().item() for batch in batches)
         loss_buffer = []
 
         # number of tokens in the batch, excluding any tail padding.
-        num_tokens_in_batch = sum(
-            batch['labels'].numel() - count_tail_padding(batch['labels'])
-            for batch in batches
-        )
+        num_tokens_in_batch = sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches)
 
         for batch in batches:
             batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
@@ -662,10 +650,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # TODO(@boxiangw): Fix TP gradient clipping
         if max_grad_norm is not None and (not self.device_mesh or self.device_mesh["tp"].size() == 1):
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                [p for p in self.model.parameters() if p.requires_grad],
-                max_grad_norm
+                [p for p in self.model.parameters() if p.requires_grad], max_grad_norm
             )
-
 
         # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
         # self.model.finish_grad_sync()
@@ -789,6 +775,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
         )
         torch.cuda.reset_peak_memory_stats()
+
 
 # ---------------------------------------------------------------------------
 # Entry point

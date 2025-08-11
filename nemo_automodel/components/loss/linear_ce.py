@@ -61,8 +61,9 @@
 # -------------------------------------------------------------------------------
 
 
-import torch
 from typing import Optional
+
+import torch
 
 from nemo_automodel.shared.import_utils import MISSING_CUT_CROSS_ENTROPY_MSG
 
