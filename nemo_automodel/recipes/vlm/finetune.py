@@ -23,7 +23,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import wandb
-from torch.distributed.device_mesh import _mesh_resources
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoProcessor
@@ -45,12 +44,7 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import count_tail_padding
-from nemo_automodel.components.utils.dist_utils import (
-    clip_gradients,
-    get_sync_ctx,
-    reduce_loss,
-    rescale_gradients,
-)
+from nemo_automodel.components.utils.dist_utils import get_sync_ctx
 from nemo_automodel.components.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
@@ -394,9 +388,7 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
         # Replace labels with -100 where mask is 0 (don't compute loss for these positions)
         # -100 is the default ignore index in PyTorch's cross entropy loss
         labels = kwargs.pop("labels")
-        if "mask" in kwargs:
-            loss_mask = kwargs.pop("mask")
-            labels.masked_fill_(loss_mask == 0, -100)
+
 
         # find the lm_head in the model
         lm_head = None
@@ -589,9 +581,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
             batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
             labels = batch.pop("labels")
-            loss_mask = batch.pop("loss_mask", None)
-            if loss_mask is None:
-                loss_mask = (labels.detach() != -100).to(torch.int)
 
             if (
                 "position_ids" not in batch
@@ -600,7 +589,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             ):
                 batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
 
-            train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels, loss_mask)
+            train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
             with train_ctx(), get_sync_ctx(self.model, i == num_batches - 1):
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
