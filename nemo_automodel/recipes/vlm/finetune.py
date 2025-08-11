@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import pathlib
 import time
 from typing import TYPE_CHECKING, Any, Dict, Optional
@@ -259,6 +260,15 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed
 
         return cfg_dl.instantiate(dataset=ds, sampler=sampler, collate_fn=collate_fn), processor
 
+        # Ensure spawn start method to avoid fork-safety issues with CUDA/JIT
+        try:
+            import torch.multiprocessing as mp
+            if mp.get_start_method(allow_none=True) is None:
+                mp.set_start_method("spawn", force=True)
+        except RuntimeError:
+            pass
+
+        return cfg_dl.instantiate(dataset=ds, sampler=sampler, collate_fn=collate_fn), processor
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
     """Build and initialize distributed training resources.
