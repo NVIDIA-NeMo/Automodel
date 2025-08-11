@@ -14,6 +14,7 @@
 
 import math
 from typing import Optional
+
 import torch
 
 
@@ -71,6 +72,7 @@ def pad_within_micro(batch, pad_token_id, pad_seq_len_divisible=None):
         pad_token_id = batch[0][-1]
     return [item + [pad_token_id] * (max_len - len(item)) for item in batch]
 
+
 def find_last_non_pad_token(lst: list[int], value: int) -> int | None:
     # lst = [optional-value .., non-value, ..., non-value, value, ...]
     # return the index of the last non-value token
@@ -97,6 +99,7 @@ def get_pad_token_from_key(val: str, pad_token_ids: Optional[dict[str, int]] = N
     if pad_token_ids is not None and val in pad_token_ids:
         return pad_token_ids[val]
     return PAD_TOKEN_IDS.get(val, None)
+
 
 def make_attention_mask_from_labels(ids: list[int], ignore_token: int = -100) -> list[int]:
     # if the last token is not an ignore token, then the attention mask is all 1s
@@ -141,10 +144,7 @@ def default_collater(batch, pad_seq_len_divisible=None):
     }
 
     # convert to tensors
-    return {
-        k: batchify(torch.LongTensor(v))
-        for k, v in ans.items()
-    }
+    return {k: batchify(torch.LongTensor(v)) for k, v in ans.items()}
 
 
 class SFTSingleTurnPreprocessor:
