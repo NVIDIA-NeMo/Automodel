@@ -58,6 +58,7 @@ def make_squad_dataset(
           to the loss (answers only).
     """
     chat_template = getattr(tokenizer, "chat_template", None)
+    eos_token_id = getattr(tokenizer, "eos_token_id", 0)
 
     def pad_to_seq_length(sample, pad_token_id):
         n = seq_length - len(sample)
@@ -75,14 +76,16 @@ def make_squad_dataset(
 
         # Tokenize separately to locate answer start
         prompt_ids = tokenizer(prompt)["input_ids"]
-        if not hasattr(tokenizer, "pad_token"):
-            tokenizer.pad_token = tokenizer.eos_token
-            tokenizer.pad_token_id = tokenizer.eos_token_id
-        input_ids = tokenizer(full_text)["input_ids"]
-        # llama3 tokenizer does not add eos token
-        # see: https://github.com/huggingface/transformers/issues/22794
-        if input_ids[-1] not in (tokenizer.eos_token_id, tokenizer.pad_token_id):
-            input_ids = input_ids + [tokenizer.eos_token_id]
+        if not hasattr(tokenizer, "pad_token_id"):
+            tokenizer.pad_token_id = eos_token_id
+        if isinstance(seq_length, int):
+            input_ids = tokenizer(full_text, truncation=True, padding="max_length", max_length=seq_length)["input_ids"]
+        else:
+            input_ids = tokenizer(full_text)["input_ids"]
+            # llama3 tokenizer does not add eos token
+            # see: https://github.com/huggingface/transformers/issues/22794
+            if input_ids[-1] not in (eos_token_id, tokenizer.pad_token_id):
+                input_ids = input_ids + [eos_token_id]
 
         # Labels: mask out prompt tokens
         labels = input_ids.copy()
@@ -95,7 +98,7 @@ def make_squad_dataset(
         # remove EOS and BOS
         last_token = input_ids[-1]
         for i in range(len(input_ids) - 1, -1, -1):
-            if input_ids[i] == tokenizer.eos_token_id:
+            if input_ids[i] == eos_token_id:
                 input_ids[i] = tokenizer.pad_token_id
                 break
         input_ids = input_ids[:-1]
