@@ -29,7 +29,7 @@ TOKENIZER_NAMES = [
 
 
 def _specific_tokenizer_dirs() -> list[Path]:
-    tokenizers_dir = "/home/TestData/akoumparouli/tokenizers/"
+    tokenizers_dir = Path("/home/TestData/akoumparouli/tokenizers/")
     dirs: list[Path] = []
     for name in TOKENIZER_NAMES:
         p = tokenizers_dir / name
