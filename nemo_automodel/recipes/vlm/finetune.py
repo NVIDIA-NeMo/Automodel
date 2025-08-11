@@ -47,8 +47,6 @@ from nemo_automodel.components.training.utils import count_tail_padding
 from nemo_automodel.components.utils.dist_utils import get_sync_ctx
 from nemo_automodel.components.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from transformers import AutoProcessor
-from transformers.processing_utils import ProcessorMixin
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
