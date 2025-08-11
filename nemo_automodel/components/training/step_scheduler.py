@@ -56,7 +56,6 @@ class StepScheduler(Stateful):
         self.val_every_steps = val_every_steps
         self.max_steps = max_steps
 
-
     def __iter__(self):
         """
         Iterates over dataloader while keeping track of counters.
@@ -84,7 +83,7 @@ class StepScheduler(Stateful):
         Set the epoch for the sampler.
         """
         self.epoch = epoch
-        if hasattr(getattr(self.dataloader, 'sampler', None), 'set_epoch'):
+        if hasattr(getattr(self.dataloader, "sampler", None), "set_epoch"):
             self.dataloader.sampler.set_epoch(epoch)
 
     @property

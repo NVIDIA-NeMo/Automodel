@@ -20,6 +20,7 @@ def _pad_to_seq_length(sample, pad_token_id, seq_length):
         return sample
     return sample + [pad_token_id] * n
 
+
 def _add_pad_token(tokenizer):
     pad_token_id = None
     if not hasattr(tokenizer, "pad_token_id"):
@@ -44,7 +45,7 @@ def _package_tokenized_example(has_chat_template, input_ids, eos_token_id, pad_t
     attention_mask = [1] * len(input_ids)
 
     # Labels: mask out prompt tokens
-    labels[: context_len] = [-100] * context_len
+    labels[:context_len] = [-100] * context_len
     # remove BOS
     labels = labels[1:]
     if not has_chat_template:
@@ -69,6 +70,7 @@ def _package_tokenized_example(has_chat_template, input_ids, eos_token_id, pad_t
         },
     }
 
+
 def _formatting_prompts_func(example, tokenizer, eos_token_id, pad_token_id, seq_length=None):
     question = example["question"]
     context = example["context"]
@@ -84,7 +86,9 @@ def _formatting_prompts_func(example, tokenizer, eos_token_id, pad_token_id, seq
     return _package_tokenized_example(False, input_ids, eos_token_id, pad_token_id, seq_length, len(prompt_ids))
 
 
-def _formatting_prompts_func_with_chat_template(example, tokenizer, eos_token_id, pad_token_id, seq_length=None, start_of_turn_token=None):
+def _formatting_prompts_func_with_chat_template(
+    example, tokenizer, eos_token_id, pad_token_id, seq_length=None, start_of_turn_token=None
+):
     formatted_text = [
         {"role": "user", "content": f"{example['context']} {example['question']}"},
         {"role": "assistant", "content": example["answers"]["text"][0].strip()},
@@ -100,6 +104,7 @@ def _formatting_prompts_func_with_chat_template(example, tokenizer, eos_token_id
     else:
         response_start = 0
     return _package_tokenized_example(True, input_ids, eos_token_id, pad_token_id, seq_length, response_start)
+
 
 def make_squad_dataset(
     tokenizer,
@@ -145,7 +150,6 @@ def make_squad_dataset(
           to the loss (answers only).
     """
 
-
     if limit_dataset_samples is not None:
         assert isinstance(limit_dataset_samples, int), "Expected limit_dataset_samples to be an int"
         split = f"{split}[:{limit_dataset_samples}]"
@@ -161,7 +165,9 @@ def make_squad_dataset(
     if chat_template is None:
         fmt_fn = lambda x: _formatting_prompts_func(x, tokenizer, eos_token_id, pad_token_id, seq_length)
     else:
-        fmt_fn = lambda x: _formatting_prompts_func_with_chat_template(x, tokenizer, eos_token_id, pad_token_id, seq_length, start_of_turn_token)  # noqa: E731
+        fmt_fn = lambda x: _formatting_prompts_func_with_chat_template(
+            x, tokenizer, eos_token_id, pad_token_id, seq_length, start_of_turn_token
+        )  # noqa: E731
 
     # map the dataset
     return dataset.map(
