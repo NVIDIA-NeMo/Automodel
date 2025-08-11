@@ -416,7 +416,6 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
             {
                 "logits": kwargs.pop("logits"),
                 "labels": kwargs.pop("labels"),
-                "mask": kwargs.pop("mask"),
             }
         )
 
