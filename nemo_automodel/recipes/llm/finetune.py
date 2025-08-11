@@ -596,10 +596,11 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # Save the checkpoint every ckpt_every_steps
                 if self.step_scheduler.is_ckpt_step:
                     self.save_checkpoint(epoch, self.step_scheduler.step)
-            # Run validation every val_every_steps
-            if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                self._run_validation_epoch()
-                self.model.train()
+
+                # Run validation every val_every_steps
+                if self.step_scheduler.is_val_step and self.val_dataloader is not None:
+                    self._run_validation_epoch()
+                    self.model.train()
 
     # ------------------ helpers ------------------
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
