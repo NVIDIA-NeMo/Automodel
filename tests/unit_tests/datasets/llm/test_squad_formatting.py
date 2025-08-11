@@ -40,6 +40,8 @@ def _specific_tokenizer_dirs() -> list[Path]:
 @pytest.mark.parametrize("tokenizer_dir", _specific_tokenizer_dirs(), ids=lambda p: p.name)
 @pytest.mark.parametrize("seq_length", [None, 256])
 def test_formatting_prompts_func_returns_valid_shapes_and_masks(tokenizer_dir: Path, seq_length):
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ["HF_HUB_OFFLINE"] = "1"
     tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_dir))
     if getattr(tokenizer, "pad_token", None) is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -106,11 +108,15 @@ def test_formatting_prompts_func_returns_valid_shapes_and_masks(tokenizer_dir: P
         if result["input_ids"][-1] == pad_id:
             assert result["labels"][-1] == -100
 
+    os.environ.pop("TRANSFORMERS_OFFLINE", None)
+    os.environ.pop("HF_HUB_OFFLINE", None)
 
 
 @pytest.mark.parametrize("tokenizer_dir", _specific_tokenizer_dirs(), ids=lambda p: p.name)
 @pytest.mark.parametrize("seq_length", [None, 64])
 def test_formatting_with_chat_template_when_available(tokenizer_dir: Path, seq_length):
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ["HF_HUB_OFFLINE"] = "1"
     tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_dir))
 
     # Only run if this tokenizer defines a chat template; otherwise skip
@@ -155,3 +161,5 @@ def test_formatting_with_chat_template_when_available(tokenizer_dir: Path, seq_l
 
     # There should be some supervised tokens
     assert any(label != -100 for label in result["labels"])
+    os.environ.pop("TRANSFORMERS_OFFLINE", None)
+    os.environ.pop("HF_HUB_OFFLINE", None)
