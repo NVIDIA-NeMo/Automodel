@@ -691,6 +691,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             for batch in self.val_dataloader:
                 batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
                 labels = batch.pop("labels")
+                num_label_tokens = (labels != -100).sum()
 
                 if (
                     self.device_mesh
@@ -701,7 +702,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
                     )
 
-                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels, loss_mask)
+                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
                 with train_ctx():
                     if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                         out = self.model(logits_to_keep=1, **batch)
@@ -713,10 +714,10 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         labels=labels,
                         model=self.model,
                         hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
+                        num_label_tokens=num_label_tokens,
                     )
 
                 total_loss += local_loss.item()
-                total_tokens += loss_mask.sum().item()
 
         # Aggregate across ranks if distributed is initialized
         if dist.is_initialized():
