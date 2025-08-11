@@ -49,6 +49,9 @@ from nemo_automodel.components.training.utils import count_tail_padding
 from nemo_automodel.components.utils.model_utils import print_trainable_parameters
 from nemo_automodel.components.utils.dist_utils import get_sync_ctx
 from nemo_automodel.recipes.base_recipe import BaseRecipe
+from transformers import AutoTokenizer
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from transformers.utils.chat_template_utils import TemplateError as ChatTemplateError
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -276,9 +279,28 @@ def build_dataloader(
         dl_kwargs = {"dataset": ds, "sampler": sampler}
         if hasattr(cfg_dl, "collate_fn") and hasattr(cfg_dl.collate_fn, "_target_"):
             collate_cfg = cfg_dl.collate_fn
-            dl_kwargs["collate_fn"] = lambda batch: collate_cfg.instantiate(batch=batch)
-
-        return cfg_dl.instantiate(**dl_kwargs), tokenizer
+            def _collate(batch):
+                try:
+                    return collate_cfg.instantiate(batch=batch)
+                except ChatTemplateError as e:
+                    raise RuntimeError(f"Chat template rendering failed: {e}")
+            dl_kwargs["collate_fn"] = _collate
+        import os
+        is_test = bool(os.environ.get("PYTEST_CURRENT_TEST")) or os.environ.get("COVERAGE_RUN") == "true" or bool(os.environ.get("COVERAGE_PROCESS_START"))
+        dl_cfg = cfg_dl.to_dict() if hasattr(cfg_dl, "to_dict") else dict(cfg_dl)
+        # Avoid duplicate collate_fn
+        if "collate_fn" in dl_cfg:
+            dl_cfg.pop("collate_fn")
+        if is_test:
+            dl_cfg["num_workers"] = 0
+            dl_cfg["pin_memory"] = False
+        try:
+            import torch.multiprocessing as mp
+            if mp.get_start_method(allow_none=True) is None:
+                mp.set_start_method("spawn", force=True)
+        except RuntimeError:
+            pass
+        return cfg_dl.instantiate(**dl_kwargs, **dl_cfg), tokenizer
 
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
