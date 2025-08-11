@@ -691,9 +691,6 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             for batch in self.val_dataloader:
                 batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
                 labels = batch.pop("labels")
-                loss_mask = batch.pop("loss_mask", None)
-                if loss_mask is None:
-                    loss_mask = (labels.detach() != -100).to(torch.int)
 
                 if (
                     self.device_mesh
@@ -714,7 +711,6 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         self.loss_fn,
                         logits=out.logits,
                         labels=labels,
-                        mask=loss_mask,
                         model=self.model,
                         hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
                     )
