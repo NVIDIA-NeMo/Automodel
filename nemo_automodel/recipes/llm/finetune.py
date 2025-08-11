@@ -650,6 +650,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 [p for p in self.model.parameters() if p.requires_grad], max_grad_norm
             )
+            if isinstance(grad_norm, torch.Tensor):
+                grad_norm = grad_norm.item()
 
         # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
         # self.model.finish_grad_sync()
