@@ -146,7 +146,7 @@ def test_default_collater_shapes() -> None:
         },
     ]
 
-    collated = sftp.default_collater(raw_batch, pad_token_id=0)
+    collated = sftp.default_collater(raw_batch)
     # Keys preserved
     assert set(collated) == {"input_ids", "attention_mask", "labels", "loss_mask"}
 
