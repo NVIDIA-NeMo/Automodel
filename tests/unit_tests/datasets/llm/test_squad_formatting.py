@@ -33,8 +33,6 @@ def _specific_tokenizer_dirs() -> list[Path]:
     dirs: list[Path] = []
     for name in TOKENIZER_NAMES:
         p = tokenizers_dir / name
-        if not p.exists():
-            pytest.skip(f"Required tokenizer directory missing: {p}")
         dirs.append(p)
     return dirs
 
