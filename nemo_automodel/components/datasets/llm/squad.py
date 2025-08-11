@@ -11,8 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from datasets import load_dataset
 import logging
+
+from datasets import load_dataset
+
 
 def _pad_to_seq_length(sample, pad_token_id, seq_length):
     n = seq_length - len(sample)
