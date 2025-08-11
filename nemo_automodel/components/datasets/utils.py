@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import math
-
+from typing import Optional
 import torch
 
 
@@ -88,12 +88,14 @@ def find_last_non_pad_token(lst: list[int], value: int) -> int | None:
     return None
 
 
-def get_pad_token_from_key(val: str) -> int | None:
+def get_pad_token_from_key(val: str, pad_token_ids: Optional[dict[str, int]] = None) -> int | None:
     PAD_TOKEN_IDS = {
         "labels": -100,
         "attention_mask": 0,
         "loss_mask": 0,
     }
+    if pad_token_ids is not None and val in pad_token_ids:
+        return pad_token_ids[val]
     return PAD_TOKEN_IDS.get(val, None)
 
 def make_attention_mask_from_labels(ids: list[int], ignore_token: int = -100) -> list[int]:
@@ -126,20 +128,14 @@ def default_collater(batch, add_attention_mask=True, pad_seq_len_divisible=None)
     Returns:
         dict: A dictionary containing batched tensors.
     """
-    if "___PAD_TOKEN_IDS___" in batch[0]:
-        pad_token_ids = batch[0].pop("___PAD_TOKEN_IDS___")
-    else:
-        pad_token_ids = {
-            key: get_pad_token_from_key(key)
-            for key in batch[0].keys()
-        }
+    pad_token_ids = batch[0].pop("___PAD_TOKEN_IDS___", None)
     # ans contains a dict with:
     # key: str (e.g., "input_ids", "attention_mask", "labels", "loss_mask")
     # value: list[list[int]] (e.g., [[1, 2, 3], [4, 5, 6]])
     ans = {
         key: pad_within_micro(
             extract_key_from_dicts(batch, key),
-            pad_token_ids[key],
+            get_pad_token_from_key(key, pad_token_ids),
             pad_seq_len_divisible,
         )
         for key in batch[0].keys()

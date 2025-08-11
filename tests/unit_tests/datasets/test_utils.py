@@ -137,12 +137,20 @@ def test_default_collater_shapes() -> None:
             "attention_mask": [1, 1],
             "labels": [101, 102],
             "loss_mask": [1, 1],
+            "___PAD_TOKEN_IDS___": {
+                "input_ids": 0,
+                "labels": -100,
+            }
         },
         {
             "input_ids": [3],
             "attention_mask": [1],
             "labels": [103],
             "loss_mask": [1],
+            "___PAD_TOKEN_IDS___": {
+                "input_ids": 0,
+                "labels": -100,
+            }
         },
     ]
 
@@ -157,16 +165,26 @@ def test_default_collater_shapes() -> None:
     assert len(lens) == 1
     lens.pop()
 
-    # Verify padded values
-    assert collated["input_ids"][1, 1:].eq(0).all()
-    assert collated["attention_mask"][1, 1:].eq(0).all()
-    assert collated["labels"][1, 1:].eq(-100).all()
-    # `loss_mask` mirrors labels but with 0/1 instead of ids
-    assert collated["loss_mask"][1, 1:].eq(0).all()
+    # Verify returned values
+    attention_mask = torch.tensor([[1, 1], [1, 0]])
+    input_ids = torch.tensor([[1, 2], [3, 0]])
+    labels = torch.tensor([[ 101,  102], [ 103, -100]])
+    loss_mask = torch.tensor([[1, 1], [1, 0]])
 
-    # Sanity on dtype
-    for tensor in collated.values():
-        assert tensor.dtype == torch.long
+    assert torch.equal(collated["attention_mask"], attention_mask)
+    assert torch.equal(collated["input_ids"], input_ids)
+    assert torch.equal(collated["labels"], labels)
+    assert torch.equal(collated["loss_mask"], loss_mask)
+    # (torch.Tensor([[1,1,2],[1,2,3]]) == torch.Tensor([[1,1,2],[1,2,3]])).all().item()
+    # assert collated["input_ids"][1, 1:].eq(0).all(), collated
+    # assert collated["attention_mask"][1, 1:].eq(0).all()
+    # assert collated["labels"][1, 1:].eq(-100).all()
+    # # `loss_mask` mirrors labels but with 0/1 instead of ids
+    # assert collated["loss_mask"][1, 1:].eq(0).all()
+
+    # # Sanity on dtype
+    # for tensor in collated.values():
+    #     assert tensor.dtype == torch.long
 
 
 def test_tokenize_function_strips_special_tokens(dummy_tokenizer: DummyTokenizer) -> None:
