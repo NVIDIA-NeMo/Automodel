@@ -188,6 +188,7 @@ def test_chat_template_path():
     row = ds[0]
     n = len(row['input_ids'])
     for k, v in row.items():
+        if k == '___PAD_TOKEN_IDS___': continue
         assert len(v) == n, f"{k} has length {len(v)} but should have length {n}"
     sot_id = tok(start_token, add_special_tokens=False)["input_ids"][0]
 

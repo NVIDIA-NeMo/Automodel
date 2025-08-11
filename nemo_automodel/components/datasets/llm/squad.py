@@ -27,7 +27,7 @@ def _add_pad_token(tokenizer):
         tokenizer.pad_token_id = tokenizer.eos_token_id
     else:
         pad_token_id = tokenizer.pad_token_id
-    if not hasattr(tokenizer, "pad_token"):
+    if not hasattr(tokenizer, "pad_token") and hasattr(tokenizer, "eos_token"):
         tokenizer.pad_token = tokenizer.eos_token
     return pad_token_id
 
