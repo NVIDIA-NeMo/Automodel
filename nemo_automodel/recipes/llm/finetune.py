@@ -673,7 +673,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         time_delta = t - self.timestamp
         self.timestamp = t
         tps = num_tokens_in_batch / time_delta
-        reporting_loss = sum(loss_buffer)
+        reporting_loss = torch.sum(torch.stack(loss_buffer)).item()
         # fix reporting_loss, tps across ranks
         return reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens
 
