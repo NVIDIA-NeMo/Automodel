@@ -214,7 +214,11 @@ def build_dataloader(
             "rank": device_mesh["dp"].get_local_rank(),
         }
     if "tokenizer" not in cfg_ds:
-        tokenizer = AutoTokenizer.from_pretrained(cfg_model.pretrained_model_name_or_path)
+        logging.info("Using model config to instantiate tokenizer")
+        trust_remote_code = getattr(cfg_model, "trust_remote_code", False)
+        tokenizer = AutoTokenizer.from_pretrained(
+            cfg_model.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+        )
     elif "_target_" not in cfg_ds.tokenizer:
         tokenizer = AutoTokenizer.from_pretrained(**cfg_ds.tokenizer.to_dict())
     else:
