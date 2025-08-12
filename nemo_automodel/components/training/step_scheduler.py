@@ -117,7 +117,8 @@ class StepScheduler(Stateful):
         """
         batch_idx = self.step % self.epoch_len
         last_batch = self.epoch_len is not None and batch_idx == self.epoch_len - 1
-        return ((self.step % self.ckpt_every_steps) == 0 and self.step != 0) or last_batch
+        finished = self.step >= self.max_steps
+        return ((self.step % self.ckpt_every_steps) == 0 and self.step != 0) or last_batch or finished
 
     @property
     def epochs(self):
@@ -128,7 +129,10 @@ class StepScheduler(Stateful):
             iterator: over epochs
         """
         epoch = self.epoch
-        yield from range(epoch, self.num_epochs)
+        for e in range(epoch, self.num_epochs):
+            if self.step >= self.max_steps:
+                return
+            yield e
 
     def state_dict(self):
         """
