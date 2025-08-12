@@ -132,14 +132,24 @@ class BaseRecipe:
         """
         if not self.checkpoint_config.enabled:
             return
+        is_dist_initialized = torch.distributed.is_initialized()
+        is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
+
+        if not is_dist_initialized:
+            dp_group = None
+        elif self.device_mesh["cp"].size() > 1:
+            dp_group = self.device_mesh["dp_cp"].get_group()
+        else:
+            dp_group = self.device_mesh["dp"].get_group()
 
         path = self.checkpoint_config.checkpoint_dir
         path = os.path.join(path, f"epoch_{epoch}_step_{step}")
-        os.makedirs(path, exist_ok=True)
 
-        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        if is_rank_0:
+            os.makedirs(path, exist_ok=True)
             print(f"Saving checkpoint to {path}", flush=True)
-
+        if is_dist_initialized:
+            torch.distributed.barrier(dp_group)
         # TODO(@adil-a): Change this when we create a LR scheduler class
         model, optimizer, scheduler, tokenizer, config = None, None, None, None, None
 
@@ -155,17 +165,17 @@ class BaseRecipe:
             elif is_tokenizer(getattr(self, key)):
                 tokenizer = getattr(self, key)
             else:
-                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                if is_rank_0:
                     torch.save(
                         getattr(self, key).state_dict(),
                         os.path.join(path, f"{key}.pt"),
                     )
-                if torch.distributed.is_initialized():
-                    torch.distributed.barrier()
 
         save_model(model, path, self.checkpoint_config, peft_config=self.peft_config, tokenizer=tokenizer)
         save_optimizer(optimizer, model, path, scheduler)
         save_config(config.raw_config, path)
+        if is_dist_initialized:
+            torch.distributed.barrier(dp_group)
 
     def load_checkpoint(self, restore_from: str | None = None):
         """
