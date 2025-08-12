@@ -47,14 +47,21 @@ class StepScheduler(Stateful):
             max_steps (int): Total number of steps to run. Default is 2^63-1.
         """
         self.grad_acc_steps = grad_acc_steps
+        assert grad_acc_steps > 0, "grad_acc_steps must be greater than 0"
         self.ckpt_every_steps = ckpt_every_steps
+        assert ckpt_every_steps > 0, "ckpt_every_steps must be greater than 0"
         self.dataloader = dataloader
         self.step = start_step
+        assert start_step >= 0, "start_step must be greater than or equal to 0"
         self.epoch = start_epoch
+        assert start_epoch >= 0, "start_epoch must be greater than or equal to 0"
         self.num_epochs = num_epochs
+        assert num_epochs > 0, "num_epochs must be greater than 0"
         self.epoch_len = len(dataloader)
         self.val_every_steps = val_every_steps
+        assert val_every_steps is None or val_every_steps > 0, "val_every_steps must be greater than 0 if not None"
         self.max_steps = max_steps
+        assert max_steps > 0, "max_steps must be greater than 0"
 
     def __iter__(self):
         """
@@ -66,6 +73,8 @@ class StepScheduler(Stateful):
         Yields:
             dict: batch
         """
+        if self.step >= self.max_steps:
+            return
         batch_buffer = []
         for batch in self.dataloader:
             batch_buffer.append(batch)
@@ -73,11 +82,12 @@ class StepScheduler(Stateful):
                 self.step += 1
                 yield batch_buffer
                 batch_buffer = []
-                if self.step == self.max_steps:
+                if self.step >= self.max_steps:
                     return
         if batch_buffer:
             self.step += 1
             yield batch_buffer
+        self.epoch += 1
 
     def set_epoch(self, epoch: int):
         """
@@ -117,7 +127,8 @@ class StepScheduler(Stateful):
         Yields:
             iterator: over epochs
         """
-        yield from range(self.epoch, self.num_epochs)
+        epoch = self.epoch
+        yield from range(epoch, self.num_epochs)
 
     def state_dict(self):
         """
