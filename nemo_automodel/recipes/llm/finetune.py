@@ -72,7 +72,7 @@ def build_model_and_optimizer(
     model_wrapper,
     seed,
     tp_size=1,
-    freeze_embeddings=False,
+    freeze_embeddings=True,
     cfg_fp8=None,
 ) -> tuple[nn.Module, "Optimizer"]:  # noqa: F821
     """
@@ -583,13 +583,11 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     batches, 1.0
                 )
 
-                if self.lr_scheduler is not None:
-                    self.lr_scheduler.step(1)
-
                 # log
                 self.log_train_metrics(reporting_loss, grad_norm, num_tokens_in_batch, tps, num_label_tokens)
 
                 # Save the checkpoint every ckpt_every_steps
+                print(f"i: {i}  step: {self.step_scheduler.step}        is_ckpt_step: {self.step_scheduler.is_ckpt_step}")
                 if self.step_scheduler.is_ckpt_step:
                     self.save_checkpoint(epoch, self.step_scheduler.step)
 
@@ -612,6 +610,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # number of tokens in the batch, excluding any tail padding.
         num_tokens_in_batch = sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches)
+        num_tokens_in_batch = self._dp_allreduce(torch.LongTensor([num_tokens_in_batch])).item()
 
         num_batches = len(batches)
         for i, batch in enumerate(batches):
@@ -650,7 +649,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 local_loss.backward()
 
         # do the optimization step
-        grad_norm = None
+        grad_norm = 0
         # Clip gradients **after** any rescaling.
         # TODO(@boxiangw): Fix TP gradient clipping
         if max_grad_norm is not None and (not self.device_mesh or self.device_mesh["tp"].size() == 1):
@@ -665,6 +664,9 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
+
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step(1)
 
         # Precompute FP8 scales
         if (
@@ -725,12 +727,10 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     )
 
                 total_loss += local_loss.item()
+                total_tokens += num_label_tokens
 
-        # Aggregate across ranks if distributed is initialized
-        if dist.is_initialized():
-            tensor = torch.tensor([total_loss, total_tokens], device=self.dist_env.device)
-            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-            total_loss, total_tokens = tensor.tolist()
+        total_loss = self._dp_allreduce(torch.FloatTensor([total_loss])).item()
+        total_tokens = self._dp_allreduce(torch.LongTensor([total_tokens])).item()
 
         val_loss = total_loss / max(total_tokens, 1e-8)
         if self.dist_env.is_main:
