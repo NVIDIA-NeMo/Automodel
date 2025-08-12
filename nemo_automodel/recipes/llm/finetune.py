@@ -21,7 +21,6 @@ from contextlib import nullcontext
 from typing import TYPE_CEHCKING, Any, Dict, Optional
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import wandb
 from torch.utils.data import DataLoader
