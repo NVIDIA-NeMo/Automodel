@@ -261,12 +261,14 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed
         # Ensure spawn start method to avoid fork-safety issues with CUDA/JIT
         try:
             import torch.multiprocessing as mp
+
             if mp.get_start_method(allow_none=True) is None:
                 mp.set_start_method("spawn", force=True)
         except RuntimeError:
             pass
 
         return cfg_dl.instantiate(dataset=ds, sampler=sampler, collate_fn=collate_fn), processor
+
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
     """Build and initialize distributed training resources.
@@ -584,7 +586,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # number of tokens in the batch, excluding any tail padding.
         num_tokens_in_batch = sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches)
         num_tokens_in_batch = self._dp_allreduce(torch.LongTensor([num_tokens_in_batch])).item()
-
 
         num_batches = len(batches)
         for i, batch in enumerate(batches):

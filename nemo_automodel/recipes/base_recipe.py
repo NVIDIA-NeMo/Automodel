@@ -356,6 +356,7 @@ class BaseRecipe:
             tensor = tensor.cpu()
         return tensor
 
+
 def _find_latest_checkpoint(checkpoint_dir):
     """
     Find the latest checkpoint in the checkpoint directory and return it.

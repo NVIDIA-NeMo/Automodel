@@ -279,6 +279,7 @@ def build_dataloader(
 
         try:
             import torch.multiprocessing as mp
+
             if mp.get_start_method(allow_none=True) is None:
                 mp.set_start_method("spawn", force=True)
         except RuntimeError:
@@ -585,7 +586,6 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 self.log_train_metrics(reporting_loss, grad_norm, num_tokens_in_batch, tps, num_label_tokens)
 
                 # Save the checkpoint every ckpt_every_steps
-                print(f"i: {i}  step: {self.step_scheduler.step}        is_ckpt_step: {self.step_scheduler.is_ckpt_step}")
                 if self.step_scheduler.is_ckpt_step:
                     self.save_checkpoint(epoch, self.step_scheduler.step)
 
