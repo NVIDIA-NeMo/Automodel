@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,10 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Convenience model builders for NeMo Automodel.
 
-from .bin_dataset import BinTokenDataset, load_bin_shard  # noqa: F401
+Currently includes:
+    • build_gpt2_model – returns a GPT-2 causal language model (Flash-Attention-2 by default).
+"""
+from .gpt2 import build_gpt2_model  # noqa: F401
 
 __all__ = [
-    "BinTokenDataset",
-    "load_bin_shard",
-]
+    "build_gpt2_model",
+] 
