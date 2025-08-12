@@ -97,7 +97,7 @@ def _build_optimizer(model: nn.Module, cfg_opt: Dict[str, Any], tp_size: int):
     """
     trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
     assert len(trainable_params) > 0, "trainable_params cannot be empty"
-    if tp_size > 1:
+    if tp_size > 1 and cfg_opt.get("foreach", False):
         cfg_opt.foreach = False
     return cfg_opt.instantiate(params=trainable_params)
 
@@ -111,7 +111,7 @@ def build_model_and_optimizer(
     model_wrapper,
     seed,
     tp_size=1,
-    freeze_embeddings=False,
+    freeze_embeddings=True,
     cfg_fp8=None,
 ) -> tuple[nn.Module, "Optimizer"]:  # noqa: F821
     """
@@ -585,6 +585,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         # number of tokens in the batch, excluding any tail padding.
         num_tokens_in_batch = sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches)
+        num_tokens_in_batch = self._dp_allreduce(torch.LongTensor([num_tokens_in_batch])).item()
+
 
         num_batches = len(batches)
         for i, batch in enumerate(batches):
@@ -703,10 +705,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 total_loss += local_loss.item()
 
         # Aggregate across ranks if distributed is initialized
-        if dist.is_initialized():
-            tensor = torch.tensor([total_loss, total_tokens], device=self.dist_env.device)
-            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-            total_loss, total_tokens = tensor.tolist()
+        total_loss = self._dp_allreduce(torch.FloatTensor([total_loss])).item()
+        total_tokens = self._dp_allreduce(torch.LongTensor([total_tokens])).item()
 
         val_loss = total_loss / max(total_tokens, 1e-8)
         if self.dist_env.is_main:
