@@ -24,6 +24,8 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.optim import Optimizer
+from transformers.processing_utils import ProcessorMixin
+from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 from nemo_automodel.components.checkpoint.checkpointing import (
     load_model,
