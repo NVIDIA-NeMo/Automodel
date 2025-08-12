@@ -21,11 +21,9 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
-import torch.nn as nn
 import torch.distributed as dist
+import torch.nn as nn
 from torch.optim import Optimizer
-from transformers.processing_utils import ProcessorMixin
-from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 from nemo_automodel.components.checkpoint.checkpointing import (
     load_model,
@@ -42,6 +40,8 @@ try:
     import yaml as _yaml
 except Exception:
     _yaml = None
+from transformers.processing_utils import ProcessorMixin
+from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 
 def has_load_restore_state(object):
@@ -147,6 +147,7 @@ class BaseRecipe:
         path = os.path.join(path, f"epoch_{epoch}_step_{step}")
 
         if is_rank_0:
+            assert not os.path.exists(path), f"Checkpoint directory {path} already exists"
             os.makedirs(path, exist_ok=True)
             print(f"Saving checkpoint to {path}", flush=True)
         if is_dist_initialized:

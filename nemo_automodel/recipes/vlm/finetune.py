@@ -15,13 +15,11 @@
 from __future__ import annotations
 
 import logging
-import os
 import pathlib
 import time
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import wandb
 from torch.utils.data import DataLoader

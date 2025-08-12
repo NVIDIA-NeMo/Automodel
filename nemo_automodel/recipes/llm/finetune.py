@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import pathlib
 import time
 from contextlib import nullcontext
