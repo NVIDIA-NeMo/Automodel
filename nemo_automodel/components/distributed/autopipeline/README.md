@@ -1,0 +1,119 @@
+## Autopipeline
+
+High-level, fork-friendly pipeline-parallel training interface built on PyTorch `torch.distributed.pipelining`.
+
+- Works with HuggingFace decoder-only models (e.g., Llama, Qwen, Mistral)
+- Minimal opinions; easy to extend
+- Public API: `AutoPipeline`, `AutoPipelineConfig`, `PipelineInfo`
+
+Source layout in this package:
+- `core.py`: orchestration (`AutoPipeline`, `AutoPipelineConfig`, `PipelineInfo`)
+- `functional.py`: stage splitting, schedule builder, helpers
+- `hf_utils.py`: HF forward patchers for pipeline compatibility
+- `training_utils.py`: training helpers (step, grad utils)
+
+### Quickstart
+
+```python
+import torch
+from torch.distributed.device_mesh import init_device_mesh
+from nemo_automodel.components.distributed.autopipeline import AutoPipeline, AutoPipelineConfig
+
+# 1) Device mesh with a pipeline axis 'pp'
+world_mesh = init_device_mesh("cuda", mesh_shape=(4,), mesh_dim_names=("pp",))
+
+# 2) Define a loss used by the pipeline schedule (runs on the last stage)
+def loss_fn(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.cross_entropy(
+        logits.float().view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100
+    )
+
+# 3) Configure and build
+cfg = AutoPipelineConfig(
+    world_mesh=world_mesh,
+    pp_axis_name="pp",
+    pp_schedule="1f1b",
+    pp_microbatch_size=1,
+    pp_batch_size=4,
+    layers_per_stage=None,
+)
+ap = AutoPipeline(cfg).build("meta-llama/Llama-2-7b-hf", loss_fn=loss_fn)
+
+# 4) Train step (batch must include `input_ids`; others are forwarded)
+def train_ctx():
+    return torch.enable_grad()
+
+loss = ap.step(
+    batch={"input_ids": input_ids, "attention_mask": attention_mask},
+    labels=labels,            # tensor, same shape as input_ids
+    loss_mask=loss_mask,      # optional; positions with 0 are ignored (-100)
+    train_ctx=train_ctx,
+)
+```
+
+### Configuration (selected)
+
+- `world_mesh`: `DeviceMesh` with a pipeline axis (default name `pp`)
+- `pp_axis_name`: name of the pipeline axis in `world_mesh` (default `"pp"`)
+- `pp_schedule`: schedule name understood by PyTorch (e.g., `"1f1b"`)
+- `pp_microbatch_size`: microbatch size per stage
+- `pp_batch_size`: per-rank batch size; must be divisible by microbatch size
+- `layers_per_stage`: int for virtual stage granularity; `None` auto-computes
+- `module_fqns_per_model_part`: explicit module names per stage (overrides auto)
+- `patch_inner_model`, `patch_causal_lm_model`: enable HF patchers (default True)
+
+See `core.AutoPipelineConfig` for the full list.
+
+### Custom parallelization (optional)
+
+You can wrap each stage in-place (e.g., FSDP/TP/EP) by providing `parallelize_fn` to `build()`.
+
+```python
+from nemo_automodel.components.distributed.autopipeline.core import ParallelizeFnProtocol
+
+def my_parallelize_fn(
+    model, world_mesh, moe_mesh, *, pp_enabled, dp_axis_names, cp_axis_name=None,
+    tp_axis_name=None, ep_axis_name=None, ep_shard_axis_names=None,
+) -> None:
+    # in-place wrapping only; do not return a new module
+    pass
+
+ap = AutoPipeline(cfg).build("meta-llama/Llama-2-7b-hf", loss_fn=loss_fn, parallelize_fn=my_parallelize_fn)
+```
+
+### Controlling stage splits
+
+- Use `layers_per_stage` for simple virtual stage control, or
+- Provide exact modules per stage via `module_fqns_per_model_part`.
+
+```python
+from nemo_automodel.components.distributed.autopipeline.functional import generate_hf_model_fqn_per_model_part
+
+module_fqns = generate_hf_model_fqn_per_model_part(num_stages=8, num_layers=32)
+cfg = AutoPipelineConfig(
+    world_mesh=world_mesh,
+    pp_axis_name="pp",
+    pp_schedule="1f1b",
+    pp_microbatch_size=1,
+    pp_batch_size=8,
+    module_fqns_per_model_part=module_fqns,
+)
+```
+
+### Introspection and helpers
+
+```python
+info = ap.pipeline_info                       # PipelineInfo
+names = ap.list_stage_modules()               # list[list[str]]
+print(ap.pretty_print_stages())               # human-readable summary
+
+from nemo_automodel.components.distributed.autopipeline.training_utils import (
+    pp_scale_grads_by_division, clip_grad_norm_for_pp,
+)
+# Example grad utilities (if stages are exposed in future versions)
+# pp_scale_grads_by_division(info.stages, scale_factor=pp_degree)
+```
+
+### HuggingFace specifics
+
+HF models are patched automatically for pipeline compatibility (embeddings, masks, rotary, KV cache, optional `lm_head`). If needed, see `hf_utils.patch_hf_model_for_pp`.
