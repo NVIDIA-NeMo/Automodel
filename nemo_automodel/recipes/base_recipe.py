@@ -337,6 +337,20 @@ class BaseRecipe:
         for k, v in attrs.items():
             logging.info(f"- {k}: {v}")
 
+    def _get_dp_group(self):
+        if not self.device_mesh:
+            return None
+        elif self.device_mesh["cp"].size() > 1:
+            return self.device_mesh["dp_cp"].get_group()
+        else:
+            return self.device_mesh["dp"].get_group()
+
+    def _dp_allreduce(self, tensor, op=dist.ReduceOp.SUM):
+        dp_group = self._get_dp_group()
+        if dp_group is not None:
+            dp_group.allreduce(tensor.cuda(), op=op)
+            tensor = tensor.cpu()
+        return tensor
 
 def _find_latest_checkpoint(checkpoint_dir):
     """
