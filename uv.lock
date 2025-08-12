@@ -1146,7 +1146,7 @@ requires-dist = [
     { name = "flash-attn", marker = "extra == 'fa'" },
     { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", specifier = "==0.5.8" },
     { name = "numba", marker = "extra == 'vlm'" },
-    { name = "numpy", marker = "extra == 'vlm'", specifier = "==2.2" },
+    { name = "numpy", marker = "extra == 'vlm'" },
     { name = "pillow", marker = "extra == 'vlm'" },
     { name = "pyyaml" },
     { name = "qwen-vl-utils", extras = ["decord"], marker = "extra == 'vlm'" },
