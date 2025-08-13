@@ -14,10 +14,10 @@
 
 import logging
 import os
+import sys
 from functools import partial
 from logging import Filter, LogRecord
 from typing import Callable, Optional, Union
-import sys
 
 logger = logging.getLogger(__name__)
 
