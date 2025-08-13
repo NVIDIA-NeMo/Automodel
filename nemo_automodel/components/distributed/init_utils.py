@@ -122,8 +122,8 @@ def initialize_distributed(
         device = None
         if device_count > 0:
             rank = get_local_rank_preinit()
-            torch.cuda.set_device(rank)
             device = torch.device("cuda", rank)
+            torch.cuda.set_device(device)
             init_pg_kwargs["device_id"] = device
 
         if get_world_size_safe() == 1:
