@@ -45,8 +45,8 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import count_tail_padding
-from nemo_automodel.components.utils.model_utils import print_trainable_parameters
 from nemo_automodel.components.utils.dist_utils import get_sync_ctx
+from nemo_automodel.components.utils.model_utils import print_trainable_parameters
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
