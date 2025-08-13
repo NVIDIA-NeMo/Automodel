@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import logging
-import torch
+
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
@@ -66,7 +66,7 @@ def print_trainable_parameters(model: nn.Module) -> tuple[int, int]:
         logging.info("--------------------------------")
         logging.info(f"Trainable parameters: {trainable_params:,}")
         logging.info(f"Total parameters: {total_params:,}")
-        logging.info(f"Trainable parameters percentage: {100 * trainable_params / total_params:.2f}%")
+        logging.info(f"Trainable parameters percentage: {trainable_pct:.2f}%")
         logging.info(f"Param L2 norm: {local_sq_norm:.4f}")
         logging.info("--------------------------------")
     except Exception:
