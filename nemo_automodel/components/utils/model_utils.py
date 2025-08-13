@@ -13,33 +13,68 @@
 # limitations under the License.
 
 import logging
-
+import torch
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
+def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
+    """
+    Get the number of trainable parameters and the L2 norm of the model.
 
-def print_trainable_parameters(model):
+    Args:
+        model: Model to analyze
+
+    Returns:
+        total_params: int
+        trainable_params: int
+        local_sq_norm: float
+    """
+    total_params = 0
+    trainable_params = 0
+    local_sq_norm = 0.0
+
+    for p in model.parameters():
+        n = p.numel()
+        total_params += n
+        if p.requires_grad:
+            trainable_params += n
+        try:
+            local_sq_norm += float(p.detach().float().norm(2).item() ** 2)
+        except Exception:
+            pass
+    return total_params, trainable_params, local_sq_norm
+
+def print_trainable_parameters(model: nn.Module) -> tuple[int, int]:
     """Print the number of trainable parameters in the model.
 
     Args:
         model: Model to analyze
+
+    Returns:
+        trainable_params: int
+        total_params: int
     """
-    trainable_params = 0
-    all_param = 0
+    total_params, trainable_params, local_sq_norm = _get_model_param_stats(model)
 
-    for _, param in model.named_parameters():
-        all_param += param.numel()
-        if param.requires_grad:
-            trainable_params += param.numel()
+    try:
+        # TODO(@akoumparouli): make this sharding aware.
+        total_sq_tensor = torch.FloatTensor([local_sq_norm])
 
-    logging.info("--------------------------------")
-    logging.info(f"Trainable parameters: {trainable_params:,}")
-    logging.info(f"Total parameters: {all_param:,}")
-    logging.info(f"Trainable parameters percentage: {100 * trainable_params / all_param:.2f}%")
-    logging.info("--------------------------------")
+        global_param_l2 = float(total_sq_tensor.item() ** 0.5)
+        trainable_pct = (100.0 * trainable_params / total_params) if total_params > 0 else 0.0
 
-    return trainable_params, all_param
+        logging.info("Model summary:")
+        logging.info("--------------------------------")
+        logging.info(f"Trainable parameters: {trainable_params:,}")
+        logging.info(f"Total parameters: {total_params:,}")
+        logging.info(f"Trainable parameters percentage: {100 * trainable_params / total_params:.2f}%")
+        logging.info(f"Param L2 norm: {global_param_l2:.4f}")
+        logging.info("--------------------------------")
+    except Exception:
+        logging.info("Model summary: <unavailable>")
+
+    return trainable_params, total_params
 
 
 def _freeze_module_by_attribute_and_patterns(model, attribute_name, name_patterns):
