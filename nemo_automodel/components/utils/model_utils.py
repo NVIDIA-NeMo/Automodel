@@ -59,7 +59,7 @@ def print_trainable_parameters(model: nn.Module) -> tuple[int, int]:
 
     try:
         # TODO(@akoumparouli): make this sharding aware.
-        local_sq_norm = float(local_sq_norm.item() ** 0.5)
+        local_sq_norm = float(local_sq_norm ** 0.5)
         trainable_pct = (100.0 * trainable_params / total_params) if total_params > 0 else 0.0
 
         logging.info("Model summary:")
