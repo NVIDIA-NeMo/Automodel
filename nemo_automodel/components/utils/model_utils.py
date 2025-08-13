@@ -18,6 +18,7 @@ import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
+
 def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
     """
     Get the number of trainable parameters and the L2 norm of the model.
@@ -45,6 +46,7 @@ def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
             pass
     return total_params, trainable_params, local_sq_norm
 
+
 def print_trainable_parameters(model: nn.Module) -> tuple[int, int]:
     """Print the number of trainable parameters in the model.
 
@@ -59,7 +61,7 @@ def print_trainable_parameters(model: nn.Module) -> tuple[int, int]:
 
     try:
         # TODO(@akoumparouli): make this sharding aware.
-        local_sq_norm = float(local_sq_norm ** 0.5)
+        local_sq_norm = float(local_sq_norm**0.5)
         trainable_pct = (100.0 * trainable_params / total_params) if total_params > 0 else 0.0
 
         logging.info("Model summary:")

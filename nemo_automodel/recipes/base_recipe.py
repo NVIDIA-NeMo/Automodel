@@ -213,7 +213,8 @@ class BaseRecipe:
             "World size": getattr(self.dist_env, "world_size", None),
             "Backend": getattr(getattr(self, "cfg", {}), "get", lambda *_: None)("dist_env.backend", "nccl"),
             "Recipe": self.__class__.__name__,
-            "Model name": getattr(getattr(self, "cfg", None), "model", None) and getattr(self.cfg.model, "pretrained_model_name_or_path", None),
+            "Model name": getattr(getattr(self, "cfg", None), "model", None)
+            and getattr(self.cfg.model, "pretrained_model_name_or_path", None),
         }
         try:
             if _yaml is not None:
@@ -226,7 +227,10 @@ class BaseRecipe:
         # Resolved config
         try:
             cfg_obj = getattr(self, "cfg", None)
-            cfg_dict = cfg_obj.to_dict() if hasattr(cfg_obj, "to_dict") else (dict(cfg_obj) if cfg_obj is not None else {})
+            cfg_dict = (
+                cfg_obj.to_dict() if hasattr(cfg_obj, "to_dict") else (dict(cfg_obj) if cfg_obj is not None else {})
+            )
+
             def rec_print(log_fn, cfg_dict: dict | None, indent: int = 2):
                 if cfg_dict is None:
                     return
@@ -236,6 +240,7 @@ class BaseRecipe:
                         rec_print(log_fn, v, indent + 2)
                     else:
                         log_fn(f"{' ' * indent}{k}: {v}")
+
             logging.info("Recipe config:")
             rec_print(logging.info, cfg_dict)
         except Exception:
@@ -247,11 +252,13 @@ class BaseRecipe:
             return
         try:
             import nemo_automodel as nemo_am
+
             nemo_path = Path(getattr(nemo_am, "__file__", "<unknown>")).resolve().as_posix()
         except Exception:
             nemo_path = "<unknown>"
         try:
             import transformers as hf_transformers
+
             tfm_path = Path(getattr(hf_transformers, "__file__", "<unknown>")).resolve().as_posix()
         except Exception:
             tfm_path = "<unknown>"
@@ -262,12 +269,17 @@ class BaseRecipe:
         }
         logging.info("Library versions:")
         for key, value in libs.items():
-            if 'cuda' in value:
+            if "cuda" in value:
                 logging.info(f"- {key}: {value['version']} CUDA {value['cuda']}")
             else:
                 logging.info(f"- {key}: {value['version']} ({value['import_path']})")
 
-    def _log_model_and_optimizer_details(self, model: nn.Module | None = None, optimizer: Optimizer | None = None, lr_scheduler: OptimizerParamScheduler | None = None):
+    def _log_model_and_optimizer_details(
+        self,
+        model: nn.Module | None = None,
+        optimizer: Optimizer | None = None,
+        lr_scheduler: OptimizerParamScheduler | None = None,
+    ):
         """Log model repr, parameter stats, param norm, optimizer and lr scheduler with YAML markers."""
         # Model repr
         if model:
@@ -297,7 +309,8 @@ class BaseRecipe:
 
     def _log_step_scheduler_details(self, step_scheduler: StepScheduler):
         """Log step scheduler details."""
-        attrs = {"Gradient accumulation steps": step_scheduler.grad_acc_steps,
+        attrs = {
+            "Gradient accumulation steps": step_scheduler.grad_acc_steps,
             "Checkpoint every steps": step_scheduler.ckpt_every_steps,
             "Current Epoch": step_scheduler.epoch,
             "Number of epochs": step_scheduler.num_epochs,
@@ -307,6 +320,7 @@ class BaseRecipe:
         logging.info("Step scheduler:")
         for k, v in attrs.items():
             logging.info(f"- {k}: {v}")
+
 
 def _find_latest_checkpoint(checkpoint_dir):
     """

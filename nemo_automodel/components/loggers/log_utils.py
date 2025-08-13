@@ -51,11 +51,11 @@ class RankFilter(logging.Filter):
 # ANSI color codes for log levels
 _COLOR_RESET = "\x1b[0m"
 _LEVEL_TO_COLOR = {
-    logging.DEBUG: "\x1b[36m",     # cyan
-    logging.INFO: "\x1b[32m",      # green
-    logging.WARNING: "\x1b[33m",   # yellow
-    logging.ERROR: "\x1b[31m",     # red
-    logging.CRITICAL: "\x1b[31;1m"  # bright/bold red
+    logging.DEBUG: "\x1b[36m",  # cyan
+    logging.INFO: "\x1b[32m",  # green
+    logging.WARNING: "\x1b[33m",  # yellow
+    logging.ERROR: "\x1b[31m",  # red
+    logging.CRITICAL: "\x1b[31;1m",  # bright/bold red
 }
 
 
