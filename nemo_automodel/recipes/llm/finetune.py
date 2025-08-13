@@ -51,6 +51,7 @@ from nemo_automodel.components.utils.dist_utils import (
     reduce_loss,
     rescale_gradients,
 )
+from nemo_automodel.components.utils.model_utils import print_trainable_parameters
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 logger = logging.getLogger(__name__)
@@ -111,6 +112,8 @@ def build_model_and_optimizer(
         # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
         if cfg_peft is not None:
             apply_lora_to_linear_modules(model, cfg_peft)
+
+    print_trainable_parameters(model)
 
     if callable(getattr(model_wrapper, "parallelize", None)):
         # FSDP2 and nvFSDP should already be on the correct device
