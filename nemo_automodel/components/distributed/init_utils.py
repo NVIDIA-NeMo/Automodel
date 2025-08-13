@@ -99,13 +99,15 @@ def initialize_distributed(
         DistInfo: An instance containing the distributed environment configuration.
     """
     device_count = torch.cuda.device_count()
+    device = None
     if torch.distributed.is_initialized():
         if get_rank_safe() == 0:
             print(
                 "torch distributed is already initialized, skipping initialization.",
                 flush=True,
             )
-
+        if device_count > 0:
+            device = torch.cuda.current_device()
     else:
         if get_rank_safe() == 0:
             print("> initializing torch distributed with {} workers.".format(get_world_size_safe()), flush=True)
