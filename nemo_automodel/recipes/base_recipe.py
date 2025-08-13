@@ -13,25 +13,18 @@
 # limitations under the License.
 
 import os
+import getpass
+import logging
+import socket
 import re
+from datetime import datetime
 from pathlib import Path
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from torch.optim import Optimizer
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils import PreTrainedTokenizerBase
-import logging
-import getpass
-import socket
-from datetime import datetime
-try:
-    import yaml as _yaml
-except Exception:
-    _yaml = None
-import transformers as hf_transformers
-import nemo_automodel as nemo_am
 
 from nemo_automodel.components.checkpoint.checkpointing import (
     load_model,
@@ -41,6 +34,11 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 )
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.step_scheduler import StepScheduler
+
+try:
+    import yaml as _yaml
+except Exception:
+    _yaml = None
 
 
 def has_load_restore_state(object):
@@ -248,10 +246,12 @@ class BaseRecipe:
         if not getattr(self, "dist_env", None) or not getattr(self.dist_env, "is_main", False):
             return
         try:
+            import nemo_automodel as nemo_am
             nemo_path = Path(getattr(nemo_am, "__file__", "<unknown>")).resolve().as_posix()
         except Exception:
             nemo_path = "<unknown>"
         try:
+            import transformers as hf_transformers
             tfm_path = Path(getattr(hf_transformers, "__file__", "<unknown>")).resolve().as_posix()
         except Exception:
             tfm_path = "<unknown>"
