@@ -59,9 +59,7 @@ def print_trainable_parameters(model: nn.Module) -> tuple[int, int]:
 
     try:
         # TODO(@akoumparouli): make this sharding aware.
-        total_sq_tensor = torch.FloatTensor([local_sq_norm])
-
-        global_param_l2 = float(total_sq_tensor.item() ** 0.5)
+        local_sq_norm = float(local_sq_norm.item() ** 0.5)
         trainable_pct = (100.0 * trainable_params / total_params) if total_params > 0 else 0.0
 
         logging.info("Model summary:")
@@ -69,7 +67,7 @@ def print_trainable_parameters(model: nn.Module) -> tuple[int, int]:
         logging.info(f"Trainable parameters: {trainable_params:,}")
         logging.info(f"Total parameters: {total_params:,}")
         logging.info(f"Trainable parameters percentage: {100 * trainable_params / total_params:.2f}%")
-        logging.info(f"Param L2 norm: {global_param_l2:.4f}")
+        logging.info(f"Param L2 norm: {local_sq_norm:.4f}")
         logging.info("--------------------------------")
     except Exception:
         logging.info("Model summary: <unavailable>")
