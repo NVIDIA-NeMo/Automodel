@@ -19,14 +19,11 @@ TRANSFORMERS_OFFLINE=1 coverage run --data-file=/workspace/.coverage --source=/w
 examples/llm/finetune.py \
   --config examples/llm/llama_3_2_1b_squad.yaml \
   --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
-  --model.output_hidden_states true \
   --step_scheduler.max_steps 3 \
   --step_scheduler.grad_acc_steps 1 \
-  --step_scheduler.val_every_steps 1 \
-  --loss_fn._target_ nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy \
-  --dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
-  --validation_dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
   --dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
   --dataset.limit_dataset_samples 10 \
-  --validation_dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
-  --validation_dataset.limit_dataset_samples 10 \
+  --peft._target_ nemo_automodel.components._peft.lora.PeftConfig \
+  --peft.target_modules '*_proj' \
+  --peft.dim 16 \
+  --peft.alpha 32

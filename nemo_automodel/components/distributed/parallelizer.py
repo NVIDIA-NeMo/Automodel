@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import importlib
-import signal
 from contextlib import contextmanager
 from functools import lru_cache
 from types import FunctionType
@@ -39,7 +38,6 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
-from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
 
 # Import model-specific tensor parallel plans from the dedicated module
 from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE_FUNCTIONS
@@ -116,25 +114,25 @@ def get_hf_tp_shard_plan(model):
     Raises:
         AssertionError: If no TP plan is found
     """
-    model_cls = type(model)
-    if isinstance(model, Gemma3ForConditionalGeneration):
-        inner_model = model.language_model
-        model_prefix = "language_model"
-    else:
-        inner_model = model.model
-        model_prefix = "model"
 
     hf_tp_plan = {}
 
     # model_cls._tp_plan will override model_cls after xxxForCausalLM.post_init() (transformers==4.51.3)
+    model_cls = type(model)
     if hasattr(model_cls, "_tp_plan") and model_cls._tp_plan is not None:
         hf_tp_plan.update(model_cls._tp_plan)
 
     if hasattr(model, "_tp_plan") and model._tp_plan is not None:
         hf_tp_plan.update(model._tp_plan)
 
-    if hasattr(inner_model, "_tp_plan") and inner_model._tp_plan is not None:
-        hf_tp_plan.update({f"{model_prefix}.{k}": v for k, v in inner_model._tp_plan.items()})
+    model_prefix = "model"
+    inner_model_attrs = ("language_model", "model")
+    for attr in inner_model_attrs:
+        if hasattr(getattr(model, attr, None), "_tp_plan"):
+            model_prefix = attr
+            _tp_plan = getattr(getattr(model, attr), "_tp_plan")
+            hf_tp_plan.update({f"{model_prefix}.{k}": v for k, v in _tp_plan.items()})
+            break
 
     assert len(hf_tp_plan) > 0, (
         f"Hugging Face tp plan is not supported for {model_cls}, please set dtensor_cfg.tensor_parallel_size to 1 or provide a custom_parallel_plan. "
@@ -214,6 +212,114 @@ def translate_to_torch_parallel_style(style: str):
         raise ValueError(f"Unknown parallel style: {style}")
 
 
+def validate_tp_mesh(model, tp_mesh):
+    """
+    Validate that attention heads and key value heads are divisible by TP size
+    """
+    if tp_mesh.size() == 1:
+        return  # if tp_mesh.size() == 1, we don't need to validate
+    try:
+        from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
+    except ImportError:  # if transformers is not installed, we don't need to validate
+        return
+
+    if isinstance(model, Gemma3ForConditionalGeneration):
+        num_attention_heads = model.config.text_config.num_attention_heads
+        num_key_value_heads = model.config.text_config.num_key_value_heads
+    elif hasattr(model, "config"):
+        num_attention_heads = getattr(model.config, "num_attention_heads", 0)
+        num_key_value_heads = getattr(model.config, "num_key_value_heads", 0)
+    else:
+        num_attention_heads = 0
+        num_key_value_heads = 0
+
+    # TP sharding with enhanced plan generation
+    # Validate that attention heads are divisible by TP size
+    assert num_key_value_heads % tp_mesh.size() == 0, (
+        f"num_key_value_heads ({num_key_value_heads}) must be divisible by TP size ({tp_mesh.size()})"
+    )
+    assert num_attention_heads % tp_mesh.size() == 0, (
+        f"num_attention_heads ({num_attention_heads}) must be divisible by TP size ({tp_mesh.size()})"
+    )
+
+
+def get_lm_ac_layers(model: nn.Module) -> List[nn.Module]:
+    """
+    Returns repeated layer blocks for activation checkpointing
+    """
+    try:
+        from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
+    except ImportError:  # if transformers is not installed, we don't need to validate
+        return []
+    if isinstance(model, Gemma3ForConditionalGeneration):
+        return model.language_model.layers
+    elif hasattr(getattr(model, "model", None), "layers"):
+        return model.model.layers
+    else:
+        # TODO: scan model for nn.Sequential or ModuleList and return it
+        return []
+
+
+def _get_parallel_plan(
+    model: nn.Module,
+    sequence_parallel: bool = False,
+    tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+) -> Dict[str, ParallelStyle]:
+    """
+    Get the parallel plan for the model.
+    """
+
+    # Generate or use tensor parallel plan
+    model_parallel_plan = None
+    model_cls = type(model)
+
+    # 1. Use custom parallel plan if provided
+    if tp_shard_plan is not None:
+        if isinstance(tp_shard_plan, dict):
+            model_parallel_plan = tp_shard_plan
+            print("Using provided parallel plan (dictionary).")
+        else:
+            try:
+                plan_obj = import_class_from_path(tp_shard_plan)
+                if isinstance(plan_obj, FunctionType):
+                    model_parallel_plan = plan_obj()
+                else:
+                    model_parallel_plan = plan_obj
+                assert isinstance(model_parallel_plan, dict), (
+                    f"Parallel plan must be a dictionary, got {type(model_parallel_plan)}"
+                )
+                print("Using provided parallel plan (from path).")
+            except Exception as e:
+                raise ValueError(
+                    f"Custom parallel plan '{tp_shard_plan}' is not valid. "
+                    f"Please ensure it is one of the following:\n"
+                    "1. A dictionary mapping module names to parallel styles\n"
+                    "2. A path to a dictionary\n"
+                    "3. A path to a function that returns a dictionary\n"
+                    f"Error: {e}"
+                )
+
+    # 2. Use optimized parallel plan based on model type
+    elif model_cls in PARALLELIZE_FUNCTIONS:
+        try:
+            func = PARALLELIZE_FUNCTIONS[model_cls]
+            model_parallel_plan = func(model, sequence_parallel)
+            print("Using optimized parallel plan.")
+        except Exception as e:
+            print(f"Optimized parallel plan is not available: {e}. Falling back to the HF tp plan.")
+            assert not sequence_parallel, "sequence_parallel is not supported in HF tp plan."
+            model_parallel_plan = get_hf_tp_shard_plan(model)
+
+    # 3. Use HF TP plan as fallback
+    else:
+        if model_cls not in PARALLELIZE_FUNCTIONS:
+            print(f"Optimized parallel plan is not supported for {model_cls}. Falling back to the HF tp plan.")
+        assert not sequence_parallel, "sequence_parallel is not supported in HF tp plan."
+        model_parallel_plan = get_hf_tp_shard_plan(model)
+
+    return model_parallel_plan
+
+
 # Taken and modified from torchtitan
 # https://github.com/pytorch/torchtitan/blob/main/torchtitan/parallelisms/parallelize_llama.py
 def fsdp2_strategy_parallelize(
@@ -265,74 +371,15 @@ def fsdp2_strategy_parallelize(
     the model must fit on GPU or CPU memory.
     """
     # Get model layers for later use
-    model_cls = type(model)
-    if isinstance(model, Gemma3ForConditionalGeneration):
-        layers = model.language_model.layers
-        num_attention_heads = model.config.text_config.num_attention_heads
-        num_key_value_heads = model.config.text_config.num_key_value_heads
-    else:
-        layers = model.model.layers
-        num_attention_heads = model.config.num_attention_heads
-        num_key_value_heads = model.config.num_key_value_heads
-
     tp_mesh = device_mesh[tp_mesh_name]
 
     # TP sharding with enhanced plan generation
     if tp_mesh.size() > 1:
         # Validate that attention heads are divisible by TP size
-        assert num_key_value_heads % tp_mesh.size() == 0, (
-            f"num_key_value_heads ({num_key_value_heads}) must be divisible by TP size ({tp_mesh.size()})"
-        )
-        assert num_attention_heads % tp_mesh.size() == 0, (
-            f"num_attention_heads ({num_attention_heads}) must be divisible by TP size ({tp_mesh.size()})"
-        )
+        validate_tp_mesh(model, tp_mesh)
 
         # Generate or use tensor parallel plan
-        model_parallel_plan = None
-
-        # 1. Use custom parallel plan if provided
-        if tp_shard_plan is not None:
-            if isinstance(tp_shard_plan, dict):
-                model_parallel_plan = tp_shard_plan
-                print("Using provided parallel plan (dictionary).")
-            else:
-                try:
-                    plan_obj = import_class_from_path(tp_shard_plan)
-                    if isinstance(plan_obj, FunctionType):
-                        model_parallel_plan = plan_obj()
-                    else:
-                        model_parallel_plan = plan_obj
-                    assert isinstance(model_parallel_plan, dict), (
-                        f"Parallel plan must be a dictionary, got {type(model_parallel_plan)}"
-                    )
-                    print("Using provided parallel plan (from path).")
-                except Exception as e:
-                    raise ValueError(
-                        f"Custom parallel plan '{tp_shard_plan}' is not valid. "
-                        f"Please ensure it is one of the following:\n"
-                        "1. A dictionary mapping module names to parallel styles\n"
-                        "2. A path to a dictionary\n"
-                        "3. A path to a function that returns a dictionary\n"
-                        f"Error: {e}"
-                    )
-
-        # 2. Use optimized parallel plan based on model type
-        elif model_cls in PARALLELIZE_FUNCTIONS:
-            try:
-                func = PARALLELIZE_FUNCTIONS[model_cls]
-                model_parallel_plan = func(model, sequence_parallel)
-                print("Using optimized parallel plan.")
-            except Exception as e:
-                print(f"Optimized parallel plan is not available: {e}. Falling back to the HF tp plan.")
-                assert not sequence_parallel, "sequence_parallel is not supported in HF tp plan."
-                model_parallel_plan = get_hf_tp_shard_plan(model)
-
-        # 3. Use HF TP plan as fallback
-        else:
-            if model_cls not in PARALLELIZE_FUNCTIONS:
-                print(f"Optimized parallel plan is not supported for {model_cls}. Falling back to the HF tp plan.")
-            assert not sequence_parallel, "sequence_parallel is not supported in HF tp plan."
-            model_parallel_plan = get_hf_tp_shard_plan(model)
+        model_parallel_plan = _get_parallel_plan(model, sequence_parallel, tp_shard_plan)
 
         # Apply tensor parallelism
         if model_parallel_plan:
@@ -340,6 +387,7 @@ def fsdp2_strategy_parallelize(
 
     # Apply activation checkpointing to MLP layers if requested
     if activation_checkpointing:
+        layers = get_lm_ac_layers(model)
         for i, layer in enumerate(layers):
             if hasattr(layer, "mlp"):
                 layers[i].mlp = checkpoint_wrapper(layer.mlp)
@@ -507,17 +555,6 @@ def nvfsdp_strategy_parallelize(
     )
 
     return model, optimizer
-
-
-def _destroy_dist_connection() -> None:
-    """
-    Destroy process group.
-    """
-    # Don't allow Ctrl+C to interrupt this handler
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        torch.distributed.destroy_process_group()
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 
 @contextmanager

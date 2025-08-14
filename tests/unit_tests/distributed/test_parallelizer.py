@@ -48,10 +48,15 @@ class MockModel(nn.Module):
 
     def __init__(self, model_type="llama", num_attention_heads=8, num_key_value_heads=8):
         super().__init__()
-        self.config = SimpleNamespace(
-            num_attention_heads=num_attention_heads,
-            num_key_value_heads=num_key_value_heads,
-        )
+        if model_type == "baichuan2":
+            self.config = SimpleNamespace(
+                num_attention_heads=num_attention_heads,
+            )
+        else:
+            self.config = SimpleNamespace(
+                num_attention_heads=num_attention_heads,
+                num_key_value_heads=num_key_value_heads,
+            )
 
         # Create mock model as a proper nn.Module so it gets picked up by named_children()
         class MockInnerModel(nn.Module):
