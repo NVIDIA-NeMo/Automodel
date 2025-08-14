@@ -30,12 +30,15 @@ try:
     from nemo_automodel.components._transformers.auto_model import (
         NeMoAutoModelForCausalLM,
         NeMoAutoModelForImageTextToText,
+        NeMoAutoModelForSequenceClassification,
     )  # noqa: I001
 
     globals()["NeMoAutoModelForCausalLM"] = NeMoAutoModelForCausalLM
     globals()["NeMoAutoModelForImageTextToText"] = NeMoAutoModelForImageTextToText
+    globals()["NeMoAutoModelForSequenceClassification"] = NeMoAutoModelForSequenceClassification
     __all__.append("NeMoAutoModelForCausalLM")
     __all__.append("NeMoAutoModelForImageTextToText")
+    __all__.append("NeMoAutoModelForSequenceClassification")
 except:
     # optional dependency might be missing,
     # leave the name off the module namespace so other imports still work
