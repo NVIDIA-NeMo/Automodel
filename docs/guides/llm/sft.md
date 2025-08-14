@@ -284,6 +284,7 @@ In addition, the model checkpoint is saved under the `checkpoints/` directory, w
 ``` bash
 $ tree checkpoints/epoch_0_step_10/
 checkpoints/epoch_0_step_10/
+├── config.yaml
 ├── dataloader.pt
 ├── model
 │   ├── consolidated
@@ -292,7 +293,8 @@ checkpoints/epoch_0_step_10/
 │   │   ├── model.safetensors.index.json
 │   │   ├── special_tokens_map.json
 │   │   ├── tokenizer.json
-│   │   └── tokenizer_config.json
+│   │   ├── tokenizer_config.json
+│   │   └── generation_config.json
 │   ├── shard-00001-model-00001-of-00001.safetensors
 │   └── shard-00002-model-00001-of-00001.safetensors
 ├── optim
