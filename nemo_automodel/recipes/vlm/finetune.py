@@ -248,9 +248,7 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed
             except Exception as e:
                 # Some models do not provide an AutoProcessor
                 processor = None
-                logging.warning(
-                    f"AutoProcessor not available for {cfg_model.pretrained_model_name_or_path} ({e}). "
-                )
+                logging.warning(f"AutoProcessor not available for {cfg_model.pretrained_model_name_or_path} ({e}). ")
 
         ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
 
