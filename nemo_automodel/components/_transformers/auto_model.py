@@ -151,6 +151,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         torch_dtype="auto",
         attn_implementation: str = "flash_attention_2",
         fp8_config: Optional[object] = None,
+        enable_gradient_checkpointing: False,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -180,6 +181,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             fp8_config (FP8Config, optional): FP8 configuration object that
                 specifies all FP8 quantization settings. If provided, FP8 quantization
                 will be applied to the model for improved performance on supported hardware.
+            enable_gradient_checkpointing (bool, default=False): If `True`, enable gradient checkpointing.
             **kwargs: Additional keyword arguments forwarded verbatim to
                 `AutoModelForCausalLM.from_pretrained`.
 
@@ -209,6 +211,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
                 fp8_config=override.get("fp8_config", fp8_config),
+                enable_gradient_checkpointing=override.get("enable_gradient_checkpointing", enable_gradient_checkpointing),
                 **kwargs,
             )
 
@@ -230,6 +233,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 logging.warning("Falling back to eager attention.")
                 return _retry(attn_implementation="eager")
             raise e
+
+        if enable_gradient_checkpointing:
+            if hasattr(model, "gradient_checkpointing_enable"):
+                model.gradient_checkpointing_enable()
+                logging.info("Enabled gradient checkpointing")
+            else:
+                logging.warning("Gradient checkpointing is not supported by this model")
 
         # Kernel patching
         try:
