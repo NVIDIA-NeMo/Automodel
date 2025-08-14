@@ -381,7 +381,7 @@ def build_wandb(cfg) -> wandb.Run:
         kwargs["name"] = "_".join(cfg.get("model.pretrained_model_name_or_path").split("/")[-2:])
     run = wandb.init(
         **kwargs,
-        config=cfg,
+        config=cfg.to_dict(),
         settings=Settings(silent=True),
     )
     return run
@@ -481,6 +481,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
             run = build_wandb(self.cfg)
             logging.info("🚀 View run at {}".format(run.url))
 
+        # Log experiment details on main rank
+        self._log_experiment_details()
+        self._log_library_versions()
+
         # Build components with VLM-specific functions
         self.peft_config = None
         if self.cfg.get("peft", None) is not None:
@@ -529,6 +533,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Build learning rate scheduler
         self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
 
+        # Log model, parameter counts, norms, optimizer and scheduler
+        self._log_model_and_optimizer_details(self.model, self.optimizer, self.lr_scheduler)
+
         # Build checkpointing config
         restore_from = self.cfg.get("checkpoint.restore_from", None)
         self.checkpoint_config = build_checkpoint_config(
@@ -543,6 +550,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         # Optionally resume
         self.load_checkpoint(restore_from)
+
+        # Log step scheduler details
+        self._log_step_scheduler_details(self.step_scheduler)
 
     # ------------------ main loop ------------------
     def run_train_validation_loop(self):
