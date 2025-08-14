@@ -19,8 +19,8 @@ import inspect
 import os
 import pprint
 import sys
-from pathlib import Path
 from copy import deepcopy
+from pathlib import Path
 
 import yaml
 
@@ -283,9 +283,7 @@ class ConfigNode:
             dict: A dictionary representation of the configuration node.
         """
         return {
-            k: self._unwrap(v)
-            for k, v in self.__dict__.items()
-            if k not in ("raise_on_missing_attr", "_raw_config")
+            k: self._unwrap(v) for k, v in self.__dict__.items() if k not in ("raise_on_missing_attr", "_raw_config")
         }
 
     def _unwrap(self, v):
