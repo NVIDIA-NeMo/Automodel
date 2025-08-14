@@ -47,7 +47,7 @@ To get started quickly, NeMo AutoModel provides a collection of ready-to-use rec
 
 
 ### Run a Recipe
-To run a NeMo AutoModel recipe, you need a recipe script (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/example/llm/finetune.py), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/example/vlm/finetune.py)) and a YAML config file (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm/llama_3_2_1b_squad.yaml), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm/gemma_3_vl_4b_cord_v2_peft.yaml)):
+To run a NeMo AutoModel recipe, you need a recipe script (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm/finetune.py), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm/finetune.py)) and a YAML config file (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm/llama_3_2_1b_squad.yaml), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm/gemma_3_vl_4b_cord_v2_peft.yaml)):
 ```
 # Command invocation format:
 uv run <recipe_script_path> --config <yaml_config_path>
