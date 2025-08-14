@@ -35,7 +35,6 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 )
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
-from nemo_automodel.components.utils.yaml_utils import safe_yaml_representers
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 
 try:
@@ -166,8 +165,7 @@ class BaseRecipe:
 
         save_model(model, path, self.checkpoint_config, peft_config=self.peft_config, tokenizer=tokenizer)
         save_optimizer(optimizer, model, path, scheduler)
-        with safe_yaml_representers():
-            save_config(config.to_dict(), path)
+        save_config(config.raw_config, path)
 
     def load_checkpoint(self, restore_from: str | None = None):
         """

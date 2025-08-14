@@ -275,7 +275,7 @@ def save_config(config: dict[str, Any], weights_path: str):
         weights_path: Path to save config
     """
     with open(os.path.join(weights_path, "config.yaml"), "w") as f:
-        yaml.safe_dump(config, f, sort_keys=False)
+        yaml.dump(config, f, sort_keys=False, default_flow_style=False)
 
 
 def _get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
