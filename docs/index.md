@@ -37,13 +37,6 @@ model-coverage/llm.md
 model-coverage/vlm.md
 ```
 
-```{toctree}
-:caption: Blogs
-:hidden:
-
-guides/gemma3n-blog.md
-```
-
 
 <!-- 
 ```{toctree}
