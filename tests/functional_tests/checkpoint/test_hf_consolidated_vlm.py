@@ -448,12 +448,12 @@ def test_consolidated_vlm_checkpoint():
         "model/consolidated/tokenizer_config.json",
         "model/consolidated/tokenizer.json",
         "model/consolidated/special_tokens_map.json",
+        "model/consolidated/generation_config.json",
         "optim/__0_0.distcp",
         "optim/__1_0.distcp",
         "optim/.metadata",
         "step_scheduler.pt",
         "config.yaml",
-        "generation_config.json",
     ]
 
     for file in output_files:
