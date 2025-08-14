@@ -243,7 +243,14 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed
                 processor_kwargs = cfg_processor.to_dict()
                 processor = AutoProcessor.from_pretrained(cfg_model.pretrained_model_name_or_path, **processor_kwargs)
         else:
-            processor = AutoProcessor.from_pretrained(cfg_model.pretrained_model_name_or_path)
+            try:
+                processor = AutoProcessor.from_pretrained(cfg_model.pretrained_model_name_or_path)
+            except Exception as e:
+                # Some models do not provide an AutoProcessor
+                processor = None
+                logging.warning(
+                    f"AutoProcessor not available for {cfg_model.pretrained_model_name_or_path} ({e}). "
+                )
 
         ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
 
