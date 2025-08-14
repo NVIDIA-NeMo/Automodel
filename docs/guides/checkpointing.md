@@ -74,7 +74,8 @@ checkpoints/
     │   │   ├── model.safetensors.index.json
     │   │   ├── special_tokens_map.json
     │   │   ├── tokenizer_config.json
-    │   │   └── tokenizer.json
+    │   │   ├── tokenizer.json
+    │   │   └── generation_config.json
     │   ├── shard-00001-model-00001-of-00002.safetensors
     │   └── shard-00002-model-00001-of-00002.safetensors
     └── optim/
@@ -218,6 +219,7 @@ checkpoints/
     │   ├── __0_0.distcp
     │   ├── __1_0.distcp
     │   └── .metadata
+    ├── config.yaml
     ├── dataloader.pt
     ├── rng.pt
     └── step_scheduler.pt

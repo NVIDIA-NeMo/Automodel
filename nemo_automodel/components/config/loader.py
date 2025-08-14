@@ -19,6 +19,7 @@ import inspect
 import os
 import pprint
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 import yaml
@@ -156,7 +157,11 @@ class ConfigNode:
             d (dict): A dictionary representing configuration options.
             raise_on_missing_attr (bool): if True, it will return `None` on a missing attr.
         """
-        self.__dict__ = {k: self._wrap(k, v) for k, v in d.items()}
+        # Finetune scripts can modify the config in place, so we need to keep a copy of the
+        # original config for checkpointing.
+        self._raw_config = deepcopy(d)
+        # Update instead of overwrite, so other instance attributes survive.
+        self.__dict__.update({k: self._wrap(k, v) for k, v in d.items()})
         self.raise_on_missing_attr = raise_on_missing_attr
 
     def __getattr__(self, key):
@@ -189,6 +194,16 @@ class ConfigNode:
         else:
             return translate_value(v)
 
+    @property
+    def raw_config(self):
+        """
+        Get the raw configuration dictionary.
+
+        Returns:
+            dict: The raw configuration dictionary.
+        """
+        return self._raw_config
+
     def instantiate(self, *args, **kwargs):
         """Instantiate the target object specified in the configuration.
 
@@ -213,7 +228,7 @@ class ConfigNode:
         # Prepare kwargs from config
         config_kwargs = {}
         for k, v in self.__dict__.items():
-            if k == "_target_" or k == "raise_on_missing_attr":
+            if k in ("_target_", "raise_on_missing_attr", "_raw_config"):
                 continue
             if k.endswith("_fn"):
                 config_kwargs[k] = v
@@ -267,7 +282,9 @@ class ConfigNode:
         Returns:
             dict: A dictionary representation of the configuration node.
         """
-        return {k: self._unwrap(v) for k, v in self.__dict__.items() if k != "raise_on_missing_attr"}
+        return {
+            k: self._unwrap(v) for k, v in self.__dict__.items() if k not in ("raise_on_missing_attr", "_raw_config")
+        }
 
     def _unwrap(self, v):
         """
@@ -347,7 +364,11 @@ class ConfigNode:
             str: An indented string representation of the configuration.
         """
         indent = "  " * level
-        lines = [f"{indent}{key}: {self._repr_value(value, level)}" for key, value in self.__dict__.items()]
+        lines = [
+            f"{indent}{key}: {self._repr_value(value, level)}"
+            for key, value in self.__dict__.items()
+            if key not in ("raise_on_missing_attr", "_raw_config")
+        ]
         return "\n#path: " + "\n".join(lines) + f"\n{indent}"
 
     def _repr_value(self, value, level):
