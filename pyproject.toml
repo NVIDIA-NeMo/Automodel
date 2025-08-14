@@ -108,12 +108,11 @@ linting = [
     "ruff~=0.9.0",
 ]
 test = ["coverage", "pytest", "peft"]
-nvfsdp = ["nvfsdp"]
-dev = ["cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@87a86ab"]
+dev = ["nvfsdp", "cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@87a86ab"]
 
 
 [tool.uv]
-default-groups = ["build", "docs", "test", "nvfsdp"]
+default-groups = ["build", "docs", "test"]
 no-build-isolation-package = ["flash-attn"]
 
 [tool.uv.sources]
