@@ -69,23 +69,23 @@ class CompileConfig:
 
 def configure_torch_dynamo(cache_size_limit: int = 256, capture_scalar_outputs: bool = True):
     """Configure torch._dynamo settings for compilation.
-    
+
     Args:
         cache_size_limit: Cache size limit for dynamo compilation
         capture_scalar_outputs: Whether to capture scalar outputs for Flash Attention compatibility
     """
     try:
         import torch._dynamo as dynamo
-        
+
         # Set cache size limit
         dynamo.config.cache_size_limit = cache_size_limit
         logger.debug(f"Set torch._dynamo cache_size_limit to {cache_size_limit}")
-        
+
         # Configure scalar output capture if requested
         if capture_scalar_outputs:
             dynamo.config.capture_scalar_outputs = True
             logger.debug("Enabled torch._dynamo scalar output capture")
-            
+
     except ImportError:
         logger.warning("torch._dynamo not available, skipping dynamo configuration")
 
