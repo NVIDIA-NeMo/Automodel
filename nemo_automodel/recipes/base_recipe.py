@@ -35,16 +35,13 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 )
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
-<<<<<<< HEAD
 from nemo_automodel.components.utils.yaml_utils import safe_yaml_representers
-=======
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 
 try:
     import yaml as _yaml
 except Exception:
     _yaml = None
->>>>>>> origin/main
 
 
 def has_load_restore_state(object):
