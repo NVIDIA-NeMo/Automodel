@@ -239,6 +239,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             )
 
         # load model
+        model = None
         try:
             name = cls.__name__
             if name.startswith("NeMo"):
@@ -253,6 +254,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             cls.__name__ = name
         except ValueError as e:
             if "does not support" in str(e):
+                if model is not None:
+                    del model
                 attn_implementation = _get_next_fallback_attn(attn_implementation)
                 logging.warning("Falling back to {} attention.".format(attn_implementation))
                 return _retry(attn_implementation=attn_implementation)
