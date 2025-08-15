@@ -22,12 +22,12 @@ from typing import Any, Dict, Optional
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import wandb
 from torch.distributed.device_mesh import _mesh_resources
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
-import wandb
 from wandb import Settings
 
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
@@ -44,6 +44,10 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import count_tail_padding
+from nemo_automodel.components.utils.compile_utils import (
+    build_compile_config,
+    compile_model,
+)
 from nemo_automodel.components.utils.dist_utils import (
     clip_gradients,
     get_sync_ctx,
@@ -51,10 +55,6 @@ from nemo_automodel.components.utils.dist_utils import (
     rescale_gradients,
 )
 from nemo_automodel.components.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
-from nemo_automodel.components.utils.compile_utils import (
-    build_compile_config,
-    compile_model,
-)
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 logger = logging.getLogger(__name__)
