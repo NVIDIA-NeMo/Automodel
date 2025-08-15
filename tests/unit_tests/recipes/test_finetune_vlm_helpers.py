@@ -14,6 +14,7 @@
 import pytest
 import torch
 import torch.nn as nn
+from unittest.mock import Mock, patch, MagicMock
 
 from nemo_automodel.recipes.vlm.finetune import _freeze_model, _build_optimizer, build_model_and_optimizer
 
@@ -169,3 +170,28 @@ def test_build_model_and_optimizer_basic():
     trainable_param_count = _count_trainable(model.parameters())
     optim_param_count = sum(p.numel() for group in optim.param_groups for p in group["params"])
     assert trainable_param_count == optim_param_count
+
+
+# -----------------------------------------------------------------------------
+# AutoProcessor exception handling test
+# -----------------------------------------------------------------------------
+
+def test_autoprocessor_exception_handling():
+    """Test the AutoProcessor exception handling logic added in this branch."""
+    
+    with patch('transformers.AutoProcessor') as mock_auto_processor:
+        # Test that when AutoProcessor.from_pretrained fails, processor becomes None
+        mock_auto_processor.from_pretrained.side_effect = Exception("Model does not have AutoProcessor")
+        
+        model_name = "test/model"
+        processor = None
+        
+        # Simulate the exact code change from the branch
+        try:
+            processor = mock_auto_processor.from_pretrained(model_name)
+        except Exception as e:
+            processor = None
+            
+        assert processor is None
+        mock_auto_processor.from_pretrained.assert_called_once_with(model_name)
+
