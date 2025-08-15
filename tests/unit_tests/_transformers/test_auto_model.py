@@ -52,7 +52,7 @@ class TestNeMoAutoModelForCausalLM:
 
             # Test line 208 - warning when HAS_LIGER_KERNEL is False
             with caplog.at_level(logging.WARNING):
-                model = NeMoAutoModelForCausalLM.from_pretrained("/home/TestData/akoumparouli/hf_gemma_38m/")
+                model = NeMoAutoModelForCausalLM.from_pretrained("hf-internal-testing/tiny-random-gpt2")
                 assert model.config["nemo_version"] == __version__
 
             assert "Asked to use Liger Kernel, but could not import" in caplog.text
@@ -70,7 +70,7 @@ class TestNeMoAutoModelForCausalLM:
             mock_model.config = {}
             mock_from_config.return_value = mock_model
 
-            config = AutoConfig.from_pretrained("/home/TestData/akoumparouli/hf_gemma_38m/")
+            config = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
 
             # Test line 297 - warning when HAS_LIGER_KERNEL is False
             with caplog.at_level(logging.WARNING):
@@ -83,7 +83,7 @@ class TestNeMoAutoModelForCausalLM:
 
     def test_from_config_happy_path(self):
         """Test the basic from_config functionality works."""
-        config = AutoConfig.from_pretrained("/home/TestData/akoumparouli/hf_gemma_38m/")
+        config = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
 
         model = NeMoAutoModelForCausalLM.from_config(config, attn_implementation="eager")
         assert model.config.nemo_version == __version__
@@ -113,7 +113,7 @@ class TestNeMoAutoModelForCausalLM:
                 side_effect=[model1, model2],  # first, then retry
             ) as mock_from_pretrained,
         ):
-            returned = NeMoAutoModelForCausalLM.from_pretrained("/home/TestData/akoumparouli/hf_gemma_38m/")
+            returned = NeMoAutoModelForCausalLM.from_pretrained("hf-internal-testing/tiny-random-gpt2")
             assert returned.config["nemo_version"] == __version__
 
         # _patch_liger_kernel called twice, first with ligand=True, then False
@@ -133,7 +133,7 @@ class TestNeMoAutoModelForCausalLM:
             patch_calls.append(model)
             raise RuntimeError("boom")
 
-        cfg = AutoConfig.from_pretrained("/home/TestData/akoumparouli/hf_gemma_38m/")
+        cfg = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
 
         with (
             patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", True),
@@ -187,7 +187,7 @@ class TestNeMoAutoModelForCausalLM:
         ):
             # Test the exception path by starting with flash_attention_2
             returned = NeMoAutoModelForCausalLM.from_pretrained(
-                "/home/TestData/akoumparouli/hf_gemma_38m/",
+                "hf-internal-testing/tiny-random-gpt2",
                 attn_implementation="flash_attention_2"
             )
             assert returned.config["nemo_version"] == __version__
@@ -226,7 +226,7 @@ class TestNeMoAutoModelForCausalLM:
             # Test that the ValueError is re-raised
             with pytest.raises(ValueError, match="Some other error not related to attention"):
                 NeMoAutoModelForCausalLM.from_pretrained(
-                    "/home/TestData/akoumparouli/hf_gemma_38m/",
+                    "hf-internal-testing/tiny-random-gpt2",
                     attn_implementation="flash_attention_2"
                 )
 
@@ -270,7 +270,7 @@ class TestNeMoAutoModelForCausalLM:
             ) as mock_from_pretrained,
         ):
             returned = NeMoAutoModelForCausalLM.from_pretrained(
-                "/home/TestData/akoumparouli/hf_gemma_38m/",
+                "hf-internal-testing/tiny-random-gpt2",
                 attn_implementation="flash_attention_2"
             )
             assert returned.config["nemo_version"] == __version__
@@ -316,7 +316,7 @@ class TestNeMoAutoModelForCausalLM:
                 # Second call with fallback (eager) - should succeed
                 return model2
 
-        cfg = AutoConfig.from_pretrained("/home/TestData/akoumparouli/hf_gemma_38m/")
+        cfg = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
 
         with (
             patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
@@ -383,7 +383,7 @@ class TestNeMoAutoModelForImageTextToText:
             mock_model.config = Mock()
             mock_from_config.return_value = mock_model
 
-            config = AutoConfig.from_pretrained("/home/TestData/akoumparouli/hf_gemma_38m/")
+            config = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
 
             # Test warning when HAS_LIGER_KERNEL is False
             with caplog.at_level(logging.WARNING):
@@ -473,7 +473,7 @@ class TestNeMoAutoModelForImageTextToText:
             patch_calls.append(model)
             raise RuntimeError("boom")
 
-        cfg = AutoConfig.from_pretrained("/home/TestData/akoumparouli/hf_gemma_38m/")
+        cfg = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
 
         with (
             patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", True),
@@ -501,7 +501,7 @@ class TestNeMoAutoModelForImageTextToText:
             patch_calls.append(model)
             raise RuntimeError("boom")
 
-        cfg = AutoConfig.from_pretrained("/home/TestData/akoumparouli/hf_gemma_38m/")
+        cfg = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
 
         with (
             patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", True),
@@ -781,7 +781,7 @@ class TestNeMoAutoModelFP8Integration:
 
             # Should work fine without fp8_config - no FP8 will be applied
             result = NeMoAutoModelForCausalLM.from_pretrained(
-                "/home/TestData/akoumparouli/hf_gemma_38m/",
+                "hf-internal-testing/tiny-random-gpt2",
                 fp8_config=None
             )
             
@@ -790,7 +790,7 @@ class TestNeMoAutoModelFP8Integration:
     
     def test_from_config_without_fp8_config_works(self):
         """Test that from_config works normally without fp8_config."""
-        config = AutoConfig.from_pretrained("/home/TestData/akoumparouli/hf_gemma_38m/")
+        config = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
         
         with (
             patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
@@ -828,7 +828,7 @@ class TestNeMoAutoModelFP8Integration:
             mock_apply_fp8.return_value = mock_model
 
             result = NeMoAutoModelForCausalLM.from_pretrained(
-                "/home/TestData/akoumparouli/hf_gemma_38m/",
+                "hf-internal-testing/tiny-random-gpt2",
                 fp8_config=fp8_config
             )
 
@@ -842,7 +842,7 @@ class TestNeMoAutoModelFP8Integration:
     
     def test_from_config_with_fp8_config_object(self):
         """Test from_config with FP8Config object."""
-        config = AutoConfig.from_pretrained("/home/TestData/akoumparouli/hf_gemma_38m/")
+        config = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
         fp8_config = FP8Config(
             recipe_name="rowwise",
             emulate=True,
@@ -892,7 +892,7 @@ class TestNeMoAutoModelFP8Integration:
             mock_apply_fp8.return_value = mock_model
 
             result = NeMoAutoModelForCausalLM.from_pretrained(
-                "/home/TestData/akoumparouli/hf_gemma_38m/",
+                "hf-internal-testing/tiny-random-gpt2",
                 fp8_config=fp8_config
             )
 
@@ -939,7 +939,7 @@ class TestNeMoAutoModelFP8Integration:
             mock_apply_fp8.return_value = mock_model
 
             result = NeMoAutoModelForCausalLM.from_pretrained(
-                "/home/TestData/akoumparouli/hf_gemma_38m/",
+                "hf-internal-testing/tiny-random-gpt2",
                 fp8_config=mock_dict_obj
             )
 
@@ -984,7 +984,7 @@ class TestNeMoAutoModelFP8Integration:
                 mock_apply_fp8.return_value = mock_model
 
                 result = NeMoAutoModelForCausalLM.from_pretrained(
-                    "/home/TestData/akoumparouli/hf_gemma_38m/",
+                    "hf-internal-testing/tiny-random-gpt2",
                     fp8_config=fp8_config
                 )
 
@@ -1004,7 +1004,7 @@ class TestNeMoAutoModelFP8Integration:
 
             # Should work fine without fp8_config - no FP8 should be applied
             result = NeMoAutoModelForCausalLM.from_pretrained(
-                "/home/TestData/akoumparouli/hf_gemma_38m/",
+                "hf-internal-testing/tiny-random-gpt2",
                 fp8_config=None
             )
 
@@ -1033,7 +1033,7 @@ class TestNeMoAutoModelFP8Integration:
 
             with patch('logging.warning') as mock_warning:
                 result = NeMoAutoModelForCausalLM.from_pretrained(
-                    "/home/TestData/akoumparouli/hf_gemma_38m/",
+                    "hf-internal-testing/tiny-random-gpt2",
                     fp8_config=fp8_config
                 )
 
