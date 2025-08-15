@@ -117,6 +117,7 @@ def _patch_liger_kernel(model):
         del model
         raise RuntimeError("Failed to patch model")
 
+
 def _get_next_fallback_attn(attn_implementation: str) -> str:
     """
     Get the next attention implementation in the priority list, in reverse order.
@@ -140,9 +141,10 @@ def _get_next_fallback_attn(attn_implementation: str) -> str:
     ]
     if attn_implementation in priorities:
         pos = priorities.index(attn_implementation)
-        return priorities[max(0, pos-1)]
+        return priorities[max(0, pos - 1)]
     else:
         return priorities[0]
+
 
 class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
     """
