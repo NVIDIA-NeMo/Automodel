@@ -14,6 +14,7 @@
 
 import logging
 import os
+import sys
 from functools import partial
 from logging import Filter, LogRecord
 from typing import Callable, Optional, Union
@@ -45,6 +46,56 @@ class RankFilter(logging.Filter):
                 logging.disable(logging.CRITICAL)
                 return False
         return True
+
+
+# ANSI color codes for log levels
+_COLOR_RESET = "\x1b[0m"
+_LEVEL_TO_COLOR = {
+    logging.DEBUG: "\x1b[36m",  # cyan
+    logging.INFO: "\x1b[32m",  # green
+    logging.WARNING: "\x1b[33m",  # yellow
+    logging.ERROR: "\x1b[31m",  # red
+    logging.CRITICAL: "\x1b[31;1m",  # bright/bold red
+}
+
+
+class ColorFormatter(logging.Formatter):
+    """Logging formatter that colorizes the level name and includes date/time.
+
+    The date is included via asctime with a default format of YYYY-MM-DD HH:MM:SS.
+    Colors can be disabled by setting the NO_COLOR env var, or forced with FORCE_COLOR.
+    """
+
+    def __init__(self, fmt: str | None = None, datefmt: str | None = None, use_color: bool = True):
+        if fmt is None:
+            fmt = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+        if datefmt is None:
+            datefmt = "%Y-%m-%d %H:%M:%S"
+        super().__init__(fmt=fmt, datefmt=datefmt)
+        self.use_color = bool(use_color) and self._stream_supports_color()
+
+    def _stream_supports_color(self) -> bool:
+        if os.getenv("FORCE_COLOR"):
+            return True
+        if os.getenv("NO_COLOR"):
+            return False
+        try:
+            return (hasattr(sys.stderr, "isatty") and sys.stderr.isatty()) or (
+                hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+            )
+        except Exception:
+            return False
+
+    def format(self, record: LogRecord) -> str:
+        original_levelname = record.levelname
+        if self.use_color:
+            color = _LEVEL_TO_COLOR.get(record.levelno)
+            if color:
+                record.levelname = f"{color}{record.levelname}{_COLOR_RESET}"
+        try:
+            return super().format(record)
+        finally:
+            record.levelname = original_levelname
 
 
 def warning_filter(record: LogRecord) -> bool:
@@ -95,6 +146,28 @@ def add_filter_to_all_loggers(filter: Union[Filter, Callable[[LogRecord], bool]]
         logger.addFilter(filter)
 
 
+def _ensure_root_handler_with_formatter(formatter: logging.Formatter) -> None:
+    """Ensure the root logger has at least one StreamHandler with the given formatter.
+
+    If handlers already exist on the root logger, set their formatter to the provided
+    formatter. Otherwise, create a StreamHandler, attach the formatter and RankFilter,
+    and add it to the root logger.
+    """
+    root = logging.getLogger()
+    if not root.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(formatter)
+        handler.addFilter(RankFilter())
+        root.addHandler(handler)
+    else:
+        for handler in root.handlers:
+            try:
+                handler.setFormatter(formatter)
+            except Exception:
+                # Best-effort; skip handlers that don't accept formatters
+                pass
+
+
 def setup_logging(
     logging_level: int = logging.INFO,
     filter_warning: bool = True,
@@ -113,19 +186,13 @@ def setup_logging(
     2. `logging_level` argument
     3. Default: `logging.INFO`
 
-    Args:
-        logging_level: The desired logging level (e.g., logging.INFO, logging.DEBUG).
-        filter_warning: If True, adds a filter to suppress WARNING level messages.
-        modules_to_filter: An optional list of module name prefixes to filter out.
-        set_level_for_all_loggers: If True, sets the logging level for all existing
-                                   loggers. If False (default), only sets the level
-                                   for the root logger and loggers starting with 'nemo'.
+    Also configures a colorized formatter that includes the date/time.
     """
     env_logging_level = os.getenv("LOGGING_LEVEL", None)
     if env_logging_level is not None:
         logging_level = int(env_logging_level)
 
-    logger.info(f"Setting logging level to {logging_level}")
+    # Set levels on root and optionally all other known loggers first
     logging.getLogger().setLevel(logging_level)
 
     for _logger_name in logging.root.manager.loggerDict:
@@ -133,6 +200,11 @@ def setup_logging(
             _logger = logging.getLogger(_logger_name)
             _logger.setLevel(logging_level)
 
+    # Install formatter (includes date) and ensure a handler exists
+    formatter = ColorFormatter()
+    _ensure_root_handler_with_formatter(formatter)
+
+    # Filters
     if filter_warning:
         add_filter_to_all_loggers(warning_filter)
     add_filter_to_all_loggers(RankFilter())
@@ -141,3 +213,5 @@ def setup_logging(
         h.addFilter(RankFilter())
     if modules_to_filter:
         add_filter_to_all_loggers(partial(module_filter, modules_to_filter=modules_to_filter))
+
+    logger.info(f"Setting logging level to {logging_level}")

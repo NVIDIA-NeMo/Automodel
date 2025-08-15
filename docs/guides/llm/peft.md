@@ -289,6 +289,7 @@ In addition, the model checkpoint is saved under the `checkpoints/` directory, w
 $ tree checkpoints/epoch_0_step_10/
 checkpoints/epoch_0_step_10/
 ├── dataloader.pt
+├── config.yaml
 ├── model
 │   ├── adapter_config.json
 │   ├── adapter_model.safetensors

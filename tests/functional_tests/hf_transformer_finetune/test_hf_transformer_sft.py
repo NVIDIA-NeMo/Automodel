@@ -19,6 +19,7 @@ HF_TRANSFORMER_SFT_FILENAME = "L2_HF_Transformer_SFT.sh"
 HF_TRANSFORMER_SFT_MegatronFSDP_FILENAME = "L2_HF_Transformer_SFT_megatronfsdp.sh"
 HF_TRANSFORMER_PEFT_FILENAME = "L2_HF_Transformer_PEFT.sh"
 HF_TRANSFORMER_PEFT_MegatronFSDP_FILENAME = "L2_HF_Transformer_PEFT_megatronfsdp.sh"
+HF_TRANSFORMER_PEFT_NO_TOKENIZER_FILENAME = "L2_HF_Transformer_PEFT_no_tokenizer.sh"
 
 
 class TestHFTransformerFinetune:
@@ -31,5 +32,8 @@ class TestHFTransformerFinetune:
     def test_hf_transformer_peft(self):
         run_test_script(TEST_FOLDER, HF_TRANSFORMER_PEFT_FILENAME)
 
-    def test_hf_transformer_peft_megatronfsdp(self):
+    def test_hf_transformer_peft_nvfsdp(self):
         run_test_script(TEST_FOLDER, HF_TRANSFORMER_PEFT_MegatronFSDP_FILENAME)
+
+    def test_hf_transformer_peft_no_tokenizer(self):
+        run_test_script(TEST_FOLDER, HF_TRANSFORMER_PEFT_NO_TOKENIZER_FILENAME)

@@ -51,6 +51,6 @@ coverage run \
     $TEST_DIR \
     -o log_cli=true \
     -o log_cli_level=INFO \
-    -vs -m "not pleasefixme" --tb=short \
+    -vs -m "not pleasefixme" --tb=short -rA \
     $ADDITIONAL_ARGS
-coverage combine
+coverage combine -q
