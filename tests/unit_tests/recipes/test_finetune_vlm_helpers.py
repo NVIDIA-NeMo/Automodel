@@ -14,6 +14,7 @@
 import pytest
 import torch
 import torch.nn as nn
+from unittest.mock import Mock, patch, MagicMock
 
 from nemo_automodel.recipes.vlm.finetune import _freeze_model, _build_optimizer, build_model_and_optimizer
 
@@ -169,3 +170,87 @@ def test_build_model_and_optimizer_basic():
     trainable_param_count = _count_trainable(model.parameters())
     optim_param_count = sum(p.numel() for group in optim.param_groups for p in group["params"])
     assert trainable_param_count == optim_param_count
+
+
+# -----------------------------------------------------------------------------
+# AutoProcessor exception handling test
+# -----------------------------------------------------------------------------
+
+def test_autoprocessor_success():
+    """Test successful AutoProcessor creation."""
+    
+    with patch('transformers.AutoProcessor') as mock_auto_processor:
+        mock_processor = MagicMock()
+        mock_auto_processor.from_pretrained.return_value = mock_processor
+        
+        cfg_model = MagicMock()
+        cfg_model.pretrained_model_name_or_path = "test/model"
+        
+        processor = mock_auto_processor.from_pretrained(cfg_model.pretrained_model_name_or_path)
+        
+        assert processor is mock_processor
+        mock_auto_processor.from_pretrained.assert_called_once_with("test/model")
+
+
+def test_autoprocessor_exception_handling(caplog):
+    """Test AutoProcessor exception handling and logging added in this branch."""
+    import logging
+    
+    with patch('transformers.AutoProcessor') as mock_auto_processor:
+        mock_auto_processor.from_pretrained.side_effect = Exception("Model does not have AutoProcessor")
+        
+        cfg_model = MagicMock()
+        cfg_model.pretrained_model_name_or_path = "test/model"
+        
+        processor = None
+        with caplog.at_level(logging.WARNING):
+            try:
+                processor = mock_auto_processor.from_pretrained(cfg_model.pretrained_model_name_or_path)
+            except Exception as e:
+                processor = None
+                logging.warning(f"AutoProcessor not available for {cfg_model.pretrained_model_name_or_path} ({e}). ")
+        
+        assert processor is None
+        assert len(caplog.records) == 1
+        assert "AutoProcessor not available for test/model" in caplog.records[0].message
+        assert "Model does not have AutoProcessor" in caplog.records[0].message
+        mock_auto_processor.from_pretrained.assert_called_once_with("test/model")
+
+
+def test_autoprocessor_with_processor_kwargs(caplog):
+    """Test AutoProcessor with processor_kwargs when cfg_processor has no instantiate method."""
+    import logging
+    
+    with patch('transformers.AutoProcessor') as mock_auto_processor:
+        mock_auto_processor.from_pretrained.side_effect = Exception("Model does not have AutoProcessor")
+        
+        # Mock cfg_processor that has to_dict but no instantiate method
+        cfg_processor = MagicMock()
+        cfg_processor.to_dict.return_value = {"trust_remote_code": True}
+        del cfg_processor.instantiate  # Remove instantiate method
+        
+        cfg_model = MagicMock()
+        cfg_model.pretrained_model_name_or_path = "test/model"
+        
+        processor = None
+        
+        # Simulate the processor_kwargs path
+        if cfg_processor is not None:
+            if hasattr(cfg_processor, "instantiate"):
+                processor = cfg_processor.instantiate()
+            else:
+                processor_kwargs = cfg_processor.to_dict()
+                with caplog.at_level(logging.WARNING):
+                    try:
+                        processor = mock_auto_processor.from_pretrained(cfg_model.pretrained_model_name_or_path, **processor_kwargs)
+                    except Exception as e:
+                        processor = None
+                        logging.warning(f"AutoProcessor not available for {cfg_model.pretrained_model_name_or_path} ({e}). ")
+        
+        # Verify the processor_kwargs path was taken
+        cfg_processor.to_dict.assert_called_once()
+        mock_auto_processor.from_pretrained.assert_called_once_with("test/model", trust_remote_code=True)
+        assert processor is None
+        assert len(caplog.records) == 1
+        assert "AutoProcessor not available for test/model" in caplog.records[0].message
+

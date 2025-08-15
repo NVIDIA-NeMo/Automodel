@@ -159,3 +159,14 @@ def test_process_text_batch_with_images():
     assert batch["pixel_values"].dtype == torch.bfloat16
     # unchanged fields still present
     assert "input_ids" in batch
+
+
+def test_extract_skipped_token_ids_with_none_processor():
+    """Test that extract_skipped_token_ids handles None processor gracefully."""
+    ids = extract_skipped_token_ids(None)
+    
+    # Should return empty IntTensor when processor is None
+    assert isinstance(ids, torch.Tensor)
+    assert ids.dtype == torch.int32
+    assert len(ids) == 0
+    assert ids.tolist() == []
