@@ -80,6 +80,7 @@ def _patch_attention(obj, sdpa_method=None):
                 return func(self, *args, **kwargs)
 
         wrapper.__doc__ = "SDPA kernel patch\n" + inspect.getdoc(method)
+        wrapper._sdpa_backend_name = sdpa_method[0].name if sdpa_method else None
         return types.MethodType(wrapper, method.__self__)  # re-bind
 
     obj.forward = patch_method(obj.forward)

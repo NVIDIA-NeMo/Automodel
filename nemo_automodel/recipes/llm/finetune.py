@@ -587,6 +587,14 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
 
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels, loss_mask)
+        # Remove attention_mask for sdpa.flash
+        if any(
+            getattr(module.forward, '_sdpa_backend_name', None) == 'FLASH_ATTENTION'
+            for name, module in self.model.named_modules()
+            if hasattr(module, 'forward')
+        ):
+            batch.pop("attention_mask", None)
+        
         with train_ctx():
             if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                 # use num_logits_to_keep to avoid full logits matrix in memory
