@@ -39,7 +39,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.llm.packed_sequence import PackedSequence
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.nvfsdp import NVFSDPManager
+from nemo_automodel.components.distributed.megatronfsdp import MegatronFSDPManager
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
@@ -135,9 +135,9 @@ def build_model_and_optimizer(
     print_trainable_parameters(model)
 
     if callable(getattr(model_wrapper, "parallelize", None)):
-        # FSDP2 and nvFSDP should already be on the correct device
-        if isinstance(model_wrapper, NVFSDPManager):
-            # nvFSDP instantiate optimizer inside parallelize_function
+        # FSDP2 and MegatronFSDP should already be on the correct device
+        if isinstance(model_wrapper, MegatronFSDPManager):
+            # MegatronFSDP instantiate optimizer inside parallelize_function
             trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
             assert len(trainable_params) > 0, "trainable_params cannot be empty"
             if tp_size > 1:
@@ -669,7 +669,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # TODO: TP WAR
                 grad_norm = 0.0
 
-            # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
+            # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
             # self.model.finish_grad_sync()
 
             self.optimizer.step()
@@ -686,7 +686,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             if self.lr_scheduler is not None:
                 self.lr_scheduler.step(1)
 
-            # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
+            # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
             # self.model.install_optimized_model_weights()
             # self.model.zero_grad_buffer()
 
