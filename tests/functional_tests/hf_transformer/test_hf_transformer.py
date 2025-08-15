@@ -17,7 +17,7 @@ from tests.utils.test_utils import run_test_script
 TEST_FOLDER = "hf_transformer"
 HF_TRANSFORMER_FUSED_CE_SFT_FILENAME = "L2_HF_Transformer_Fused_CE_SFT.sh"
 HF_TRANSFORMER_PACKED_SEQUENCE_FILENAME = "L2_HF_Transformer_Packed_Sequence.sh"
-
+HF_TRANSFORMER_LLM_META_FILENAME = "L2_HF_Transformer_LLM_Meta.sh"
 
 class TestHFTransformer:
     def test_hf_transformer_fused_ce_sft(self):
@@ -25,3 +25,6 @@ class TestHFTransformer:
 
     def test_hf_transformer_packed_sequence(self):
         run_test_script(TEST_FOLDER, HF_TRANSFORMER_PACKED_SEQUENCE_FILENAME)
+
+    def test_hf_transformer_llm_meta(self):
+        run_test_script(TEST_FOLDER, HF_TRANSFORMER_LLM_META_FILENAME)
