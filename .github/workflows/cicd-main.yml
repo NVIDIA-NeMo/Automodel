@@ -58,8 +58,8 @@ jobs:
 
       - name: Run ruff
         run: |
-          uv ruff check . --verbose
-          uv ruff format --check . --verbose
+          uv run ruff check . --verbose
+          uv run ruff format --check . --verbose
 
   import_linting:
     runs-on: ubuntu-latest
@@ -87,7 +87,7 @@ jobs:
 
       - name: Run import-linter
         run: |
-          uv lint-imports --debug --verbose --no-cache
+          uv run lint-imports --debug --verbose --no-cache
 
   Nemo_Linting_Test:
     needs: [linting, import_linting]
