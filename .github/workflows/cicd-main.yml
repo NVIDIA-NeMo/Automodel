@@ -58,6 +58,7 @@ jobs:
 
       - name: Run ruff
         run: |
+          source ./venv/bin/activate
           uv run ruff check . --verbose
           uv run ruff format --check . --verbose
 
@@ -87,6 +88,7 @@ jobs:
 
       - name: Run import-linter
         run: |
+          source ./venv/bin/activate
           uv run lint-imports --debug --verbose --no-cache
 
   Nemo_Linting_Test:
