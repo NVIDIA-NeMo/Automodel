@@ -118,6 +118,34 @@ def _patch_liger_kernel(model):
         raise RuntimeError("Failed to patch model")
 
 
+def _get_next_fallback_attn(attn_implementation: str) -> str:
+    """
+    Get the next attention implementation in the priority list, in reverse order.
+
+    If a model does not support a given attention implementation, the next
+    implementation in the priority list is returned.
+
+    If the current attention implementation is not in the priority list, it uses eager.
+
+    Args:
+        attn_implementation (str): The current attention implementation.
+
+    Returns:
+        str: The next attention implementation in the priority list.
+    """
+    priorities = [
+        "eager",
+        "sdpa",
+        "flash_attention_2",
+        "flash_attention_3",
+    ]
+    if attn_implementation in priorities:
+        pos = priorities.index(attn_implementation)
+        return priorities[max(0, pos - 1)]
+    else:
+        return priorities[0]
+
+
 class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
     """
     Drop-in replacement for ``_BaseAutoModelClass`` that includes custom-kernels.
@@ -213,6 +241,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             )
 
         # load model
+        model = None
         try:
             name = cls.__name__
             if name.startswith("NeMo"):
@@ -227,8 +256,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             cls.__name__ = name
         except ValueError as e:
             if "does not support" in str(e):
-                logging.warning("Falling back to eager attention.")
-                return _retry(attn_implementation="eager")
+                if model is not None:
+                    del model
+                attn_implementation = _get_next_fallback_attn(attn_implementation)
+                logging.warning("Falling back to {} attention.".format(attn_implementation))
+                return _retry(attn_implementation=attn_implementation)
             raise e
 
         # Kernel patching

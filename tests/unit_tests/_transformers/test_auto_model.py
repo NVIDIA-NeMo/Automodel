@@ -24,11 +24,18 @@ from transformers import AutoConfig
 from nemo_automodel.components._transformers.auto_model import (
     NeMoAutoModelForCausalLM,
     NeMoAutoModelForImageTextToText,
+    _get_next_fallback_attn,
     _patch_attention,
 )
 from nemo_automodel import __version__
 from nemo_automodel.components.quantization.fp8 import FP8Config
 
+HAS_LIGER_KERNEL = False
+try:
+    import liger_kernel
+    HAS_LIGER_KERNEL = True
+except Exception:
+    pass
 
 class TestNeMoAutoModelForCausalLM:
     """Test cases for NeMoAutoModelForCausalLM class."""
@@ -142,6 +149,204 @@ class TestNeMoAutoModelForCausalLM:
         assert patch_calls == [model1]
         assert mock_from_config.call_count == 2
         assert returned is model2
+
+    def test_from_pretrained_valueerror_attention_fallback(self, caplog):
+        """Test ValueError exception handling when attention implementation is not supported.
+
+        When super().from_pretrained() raises ValueError with "does not support" message,
+        the method should:
+        1. Delete the model if it exists
+        2. Fall back to the next attention implementation
+        3. Log a warning
+        4. Retry with the fallback attention implementation
+        """
+        # Create two model instances - first for failed attempt, second for successful retry
+        model1, model2 = Mock(name="failed_model"), Mock(name="success_model")
+        model1.config = {}
+        model2.config = {}
+
+        # Mock the call sequence: first call fails with ValueError, second succeeds
+        def mock_from_pretrained_side_effect(*args, **kwargs):
+            # Check the attn_implementation parameter to determine which call this is
+            attn_impl = kwargs.get("attn_implementation", "sdpa")
+            if attn_impl == "flash_attention_2":
+                # First call with flash_attention_2 - should fail
+                raise ValueError("Model does not support flash_attention_2 attention implementation")
+            else:
+                # Second call with fallback (sdpa) - should succeed
+                return model2
+
+        with (
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch.object(
+                transformers.AutoModelForCausalLM,
+                "from_pretrained",
+                side_effect=mock_from_pretrained_side_effect
+            ) as mock_from_pretrained,
+            caplog.at_level(logging.WARNING)
+        ):
+            # Test the exception path by starting with flash_attention_2
+            returned = NeMoAutoModelForCausalLM.from_pretrained(
+                "hf-internal-testing/tiny-random-gpt2",
+                attn_implementation="flash_attention_2"
+            )
+            assert returned.config["nemo_version"] == __version__
+
+        # Verify the warning was logged
+        assert "Falling back to sdpa attention." in caplog.text
+
+        # Verify from_pretrained was called twice (first failed, second succeeded)
+        assert mock_from_pretrained.call_count == 2 + int(HAS_LIGER_KERNEL)
+
+        # Verify the final returned model is the successful one
+        assert returned is model2
+
+        # Verify the calls were made with correct attention implementations
+        call_args_list = mock_from_pretrained.call_args_list
+        assert call_args_list[0][1]["attn_implementation"] == "flash_attention_2"
+        assert call_args_list[1][1]["attn_implementation"] == "sdpa"
+
+    def test_from_pretrained_valueerror_non_attention_reraises(self):
+        """Test that ValueError not related to attention implementation is re-raised.
+
+        When super().from_pretrained() raises ValueError that doesn't contain
+        "does not support", the exception should be re-raised without fallback.
+        """
+        def mock_from_pretrained_side_effect(*args, **kwargs):
+            raise ValueError("Some other error not related to attention")
+
+        with (
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch.object(
+                transformers.AutoModelForCausalLM,
+                "from_pretrained",
+                side_effect=mock_from_pretrained_side_effect
+            ) as mock_from_pretrained,
+        ):
+            # Test that the ValueError is re-raised
+            with pytest.raises(ValueError, match="Some other error not related to attention"):
+                NeMoAutoModelForCausalLM.from_pretrained(
+                    "hf-internal-testing/tiny-random-gpt2",
+                    attn_implementation="flash_attention_2"
+                )
+
+        # Verify from_pretrained was called only once (no retry)
+        assert mock_from_pretrained.call_count == 1
+
+    def test_from_pretrained_model_deletion_on_exception(self):
+        """Test that partially created model is properly deleted when exception occurs.
+
+        When super().from_pretrained() raises ValueError with "does not support" and
+        a model object was created, it should be deleted before retrying.
+        """
+        model1, model2 = Mock(name="failed_model"), Mock(name="success_model")
+        model1.config = {}
+        model2.config = {}
+
+        # Track which models are created and when deletion logic is triggered
+        models_created = []
+        call_count = 0
+
+        def mock_from_pretrained_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            attn_impl = kwargs.get("attn_implementation", "sdpa")
+
+            if call_count == 1 and attn_impl == "flash_attention_2":
+                # First call - create model1 and add to tracking, then raise exception
+                models_created.append(model1)
+                raise ValueError("Model does not support flash_attention_2 attention implementation")
+            else:
+                # Second call - succeed with model2
+                models_created.append(model2)
+                return model2
+
+        with (
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch.object(
+                transformers.AutoModelForCausalLM,
+                "from_pretrained",
+                side_effect=mock_from_pretrained_side_effect
+            ) as mock_from_pretrained,
+        ):
+            returned = NeMoAutoModelForCausalLM.from_pretrained(
+                "hf-internal-testing/tiny-random-gpt2",
+                attn_implementation="flash_attention_2"
+            )
+            assert returned.config["nemo_version"] == __version__
+
+        # Verify the method was called twice for retry
+        assert mock_from_pretrained.call_count == 2 + int(HAS_LIGER_KERNEL)
+
+        # Verify both models were created during the process
+        assert len(models_created) == 2 + int(HAS_LIGER_KERNEL)
+        assert models_created[0] is model1  # First attempt
+        assert models_created[1] is model2  # Successful retry
+
+        # Verify the final returned model is the successful one
+        assert returned is model2
+
+        # Verify the calls were made with correct attention implementations
+        call_args_list = mock_from_pretrained.call_args_list
+        assert call_args_list[0][1]["attn_implementation"] == "flash_attention_2"
+        assert call_args_list[1][1]["attn_implementation"] == "sdpa"
+
+    def test_from_config_valueerror_attention_fallback(self, caplog):
+        """Test ValueError exception handling in from_config when attention implementation is not supported.
+
+        When super().from_config() raises ValueError with "does not support" message,
+        the method should:
+        1. Fall back to eager attention implementation
+        2. Log a warning
+        3. Retry with the fallback attention implementation
+        """
+        # Create two model instances - first for failed attempt, second for successful retry
+        model1, model2 = Mock(name="failed_model"), Mock(name="success_model")
+        model1.config = {}
+        model2.config = {}
+
+        # Mock the call sequence: first call fails with ValueError, second succeeds
+        def mock_from_config_side_effect(*args, **kwargs):
+            # Check the attn_implementation parameter to determine which call this is
+            attn_impl = kwargs.get("attn_implementation", "flash_attention_2")
+            if attn_impl == "flash_attention_2":
+                # First call with flash_attention_2 - should fail
+                raise ValueError("Model does not support flash_attention_2 attention implementation")
+            else:
+                # Second call with fallback (eager) - should succeed
+                return model2
+
+        cfg = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
+
+        with (
+            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch.object(
+                transformers.AutoModelForCausalLM,
+                "from_config",
+                side_effect=mock_from_config_side_effect
+            ) as mock_from_config,
+            caplog.at_level(logging.WARNING)
+        ):
+            # Test the exception path by starting with flash_attention_2
+            returned = NeMoAutoModelForCausalLM.from_config(
+                cfg,
+                attn_implementation="flash_attention_2"
+            )
+            assert returned.config["nemo_version"] == __version__
+
+        # Verify the warning was logged
+        assert "Falling back to eager attention." in caplog.text
+
+        # Verify from_config was called twice (first failed, second succeeded)
+        assert mock_from_config.call_count == 2 + int(HAS_LIGER_KERNEL)
+
+        # Verify the final returned model is the successful one
+        assert returned is model2
+
+        # Verify the calls were made with correct attention implementations
+        call_args_list = mock_from_config.call_args_list
+        assert call_args_list[0][1]["attn_implementation"] == "flash_attention_2"
+        assert call_args_list[1][1]["attn_implementation"] == "eager"
 
 
 class TestNeMoAutoModelForImageTextToText:
@@ -391,6 +596,57 @@ class TestUtilityFunctions:
         # Should raise an AssertionError
         with pytest.raises(AssertionError):
             _assert_same_signature(func1, func2)
+
+    def test_get_next_fallback_attn_valid_priorities(self):
+        """Test _get_next_fallback_attn with valid attention implementations."""
+        # Test fallback from highest to lowest priority
+        assert _get_next_fallback_attn("flash_attention_3") == "flash_attention_2"
+        assert _get_next_fallback_attn("flash_attention_2") == "sdpa"
+        assert _get_next_fallback_attn("sdpa") == "eager"
+
+        # Test that eager falls back to itself (lowest priority)
+        assert _get_next_fallback_attn("eager") == "eager"
+
+    def test_get_next_fallback_attn_invalid_implementations(self):
+        """Test _get_next_fallback_attn with invalid/unknown attention implementations."""
+        # Test various invalid implementations all fall back to eager
+        assert _get_next_fallback_attn("flash_attention_1") == "eager"
+        assert _get_next_fallback_attn("unknown_attention") == "eager"
+        assert _get_next_fallback_attn("custom_attention") == "eager"
+        assert _get_next_fallback_attn("") == "eager"
+        assert _get_next_fallback_attn("none") == "eager"
+        assert _get_next_fallback_attn("legacy_attention") == "eager"
+
+    @pytest.mark.parametrize("attn_impl,expected", [
+        ("flash_attention_3", "flash_attention_2"),
+        ("flash_attention_2", "sdpa"),
+        ("sdpa", "eager"),
+        ("eager", "eager"),
+        ("invalid", "eager"),
+        ("custom_impl", "eager"),
+        ("", "eager"),
+    ])
+    def test_get_next_fallback_attn_parametrized(self, attn_impl, expected):
+        """Parametrized test for _get_next_fallback_attn covering all scenarios."""
+        assert _get_next_fallback_attn(attn_impl) == expected
+
+    def test_get_next_fallback_attn_edge_cases(self):
+        """Test _get_next_fallback_attn with edge cases and special inputs."""
+        # Test with None (should be treated as unknown)
+        assert _get_next_fallback_attn(None) == "eager"
+
+        # Test case sensitivity (should be treated as unknown since not exact match)
+        assert _get_next_fallback_attn("EAGER") == "eager"
+        assert _get_next_fallback_attn("Flash_Attention_2") == "eager"
+        assert _get_next_fallback_attn("SDPA") == "eager"
+
+        # Test with whitespace (should be treated as unknown)
+        assert _get_next_fallback_attn(" eager ") == "eager"
+        assert _get_next_fallback_attn("sdpa ") == "eager"
+
+        # Test with numeric strings
+        assert _get_next_fallback_attn("123") == "eager"
+        assert _get_next_fallback_attn("0") == "eager"
 
 
 class DummyModel(torch.nn.Module):
