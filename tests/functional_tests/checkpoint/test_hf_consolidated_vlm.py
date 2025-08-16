@@ -518,7 +518,7 @@ def test_consolidated_vlm_checkpoint():
     assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
 
     # compare the recipe configs
-    with open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "config.yaml", "r") as f:
+    with open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_2_step_10" / "config.yaml", "r") as f:
         restored_config = yaml.safe_load(f)
     compare_configs(trainer.cfg.raw_config, restored_config)
 
