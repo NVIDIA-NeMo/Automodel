@@ -177,7 +177,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         use_sdpa_patching: bool = True,
         sdpa_method: Optional[List[SDPBackend]] = None,
         torch_dtype="auto",
-        attn_implementation: str = "sdpa",
+        attn_implementation: str = "flash_attention_2",
         fp8_config: Optional[object] = None,
         **kwargs,
     ) -> PreTrainedModel:
