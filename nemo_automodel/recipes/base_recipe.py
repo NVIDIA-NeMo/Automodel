@@ -29,9 +29,11 @@ from transformers.tokenization_utils import PreTrainedTokenizerBase
 from nemo_automodel.components.checkpoint.checkpointing import (
     load_model,
     load_optimizer,
+    save_config,
     save_model,
     save_optimizer,
 )
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 
@@ -110,6 +112,7 @@ class BaseRecipe:
             or has_load_restore_state(value)
             or is_tokenizer(value)
             or is_lr_scheduler(value)
+            or isinstance(value, ConfigNode)
         )
 
         if should_track and not any(substr in key.lower() for substr in ("val", "eval", "test")):
@@ -138,13 +141,15 @@ class BaseRecipe:
             print(f"Saving checkpoint to {path}", flush=True)
 
         # TODO(@adil-a): Change this when we create a LR scheduler class
-        model, optimizer, scheduler, tokenizer = None, None, None, None
+        model, optimizer, scheduler, tokenizer, config = None, None, None, None, None
 
         for key in self.__dict__["__state_tracked"]:
             if isinstance(getattr(self, key), nn.Module):
                 model = getattr(self, key)
             elif isinstance(getattr(self, key), Optimizer):
                 optimizer = getattr(self, key)
+            elif isinstance(getattr(self, key), ConfigNode):
+                config = getattr(self, key)
             elif is_lr_scheduler(getattr(self, key)):
                 scheduler = getattr(self, key)
             elif is_tokenizer(getattr(self, key)):
@@ -160,6 +165,7 @@ class BaseRecipe:
 
         save_model(model, path, self.checkpoint_config, peft_config=self.peft_config, tokenizer=tokenizer)
         save_optimizer(optimizer, model, path, scheduler)
+        save_config(config.raw_config, path)
 
     def load_checkpoint(self, restore_from: str | None = None):
         """
@@ -192,8 +198,8 @@ class BaseRecipe:
                 optimizer = getattr(self, key)
             elif is_lr_scheduler(getattr(self, key)):
                 scheduler = getattr(self, key)
-            elif is_tokenizer(getattr(self, key)):
-                # we don't need to load the tokenizer from the checkpoint
+            elif is_tokenizer(getattr(self, key)) or isinstance(getattr(self, key), ConfigNode):
+                # we don't need to load the tokenizer or config from the checkpoint
                 # we only save the tokenizer for consolidated checkpoints for downstream use
                 continue
             else:

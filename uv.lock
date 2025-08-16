@@ -1115,6 +1115,7 @@ build = [
 ]
 dev = [
     { name = "cut-cross-entropy" },
+    { name = "nvfsdp" },
 ]
 docs = [
     { name = "myst-parser" },
@@ -1128,9 +1129,6 @@ docs = [
 linting = [
     { name = "pre-commit" },
     { name = "ruff" },
-]
-nvfsdp = [
-    { name = "nvfsdp" },
 ]
 test = [
     { name = "coverage" },
@@ -1166,7 +1164,10 @@ build = [
     { name = "setuptools" },
     { name = "torch" },
 ]
-dev = [{ name = "cut-cross-entropy", git = "https://github.com/apple/ml-cross-entropy.git?rev=87a86ab" }]
+dev = [
+    { name = "cut-cross-entropy", git = "https://github.com/apple/ml-cross-entropy.git?rev=87a86ab" },
+    { name = "nvfsdp", git = "https://github.com/NVIDIA-NeMo/nvFSDP.git?rev=d97136886a65d70f298a4b361571ac75c20198af" },
+]
 docs = [
     { name = "myst-parser" },
     { name = "nvidia-sphinx-theme" },
@@ -1179,7 +1180,6 @@ linting = [
     { name = "pre-commit", specifier = ">=4.2.0" },
     { name = "ruff", specifier = "~=0.9.0" },
 ]
-nvfsdp = [{ name = "nvfsdp", git = "https://github.com/NVIDIA-NeMo/nvFSDP.git?rev=d97136886a65d70f298a4b361571ac75c20198af" }]
 test = [
     { name = "coverage" },
     { name = "peft" },

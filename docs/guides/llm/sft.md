@@ -146,6 +146,7 @@ The recipe ensures stateless, config-driven orchestration where core components 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+  is_meta_device: false
 
 # As mentioned earlier, we are using the SQuAD dataset. NeMo Automodel provides the make_squad_dataset
 # function which formats the prepares the dataset (e.g., formatting). We are using the "train"
@@ -229,6 +230,11 @@ running inference, the adapter and base model weights need to match
 those used for training.
 :::
 
+## Loading Large Models
+The common model loading pipeline when doing distributed training is that each GPU will load the full model onto it and then hold the shard it needs. However, this is an issue when we want to train models that are larger than the memory of a single GPU. For example, a 70B parameter model takes up 140GB for the model parameters assuming BF16 data type (2 bytes per parameter). Most popular GPUs have a limit of 80GB, which means we cannot directly load the full model onto the GPU.
+
+In these scenarios, you can pass `is_meta_device: true` in the model config. The model will then be instantiated using [PyTorch's Meta device](https://docs.pytorch.org/docs/stable/meta.html) which loads no data, but stores all other parameter metadata necessary for sharding the model. Once the model is sharded, the model weights will be populated by only loading the weights required by the respective model shard.
+
 ## Run the Fine-Tune Recipe
 Assuming the above `yaml` is saved in a file named `sft_guide.yaml`, you can run the fine-tuning workflow either using the Automodel CLI or by directly invoking the recipe Python script.
 
@@ -284,6 +290,7 @@ In addition, the model checkpoint is saved under the `checkpoints/` directory, w
 ``` bash
 $ tree checkpoints/epoch_0_step_10/
 checkpoints/epoch_0_step_10/
+├── config.yaml
 ├── dataloader.pt
 ├── model
 │   ├── consolidated
@@ -292,7 +299,8 @@ checkpoints/epoch_0_step_10/
 │   │   ├── model.safetensors.index.json
 │   │   ├── special_tokens_map.json
 │   │   ├── tokenizer.json
-│   │   └── tokenizer_config.json
+│   │   ├── tokenizer_config.json
+│   │   └── generation_config.json
 │   ├── shard-00001-model-00001-of-00001.safetensors
 │   └── shard-00002-model-00001-of-00001.safetensors
 ├── optim
