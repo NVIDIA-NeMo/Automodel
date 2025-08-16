@@ -18,7 +18,7 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
-from typing import TYPE_CEHCKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 import torch.nn as nn
