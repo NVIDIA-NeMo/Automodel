@@ -21,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.optim import Optimizer
 from transformers.processing_utils import ProcessorMixin
@@ -41,6 +42,8 @@ try:
     import yaml as _yaml
 except Exception:
     _yaml = None
+from transformers.processing_utils import ProcessorMixin
+from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 
 def has_load_restore_state(object):
@@ -132,14 +135,25 @@ class BaseRecipe:
         """
         if not self.checkpoint_config.enabled:
             return
+        is_dist_initialized = torch.distributed.is_initialized()
+        is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
+
+        if not is_dist_initialized:
+            dp_group = None
+        elif self.device_mesh["cp"].size() > 1:
+            dp_group = self.device_mesh["dp_cp"].get_group()
+        else:
+            dp_group = self.device_mesh["dp"].get_group()
 
         path = self.checkpoint_config.checkpoint_dir
         path = os.path.join(path, f"epoch_{epoch}_step_{step}")
-        os.makedirs(path, exist_ok=True)
 
-        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        if is_rank_0:
+            assert not os.path.exists(path), f"Checkpoint directory {path} already exists"
+            os.makedirs(path, exist_ok=True)
             print(f"Saving checkpoint to {path}", flush=True)
-
+        if is_dist_initialized:
+            torch.distributed.barrier(dp_group)
         # TODO(@adil-a): Change this when we create a LR scheduler class
         model, optimizer, scheduler, tokenizer, config = None, None, None, None, None
 
@@ -155,17 +169,17 @@ class BaseRecipe:
             elif is_tokenizer(getattr(self, key)):
                 tokenizer = getattr(self, key)
             else:
-                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                if is_rank_0:
                     torch.save(
                         getattr(self, key).state_dict(),
                         os.path.join(path, f"{key}.pt"),
                     )
-                if torch.distributed.is_initialized():
-                    torch.distributed.barrier()
 
         save_model(model, path, self.checkpoint_config, peft_config=self.peft_config, tokenizer=tokenizer)
         save_optimizer(optimizer, model, path, scheduler)
         save_config(config.raw_config, path)
+        if is_dist_initialized:
+            torch.distributed.barrier(dp_group)
 
     def load_checkpoint(self, restore_from: str | None = None):
         """
@@ -326,6 +340,21 @@ class BaseRecipe:
         logging.info("Step scheduler:")
         for k, v in attrs.items():
             logging.info(f"- {k}: {v}")
+
+    def _get_dp_group(self):
+        if not self.device_mesh:
+            return None
+        elif self.device_mesh["cp"].size() > 1:
+            return self.device_mesh["dp_cp"].get_group()
+        else:
+            return self.device_mesh["dp"].get_group()
+
+    def _dp_allreduce(self, tensor, op=dist.ReduceOp.SUM):
+        dp_group = self._get_dp_group()
+        if dp_group is not None:
+            dp_group.allreduce(tensor.cuda(), op=op)
+            tensor = tensor.cpu()
+        return tensor
 
 
 def _find_latest_checkpoint(checkpoint_dir):
