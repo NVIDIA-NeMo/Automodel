@@ -16,6 +16,7 @@
 
 import glob
 import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +43,7 @@ from nemo_automodel.components.checkpoint.stateful_wrappers import (
 
 if TYPE_CHECKING:
     from peft import PeftConfig
+    from transformers.configuration_utils import PretrainedConfig
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 
@@ -135,7 +137,7 @@ def save_model(
         fqn_to_file_index_mapping = None
         if checkpoint_config.save_consolidated:
             # we first need to find the FQN -> .safetensors mapping
-            index_path = _get_safetensors_index_path(
+            index_path = get_safetensors_index_path(
                 checkpoint_config.model_cache_dir,
                 checkpoint_config.model_repo_id,
             )
@@ -170,6 +172,71 @@ def save_model(
         dcp.save(model_state.state_dict(), checkpoint_id=model_path)
     else:
         raise ValueError(f"Unsupported model save format: {checkpoint_config.model_save_format}")
+
+
+def load_model_from_base_checkpoint(
+    model: torch.nn.Module,
+    device: torch.device,
+    is_peft: bool,
+    root_dir: str,
+    model_name: str,
+    peft_init_method: str,
+):
+    """
+    Load a model from the base Hugging Face checkpoint in parallel.
+
+    Args:
+        model: Model to load state into
+        device: Device to load model onto
+        is_peft: Whether the model is PEFT
+        root_dir: Root directory of the model
+        model_name: Name of the model
+    """
+    from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
+
+    model.to_empty(device=device)
+
+    # HF models set _is_hf_initialized to True after initialization.
+    # But because we initialize on meta device, these are erroneously set to True.
+    # We need to set them to False and call initialize_weights to re-initialize the weights.
+
+    # Gemma3ForConditionalGeneration cannot be pretrained currently. The pinned torch version
+    # doesn't support initialize_weights when the model is sharded. This is because Gemma's
+    # initialize_weights method requires setting a row to zeros in the embedding matrix.
+    # This index selection op is not supported for DTensors in the pinned torch version.
+    if not isinstance(model, Gemma3ForConditionalGeneration):
+        for _, module in model.named_modules():
+            if hasattr(module, "_is_hf_initialized"):
+                module._is_hf_initialized = False
+
+        # init model weights
+        if hasattr(model, "initialize_weights"):
+            model.initialize_weights()
+        else:
+            logging.warning(
+                "Warning: Model does not have initialize_weights method. Requires custom initialization to be implemented."
+            )
+
+    # init buffer-only modules
+    _rebuild_buffer_only_modules_in_place(model, device, getattr(model, "config", None))
+
+    # init peft adapters with the scaled weights
+    _init_peft_adapters(model, peft_init_method)
+
+    model_state = ModelState(model, is_peft=is_peft, is_init_step=True)
+    model_state_dict = model_state.state_dict()
+    if os.path.exists(model_name):
+        # offline models will pass in the model path directly
+        model_path = model_name
+    else:
+        model_path = get_safetensors_index_path(root_dir, model_name)
+    dcp.load(
+        model_state_dict,
+        storage_reader=_HuggingFaceStorageReader(
+            model_path, key_mapping=getattr(model, "_checkpoint_conversion_mapping", None)
+        ),
+    )
+    model_state.load_state_dict(model_state_dict)
 
 
 def load_model(
@@ -278,7 +345,7 @@ def save_config(config: dict[str, Any], weights_path: str):
         yaml.dump(config, f, sort_keys=False, default_flow_style=False)
 
 
-def _get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
+def get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
     """
     Return the directory containing the first `model.safetensors.index.json` found for given model.
 
@@ -401,3 +468,61 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
         if "lora" in name.lower():
             final_target_modules.add(name.rsplit(".", 1)[0])
     return sorted(list(final_target_modules))
+
+
+def _rebuild_buffer_only_modules_in_place(
+    model: nn.Module, device: torch.device, model_config: "PretrainedConfig"
+) -> None:
+    """
+    Rebuild submodules that *exclusively* hold buffers (e.g., RotaryEmbedding).
+    These need to be manually reset because HF will only initialize trainable parameters via the initialize_weights call. Buffers
+    are initialized at the time of class instantiation, but because we initialize the model
+    on meta device, these aren't populated.
+
+    The heuristic we use is that the module to be replaced (e.g., RotaryEmbedding) is a leaf-like module
+    that has buffers and no direct parameters. We also assume that the module takes in a config object.
+
+    Args:
+        model: Model to rebuild buffers for
+        device: Device to rebuild buffers on
+        model_config: Model config
+    """
+    if not model_config:
+        logging.warning("Warning: Model config is not available. Skipping buffer rebuild.")
+        return
+
+    for module_name, child in list(model.named_children()):
+        _rebuild_buffer_only_modules_in_place(child, device, model_config)
+
+        # Only consider leaf-like modules that have buffers and no direct parameters
+        buffers = list(child.buffers(recurse=False))
+        if not buffers:
+            continue
+        has_params = any(True for _ in child.parameters(recurse=False))
+        if has_params:
+            continue
+
+        try:
+            module_cls = child.__class__
+            with torch.device(device):
+                new_child = module_cls(config=model_config)
+            setattr(model, module_name, new_child)
+            logging.info(f"Initialized weights for buffer-only module `{module_name}` of type {module_cls.__name__}.")
+        except Exception as e:
+            logging.warning(f"Failed to initialize weights for buffer-only module `{module_name}`: {e}")
+
+
+def _init_peft_adapters(model: nn.Module, peft_init_method: str):
+    """
+    Initialize the PEFT adapters with the scaled weights.
+
+    Args:
+        model: Model to initialize PEFT adapters for
+        peft_init_method: Method to initialize PEFT adapters e.g. "xavier". See `LinearLoRA` for more details.
+    """
+    for module in model.modules():
+        if hasattr(module, "init_lora_weights"):
+            try:
+                module.init_lora_weights(peft_init_method)
+            except Exception as e:
+                logging.warning(f"Failed to initialize weights for PEFT adapter `{module.__class__.__name__}`: {e}")

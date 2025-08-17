@@ -16,6 +16,7 @@
 from nemo_automodel.components._transformers.auto_model import (
     NeMoAutoModelForCausalLM,
     NeMoAutoModelForImageTextToText,
+    NeMoAutoModelForSequenceClassification,
 )
 
-__all__ = ["NeMoAutoModelForCausalLM", "NeMoAutoModelForImageTextToText"]
+__all__ = ["NeMoAutoModelForCausalLM", "NeMoAutoModelForImageTextToText", "NeMoAutoModelForSequenceClassification"]

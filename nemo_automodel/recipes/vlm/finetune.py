@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import pathlib
 import time
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 import torch.distributed as dist
@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
+from transformers.utils import TRANSFORMERS_CACHE
 from wandb import Settings
 
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
@@ -52,6 +53,11 @@ from nemo_automodel.components.utils.dist_utils import (
 )
 from nemo_automodel.components.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
 from nemo_automodel.recipes.base_recipe import BaseRecipe
+
+if TYPE_CHECKING:
+    from torch.optim import Optimizer
+
+    from nemo_automodel.components.distributed.init_utils import DistInfo
 
 logger = logging.getLogger(__name__)
 
@@ -137,9 +143,7 @@ def build_model_and_optimizer(
             kwargs["fp8_config"] = cfg_fp8.instantiate()
 
         model = cfg_model.instantiate(**kwargs)
-
         model = _freeze_model(model, cfg_freeze, freeze_embeddings)
-
         # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
         if cfg_peft is not None:
             apply_lora_to_linear_modules(model, cfg_peft)
@@ -177,8 +181,6 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
     Returns:
         The instantiated checkpoint configuration.
     """
-    from transformers.utils import TRANSFORMERS_CACHE
-
     ckpt_kwargs = dict(
         enabled=False,
         checkpoint_dir="checkpoints/",
