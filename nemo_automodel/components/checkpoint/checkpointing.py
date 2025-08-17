@@ -462,11 +462,18 @@ def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
 def _extract_target_modules(model: nn.Module) -> list[str]:
     """
     Extract the target modules from the model.
+
+    Note: When torch.compile is used, module names get prefixed with '_orig_mod.'.
+    This function strips those prefixes to get the original module names.
     """
     final_target_modules = set()
     for name, _ in model.named_modules():
         if "lora" in name.lower():
-            final_target_modules.add(name.rsplit(".", 1)[0])
+            # Remove the torch.compile _orig_mod prefix if present
+            target_name = name.rsplit(".", 1)[0]
+            if target_name.startswith("_orig_mod."):
+                target_name = target_name[len("_orig_mod.") :]
+            final_target_modules.add(target_name)
     return sorted(list(final_target_modules))
 
 
