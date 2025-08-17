@@ -238,19 +238,17 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed
         }
 
     with StatefulRNG(seed=seed, ranked=True):
-        if cfg_processor is not None:
-            if hasattr(cfg_processor, "instantiate"):
-                processor = cfg_processor.instantiate()
-            else:
-                processor_kwargs = cfg_processor.to_dict()
-                try:
-                    processor = AutoProcessor.from_pretrained(cfg_model.pretrained_model_name_or_path, **processor_kwargs)
-                except Exception as e:
-                    processor = None
-                    logging.warning(f"AutoProcessor not available for {cfg_model.pretrained_model_name_or_path} ({e}). ")
-        else:
+        processor = None
+        processor_kwargs = {}
+        if cfg_processor is not None and hasattr(cfg_processor, "instantiate"):
+            processor = cfg_processor.instantiate()
+        elif cfg_processor is not None:
+            processor_kwargs = cfg_processor.to_dict()
+
+        # If no processor was instantiated, try AutoProcessor
+        if processor is None:
             try:
-                processor = AutoProcessor.from_pretrained(cfg_model.pretrained_model_name_or_path)
+                processor = AutoProcessor.from_pretrained(cfg_model.pretrained_model_name_or_path, **processor_kwargs)
             except Exception as e:
                 # Some models do not provide an AutoProcessor
                 processor = None
