@@ -23,6 +23,7 @@ def compute_cross_entropy(
     logits: torch.Tensor,
     targets: torch.Tensor,
     ignore_index=-100,
+    reduction="sum",
 ):
     """Computes the cross-entropy loss between logits and targets.
 
@@ -35,11 +36,11 @@ def compute_cross_entropy(
     Returns:
         torch.Tensor: The sum of cross-entropy losses over the sequence.
     """
-    return F.cross_entropy(logits.float(), targets, ignore_index=ignore_index, reduction="sum")
+    return F.cross_entropy(logits.float(), targets, ignore_index=ignore_index, reduction=reduction)
 
 
 class ChunkedCrossEntropy:
-    def __init__(self, chunk_len: int = 32, compile: bool = True, ignore_index: int = -100):
+    def __init__(self, chunk_len: int = 32, compile: bool = True, ignore_index: int = -100, reduction: str = "sum"):
         """
         Chunked cross-entropy loss.
 
@@ -50,16 +51,19 @@ class ChunkedCrossEntropy:
                 Defaults to True.
             ignore_index (int, optional): Target value that is ignored when computing the loss.
                 Defaults to -100.
+            reduction (str, optional): Type of reduction. Defaults to "sum".
         """
         self.chunk_len = chunk_len
         self.compile = compile
         self.ignore_index = ignore_index
+        self.reduction = reduction
 
     def __call__(
         self,
         logits: torch.Tensor,
         labels: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        num_label_tokens: Optional[int] = None,
     ) -> torch.Tensor:
         """Computes cross-entropy loss in chunks to handle long sequences more efficiently.
 
@@ -95,5 +99,8 @@ class ChunkedCrossEntropy:
         num_chunks = (seq_len + self.chunk_len - 1) // self.chunk_len
         loss = 0.0
         for logits_chunk, targets_chunk in zip(logits.chunk(num_chunks, dim=0), labels.chunk(num_chunks, dim=0)):
-            loss += _compiled_compute_cross_entropy(logits_chunk, targets_chunk, self.ignore_index)
+            loss += _compiled_compute_cross_entropy(logits_chunk, targets_chunk, self.ignore_index, self.reduction)
+        if num_label_tokens is not None:
+            assert self.reduction == "sum", "num_label_tokens is only supported when reduction is 'sum'"
+            loss = loss / num_label_tokens
         return loss

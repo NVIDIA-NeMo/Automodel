@@ -37,6 +37,7 @@ class MaskedCrossEntropy:
         logits: torch.Tensor,
         labels: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        num_label_tokens: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Compute the masked cross-entropy loss between logits and targets.
@@ -68,4 +69,8 @@ class MaskedCrossEntropy:
                 del mask
         if self.fp32_upcast:
             logits = logits.float()
-        return F.cross_entropy(logits, labels, reduction=self.reduction)
+        loss = F.cross_entropy(logits, labels, reduction=self.reduction)
+        if num_label_tokens is not None:
+            assert self.reduction == "sum", "num_label_tokens is only supported when reduction is 'sum'"
+            loss = loss / num_label_tokens
+        return loss

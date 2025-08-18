@@ -11,7 +11,101 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
+
 from datasets import load_dataset
+
+
+def _pad_to_seq_length(sample, pad_token_id, seq_length):
+    n = seq_length - len(sample)
+    if n == 0:
+        return sample
+    return sample + [pad_token_id] * n
+
+
+def _add_pad_token(tokenizer):
+    pad_token_id = None
+    if not hasattr(tokenizer, "pad_token_id"):
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    else:
+        pad_token_id = tokenizer.pad_token_id
+    if not hasattr(tokenizer, "pad_token") and hasattr(tokenizer, "eos_token"):
+        tokenizer.pad_token = tokenizer.eos_token
+    return pad_token_id
+
+
+def _package_tokenized_example(has_chat_template, input_ids, eos_token_id, pad_token_id, seq_length, context_len):
+    # llama3 tokenizer does not add eos token
+    # see: https://github.com/huggingface/transformers/issues/22794
+    if not has_chat_template and eos_token_id != input_ids[-1]:
+        input_ids += [eos_token_id]
+
+    labels = input_ids.copy()
+    # [a, b, EOS]
+    input_ids = input_ids[:-1]
+    # input_ids= [a, b] -> attention_mask = [1, 1]
+    attention_mask = [1] * len(input_ids)
+
+    # Labels: mask out prompt tokens
+    labels[:context_len] = [-100] * context_len
+    # remove BOS
+    labels = labels[1:]
+    if not has_chat_template:
+        assert labels[-1] == eos_token_id, f"labels[-1]={labels[-1]} != eos_token_id={eos_token_id}"
+        assert input_ids[-1] != eos_token_id, f"input_ids[-1]={input_ids[-1]} == eos_token_id={eos_token_id}"
+    assert len(input_ids) == len(labels), f"len(input_ids)={len(input_ids)} != len(labels)={len(labels)}"
+
+    if isinstance(seq_length, int):
+        input_ids = _pad_to_seq_length(input_ids, pad_token_id, seq_length)
+        labels = _pad_to_seq_length(labels, -100, seq_length)
+
+    # the attention mask can also be extended in the collator with zeros.
+    attention_mask += [0] * (len(labels) - len(attention_mask))
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "attention_mask": attention_mask,
+        "___PAD_TOKEN_IDS___": {
+            "input_ids": pad_token_id,
+            "labels": -100,
+            "attention_mask": 0,
+        },
+    }
+
+
+def _formatting_prompts_func(example, tokenizer, eos_token_id, pad_token_id, seq_length=None):
+    question = example["question"]
+    context = example["context"]
+    answer = example["answers"]["text"][0].strip() if example["answers"]["text"] else ""
+
+    prompt = f"Context: {context}\nQuestion: {question}\nAnswer:"
+    full_text = prompt + " " + answer
+
+    # Tokenize separately to locate answer start
+    prompt_ids = tokenizer(prompt)["input_ids"]
+    # Tokenize full text
+    input_ids = tokenizer(full_text)["input_ids"]
+    return _package_tokenized_example(False, input_ids, eos_token_id, pad_token_id, seq_length, len(prompt_ids))
+
+
+def _formatting_prompts_func_with_chat_template(
+    example, tokenizer, eos_token_id, pad_token_id, seq_length=None, start_of_turn_token=None
+):
+    formatted_text = [
+        {"role": "user", "content": f"{example['context']} {example['question']}"},
+        {"role": "assistant", "content": example["answers"]["text"][0].strip()},
+    ]
+    input_ids = tokenizer.apply_chat_template(formatted_text)
+    if isinstance(start_of_turn_token, str):
+        start_of_turn_token_id = tokenizer(start_of_turn_token, add_special_tokens=False)["input_ids"][0]
+        first_start_of_turn_token_id = input_ids.index(start_of_turn_token_id)
+        # Loss mask is starting with the second start of turn token.
+        # labels    = [a b c S d e] ; S is the start of turn token.
+        # loss_mask = [0 0 0 1 1 1] ; 1 is the loss mask enabled for the answer.
+        response_start = input_ids.index(start_of_turn_token_id, first_start_of_turn_token_id + 1)
+    else:
+        response_start = 0
+    return _package_tokenized_example(True, input_ids, eos_token_id, pad_token_id, seq_length, response_start)
 
 
 def make_squad_dataset(
@@ -57,71 +151,30 @@ def make_squad_dataset(
         - `loss_mask`: List of 0/1 flags indicating which tokens contribute
           to the loss (answers only).
     """
-    eos_token_id = getattr(tokenizer, "eos_token_id", 0)
-    chat_template = getattr(tokenizer, "chat_template", None)
-
-    def pad_to_seq_length(sample):
-        seq_pad_len_ar = max(0, seq_length - len(next(iter(sample.values()))))
-        return {k: v + [eos_token_id if k != "loss_mask" else 0] * seq_pad_len_ar for k, v in sample.items()}
-
-    def formatting_prompts_func(example):
-        formatted_text = [
-            f"{example['context']} {example['question']} ",
-            example["answers"]["text"][0].strip(),
-        ]
-        context_ids, answer_ids = list(map(lambda x: tokenizer(x)["input_ids"], formatted_text))
-        bos_id = getattr(tokenizer, "bos_token_id", None)
-        eos_id = getattr(tokenizer, "eos_token_id", None)
-        # Remove EOS token from context's end
-        if len(context_ids) > 0 and context_ids[-1] == eos_id:
-            context_ids = context_ids[:-1]
-        # Remove BOS token from answer's start
-        if len(answer_ids) > 0 and answer_ids[0] == bos_id:
-            answer_ids = answer_ids[1:]
-
-        input_ids = context_ids + answer_ids
-        return dict(
-            input_ids=input_ids[:-1],  # remove EOS
-            labels=input_ids[1:],  # remove BOS
-            loss_mask=[0] * (len(context_ids) - 1) + [1] * len(answer_ids),  # remove EOS
-        )
-
-    def formatting_prompts_func_with_chat_template(example, start_of_turn_token=None):
-        formatted_text = [
-            {"role": "user", "content": f"{example['context']} {example['question']}"},
-            {"role": "assistant", "content": example["answers"]["text"][0].strip()},
-        ]
-        input_ids = tokenizer.apply_chat_template(formatted_text)
-        if isinstance(start_of_turn_token, str):
-            start_of_turn_token_id = tokenizer(start_of_turn_token, add_special_tokens=False)["input_ids"][0]
-            first_start_of_turn_token_id = input_ids.index(start_of_turn_token_id)
-            # Loss mask is starting with the second start of turn token.
-            # labels    = [a b c S d e] ; S is the start of turn token.
-            # loss_mask = [0 0 0 1 1 1] ; 1 is the loss mask enabled for the answer.
-            response_start = input_ids.index(start_of_turn_token_id, first_start_of_turn_token_id + 1)
-        else:
-            response_start = 0
-        loss_mask = [0] * response_start + [1] * (len(input_ids) - response_start)
-        return dict(
-            input_ids=input_ids[:-1],  # remove EOS
-            labels=input_ids[1:],  # remove BOS
-            loss_mask=loss_mask[1:],  # remove EOS
-        )
 
     if limit_dataset_samples is not None:
         assert isinstance(limit_dataset_samples, int), "Expected limit_dataset_samples to be an int"
-        split = f"{split}[:{limit_dataset_samples}]"
-
+        if not "[" in split:
+            split = f"{split}[:{limit_dataset_samples}]"
+        else:
+            logging.warning(f"Dataset split {split} already has a slice, skipping limit_dataset_samples")
     dataset = load_dataset(dataset_name, split=split)
 
-    fmt_fn = formatting_prompts_func
-    if chat_template is not None:
-        fmt_fn = lambda x: formatting_prompts_func_with_chat_template(x, start_of_turn_token)  # noqa: E731
+    # format the dataset
+    chat_template = getattr(tokenizer, "chat_template", None)
+    eos_token_id = getattr(tokenizer, "eos_token_id", 0)
+    # if pad_token_id is not set, use eos_token_id
+    # therefore, pad_token can either [PAD] or [EOS]
+    pad_token_id = _add_pad_token(tokenizer) or eos_token_id
 
-    if isinstance(seq_length, int):
-        fmt_fn_ = fmt_fn
-        fmt_fn = lambda x: pad_to_seq_length(fmt_fn_(x))  # noqa: E731
+    if chat_template is None:
+        fmt_fn = lambda x: _formatting_prompts_func(x, tokenizer, eos_token_id, pad_token_id, seq_length)
+    else:
+        fmt_fn = lambda x: _formatting_prompts_func_with_chat_template(
+            x, tokenizer, eos_token_id, pad_token_id, seq_length, start_of_turn_token
+        )  # noqa: E731
 
+    # map the dataset
     return dataset.map(
         fmt_fn,
         batched=False,

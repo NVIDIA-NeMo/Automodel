@@ -61,6 +61,8 @@
 # -------------------------------------------------------------------------------
 
 
+from typing import Optional
+
 import torch
 
 from nemo_automodel.shared.import_utils import MISSING_CUT_CROSS_ENTROPY_MSG
@@ -132,6 +134,7 @@ class FusedLinearCrossEntropy:
         hidden_states: torch.Tensor,
         labels: torch.Tensor,
         lm_weight: torch.Tensor,
+        num_label_tokens: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Compute fused linear cross entropy loss that matches PyTorch's cross_entropy behavior.
@@ -140,6 +143,7 @@ class FusedLinearCrossEntropy:
             hidden_states: Input hidden states
             labels: Target labels
             lm_weight: Weight matrix for linear transformation
+            num_label_tokens: Number of non-padding tokens.
         """
         if not HAVE_CUT_CROSS_ENTROPY:
             raise ImportError(MISSING_CUT_CROSS_ENTROPY_MSG)
@@ -160,4 +164,7 @@ class FusedLinearCrossEntropy:
             shift=False,  # Match PyTorch behavior
             filter_eps=None,  # No token filtering
         )
+        if num_label_tokens is not None:
+            assert self.reduction == "sum", "num_label_tokens is only supported when reduction is 'sum'"
+            loss = loss / num_label_tokens
         return loss

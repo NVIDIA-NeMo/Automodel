@@ -184,16 +184,11 @@ def get_sync_ctx(model, is_optim_step):
     # Use `no_sync` on DDP models when we are *not* on the final micro-batch for
     # this gradient update (i.e., when `is_grad` is False). This avoids an
     # all-reduce for every micro-batch and greatly improves throughput.
+    sync_ctx = nullcontext()
     if isinstance(model, dist.fsdp._fully_shard._fully_shard.FSDPModule):
         model.set_requires_gradient_sync(is_optim_step)
-        sync_ctx = nullcontext()
-    elif isinstance(model, torch.nn.parallel.DistributedDataParallel):
-        if is_optim_step:
-            sync_ctx = nullcontext()
-        else:
-            sync_ctx = model.no_sync()
-    else:
-        sync_ctx = nullcontext()
+    elif isinstance(model, torch.nn.parallel.DistributedDataParallel) and not is_optim_step:
+        sync_ctx = model.no_sync()
     return sync_ctx
 
 

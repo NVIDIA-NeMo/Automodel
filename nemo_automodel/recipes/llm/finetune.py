@@ -18,13 +18,11 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import wandb
-from torch.distributed.device_mesh import _mesh_resources
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
@@ -51,12 +49,7 @@ from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
     compile_model,
 )
-from nemo_automodel.components.utils.dist_utils import (
-    clip_gradients,
-    get_sync_ctx,
-    reduce_loss,
-    rescale_gradients,
-)
+from nemo_automodel.components.utils.dist_utils import get_sync_ctx
 from nemo_automodel.components.utils.model_utils import print_trainable_parameters
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
@@ -296,6 +289,13 @@ def build_dataloader(
             collate_cfg = cfg_dl.collate_fn
             dl_kwargs["collate_fn"] = lambda batch: collate_cfg.instantiate(batch=batch)
 
+        try:
+            import torch.multiprocessing as mp
+
+            if mp.get_start_method(allow_none=True) is None:
+                mp.set_start_method("spawn", force=True)
+        except RuntimeError:
+            pass
         return cfg_dl.instantiate(**dl_kwargs), tokenizer
 
 
@@ -420,16 +420,10 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
     Returns:
         The loss.
     """
-    loss_fn_kwargs = {}
+    loss_fn_kwargs = {"num_label_tokens": kwargs.pop("num_label_tokens", None)}
     if isinstance(loss_fn, FusedLinearCrossEntropy):
         model = kwargs.pop("model")
-
-        # Replace labels with -100 where mask is 0 (don't compute loss for these positions)
-        # -100 is the default ignore index in PyTorch's cross entropy loss
         labels = kwargs.pop("labels")
-        if "mask" in kwargs:
-            loss_mask = kwargs.pop("mask")
-            labels.masked_fill_(loss_mask == 0, -100)
 
         # find the lm_head in the model
         lm_head = None
@@ -457,7 +451,6 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
             {
                 "logits": kwargs.pop("logits"),
                 "labels": kwargs.pop("labels"),
-                "mask": kwargs.pop("mask"),
             }
         )
 
@@ -555,10 +548,6 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 seed=self.cfg.get("seed", 42),
             )
 
-        # Initialize metrics required for calculating loss
-        self.total_local_num_loss_tokens = torch.zeros([], dtype=torch.int, device="cuda")
-        self.forward_data_store = []
-
         # Scheduler
         self.step_scheduler = build_step_scheduler(self.cfg.get("step_scheduler", None), self.dataloader)
 
@@ -595,137 +584,120 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
         self.model.train()
         self.timestamp = time.perf_counter()
-        self.num_nonpad_tokens = 0
+
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
-            for batch_idx, batch in enumerate(self.step_scheduler):
-                self._run_train_step(batch, self.step_scheduler.is_optim_step, 1.0)
+            # The step scheduler yields a list of batches with the following properties:
+            # 1. len(batches) == grad_acc_steps
+            # 2. len(batches[0]) == batch_size
+            for i, batches in enumerate(self.step_scheduler):
+                reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens = self._run_train_optim_step(
+                    batches, 1.0
+                )
+
+                # log
+                self.log_train_metrics(reporting_loss, grad_norm, num_tokens_in_batch, tps, num_label_tokens)
+
+                # Save the checkpoint every ckpt_every_steps
                 if self.step_scheduler.is_ckpt_step:
                     self.save_checkpoint(epoch, self.step_scheduler.step)
 
+                # Run validation every val_every_steps
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     self._run_validation_epoch()
+                    self.model.train()
 
     # ------------------ helpers ------------------
-    def _run_train_step(self, batch, is_optim_step, clip_norm=1.0):
+    def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
 
         Args:
-            batch: Batch of training data.
-            is_optim_step: Flag indicating if a gradient step should be applied.
-            clip_norm: Gradient clipping norm.
+            batches: List of batches of training data.
+            max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
         """
-        self.model.train()
 
-        batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
-        labels = batch.pop("labels")
-        loss_mask = batch.pop("loss_mask", None)
-        if loss_mask is None:
-            loss_mask = (labels.detach() != -100).to(torch.int)
+        num_label_tokens = sum((batch["labels"] != -100).sum().item() for batch in batches)
+        loss_buffer = []
 
-        if (
-            "position_ids" not in batch
-            and self.device_mesh is not None
-            and (self.device_mesh["cp"].size() > 1 or self.device_mesh["tp"].size() > 1)
-        ):
-            batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
+        # number of tokens in the batch, excluding any tail padding.
+        num_tokens_in_batch = sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches)
+        num_tokens_in_batch = self._dp_allreduce(torch.LongTensor([num_tokens_in_batch])).item()
 
-        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels, loss_mask)
-        with train_ctx():
-            if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                # use num_logits_to_keep to avoid full logits matrix in memory
-                out = self.model(logits_to_keep=1, **batch)
-                if "hidden_states" not in out:
-                    raise ValueError(
-                        "FusedLinearCrossEntropy requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
-                    )
-            else:
-                out = self.model(**batch)
-            local_loss = calculate_loss(
-                self.loss_fn,
-                logits=out.logits,
-                labels=labels,
-                mask=loss_mask,
-                model=self.model,
-                hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
-            )
+        num_batches = len(batches)
+        for i, batch in enumerate(batches):
+            batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
+            labels = batch.pop("labels")
 
-        # local_num_loss_tokens are the number of tokens that are used for loss calculation
-        # in pretraining, this excludes padding tokens. In SFT, this additionally
-        # excludes the context tokens.
-        local_num_loss_tokens = loss_mask.sum().detach().to(torch.int)
-        # num_nonpad_tokens are the number of non-padding tokens
-        self.num_nonpad_tokens += labels.numel() - count_tail_padding(labels)
-        self.total_local_num_loss_tokens += local_num_loss_tokens
-        self.forward_data_store.append(local_loss.detach())
-
-        with get_sync_ctx(self.model, is_optim_step):
-            local_loss.backward()
-
-        grad_norm = None
-        if is_optim_step:
-            rescale_gradients(
-                self.model,
-                self.total_local_num_loss_tokens,
-                self.device_mesh[
-                    ("dp_cp" if "dp_cp" in _mesh_resources.root_to_flatten_mapping.get(self.device_mesh, {}) else "dp")
-                ].get_group()
-                if self.device_mesh is not None
-                else None,
-            )
-
-            # Clip gradients **after** any rescaling.
-            # TODO(@boxiangw): Fix TP gradient clipping
-            if not self.device_mesh or self.device_mesh["tp"].size() == 1:
-                grad_norm = clip_gradients(self.model, clip_norm)
-            else:
-                # TODO: TP WAR
-                grad_norm = 0.0
-
-            # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
-            # self.model.finish_grad_sync()
-
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-
-            # Precompute FP8 scales
             if (
-                self.cfg.get("fp8", None) is not None
-                and self.model.precompute_float8_dynamic_scale_for_fsdp
-                and self.device_mesh["dp_shard"].size() > 1
+                "position_ids" not in batch
+                and self.device_mesh is not None
+                and (self.device_mesh["cp"].size() > 1 or self.device_mesh["tp"].size() > 1)
             ):
-                precompute_float8_dynamic_scale_for_fsdp(self.model)
+                batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
 
-            if self.lr_scheduler is not None:
-                self.lr_scheduler.step(1)
+            train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
 
-            # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
-            # self.model.install_optimized_model_weights()
-            # self.model.zero_grad_buffer()
+            with train_ctx(), get_sync_ctx(self.model, i == num_batches - 1):
+                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                    # use num_logits_to_keep to avoid full logits matrix in memory
+                    out = self.model(logits_to_keep=1, **batch)
+                    if "hidden_states" not in out:
+                        raise ValueError(
+                            "FusedLinearCrossEntropy requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
+                        )
+                else:
+                    out = self.model(**batch)
 
-            # TPS is calculated as follows (assuming grad-accumulation-steps=2):
-            # fwd 0 | bwd 0 | fwd 1 | bwd 1 | opt 0 | fwd 2 | bwd 2 | ...
-            # ^                                     ^
-            t = time.perf_counter()
-            time_delta = t - self.timestamp
-            self.timestamp = t
-            tps = self.num_nonpad_tokens / time_delta
-            self.num_nonpad_tokens = 0
-            # log
-            reporting_loss = self.log_train_metrics(grad_norm, tps)
-            current_lr = self.optimizer.param_groups[0]["lr"]
-            logging.info(
-                "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem: {:.2f} GiB | tps {:.2f}".format(
-                    self.step_scheduler.step,
-                    self.step_scheduler.epoch,
-                    reporting_loss,
-                    grad_norm,
-                    current_lr,
-                    torch.cuda.max_memory_allocated() / 1024**3,
-                    tps,
+                local_loss = calculate_loss(
+                    self.loss_fn,
+                    logits=out.logits,
+                    labels=labels,
+                    model=self.model,
+                    hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
+                    num_label_tokens=num_label_tokens,
                 )
+                loss_buffer.append(local_loss.clone().detach())
+                local_loss.backward()
+
+        # do the optimization step
+        grad_norm = 0
+        # Clip gradients **after** any rescaling.
+        # TODO(@boxiangw): Fix TP gradient clipping
+        if max_grad_norm is not None and (not self.device_mesh or self.device_mesh["tp"].size() == 1):
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                [p for p in self.model.parameters() if p.requires_grad], max_grad_norm
             )
-            torch.cuda.reset_peak_memory_stats()
+            if isinstance(grad_norm, torch.Tensor):
+                grad_norm = grad_norm.item()
+
+        # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
+        # self.model.finish_grad_sync()
+
+        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step(1)
+
+        # Precompute FP8 scales
+        if (
+            self.cfg.get("fp8", None) is not None
+            and self.model.precompute_float8_dynamic_scale_for_fsdp
+            and self.device_mesh["dp_shard"].size() > 1
+        ):
+            precompute_float8_dynamic_scale_for_fsdp(self.model)
+
+        # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
+        # self.model.install_optimized_model_weights()
+        # self.model.zero_grad_buffer()
+
+        t = time.perf_counter()
+        time_delta = t - self.timestamp
+        self.timestamp = t
+        tps = num_tokens_in_batch / time_delta
+        reporting_loss = torch.sum(torch.stack(loss_buffer)).item()
+        # fix reporting_loss, tps across ranks
+        return reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens
 
     @torch.no_grad()
     def _run_validation_epoch(self):
@@ -739,9 +711,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             for batch in self.val_dataloader:
                 batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
                 labels = batch.pop("labels")
-                loss_mask = batch.pop("loss_mask", None)
-                if loss_mask is None:
-                    loss_mask = (labels.detach() != -100).to(torch.int)
+                num_label_tokens = (labels != -100).sum()
 
                 if (
                     self.device_mesh
@@ -752,7 +722,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
                     )
 
-                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels, loss_mask)
+                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
                 with train_ctx():
                     if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                         out = self.model(logits_to_keep=1, **batch)
@@ -762,19 +732,16 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         self.loss_fn,
                         logits=out.logits,
                         labels=labels,
-                        mask=loss_mask,
                         model=self.model,
                         hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
+                        num_label_tokens=num_label_tokens,
                     )
 
                 total_loss += local_loss.item()
-                total_tokens += loss_mask.sum().item()
+                total_tokens += num_label_tokens
 
-        # Aggregate across ranks if distributed is initialized
-        if dist.is_initialized():
-            tensor = torch.tensor([total_loss, total_tokens], device=self.dist_env.device)
-            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-            total_loss, total_tokens = tensor.tolist()
+        total_loss = self._dp_allreduce(torch.FloatTensor([total_loss])).item()
+        total_tokens = self._dp_allreduce(torch.LongTensor([total_tokens])).item()
 
         val_loss = total_loss / max(total_tokens, 1e-8)
         if self.dist_env.is_main:
@@ -787,45 +754,42 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
         )
 
-    def log_train_metrics(self, grad_norm, tps) -> float:
+    def log_train_metrics(self, train_loss, grad_norm, num_tokens_in_batch, tps, num_label_tokens) -> float:
         """Log metrics to wandb.
 
         Args:
+            train_loss: Training loss.
             grad_norm: Grad norm from the training step.
+            num_tokens_in_batch: Total number of loss tokens.
             tps: Tokens per second.
-
-        Returns:
-            Reporting loss.
         """
-        if not self.device_mesh:
-            dp_group = None
-        elif self.device_mesh["cp"].size() > 1:
-            dp_group = self.device_mesh["dp_cp"].get_group()
-        else:
-            dp_group = self.device_mesh["dp"].get_group()
-
-        total_loss, total_num_loss_tokens = reduce_loss(
-            self.forward_data_store, self.total_local_num_loss_tokens, per_token_loss=True, dp_group=dp_group
-        )
-        reporting_loss = (total_loss / total_num_loss_tokens).item()
-        grad_norm = grad_norm.item() if not isinstance(grad_norm, float) else grad_norm  # TP WAR
-        self.total_local_num_loss_tokens.zero_()
-        self.forward_data_store = []
         log_data = {
-            "train_loss": reporting_loss,
-            "loss_sum": total_loss,
             "step": self.step_scheduler.step,
             "epoch": self.step_scheduler.epoch,
+            "train_loss": train_loss,
             "grad_norm": grad_norm,
-            "num_tokens_per_step": total_num_loss_tokens,
+            "num_tokens_per_step": num_tokens_in_batch,
             "tps": tps,
         }
-        if self.optimizer.param_groups:
-            log_data["learning_rate"] = self.optimizer.param_groups[0]["lr"]
+        current_lr = self.optimizer.param_groups[0]["lr"]
+        log_data["learning_rate"] = current_lr
 
         if wandb.run is not None:
             wandb.log(log_data)
-        return reporting_loss
+
+        logging.info(
+            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f} | num_label_tokens {}".format(
+                self.step_scheduler.step,
+                self.step_scheduler.epoch,
+                train_loss,
+                grad_norm,
+                current_lr,
+                torch.cuda.max_memory_allocated() / 1024**3,
+                tps,
+                num_label_tokens,
+            )
+        )
+        torch.cuda.reset_peak_memory_stats()
 
 
 # ---------------------------------------------------------------------------
