@@ -186,10 +186,6 @@ class FSDP2Manager:
             mesh_shape=mesh_shape,
             mesh_dim_names=mesh_names,
         )
-        # flatten dp+cp if cp>1
-        if self.cp_size > 1:
-            self.device_mesh[("dp", "cp")]._flatten(mesh_dim_name="dp_cp")
-
         # based on https://github.com/pytorch/torchtitan/blob/d282cf2ce9ca8049b4b8423c1d7578c80426576f/torchtitan/distributed/parallel_dims.py#L191
         # Create all the submesh here to ensure all required process groups are
         # initialized:
