@@ -52,6 +52,7 @@ from nemo_automodel.components.utils.compile_utils import (
 from nemo_automodel.components.utils.dist_utils import get_sync_ctx
 from nemo_automodel.components.utils.model_utils import print_trainable_parameters
 from nemo_automodel.recipes.base_recipe import BaseRecipe
+from nemo_automodel.components.quantization.fp8 import build_fp8_config, apply_fp8_wrapper
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -115,9 +116,6 @@ def build_model_and_optimizer(
                 "Packed sequence is supported only with Flash Attention. "
                 "Setting model's attn_implementation to flash_attention_2"
             )
-        # Add FP8 config if provided
-        if cfg_fp8 is not None:
-            kwargs["fp8_config"] = cfg_fp8.instantiate()
 
         # Instantiate the model in meta device to avoid OOM
         with init_ctx:
@@ -131,6 +129,10 @@ def build_model_and_optimizer(
             # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
             if cfg_peft is not None:
                 apply_lora_to_linear_modules(model, cfg_peft)
+
+    if cfg_fp8 is not None:
+        fp8_config = build_fp8_config(cfg_fp8)
+        model = apply_fp8_wrapper(model, fp8_config)
 
     print_trainable_parameters(model)
 
@@ -680,9 +682,11 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.lr_scheduler.step(1)
 
         # Precompute FP8 scales
+        fp8_config = self.cfg.get("fp8", None)
         if (
-            self.cfg.get("fp8", None) is not None
-            and self.model.precompute_float8_dynamic_scale_for_fsdp
+            fp8_config is not None
+            and fp8_config.get("enabled", False)
+            and fp8_config.get("precompute_float8_dynamic_scale_for_fsdp", False)
             and self.device_mesh["dp_shard"].size() > 1
         ):
             precompute_float8_dynamic_scale_for_fsdp(self.model)

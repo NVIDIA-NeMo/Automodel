@@ -49,6 +49,11 @@ from nemo_automodel.components.utils.compile_utils import (
 )
 from nemo_automodel.components.utils.dist_utils import get_sync_ctx
 from nemo_automodel.components.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
+from nemo_automodel.components.utils.compile_utils import (
+    build_compile_config,
+    compile_model,
+)
+from nemo_automodel.components.quantization.fp8 import build_fp8_config, apply_fp8_wrapper
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
@@ -137,16 +142,17 @@ def build_model_and_optimizer(
         The instantiated model on the specified device and optimizer.
     """
     with StatefulRNG(seed=seed, ranked=True):
-        # Add FP8 config if provided
         kwargs = {}
-        if cfg_fp8 is not None:
-            kwargs["fp8_config"] = cfg_fp8.instantiate()
 
         model = cfg_model.instantiate(**kwargs)
         model = _freeze_model(model, cfg_freeze, freeze_embeddings)
         # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
         if cfg_peft is not None:
             apply_lora_to_linear_modules(model, cfg_peft)
+
+        if cfg_fp8 is not None:
+            fp8_config = build_fp8_config(cfg_fp8)
+            model = apply_fp8_wrapper(model, fp8_config)
 
         print_trainable_parameters(model)
 
@@ -651,9 +657,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.optimizer.zero_grad(set_to_none=True)
 
         # Precompute FP8 scales
+        fp8_config = self.cfg.get("fp8", None)
         if (
-            self.cfg.get("fp8", None) is not None
-            and self.model.precompute_float8_dynamic_scale_for_fsdp
+            fp8_config is not None
+            and fp8_config.get("enabled", False)
+            and fp8_config.get("precompute_float8_dynamic_scale_for_fsdp", False)
             and self.device_mesh["dp_shard"].size() > 1
         ):
             precompute_float8_dynamic_scale_for_fsdp(self.model)

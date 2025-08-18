@@ -7,7 +7,7 @@
 import logging
 from dataclasses import dataclass, field
 from functools import partial
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Dict, Any
 
 import torch
 import torch.nn as nn
@@ -27,6 +27,9 @@ except ImportError:
 @dataclass
 class FP8Config:
     """Configuration for FP8 quantization settings."""
+
+    enabled: bool = False
+    """Whether FP8 quantization is enabled."""
 
     recipe_name: Optional[Literal["tensorwise", "rowwise", "rowwise_with_gw_hp"]] = None
     """FP8 recipe to use. If None, uses tensorwise scaling with manual configuration."""
@@ -50,6 +53,24 @@ class FP8Config:
     emulate: bool = False
     """If True, emulation is used instead of hardware accelerated gemm. This is for test purpose only"""
 
+    def __init__(
+        self,
+        enabled: bool = False,
+        recipe_name: Optional[Literal["tensorwise", "rowwise", "rowwise_with_gw_hp"]] = None,
+        enable_fsdp_float8_all_gather: bool = False,
+        precompute_float8_dynamic_scale_for_fsdp: bool = False,
+        force_recompute_fp8_weight_in_bwd: bool = False,
+        filter_fqns: List[str] = None,
+        emulate: bool = False,
+    ):
+        self.enabled = enabled
+        self.recipe_name = recipe_name
+        self.enable_fsdp_float8_all_gather = enable_fsdp_float8_all_gather
+        self.precompute_float8_dynamic_scale_for_fsdp = precompute_float8_dynamic_scale_for_fsdp
+        self.force_recompute_fp8_weight_in_bwd = force_recompute_fp8_weight_in_bwd
+        self.filter_fqns = filter_fqns or []
+        self.emulate = emulate
+
     @classmethod
     def from_config_node(cls, config_node):
         """Create FP8Config from a configuration node."""
@@ -65,6 +86,7 @@ class FP8Config:
 
     def to_dict(self):
         return {
+            "enabled": self.enabled,
             "fp8_recipe_name": self.recipe_name,
             "enable_fsdp_float8_all_gather": self.enable_fsdp_float8_all_gather,
             "precompute_float8_dynamic_scale_for_fsdp": self.precompute_float8_dynamic_scale_for_fsdp,
@@ -246,3 +268,78 @@ def verify_fp8_conversion(model: nn.Module) -> dict:
         "fp8_modules": fp8_modules,
         "success": len(fp8_modules) > 0,
     }
+
+
+def create_fp8_config_from_dict(config_dict: Dict[str, Any]) -> FP8Config:
+    """Create a FP8Config from a dictionary.
+
+    Args:
+        config_dict: Dictionary containing FP8 configuration.
+
+    Returns:
+        FP8Config instance.
+    """
+    from typing import Dict, Any
+    
+    return FP8Config(
+        enabled=config_dict.get("enabled", False),
+        recipe_name=config_dict.get("recipe_name", None),
+        enable_fsdp_float8_all_gather=config_dict.get("enable_fsdp_float8_all_gather", False),
+        precompute_float8_dynamic_scale_for_fsdp=config_dict.get("precompute_float8_dynamic_scale_for_fsdp", False),
+        force_recompute_fp8_weight_in_bwd=config_dict.get("force_recompute_fp8_weight_in_bwd", False),
+        filter_fqns=config_dict.get("filter_fqns", []),
+        emulate=config_dict.get("emulate", False),
+    )
+
+
+def build_fp8_config(cfg: Optional[Dict[str, Any]]) -> FP8Config:
+    """Build a FP8 config from configuration.
+
+    Args:
+        cfg: Configuration dictionary for FP8 quantization.
+
+    Returns:
+        FP8Config instance.
+    """
+    from typing import Dict, Any, Optional
+    
+    if cfg is None:
+        return FP8Config(enabled=False)
+    else:
+        return create_fp8_config_from_dict(cfg)
+
+
+def apply_fp8_wrapper(model: nn.Module, config: FP8Config) -> nn.Module:
+    """Apply FP8 quantization to the model with configuration.
+
+    Args:
+        model: The model to apply FP8 quantization to.
+        config: FP8 configuration.
+
+    Returns:
+        The model with FP8 quantization applied.
+    """
+    if not config.enabled:
+        logger.info("FP8 quantization is disabled")
+        return model
+
+    try:
+        model.precompute_float8_dynamic_scale_for_fsdp = (
+            config.precompute_float8_dynamic_scale_for_fsdp
+            and config.recipe_name == "tensorwise"
+            and config.enable_fsdp_float8_all_gather
+        )
+        
+        model = apply_fp8_to_model(
+            model,
+            recipe_name=config.recipe_name,
+            filter_fqns=config.filter_fqns,
+            enable_fsdp_float8_all_gather=config.enable_fsdp_float8_all_gather,
+            force_recompute_fp8_weight_in_bwd=config.force_recompute_fp8_weight_in_bwd,
+            emulate=config.emulate,
+        )
+        logger.info("FP8 quantization applied successfully")
+        return model
+    except Exception as e:
+        logger.warning(f"FP8 quantization failed: {e}. Returning original model")
+        return model
