@@ -18,27 +18,16 @@ set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1"
 
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run \
---master-port=29503 --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace  \
--m pytest tests/functional_tests/checkpoint/test_peft.py \
+TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
+-m pytest tests/functional_tests/training/test_meta_device_sft.py \
     --config examples/llm/llama_3_2_1b_squad.yaml \
     --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
-    --step_scheduler.max_steps 10 \
-    --step_scheduler.grad_acc_steps 1 \
     --dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
     --validation_dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
     --dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
     --validation_dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
     --dataset.limit_dataset_samples 1000 \
-    --step_scheduler.ckpt_every_steps 10 \
-    --checkpoint.enabled true \
-    --checkpoint.checkpoint_dir checkpoints/ \
     --dataloader.batch_size 8 \
-    --peft.match_all_linear true \
-    --peft.dim 8 \
-    --peft.alpha 32 \
-    --peft.use_triton false \
-    --peft._target_ nemo_automodel.components._peft.lora.PeftConfig \
     --distributed._target_ nemo_automodel.components.distributed.fsdp2.FSDP2Manager \
     --distributed.dp_size none \
     --distributed.tp_size 1 \
