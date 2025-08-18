@@ -515,20 +515,6 @@ def _apply(module, fn, recurse=True):
         for child in module.children():
             _apply(child, fn, recurse=recurse)
 
-    def compute_should_use_set_data(tensor, tensor_applied):
-        if torch._has_compatible_shallow_copy_type(tensor, tensor_applied):
-            # If the new tensor has compatible tensor type as the existing tensor,
-            # the current behavior is to change the tensor in-place using `.data =`,
-            # and the future behavior is to overwrite the existing tensor. However,
-            # changing the current behavior is a BC-breaking change, and we want it
-            # to happen in future releases. So for now we introduce the
-            # `torch.__future__.get_overwrite_module_params_on_conversion()`
-            # global flag to let the user control whether they want the future
-            # behavior of overwriting the existing tensor or not.
-            return not torch.__future__.get_overwrite_module_params_on_conversion()
-        else:
-            return False
-
     should_use_swap_tensors = torch.__future__.get_swap_module_params_on_conversion()
     for key, param in module._parameters.items():
         if param is None:
@@ -538,7 +524,6 @@ def _apply(module, fn, recurse=True):
         # `with torch.no_grad():`
         with torch.no_grad():
             param_applied = fn(param)
-        p_should_use_set_data = compute_should_use_set_data(param, param_applied)
 
         # subclasses may have multiple child tensors so we need to use swap_tensors
         p_should_use_swap_tensors = should_use_swap_tensors or is_traceable_wrapper_subclass(param_applied)
@@ -556,32 +541,7 @@ def _apply(module, fn, recurse=True):
                 if param_grad is not None:
                     param.grad = param_grad
                 raise RuntimeError(f"_apply(): Couldn't swap {module._get_name()}.{key}") from e
-            out_param = param
-        elif p_should_use_set_data:
-            param.data = param_applied
-            out_param = param
         else:
-            assert isinstance(param, torch.nn.Parameter)
-            assert param.is_leaf
-            out_param = torch.nn.Parameter(param_applied, param.requires_grad)
-            module._parameters[key] = out_param
-
-        if param_grad is not None:
-            with torch.no_grad():
-                grad_applied = fn(param_grad)
-            g_should_use_set_data = compute_should_use_set_data(param_grad, grad_applied)
-            if p_should_use_swap_tensors:
-                grad_applied.requires_grad_(param_grad.requires_grad)
-                try:
-                    torch.utils.swap_tensors(param_grad, grad_applied)
-                except Exception as e:
-                    raise RuntimeError(f"_apply(): Couldn't swap {module._get_name()}.{key}.grad") from e
-                out_param.grad = param_grad
-            elif g_should_use_set_data:
-                assert out_param.grad is not None
-                out_param.grad.data = grad_applied
-            else:
-                assert param_grad.is_leaf
-                out_param.grad = grad_applied.requires_grad_(param_grad.requires_grad)
+            raise RuntimeError(f"_apply(): Couldn't swap {module._get_name()}.{key}")
 
     return module
