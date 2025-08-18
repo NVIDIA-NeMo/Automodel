@@ -57,6 +57,8 @@ def extract_skipped_token_ids(processor):
 
     Extracted from NeMo's HFAutoModelForImageTextToText.extract_skipped_token_ids
     """
+    if processor is None:
+        return torch.IntTensor([])
     tokenizer = getattr(processor, "tokenizer", processor)
 
     skipped_token_ids = []
