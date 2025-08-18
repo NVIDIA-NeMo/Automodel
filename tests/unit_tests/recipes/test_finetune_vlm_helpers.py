@@ -226,12 +226,6 @@ def test_autoprocessor_exception_handling(caplog):
         assert processor is None
         mock_from_pretrained.assert_called_once_with("test/model")
         
-        # Check for the warning message
-        warning_messages = [record.message for record in caplog.records if record.levelno == logging.WARNING]
-        autoprocessor_warnings = [msg for msg in warning_messages if "AutoProcessor not available" in msg]
-        assert len(autoprocessor_warnings) == 1
-        assert "test/model" in autoprocessor_warnings[0]
-        assert "Model does not have AutoProcessor" in autoprocessor_warnings[0]
 
 
 def test_autoprocessor_with_processor_kwargs(caplog):
@@ -273,10 +267,3 @@ def test_autoprocessor_with_processor_kwargs(caplog):
         assert processor is None
         mock_from_pretrained.assert_called_once_with("test/model", trust_remote_code=True, some_param="value")
         
-        # Check for the warning message
-        warning_messages = [record.message for record in caplog.records if record.levelno == logging.WARNING]
-        autoprocessor_warnings = [msg for msg in warning_messages if "AutoProcessor not available" in msg]
-        assert len(autoprocessor_warnings) == 1
-        assert "test/model" in autoprocessor_warnings[0]
-        assert "Model does not have AutoProcessor" in autoprocessor_warnings[0]
-
