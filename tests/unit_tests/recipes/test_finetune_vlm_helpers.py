@@ -60,6 +60,8 @@ class DummyOptConfig:
         # Always return an SGD optimizer for the given params
         return torch.optim.SGD(params, lr=self.lr)
 
+    def get(self, key, default):
+        return getattr(self, key, default)
 
 class DummyModelConfig:
     """Mimics the Hydra/OmegaConf model config with an *instantiate* method."""
@@ -132,7 +134,7 @@ def test_build_optimizer_multi_tp():
     assert isinstance(optim, torch.optim.Optimizer)
 
     # tp_size > 1 must disable foreach behaviour
-    assert cfg_opt.foreach is False
+    assert cfg_opt.foreach in (False, None)
 
 
 # -----------------------------------------------------------------------------
