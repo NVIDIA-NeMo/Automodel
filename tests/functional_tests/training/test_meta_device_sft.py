@@ -16,26 +16,64 @@
 """Tests for consolidated HF safetensors checkpointing for LLM."""
 
 from pathlib import Path
+import sys
 
 import torch
 import torch.distributed.tensor
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction
+from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
+
+def get_cfg_path() -> str:
+    """
+    Parses CLI args, pulls out --config and returns the config path.
+
+    Raises:
+        ValueError: if there's no --config and cfg_path = None
+        ValueError: if there's --config but not yaml file passed
+
+    Returns:
+        str: the config path
+    """
+    argv = sys.argv[1:]
+    i = 0
+
+    while i < len(argv):
+        tok = argv[i]
+
+        # --config or -c
+        if tok in ("--config", "-c"):
+            if i + 1 >= len(argv):
+                raise ValueError("Expected a path after --config")
+            cfg_path = argv[i + 1]
+            i += 2
+            return cfg_path
+
+        i += 1
 
 def test_consolidated_llm_checkpoint():
     """
     Tests HF consolidated checkpoint for LLM.
     """
-    script_path = Path(__file__).parent.resolve()
-    cfg = parse_args_and_load_config(script_path / "llama_3_2_1b_hellaswag.yaml")
+    cfg_path = get_cfg_path()
+    if "llm" in cfg_path:
+        recipe_cls = FinetuneRecipeForNextTokenPrediction
+        default_cfg_path = Path(__file__).parents[3] / "examples" / "llm" / "llama_3_2_1b_hellaswag.yaml"
+    elif "vlm" in cfg_path:
+        recipe_cls = FinetuneRecipeForVLM
+        default_cfg_path = Path(__file__).parents[3] / "examples" / "vlm" / "gemma_3_vl_4b_cord_v2.yaml"
+    else:
+        raise ValueError(f"Unable to infer trainer from config path: {cfg_path}")
+
+    cfg = parse_args_and_load_config(default_cfg_path)
     cfg.model.is_meta_device = False
-    trainer = FinetuneRecipeForNextTokenPrediction(cfg)
+    trainer = recipe_cls(cfg)
     trainer.setup()
 
     cfg.model.is_meta_device = True
-    meta_trainer = FinetuneRecipeForNextTokenPrediction(cfg)
+    meta_trainer = recipe_cls(cfg)
     meta_trainer.setup()
 
     for (n, p), (meta_n, meta_p) in zip(trainer.model.named_parameters(), meta_trainer.model.named_parameters()):

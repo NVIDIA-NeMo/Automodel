@@ -27,8 +27,10 @@ from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoTokenizer
+from transformers.integrations.accelerate import init_empty_weights
+from transformers.modeling_utils import no_init_weights
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from transformers.utils import TRANSFORMERS_CACHE
+from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
 from wandb import Settings
 
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
@@ -104,7 +106,7 @@ def build_model_and_optimizer(
         is_meta_device = cfg_model.is_meta_device
         if is_meta_device and isinstance(model_wrapper, NVFSDPManager):
             raise ValueError("Meta device initialization is not supported with NVFSDPManager")
-        init_ctx = torch.device("meta") if is_meta_device else init_ctx
+        init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else init_ctx
         del cfg_model.is_meta_device
 
     with StatefulRNG(seed=seed, ranked=True):
