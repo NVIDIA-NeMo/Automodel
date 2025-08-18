@@ -43,7 +43,6 @@ from nemo_automodel.components.checkpoint.stateful_wrappers import (
 
 if TYPE_CHECKING:
     from peft import PeftConfig
-    from transformers.configuration_utils import PretrainedConfig
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 
@@ -194,7 +193,7 @@ def load_model_from_base_checkpoint(
     """
     from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
 
-    model.to_empty(device=device)
+    to_empty_parameters_only(model, device=device)
 
     # HF models set _is_hf_initialized to True after initialization.
     # But because we initialize on meta device, these are erroneously set to True.
@@ -217,9 +216,6 @@ def load_model_from_base_checkpoint(
                 "Warning: Model does not have initialize_weights method. Requires custom initialization to be implemented."
             )
 
-    # init buffer-only modules
-    _rebuild_buffer_only_modules_in_place(model, device, getattr(model, "config", None))
-
     # init peft adapters with the scaled weights
     _init_peft_adapters(model, peft_init_method)
 
@@ -237,6 +233,8 @@ def load_model_from_base_checkpoint(
         ),
     )
     model_state.load_state_dict(model_state_dict)
+    if hasattr(model, "tie_weights") and model_state.is_tied_lm_head:
+        model.tie_weights()
 
 
 def load_model(
@@ -391,6 +389,23 @@ def get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
             raise FileNotFoundError(f"No snapshot directories found in {snapshots_root}")
 
 
+def to_empty_parameters_only(model: nn.Module, *, device: torch.device, recurse: bool = True) -> nn.Module:
+    """
+    Move parameters to the specified device without copying storage, skipping buffers.
+
+    Mirrors torch.nn.Module.to_empty but applies only to parameters, not buffers.
+
+    Args:
+        model: The module to transform
+        device: Target device
+        recurse: Whether to recurse into child modules
+
+    Returns:
+        The same module instance
+    """
+    return _apply(model, lambda t: torch.empty_like(t, device=device), recurse=recurse)
+
+
 def _save_peft_adapters(
     model_state: ModelState,
     peft_config: "PeftConfig",
@@ -477,48 +492,6 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
     return sorted(list(final_target_modules))
 
 
-def _rebuild_buffer_only_modules_in_place(
-    model: nn.Module, device: torch.device, model_config: "PretrainedConfig"
-) -> None:
-    """
-    Rebuild submodules that *exclusively* hold buffers (e.g., RotaryEmbedding).
-    These need to be manually reset because HF will only initialize trainable parameters via the initialize_weights call. Buffers
-    are initialized at the time of class instantiation, but because we initialize the model
-    on meta device, these aren't populated.
-
-    The heuristic we use is that the module to be replaced (e.g., RotaryEmbedding) is a leaf-like module
-    that has buffers and no direct parameters. We also assume that the module takes in a config object.
-
-    Args:
-        model: Model to rebuild buffers for
-        device: Device to rebuild buffers on
-        model_config: Model config
-    """
-    if not model_config:
-        logging.warning("Warning: Model config is not available. Skipping buffer rebuild.")
-        return
-
-    for module_name, child in list(model.named_children()):
-        _rebuild_buffer_only_modules_in_place(child, device, model_config)
-
-        # Only consider leaf-like modules that have buffers and no direct parameters
-        buffers = list(child.buffers(recurse=False))
-        if not buffers:
-            continue
-        has_params = any(True for _ in child.parameters(recurse=False))
-        if has_params:
-            continue
-
-        try:
-            module_cls = child.__class__
-            with torch.device(device):
-                new_child = module_cls(config=model_config)
-            setattr(model, module_name, new_child)
-            logging.info(f"Initialized weights for buffer-only module `{module_name}` of type {module_cls.__name__}.")
-        except Exception as e:
-            logging.warning(f"Failed to initialize weights for buffer-only module `{module_name}`: {e}")
-
-
 def _init_peft_adapters(model: nn.Module, peft_init_method: str):
     """
     Initialize the PEFT adapters with the scaled weights.
@@ -533,3 +506,42 @@ def _init_peft_adapters(model: nn.Module, peft_init_method: str):
                 module.init_lora_weights(peft_init_method)
             except Exception as e:
                 logging.warning(f"Failed to initialize weights for PEFT adapter `{module.__class__.__name__}`: {e}")
+
+
+def _apply(module, fn, recurse=True):
+    from torch.utils._python_dispatch import is_traceable_wrapper_subclass
+
+    if recurse:
+        for child in module.children():
+            _apply(child, fn, recurse=recurse)
+
+    should_use_swap_tensors = torch.__future__.get_swap_module_params_on_conversion()
+    for key, param in module._parameters.items():
+        if param is None:
+            continue
+        # Tensors stored in modules are graph leaves, and we don't want to
+        # track autograd history of `param_applied`, so we have to use
+        # `with torch.no_grad():`
+        with torch.no_grad():
+            param_applied = fn(param)
+
+        # subclasses may have multiple child tensors so we need to use swap_tensors
+        p_should_use_swap_tensors = should_use_swap_tensors or is_traceable_wrapper_subclass(param_applied)
+
+        param_grad = param.grad
+        if p_should_use_swap_tensors:
+            try:
+                if param_grad is not None:
+                    # Accessing param.grad makes its at::Tensor's use_count 2, which will prevent swapping.
+                    # Decrement use count of the gradient by setting to None
+                    param.grad = None
+                param_applied = torch.nn.Parameter(param_applied, requires_grad=param.requires_grad)
+                torch.utils.swap_tensors(param, param_applied)
+            except Exception as e:
+                if param_grad is not None:
+                    param.grad = param_grad
+                raise RuntimeError(f"_apply(): Couldn't swap {module._get_name()}.{key}") from e
+        else:
+            raise RuntimeError(f"_apply(): Couldn't swap {module._get_name()}.{key}")
+
+    return module
