@@ -99,28 +99,34 @@ def initialize_distributed(
         DistInfo: An instance containing the distributed environment configuration.
     """
     device_count = torch.cuda.device_count()
+    device = None
     if torch.distributed.is_initialized():
         if get_rank_safe() == 0:
             print(
-                "torch distributed is already initialized, skipping initialization ...",
+                "torch distributed is already initialized, skipping initialization.",
                 flush=True,
             )
-
+        if device_count > 0:
+            device = torch.cuda.current_device()
     else:
         if get_rank_safe() == 0:
-            print("> initializing torch distributed with {} workers...".format(get_world_size_safe()), flush=True)
-
-        # Manually set the device ids.
-        if device_count > 0:
-            torch.cuda.set_device(get_local_rank_preinit())
+            print("> initializing torch distributed with {} workers.".format(get_world_size_safe()), flush=True)
 
         # Call the init process
-        init_process_group_kwargs = {
+        init_pg_kwargs = {
             "backend": backend,
             "world_size": get_world_size_safe(),
             "rank": get_rank_safe(),
             "timeout": datetime.timedelta(minutes=timeout_minutes),
         }
+
+        # Manually set the device ids.
+        device = None
+        if device_count > 0:
+            rank = get_local_rank_preinit()
+            device = torch.device("cuda", rank)
+            torch.cuda.set_device(device)
+            init_pg_kwargs["device_id"] = device
 
         if get_world_size_safe() == 1:
             import socket
@@ -131,17 +137,16 @@ def initialize_distributed(
                     return s.getsockname()[1]
 
             free_port = find_free_port()
-            init_process_group_kwargs["world_size"] = 1
-            init_process_group_kwargs["rank"] = 0
-            init_process_group_kwargs["init_method"] = f"tcp://localhost:{free_port}"
+            init_pg_kwargs["world_size"] = 1
+            init_pg_kwargs["rank"] = 0
+            init_pg_kwargs["init_method"] = f"tcp://localhost:{free_port}"
 
-        torch.distributed.init_process_group(**init_process_group_kwargs)
+        torch.distributed.init_process_group(**init_pg_kwargs)
         atexit.register(destroy_global_state)
         torch.distributed.barrier(device_ids=[get_local_rank_preinit()])
 
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
-    device = torch.device("cuda", rank % torch.cuda.device_count())
     return DistInfo(backend, rank, world_size, device, rank == 0)
 
 
