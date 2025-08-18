@@ -53,6 +53,6 @@ guides/checkpointing.md
 guides/llm/dataset.md
 guides/vlm/dataset.md
 guides/llm/column-mapped-text-instruction-dataset.md
-
+guides/gradient_checkpointing.md
 apidocs/index.rst
 ```

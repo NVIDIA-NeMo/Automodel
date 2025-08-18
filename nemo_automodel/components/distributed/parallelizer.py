@@ -387,10 +387,17 @@ def fsdp2_strategy_parallelize(
 
     # Apply activation checkpointing to MLP layers if requested
     if activation_checkpointing:
-        layers = get_lm_ac_layers(model)
-        for i, layer in enumerate(layers):
-            if hasattr(layer, "mlp"):
-                layers[i].mlp = checkpoint_wrapper(layer.mlp)
+        # Enable HuggingFace's built-in GC toggle if available
+        if hasattr(model, "gradient_checkpointing_enable"):
+            try:
+                model.gradient_checkpointing_enable()
+            except Exception:
+                pass  # silently ignore if the method is not implemented correctly
+        else:
+            layers = get_lm_ac_layers(model)
+            for i, layer in enumerate(layers):
+                if hasattr(layer, "mlp"):
+                    layers[i].mlp = checkpoint_wrapper(layer.mlp)
 
     # Set up mixed precision policy
     if not mp_policy:
@@ -429,6 +436,7 @@ def nvfsdp_strategy_parallelize(
     optimizer=None,
     nvfsdp_unit_modules: Optional[List[str]] = None,
     tp_shard_plan: Optional[Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]] = None,
+    activation_checkpointing: bool = False,
     data_parallel_sharding_strategy: str = "optim_grads_params",
     init_nvfsdp_with_meta_device: bool = False,
     grad_reduce_in_fp32: bool = False,
@@ -495,6 +503,10 @@ def nvfsdp_strategy_parallelize(
             Defaults to "context_parallel".
         tp_mesh_name (str): Key name for the tensor parallel mesh in device_mesh.
             Defaults to "tensor_parallel".
+        activation_checkpointing (bool): If True, wraps MLP sub-layers with
+            PyTorch's checkpoint_wrapper to trade compute for memory. This can
+            significantly reduce the peak activation memory during training at
+            the cost of additional compute in the backward pass.
 
     NOTE: The passed-in model should preferably reside on the meta device.
     Otherwise, ensure the model fits into available GPU or CPU memory.
@@ -519,6 +531,30 @@ def nvfsdp_strategy_parallelize(
     # TP sharding.
     if tp_mesh.size() > 1:
         parallelize_module(model, tp_mesh, tp_shard_plan)
+
+    # ------------------------------------------------------------------
+    # Gradient / Activation checkpointing (memory-vs-compute trade-off)
+    # ------------------------------------------------------------------
+    if activation_checkpointing:
+        # Enable HuggingFace's built-in GC toggle if the model supports it
+        if hasattr(model, "gradient_checkpointing_enable"):
+            try:
+                model.gradient_checkpointing_enable()
+            except Exception:
+                pass
+
+        # Transformer-style models expose layers differently, handle both
+        if hasattr(model, "language_model") and hasattr(model.language_model, "layers"):
+            _layers = model.language_model.layers
+        elif hasattr(model, "model") and hasattr(model.model, "layers"):
+            _layers = model.model.layers
+        else:
+            _layers = None
+
+        if _layers is not None:
+            for idx, block in enumerate(_layers):
+                if hasattr(block, "mlp"):
+                    _layers[idx].mlp = checkpoint_wrapper(block.mlp)
 
     if cp_mesh.size() > 1:
         dp_cp_mesh_name = "dp_cp"

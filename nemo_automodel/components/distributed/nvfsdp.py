@@ -114,6 +114,12 @@ class NVFSDPManager:
     nccl_ub: Optional[bool] = field(default=False, metadata={"help": "Use NCCL UBs if True."})
     fsdp_double_buffer: Optional[bool] = field(default=False, metadata={"help": "Use double buffer if True."})
 
+    # Gradient / Activation checkpointing
+    activation_checkpointing: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Enable activation checkpointing for transformer MLP layers to save memory."},
+    )
+
     def __post_init__(self):
         """
         Post-initialization hook that sets up the distributed environment.
@@ -238,6 +244,7 @@ class NVFSDPManager:
             optimizer=optimizer,
             nvfsdp_unit_modules=self.nvfsdp_unit_modules,
             tp_shard_plan=tp_shard_plan,
+            activation_checkpointing=self.activation_checkpointing,
             data_parallel_sharding_strategy=self.data_parallel_sharding_strategy,
             init_nvfsdp_with_meta_device=self.init_nvfsdp_with_meta_device,
             grad_reduce_in_fp32=self.grad_reduce_in_fp32,
