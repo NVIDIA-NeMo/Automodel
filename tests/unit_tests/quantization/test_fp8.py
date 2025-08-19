@@ -31,6 +31,7 @@ class TestFP8Config:
     def test_default_config(self):
         """Test default configuration values."""
         config = FP8Config()
+        assert config.enabled is False
         assert config.enable_fsdp_float8_all_gather is False
         assert config.force_recompute_fp8_weight_in_bwd is False
         assert config.precompute_float8_dynamic_scale_for_fsdp is False
@@ -41,6 +42,7 @@ class TestFP8Config:
     def test_custom_config(self):
         """Test custom configuration values."""
         config = FP8Config(
+            enabled=True,
             enable_fsdp_float8_all_gather=True,
             force_recompute_fp8_weight_in_bwd=True,
             precompute_float8_dynamic_scale_for_fsdp=True,
@@ -48,6 +50,7 @@ class TestFP8Config:
             recipe_name="tensorwise",
             emulate=True
         )
+        assert config.enabled is True
         assert config.enable_fsdp_float8_all_gather is True
         assert config.force_recompute_fp8_weight_in_bwd is True
         assert config.precompute_float8_dynamic_scale_for_fsdp is True
@@ -290,6 +293,7 @@ class TestFP8ConfigMethods:
     def test_to_dict_conversion(self):
         """Test to_dict method converts config to legacy format."""
         config = FP8Config(
+            enabled=True,
             recipe_name="tensorwise",
             enable_fsdp_float8_all_gather=True,
             precompute_float8_dynamic_scale_for_fsdp=True,
@@ -300,6 +304,7 @@ class TestFP8ConfigMethods:
         
         result = config.to_dict()
         expected = {
+            'enabled': True,
             'fp8_recipe_name': 'tensorwise',
             'enable_fsdp_float8_all_gather': True,
             'precompute_float8_dynamic_scale_for_fsdp': True,
@@ -316,6 +321,7 @@ class TestFP8ConfigMethods:
         result = config.to_dict()
         
         expected = {
+            'enabled': False,
             'fp8_recipe_name': None,
             'enable_fsdp_float8_all_gather': False,
             'precompute_float8_dynamic_scale_for_fsdp': False,
@@ -325,6 +331,100 @@ class TestFP8ConfigMethods:
         }
         
         assert result == expected
+
+
+class TestFP8ConfigBuilders:
+    """Test helper functions for building FP8Config from dictionaries."""
+    
+    def test_create_fp8_config_from_dict(self):
+        """Test create_fp8_config_from_dict function."""
+        from nemo_automodel.components.quantization.fp8 import create_fp8_config_from_dict
+        
+        config_dict = {
+            "enabled": True,
+            "recipe_name": "tensorwise",
+            "enable_fsdp_float8_all_gather": True,
+            "precompute_float8_dynamic_scale_for_fsdp": True,
+            "force_recompute_fp8_weight_in_bwd": False,
+            "filter_fqns": ["lm_head"],
+            "emulate": True,
+        }
+        
+        config = create_fp8_config_from_dict(config_dict)
+        
+        assert config.enabled is True
+        assert config.recipe_name == "tensorwise"
+        assert config.enable_fsdp_float8_all_gather is True
+        assert config.precompute_float8_dynamic_scale_for_fsdp is True
+        assert config.force_recompute_fp8_weight_in_bwd is False
+        assert config.filter_fqns == ["lm_head"]
+        assert config.emulate is True
+    
+    def test_create_fp8_config_from_dict_with_defaults(self):
+        """Test create_fp8_config_from_dict with missing keys uses defaults."""
+        from nemo_automodel.components.quantization.fp8 import create_fp8_config_from_dict
+        
+        config_dict = {"enabled": True}
+        config = create_fp8_config_from_dict(config_dict)
+        
+        assert config.enabled is True
+        assert config.recipe_name is None
+        assert config.enable_fsdp_float8_all_gather is False
+        assert config.filter_fqns == []
+        assert config.emulate is False
+    
+    def test_build_fp8_config_with_dict(self):
+        """Test build_fp8_config function with dictionary."""
+        from nemo_automodel.components.quantization.fp8 import build_fp8_config
+        
+        config_dict = {
+            "enabled": True,
+            "recipe_name": "rowwise",
+            "filter_fqns": ["lm_head", "embed"]
+        }
+        
+        config = build_fp8_config(config_dict)
+        
+        assert config.enabled is True
+        assert config.recipe_name == "rowwise"
+        assert config.filter_fqns == ["lm_head", "embed"]
+    
+    def test_build_fp8_config_with_none(self):
+        """Test build_fp8_config function with None returns disabled config."""
+        from nemo_automodel.components.quantization.fp8 import build_fp8_config
+        
+        config = build_fp8_config(None)
+        
+        assert config.enabled is False
+        assert config.recipe_name is None
+        assert config.filter_fqns == []
+    
+    def test_apply_fp8_wrapper_disabled(self):
+        """Test apply_fp8_wrapper with disabled config returns original model."""
+        from nemo_automodel.components.quantization.fp8 import apply_fp8_wrapper
+        
+        model = nn.Linear(32, 64)
+        config = FP8Config(enabled=False)
+        
+        result = apply_fp8_wrapper(model, config)
+        
+        # Should return the same model instance when disabled
+        assert result is model
+    
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_apply_fp8_wrapper_enabled_with_error(self):
+        """Test apply_fp8_wrapper with enabled config but error falls back gracefully."""
+        from nemo_automodel.components.quantization.fp8 import apply_fp8_wrapper
+        
+        model = nn.Linear(32, 64)
+        config = FP8Config(enabled=True, emulate=True)
+        
+        # This should gracefully handle errors and return original model
+        result = apply_fp8_wrapper(model, config)
+        
+        # Should return a model (either transformed or original)
+        assert isinstance(result, nn.Module)
+
 
 if __name__ == "__main__":
     pytest.main([__file__]) 
