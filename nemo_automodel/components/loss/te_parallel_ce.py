@@ -122,6 +122,7 @@ class TEParallelCrossEntropy:
         logits: torch.Tensor,
         labels: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        num_label_tokens: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Compute parallel cross entropy loss that matches PyTorch's cross_entropy behavior.
@@ -130,6 +131,7 @@ class TEParallelCrossEntropy:
             logits: Input logits. Shape: [B, T, V]
             labels: Target labels. Shape: [B, T]
             mask: Mask to apply to the loss. Shape: [B, T]
+            num_label_tokens (int): The number of non-padding tokens.
 
         Returns:
             Computed loss tensor
@@ -153,6 +155,9 @@ class TEParallelCrossEntropy:
         if self.reduction == "none" or self.reduction == "mean":
             return te_loss
         elif self.reduction == "sum":
-            return te_loss.sum()
+            loss = te_loss.sum()
+            if num_label_tokens is not None:
+                loss = loss / num_label_tokens
+            return loss
         else:
             raise ValueError(f"Invalid reduction: {self.reduction}. Must be one of 'none', 'mean', 'sum'")

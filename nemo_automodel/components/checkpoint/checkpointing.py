@@ -16,6 +16,7 @@
 
 import glob
 import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -135,7 +136,7 @@ def save_model(
         fqn_to_file_index_mapping = None
         if checkpoint_config.save_consolidated:
             # we first need to find the FQN -> .safetensors mapping
-            index_path = _get_safetensors_index_path(
+            index_path = get_safetensors_index_path(
                 checkpoint_config.model_cache_dir,
                 checkpoint_config.model_repo_id,
             )
@@ -170,6 +171,70 @@ def save_model(
         dcp.save(model_state.state_dict(), checkpoint_id=model_path)
     else:
         raise ValueError(f"Unsupported model save format: {checkpoint_config.model_save_format}")
+
+
+def load_model_from_base_checkpoint(
+    model: torch.nn.Module,
+    device: torch.device,
+    is_peft: bool,
+    root_dir: str,
+    model_name: str,
+    peft_init_method: str,
+):
+    """
+    Load a model from the base Hugging Face checkpoint in parallel.
+
+    Args:
+        model: Model to load state into
+        device: Device to load model onto
+        is_peft: Whether the model is PEFT
+        root_dir: Root directory of the model
+        model_name: Name of the model
+    """
+    from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
+
+    to_empty_parameters_only(model, device=device)
+
+    # HF models set _is_hf_initialized to True after initialization.
+    # But because we initialize on meta device, these are erroneously set to True.
+    # We need to set them to False and call initialize_weights to re-initialize the weights.
+
+    # Gemma3ForConditionalGeneration cannot be pretrained currently. The pinned torch version
+    # doesn't support initialize_weights when the model is sharded. This is because Gemma's
+    # initialize_weights method requires setting a row to zeros in the embedding matrix.
+    # This index selection op is not supported for DTensors in the pinned torch version.
+    if not isinstance(model, Gemma3ForConditionalGeneration):
+        for _, module in model.named_modules():
+            if hasattr(module, "_is_hf_initialized"):
+                module._is_hf_initialized = False
+
+        # init model weights
+        if hasattr(model, "initialize_weights"):
+            model.initialize_weights()
+        else:
+            logging.warning(
+                "Warning: Model does not have initialize_weights method. Requires custom initialization to be implemented."
+            )
+
+    # init peft adapters with the scaled weights
+    _init_peft_adapters(model, peft_init_method)
+
+    model_state = ModelState(model, is_peft=is_peft, is_init_step=True)
+    model_state_dict = model_state.state_dict()
+    if os.path.exists(model_name):
+        # offline models will pass in the model path directly
+        model_path = model_name
+    else:
+        model_path = get_safetensors_index_path(root_dir, model_name)
+    dcp.load(
+        model_state_dict,
+        storage_reader=_HuggingFaceStorageReader(
+            model_path, key_mapping=getattr(model, "_checkpoint_conversion_mapping", None)
+        ),
+    )
+    model_state.load_state_dict(model_state_dict)
+    if hasattr(model, "tie_weights") and model_state.is_tied_lm_head:
+        model.tie_weights()
 
 
 def load_model(
@@ -278,7 +343,7 @@ def save_config(config: dict[str, Any], weights_path: str):
         yaml.dump(config, f, sort_keys=False, default_flow_style=False)
 
 
-def _get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
+def get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
     """
     Return the directory containing the first `model.safetensors.index.json` found for given model.
 
@@ -322,6 +387,23 @@ def _get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
             return snapshot_dirs[0]
         except IndexError:
             raise FileNotFoundError(f"No snapshot directories found in {snapshots_root}")
+
+
+def to_empty_parameters_only(model: nn.Module, *, device: torch.device, recurse: bool = True) -> nn.Module:
+    """
+    Move parameters to the specified device without copying storage, skipping buffers.
+
+    Mirrors torch.nn.Module.to_empty but applies only to parameters, not buffers.
+
+    Args:
+        model: The module to transform
+        device: Target device
+        recurse: Whether to recurse into child modules
+
+    Returns:
+        The same module instance
+    """
+    return _apply(model, lambda t: torch.empty_like(t, device=device), recurse=recurse)
 
 
 def _save_peft_adapters(
@@ -395,9 +477,71 @@ def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
 def _extract_target_modules(model: nn.Module) -> list[str]:
     """
     Extract the target modules from the model.
+
+    Note: When torch.compile is used, module names get prefixed with '_orig_mod.'.
+    This function strips those prefixes to get the original module names.
     """
     final_target_modules = set()
     for name, _ in model.named_modules():
         if "lora" in name.lower():
-            final_target_modules.add(name.rsplit(".", 1)[0])
+            # Remove the torch.compile _orig_mod prefix if present
+            target_name = name.rsplit(".", 1)[0]
+            if target_name.startswith("_orig_mod."):
+                target_name = target_name[len("_orig_mod.") :]
+            final_target_modules.add(target_name)
     return sorted(list(final_target_modules))
+
+
+def _init_peft_adapters(model: nn.Module, peft_init_method: str):
+    """
+    Initialize the PEFT adapters with the scaled weights.
+
+    Args:
+        model: Model to initialize PEFT adapters for
+        peft_init_method: Method to initialize PEFT adapters e.g. "xavier". See `LinearLoRA` for more details.
+    """
+    for module in model.modules():
+        if hasattr(module, "init_lora_weights"):
+            try:
+                module.init_lora_weights(peft_init_method)
+            except Exception as e:
+                logging.warning(f"Failed to initialize weights for PEFT adapter `{module.__class__.__name__}`: {e}")
+
+
+def _apply(module, fn, recurse=True):
+    from torch.utils._python_dispatch import is_traceable_wrapper_subclass
+
+    if recurse:
+        for child in module.children():
+            _apply(child, fn, recurse=recurse)
+
+    should_use_swap_tensors = torch.__future__.get_swap_module_params_on_conversion()
+    for key, param in module._parameters.items():
+        if param is None:
+            continue
+        # Tensors stored in modules are graph leaves, and we don't want to
+        # track autograd history of `param_applied`, so we have to use
+        # `with torch.no_grad():`
+        with torch.no_grad():
+            param_applied = fn(param)
+
+        # subclasses may have multiple child tensors so we need to use swap_tensors
+        p_should_use_swap_tensors = should_use_swap_tensors or is_traceable_wrapper_subclass(param_applied)
+
+        param_grad = param.grad
+        if p_should_use_swap_tensors:
+            try:
+                if param_grad is not None:
+                    # Accessing param.grad makes its at::Tensor's use_count 2, which will prevent swapping.
+                    # Decrement use count of the gradient by setting to None
+                    param.grad = None
+                param_applied = torch.nn.Parameter(param_applied, requires_grad=param.requires_grad)
+                torch.utils.swap_tensors(param, param_applied)
+            except Exception as e:
+                if param_grad is not None:
+                    param.grad = param_grad
+                raise RuntimeError(f"_apply(): Couldn't swap {module._get_name()}.{key}") from e
+        else:
+            raise RuntimeError(f"_apply(): Couldn't swap {module._get_name()}.{key}")
+
+    return module
