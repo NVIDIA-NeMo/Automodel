@@ -14,6 +14,7 @@
 import pytest
 import torch
 import torch.nn as nn
+from unittest.mock import Mock, patch, MagicMock
 
 from nemo_automodel.recipes.vlm.finetune import _freeze_model, _build_optimizer, build_model_and_optimizer
 
@@ -171,3 +172,100 @@ def test_build_model_and_optimizer_basic():
     trainable_param_count = _count_trainable(model.parameters())
     optim_param_count = sum(p.numel() for group in optim.param_groups for p in group["params"])
     assert trainable_param_count == optim_param_count
+
+
+# -----------------------------------------------------------------------------
+# AutoProcessor exception handling test
+# -----------------------------------------------------------------------------
+
+def test_autoprocessor_success():
+    """Test successful AutoProcessor creation."""
+    
+    with patch('transformers.AutoProcessor') as mock_auto_processor:
+        mock_processor = MagicMock()
+        mock_auto_processor.from_pretrained.return_value = mock_processor
+        
+        cfg_model = MagicMock()
+        cfg_model.pretrained_model_name_or_path = "test/model"
+        
+        processor = mock_auto_processor.from_pretrained(cfg_model.pretrained_model_name_or_path)
+        
+        assert processor is mock_processor
+        mock_auto_processor.from_pretrained.assert_called_once_with("test/model")
+
+
+def test_autoprocessor_exception_handling(caplog):
+    """Test AutoProcessor exception handling and logging in build_dataloader."""
+    import logging
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+    
+    with patch('transformers.AutoProcessor.from_pretrained') as mock_from_pretrained, \
+         patch('nemo_automodel.components.training.rng.StatefulRNG'), \
+         patch('torch.utils.data.distributed.DistributedSampler'), \
+         patch('nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS', {'NoneType': MagicMock()}):
+        
+        # Set up the exception
+        mock_from_pretrained.side_effect = Exception("Model does not have AutoProcessor")
+        
+        # Mock configurations - minimal setup
+        cfg_ds = MagicMock()
+        cfg_ds.instantiate.return_value = []
+        cfg_ds.path_or_dataset = "test/dataset"
+        
+        cfg_dl = MagicMock()
+        cfg_dl.get.return_value = None  # No custom settings
+        cfg_dl.instantiate.return_value = MagicMock()
+        
+        cfg_model = MagicMock()
+        cfg_model.pretrained_model_name_or_path = "test/model"
+        
+        cfg_processor = None  # This triggers the exception path
+        
+        with caplog.at_level(logging.WARNING):
+            dataloader, processor = build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, None, 123)
+        
+        # Verify the results
+        assert processor is None
+        mock_from_pretrained.assert_called_once_with("test/model")
+        
+
+
+def test_autoprocessor_with_processor_kwargs(caplog):
+    """Test AutoProcessor exception handling when cfg_processor has no instantiate method."""
+    import logging
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+    
+    # Simple processor config class without instantiate method
+    class ProcessorConfig:
+        def to_dict(self):
+            return {"trust_remote_code": True, "some_param": "value"}
+    
+    with patch('transformers.AutoProcessor.from_pretrained') as mock_from_pretrained, \
+         patch('nemo_automodel.components.training.rng.StatefulRNG'), \
+         patch('torch.utils.data.distributed.DistributedSampler'), \
+         patch('nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS', {'NoneType': MagicMock()}):
+        
+        # Set up the exception
+        mock_from_pretrained.side_effect = Exception("Model does not have AutoProcessor")
+        
+        # Mock configurations - minimal setup
+        cfg_ds = MagicMock()
+        cfg_ds.instantiate.return_value = []
+        cfg_ds.path_or_dataset = "test/dataset"
+        
+        cfg_dl = MagicMock()
+        cfg_dl.get.return_value = None  # No custom settings
+        cfg_dl.instantiate.return_value = MagicMock()
+        
+        cfg_model = MagicMock()
+        cfg_model.pretrained_model_name_or_path = "test/model"
+        
+        cfg_processor = ProcessorConfig()  # This has to_dict but no instantiate
+        
+        with caplog.at_level(logging.WARNING):
+            dataloader, processor = build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, None, 123)
+        
+        # Verify the results
+        assert processor is None
+        mock_from_pretrained.assert_called_once_with("test/model", trust_remote_code=True, some_param="value")
+        
