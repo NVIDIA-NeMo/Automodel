@@ -41,7 +41,7 @@ model:
   trust_remote_code: true
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: checkpoints_fp8/
   model_save_format: torch_save # torch_save or safetensors
   save_consolidated: false 
