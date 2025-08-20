@@ -43,6 +43,7 @@ from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+from nemo_automodel.components.quantization.fp8 import apply_fp8_wrapper, build_fp8_config
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import count_tail_padding
@@ -52,11 +53,6 @@ from nemo_automodel.components.utils.compile_utils import (
 )
 from nemo_automodel.components.utils.dist_utils import get_sync_ctx
 from nemo_automodel.components.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
-from nemo_automodel.components.utils.compile_utils import (
-    build_compile_config,
-    compile_model,
-)
-from nemo_automodel.components.quantization.fp8 import build_fp8_config, apply_fp8_wrapper
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
