@@ -24,6 +24,9 @@ NeMo Framework is NVIDIA's GPU accelerated, end-to-end training framework for la
 
 > ⚠️ Note: NeMo AutoModel is under active development. New features, improvements, and documentation updates are released regularly. We are working toward a stable release, so expect the interface to solidify over time. Your feedback and contributions are welcome, and we encourage you to follow along as new updates roll out.
 
+## News
+- 20 Aug 2025: NeMo Automodel will support pre-training in the 25.09 release with DTensor and 3D Parallelism. Custom kernels for MoE models will be included.
+
 ## 🎛️ Supported Models
 NeMo AutoModel provides native support for a wide range of models available on the Hugging Face Hub, enabling efficient fine-tuning for various domains.
 
