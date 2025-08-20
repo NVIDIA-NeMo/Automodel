@@ -43,7 +43,7 @@ from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
-from nemo_automodel.components.quantization.fp8 import apply_fp8_wrapper, build_fp8_config
+from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import count_tail_padding
@@ -162,7 +162,7 @@ def build_model_and_optimizer(
 
         if cfg_fp8 is not None:
             fp8_config = build_fp8_config(cfg_fp8)
-            model = apply_fp8_wrapper(model, fp8_config)
+            model = apply_fp8_to_model(model, config=fp8_config)
 
         print_trainable_parameters(model)
 
