@@ -338,6 +338,88 @@ def validate_tp_mesh(model, tp_mesh):
     )
 
 
+def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
+    """
+    Extract layers from different model architectures for parallelization.
+    
+    This function handles various model types including vision-language models,
+    causal language models, and multimodal models. It collects both language
+    model layers and vision model layers where applicable.
+    
+    Args:
+        model (nn.Module): The model to extract layers from.
+        
+    Returns:
+        List[nn.Module]: A list of all layers that should be parallelized.
+    """
+    model_cls = type(model)
+    layers: List[nn.Module] = []
+    
+    # Handle different model structures
+    if model_cls == Gemma3ForConditionalGeneration:
+        # Collect language model layers
+        for layer in model.language_model.layers:
+            layers.append(layer)
+        # Collect vision model layers (siglip encoder has same structure as clip encoder)
+        for layer in model.vision_tower.vision_model.encoder.layers:
+            layers.append(layer)
+            
+    elif model_cls in [
+        Qwen2_5_VLForConditionalGeneration,
+        Qwen2VLForConditionalGeneration,
+    ]:
+        # VL models have the language model at model.language_model
+        # Append language model layers
+        for layer in model.language_model.layers:
+            layers.append(layer)
+        # Append visual model layers
+        for layer in model.visual.blocks:
+            layers.append(layer)
+            
+    elif model_cls == SmolVLMForConditionalGeneration:
+        # Collect text model layers
+        for layer in model.model.text_model.layers:
+            layers.append(layer)
+        # Collect vision model layers
+        for layer in model.model.vision_model.encoder.layers:
+            layers.append(layer)
+            
+    elif model_cls in [
+        LlavaForConditionalGeneration,
+        LlavaNextForConditionalGeneration,
+        LlavaNextVideoForConditionalGeneration,
+        LlavaOnevisionForConditionalGeneration,
+    ]:
+        # Collect language model layers
+        for layer in model.model.language_model.layers:
+            layers.append(layer)
+        # Collect vision model layers
+        for layer in model.vision_tower.vision_model.encoder.layers:
+            layers.append(layer)
+            
+    elif model_cls == Mistral3ForConditionalGeneration:
+        # Collect language model layers
+        for layer in model.model.language_model.layers:
+            layers.append(layer)
+        # Collect vision model layers
+        for layer in model.model.vision_tower.transformer.layers:
+            layers.append(layer)
+            
+    elif model_cls == Llama4ForConditionalGeneration:
+        # Collect language model layers
+        for layer in model.language_model.model.layers:
+            layers.append(layer)
+        # Collect vision model layers
+        for layer in model.vision_model.model.layers:
+            layers.append(layer)
+    elif model_cls.__name__ == "NemotronHForCausalLM":
+        # NemotronH models use backbone.layers instead of model.layers
+        layers.extend(model.backbone.layers)
+    else:
+        # Default case for all other models (assumed to be a causal LM)
+        layers.extend(model.model.layers)
+        
+    return layers
 
 def _get_parallel_plan(
     model: nn.Module,
@@ -457,18 +539,7 @@ def fsdp2_strategy_parallelize(
     dp_mesh = device_mesh[dp_mesh_dim_names]
 
     model_cls = type(model)
-    layers: list = []
-    # Handle different model structures
-    if model_cls == Gemma3ForConditionalGeneration:
-        # layers: torch.nn.ModuleList = model.language_model.layers  # type: ignore
-        for layer in model.language_model.layers:
-            layers.append(layer)
-        # siglip encoder also has the same structure as clip encoder (being the same model after all)
-        for layer in model.vision_tower.vision_model.encoder.layers:
-            layers.append(layer)
-        layers: torch.nn.ModuleList = model.language_model.layers  # type: ignore
-
-    elif model_cls.__name__ == "NemotronHForCausalLM":
+    if model_cls.__name__ == "NemotronHForCausalLM":
         # need to do something special for nm5, since it's harder to shard the mamba layers
         # nm5 is not importable, so we check the __name__ attribute
 
@@ -483,52 +554,8 @@ def fsdp2_strategy_parallelize(
             custom_parallel_plan=tp_shard_plan,
         )
 
-    elif model_cls in [
-        Qwen2_5_VLForConditionalGeneration,
-        Qwen2VLForConditionalGeneration,
-    ]:
-        # VL models have the language model at model.language_model
-        # append language model layers
-        for layer in model.language_model.layers:
-            layers.append(layer)
-        # append visual model layers
-        for layer in model.visual.blocks:
-            layers.append(layer)
-
-
-    elif model_cls == SmolVLMForConditionalGeneration:
-        layers: list = []
-        for layer in model.model.text_model.layers:
-            layers.append(layer)
-        for layer in model.model.vision_model.encoder.layers:
-            layers.append(layer)
-
-    elif model_cls in [
-        LlavaForConditionalGeneration,
-        LlavaNextForConditionalGeneration,
-        LlavaNextVideoForConditionalGeneration,
-        LlavaOnevisionForConditionalGeneration,
-    ]:
-        for layer in model.model.language_model.layers:
-            layers.append(layer)
-        for layer in model.vision_tower.vision_model.encoder.layers:
-            layers.append(layer)
-
-    elif model_cls == Mistral3ForConditionalGeneration:
-        for layer in model.model.language_model.layers:
-            layers.append(layer)
-        for layer in model.model.vision_tower.transformer.layers:
-            layers.append(layer)
-
-    elif model_cls == Llama4ForConditionalGeneration:
-        for layer in model.language_model.model.layers:
-            layers.append(layer)
-        for layer in model.vision_model.model.layers:
-            layers.append(layer)
-
-    else:
-        # this is the default case for all other models (assumed to be a causal LM)
-        layers: torch.nn.ModuleList = model.model.layers  # type: ignore
+    # Extract layers from the model for parallelization
+    layers = _extract_model_layers(model)
 
     # TP sharding with enhanced plan generation
     if tp_mesh.size() > 1:
