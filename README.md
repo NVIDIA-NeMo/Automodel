@@ -39,7 +39,7 @@ NeMo Framework is NVIDIA's GPU accelerated, end-to-end training framework for la
 - ✅ **HSDP** - Hybrid Sharding Data Parallelism based on FSDP2.
 
 - 🔜 **Pipeline Support** - Torch-native support for pipelining composable with FSDP2 and DTensor (3D Parallelism).
-- 🔜 **Pre-training** - Support for model pre-training, including DeepSeekV3, GPT-OSS and Qwen3 (Coder-480B-A35B, 235B-A22B-Thinking, etc).
+- 🔜 **Pre-training** - Support for model pre-training, including DeepSeekV3, GPT-OSS and Qwen3 (Coder-480B-A35B, etc).
 - 🔜 **Knowledge Distillation** - Support for knowledge distillation.
 
 
