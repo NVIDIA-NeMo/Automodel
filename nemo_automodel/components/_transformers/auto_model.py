@@ -275,7 +275,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             logging.warning("Retrying without SDPA patching.")
             return _retry(use_sdpa_patching=False)
 
-
         model.config.update({"nemo_version": __version__})
         return model
 
@@ -377,7 +376,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         except:
             logging.warning("Retrying without SDPA patching.")
             return _retry(use_sdpa_patching=False)
-
 
         model.config.update({"nemo_version": __version__})
         return model

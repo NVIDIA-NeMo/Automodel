@@ -7,7 +7,7 @@
 import logging
 from dataclasses import dataclass, field
 from functools import partial
-from typing import List, Literal, Optional, Dict, Any
+from typing import Any, Dict, List, Literal, Optional
 
 import torch
 import torch.nn as nn
@@ -279,8 +279,7 @@ def create_fp8_config_from_dict(config_dict: Dict[str, Any]) -> FP8Config:
     Returns:
         FP8Config instance.
     """
-    from typing import Dict, Any
-    
+
     return FP8Config(
         enabled=config_dict.get("enabled", False),
         recipe_name=config_dict.get("recipe_name", None),
@@ -301,8 +300,7 @@ def build_fp8_config(cfg: Optional[Dict[str, Any]]) -> FP8Config:
     Returns:
         FP8Config instance.
     """
-    from typing import Dict, Any, Optional
-    
+
     if cfg is None:
         return FP8Config(enabled=False)
     else:
@@ -329,7 +327,7 @@ def apply_fp8_wrapper(model: nn.Module, config: FP8Config) -> nn.Module:
             and config.recipe_name == "tensorwise"
             and config.enable_fsdp_float8_all_gather
         )
-        
+
         model = apply_fp8_to_model(
             model,
             recipe_name=config.recipe_name,
