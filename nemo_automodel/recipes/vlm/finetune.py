@@ -748,6 +748,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     )
 
                 total_loss += local_loss.item()
+                total_tokens += num_label_tokens
 
         # Aggregate across ranks if distributed is initialized
         total_loss = self._dp_allreduce(torch.FloatTensor([total_loss])).item()
