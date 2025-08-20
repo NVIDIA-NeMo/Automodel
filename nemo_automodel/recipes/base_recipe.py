@@ -350,7 +350,8 @@ class BaseRecipe:
             return self.device_mesh["dp"].get_group()
 
     def _get_dp_group_size(self):
-        return 1 if self.device_mesh is None else self._get_dp_group().size()
+        dp_group = self._get_dp_group()
+        return 1 if dp_group is None else dp_group.size()
 
     def _dp_allreduce(self, tensor, op=dist.ReduceOp.SUM):
         dp_group = self._get_dp_group()
