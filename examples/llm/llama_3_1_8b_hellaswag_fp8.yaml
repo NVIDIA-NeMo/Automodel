@@ -14,7 +14,7 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm/finetune.py --config examples/llm/llama_3_2_1b_hellaswag_fp8.yaml
+# torchrun --nproc-per-node=8 recipes/llm/finetune.py --config examples/llm/llama_3_1_8b_hellaswag_fp8.yaml
 # Adjust --nproc-per-node to the number of GPUs available on your host machine.
 #
 # This example demonstrates FP8 quantization for improved training performance on H100+ GPUs.
