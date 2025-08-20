@@ -150,7 +150,7 @@ jobs:
 
           if [[ $EXTRA == *"fa"* ]]; then
             pip install --index-url https://download.pytorch.org/whl/cu128 torch
-            pip install setuptools psutil
+            pip install setuptools psutil packaging
             PIP_ARGS=(--no-build-isolation)
           fi
 
