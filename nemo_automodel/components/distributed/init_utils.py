@@ -126,7 +126,6 @@ def initialize_distributed(
             rank = get_local_rank_preinit()
             device = torch.device("cuda", rank)
             torch.cuda.set_device(device)
-            init_pg_kwargs["device_id"] = device
 
         if get_world_size_safe() == 1:
             import socket
