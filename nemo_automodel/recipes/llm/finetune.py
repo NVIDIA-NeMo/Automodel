@@ -624,6 +624,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # number of tokens in the batch, excluding any tail padding.
         num_tokens_in_batch = sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches)
         num_tokens_in_batch = self._dp_allreduce(torch.LongTensor([num_tokens_in_batch])).item()
+        dp_group_size = self._get_dp_group_size()
 
         num_batches = len(batches)
         for i, batch in enumerate(batches):
@@ -656,7 +657,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     labels=labels,
                     model=self.model,
                     hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
-                    num_label_tokens=num_label_tokens,
+                    num_label_tokens=num_label_tokens / dp_group_size,
                 )
                 loss_buffer.append(local_loss.clone().detach())
                 local_loss.backward()
