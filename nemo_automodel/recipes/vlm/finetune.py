@@ -753,14 +753,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
         total_loss = self._dp_allreduce(torch.FloatTensor([total_loss])).item()
         total_tokens = self._dp_allreduce(torch.LongTensor([total_tokens])).item()
 
-        val_loss = total_loss / max(total_tokens, 1e-8)
         if self.dist_env.is_main:
             if wandb.run is not None:
-                wandb.log({"val_loss": val_loss, "step": self.step_scheduler.step, "epoch": self.step_scheduler.epoch})
+                wandb.log({"val_loss": total_loss, "step": self.step_scheduler.step, "epoch": self.step_scheduler.epoch})
         current_lr = self.optimizer.param_groups[0]["lr"]
         logging.info(
-            "[val] step {} | epoch {} | loss {:.4f} | lr {:.2e}".format(
-                self.step_scheduler.step, self.step_scheduler.epoch, val_loss, current_lr
+            "[val] step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
+                self.step_scheduler.step, self.step_scheduler.epoch, total_loss, current_lr, total_tokens
             )
         )
 
