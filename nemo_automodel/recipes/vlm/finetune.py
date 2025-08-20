@@ -160,9 +160,9 @@ def build_model_and_optimizer(
             if cfg_peft is not None:
                 apply_lora_to_linear_modules(model, cfg_peft)
 
-        if cfg_fp8 is not None:
-            fp8_config = build_fp8_config(cfg_fp8)
-            model = apply_fp8_to_model(model, config=fp8_config)
+            if cfg_fp8 is not None:
+                fp8_config = build_fp8_config(cfg_fp8)
+                model = apply_fp8_to_model(model, config=fp8_config)
 
         print_trainable_parameters(model)
 
