@@ -40,7 +40,7 @@ NeMo Framework is NVIDIA's GPU accelerated, end-to-end training framework for la
 
 - 🔜 **Pipeline Support** - Torch-native support for pipelining composable with FSDP2 and DTensor (3D Parallelism).
 - 🔜 **Pre-training** - Support for model pre-training, including DeepSeekV3, GPT-OSS and Qwen3 (Coder-480B-A35B, etc).
-- 🔜 **Knowledge Distillation** - Support for knowledge distillation.
+- 🔜 **Knowledge Distillation** - Support for knowledge distillation with LLMs; VLM support will be added post 25.09.
 
 
 ## 🎛️ Supported Models
