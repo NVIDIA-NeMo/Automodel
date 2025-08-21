@@ -24,6 +24,25 @@ NeMo Framework is NVIDIA's GPU accelerated, end-to-end training framework for la
 
 > ⚠️ Note: NeMo AutoModel is under active development. New features, improvements, and documentation updates are released regularly. We are working toward a stable release, so expect the interface to solidify over time. Your feedback and contributions are welcome, and we encourage you to follow along as new updates roll out.
 
+## Features
+
+✅ _Available now_ | 🔜 _Coming in 25.09_
+
+- ✅ **HuggingFace Integration** - Works with 1-70B models (Qwen, Llama).
+- ✅ **Distributed Training** - Fully Sharded Data Parallel (FSDP2) support.
+- ✅ **Environment Support** - Support for SLURM and interactive training.
+- ✅ **Learning Algorithms** - SFT (Supervised Fine-Tuning), and PEFT (Parameter Efficient Fine-Tuning).
+- ✅ **Large Model Support** - Native PyTorch support for models up to 70B parameters.
+- ✅ **Advanced Parallelism** - PyTorch native FSDP2, TP, CP, and SP for efficient training.
+- ✅ **Sequence Packing** - Sequence packing in both DTensor and MCore for huge training perf gains.
+- ✅ **DCP** - Distributed Checkpoint support with SafeTensors output.
+- ✅ **HSDP** - Hybrid Sharding Data Parallelism based on FSDP2.
+
+- 🔜 **Pipeline Support** - Torch-native support for pipelining composable with FSDP2 and DTensor (3D Parallelism).
+- 🔜 **Pre-training** - Support for model pre-training, including DeepSeekV3, GPT-OSS and Qwen3 (Coder-480B-A35B, etc).
+- 🔜 **Knowledge Distillation** - Support for knowledge distillation with LLMs; VLM support will be added post 25.09.
+
+
 ## 🎛️ Supported Models
 NeMo AutoModel provides native support for a wide range of models available on the Hugging Face Hub, enabling efficient fine-tuning for various domains.
 
