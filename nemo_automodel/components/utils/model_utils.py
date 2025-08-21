@@ -19,6 +19,20 @@ import torch.nn as nn
 logger = logging.getLogger(__name__)
 
 
+def unwrap_model(model: nn.Module) -> nn.Module:
+    """Unwrap a model from its wrapper(s).
+
+    Args:
+        model: The model to unwrap.
+
+    Returns:
+        The innermost model.
+    """
+    while hasattr(model, "module"):
+        model = model.module
+    return model
+
+
 def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
     """
     Get the number of trainable parameters and the L2 norm of the model.

@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 import torch
 import torch.nn as nn
 import wandb
+from modelopt.torch.opt.plugins.huggingface import enable_huggingface_checkpointing
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
@@ -43,6 +44,7 @@ from nemo_automodel.components.distributed.nvfsdp import NVFSDPManager
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.modelopt import convert_to_kd_model, kd_reduction_fn
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
@@ -52,7 +54,7 @@ from nemo_automodel.components.utils.compile_utils import (
     compile_model,
 )
 from nemo_automodel.components.utils.dist_utils import get_sync_ctx
-from nemo_automodel.components.utils.model_utils import print_trainable_parameters
+from nemo_automodel.components.utils.model_utils import print_trainable_parameters, unwrap_model
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
@@ -66,7 +68,6 @@ logger = logging.getLogger(__name__)
 #  Stateless helper functions
 # ---------------------------
 
-
 def build_model_and_optimizer(
     device,
     cfg_model,
@@ -79,6 +80,7 @@ def build_model_and_optimizer(
     freeze_embeddings=True,
     cfg_fp8=None,
     cfg_compile=None,
+    cfg_kd=None,
 ) -> tuple[nn.Module, "Optimizer"]:  # noqa: F821
     """
     Build and initialize a model and optimizer.
@@ -96,6 +98,7 @@ def build_model_and_optimizer(
         freeze_embeddings: Whether to freeze embeddings.
         cfg_fp8: Configuration for FP8.
         cfg_compile: Configuration for torch.compile.
+        cfg_kd: Configuration for knowledge distillation.
 
     Returns:
         The instantiated model on the specified device and optimizer.
@@ -120,6 +123,9 @@ def build_model_and_optimizer(
         # Add FP8 config if provided
         if cfg_fp8 is not None:
             kwargs["fp8_config"] = cfg_fp8.instantiate()
+        if cfg_kd is not None:
+            logging.info("Disabling SDPA patching on student model for KD mode.")
+            cfg_model.use_sdpa_patching = False
 
         # Instantiate the model in meta device to avoid OOM
         with init_ctx:
@@ -133,6 +139,10 @@ def build_model_and_optimizer(
             # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
             if cfg_peft is not None:
                 apply_lora_to_linear_modules(model, cfg_peft)
+
+        # [ModelOpt]: Apply model transformations if required
+        if cfg_kd is not None:
+            model = convert_to_kd_model(model, cfg_kd, teacher_kwargs=kwargs)
 
     print_trainable_parameters(model)
 
@@ -422,11 +432,12 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
     Returns:
         The loss.
     """
-    loss_fn_kwargs = {"num_label_tokens": kwargs.pop("num_label_tokens", None)}
-    if isinstance(loss_fn, FusedLinearCrossEntropy):
-        model = kwargs.pop("model")
-        labels = kwargs.pop("labels")
+    model = kwargs.pop("model")
+    labels = kwargs.pop("labels")
+    num_label_tokens = kwargs.pop("num_label_tokens", None)
+    loss_fn_kwargs = {"num_label_tokens": num_label_tokens}
 
+    if isinstance(loss_fn, FusedLinearCrossEntropy):
         # find the lm_head in the model
         lm_head = None
         if hasattr(model, "get_output_embeddings"):
@@ -452,11 +463,31 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
         loss_fn_kwargs.update(
             {
                 "logits": kwargs.pop("logits"),
-                "labels": kwargs.pop("labels"),
+                "labels": labels,
             }
         )
 
-    return loss_fn(**loss_fn_kwargs)
+    # [ModelOpt]: Compute KD loss if model is a DistillationModel
+    original_loss = None
+    kd_loss = None
+    model = unwrap_model(model)
+    if hasattr(model, "compute_kd_loss"):
+        kd_loss_kwargs = {"loss_reduction_fn": lambda x: kd_reduction_fn(x, labels, num_label_tokens)}
+        if model.loss_balancer is not None:
+            original_loss = loss_fn(**loss_fn_kwargs)
+            kd_loss_kwargs["student_loss"] = original_loss
+        kd_loss = model.compute_kd_loss(**kd_loss_kwargs)
+
+    # Avoid recomputing the loss if done as part of KD
+    original_loss = original_loss or loss_fn(**loss_fn_kwargs)
+
+    if kd_loss is not None:
+        if not model.training:
+            return {"loss": kd_loss, "loss_original": original_loss}
+        else:
+            return {"loss": kd_loss}
+
+    return {"loss": original_loss}
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +556,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             tp_size=self.cfg.get("distributed.tp_size", 1),
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
+            cfg_kd=self.cfg.get("distillation", None),
         )
         self.loss_fn = build_loss_fn(self.cfg.loss_fn)
         self.dataloader, self.tokenizer = build_dataloader(
@@ -606,7 +638,9 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
                 # Run validation every val_every_steps
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                    self._run_validation_epoch()
+                    val_loss, val_num_tokens_in_batch = self._run_validation_epoch()
+                    self.log_val_metrics(val_loss, val_num_tokens_in_batch)
+
                     self.model.train()
 
     # ------------------ helpers ------------------
@@ -641,7 +675,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             with train_ctx(), get_sync_ctx(self.model, i == num_batches - 1):
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                    # use num_logits_to_keep to avoid full logits matrix in memory
+                    # use logits_to_keep to avoid full logits matrix in memory
                     out = self.model(logits_to_keep=1, **batch)
                     if "hidden_states" not in out:
                         raise ValueError(
@@ -650,7 +684,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 else:
                     out = self.model(**batch)
 
-                local_loss = calculate_loss(
+                losses = calculate_loss(
                     self.loss_fn,
                     logits=out.logits,
                     labels=labels,
@@ -658,6 +692,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
                     num_label_tokens=num_label_tokens,
                 )
+                local_loss = losses["loss"]
                 loss_buffer.append(local_loss.clone().detach())
                 local_loss.backward()
 
@@ -708,6 +743,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.model.eval()
 
             total_loss = 0.0
+            total_loss_original = 0.0
             total_tokens = 0
 
             for batch in self.val_dataloader:
@@ -730,40 +766,35 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         out = self.model(logits_to_keep=1, **batch)
                     else:
                         out = self.model(**batch)
-                    local_loss = calculate_loss(
+                    losses = calculate_loss(
                         self.loss_fn,
                         logits=out.logits,
                         labels=labels,
                         model=self.model,
                         hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
-                        num_label_tokens=num_label_tokens,
+                        num_label_tokens=None,
                     )
 
-                total_loss += local_loss.item()
+                total_loss += losses["loss"].item()
+                if "loss_original" in losses:
+                    total_loss_original += losses["loss_original"].item()
                 total_tokens += num_label_tokens
 
-        total_loss = self._dp_allreduce(torch.FloatTensor([total_loss])).item()
-        total_tokens = self._dp_allreduce(torch.LongTensor([total_tokens])).item()
+        if total_loss_original > 0:
+            # [ModelOpt]: Log the original loss during distillation val phase.
+            self.log_val_metrics(total_loss_original, total_tokens, loss_suffix="_original")
 
-        val_loss = total_loss / max(total_tokens, 1e-8)
-        if self.dist_env.is_main:
-            if wandb.run is not None:
-                wandb.log({"val_loss": val_loss, "step": self.step_scheduler.step, "epoch": self.step_scheduler.epoch})
-        current_lr = self.optimizer.param_groups[0]["lr"]
-        logging.info(
-            "[val] step {} | epoch {} | loss {:.4f} | lr {:.2e}".format(
-                self.step_scheduler.step, self.step_scheduler.epoch, val_loss, current_lr
-            )
-        )
+        return total_loss, total_tokens
 
-    def log_train_metrics(self, train_loss, grad_norm, num_tokens_in_batch, tps, num_label_tokens) -> float:
-        """Log metrics to wandb.
+    def log_train_metrics(self, train_loss, grad_norm, num_tokens_in_batch, tps, num_label_tokens):
+        """Log metrics to stdout and wandb.
 
         Args:
             train_loss: Training loss.
             grad_norm: Grad norm from the training step.
             num_tokens_in_batch: Total number of loss tokens.
             tps: Tokens per second.
+            num_label_tokens: Number of label tokens.
         """
         log_data = {
             "step": self.step_scheduler.step,
@@ -793,6 +824,34 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
         torch.cuda.reset_peak_memory_stats()
 
+    def log_val_metrics(self, val_loss, num_label_tokens, loss_suffix=""):
+        """Log validation metrics to stdout and wandb.
+
+        Args:
+            val_loss: Validation loss.
+            num_label_tokens: Total number of label tokens in batch.
+        """
+        # Apply distributed reduction to metrics
+        val_loss = self._dp_allreduce(torch.FloatTensor([val_loss])).item()
+        num_label_tokens = self._dp_allreduce(torch.LongTensor([num_label_tokens])).item()
+        # Calculate per-token loss
+        val_loss_per_token = val_loss / max(num_label_tokens, 1e-8)
+
+        log_data = {
+            "step": self.step_scheduler.step,
+            "epoch": self.step_scheduler.epoch,
+            f"val_loss{loss_suffix}": val_loss_per_token,
+        }
+
+        if self.dist_env.is_main and wandb.run is not None:
+            wandb.log(log_data)
+
+        logging.info(
+            "[val] step {} | epoch {} | loss{} {:.4f}".format(
+                self.step_scheduler.step, self.step_scheduler.epoch, loss_suffix, val_loss_per_token
+            )
+        )
+
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -807,6 +866,11 @@ def main(config_path=None):
     if config_path is None:
         config_path = pathlib.Path(__file__).parent.resolve() / "llama_3_2_1b_hellaswag.yaml"
     cfg = parse_args_and_load_config(config_path)
+
+    # [ModelOpt]: Enable save/restore functionality
+    if cfg.get("kd_config", None) is not None:
+        enable_huggingface_checkpointing()
+
     trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
