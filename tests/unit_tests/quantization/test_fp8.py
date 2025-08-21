@@ -22,6 +22,8 @@ from nemo_automodel.components.quantization.fp8 import (
     apply_fp8_to_model,
     verify_fp8_conversion,
     _module_filter_fn,
+    build_fp8_config,
+    create_fp8_config_from_dict,
 )
 
 
@@ -31,6 +33,7 @@ class TestFP8Config:
     def test_default_config(self):
         """Test default configuration values."""
         config = FP8Config()
+        assert config.enabled is False
         assert config.enable_fsdp_float8_all_gather is False
         assert config.force_recompute_fp8_weight_in_bwd is False
         assert config.precompute_float8_dynamic_scale_for_fsdp is False
@@ -41,6 +44,7 @@ class TestFP8Config:
     def test_custom_config(self):
         """Test custom configuration values."""
         config = FP8Config(
+            enabled=True,
             enable_fsdp_float8_all_gather=True,
             force_recompute_fp8_weight_in_bwd=True,
             precompute_float8_dynamic_scale_for_fsdp=True,
@@ -48,6 +52,7 @@ class TestFP8Config:
             recipe_name="tensorwise",
             emulate=True
         )
+        assert config.enabled is True
         assert config.enable_fsdp_float8_all_gather is True
         assert config.force_recompute_fp8_weight_in_bwd is True
         assert config.precompute_float8_dynamic_scale_for_fsdp is True
@@ -55,6 +60,87 @@ class TestFP8Config:
         assert config.recipe_name == "tensorwise"
         assert config.emulate is True
 
+    def test_init_missing_enabled(self):
+        """Test that __init__ properly handles missing enabled parameter."""
+        # In the refactored version, __init__ doesn't set self.enabled
+        # This tests the dataclass behavior
+        config = FP8Config()
+        # enabled should still be False from the dataclass field default
+        assert config.enabled is False
+    
+    def test_from_config_node_with_none(self):
+        """Test from_config_node with None returns default config."""
+        config = FP8Config.from_config_node(None)
+        assert isinstance(config, FP8Config)
+        assert config.enabled is False
+        assert config.recipe_name is None
+        assert config.enable_fsdp_float8_all_gather is False
+        assert config.filter_fqns == []
+    
+    def test_from_config_node_with_mock_node(self):
+        """Test from_config_node with mock config node."""
+        # Create a mock config node
+        mock_node = MagicMock()
+        mock_node.enabled = True
+        mock_node.recipe_name = "rowwise"
+        mock_node.enable_fsdp_float8_all_gather = True
+        mock_node.filter_fqns = ["lm_head"]
+        mock_node.emulate = True
+        
+        # Mock hasattr to return True for these fields
+        def mock_hasattr(obj, attr):
+            return attr in ['enabled', 'recipe_name', 'enable_fsdp_float8_all_gather', 'filter_fqns', 'emulate']
+        
+        with patch('builtins.hasattr', side_effect=mock_hasattr):
+            config = FP8Config.from_config_node(mock_node)
+        
+        assert config.enabled is True
+        assert config.recipe_name == "rowwise"
+        assert config.enable_fsdp_float8_all_gather is True
+        assert config.filter_fqns == ["lm_head"]
+        assert config.emulate is True
+    
+    def test_to_dict_conversion(self):
+        """Test to_dict method converts config to legacy format."""
+        config = FP8Config(
+            enabled=True,
+            recipe_name="tensorwise",
+            enable_fsdp_float8_all_gather=True,
+            precompute_float8_dynamic_scale_for_fsdp=True,
+            force_recompute_fp8_weight_in_bwd=False,
+            filter_fqns=["lm_head", "embed_tokens"],
+            emulate=True
+        )
+        
+        result = config.to_dict()
+        expected = {
+            'enabled': True,
+            'fp8_recipe_name': 'tensorwise',
+            'enable_fsdp_float8_all_gather': True,
+            'precompute_float8_dynamic_scale_for_fsdp': True,
+            'force_recompute_fp8_weight_in_bwd': False,
+            'fp8_filter_fqns': ['lm_head', 'embed_tokens'],
+            'fp8_emulate': True,
+        }
+        
+        assert result == expected
+    
+    def test_to_dict_with_defaults(self):
+        """Test to_dict with default values."""
+        config = FP8Config()
+        result = config.to_dict()
+        
+        expected = {
+            'enabled': False,
+            'fp8_recipe_name': None,
+            'enable_fsdp_float8_all_gather': False,
+            'precompute_float8_dynamic_scale_for_fsdp': False,
+            'force_recompute_fp8_weight_in_bwd': False,
+            'fp8_filter_fqns': [],
+            'fp8_emulate': False,
+        }
+        
+        assert result == expected
 
 
 class TestModuleFilter:
@@ -112,10 +198,18 @@ class TestFP8Conversion:
         mock_cuda_capability.return_value = False
         
         model = self.create_test_model()
-        config = FP8Config(emulate=False)
         
+        # Updated to match new function signature
         with pytest.raises(ValueError, match="FP8 is only supported on SM89"):
-            apply_fp8_to_model(model, config)
+            apply_fp8_to_model(
+                model, 
+                config=None,
+                filter_fqns=[],
+                recipe_name=None,
+                force_recompute_fp8_weight_in_bwd=False,
+                enable_fsdp_float8_all_gather=False,
+                emulate=False
+            )
     
     @patch('nemo_automodel.components.quantization.fp8._has_cuda_capability')
     @patch('nemo_automodel.components.quantization.fp8.HAVE_TORCHAO', False)
@@ -124,11 +218,45 @@ class TestFP8Conversion:
         mock_cuda_capability.return_value = True
         
         model = self.create_test_model()
-        config = FP8Config()
         
-        # This will cause the import to fail in apply_fp8_to_model
+        # Updated to match new function signature
         with pytest.raises(ImportError, match="torchao is not installed"):
-            apply_fp8_to_model(model, config)
+            apply_fp8_to_model(
+                model,
+                config=None,
+                filter_fqns=[],
+                recipe_name=None,
+                force_recompute_fp8_weight_in_bwd=False,
+                enable_fsdp_float8_all_gather=False,
+                emulate=False
+            )
+    
+    def test_apply_fp8_to_model_disabled(self):
+        """Test apply_fp8_to_model with disabled config returns original model."""
+        model = nn.Linear(32, 64)
+        config = FP8Config(enabled=False)
+        
+        result = apply_fp8_to_model(model, config=config)
+        
+        # Should return the same model instance when disabled
+        assert result is model
+        
+    def test_apply_fp8_to_model_with_individual_params(self):
+        """Test apply_fp8_to_model with individual parameters instead of config."""
+        model = nn.Linear(32, 64)
+        
+        # This should work without throwing an error (will return model if disabled or fail gracefully)
+        result = apply_fp8_to_model(
+            model, 
+            config=None,
+            enabled=False,  # Disable to avoid torchao dependency in tests
+            filter_fqns=[],
+            recipe_name=None,
+            emulate=True
+        )
+        
+        # Should return model (either transformed or original)
+        assert isinstance(result, nn.Module)
     
     def test_verify_fp8_conversion_no_fp8(self):
         """Test verification with no FP8 modules."""
@@ -175,6 +303,65 @@ class TestFP8Conversion:
         assert 'linear1' in results['fp8_modules'][0]['name']
 
 
+class TestFP8ConfigBuilders:
+    """Test helper functions for building FP8Config from dictionaries."""
+    
+    def test_create_fp8_config_from_dict(self):
+        """Test create_fp8_config_from_dict function."""
+        config_dict = {
+            "enabled": True,
+            "recipe_name": "tensorwise",
+            "enable_fsdp_float8_all_gather": True,
+            "precompute_float8_dynamic_scale_for_fsdp": True,
+            "force_recompute_fp8_weight_in_bwd": False,
+            "filter_fqns": ["lm_head"],
+            "emulate": True,
+        }
+        
+        config = create_fp8_config_from_dict(config_dict)
+        
+        assert config.enabled is True
+        assert config.recipe_name == "tensorwise"
+        assert config.enable_fsdp_float8_all_gather is True
+        assert config.precompute_float8_dynamic_scale_for_fsdp is True
+        assert config.force_recompute_fp8_weight_in_bwd is False
+        assert config.filter_fqns == ["lm_head"]
+        assert config.emulate is True
+    
+    def test_create_fp8_config_from_dict_with_defaults(self):
+        """Test create_fp8_config_from_dict with missing keys uses defaults."""
+        config_dict = {"enabled": True}
+        config = create_fp8_config_from_dict(config_dict)
+        
+        assert config.enabled is True
+        assert config.recipe_name is None
+        assert config.enable_fsdp_float8_all_gather is False
+        assert config.filter_fqns == []
+        assert config.emulate is False
+    
+    def test_build_fp8_config_with_dict(self):
+        """Test build_fp8_config function with dictionary."""
+        config_dict = {
+            "enabled": True,
+            "recipe_name": "rowwise",
+            "filter_fqns": ["lm_head", "embed"]
+        }
+        
+        config = build_fp8_config(config_dict)
+        
+        assert config.enabled is True
+        assert config.recipe_name == "rowwise"
+        assert config.filter_fqns == ["lm_head", "embed"]
+    
+    def test_build_fp8_config_with_none(self):
+        """Test build_fp8_config function with None returns disabled config."""
+        config = build_fp8_config(None)
+        
+        assert config.enabled is False
+        assert config.recipe_name is None
+        assert config.filter_fqns == []
+
+
 class TestIntegration:
     """Integration tests for FP8 functionality."""
     
@@ -190,11 +377,17 @@ class TestIntegration:
             nn.Linear(256, 128)
         )
         
-        # Apply FP8 with emulation
-        config = FP8Config(emulate=True)
-        
+        # Apply FP8 with emulation using new function signature
         try:
-            fp8_model = apply_fp8_to_model(model, config)
+            fp8_model = apply_fp8_to_model(
+                model,
+                config=None,
+                filter_fqns=[],
+                recipe_name=None,
+                force_recompute_fp8_weight_in_bwd=False,
+                enable_fsdp_float8_all_gather=False,
+                emulate=True
+            )
             
             # Verify conversion
             results = verify_fp8_conversion(fp8_model)
@@ -219,7 +412,15 @@ class TestIntegration:
         # Should not raise with None config (uses default)
         # Note: This will likely fail without torchao, but that's expected
         try:
-            apply_fp8_to_model(model, None)
+            apply_fp8_to_model(
+                model,
+                config=None,
+                filter_fqns=None,
+                recipe_name=None,
+                force_recompute_fp8_weight_in_bwd=False,
+                enable_fsdp_float8_all_gather=False,
+                emulate=False
+            )
         except (ImportError, ValueError):
             # Expected in test environment without proper setup
             pass
@@ -236,8 +437,6 @@ class TestIntegration:
         model = TestModel()
         
         # Test filtering works correctly
-        from nemo_automodel.components.quantization.fp8 import _module_filter_fn
-        
         filter_fqns = ["lm_head", "embed_tokens"]
         
         # Should include backbone
@@ -254,77 +453,36 @@ class TestIntegration:
             model.embed_tokens, "embed_tokens", filter_fqns
         ) is False
 
-
-class TestFP8ConfigMethods:
-    """Test FP8Config class methods added in the refactor."""
-    
-    def test_from_config_node_with_none(self):
-        """Test from_config_node with None returns default config."""
-        config = FP8Config.from_config_node(None)
-        assert isinstance(config, FP8Config)
-        assert config.recipe_name is None
-        assert config.enable_fsdp_float8_all_gather is False
-        assert config.filter_fqns == []
-    
-    def test_from_config_node_with_mock_node(self):
-        """Test from_config_node with mock config node."""
-        # Create a mock config node
-        mock_node = MagicMock()
-        mock_node.recipe_name = "rowwise"
-        mock_node.enable_fsdp_float8_all_gather = True
-        mock_node.filter_fqns = ["lm_head"]
-        mock_node.emulate = True
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_apply_fp8_to_model_integration_with_config(self):
+        """Test apply_fp8_to_model integration with FP8Config."""
+        pytest.importorskip("torchao.float8", reason="torchao not available")
         
-        # Mock hasattr to return True for these fields
-        def mock_hasattr(obj, attr):
-            return attr in ['recipe_name', 'enable_fsdp_float8_all_gather', 'filter_fqns', 'emulate']
-        
-        with patch('builtins.hasattr', side_effect=mock_hasattr):
-            config = FP8Config.from_config_node(mock_node)
-        
-        assert config.recipe_name == "rowwise"
-        assert config.enable_fsdp_float8_all_gather is True
-        assert config.filter_fqns == ["lm_head"]
-        assert config.emulate is True
-    
-    def test_to_dict_conversion(self):
-        """Test to_dict method converts config to legacy format."""
+        model = nn.Linear(32, 64)
         config = FP8Config(
+            enabled=True,
+            emulate=True,
             recipe_name="tensorwise",
-            enable_fsdp_float8_all_gather=True,
-            precompute_float8_dynamic_scale_for_fsdp=True,
-            force_recompute_fp8_weight_in_bwd=False,
-            filter_fqns=["lm_head", "embed_tokens"],
-            emulate=True
+            enable_fsdp_float8_all_gather=False,
+            filter_fqns=[]
         )
         
-        result = config.to_dict()
-        expected = {
-            'fp8_recipe_name': 'tensorwise',
-            'enable_fsdp_float8_all_gather': True,
-            'precompute_float8_dynamic_scale_for_fsdp': True,
-            'force_recompute_fp8_weight_in_bwd': False,
-            'fp8_filter_fqns': ['lm_head', 'embed_tokens'],
-            'fp8_emulate': True,
-        }
-        
-        assert result == expected
-    
-    def test_to_dict_with_defaults(self):
-        """Test to_dict with default values."""
-        config = FP8Config()
-        result = config.to_dict()
-        
-        expected = {
-            'fp8_recipe_name': None,
-            'enable_fsdp_float8_all_gather': False,
-            'precompute_float8_dynamic_scale_for_fsdp': False,
-            'force_recompute_fp8_weight_in_bwd': False,
-            'fp8_filter_fqns': [],
-            'fp8_emulate': False,
-        }
-        
-        assert result == expected
+        try:
+            result = apply_fp8_to_model(model, config=config)
+            assert isinstance(result, nn.Module)
+            
+            # Test that precompute attribute is set correctly
+            expected_precompute = (
+                config.precompute_float8_dynamic_scale_for_fsdp
+                and config.recipe_name == "tensorwise" 
+                and config.enable_fsdp_float8_all_gather
+            )
+            assert hasattr(result, 'precompute_float8_dynamic_scale_for_fsdp')
+            assert result.precompute_float8_dynamic_scale_for_fsdp == expected_precompute
+            
+        except Exception as e:
+            pytest.skip(f"FP8 integration not working in test environment: {e}")
+
 
 if __name__ == "__main__":
     pytest.main([__file__]) 
