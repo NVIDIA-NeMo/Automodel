@@ -45,9 +45,11 @@ checkpoint:
 
 distributed:
   _target_: nemo_automodel.components.distributed.nvfsdp.NVFSDPManager
-  dp_size: none
-  tp_size: 1
-  cp_size: 1
+  parallel_dims:
+    dp_replicate_size: none
+    tp_size: 1
+    cp_size: 1
+  sequence_parallel: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

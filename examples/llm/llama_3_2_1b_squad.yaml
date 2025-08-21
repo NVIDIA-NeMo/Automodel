@@ -39,7 +39,7 @@ model:
 
 # torch.compile configuration
 compile:
-  enabled: true
+  enabled: false
   mode: "default"  # Options: "default", "reduce-overhead", "max-autotune"
   fullgraph: false
   dynamic: true  # Set to false for better performance with fixed shapes
@@ -47,10 +47,10 @@ compile:
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
-  dp_size: none
-  dp_replicate_size: 1 # dp_shard_size = dp_size / dp_replicate_size and dp_shard_size < dp_size. For DDP usecase, use DDPManager
-  tp_size: 1
-  cp_size: 1
+  parallel_dims:
+    dp_replicate_size: none
+    tp_size: 1
+    cp_size: 1
   sequence_parallel: false
 
 loss_fn:

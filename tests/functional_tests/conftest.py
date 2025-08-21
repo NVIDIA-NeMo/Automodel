@@ -47,6 +47,10 @@ _OVERRIDES = [
     "dataset.path_or_dataset",
     "validation_dataset.path_or_dataset",
     "validation_dataset.limit_dataset_samples",
+    "distributed.parallel_dims._target_",
+    "distributed.parallel_dims.dp_replicate_size",
+    "distributed.parallel_dims.tp_size",
+    "distributed.parallel_dims.cp_size",
 ]
 
 

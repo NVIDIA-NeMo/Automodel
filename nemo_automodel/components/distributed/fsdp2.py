@@ -16,8 +16,6 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
-import torch.distributed as dist
-from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
@@ -26,6 +24,7 @@ from torch.distributed.tensor.parallel import (
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
+from nemo_automodel.components.distributed.parallel_dims import DimNames, ParallelDims
 from nemo_automodel.components.distributed.parallelizer import (
     fsdp2_strategy_parallelize,
     get_hf_tp_shard_plan,
@@ -43,19 +42,12 @@ class FSDP2Manager:
     TP sharding plan. It also supports mixed precision and CPU offloading options.
 
     Attributes:
-        dp_size (Optional[int]): Data-parallel group size. If None or non-positive, it is
-            inferred from WORLD_SIZE.
-        dp_replicate_size (Optional[int]): Data-parallel replicate group size. If None or non-positive, it is
-            inferred from dp_size. Must be a divisor of dp_size.
-        tp_size (Optional[int]): Tensor-parallel group size. Defaults to 1 if zero/None.
-        cp_size (int): Context-parallel group size for pipeline-like sharding.
-        sequence_parallel (bool): Enables sequence parallelism in the TP plan when True.
+        parallel_dims (ParallelDims): Parallel dimensions for the model.
+        sequence_parallel (bool): Enable sequence parallelism in TP plan if True.
         mp_policy (MixedPrecisionPolicy): Defines the mixed precision policy for parameters,
             reductions, and outputs.
         offload_policy (CPUOffloadPolicy): Policy to offload parameters or optimizer states
             to CPU, if specified.
-        backend (str): Distributed backend to use (e.g., 'nccl' for GPUs or 'gloo' for CPUs).
-        world_size (int): Total number of processes.
 
     Methods:
         __post_init__():
@@ -67,24 +59,8 @@ class FSDP2Manager:
             Applies FSDP2 and Tensor-Parallel sharding strategies to the given model.
     """
 
-    dp_size: Optional[int] = field(
-        default=None,
-        metadata={"help": "Data-parallel group size; if None, infer from WORLD_SIZE."},
-    )
-    dp_replicate_size: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": "Data-parallel replicate group size; if None, infer from dp_size. Must be a divisor of dp_size."
-        },
-    )
-    tp_size: Optional[int] = field(
-        default=1,
-        metadata={"help": "Tensor-parallel group size; if None, defaults to 1."},
-    )
-    cp_size: Optional[int] = field(
-        default=1,
-        metadata={"help": "Context-parallel group size (for pipeline-like sharding)."},
-    )
+    parallel_dims: ParallelDims = field(default_factory=ParallelDims)
+
     sequence_parallel: Optional[bool] = field(
         default=False,
         metadata={"help": "Enable sequence parallelism in TP plan if True."},
@@ -102,118 +78,13 @@ class FSDP2Manager:
         default=None,
         metadata={"help": "CPUOffloadPolicy to offload parameters/optim states to CPU."},
     )
-    backend: Optional[str] = field(default="nccl", metadata={"help": "Distributed backend, e.g. 'nccl' or 'gloo'."})
-    world_size: Optional[int] = field(
-        default=None,
-        # init=False,
-        metadata={"help": "Total number of processes."},
-    )
 
     def __post_init__(self):
         """
         Post-initialization hook that sets up the distributed environment.
         """
-        return self._setup_distributed()
-
-    def _setup_distributed(self):
-        """
-        Initializes the distributed environment.
-
-        - Checks availability and initialization of torch.distributed.
-        - Infers data-parallel and tensor-parallel sizes if not provided.
-        - Builds a device mesh based on the specified mesh shape and dimension names.
-        - Flattens data and context dimensions if context parallelism is enabled.
-
-        Requires the environment variables: RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT.
-
-        Raises:
-            RuntimeError: If torch.distributed is not available or not initialized.
-
-        Returns:
-            FSDP2Manager: Instance with the device mesh configured.
-        """
-        if not dist.is_available():
-            raise RuntimeError("torch.distributed not available")
-
-        if not dist.is_initialized():
-            raise RuntimeError("expected torch.distributed to be initialized")
-
-        if self.tp_size is None or self.tp_size <= 0:
-            self.tp_size = 1
-
-        if self.cp_size is None or self.cp_size <= 0:
-            self.cp_size = 1
-
-        # infer if not provided
-        if self.dp_size is None or self.dp_size <= 0:
-            # Calculate dp_size to ensure dp_size * tp_size * cp_size == world_size
-            total_parallel_ranks = self.tp_size * self.cp_size
-            if self.world_size % total_parallel_ranks != 0:
-                raise ValueError(
-                    f"world_size ({self.world_size}) must be divisible by (tp_size * cp_size) "
-                    f"({self.tp_size} * {self.cp_size} = {total_parallel_ranks})"
-                )
-            self.dp_size = self.world_size // total_parallel_ranks
-
-        if self.dp_replicate_size is None or self.dp_replicate_size <= 0:
-            self.dp_replicate_size = 1
-
-        # HSDP usecase
-        # dp_size = dp_replicate_size * dp_shard_size
-        # dp_shard_size < dp_size since ddp usecase is not supported by FSDP2, need to use DDPManager instead
-        # TODO(boxiangw): Call DDPManager instead of FSDP2Manager for ddp usecase?
-        assert self.dp_size % self.dp_replicate_size == 0, "dp_size must be a multiple of dp_replicate_size"
-        assert self.dp_replicate_size < self.dp_size or self.dp_replicate_size == 1, (
-            "dp_replicate_size must be less than dp_size since ddp usecase is not supported by FSDP2"
-        )
-
-        self.dp_shard_size = self.dp_size // self.dp_replicate_size
-
-        self.device_mesh = self._get_device_mesh()
-
-        return self
-
-    def _get_device_mesh(self):
-        mesh_shape = (self.dp_replicate_size, self.dp_shard_size, self.cp_size, self.tp_size)
-        mesh_names = ("dp_replicate", "dp_shard", "cp", "tp")
-        for shape, name in zip(mesh_shape, mesh_names):
-            assert isinstance(shape, int), "Expected {} to be an int, but got {}".format(name, type(shape))
-            assert shape > 0, "Expected {} > 0, {}".format(name, shape)
-
-        # build mesh [dp, cp, tp]
-        self.device_mesh = init_device_mesh(
-            device_type="cuda" if self.backend == "nccl" else "cpu",
-            mesh_shape=mesh_shape,
-            mesh_dim_names=mesh_names,
-        )
-        # based on https://github.com/pytorch/torchtitan/blob/d282cf2ce9ca8049b4b8423c1d7578c80426576f/torchtitan/distributed/parallel_dims.py#L191
-        # Create all the submesh here to ensure all required process groups are
-        # initialized:
-        # Mesh for data loading (no communication on this mesh)
-        dp_mesh_dim_names = []
-        # Mesh for param sharding
-        dp_shard_cp_mesh_dim_names = []
-        # Mesh for loss all-reduce
-        dp_cp_mesh_dim_names = []
-
-        # for dp_replicate:
-        dp_mesh_dim_names.append("dp_replicate")
-        dp_cp_mesh_dim_names.append("dp_replicate")
-        # for dp_shard:
-        dp_mesh_dim_names.append("dp_shard")
-        dp_shard_cp_mesh_dim_names.append("dp_shard")
-        dp_cp_mesh_dim_names.append("dp_shard")
-        # for cp:
-        dp_shard_cp_mesh_dim_names.append("cp")
-        dp_cp_mesh_dim_names.append("cp")
-
-        # submesh for dp
-        self.device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
-        # submesh for dp_shard_cp
-        self.device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_shard_cp")
-        # submesh for dp_cp
-        self.device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
-        return self.device_mesh
+        self.device_mesh = self.parallel_dims.mesh
+        assert self.device_mesh is not None, "Device mesh is not initialized1"
 
     def parallelize(self, model, use_hf_tp_plan=False):
         """
@@ -233,7 +104,10 @@ class FSDP2Manager:
         Raises:
             NotImplemented: If the required TP sharding plan is not supported.
         """
-        if self.device_mesh["tp"].size() > 1:
+        if self.device_mesh is None:
+            raise ValueError("Device mesh is not initialized")
+
+        if DimNames.TP in self.device_mesh.mesh_dim_names and self.device_mesh[DimNames.TP].size() > 1:
             if use_hf_tp_plan:
                 tp_shard_plan = get_hf_tp_shard_plan(model)
             else:

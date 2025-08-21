@@ -43,13 +43,14 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints_fp8/
   model_save_format: torch_save # torch_save or safetensors
-  save_consolidated: false 
+  save_consolidated: false
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
-  dp_size: none
-  tp_size: 1
-  cp_size: 1
+  parallel_dims:
+    dp_replicate_size: none
+    tp_size: 1
+    cp_size: 1
   sequence_parallel: false
 
 fp8:

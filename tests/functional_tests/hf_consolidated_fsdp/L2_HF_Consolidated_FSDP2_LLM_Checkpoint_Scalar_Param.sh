@@ -20,7 +20,7 @@ export CUDA_VISIBLE_DEVICES="0"
 
 TRANSFORMERS_OFFLINE=1 python -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
 -m pytest tests/functional_tests/checkpoint/test_hf_consolidated_llm_scalar_param.py \
-    --config examples/llm/llama_3_2_1b_squad.yaml \
+    --config tests/functional_tests/hf_consolidated_fsdp/llama_3_2_1b_squad_single.yaml \
     --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
     --step_scheduler.max_steps 10 \
     --step_scheduler.grad_acc_steps 4 \
@@ -34,9 +34,4 @@ TRANSFORMERS_OFFLINE=1 python -m coverage run --data-file=/workspace/.coverage -
     --checkpoint.checkpoint_dir checkpoints/ \
     --checkpoint.model_save_format safetensors \
     --checkpoint.save_consolidated true \
-    --dataloader.batch_size 8 \
-    --distributed._target_ nemo_automodel.components.distributed.fsdp2.FSDP2Manager \
-    --distributed.dp_size none \
-    --distributed.tp_size 1 \
-    --distributed.cp_size 1 \
-    --distributed.sequence_parallel false
+    --dataloader.batch_size 8

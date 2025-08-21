@@ -35,6 +35,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     save_optimizer,
 )
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.distributed.parallel_dims import DimNames
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 
@@ -138,12 +139,7 @@ class BaseRecipe:
         is_dist_initialized = torch.distributed.is_initialized()
         is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
 
-        if not is_dist_initialized:
-            dp_group = None
-        elif self.device_mesh["cp"].size() > 1:
-            dp_group = self.device_mesh["dp_cp"].get_group()
-        else:
-            dp_group = self.device_mesh["dp"].get_group()
+        dp_group = self._get_dp_group()
 
         path = self.checkpoint_config.checkpoint_dir
         path = os.path.join(path, f"epoch_{epoch}_step_{step}")
@@ -168,12 +164,11 @@ class BaseRecipe:
                 scheduler = getattr(self, key)
             elif is_tokenizer(getattr(self, key)):
                 tokenizer = getattr(self, key)
-            else:
-                if is_rank_0:
-                    torch.save(
-                        getattr(self, key).state_dict(),
-                        os.path.join(path, f"{key}.pt"),
-                    )
+            elif is_rank_0:
+                torch.save(
+                    getattr(self, key).state_dict(),
+                    os.path.join(path, f"{key}.pt"),
+                )
 
         save_model(model, path, self.checkpoint_config, peft_config=self.peft_config, tokenizer=tokenizer)
         save_optimizer(optimizer, model, path, scheduler)
@@ -344,10 +339,12 @@ class BaseRecipe:
     def _get_dp_group(self):
         if not self.device_mesh:
             return None
-        elif self.device_mesh["cp"].size() > 1:
-            return self.device_mesh["dp_cp"].get_group()
+        elif DimNames.CP in self.device_mesh.mesh_dim_names and self.device_mesh[DimNames.CP].size() > 1:
+            return self.device_mesh[DimNames.DP_CP].get_group()
+        elif DimNames.DP in self.device_mesh.mesh_dim_names:
+            return self.device_mesh[DimNames.DP].get_group()
         else:
-            return self.device_mesh["dp"].get_group()
+            return None
 
     def _dp_allreduce(self, tensor, op=dist.ReduceOp.SUM):
         dp_group = self._get_dp_group()

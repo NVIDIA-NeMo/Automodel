@@ -40,6 +40,7 @@ from nemo_automodel.components.datasets.llm.packed_sequence import PackedSequenc
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.nvfsdp import NVFSDPManager
+from nemo_automodel.components.distributed.parallel_dims import DimNames, ParallelDims
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
@@ -494,8 +495,11 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         self.device_mesh = None
         self.model_wrapper = None
-        if "distributed" in self.cfg:
-            self.model_wrapper = self.cfg.distributed.instantiate(world_size=self.dist_env.world_size)
+        if "distributed" in self.cfg and self.dist_env.world_size > 1:
+            parallel_dims = ParallelDims(
+                **self.cfg.distributed.parallel_dims.to_dict(), world_size=self.dist_env.world_size
+            )
+            self.model_wrapper = self.cfg.distributed.instantiate(parallel_dims=parallel_dims)
             self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
@@ -633,7 +637,12 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             if (
                 "position_ids" not in batch
                 and self.device_mesh is not None
-                and (self.device_mesh["cp"].size() > 1 or self.device_mesh["tp"].size() > 1)
+                and (
+                    DimNames.CP in self.device_mesh.mesh_dim_names
+                    and self.device_mesh[DimNames.CP].size() > 1
+                    or DimNames.TP in self.device_mesh.mesh_dim_names
+                    and self.device_mesh[DimNames.TP].size() > 1
+                )
             ):
                 batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
 
@@ -665,7 +674,10 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         grad_norm = 0
         # Clip gradients **after** any rescaling.
         # TODO(@boxiangw): Fix TP gradient clipping
-        if max_grad_norm is not None and (not self.device_mesh or self.device_mesh["tp"].size() == 1):
+        if max_grad_norm is not None and (
+            not self.device_mesh
+            or (DimNames.TP in self.device_mesh.mesh_dim_names and self.device_mesh[DimNames.TP].size() == 1)
+        ):
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 [p for p in self.model.parameters() if p.requires_grad], max_grad_norm
             )
@@ -718,7 +730,12 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 if (
                     self.device_mesh
                     and "position_ids" not in batch
-                    and (self.device_mesh["cp"].size() > 1 or self.device_mesh["tp"].size() > 1)
+                    and (
+                        DimNames.CP in self.device_mesh.mesh_dim_names
+                        and self.device_mesh[DimNames.CP].size() > 1
+                        or DimNames.TP in self.device_mesh.mesh_dim_names
+                        and self.device_mesh[DimNames.TP].size() > 1
+                    )
                 ):
                     batch["position_ids"] = (
                         torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)

@@ -41,6 +41,7 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 
 # Import model-specific tensor parallel plans from the dedicated module
 from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE_FUNCTIONS
+from nemo_automodel.components.distributed.parallel_dims import DimNames
 
 # TODO(boxiangw): Change to nvFSDP once it got published
 HAVE_NVFSDP = False
@@ -330,9 +331,9 @@ def fsdp2_strategy_parallelize(
     sequence_parallel: bool = False,
     activation_checkpointing: bool = False,
     tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
-    dp_replicate_mesh_name: str = "dp_replicate",
-    dp_shard_cp_mesh_name: str = "dp_shard_cp",
-    tp_mesh_name: str = "tp",
+    dp_replicate_mesh_name: str = DimNames.DP_REPLICATE,
+    dp_shard_cp_mesh_name: str = DimNames.DP_SHARD_CP,
+    tp_mesh_name: str = DimNames.TP,
 ):
     """
     Apply parallelisms and activation checkpointing to the model.
@@ -370,11 +371,9 @@ def fsdp2_strategy_parallelize(
     NOTE: The passed-in model preferably should be on meta device. Otherwise,
     the model must fit on GPU or CPU memory.
     """
-    # Get model layers for later use
-    tp_mesh = device_mesh[tp_mesh_name]
 
     # TP sharding with enhanced plan generation
-    if tp_mesh.size() > 1:
+    if tp_mesh_name in device_mesh.mesh_dim_names and (tp_mesh := device_mesh[tp_mesh_name]).size() > 1:
         # Validate that attention heads are divisible by TP size
         validate_tp_mesh(model, tp_mesh)
 
@@ -402,7 +401,10 @@ def fsdp2_strategy_parallelize(
 
     # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
     # if dp_replicate_size > 1, use HSDP, else use FSDP
-    dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
+    if dp_replicate_mesh_name in device_mesh.mesh_dim_names and dp_shard_cp_mesh_name in device_mesh.mesh_dim_names:
+        dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
+    else:
+        dp_mesh_dim_names = (dp_replicate_mesh_name,)
 
     dp_mesh = device_mesh[dp_mesh_dim_names]
 
@@ -442,9 +444,9 @@ def nvfsdp_strategy_parallelize(
     keep_fp8_transpose_cache_when_using_custom_fsdp: bool = False,
     nccl_ub: bool = False,
     fsdp_double_buffer: bool = False,
-    dp_mesh_name: str = "dp",
-    cp_mesh_name: str = "cp",
-    tp_mesh_name: str = "tp",
+    dp_mesh_name: str = DimNames.DP,
+    cp_mesh_name: str = DimNames.CP,
+    tp_mesh_name: str = DimNames.TP,
 ):
     """
     Apply tensor/data parallelism (nvFSDP) and optional activation-checkpointing to the model.
@@ -521,9 +523,9 @@ def nvfsdp_strategy_parallelize(
         parallelize_module(model, tp_mesh, tp_shard_plan)
 
     if cp_mesh.size() > 1:
-        dp_cp_mesh_name = "dp_cp"
+        dp_cp_mesh_name = DimNames.DP_CP
     else:
-        dp_cp_mesh_name = "dp"
+        dp_cp_mesh_name = DimNames.DP
 
     # Import nvFSDP unit modules specified by the user.
     nvfsdp_unit_modules = import_classes_from_paths(nvfsdp_unit_modules)
