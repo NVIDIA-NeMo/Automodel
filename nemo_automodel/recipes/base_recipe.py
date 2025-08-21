@@ -140,10 +140,8 @@ class BaseRecipe:
 
         if not is_dist_initialized:
             dp_group = None
-        elif self.device_mesh["cp"].size() > 1:
-            dp_group = self.device_mesh["dp_cp"].get_group()
         else:
-            dp_group = self.device_mesh["dp"].get_group()
+            dp_group = self._get_dp_group()
 
         path = self.checkpoint_config.checkpoint_dir
         path = os.path.join(path, f"epoch_{epoch}_step_{step}")

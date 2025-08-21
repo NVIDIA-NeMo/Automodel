@@ -689,6 +689,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             fp8_config is not None
             and fp8_config.get("enabled", False)
             and fp8_config.get("precompute_float8_dynamic_scale_for_fsdp", False)
+            and self.device_mesh is not None
             and self.device_mesh["dp_shard"].size() > 1
         ):
             precompute_float8_dynamic_scale_for_fsdp(self.model)
