@@ -43,6 +43,7 @@ from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import count_tail_padding
@@ -149,10 +150,7 @@ def build_model_and_optimizer(
         del cfg_model.is_meta_device
 
     with StatefulRNG(seed=seed, ranked=True):
-        # Add FP8 config if provided
         kwargs = {}
-        if cfg_fp8 is not None:
-            kwargs["fp8_config"] = cfg_fp8.instantiate()
 
         # Instantiate the model in meta device to avoid OOM
         with init_ctx:
@@ -161,6 +159,10 @@ def build_model_and_optimizer(
             # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
             if cfg_peft is not None:
                 apply_lora_to_linear_modules(model, cfg_peft)
+
+            if cfg_fp8 is not None:
+                fp8_config = build_fp8_config(cfg_fp8)
+                model = apply_fp8_to_model(model, config=fp8_config)
 
         print_trainable_parameters(model)
 
@@ -683,9 +685,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.optimizer.zero_grad(set_to_none=True)
 
         # Precompute FP8 scales
+        fp8_config = self.cfg.get("fp8", None)
         if (
-            self.cfg.get("fp8", None) is not None
-            and self.model.precompute_float8_dynamic_scale_for_fsdp
+            fp8_config is not None
+            and fp8_config.get("enabled", False)
+            and fp8_config.get("precompute_float8_dynamic_scale_for_fsdp", False)
             and self.device_mesh["dp_shard"].size() > 1
         ):
             precompute_float8_dynamic_scale_for_fsdp(self.model)
