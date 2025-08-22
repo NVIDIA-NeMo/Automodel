@@ -56,8 +56,8 @@ class StepScheduler(Stateful):
         self.epoch = start_epoch
         assert start_epoch >= 0, "start_epoch must be greater than or equal to 0"
         self.num_epochs = num_epochs
+        self.epoch_len = len(dataloader) if hasattr(dataloader, "__len__") else None
         assert num_epochs > 0, "num_epochs must be greater than 0"
-        self.epoch_len = len(dataloader)
         self.val_every_steps = val_every_steps
         assert val_every_steps is None or val_every_steps > 0, "val_every_steps must be greater than 0 if not None"
         self.max_steps = max_steps
@@ -115,9 +115,14 @@ class StepScheduler(Stateful):
         Returns:
             bool: if true, the checkpoint should run.
         """
+        finished = self.step >= self.max_steps
+
+        # For iterable datasets without epoch_len, only checkpoint based on steps
+        if self.epoch_len is None:
+            return ((self.step % self.ckpt_every_steps) == 0 and self.step != 0) or finished
+
         batch_idx = self.step % self.epoch_len
         last_batch = self.epoch_len is not None and batch_idx == self.epoch_len - 1
-        finished = self.step >= self.max_steps
         return ((self.step % self.ckpt_every_steps) == 0 and self.step != 0) or last_batch or finished
 
     @property

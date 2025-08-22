@@ -27,6 +27,7 @@ guides/omni/gemma3-3n.md
 
 guides/llm/sft.md
 guides/llm/peft.md
+guides/llm/continued_pretraining.md
 ```
 
 ```{toctree}

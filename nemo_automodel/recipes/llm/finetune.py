@@ -36,6 +36,7 @@ from wandb import Settings
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig, load_model_from_base_checkpoint
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.llm.jsonl_dataset import JSONLDataset
 from nemo_automodel.components.datasets.llm.packed_sequence import PackedSequence
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
@@ -247,15 +248,26 @@ def build_dataloader(
         The instantiated DataLoader and tokenizer.
     """
     dist_sampler_kwargs = {
-        "shuffle": cfg_dl.get("shuffle", True),
+        "shuffle": cfg_dl.get("shuffle", True) if cfg_dl is not None else True,
     }
-    if "shuffle" in cfg_dl:
+    if cfg_dl is not None and "shuffle" in cfg_dl:
         del cfg_dl.shuffle
     if device_mesh is not None:
         dist_sampler_kwargs |= {
             "num_replicas": device_mesh["dp"].size(),
             "rank": device_mesh["dp"].get_local_rank(),
         }
+
+        if device_mesh["cp"].size() > 1:
+            dp_group = device_mesh["dp_cp"].get_group()
+        else:
+            dp_group = device_mesh["dp"].get_group()
+        jsonl_kwargs = {
+            "rank": device_mesh["dp"].get_local_rank(),
+            "world_size": device_mesh["dp"].size(),
+            "dp_group": dp_group,
+        }
+
     if "tokenizer" not in cfg_ds:
         logging.info("Using model config to instantiate tokenizer")
         trust_remote_code = getattr(cfg_model, "trust_remote_code", False)
@@ -268,7 +280,11 @@ def build_dataloader(
         tokenizer = cfg_ds.tokenizer.instantiate()
 
     with StatefulRNG(seed=seed, ranked=True):
-        ds = cfg_ds.instantiate(tokenizer=tokenizer)
+        if cfg_ds._target_ is JSONLDataset:
+            ds = cfg_ds.instantiate(tokenizer=tokenizer, seed=seed, **jsonl_kwargs)
+            return ds, tokenizer
+        else:
+            ds = cfg_ds.instantiate(tokenizer=tokenizer)
         # Apply packing if configured
         if getattr(cfg_ps, "packed_sequence_size", 0) > 0:
             logger.info(f"Packing dataset with size: {cfg_ps.packed_sequence_size}")
@@ -531,7 +547,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.loss_fn = build_loss_fn(self.cfg.loss_fn)
         self.dataloader, self.tokenizer = build_dataloader(
             self.cfg.dataset,
-            self.cfg.dataloader,
+            self.cfg.get("dataloader", None),
             self.cfg.model,
             self.cfg.get("packed_sequence", None),
             device_mesh=self.device_mesh,
@@ -545,7 +561,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             self.val_dataloader, _ = build_dataloader(
                 self.cfg.validation_dataset,
-                self.cfg.validation_dataloader,
+                self.cfg.get("validation_dataloader", None),
                 self.cfg.model,
                 cfg_ps=None,  # Use unpacked config for validation
                 device_mesh=self.device_mesh,
@@ -574,7 +590,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
         # Optionally resume
-        self.load_checkpoint(restore_from)
+        self.load_checkpoint(restore_from, self.device_mesh)
 
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
@@ -604,7 +620,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
                 # Save the checkpoint every ckpt_every_steps
                 if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(epoch, self.step_scheduler.step)
+                    self.save_checkpoint(epoch, self.step_scheduler.step, self.device_mesh)
 
                 # Run validation every val_every_steps
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
@@ -619,8 +635,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             batches: List of batches of training data.
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
         """
-
-        num_label_tokens = sum((batch["labels"] != -100).sum().item() for batch in batches)
+        num_label_tokens = torch.tensor(sum((batch["labels"] != -100).sum().item() for batch in batches))
+        num_label_tokens = self._dp_allreduce(num_label_tokens).item()
         loss_buffer = []
 
         # number of tokens in the batch, excluding any tail padding.
@@ -661,7 +677,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     num_label_tokens=num_label_tokens,
                 )
                 loss_buffer.append(local_loss.clone().detach())
-                local_loss.backward()
+                (local_loss * self.device_mesh["dp"].size()).backward()
 
         # do the optimization step
         grad_norm = 0
@@ -671,6 +687,10 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 [p for p in self.model.parameters() if p.requires_grad], max_grad_norm
             )
+
+            if hasattr(grad_norm, "full_tensor"):
+                grad_norm = grad_norm.full_tensor()  # collect the summed grad norm across ranks
+
             if isinstance(grad_norm, torch.Tensor):
                 grad_norm = grad_norm.item()
 
@@ -702,7 +722,8 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         time_delta = t - self.timestamp
         self.timestamp = t
         tps = num_tokens_in_batch / time_delta
-        reporting_loss = torch.sum(torch.stack(loss_buffer)).item()
+        reporting_loss = torch.sum(torch.stack(loss_buffer))
+        reporting_loss = self._dp_allreduce(reporting_loss)
         # fix reporting_loss, tps across ranks
         return reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens
 
@@ -718,7 +739,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             for batch in self.val_dataloader:
                 batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
                 labels = batch.pop("labels")
-                num_label_tokens = (labels != -100).sum()
+                num_label_tokens = (labels != -100).sum().item()
 
                 if (
                     self.device_mesh
@@ -744,11 +765,13 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         num_label_tokens=num_label_tokens,
                     )
 
-                total_loss += local_loss.item()
+                total_loss += (
+                    local_loss.item() * num_label_tokens
+                )  # because we pass in reduction=sum, loss is normalized by num_label_tokens
                 total_tokens += num_label_tokens
 
-        total_loss = self._dp_allreduce(torch.FloatTensor([total_loss])).item()
-        total_tokens = self._dp_allreduce(torch.LongTensor([total_tokens])).item()
+        total_loss = self._dp_allreduce(torch.tensor(total_loss)).item()
+        total_tokens = self._dp_allreduce(torch.tensor(total_tokens)).item()
 
         val_loss = total_loss / max(total_tokens, 1e-8)
         if self.dist_env.is_main:
