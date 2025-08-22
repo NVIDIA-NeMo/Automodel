@@ -46,7 +46,7 @@ from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE
 HAVE_MegatronFSDP = False
 try:
     # TODO: Change to megatron_fsdp once nvFSDP is merged back to MCore
-    from nvfsdp import fully_shard as megatron_fsdp_fully_shard
+    from megatron_fsdp import fully_shard as megatron_fsdp_fully_shard
 
     HAVE_MegatronFSDP = True
 except:
@@ -440,7 +440,7 @@ def megatron_fsdp_strategy_parallelize(
     average_in_collective: bool = False,
     disable_bucketing: bool = False,
     calculate_per_token_loss: bool = False,
-    keep_fp8_transpose_cache_when_using_custom_fsdp: bool = False,
+    keep_fp8_transpose_cache: bool = False,
     nccl_ub: bool = False,
     fsdp_double_buffer: bool = False,
     dp_mesh_name: str = "dp",
@@ -536,11 +536,10 @@ def megatron_fsdp_strategy_parallelize(
         optimizer=optimizer,
         fsdp_unit_modules=fsdp_unit_modules,
         device_mesh=device_mesh,
-        dp_mesh_name=dp_mesh_name,
-        cp_mesh_name=cp_mesh_name,
-        tp_mesh_name=tp_mesh_name,
-        dp_cp_mesh_name=dp_cp_mesh_name,
-        data_parallel_sharding_strategy=data_parallel_sharding_strategy,
+        dp_inter_dim=None,
+        dp_shard_dim=dp_cp_mesh_name,
+        tp_dim=tp_mesh_name,
+        zero_dp_strategy=3,
         init_model_with_meta_device=init_fsdp_with_meta_device,
         grad_reduce_in_fp32=grad_reduce_in_fp32,
         preserve_fp32_weights=preserve_fp32_weights,
@@ -551,7 +550,7 @@ def megatron_fsdp_strategy_parallelize(
         average_in_collective=average_in_collective,
         disable_bucketing=disable_bucketing,
         calculate_per_token_loss=calculate_per_token_loss,
-        keep_fp8_transpose_cache_when_using_custom_fsdp=keep_fp8_transpose_cache_when_using_custom_fsdp,
+        keep_fp8_transpose_cache=keep_fp8_transpose_cache,
         nccl_ub=nccl_ub,
         fsdp_double_buffer=fsdp_double_buffer,
     )
