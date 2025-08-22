@@ -639,7 +639,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
             labels = batch.pop("labels")
 
-
             if (
                 "position_ids" not in batch
                 and self.device_mesh is not None
