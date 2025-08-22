@@ -144,8 +144,8 @@ def build_model_and_optimizer(
     init_ctx = nullcontext()
     if hasattr(cfg_model, "is_meta_device"):
         is_meta_device = cfg_model.is_meta_device
-        if is_meta_device and isinstance(model_wrapper, NVFSDPManager):
-            raise ValueError("Meta device initialization is not supported with NVFSDPManager")
+        if is_meta_device and isinstance(model_wrapper, MegatronFSDPManager):
+            raise ValueError("Meta device initialization is not supported with MegatronFSDPManager")
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else init_ctx
         del cfg_model.is_meta_device
 
