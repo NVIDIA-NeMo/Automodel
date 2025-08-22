@@ -39,7 +39,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.llm.packed_sequence import PackedSequence
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.nvfsdp import NVFSDPManager
+from nemo_automodel.components.distributed.megatronfsdp import MegatronFSDPManager
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
@@ -105,8 +105,8 @@ def build_model_and_optimizer(
     init_ctx = nullcontext()
     if hasattr(cfg_model, "is_meta_device"):
         is_meta_device = cfg_model.is_meta_device
-        if is_meta_device and isinstance(model_wrapper, NVFSDPManager):
-            raise ValueError("Meta device initialization is not supported with NVFSDPManager")
+        if is_meta_device and isinstance(model_wrapper, MegatronFSDPManager):
+            raise ValueError("Meta device initialization is not supported with MegatronFSDPManager")
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else init_ctx
         del cfg_model.is_meta_device
 
@@ -139,9 +139,9 @@ def build_model_and_optimizer(
     print_trainable_parameters(model)
 
     if callable(getattr(model_wrapper, "parallelize", None)):
-        # FSDP2 and nvFSDP should already be on the correct device
-        if isinstance(model_wrapper, NVFSDPManager):
-            # nvFSDP instantiate optimizer inside parallelize_function
+        # FSDP2 and MegatronFSDP should already be on the correct device
+        if isinstance(model_wrapper, MegatronFSDPManager):
+            # MegatronFSDP instantiate optimizer inside parallelize_function
             trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
             assert len(trainable_params) > 0, "trainable_params cannot be empty"
             if tp_size > 1:
