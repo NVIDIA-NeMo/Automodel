@@ -41,14 +41,26 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+      - name: Set up UV
+        uses: astral-sh/setup-uv@v1
+        with:
+          version: 0.7.2
       - name: Install ruff
+        env:
+          UV_PROJECT_ENVIRONMENT: ./venv
         run: |
-          pip install ruff
+          uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+          source ./venv/bin/activate
+
+          export PATH="./bin/:$PATH"
+
+          uv sync --link-mode copy --locked --group linting
 
       - name: Run ruff
         run: |
-          ruff check . --verbose
-          ruff format --check . --verbose
+          source ./venv/bin/activate
+          uv run ruff check . --verbose
+          uv run ruff format --check . --verbose
 
   import_linting:
     runs-on: ubuntu-latest
@@ -59,13 +71,25 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-      - name: Install import-liner
+      - name: Set up UV
+        uses: astral-sh/setup-uv@v1
+        with:
+          version: 0.7.2
+      - name: Install ruff
+        env:
+          UV_PROJECT_ENVIRONMENT: ./venv
         run: |
-          pip install import-linter
+          uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+          source ./venv/bin/activate
+
+          export PATH="./bin/:$PATH"
+
+          uv sync --link-mode copy --locked --group linting
 
       - name: Run import-linter
         run: |
-          lint-imports --debug --verbose --no-cache
+          source ./venv/bin/activate
+          uv run lint-imports --debug --verbose --no-cache
 
   Nemo_Linting_Test:
     needs: [linting, import_linting]

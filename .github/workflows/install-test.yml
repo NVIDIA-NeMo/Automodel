@@ -128,7 +128,7 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.12"]
-        extra-groups: ["", "vlm"]
+        extra-groups: ["", "vlm", "fa"]
     env:
       EXTRA: ${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }}
     steps:
@@ -149,7 +149,8 @@ jobs:
           PIP_ARGS=()
 
           if [[ $EXTRA == *"fa"* ]]; then
-            pip install torch setuptools psutil
+            pip install --index-url https://download.pytorch.org/whl/cu128 "torch<=2.8.0"
+            pip install numpy packaging psutil pybind11 setuptools wheel wheel_stub
             PIP_ARGS=(--no-build-isolation)
           fi
 

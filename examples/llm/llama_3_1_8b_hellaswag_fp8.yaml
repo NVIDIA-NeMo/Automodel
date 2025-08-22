@@ -14,16 +14,16 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm/finetune.py --config examples/llm/llama_3_2_1b_hellaswag_fp8.yaml
+# torchrun --nproc-per-node=8 recipes/llm/finetune.py --config examples/llm/llama_3_1_8b_hellaswag_fp8.yaml
 # Adjust --nproc-per-node to the number of GPUs available on your host machine.
 #
 # This example demonstrates FP8 quantization for improved training performance on H100+ GPUs.
 
 step_scheduler:
   grad_acc_steps: 1
-  ckpt_every_steps: 200
-  val_every_steps: 200  # will run every x number of gradient steps
-  num_epochs: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000  # will run every x number of gradient steps
+  max_steps: 1000
 
 dist_env:
   backend: nccl
@@ -36,8 +36,9 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Meta-Llama-3.1-8B
+  pretrained_model_name_or_path: meta-llama/Llama-3.1-8B
   torch_dtype: bf16
+  trust_remote_code: true
 
 checkpoint:
   enabled: true
@@ -52,8 +53,15 @@ distributed:
   cp_size: 1
   sequence_parallel: false
 
+compile:
+  enabled: true
+  mode: "default"  # Options: "default", "reduce-overhead", "max-autotune"
+  fullgraph: false
+  dynamic: false  # Set to false for better performance with fixed shapes
+  backend: null  # Use default backend (inductor)
+
 fp8:
-  _target_: nemo_automodel.components.quantization.fp8.FP8Config
+  enabled: true
   recipe_name: tensorwise  # Options: tensorwise, rowwise, rowwise_with_gw_hp
   enable_fsdp_float8_all_gather: true
   precompute_float8_dynamic_scale_for_fsdp: true
@@ -71,7 +79,7 @@ dataset:
 
 packed_sequence:
   # Set packed_sequence_size > 0 to run with packed sequences
-  packed_sequence_size: 0
+  packed_sequence_size: 8192
   split_across_pack: False
 
 dataloader:
