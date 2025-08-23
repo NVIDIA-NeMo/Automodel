@@ -553,9 +553,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
 
         # Scheduler
-        self.step_scheduler = build_step_scheduler(
-            self.cfg.get("step_scheduler", None), self.dataloader
-        )
+        self.step_scheduler = build_step_scheduler(self.cfg.get("step_scheduler", None), self.dataloader)
 
         # Build learning rate scheduler
         self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
