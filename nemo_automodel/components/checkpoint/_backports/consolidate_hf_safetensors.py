@@ -566,8 +566,11 @@ def _write_sub_tensor_to_file_optimized(
         output_file_path: Path to the output file
         output_start_byte: Starting byte position of the tensor in the file
     """
-    # Handle empty tensors
-    if not tensor_shape or not sub_tensor_shape:
+    # Handle tensors with no dimensions
+    if tensor_shape == [] and sub_tensor_shape == []:
+        with fs.open(output_file_path, "r+b") as f:
+            f.seek(output_start_byte)
+            f.write(sub_tensor_bytes)
         return
 
     # Enhanced row-wise sharding detection

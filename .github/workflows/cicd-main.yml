@@ -41,31 +41,76 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+      - name: Set up UV
+        uses: astral-sh/setup-uv@v1
+        with:
+          version: 0.7.2
       - name: Install ruff
+        env:
+          UV_PROJECT_ENVIRONMENT: ./venv
         run: |
-          pip install ruff
+          uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+          source ./venv/bin/activate
+
+          export PATH="./bin/:$PATH"
+
+          uv sync --link-mode copy --locked --group linting
 
       - name: Run ruff
         run: |
-          ruff check . --verbose
-          ruff format --check . --verbose
+          source ./venv/bin/activate
+          uv run ruff check . --verbose
+          uv run ruff format --check . --verbose
+
+  import_linting:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Set up UV
+        uses: astral-sh/setup-uv@v1
+        with:
+          version: 0.7.2
+      - name: Install ruff
+        env:
+          UV_PROJECT_ENVIRONMENT: ./venv
+        run: |
+          uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+          source ./venv/bin/activate
+
+          export PATH="./bin/:$PATH"
+
+          uv sync --link-mode copy --locked --group linting
+
+      - name: Run import-linter
+        run: |
+          source ./venv/bin/activate
+          uv run lint-imports --debug --verbose --no-cache
 
   Nemo_Linting_Test:
-    needs: linting
+    needs: [linting, import_linting]
     runs-on: ubuntu-latest
     if: always()
     steps:
       - name: Main
         env:
-          RESULTS: ${{ toJson(needs.linting) }}
+          LINTING_RESULT: ${{ toJson(needs.linting) }}
+          IMPORT_LINTING_RESULT: ${{ toJson(needs.import_linting) }}
         run: |
-          RESULT=$(echo "$RESULTS" | jq -r '.result')
+          LINTING=$(echo "$LINTING_RESULT" | jq -r '.result')
+          IMPORT_LINTING=$(echo "$IMPORT_LINTING_RESULT" | jq -r '.result')
 
-          if [[ "$RESULT" == "success" ]]; then
-            echo "All passed."
+          if [[ "$LINTING" == "success" ]] && [[ "$IMPORT_LINTING" == "success" ]]; then
+            echo "All linting checks passed."
             exit 0
           else
-            echo "Some linting domains failed."
+            echo "Some linting checks failed:"
+            echo "  - linting: $LINTING"
+            echo "  - import_linting: $IMPORT_LINTING"
             exit 1
           fi
 
@@ -88,15 +133,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - script: L0_Unit_Tests_GPU
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-            timeout: 30
-          - script: L0_Unit_Tests_CPU
+          - test-name: L0_Unit_Tests_CPU
             runner: linux-amd64-cpu16
             cpu-only: true
+          - test-name: L0_Unit_Tests_GPU
+            runner: self-hosted-nemo
+            cpu-only: false
+            timeout: 30
     needs: [pre-flight, cicd-wait-in-queue]
     runs-on: ${{ matrix.runner }}
-    name: ${{ matrix.script }}
+    name: ${{ matrix.test-name }}
     environment: nemo-ci
     if: |
       (
@@ -111,9 +157,8 @@ jobs:
       - name: main
         uses: ./.github/actions/test-template
         with:
-          script: ${{ matrix.script }}
           timeout: ${{ matrix.timeout || 10 }}
-          is_unit_test: "true"
+          is-unit-test: "true"
           cpu-only: ${{ matrix.cpu-only || false }}
           has-azure-credentials: "true"
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -126,37 +171,37 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - script: L2_HF_Transformer_SFT
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_Transformer_SFT_nvfsdp
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_Transformer_PEFT
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_Transformer_PEFT_nvfsdp
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_DCP_FSDP2_Checkpoint
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_DCP_FSDP2_Checkpoint
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_Consolidated_FSDP2_Checkpoint
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-#          - script: L2_HF_PEFT_Triton_FSDP2_Checkpoint
-#            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_PEFT_FSDP2_Checkpoint
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_Transformer_VLM_SFT
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_Transformer_VLM_PEFT
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_DCP_VLM_FSDP2_Checkpoint
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_DCP_VLM_FSDP2_Checkpoint
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-          - script: L2_HF_PEFT_VLM_FSDP2_Checkpoint
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+          - test-name: L2_HF_Consolidated_FSDP
+            test-folder: hf_consolidated_fsdp
+            runner: self-hosted-nemo
+            timeout: 20
+          - test-name: L2_HF_DCP
+            test-folder: hf_dcp
+            runner: self-hosted-nemo
+            timeout: 40
+          - test-name: L2_HF_PEFT
+            test-folder: hf_peft
+            runner: self-hosted-nemo
+            timeout: 30
+          - test-name: L2_HF_Transformer
+            test-folder: hf_transformer
+            runner: self-hosted-nemo
+            timeout: 20
+          - test-name: L2_HF_Transformer_Finetune
+            test-folder: hf_transformer_finetune
+            runner: self-hosted-nemo
+            timeout: 40
+          # - test-name: L2_HF_Transformer_LLM
+          #   test-folder: hf_transformer_llm
+          #   runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+          #   timeout: 20
+          - test-name: L2_HF_Transformer_VLM
+            test-folder: hf_transformer_vlm
+            runner: self-hosted-nemo
+            timeout: 60
     needs: [cicd-unit-tests]
     runs-on: ${{ matrix.runner }}
-    name: ${{ matrix.script }}
+    name: ${{ matrix.test-name }}
     environment: nemo-ci
     if: |
       (
@@ -171,7 +216,8 @@ jobs:
       - name: main
         uses: ./.github/actions/test-template
         with:
-          script: ${{ matrix.script }}
+          test-folder: ${{ matrix.test-folder }}
+          timeout: ${{ matrix.timeout }}
           is_unit_test: "false"
           has-azure-credentials: "true"
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}

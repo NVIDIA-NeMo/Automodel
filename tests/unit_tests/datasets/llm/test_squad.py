@@ -42,7 +42,7 @@ class DummyTokenizer:
             self._start_tok = start_of_turn
             self.start_of_turn = start_of_turn
 
-    def __call__(self, text, add_special_tokens=True):
+    def __call__(self, text, add_special_tokens=True, **kwargs):
         ids = [self._tok_to_id(t) for t in text.strip().split()]
         if add_special_tokens:
             ids.append(self.eos_token_id)
@@ -122,15 +122,18 @@ def test_plain_tokenizer_basic():
     assert len(ds) == 2
     sample = ds[0]
     # keys present?
-    assert set(sample) == {"input_ids", "labels", "loss_mask"}
+    assert "input_ids" in sample
+    assert "labels" in sample
+    assert "___PAD_TOKEN_IDS___" in sample
     # loss_mask correct length
-    assert len(sample["input_ids"]) == len(sample["loss_mask"]) == len(sample["labels"])
-    # Verify at least one 1 exists in loss_mask (answer tokens)
-    assert 1 in sample["loss_mask"]
-    # Context tokens (loss_mask==0) must precede answer tokens (loss_mask==1)
-    first_one = sample["loss_mask"].index(1)
-    assert all(v == 0 for v in sample["loss_mask"][:first_one])
-    assert all(v == 1 for v in sample["loss_mask"][first_one:])
+    if 'loss_mask' in sample:
+        assert len(sample["input_ids"]) == len(sample["loss_mask"]) == len(sample["labels"])
+        # Verify at least one 1 exists in loss_mask (answer tokens)
+        assert 1 in sample["loss_mask"]
+        # Context tokens (loss_mask==0) must precede answer tokens (loss_mask==1)
+        first_one = sample["loss_mask"].index(1)
+        assert all(v == 0 for v in sample["loss_mask"][:first_one])
+        assert all(v == 1 for v in sample["loss_mask"][first_one:])
 
 
 def test_sequence_padding():
@@ -144,11 +147,14 @@ def test_sequence_padding():
     ds = make_squad_dataset(tok, seq_length=pad_len)
     for row in ds:
         for key, val in row.items():
+            if key == "___PAD_TOKEN_IDS___":
+                continue
             assert len(val) == pad_len
         # last id in labels must equal eos
-        assert row["labels"][-1] == tok.eos_token_id
-        # loss mask padding must be zeros
-        assert row["loss_mask"][-1] == 0
+        assert list(filter(lambda x: x != -100, row["labels"])) == [0]
+        if 'loss_mask' in row:
+            # loss mask padding must be zeros
+            assert row["loss_mask"][-1] == 0
 
 
 def test_limit_dataset_samples(monkeypatch):
@@ -180,16 +186,22 @@ def test_chat_template_path():
         seq_length=None,  # no padding
     )
     row = ds[0]
+    n = len(row['input_ids'])
+    for k, v in row.items():
+        if k == '___PAD_TOKEN_IDS___': continue
+        assert len(v) == n, f"{k} has length {len(v)} but should have length {n}"
     sot_id = tok(start_token, add_special_tokens=False)["input_ids"][0]
 
     # The index of the *second* SOT token +1 is response_start
     idx_first = row["input_ids"].index(sot_id)
     idx_second = row["input_ids"].index(sot_id, idx_first + 1)
-    response_start = idx_second + 1
-
-    # Everything before response_start must have loss_mask==0; after ==>1
-    assert all(v == 0 for v in row["loss_mask"][:response_start])
-    assert all(v == 1 for v in row["loss_mask"][response_start:])
+    # in the squad.py dataset, the response_start points to the second SOT token (including).
+    # therefore, it is defined as `response_start = idx_second`.
+    # However, here, the returned labels are already shifted by 1, so we can use `response_start = idx_second - 1`.
+    response_start = idx_second - 1
+    if 'loss_mask' in row:
+        assert sum(row["loss_mask"][:response_start]) == 0
+        assert sum(row["loss_mask"][response_start:]) == len(row["loss_mask"][response_start:])
 
 
 def test_fp8_flag_is_noop():

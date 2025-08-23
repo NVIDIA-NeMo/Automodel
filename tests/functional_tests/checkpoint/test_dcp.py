@@ -23,37 +23,52 @@ import torch
 import torch.distributed.checkpoint as dcp
 import torch.distributed.tensor
 import torch.nn as nn
+import yaml
 
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction
+from nemo_automodel.recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction, calculate_loss
 
 
-def load_dcp(ckpt_dir: Path | str) -> dict[str, torch.Tensor]:
-    """Loads a DCP checkpoint in a state dictionary from a directory.
-
-    Args:
-        ckpt_dir: The directory containing the DCP checkpoint.
-
-    Returns:
-        A state dictionary containing the checkpoint.
-    """
+def load_dcp(ckpt_dir: Path | str) -> tuple[dict, dict]:
+    """Loads a DCP checkpoint in a state dictionary from a directory."""
     if not isinstance(ckpt_dir, Path):
         ckpt_dir = Path(ckpt_dir)
     fs_reader = dcp.FileSystemReader(ckpt_dir)
     metadata = fs_reader.read_metadata()
 
-    state_dict = {
+    # Load tensor data
+    tensor_state_dict = {
         k: torch.empty(tp.size, dtype=tp.properties.dtype)
         for k, tp in metadata.state_dict_metadata.items()
         if type(tp).__name__ == "TensorStorageMetadata"
     }
 
-    dcp.load(
-        state_dict,
-        storage_reader=fs_reader,
-    )
-    return state_dict
+    if tensor_state_dict:
+        dcp.load(tensor_state_dict, storage_reader=fs_reader)
+
+    # Load scheduler data
+    sched_keys = [k for k, tp in metadata.state_dict_metadata.items() if "sched" in k]
+
+    sched_state_dict = {}
+    if sched_keys:
+        sched_state_dict = {k: None for k in sched_keys}
+        try:
+            dcp.load(sched_state_dict, storage_reader=fs_reader)
+        except Exception:
+            sched_state_dict = {}
+
+    return tensor_state_dict, sched_state_dict
+
+
+def compare_configs(source_config: dict, restored_config: dict):
+    """ Recursively compare two configs."""
+    for k, v in source_config.items():
+        if k in restored_config:
+            if isinstance(v, dict):
+                compare_configs(v, restored_config[k])
+            else:
+                assert v == restored_config[k], f"Config mismatch for key {k}. Expected {v} but got {restored_config[k]}"
 
 
 def to_cpu(
@@ -76,7 +91,12 @@ def get_validation_loss(
 
     with torch.no_grad():
         out = model(**val_batch)
-        loss = loss_fn(out.logits.view(-1, out.logits.size(-1)), labels.view(-1), mask=loss_mask, reduction="sum")
+        loss = calculate_loss(
+                loss_fn,
+                logits=out.logits,
+                labels=labels,
+                mask=loss_mask,
+            )
         return loss
 
 
@@ -728,8 +748,8 @@ def test_dcp_checkpoint():
         "optim.state.lm_head.weight.exp_avg_sq": ([16000, 512], torch.bfloat16, "cpu"),
     }
 
-    script_path = Path(__file__).parent.resolve()
-    cfg = parse_args_and_load_config(script_path / "llama_3_2_1b_hellaswag.yaml")
+    cfg_path = Path(__file__).parents[3] / "examples" / "llm" / "llama_3_2_1b_hellaswag.yaml"
+    cfg = parse_args_and_load_config(cfg_path)
     trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
@@ -762,6 +782,7 @@ def test_dcp_checkpoint():
         "optim/__1_0.distcp",
         "optim/.metadata",
         "step_scheduler.pt",
+        "config.yaml",
     ]
 
     for file in output_files:
@@ -773,10 +794,37 @@ def test_dcp_checkpoint():
             assert path.is_dir(), f"Expected {path} to be a directory"
         assert os.access(path, os.R_OK), f"Expected {path} to be readable"
         assert path.stat().st_size > 0, f"Expected {path} to be non-empty"
-    restored_optim_dict = load_dcp(
+    restored_optim_dict, saved_lr_scheduler_state = load_dcp(
         Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "optim",
     )
-    restored_model_dict = load_dcp(
+    # Remove "sched." prefix from keys in saved_lr_scheduler_state if present
+    if saved_lr_scheduler_state is not None:
+        saved_lr_scheduler_state = {
+            (k[6:] if k.startswith("sched.") else k): v for k, v in saved_lr_scheduler_state.items()
+        }
+
+    if saved_lr_scheduler_state is not None and trainer.lr_scheduler is not None:
+        assert hasattr(trainer, "lr_scheduler") and trainer.lr_scheduler is not None, (
+            "test_dcp_checkpoint: lr_scheduler not found in restored trainer"
+        )
+
+        restored_lr_state = trainer.lr_scheduler.state_dict()
+
+        for key in saved_lr_scheduler_state:
+            assert key in restored_lr_state, f"test_dcp_checkpoint: lr_scheduler key {key} missing in restored state"
+            saved_val = saved_lr_scheduler_state[key]
+            restored_val = restored_lr_state[key]
+
+            if isinstance(saved_val, torch.Tensor):
+                assert torch.equal(saved_val, restored_val), (
+                    f"test_dcp_checkpoint: lr_scheduler tensor mismatch for {key}"
+                )
+            else:
+                assert saved_val == restored_val, (
+                    f"test_dcp_checkpoint: lr_scheduler value mismatch for {key}: saved={saved_val} != restored={restored_val}"
+                )
+
+    restored_model_dict, _ = load_dcp(
         Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "model",
     )
 
@@ -788,6 +836,11 @@ def test_dcp_checkpoint():
     source_model_loss = get_validation_loss(trainer.model, val_batch, trainer.loss_fn, trainer.dist_env.device)
     restored_model_loss = get_validation_loss(restored_model, val_batch, trainer.loss_fn, trainer.dist_env.device)
     assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
+
+    # compare the recipe configs
+    with open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "config.yaml", "r") as f:
+        restored_config = yaml.safe_load(f)
+    compare_configs(trainer.cfg.raw_config, restored_config)
 
     # similarly, the optimizer states are saved in a dictionary formatted as:
     # {

@@ -19,14 +19,14 @@ inputs:
     description: "Max runtime of test in minutes"
     required: false
     default: "10"
-  script:
-    description: "Test script to execute"
-    required: true
-  is_optional:
+  test-folder:
+    description: "Name of the folder containg tests suite"
+    required: false
+  is-optional:
     description: "Failure will cancel all other tests if set to true"
     required: false
     default: "false"
-  is_unit_test:
+  is-unit-test:
     description: "Upload coverage as unit test"
     required: false
     default: "false"
@@ -57,7 +57,9 @@ runs:
       if: ${{ inputs.has-azure-credentials == 'true' }}
       shell: bash
       run: |
+        echo "::group::Install Azure CLI"
         curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+        echo "::endgroup::"
 
     - name: Azure Login
       if: ${{ inputs.has-azure-credentials == 'true' }}
@@ -68,10 +70,11 @@ runs:
         subscription-id: ${{ inputs.azure-subscription-id }}
 
     - name: Azure Fileshare
-      if: ${{ inputs.has-azure-credentials == 'true' && inputs.is_unit_test == 'false' }}
+      if: ${{ inputs.has-azure-credentials == 'true' && inputs.is-unit-test == 'false' }}
       shell: bash
       id: azure-fileshare
       run: |
+        echo "::group::Mount SMB drive"
         sudo apt update
         sudo apt install -y cifs-utils
 
@@ -120,6 +123,7 @@ runs:
         sudo mount -t cifs $SMB_PATH $MNT_PATH -o credentials=$SMB_CREDENTIAL_FILE,serverino,nosharesock,actimeo=30,mfsymlinks
 
         ls -al $MNT_PATH/TestData
+        echo "::endgroup::"
 
     - name: Checkout repository
       uses: actions/checkout@v2
@@ -131,11 +135,15 @@ runs:
       env:
         GH_TOKEN: ${{ inputs.PAT }}
       run: |
+        echo "::group::Build test container"
+        docker system prune -af
         docker build -f docker/Dockerfile.ci  --secret id=GH_TOKEN -t automodel .
+        echo "::endgroup::"
 
     - name: Start container
       shell: bash
       run: |
+        echo "::group::Start test container"
         MNT_PATH=${{ steps.azure-fileshare.outputs.mnt_path }}
 
         ARG=("")
@@ -165,12 +173,14 @@ runs:
 
         echo "$cmd" | tee "retry_job.sh"
         bash retry_job.sh
+        echo "::endgroup::"
 
     - name: Create run-script
       id: create
       shell: bash
       run: |
-        COVERAGE_PREFIX=$([[ "${{ inputs.is_unit_test }}" == "true" ]] && echo "unit-test" || echo "e2e")
+        echo "::group::Create run-script"
+        COVERAGE_PREFIX=$([[ "${{ inputs.is-unit-test }}" == "true" ]] && echo "unit-test" || echo "e2e")
         echo "coverage-prefix=$COVERAGE_PREFIX" | tee -a "$GITHUB_OUTPUT"
 
         cmd=$(cat <<'RUN_TEST_EOF'
@@ -178,18 +188,20 @@ runs:
 
         docker exec -t nemo_container_${{ github.run_id }} bash -c '
           set -e
-          
+
           . /opt/venv/env.sh
 
-          bash tests/${{ inputs.is_unit_test == 'true' && 'unit_tests' || 'functional_tests' }}/${{ inputs.script }}.sh
-          
+          bash tests/run_test.sh --UNIT_TEST=${{ inputs.is-unit-test }} --CPU=${{ inputs.cpu-only}} --TEST_NAME=${{ inputs.test-folder }}
+
         '
+
 
         RUN_TEST_EOF
         )
 
         echo "timeout_in_seconds=$(( ${{ inputs.timeout }} * 60 ))" | tee -a "$GITHUB_OUTPUT"
         echo "$cmd" | tee "job.sh"
+        echo "::endgroup::"
 
     - name: Run main script
       uses: nick-fields/retry@v3
@@ -206,6 +218,7 @@ runs:
       id: check
       shell: bash
       run: |
+        echo "::group::Check result"
         docker exec nemo_container_${{ github.run_id }} /opt/venv/bin/coverage combine || true
         docker exec nemo_container_${{ github.run_id }} /opt/venv/bin/coverage xml || true
         docker cp nemo_container_${{ github.run_id }}:/workspace/.coverage .coverage
@@ -217,7 +230,7 @@ runs:
         EXIT_CODE=${{ steps.run-main-script.outputs.exit_code }}
         IS_SUCCESS=$([[ "$EXIT_CODE" -eq 0 ]] && echo "true" || echo "false")
 
-        if [[ "$IS_SUCCESS" == "false" && "${{ inputs.is_optional }}" == "true" ]]; then
+        if [[ "$IS_SUCCESS" == "false" && "${{ inputs.is-optional }}" == "true" ]]; then
           echo "::warning:: Test failed, but displayed as successful because it is marked as optional."
           IS_SUCCESS=true
         fi
@@ -225,14 +238,12 @@ runs:
         if [[ "$IS_SUCCESS" == "false" ]]; then
           echo Test did not finish successfully.
           exit 1
+        else
+          docker exec -t nemo_container_${{ github.run_id }} /opt/venv/bin/coverage report -i
         fi
 
         exit $EXIT_CODE
-
-    - name: Test coverage
-      shell: bash -x -e -u -o pipefail {0}
-      run: |
-        docker exec -t nemo_container_${{ github.run_id }} /opt/venv/bin/coverage report -i
+        echo "::endgroup::"
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4

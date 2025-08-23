@@ -126,70 +126,6 @@ class FirstRankPerNode(ContextDecorator):
         return False
 
 
-def get_rank_safe() -> int:
-    """
-    Get the distributed rank safely, even if torch.distributed is not initialized.
-
-    Returns:
-        The current process rank.
-    """
-    # In megatron init, args.rank comes from the torchrun env var.
-    # Once init has been done, args.rank is updated to value of torch get_rank()
-    if torch.distributed.is_initialized():
-        return torch.distributed.get_rank()
-    else:
-        return int(os.getenv("RANK", "0"))
-
-
-def get_world_size_safe() -> int:
-    """
-    Get the distributed world size safely, even if torch.distributed is not initialized.
-
-    Returns:
-        The total number of processes in the distributed job.
-    """
-    # In megatron init, args.world_size comes from the torchrun env var.
-    # Once init has been done, args.world_size is updated to value of torch get_world_size()
-    if torch.distributed.is_initialized():
-        return torch.distributed.get_world_size()
-    else:
-        return int(os.getenv("WORLD_SIZE", "1"))
-
-
-def get_local_rank_preinit() -> int:
-    """
-    Get the local rank from the environment variable, intended for use before full init.
-
-    Returns:
-        The local rank of the current process.
-    """
-    return int(os.getenv("LOCAL_RANK", "0"))
-
-
-def append_to_progress_log(save_dir: str, string: str, barrier: bool = True) -> None:
-    """
-    Append a formatted string to the progress log file (rank 0 only).
-
-    Includes timestamp, job ID, and number of GPUs in the log entry.
-
-    Args:
-        save_dir: The directory where the 'progress.txt' file is located.
-        string: The message string to append.
-        barrier: If True, performs a distributed barrier before writing (rank 0 only).
-    """
-    if save_dir is None:
-        return
-    progress_log_filename = os.path.join(save_dir, "progress.txt")
-    if barrier and torch.distributed.is_initialized():
-        torch.distributed.barrier()
-    if get_rank_safe() == 0:
-        os.makedirs(os.path.dirname(progress_log_filename), exist_ok=True)
-        with open(progress_log_filename, "a+") as f:
-            job_id = os.getenv("SLURM_JOB_ID", "")
-            num_gpus = get_world_size_safe()
-            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\tJob ID: {job_id}\t# GPUs: {num_gpus}\t{string}\n")
-
-
 def barrier_and_log(string: str) -> None:
     """
     Perform a distributed barrier and then log a message on rank 0.
@@ -248,16 +184,11 @@ def get_sync_ctx(model, is_optim_step):
     # Use `no_sync` on DDP models when we are *not* on the final micro-batch for
     # this gradient update (i.e., when `is_grad` is False). This avoids an
     # all-reduce for every micro-batch and greatly improves throughput.
+    sync_ctx = nullcontext()
     if isinstance(model, dist.fsdp._fully_shard._fully_shard.FSDPModule):
         model.set_requires_gradient_sync(is_optim_step)
-        sync_ctx = nullcontext()
-    elif isinstance(model, torch.nn.parallel.DistributedDataParallel):
-        if is_optim_step:
-            sync_ctx = nullcontext()
-        else:
-            sync_ctx = model.no_sync()
-    else:
-        sync_ctx = nullcontext()
+    elif isinstance(model, torch.nn.parallel.DistributedDataParallel) and not is_optim_step:
+        sync_ctx = model.no_sync()
     return sync_ctx
 
 

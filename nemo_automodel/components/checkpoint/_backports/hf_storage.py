@@ -19,6 +19,7 @@
 import dataclasses
 import json
 import queue
+import re
 from typing import Any, Optional
 
 import torch
@@ -47,7 +48,6 @@ from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors 
 from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
 from nemo_automodel.components.checkpoint._backports.hf_utils import (
     CUSTOM_METADATA_KEY,
-    DATA_KEY,
     DATA_OFFSETS_KEY,
     DEFAULT_EXTRA_METADATA_KEY,
     DTYPE_KEY,
@@ -221,7 +221,7 @@ class _HuggingFaceStorageReader(FsspecReader):
     Fsspec registration of the storage solution is required.
     """
 
-    def __init__(self, path: str, token: Optional[str] = None) -> None:
+    def __init__(self, path: str, token: Optional[str] = None, key_mapping: Optional[dict[str, str]] = None) -> None:
         """
         Initialize the huggingface reader pointing to path.
 
@@ -230,15 +230,18 @@ class _HuggingFaceStorageReader(FsspecReader):
             Needs to have .safetensors file, but can be from any fsspec supported storage,
             including localFS and hf://.
             token: The token to use to authenticate with huggingface hub.
+            key_mapping: VLMs in HuggingFace can have their FQNs remapped at load time. This means that the state dict keys are not the same as the loaded model's FQNs.
+                         This mapping is used to map the state dict keys to the loaded model's FQNs.
         """
+
         if token is not None:
             super().__init__(path=path, token=token)
         else:
             super().__init__(path=path)
 
-    def read_data(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:
-        from safetensors import deserialize  # type: ignore[import-not-found]
+        self.key_mapping = key_mapping
 
+    def read_data(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:
         per_file: dict[str, list[ReadItem]] = {}
 
         for read_item in plan.items:
@@ -248,17 +251,11 @@ class _HuggingFaceStorageReader(FsspecReader):
 
         for file_name, reqs in per_file.items():
             with self.fs.create_stream(file_name, "rb") as stream:
-                # TODO: make this more efficient by doing offset reads instead of a
-                # full deserialization of the file
-                deserialized = deserialize(stream.read())
-                deserialized_dict: dict[str, dict[str, Any]] = {
-                    tensor_info[0]: tensor_info[1] for tensor_info in deserialized
-                }
-
                 for req in reqs:
-                    item_md: _HFStorageInfo = self.storage_data[req.storage_index]
+                    item_md = self.storage_data[req.storage_index]
 
-                    tensor_bytes = deserialized_dict[req.dest_index.fqn][DATA_KEY]
+                    stream.seek(item_md.offset)
+                    tensor_bytes = stream.read(item_md.length)
 
                     tensor = torch.frombuffer(
                         tensor_bytes,
@@ -290,7 +287,7 @@ class _HuggingFaceStorageReader(FsspecReader):
 
         for safetensor_file in safetensors_files:
             with self.fs.create_stream(safetensor_file, "rb") as f:
-                safetensors_metadata, _ = _get_safetensors_file_metadata(f)
+                safetensors_metadata, metadata_size = _get_safetensors_file_metadata(f)
                 custom_metadata = safetensors_metadata.get(DEFAULT_EXTRA_METADATA_KEY)
 
                 dcp_sharding_info = None
@@ -300,6 +297,8 @@ class _HuggingFaceStorageReader(FsspecReader):
                 for key, val in safetensors_metadata.items():
                     if key == DEFAULT_EXTRA_METADATA_KEY:
                         continue
+
+                    key = _get_key_renaming_mapping(key, self.key_mapping)
 
                     # construct state_dict_metadata
                     if dcp_sharding_info is not None:
@@ -334,7 +333,7 @@ class _HuggingFaceStorageReader(FsspecReader):
                         metadata_index = MetadataIndex(fqn=key, offset=[0] * len(val[SHAPE_KEY]))
                     storage_data[metadata_index] = _HFStorageInfo(
                         relative_path=safetensor_file,
-                        offset=val[DATA_OFFSETS_KEY][0],
+                        offset=val[DATA_OFFSETS_KEY][0] + metadata_size,
                         length=val[DATA_OFFSETS_KEY][1] - val[DATA_OFFSETS_KEY][0],
                         shape=torch.Size(val[SHAPE_KEY]),
                         dtype=_get_dtype(val[DTYPE_KEY]),
@@ -391,7 +390,9 @@ def _extract_file_index(filename: str) -> int:
     return 1
 
 
-def get_fqn_to_file_index_mapping(reference_model_path: str) -> dict[str, int]:
+def get_fqn_to_file_index_mapping(
+    reference_model_path: str, key_mapping: Optional[dict[str, str]] = None
+) -> dict[str, int]:
     """
     Get the FQN to file index mapping from the metadata.
 
@@ -403,16 +404,30 @@ def get_fqn_to_file_index_mapping(reference_model_path: str) -> dict[str, int]:
         Indices are from 1 to N, where N is the number of files.
     """
     hf_reader = _HuggingFaceStorageReader(reference_model_path)
-
     fqn_to_file_index_mapping: dict[str, int] = {}
-
-    # ``read_metadata`` transparently handles both the presence of an index
-    # JSON **and** the single-file fallback, so we can simply rely on it.
     metadata = hf_reader.read_metadata()
 
     for md_index, storage_info in metadata.storage_data.items():
         fqn = getattr(md_index, "fqn", md_index)
+        fqn = _get_key_renaming_mapping(fqn, key_mapping)
         filename = storage_info.relative_path
         fqn_to_file_index_mapping[str(fqn)] = _extract_file_index(filename)
 
     return fqn_to_file_index_mapping
+
+
+# the following function is taken from https://github.com/huggingface/transformers/blob/b85ed49e0a5f1bd9fd887f497d055b22b9319a12/src/transformers/modeling_utils.py#L4989-L5047
+def _get_key_renaming_mapping(
+    key: str,
+    key_mapping: Optional[dict[str, str]] = None,
+) -> str:
+    if key_mapping is None:
+        return key
+
+    # Optionally map the key according to `key_mapping`
+    for pattern, replacement in key_mapping.items():
+        new_key, n_replace = re.subn(pattern, replacement, key)
+        # Early exit of the loop
+        if n_replace > 0:
+            return new_key
+    return key

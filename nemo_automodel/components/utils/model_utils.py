@@ -16,33 +16,65 @@ import logging
 
 import torch.nn as nn
 
-from nemo_automodel.components.utils.dist_utils import get_rank_safe
-
 logger = logging.getLogger(__name__)
 
 
-def print_trainable_parameters(model):
+def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
+    """
+    Get the number of trainable parameters and the L2 norm of the model.
+
+    Args:
+        model: Model to analyze
+
+    Returns:
+        total_params: int
+        trainable_params: int
+        local_sq_norm: float
+    """
+    total_params = 0
+    trainable_params = 0
+    local_sq_norm = 0.0
+
+    for p in model.parameters():
+        n = p.numel()
+        total_params += n
+        if p.requires_grad:
+            trainable_params += n
+        try:
+            local_sq_norm += float(p.detach().float().norm(2).item() ** 2)
+        except Exception:
+            pass
+    return total_params, trainable_params, local_sq_norm
+
+
+def print_trainable_parameters(model: nn.Module) -> tuple[int, int]:
     """Print the number of trainable parameters in the model.
 
     Args:
         model: Model to analyze
+
+    Returns:
+        trainable_params: int
+        total_params: int
     """
-    trainable_params = 0
-    all_param = 0
+    total_params, trainable_params, local_sq_norm = _get_model_param_stats(model)
 
-    for _, param in model.named_parameters():
-        all_param += param.numel()
-        if param.requires_grad:
-            trainable_params += param.numel()
+    try:
+        # TODO(@akoumparouli): make this sharding aware.
+        local_sq_norm = float(local_sq_norm**0.5)
+        trainable_pct = (100.0 * trainable_params / total_params) if total_params > 0 else 0.0
 
-    if get_rank_safe() == 0:
-        print("--------------------------------")
-        print(f"Trainable parameters: {trainable_params:,}")
-        print(f"Total parameters: {all_param:,}")
-        print(f"Trainable parameters percentage: {100 * trainable_params / all_param:.2f}%")
-        print("--------------------------------")
+        logging.info("Model summary:")
+        logging.info("--------------------------------")
+        logging.info(f"Trainable parameters: {trainable_params:,}")
+        logging.info(f"Total parameters: {total_params:,}")
+        logging.info(f"Trainable parameters percentage: {trainable_pct:.2f}%")
+        logging.info(f"Param L2 norm: {local_sq_norm:.4f}")
+        logging.info("--------------------------------")
+    except Exception:
+        logging.info("Model summary: <unavailable>")
 
-    return trainable_params, all_param
+    return trainable_params, total_params
 
 
 def _freeze_module_by_attribute_and_patterns(model, attribute_name, name_patterns):

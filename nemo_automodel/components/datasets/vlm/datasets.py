@@ -114,3 +114,23 @@ def make_medpix_dataset(path_or_dataset="medpix-dataset/medpix-dataset", split="
         }
 
     return [format(example) for example in dataset]
+
+
+def make_cv17_dataset(path_or_dataset="ysdede/commonvoice_17_tr_fixed", split="train", **kwargs):
+    """Load and preprocess the CommonVoice 17 dataset for audio-to-text fine-tuning."""
+    dataset = load_dataset(path_or_dataset, split=split)
+    all_columns = dataset.column_names
+    columns_to_remove = [col for col in all_columns if col not in ["audio", "transcription"]]
+    dataset = dataset.remove_columns(columns_to_remove)
+
+    def format(example):
+        return {
+            "conversation": [
+                {"role": "user", "content": "<|audio_1|>Transcribe the Turkish audio clip."},
+                {"role": "assistant", "content": example["transcription"]},
+            ],
+            "audio": (example["audio"]["array"], example["audio"]["sampling_rate"]),
+        }
+
+    ret = [format(example) for example in dataset]
+    return ret

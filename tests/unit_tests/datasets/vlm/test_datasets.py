@@ -174,3 +174,68 @@ def test_make_medpix_dataset(monkeypatch):
         assert assistant_turn["role"] == "assistant"
         assistant_payload = assistant_turn["content"][0]
         assert assistant_payload == {"type": "text", "text": src["answer"]}
+
+
+def test_make_cv17_dataset(monkeypatch):
+    """End-to-end sanity check for `make_cv17_dataset`."""
+    # Mock dataset with audio data and extra columns to test column removal
+    class MockDataset:
+        def __init__(self, data):
+            self.data = data
+            self.column_names = ["audio", "transcription", "extra_col1", "extra_col2", "unwanted_col"]
+
+        def remove_columns(self, columns_to_remove):
+            # Simulate column removal
+            expected_removed = ["extra_col1", "extra_col2", "unwanted_col"]
+            assert set(columns_to_remove) == set(expected_removed)
+            return self.data
+
+        def __iter__(self):
+            return iter(self.data)
+
+    fake_audio_data = [
+        {
+            "audio": {
+                "array": [0.1, 0.2, 0.3, -0.1, -0.2],
+                "sampling_rate": 16000
+            },
+            "transcription": "Merhaba, nasılsınız?"
+        },
+        {
+            "audio": {
+                "array": [0.5, -0.3, 0.8, 0.2, -0.1],
+                "sampling_rate": 16000
+            },
+            "transcription": "Bu bir test cümlesidir."
+        },
+    ]
+
+    mock_dataset = MockDataset(fake_audio_data)
+
+    # Patch `load_dataset` so no network call is issued
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: mock_dataset)
+
+    result = ds.make_cv17_dataset()
+
+    assert len(result) == len(fake_audio_data)
+    for sample, src in zip(result, fake_audio_data, strict=True):
+        assert set(sample.keys()) == {"conversation", "audio"}
+
+        # Test conversation structure
+        conversation = sample["conversation"]
+        assert len(conversation) == 2
+
+        # Test user turn
+        user_turn = conversation[0]
+        assert user_turn["role"] == "user"
+        assert user_turn["content"] == "<|audio_1|>Transcribe the Turkish audio clip."
+
+        # Test assistant turn
+        assistant_turn = conversation[1]
+        assert assistant_turn["role"] == "assistant"
+        assert assistant_turn["content"] == src["transcription"]
+
+        # Test audio data processing
+        audio_array, sampling_rate = sample["audio"]
+        assert audio_array == src["audio"]["array"]
+        assert sampling_rate == src["audio"]["sampling_rate"]

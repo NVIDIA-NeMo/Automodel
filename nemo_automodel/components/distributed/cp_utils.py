@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import contextlib
-from typing import List, Set
+from typing import List, Optional, Set
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -68,7 +68,7 @@ def create_context_parallel_ctx(
     cp_buffers: List[torch.Tensor],
     cp_seq_dims: List[int],
     cp_no_restore_buffers: Set[torch.Tensor],
-    cp_rotate_method: str,
+    cp_rotate_method: Optional[str] = None,
 ):
     """
     Create a context parallel context.
@@ -82,6 +82,10 @@ def create_context_parallel_ctx(
             such as "allgather" or "addtoall".
     """
     from torch.distributed.tensor.experimental import context_parallel
+    from torch.distributed.tensor.experimental._attention import set_rotate_method
+
+    if cp_rotate_method is not None:
+        set_rotate_method(cp_rotate_method)
 
     # TODO: uncomment this when torch.distributed.tensor.experimental._attention.set_rotate_method
     # is available
@@ -95,7 +99,7 @@ def create_context_parallel_ctx(
     )
 
 
-def make_cp_batch_and_ctx(device_mesh, batch, labels, loss_mask):
+def make_cp_batch_and_ctx(device_mesh, batch, labels, loss_mask=None):
     """
     Build a CP context manager and shards a batch. If the input device_mesh is None or the size
     of the context_parallel submesh is 1, this function is effectively a no-op.
@@ -115,7 +119,7 @@ def make_cp_batch_and_ctx(device_mesh, batch, labels, loss_mask):
     if device_mesh is None:
         cp_mesh = None
     else:
-        cp_mesh = device_mesh["context_parallel"]
+        cp_mesh = device_mesh["cp"]
 
     if cp_mesh is None or cp_mesh.size() == 1:
         return nullcontext, batch
