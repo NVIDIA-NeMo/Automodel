@@ -644,7 +644,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 and self.device_mesh is not None
                 and (self.device_mesh["cp"].size() > 1 or self.device_mesh["tp"].size() > 1)
             ):
-                batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
+                batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.dist_env.device)
 
             train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
 
@@ -723,7 +723,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         with StatefulRNG(seed=1, ranked=True):
             self.model.eval()
 
-            total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.model.device)
+            total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
             total_num_label_tokens = 0
 
             for batch in self.val_dataloader:
@@ -737,7 +737,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     and (self.device_mesh["cp"].size() > 1 or self.device_mesh["tp"].size() > 1)
                 ):
                     batch["position_ids"] = (
-                        torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
+                        torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.dist_env.device)
                     )
 
                 train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
