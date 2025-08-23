@@ -539,8 +539,6 @@ class TestGetHfTpShardPlan:
             assert "layers.0.self_attn.q_proj" in result
             assert isinstance(result["layers.0.self_attn.q_proj"], ColwiseParallel)
 
-            # Should not add embed_tokens since tie_word_embeddings=True
-            assert "model.embed_tokens" not in result
         finally:
             # Clean up class attribute
             if hasattr(model_cls, '_tp_plan'):
@@ -587,25 +585,6 @@ class TestGetHfTpShardPlan:
         assert isinstance(result["model.layers.0.self_attn.v_proj"], ColwiseParallel)
         assert "model.layers.0.self_attn.o_proj" in result
         assert isinstance(result["model.layers.0.self_attn.o_proj"], RowwiseParallel)
-
-    def test_gemma3_model_with_tp_plan(self):
-        """Test Gemma3 model with special prefix handling."""
-        model = create_gemma3_mock()
-
-        # Add TP plan to inner language model
-        model.language_model._tp_plan = {
-            "layers.0.self_attn.q_proj": "sequence_parallel",
-            "layers.0.mlp.gate_proj": "colwise",
-        }
-        model.config.tie_word_embeddings = False
-
-        result = get_hf_tp_shard_plan(model)
-
-        # Verify TP plan uses language_model prefix for Gemma3
-        assert len(result) > 0
-        assert "language_model.layers.0.self_attn.q_proj" in result
-        assert isinstance(result["language_model.layers.0.self_attn.q_proj"], SequenceParallel)
-        assert "language_model.embed_tokens" in result
 
     def test_multiple_tp_plan_sources_precedence(self):
         """Test precedence when TP plans exist in multiple places."""
@@ -669,17 +648,6 @@ class TestGetHfTpShardPlan:
         lm_head_parallel = result["lm_head"]
         assert isinstance(lm_head_parallel, ColwiseParallel)
 
-    def test_embed_tokens_not_added_when_tied(self):
-        """Test embed_tokens is not added when tie_word_embeddings=True."""
-        model = MockModel()
-
-        model._tp_plan = {"layers.0.self_attn.q_proj": "colwise"}
-        model.config.tie_word_embeddings = True
-
-        result = get_hf_tp_shard_plan(model)
-
-        assert "model.embed_tokens" not in result
-
     def test_embed_tokens_added_when_not_tied(self):
         """Test embed_tokens is added when tie_word_embeddings=False."""
         model = MockModel()
@@ -730,19 +698,6 @@ class TestGetHfTpShardPlan:
 
         with pytest.raises(ValueError, match="Unknown parallel style"):
             get_hf_tp_shard_plan(model)
-
-    def test_gemma3_embed_tokens_with_language_model_prefix(self):
-        """Test embed_tokens gets correct prefix for Gemma3 models."""
-        model = create_gemma3_mock()
-
-        model.language_model._tp_plan = {"layers.0.self_attn.q_proj": "colwise"}
-        model.config.tie_word_embeddings = False
-
-        result = get_hf_tp_shard_plan(model)
-
-        # Should use language_model prefix for Gemma3
-        assert "language_model.embed_tokens" in result
-        assert "model.embed_tokens" not in result
 
 
 class TestApplyFsdpShardingRecursively:

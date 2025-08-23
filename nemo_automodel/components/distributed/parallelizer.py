@@ -39,6 +39,31 @@ from torch.distributed.tensor.parallel import (
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
+from transformers.models.gemma3.modeling_gemma3 import (
+    Gemma3ForConditionalGeneration,
+)
+from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
+from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
+from transformers.models.llava_next.modeling_llava_next import (
+    LlavaNextForConditionalGeneration,
+)
+from transformers.models.llava_next_video.modeling_llava_next_video import (
+    LlavaNextVideoForConditionalGeneration,
+)
+from transformers.models.llava_onevision.modeling_llava_onevision import (
+    LlavaOnevisionForConditionalGeneration,
+)
+from transformers.models.mistral3.modeling_mistral3 import (
+    Mistral3ForConditionalGeneration,
+)
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+    Qwen2_5_VLForConditionalGeneration,
+)
+from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+    Qwen2VLForConditionalGeneration,
+)
+from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
+
 # Import model-specific tensor parallel plans from the dedicated module
 from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE_FUNCTIONS
 
@@ -114,25 +139,63 @@ def get_hf_tp_shard_plan(model):
     Raises:
         AssertionError: If no TP plan is found
     """
+    model_cls = type(model)
+
+    # Handle VL models structure
+    if model_cls in [
+        Qwen2VLForConditionalGeneration,
+        Qwen2_5_VLForConditionalGeneration,
+    ]:
+        inner_model = model.model.language_model
+        model_prefix = "model.language_model"
+        config = model.model.language_model.config
+
+    elif model_cls == Gemma3ForConditionalGeneration:
+        inner_model = model.language_model
+        model_prefix = "language_model"
+        config = model.config.text_config
+
+    elif model_cls == Llama4ForConditionalGeneration:
+        inner_model = model.language_model.model
+        model_prefix = "language_model.model"
+        config = model.language_model.model.config
+
+    elif model_cls in [
+        LlavaForConditionalGeneration,
+        LlavaNextForConditionalGeneration,
+        LlavaNextVideoForConditionalGeneration,
+        LlavaOnevisionForConditionalGeneration,
+    ]:
+        inner_model = model.model.language_model
+        model_prefix = "model.language_model"
+        config = model.model.language_model.config
+
+    elif model_cls == Mistral3ForConditionalGeneration:
+        inner_model = model.model.language_model
+        model_prefix = "model.language_model"
+        config = model.model.language_model.config
+
+    else:
+        inner_model = model.model
+        model_prefix = "model"
+        config = model.config
 
     hf_tp_plan = {}
 
     # model_cls._tp_plan will override model_cls after xxxForCausalLM.post_init() (transformers==4.51.3)
-    model_cls = type(model)
     if hasattr(model_cls, "_tp_plan") and model_cls._tp_plan is not None:
+        assert isinstance(model_cls._tp_plan, dict), (
+            f"model_cls._tp_plan is not a dict: {model_cls._tp_plan}"
+        )
         hf_tp_plan.update(model_cls._tp_plan)
 
     if hasattr(model, "_tp_plan") and model._tp_plan is not None:
         hf_tp_plan.update(model._tp_plan)
 
-    model_prefix = "model"
-    inner_model_attrs = ("language_model", "model")
-    for attr in inner_model_attrs:
-        if hasattr(getattr(model, attr, None), "_tp_plan"):
-            model_prefix = attr
-            _tp_plan = getattr(getattr(model, attr), "_tp_plan")
-            hf_tp_plan.update({f"{model_prefix}.{k}": v for k, v in _tp_plan.items()})
-            break
+    if hasattr(inner_model, "_tp_plan") and inner_model._tp_plan is not None:
+        hf_tp_plan.update(
+            {f"{model_prefix}.{k}": v for k, v in inner_model._tp_plan.items()}
+        )
 
     assert len(hf_tp_plan) > 0, (
         f"Hugging Face tp plan is not supported for {model_cls}, please set dtensor_cfg.tensor_parallel_size to 1 or provide a custom_parallel_plan. "
@@ -140,13 +203,15 @@ def get_hf_tp_shard_plan(model):
     )
 
     # hf tp plan not contain embed_tokens, we add it and set to rowwise_rep
-    if f"{model_prefix}.embed_tokens" not in hf_tp_plan and not model.config.tie_word_embeddings:
+    if f"{model_prefix}.embed_tokens" not in hf_tp_plan:
         hf_tp_plan[f"{model_prefix}.embed_tokens"] = "rowwise_rep"
 
     for k, v in hf_tp_plan.items():
         # speed up the tp plan for lm_head
-        if k == "lm_head" and v == "colwise_rep" and not model.config.tie_word_embeddings:
-            hf_tp_plan[k] = ColwiseParallel(output_layouts=Shard(-1), use_local_output=False)
+        if (k == "lm_head" or k == "language_model.lm_head") and v == "colwise_rep":
+            hf_tp_plan[k] = ColwiseParallel(
+                output_layouts=Shard(-1), use_local_output=False
+            )
         else:
             hf_tp_plan[k] = translate_to_torch_parallel_style(v)
 
@@ -218,12 +283,39 @@ def validate_tp_mesh(model, tp_mesh):
     """
     if tp_mesh.size() == 1:
         return  # if tp_mesh.size() == 1, we don't need to validate
-    try:
-        from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
-    except ImportError:  # if transformers is not installed, we don't need to validate
-        return
 
-    if isinstance(model, Gemma3ForConditionalGeneration):
+    model_cls = type(model)
+
+    if model_cls in [
+        Qwen2_5_VLForConditionalGeneration,
+        Qwen2VLForConditionalGeneration,
+    ]:
+        # VL models have the language model at model.language_model
+        num_attention_heads = model.language_model.config.num_attention_heads
+        num_key_value_heads = model.language_model.config.num_key_value_heads
+
+    elif model_cls == SmolVLMForConditionalGeneration:
+        num_attention_heads = model.model.text_model.config.num_attention_heads
+        num_key_value_heads = model.model.text_model.config.num_key_value_heads
+
+    elif model_cls in [
+        LlavaForConditionalGeneration,
+        LlavaNextForConditionalGeneration,
+        LlavaNextVideoForConditionalGeneration,
+        LlavaOnevisionForConditionalGeneration,
+    ]:
+        num_attention_heads = model.language_model.config.num_attention_heads
+        num_key_value_heads = model.language_model.config.num_key_value_heads
+
+    elif model_cls == Mistral3ForConditionalGeneration:
+        num_attention_heads = model.model.language_model.config.num_attention_heads
+        num_key_value_heads = model.model.language_model.config.num_key_value_heads
+
+    elif model_cls == Llama4ForConditionalGeneration:
+        num_attention_heads = model.language_model.model.config.num_attention_heads
+        num_key_value_heads = model.language_model.model.config.num_key_value_heads
+
+    elif model_cls == Gemma3ForConditionalGeneration:
         num_attention_heads = model.config.text_config.num_attention_heads
         num_key_value_heads = model.config.text_config.num_key_value_heads
     elif hasattr(model, "config"):
@@ -243,22 +335,88 @@ def validate_tp_mesh(model, tp_mesh):
     )
 
 
-def get_lm_ac_layers(model: nn.Module) -> List[nn.Module]:
+def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
     """
-    Returns repeated layer blocks for activation checkpointing
+    Extract layers from different model architectures for parallelization.
+    
+    This function handles various model types including vision-language models,
+    causal language models, and multimodal models. It collects both language
+    model layers and vision model layers where applicable.
+    
+    Args:
+        model (nn.Module): The model to extract layers from.
+        
+    Returns:
+        List[nn.Module]: A list of all layers that should be parallelized.
     """
-    try:
-        from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
-    except ImportError:  # if transformers is not installed, we don't need to validate
-        return []
-    if isinstance(model, Gemma3ForConditionalGeneration):
-        return model.language_model.layers
-    elif hasattr(getattr(model, "model", None), "layers"):
-        return model.model.layers
+    model_cls = type(model)
+    layers: List[nn.Module] = []
+    
+    # Handle different model structures
+    if model_cls == Gemma3ForConditionalGeneration:
+        # Collect language model layers
+        for layer in model.language_model.layers:
+            layers.append(layer)
+        # Collect vision model layers (siglip encoder has same structure as clip encoder)
+        for layer in model.vision_tower.vision_model.encoder.layers:
+            layers.append(layer)
+            
+    elif model_cls in [
+        Qwen2_5_VLForConditionalGeneration,
+        Qwen2VLForConditionalGeneration,
+    ]:
+        # VL models have the language model at model.language_model
+        # Append language model layers
+        for layer in model.language_model.layers:
+            layers.append(layer)
+        # Append visual model layers
+        for layer in model.visual.blocks:
+            layers.append(layer)
+            
+    elif model_cls == SmolVLMForConditionalGeneration:
+        # Collect text model layers
+        for layer in model.model.text_model.layers:
+            layers.append(layer)
+        # Collect vision model layers
+        for layer in model.model.vision_model.encoder.layers:
+            layers.append(layer)
+            
+    elif model_cls in [
+        LlavaForConditionalGeneration,
+        LlavaNextForConditionalGeneration,
+        LlavaNextVideoForConditionalGeneration,
+        LlavaOnevisionForConditionalGeneration,
+    ]:
+        # Collect language model layers
+        for layer in model.model.language_model.layers:
+            layers.append(layer)
+        # Collect vision model layers
+        for layer in model.vision_tower.vision_model.encoder.layers:
+            layers.append(layer)
+            
+    elif model_cls == Mistral3ForConditionalGeneration:
+        # Collect language model layers
+        for layer in model.model.language_model.layers:
+            layers.append(layer)
+        # Collect vision model layers
+        for layer in model.model.vision_tower.transformer.layers:
+            layers.append(layer)
+            
+    elif model_cls == Llama4ForConditionalGeneration:
+        # Collect language model layers
+        for layer in model.language_model.model.layers:
+            layers.append(layer)
+        # Collect vision model layers
+        for layer in model.vision_model.model.layers:
+            layers.append(layer)
+    elif model_cls.__name__ == "NemotronHForCausalLM":
+        # NemotronH models use backbone.layers instead of model.layers
+        layers.extend(model.backbone.layers)
     else:
-        # TODO: scan model for nn.Sequential or ModuleList and return it
-        return []
-
+        # Default case for all other models (assumed to be a causal LM)
+        layers.extend(model.model.layers)
+        
+    return layers
 
 def _get_parallel_plan(
     model: nn.Module,
@@ -370,8 +528,31 @@ def fsdp2_strategy_parallelize(
     NOTE: The passed-in model preferably should be on meta device. Otherwise,
     the model must fit on GPU or CPU memory.
     """
-    # Get model layers for later use
     tp_mesh = device_mesh[tp_mesh_name]
+
+    # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
+    # if dp_replicate_size > 1, use HSDP, else use FSDP
+    dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
+    dp_mesh = device_mesh[dp_mesh_dim_names]
+
+    model_cls = type(model)
+    if model_cls.__name__ == "NemotronHForCausalLM":
+        # need to do something special for nm5, since it's harder to shard the mamba layers
+        # nm5 is not importable, so we check the __name__ attribute
+
+        return _parallelize_nm5_h(
+            model,
+            dp_mesh,
+            tp_mesh,
+            sequence_parallel,
+            activation_checkpointing,
+            mp_policy,
+            offload_policy,
+            custom_parallel_plan=tp_shard_plan,
+        )
+
+    # Extract layers from the model for parallelization
+    layers = _extract_model_layers(model)
 
     # TP sharding with enhanced plan generation
     if tp_mesh.size() > 1:
@@ -387,7 +568,6 @@ def fsdp2_strategy_parallelize(
 
     # Apply activation checkpointing to MLP layers if requested
     if activation_checkpointing:
-        layers = get_lm_ac_layers(model)
         for i, layer in enumerate(layers):
             if hasattr(layer, "mlp"):
                 layers[i].mlp = checkpoint_wrapper(layer.mlp)
@@ -399,12 +579,6 @@ def fsdp2_strategy_parallelize(
             reduce_dtype=torch.float32,
             output_dtype=torch.float32,
         )
-
-    # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
-    # if dp_replicate_size > 1, use HSDP, else use FSDP
-    dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-
-    dp_mesh = device_mesh[dp_mesh_dim_names]
 
     # Find transformer layers and apply parallelisms
     apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy)
@@ -569,3 +743,60 @@ def unshard_fsdp2_model(model: nn.Module) -> Generator[None, None, None]:
         for module in model.modules():
             if isinstance(module, FSDPModule):
                 module.reshard()
+
+def _parallelize_nm5_h(
+    model,
+    dp_mesh,
+    tp_mesh,
+    sequence_parallel,
+    activation_checkpointing,
+    mp_policy,
+    offload_policy,
+    custom_parallel_plan: Optional[Union[dict, str]] = None,
+) -> torch.distributed.fsdp.FSDPModule:
+    """Parallelize a NemotronHForCausalLM model across data and tensor parallel dimensions."""
+    assert not sequence_parallel, (
+        "Sequence parallelism is not supported for NemotronHForCausalLM"
+    )
+    assert custom_parallel_plan is None, (
+        "Custom parallel plan is not supported for NemotronHForCausalLM"
+    )
+
+    model_tp_plan: dict[str, ParallelStyle] = {
+        "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+    }
+
+    mlp_tp_plan: dict[str, ParallelStyle] = {
+        "mixer.up_proj": ColwiseParallel(),
+        "mixer.down_proj": RowwiseParallel(),
+    }
+
+    layers: torch.nn.ModuleList = model.backbone.layers
+    parallelize_module(model, tp_mesh, model_tp_plan)
+
+    for layer in model.backbone.layers:
+        if layer.block_type == "mlp":
+            parallelize_module(layer, tp_mesh, mlp_tp_plan)
+
+    if activation_checkpointing:
+        for i in range(len(layers)):
+            if layers[i].block_type == "mlp":
+                layers[i] = checkpoint_wrapper(layers[i])
+
+            if layers[i].block_type == "mamba":
+                layers[i] = checkpoint_wrapper(layers[i])
+
+    for layer in layers:
+        fully_shard(
+            layer, mesh=dp_mesh, mp_policy=mp_policy, offload_policy=offload_policy
+        )
+
+    # do not reshard after forward for root model
+    # because its parameters will be used in backward immediately
+    return fully_shard(
+        model,
+        mesh=dp_mesh,
+        mp_policy=mp_policy,
+        offload_policy=offload_policy,
+        reshard_after_forward=False,
+    )
