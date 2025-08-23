@@ -330,7 +330,7 @@ def build_step_scheduler(cfg, dataloader):
     assert "_target_" not in cfg, "_target_ not permitted in step scheduler"
     default_kwargs = dict(
         num_epochs=10,
-        grad_acc_steps=4,
+        grad_acc_steps=10,
         ckpt_every_steps=100,
         dataloader=dataloader,
     )
