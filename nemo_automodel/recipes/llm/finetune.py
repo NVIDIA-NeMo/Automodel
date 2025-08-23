@@ -553,7 +553,9 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
 
         # Scheduler
-        self.step_scheduler = build_step_scheduler(self.cfg.get("step_scheduler", None), self.dataloader, self._get_dp_group_size())
+        self.step_scheduler = build_step_scheduler(
+            self.cfg.get("step_scheduler", None), self.dataloader, self._get_dp_group_size()
+        )
 
         # Build learning rate scheduler
         self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
@@ -625,7 +627,9 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         loss_buffer = []
 
         # number of tokens in the batch, excluding any tail padding.
-        num_tokens_in_batch = torch.tensor(sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches))
+        num_tokens_in_batch = torch.tensor(
+            sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches)
+        )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
         dp_group_size = self._get_dp_group_size()
 
@@ -763,7 +767,10 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
         current_lr = self.optimizer.param_groups[0]["lr"]
         logging.info(
             "[val] step {} | epoch {} | loss {:.4f} | lr {:.2e}".format(
-                self.step_scheduler.step, self.step_scheduler.epoch, val_loss, current_lr,
+                self.step_scheduler.step,
+                self.step_scheduler.epoch,
+                val_loss,
+                current_lr,
             )
         )
 

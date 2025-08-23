@@ -51,9 +51,13 @@ class StepScheduler(Stateful):
             num_epochs (int): Total number of epochs.
             max_steps (int): Total number of steps to run. Default is 2^63-1.
         """
-        assert global_batch_size % (minibatch_size * dp_world_size) == 0, "global_batch_size must be divisible by (minibatch_size * dp_world_size)"
+        assert global_batch_size % (minibatch_size * dp_world_size) == 0, (
+            "global_batch_size must be divisible by (minibatch_size * dp_world_size)"
+        )
         self.grad_acc_steps = global_batch_size // (minibatch_size * dp_world_size)
-        assert self.grad_acc_steps >= 1, "grad_acc_steps must be at least 1. Please make sure global_batch_size >= minibatch_size * dp_world_size"
+        assert self.grad_acc_steps >= 1, (
+            "grad_acc_steps must be at least 1. Please make sure global_batch_size >= minibatch_size * dp_world_size"
+        )
         self.ckpt_every_steps = ckpt_every_steps
         assert ckpt_every_steps > 0, "ckpt_every_steps must be greater than 0"
         self.dataloader = dataloader
