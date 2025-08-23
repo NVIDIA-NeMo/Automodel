@@ -22,7 +22,7 @@ export CUDA_VISIBLE_DEVICES="0,1"
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run  --master-port=29504 \
 --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace  \
 -m pytest tests/functional_tests/checkpoint/test_peft_vlm.py \
-  --config examples/vlm/gemma_3_vl_4b_cord_v2_peft.yaml \
+  --config examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml \
   --model.pretrained_model_name_or_path /home/TestData/huiyingl/hf_gemma3_2l/ \
   --step_scheduler.max_steps 10 \
   --step_scheduler.grad_acc_steps 1 \

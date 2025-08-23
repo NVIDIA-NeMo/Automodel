@@ -64,7 +64,7 @@ $ tree -L 2 nemo_automodel/recipes/
 
 Each recipe can be executed directly using torchrun, for example, from the root directory:
 ```bash
-torchrun --nproc-per-node=2 nemo_automodel/recipes/llm/finetune.py -c examples/llm/llama_3_2_1b_squad.yaml
+torchrun --nproc-per-node=2 nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
 The above command will fine-tune the Llama3.2-1B model on the SQuaD dataset with two GPUs.
@@ -77,7 +77,7 @@ The recipe/components structure enables you to:
 <!-- For an in-depth explanation of the LLM recipe please also see the [LLM recipe deep-dive guide](docs/llm_recipe_deep_dive.md). -->
 
 #### Configure a Recipe
-An example YAML configuration is shown below. The complete config is available [here](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm/llama_3_2_1b_squad.yaml):
+An example YAML configuration is shown below. The complete config is available [here](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml):
 ```yaml
 step_scheduler:
   grad_acc_steps: 4
@@ -104,7 +104,7 @@ single-GPU interactive sessions to batch multi-node runs. Currently, it supports
 #### Run the LLM Fine-Tuning Recipe
 For example, to run the same torchrun LLM fine-tuning workflow described in the recipes section above, use the following command:
 ```bash
-automodel llm finetune -c examples/llm/llama_3_2_1b_squad.yaml --nproc-per-node=2
+automodel llm finetune -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node=2
 ```
 
 #### Launch a Batch Job on Slurm
@@ -134,7 +134,7 @@ For example,
 ```bash
 git clone git@github.com:NVIDIA-NeMo/Automodel.git automodel_test_repo
 cd automodel_test_repo/
-automodel llm finetune -c examples/llm/llama_3_2_1b_squad.yaml --nproc-per-node=2
+automodel llm finetune -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node=2
 ```
 
 This will launch the job using the source code contained in the `automodel_test_repo` directory instead of the version bundled in the Docker image.

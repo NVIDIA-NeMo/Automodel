@@ -23,7 +23,7 @@ Where:
 For simple fine-tuning on a single GPU:
 
 ```bash
-automodel finetune llm -c examples/llm/llama_3_2_1b_squad.yaml
+automodel finetune llm -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
 ### Train on Multiple GPUs
@@ -32,7 +32,7 @@ For interactive single-node jobs, the CLI automatically detects the number of av
 uses `torchrun` for multi-GPU training. You can specify manually the number of GPUs using the `--nproc-per-node` option, as follows:
 
 ```bash
-automodel finetune llm -c examples/llm/llama_3_2_1b_squad.yaml --nproc-per-node=2
+automodel finetune llm -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node=2
 ```
 
 If you don't specify `--nproc-per-node`, it will use all available GPUs on your system.
@@ -82,7 +82,7 @@ When you need more control over the environment or are actively developing with 
 ### Train on a Single GPU
 
 ```bash
-uv run nemo_automodel/recipes/llm/finetune.py -c examples/llm/llama_3_2_1b_squad.yaml
+uv run nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
 ### Train on Multiple GPUs with Torchrun
@@ -90,7 +90,7 @@ uv run nemo_automodel/recipes/llm/finetune.py -c examples/llm/llama_3_2_1b_squad
 For multi-GPU training, use `torchrun` directly:
 
 ```bash
-uv run torchrun --nproc-per-node=2 nemo_automodel/recipes/llm/finetune.py -c examples/llm/llama_3_2_1b_squad.yaml
+uv run torchrun --nproc-per-node=2 nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
 ### Why use uv?
@@ -110,13 +110,13 @@ If you have NeMo Automodel installed in your environment and prefer to run recip
 ### Train on a Single GPU
 
 ```bash
-python nemo_automodel/recipes/llm/finetune.py -c examples/llm/llama_3_2_1b_squad.yaml
+python nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
 ### Train on Multiple GPUs
 
 ```bash
-torchrun --nproc-per-node=2 nemo_automodel/recipes/llm/finetune.py -c examples/llm/llama_3_2_1b_squad.yaml
+torchrun --nproc-per-node=2 nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
 This approach requires that you have already installed NeMo Automodel and its dependencies in your Python environment (see the [installation guide](../guides/installation.md) for details).

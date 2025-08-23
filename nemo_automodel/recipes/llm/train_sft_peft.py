@@ -825,7 +825,7 @@ def main(config_path=None):
     Loads the configuration, sets up the trainer, and initiates the training loop.
     """
     if config_path is None:
-        config_path = pathlib.Path(__file__).parent.resolve() / "llama_3_2_1b_hellaswag.yaml"
+        config_path = pathlib.Path(__file__).parent.resolve() / "llama3_2" / "llama3_2_1b_hellaswag.yaml"
     cfg = parse_args_and_load_config(config_path)
     trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()

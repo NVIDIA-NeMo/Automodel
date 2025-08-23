@@ -36,7 +36,7 @@ logging.getLogger().setLevel(logging.INFO)
 #     │   ├── llama_3_2_1b_hellaswag.yaml
 #     │   ├── ...
 #     │   └── llama_3_2_1b_squad_slurm.yaml
-#     └── vlm
+#     └── vlm_finetune
 #         ├── finetune.py
 #         ├── gemma_3_vl_3b_cord_v2.yaml
 #         ├── ...

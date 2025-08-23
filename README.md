@@ -62,11 +62,11 @@ To get started quickly, NeMo AutoModel provides a collection of ready-to-use rec
 | Domain | Model ID | Single-GPU | Single-Node | Multi-Node |
 |--------|----------|------------|-------------|------------|
 | [**LLM**](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm/finetune.py) | [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B) | [HellaSwag + LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama_3_2/llama_3_2_1b_hellaswag_peft.yaml) |•[HellaSwag](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama_3_2/llama_3_2_1b_hellaswag.yaml)<br>•[SQuAD](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama_3_2/llama_3_2_1b_squad.yaml) |  [HellaSwag + nvFSDP](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama_3_2/llama_3_2_1b_hellaswag_nvfsdp.yaml) |
-| [**VLM**](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm/finetune.py) | [`google/gemma-3-4b-it`](https://huggingface.co/google/gemma-3-4b-it) | [CORD-v2 + LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma_3/gemma_3_vl_4b_cord_v2_peft.yaml) | [CORD-v2](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma_3/gemma_3_vl_4b_cord_v2.yaml) | Coming Soon |
+| [**VLM**](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm/finetune.py) | [`google/gemma-3-4b-it`](https://huggingface.co/google/gemma-3-4b-it) | [CORD-v2 + LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml) | [CORD-v2](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml) | Coming Soon |
 
 
 ### Run a Recipe
-To run a NeMo AutoModel recipe, you need a recipe script (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm/finetune.py), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm/finetune.py)) and a YAML config file (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama_3_2/llama_3_2_1b_squad.yaml), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma_3/gemma_3_vl_4b_cord_v2_peft.yaml)):
+To run a NeMo AutoModel recipe, you need a recipe script (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm/finetune.py), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm/finetune.py)) and a YAML config file (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama_3_2/llama_3_2_1b_squad.yaml), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml)):
 ```
 # Command invocation format:
 uv run <recipe_script_path> --config <yaml_config_path>
@@ -75,7 +75,7 @@ uv run <recipe_script_path> --config <yaml_config_path>
 uv run torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_hellaswag.yaml
 
 # VLM example: single GPU fine-tuning (Gemma-3-VL) with LoRA
-uv run recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml
+uv run recipes/vlm_finetune/finetune.py --config recipes/vlm_finetune/gemma3/gemma3_vl_3b_cord_v2_peft.yaml
 ```
 
 

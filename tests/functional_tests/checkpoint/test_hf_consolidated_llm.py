@@ -778,7 +778,7 @@ def test_consolidated_llm_checkpoint():
     }
 
     script_path = Path(__file__).parent.resolve()
-    cfg = parse_args_and_load_config(script_path / "llama_3_2_1b_hellaswag.yaml")
+    cfg = parse_args_and_load_config(script_path / "llama3_2" / "llama3_2_1b_hellaswag.yaml")
     trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()

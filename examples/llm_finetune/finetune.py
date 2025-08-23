@@ -18,7 +18,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction
 
 
-def main(default_config_path="examples/llm/llama_3_2_1b_hellaswag.yaml"):
+def main(default_config_path="examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml"):
     """Main entry point for the fine-tuning recipe.
 
     Loads the configuration, sets up the recipe, and initiates the training loop.
