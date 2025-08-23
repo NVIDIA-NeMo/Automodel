@@ -44,7 +44,7 @@ For distributed training on Slurm clusters, add a `slurm` section to your YAML c
 ```yaml
 # Your existing model, dataset, training config...
 step_scheduler:
-  global_batch_size: 32
+  grad_acc_steps: 4
   num_epochs: 1
 
 model:

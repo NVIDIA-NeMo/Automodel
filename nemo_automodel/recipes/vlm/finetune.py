@@ -330,7 +330,7 @@ def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
     return initialize_distributed(backend=backend, timeout_minutes=timeout)
 
 
-def build_step_scheduler(cfg, dataloader, dp_world_size):
+def build_step_scheduler(cfg, dataloader):
     """Build the step scheduler.
 
     Args:
@@ -343,9 +343,7 @@ def build_step_scheduler(cfg, dataloader, dp_world_size):
     assert "_target_" not in cfg, "_target_ not permitted in step scheduler"
     default_kwargs = dict(
         num_epochs=10,
-        global_batch_size=32,
-        minibatch_size=dataloader.batch_size,
-        dp_world_size=dp_world_size,
+        grad_acc_steps=4,
         ckpt_every_steps=100,
         dataloader=dataloader,
     )
@@ -567,7 +565,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         # Scheduler
         self.step_scheduler = build_step_scheduler(
-            self.cfg.get("step_scheduler", None), self.dataloader, self._get_dp_group_size()
+            self.cfg.get("step_scheduler", None), self.dataloader
         )
 
         # Build learning rate scheduler

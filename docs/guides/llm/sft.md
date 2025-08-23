@@ -164,7 +164,7 @@ validation_dataset:
   limit_dataset_samples: 64
 
 step_scheduler:
-  global_batch_size: 32
+  grad_acc_steps: 4
   ckpt_every_steps: 10 # will save a checkpoint every 10 steps
   val_every_steps: 10  # will run every x number of gradient steps
   num_epochs: 1
