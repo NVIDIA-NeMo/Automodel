@@ -80,7 +80,7 @@ The recipe/components structure enables you to:
 An example YAML configuration is shown below. The complete config is available [here](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm/llama_3_2_1b_squad.yaml):
 ```yaml
 step_scheduler:
-  grad_acc_steps: 4
+  global_batch_size: 32
   ckpt_every_steps: 1000
   val_every_steps: 10  # will run every x number of gradient steps
   num_epochs: 1

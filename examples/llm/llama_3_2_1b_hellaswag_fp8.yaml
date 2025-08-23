@@ -20,7 +20,7 @@
 # This example demonstrates FP8 quantization for improved training performance on H100+ GPUs.
 
 step_scheduler:
-  grad_acc_steps: 1
+  global_batch_size: 32
   ckpt_every_steps: 200
   val_every_steps: 200  # will run every x number of gradient steps
   num_epochs: 1

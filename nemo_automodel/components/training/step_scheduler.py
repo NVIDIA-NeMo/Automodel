@@ -24,7 +24,9 @@ class StepScheduler(Stateful):
 
     def __init__(
         self,
-        grad_acc_steps: int,
+        global_batch_size: int,
+        minibatch_size: int,
+        dp_world_size: int,
         ckpt_every_steps: int,
         dataloader: Optional[int],
         val_every_steps: Optional[int] = None,
@@ -37,7 +39,10 @@ class StepScheduler(Stateful):
         Initialize the StepScheduler.
 
         Args:
-            grad_acc_steps (int): Number of steps for gradient accumulation.
+            global_batch_size (int): Global batch size. This is the total number of batches
+                we accumulate over across the DP groups before calling the optimizer.step().
+            minibatch_size (int): Minibatch size. This is the local batch size per GPU.
+            dp_world_size (int): Number of DP groups.
             ckpt_every_steps (int): Frequency of checkpoint steps.
             dataloader (Optional[int]): The training dataloader.
             val_every_steps (int): Number of training steps between validation.
@@ -46,8 +51,9 @@ class StepScheduler(Stateful):
             num_epochs (int): Total number of epochs.
             max_steps (int): Total number of steps to run. Default is 2^63-1.
         """
-        self.grad_acc_steps = grad_acc_steps
-        assert grad_acc_steps > 0, "grad_acc_steps must be greater than 0"
+        assert global_batch_size % (minibatch_size * dp_world_size) == 0, "global_batch_size must be divisible by (minibatch_size * dp_world_size)"
+        self.grad_acc_steps = global_batch_size // (minibatch_size * dp_world_size)
+        assert self.grad_acc_steps >= 1, "grad_acc_steps must be at least 1. Please make sure global_batch_size >= minibatch_size * dp_world_size"
         self.ckpt_every_steps = ckpt_every_steps
         assert ckpt_every_steps > 0, "ckpt_every_steps must be greater than 0"
         self.dataloader = dataloader
