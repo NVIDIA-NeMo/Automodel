@@ -101,7 +101,6 @@ def _formatting_prompts_func_with_chat_template(
         first_start_of_turn_token_id = input_ids.index(start_of_turn_token_id)
         # Loss mask is starting with the second start of turn token.
         # labels    = [a b c S d e] ; S is the start of turn token.
-        # loss_mask = [0 0 0 1 1 1] ; 1 is the loss mask enabled for the answer.
         response_start = input_ids.index(start_of_turn_token_id, first_start_of_turn_token_id + 1)
     else:
         response_start = 0
@@ -123,7 +122,7 @@ def make_squad_dataset(
     This function retrieves the specified split of the SQuAD dataset, applies
     either a simple prompt–completion format or a chat‐template format
     (if `tokenizer.chat_template` is set), tokenizes each example,
-    constructs `input_ids`, `labels`, and `loss_mask`, and optionally pads
+    constructs `input_ids` and `labels`, and optionally pads
     all sequences to a fixed length.
 
     Args:
@@ -136,7 +135,7 @@ def make_squad_dataset(
             examples loaded from the split.
         start_of_turn_token (str or None): If using a chat template, the
             token that marks the start of each turn. Used to compute the
-            response offset for `loss_mask`.
+            response offset for `labels`.
         fp8 (bool): Flag for future use (e.g., mixed precision). Currently
             unused.
         split (str): Which split of the dataset to load (e.g. 'train',
@@ -148,7 +147,6 @@ def make_squad_dataset(
         A Hugginggth Face Dataset where each example is a dict with keys:
         - `input_ids`: List of token IDs for the prompt + answer.
         - `labels`: List of token IDs shifted for language modeling.
-        - `loss_mask`: List of 0/1 flags indicating which tokens contribute
           to the loss (answers only).
     """
 
