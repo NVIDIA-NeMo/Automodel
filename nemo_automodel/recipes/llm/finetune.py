@@ -620,7 +620,9 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
         """
 
-        num_label_tokens = torch.tensor(sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long)
+        num_label_tokens = torch.tensor(
+            sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
+        )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
         loss_buffer = []
 
@@ -749,7 +751,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         labels=labels,
                         model=self.model,
                         hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
-                        num_label_tokens=None, # we will normalize outside.
+                        num_label_tokens=None,  # we will normalize outside.
                     )
 
                 total_num_label_tokens += num_label_tokens
