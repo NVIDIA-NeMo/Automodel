@@ -36,7 +36,7 @@ logging.getLogger().setLevel(logging.INFO)
 #     │   ├── llama_3_2_1b_hellaswag.yaml
 #     │   ├── ...
 #     │   └── llama_3_2_1b_squad_slurm.yaml
-#     └── vlm_finetune
+#     └── vlm
 #         ├── finetune.py
 #         ├── gemma_3_vl_3b_cord_v2.yaml
 #         ├── ...
@@ -165,8 +165,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         metavar="<command>",
-        choices=["finetune", "pretrain"],
-        help="Command within the domain (e.g., finetune, pretrain, generate, etc)",
+        choices=["finetune"],
+        help="Command within the domain (e.g., finetune, generate, etc)",
     )
     parser.add_argument(
         "domain",
