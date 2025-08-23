@@ -140,7 +140,7 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
         (
             f"PYTHONPATH={repo_root}:$PYTHONPATH",
             "python3",
-            f"{repo_root}/nemo_automodel/recipes/{args.domain}/{args.command}.py",
+            f"{repo_root}/nemo_automodel/recipes/{args.domain}_{args.command}/{args.command}.py",
             "-c",
             f"{job_conf_path}",
         )
