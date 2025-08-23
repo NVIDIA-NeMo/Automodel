@@ -68,7 +68,7 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
   batch_size: 8
-  shuffle: false
+  shuffle: true
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
@@ -94,4 +94,4 @@ optimizer:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   dir: <your_wandb_save_dir>
+#   save_dir: <your_wandb_save_dir> 
