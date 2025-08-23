@@ -43,6 +43,7 @@ from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import count_tail_padding
@@ -149,10 +150,7 @@ def build_model_and_optimizer(
         del cfg_model.is_meta_device
 
     with StatefulRNG(seed=seed, ranked=True):
-        # Add FP8 config if provided
         kwargs = {}
-        if cfg_fp8 is not None:
-            kwargs["fp8_config"] = cfg_fp8.instantiate()
 
         # Instantiate the model in meta device to avoid OOM
         with init_ctx:
@@ -161,6 +159,10 @@ def build_model_and_optimizer(
             # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
             if cfg_peft is not None:
                 apply_lora_to_linear_modules(model, cfg_peft)
+
+            if cfg_fp8 is not None:
+                fp8_config = build_fp8_config(cfg_fp8)
+                model = apply_fp8_to_model(model, config=fp8_config)
 
         print_trainable_parameters(model)
 
@@ -328,7 +330,7 @@ def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
     return initialize_distributed(backend=backend, timeout_minutes=timeout)
 
 
-def build_step_scheduler(cfg, dataloader):
+def build_step_scheduler(cfg, dataloader, dp_world_size):
     """Build the step scheduler.
 
     Args:
@@ -341,7 +343,9 @@ def build_step_scheduler(cfg, dataloader):
     assert "_target_" not in cfg, "_target_ not permitted in step scheduler"
     default_kwargs = dict(
         num_epochs=10,
-        grad_acc_steps=10,
+        global_batch_size=32,
+        minibatch_size=dataloader.batch_size,
+        dp_world_size=dp_world_size,
         ckpt_every_steps=100,
         dataloader=dataloader,
     )
@@ -562,7 +566,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.forward_data_store = []
 
         # Scheduler
-        self.step_scheduler = build_step_scheduler(self.cfg.get("step_scheduler", None), self.dataloader)
+        self.step_scheduler = build_step_scheduler(self.cfg.get("step_scheduler", None), self.dataloader, self._get_dp_group_size())
 
         # Build learning rate scheduler
         self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
@@ -631,7 +635,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # number of tokens in the batch, excluding any tail padding.
         num_tokens_in_batch = sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches)
         num_tokens_in_batch = self._dp_allreduce(torch.LongTensor([num_tokens_in_batch])).item()
-        dp_group_size = self._get_dp_group_size()
 
         num_batches = len(batches)
         for i, batch in enumerate(batches):
@@ -662,7 +665,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     labels=labels,
                     model=self.model,
                     hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
-                    num_label_tokens=num_label_tokens / dp_group_size,
+                    num_label_tokens=num_label_tokens,
                 )
                 loss_buffer.append(local_loss.clone().detach())
                 local_loss.backward()
@@ -684,9 +687,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.optimizer.zero_grad(set_to_none=True)
 
         # Precompute FP8 scales
+        fp8_config = self.cfg.get("fp8", None)
         if (
-            self.cfg.get("fp8", None) is not None
-            and self.model.precompute_float8_dynamic_scale_for_fsdp
+            fp8_config is not None
+            and fp8_config.get("enabled", False)
+            and fp8_config.get("precompute_float8_dynamic_scale_for_fsdp", False)
+            and self.device_mesh is not None
             and self.device_mesh["dp_shard"].size() > 1
         ):
             precompute_float8_dynamic_scale_for_fsdp(self.model)
@@ -748,19 +754,19 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     )
 
                 total_loss += local_loss.item()
-                total_tokens += num_label_tokens
 
         # Aggregate across ranks if distributed is initialized
         total_loss = self._dp_allreduce(torch.FloatTensor([total_loss])).item()
         total_tokens = self._dp_allreduce(torch.LongTensor([total_tokens])).item()
 
+        val_loss = total_loss / max(total_tokens, 1e-8)
         if self.dist_env.is_main:
             if wandb.run is not None:
-                wandb.log({"val_loss": total_loss, "step": self.step_scheduler.step, "epoch": self.step_scheduler.epoch})
+                wandb.log({"val_loss": val_loss, "step": self.step_scheduler.step, "epoch": self.step_scheduler.epoch})
         current_lr = self.optimizer.param_groups[0]["lr"]
         logging.info(
-            "[val] step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
-                self.step_scheduler.step, self.step_scheduler.epoch, total_loss, current_lr, total_tokens
+            "[val] step {} | epoch {} | loss {:.4f} | lr {:.2e}".format(
+                self.step_scheduler.step, self.step_scheduler.epoch, val_loss, current_lr
             )
         )
 
