@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 from typing import Optional
 
 from torch.distributed.checkpoint.stateful import Stateful
@@ -32,7 +31,7 @@ class StepScheduler(Stateful):
         start_step: int = 0,
         start_epoch: int = 0,
         num_epochs: int = 10,
-        max_steps: Optional[int] = None,
+        max_steps: int = 9223372036854775807,
     ):
         """
         Initialize the StepScheduler.
@@ -45,21 +44,24 @@ class StepScheduler(Stateful):
             start_step (int): Initial global step.
             start_epoch (int): Initial epoch.
             num_epochs (int): Total number of epochs.
-            max_steps (int): Total number of steps to run.
+            max_steps (int): Total number of steps to run. Default is 2^63-1.
         """
         self.grad_acc_steps = grad_acc_steps
+        assert grad_acc_steps > 0, "grad_acc_steps must be greater than 0"
         self.ckpt_every_steps = ckpt_every_steps
+        assert ckpt_every_steps > 0, "ckpt_every_steps must be greater than 0"
         self.dataloader = dataloader
         self.step = start_step
+        assert start_step >= 0, "start_step must be greater than or equal to 0"
         self.epoch = start_epoch
+        assert start_epoch >= 0, "start_epoch must be greater than or equal to 0"
         self.num_epochs = num_epochs
-        try:
-            self.epoch_len = len(dataloader)
-        except Exception:
-            self.epoch_len = None
-        self.grad_step = 0  # number of optimizer steps taken
+        assert num_epochs > 0, "num_epochs must be greater than 0"
+        self.epoch_len = len(dataloader)
         self.val_every_steps = val_every_steps
+        assert val_every_steps is None or val_every_steps > 0, "val_every_steps must be greater than 0 if not None"
         self.max_steps = max_steps
+        assert max_steps > 0, "max_steps must be greater than 0"
 
     def __iter__(self):
         """
@@ -71,35 +73,29 @@ class StepScheduler(Stateful):
         Yields:
             dict: batch
         """
+        if self.step >= self.max_steps:
+            return
+        batch_buffer = []
         for batch in self.dataloader:
+            batch_buffer.append(batch)
+            if len(batch_buffer) == self.grad_acc_steps:
+                self.step += 1
+                yield batch_buffer
+                batch_buffer = []
+                if self.step >= self.max_steps:
+                    return
+        if batch_buffer:
             self.step += 1
-            if isinstance(self.max_steps, int) and self.step > self.max_steps:
-                return
-            yield batch
+            yield batch_buffer
+        self.epoch += 1
 
     def set_epoch(self, epoch: int):
         """
-        Set the epoch for the dataloader.
+        Set the epoch for the sampler.
         """
         self.epoch = epoch
-        if getattr(self.dataloader, "sampler", None) is not None and callable(
-            getattr(self.dataloader.sampler, "set_epoch", None)
-        ):
+        if hasattr(getattr(self.dataloader, "sampler", None), "set_epoch"):
             self.dataloader.sampler.set_epoch(epoch)
-        else:
-            logging.warning("Dataloader sampler does not support setting epoch")
-
-    @property
-    def is_optim_step(self):
-        """
-        Returns whether this step needs to call the optimizer step.
-
-        Returns:
-            bool: if true, the optimizer should run.
-        """
-        is_grad = (self.step % self.grad_acc_steps) == 0
-        self.grad_step += int(is_grad)
-        return is_grad
 
     @property
     def is_val_step(self):
@@ -107,8 +103,8 @@ class StepScheduler(Stateful):
         Returns whether this step needs to call the validation.
         """
         is_val = False
-        if self.val_every_steps and self.val_every_steps > 0 and self.is_optim_step:
-            is_val = (self.grad_step % self.val_every_steps) == 0
+        if self.val_every_steps and self.val_every_steps > 0:
+            is_val = (self.step % self.val_every_steps) == 0
         return is_val
 
     @property
@@ -119,11 +115,10 @@ class StepScheduler(Stateful):
         Returns:
             bool: if true, the checkpoint should run.
         """
-        last_batch = False
-        if isinstance(self.epoch_len, int) and self.epoch_len > 0:
-            batch_idx = self.step % self.epoch_len
-            last_batch = batch_idx == self.epoch_len - 1
-        return ((self.step % self.ckpt_every_steps) == 0 and self.step != 0) or last_batch
+        batch_idx = self.step % self.epoch_len
+        last_batch = self.epoch_len is not None and batch_idx == self.epoch_len - 1
+        finished = self.step >= self.max_steps
+        return ((self.step % self.ckpt_every_steps) == 0 and self.step != 0) or last_batch or finished
 
     @property
     def epochs(self):
@@ -133,7 +128,11 @@ class StepScheduler(Stateful):
         Yields:
             iterator: over epochs
         """
-        yield from range(self.epoch, self.num_epochs)
+        epoch = self.epoch
+        for e in range(epoch, self.num_epochs):
+            if self.step >= self.max_steps:
+                return
+            yield e
 
     def state_dict(self):
         """
