@@ -437,7 +437,7 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
     Returns:
         The loss.
     """
-    loss_fn_kwargs = {}
+    loss_fn_kwargs = {"num_label_tokens": kwargs.pop("num_label_tokens", None)}
     if isinstance(loss_fn, FusedLinearCrossEntropy):
         model = kwargs.pop("model")
 
