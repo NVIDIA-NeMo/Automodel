@@ -20,7 +20,7 @@ export CUDA_VISIBLE_DEVICES="0,1"
 
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
 -m pytest tests/functional_tests/training/test_meta_device_sft.py \
-    --config examples/vlm/gemma_3_vl_4b_cord_v2.yaml \
+    --config examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml \
     --model.pretrained_model_name_or_path /home/TestData/huiyingl/hf_gemma3_2l/ \
     --dataset._target_=nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset \
     --dataset.path_or_dataset /home/TestData/lite/hf_cache/mini_cord_v2/ \

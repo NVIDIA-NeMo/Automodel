@@ -817,7 +817,7 @@ def main(config_path=None):
     Loads the configuration, sets up the trainer, and initiates the training loop.
     """
     if config_path is None:
-        config_path = pathlib.Path(__file__).parent.resolve() / "gemma_3_vl_4b_cord_v2.yaml"
+        config_path = pathlib.Path(__file__).parent.resolve() / "gemma3" / "gemma3_vl_4b_cord_v2.yaml"
     cfg = parse_args_and_load_config(config_path)
     trainer = FinetuneRecipeForVLM(cfg)
     trainer.setup()

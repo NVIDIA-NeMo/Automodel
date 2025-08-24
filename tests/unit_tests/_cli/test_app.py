@@ -134,7 +134,7 @@ def test_launch_with_slurm(monkeypatch, tmp_path):
         assert parts[0].startswith("PYTHONPATH=")
         assert parts[0].endswith(":$PYTHONPATH")
         assert parts[1] == "python3"
-        assert parts[2].endswith("recipes/llm/finetune.py")
+        assert parts[2].endswith("recipes/llm_finetune/finetune.py")
         assert parts[3] == "-c"
         assert parts[4] == "/tmp/a/0123456789/y.conf"
 

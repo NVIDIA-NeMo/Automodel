@@ -14,14 +14,15 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/qwen_3_0p6b_hellaswag.yaml
+# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_fp8.yaml
 # Adjust --nproc-per-node to the number of GPUs available on your host machine.
-
+#
+# This example demonstrates FP8 quantization for improved training performance on H100+ GPUs.
 
 step_scheduler:
   grad_acc_steps: 4
   ckpt_every_steps: 200
-  val_every_steps: 100  # will run every x number of gradient steps
+  val_every_steps: 200  # will run every x number of gradient steps
   num_epochs: 1
 
 dist_env:
@@ -35,22 +36,38 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen3-0.6B
+  pretrained_model_name_or_path: meta-llama/Llama-3.1-8B
+  torch_dtype: bf16
+  trust_remote_code: true
 
 checkpoint:
-  enabled: false
-  checkpoint_dir: checkpoints/
+  enabled: true
+  checkpoint_dir: checkpoints_fp8/
   model_save_format: torch_save # torch_save or safetensors
-  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  save_consolidated: false 
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: none
-  dp_replicate_size: 1 # dp_shard_size = dp_size / dp_replicate_size and dp_shard_size < dp_size. For DDP usecase, use DDPManager
   tp_size: 1
   cp_size: 1
   sequence_parallel: false
-  use_hf_tp_plan: false # if true, will attempt to get the TP plan from hf model.
+
+compile:
+  enabled: true
+  mode: "default"  # Options: "default", "reduce-overhead", "max-autotune"
+  fullgraph: false
+  dynamic: false  # Set to false for better performance with fixed shapes
+  backend: null  # Use default backend (inductor)
+
+fp8:
+  enabled: true
+  recipe_name: tensorwise  # Options: tensorwise, rowwise, rowwise_with_gw_hp
+  enable_fsdp_float8_all_gather: true
+  precompute_float8_dynamic_scale_for_fsdp: true
+  force_recompute_fp8_weight_in_bwd: true
+  filter_fqns: ["lm_head"]
+  emulate: false  # Set to true for testing on older GPUs without native FP8 support
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -62,13 +79,15 @@ dataset:
 
 packed_sequence:
   # Set packed_sequence_size > 0 to run with packed sequences
-  packed_sequence_size: 0
+  packed_sequence_size: 8192
   split_across_pack: False
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  batch_size: 8
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 16 # fp8 requires divisible by 16
+  batch_size: 1  # 1 for benchmark, increase it for better throughput
   shuffle: false
 
 validation_dataset:
@@ -79,9 +98,11 @@ validation_dataset:
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  batch_size: 8
-
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 16
+  batch_size: 1
+  
 optimizer:
   _target_: torch.optim.Adam
   betas: [0.9, 0.999]
@@ -95,4 +116,4 @@ optimizer:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   dir: <your_wandb_save_dir>
+#   save_dir: <your_wandb_save_dir> 

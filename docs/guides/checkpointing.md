@@ -48,12 +48,12 @@ To ensure seamless integration with the Hugging Face ecosystem, NeMo Automodel s
 
 The following command runs the LLM fine-tuning recipe on two GPUs and saves the resulting checkpoint in the Safetensors format:
 ```bash
-uv run torchrun --nproc-per-node=2 examples/llm/finetune.py --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors --checkpoint.save_consolidated True
+uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors --checkpoint.save_consolidated True
 ```
 
 If you're running on a single GPU, you can run:
 ```
-uv run examples/llm/finetune.py --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors --checkpoint.save_consolidated True
+uv run examples/llm_finetune/finetune.py --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors --checkpoint.save_consolidated True
 ```
 
 After running for a few seconds, the standard output should be:
@@ -122,7 +122,7 @@ Because the PEFT state is so lightweight, sharded checkpointing adds unnecessary
 
 To fine-tune a model using PEFT and save a Hugging Face–ready checkpoint:
 ```
-uv run torchrun --nproc-per-node=2 examples/llm/finetune.py --config examples/llm/llama_3_2_1b_hellaswag_peft.yaml --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors
+uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py --config examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors
 ```
 
 After training, you'll get a compact, consolidated Safetensors checkpoint that can be loaded directly with Hugging Face tools:
@@ -168,7 +168,7 @@ NeMo AutoModel also offers native PyTorch DCP checkpointing support (`.distcp` e
 
 As a simple example, we can run the following command to launch the training recipe on two GPUs.
 ```bash
-uv run torchrun --nproc-per-node=2 examples/llm/finetune.py --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format torch_save
+uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format torch_save
 
 ...
 > Saving checkpoint to checkpoints/epoch_0_step_20
@@ -192,7 +192,7 @@ checkpoints/
 
 If you rerun the script, NeMo AutoModel automatically detects and restores the most recent checkpoint.
 ```bash
-uv run torchrun --nproc-per-node=2 examples/llm/finetune.py --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format torch_save
+uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format torch_save
 
 ...
 > Loading checkpoint from checkpoints/epoch_0_step_20

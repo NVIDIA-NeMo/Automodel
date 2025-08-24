@@ -16,7 +16,7 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/vlm/finetune.py --config recipes/vlm/qwen2_5_vl_3b_rdr.yaml
+# torchrun --nproc-per-node=8 recipes/vlm_finetune/finetune.py --config recipes/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml
 # Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
 

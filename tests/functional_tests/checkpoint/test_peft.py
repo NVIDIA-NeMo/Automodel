@@ -1858,7 +1858,7 @@ def test_hf_peft_checkpoint(use_triton=False):
     }
 
     script_path = Path(__file__).parent.resolve()
-    cfg = parse_args_and_load_config(script_path / "llama_3_2_1b_hellaswag_peft.yaml")
+    cfg = parse_args_and_load_config(script_path / "llama3_2" / "llama3_2_1b_hellaswag_peft.yaml")
 
     # set use_triton value based on parsed input
     expected_automodel_peft_config["use_triton"] = cfg.peft.use_triton

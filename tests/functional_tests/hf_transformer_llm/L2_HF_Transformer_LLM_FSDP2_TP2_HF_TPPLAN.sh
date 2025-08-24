@@ -16,8 +16,8 @@
 set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
--m pytest examples/llm/finetune.py \
-  --config examples/llm/llama_3_2_1b_squad.yaml \
+-m pytest examples/llm_finetune/finetune.py \
+  --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
   --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
   --step_scheduler.max_steps 3 \
   --step_scheduler.grad_acc_steps 1 \
