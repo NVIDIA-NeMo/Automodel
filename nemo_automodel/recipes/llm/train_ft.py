@@ -55,6 +55,7 @@ from nemo_automodel.components.utils.compile_utils import (
 from nemo_automodel.components.utils.dist_utils import get_sync_ctx
 from nemo_automodel.components.utils.model_utils import print_trainable_parameters
 from nemo_automodel.recipes.base_recipe import BaseRecipe
+from torch.utils.data import IterableDataset
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -77,7 +78,6 @@ def build_model_and_optimizer(
     model_wrapper,
     seed,
     tp_size=1,
-    freeze_embeddings=True,
     cfg_fp8=None,
     cfg_compile=None,
 ) -> tuple[nn.Module, "Optimizer"]:  # noqa: F821
@@ -94,7 +94,6 @@ def build_model_and_optimizer(
         model_wrapper: Optional parallelism wrapper.
         seed: Random seed.
         tp_size: Tensor parallel size.
-        freeze_embeddings: Whether to freeze embeddings.
         cfg_fp8: Configuration for FP8.
         cfg_compile: Configuration for torch.compile.
 
@@ -123,11 +122,6 @@ def build_model_and_optimizer(
         with init_ctx:
             model = cfg_model.instantiate(**kwargs)
 
-            if freeze_embeddings:
-                logging.info("Freezing embeddings")
-                for m in model.modules():
-                    if isinstance(m, nn.Embedding):
-                        m.weight.requires_grad_(False)
             # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
             if cfg_peft is not None:
                 apply_lora_to_linear_modules(model, cfg_peft)
@@ -256,19 +250,25 @@ def build_dataloader(
             "num_replicas": device_mesh["dp"].size(),
             "rank": device_mesh["dp"].get_local_rank(),
         }
-    if "tokenizer" not in cfg_ds:
-        logging.info("Using model config to instantiate tokenizer")
-        trust_remote_code = getattr(cfg_model, "trust_remote_code", False)
-        tokenizer = AutoTokenizer.from_pretrained(
-            cfg_model.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
-        )
+    # if tokenizer is not provided, use the model config to instantiate it
+    if "tokenizer" not in cfg_ds and cfg_model.get('pretrained_model_name_or_path', None) is not None:
+            logging.info("Using model config to instantiate tokenizer")
+            trust_remote_code = getattr(cfg_model, "trust_remote_code", False)
+            tokenizer = AutoTokenizer.from_pretrained(
+                cfg_model.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+            )
+    elif cfg_ds.get("tokenizer", None) is None:
+        tokenizer = None
     elif "_target_" not in cfg_ds.tokenizer:
         tokenizer = AutoTokenizer.from_pretrained(**cfg_ds.tokenizer.to_dict())
     else:
         tokenizer = cfg_ds.tokenizer.instantiate()
 
     with StatefulRNG(seed=seed, ranked=True):
-        ds = cfg_ds.instantiate(tokenizer=tokenizer)
+        kwargs = {}
+        if tokenizer is not None:
+            kwargs["tokenizer"] = tokenizer
+        ds = cfg_ds.instantiate(**kwargs)
         # Apply packing if configured
         if getattr(cfg_ps, "packed_sequence_size", 0) > 0:
             logger.info(f"Packing dataset with size: {cfg_ps.packed_sequence_size}")
@@ -280,12 +280,16 @@ def build_dataloader(
                 max_packs=getattr(cfg_ps, "max_packs", None),
             ).pack()
 
-        sampler = StatefulDistributedSampler(
-            ds,
-            seed=seed,
-            drop_last=True,
-            **dist_sampler_kwargs,
-        )
+        if not isinstance(ds, IterableDataset):
+            sampler = StatefulDistributedSampler(
+                ds,
+                seed=seed,
+                drop_last=True,
+                **dist_sampler_kwargs,
+            )
+        else:
+            logging.info("Using IterableDataset; skipping sampler.")
+            sampler = None
 
         # Handle collate_fn instantiation if it's a ConfigNode
         dl_kwargs = {"dataset": ds, "sampler": sampler}
@@ -566,7 +570,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.checkpoint_config = build_checkpoint_config(
             self.cfg.get("checkpoint", None),
             self.cfg.get("model.cache_dir", None),
-            self.cfg.model.pretrained_model_name_or_path,
+            self.cfg.model.get("pretrained_model_name_or_path", None),
             True if self.cfg.get("peft", None) else False,
         )
 
@@ -642,7 +646,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             if (
                 "position_ids" not in batch
                 and self.device_mesh is not None
-                and (self.device_mesh["cp"].size() > 1 or self.device_mesh["tp"].size() > 1)
+                and self.device_mesh["cp"].size() > 1
             ):
                 batch["position_ids"] = (
                     torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.dist_env.device)
@@ -663,10 +667,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
                 local_loss = calculate_loss(
                     self.loss_fn,
-                    logits=out.logits,
+                    logits=getattr(out, "logits", out),
                     labels=labels,
                     model=self.model,
-                    hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
+                    hidden_states=out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None else None,
                     num_label_tokens=num_label_tokens,
                 )
                 loss_buffer.append(local_loss.clone().detach())
