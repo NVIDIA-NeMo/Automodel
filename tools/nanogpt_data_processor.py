@@ -43,13 +43,13 @@ import numpy as np
 from transformers import PreTrainedTokenizer
 
 try:
-    from nemo_automodel.components.datasets.llm.bin_dataset import (
+    from nemo_automodel.components.datasets.llm.nanogpt_dataset import (
         HEADER_SIZE as BIN_HEADER_SIZE,
     )
-    from nemo_automodel.components.datasets.llm.bin_dataset import (
+    from nemo_automodel.components.datasets.llm.nanogpt_dataset import (
         MAGIC as BIN_MAGIC_NUMBER,
     )
-    from nemo_automodel.components.datasets.llm.bin_dataset import (
+    from nemo_automodel.components.datasets.llm.nanogpt_dataset import (
         VERSION as BIN_VERSION,
     )
 except ImportError:
