@@ -50,6 +50,7 @@ class FSDP2Manager:
         tp_size (Optional[int]): Tensor-parallel group size. Defaults to 1 if zero/None.
         cp_size (int): Context-parallel group size for pipeline-like sharding.
         sequence_parallel (bool): Enables sequence parallelism in the TP plan when True.
+        use_hf_tp_plan (bool): Use Hugging Face TP plan if True.
         mp_policy (MixedPrecisionPolicy): Defines the mixed precision policy for parameters,
             reductions, and outputs.
         offload_policy (CPUOffloadPolicy): Policy to offload parameters or optimizer states
@@ -88,6 +89,10 @@ class FSDP2Manager:
     sequence_parallel: Optional[bool] = field(
         default=False,
         metadata={"help": "Enable sequence parallelism in TP plan if True."},
+    )
+    use_hf_tp_plan: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Use Hugging Face TP plan if True."},
     )
     mp_policy: Optional[MixedPrecisionPolicy] = field(
         default=MixedPrecisionPolicy(
@@ -215,7 +220,7 @@ class FSDP2Manager:
         self.device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
         return self.device_mesh
 
-    def parallelize(self, model, use_hf_tp_plan=False):
+    def parallelize(self, model):
         """
         Parallelizes the given model using FSDP2 and TP sharding strategies.
 
@@ -225,7 +230,6 @@ class FSDP2Manager:
 
         Args:
             model (nn.Module): The model to be parallelized.
-            use_hf_tp_plan (bool): if true, will attempt to get the TP plan from the model.
 
         Returns:
             The parallelized model.
@@ -234,7 +238,7 @@ class FSDP2Manager:
             NotImplemented: If the required TP sharding plan is not supported.
         """
         if self.device_mesh["tp"].size() > 1:
-            if use_hf_tp_plan:
+            if self.use_hf_tp_plan:
                 tp_shard_plan = get_hf_tp_shard_plan(model)
             else:
                 # Parallelize the first embedding and the last linear out projection
