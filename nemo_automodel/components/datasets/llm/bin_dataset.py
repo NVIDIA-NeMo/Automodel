@@ -138,7 +138,7 @@ class BinTokenDataset(IterableDataset):
         file_pattern: str | Sequence[str],
         seq_len: int,
         *,
-        bos_token: int = None,
+        bos_token: int | None = None,
         shuffle_files: bool = False,
         align_to_bos: bool = False,
         drop_last: bool = True,
