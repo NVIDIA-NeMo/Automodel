@@ -827,7 +827,7 @@ def main(config_path=None):
     if config_path is None:
         config_path = pathlib.Path(__file__).parent.resolve() / "llama_3_2_1b_hellaswag.yaml"
     cfg = parse_args_and_load_config(config_path)
-    trainer = FinetuneRecipeForNextTokenPrediction(cfg)
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
 

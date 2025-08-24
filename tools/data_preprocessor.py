@@ -37,14 +37,19 @@ import json
 import multiprocessing as mp
 import os
 import queue  # for Empty exception handling
-import numpy as np
 from functools import lru_cache
+
+import numpy as np
 from transformers import PreTrainedTokenizer
 
 try:
     from nemo_automodel.components.datasets.llm.bin_dataset import (
-        MAGIC as BIN_MAGIC_NUMBER,
         HEADER_SIZE as BIN_HEADER_SIZE,
+    )
+    from nemo_automodel.components.datasets.llm.bin_dataset import (
+        MAGIC as BIN_MAGIC_NUMBER,
+    )
+    from nemo_automodel.components.datasets.llm.bin_dataset import (
         VERSION as BIN_VERSION,
     )
 except ImportError:
@@ -444,11 +449,10 @@ def main(args):
 
     # This process writes the binary data to disk.
     from transformers import AutoTokenizer
+
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     writer = BinaryDataWriter(
-        os.path.join(output_dir, "dataset.bin"),
-        bos_token_id=tokenizer.bos_token_id,
-        vocab_size=tokenizer.vocab_size
+        os.path.join(output_dir, "dataset.bin"), bos_token_id=tokenizer.bos_token_id, vocab_size=tokenizer.vocab_size
     )
     del tokenizer
 

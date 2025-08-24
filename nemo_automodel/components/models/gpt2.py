@@ -32,6 +32,7 @@ model:
   n_positions: 2048
 ```
 """
+
 from __future__ import annotations
 
 """Self-contained GPT-2 (Causal LM) implementation.
@@ -50,9 +51,8 @@ It is, however, perfectly suitable for forward/backward passes, fine-tuning,
 and next-token prediction.
 """
 
-from typing import Any
-
 import math
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -94,18 +94,14 @@ class CausalSelfAttention(nn.Module):
         else:
             # Fallback implementation with an explicit causal mask
             scores = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)
-            causal_mask = torch.tril(
-                torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool)
-            )
+            causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool))
             scores = scores.masked_fill(~causal_mask, float("-inf"))
             attn_weights = F.softmax(scores, dim=-1)
             attn_weights = F.dropout(attn_weights, p=self.attn_dropout, training=self.training)
             attn_output = attn_weights @ v  # (B, n_head, T, head_dim)
 
         # Merge heads
-        attn_output = (
-            attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, self.embed_dim)
-        )
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, self.embed_dim)
         return self.out_proj(attn_output)
 
 
@@ -139,7 +135,6 @@ class TransformerBlock(nn.Module):
         return x
 
 
-
 class GPT2LMHeadModel(nn.Module):
     """Minimal GPT-2 Causal-LM with tied input/output embeddings."""
 
@@ -159,9 +154,7 @@ class GPT2LMHeadModel(nn.Module):
         self.wpe = nn.Embedding(n_positions, n_embd)
         self.drop = nn.Dropout(dropout)
 
-        self.h = nn.ModuleList(
-            [TransformerBlock(n_embd, n_head, dropout) for _ in range(n_layer)]
-        )
+        self.h = nn.ModuleList([TransformerBlock(n_embd, n_head, dropout) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd)
 
         # Language model head (weights tied to token embedding matrix)
@@ -175,9 +168,7 @@ class GPT2LMHeadModel(nn.Module):
         batch_size, seq_len = input_ids.shape
 
         if seq_len > self.wpe.num_embeddings:
-            raise ValueError(
-                f"Sequence length {seq_len} exceeds maximum context size {self.wpe.num_embeddings}."
-            )
+            raise ValueError(f"Sequence length {seq_len} exceeds maximum context size {self.wpe.num_embeddings}.")
 
         pos_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, seq_len)
 
@@ -242,4 +233,4 @@ def build_gpt2_model(
         n_embd=n_embd,
         n_layer=n_layer,
         n_head=n_head,
-    ) 
+    )

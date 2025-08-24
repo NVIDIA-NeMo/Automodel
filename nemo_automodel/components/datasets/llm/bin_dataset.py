@@ -33,6 +33,7 @@ This file is copied (with minimal adjustments) from
 ``nemo_automodel`` can directly import ``BinTokenDataset`` without taking a
 runtime dependency on the NanoGPT codebase.
 """
+
 from __future__ import annotations
 
 import glob
@@ -43,8 +44,8 @@ from typing import Iterator, List, Sequence
 
 import numpy as np
 import torch
-from torch.utils.data import IterableDataset, get_worker_info
 from torch.distributed.device_mesh import DeviceMesh
+from torch.utils.data import IterableDataset, get_worker_info
 
 __all__ = ["BinTokenDataset", "load_bin_shard"]
 
@@ -60,6 +61,7 @@ def _peek_num_tokens(path: str | os.PathLike) -> int:
     header = np.memmap(path, dtype=np.int32, mode="r", shape=(256,))
     return int(header[2])
 
+
 def _get_dtype_from_val(n_bytes: int) -> torch.dtype:
     """
     Returns the torch.dtype for the given value.
@@ -70,6 +72,7 @@ def _get_dtype_from_val(n_bytes: int) -> torch.dtype:
         return np.uint32
     else:
         raise ValueError(f"Expected {n_bytes} to be equal to 2 (uint16) or 4 (uint32).")
+
 
 def load_bin_shard(path: str | os.PathLike) -> torch.Tensor:
     """
@@ -89,9 +92,7 @@ def load_bin_shard(path: str | os.PathLike) -> torch.Tensor:
     dtype = _get_dtype_from_val(int(header[3]))
 
     # Memory-map the tokens. Offset skips the 256x4-byte header.
-    tokens_np = np.memmap(
-        path, dtype=dtype, mode="r", offset=HEADER_BYTES, shape=(num_tokens,)
-    )
+    tokens_np = np.memmap(path, dtype=dtype, mode="r", offset=HEADER_BYTES, shape=(num_tokens,))
     # UserWarning: The given NumPy array is not writable, and PyTorch does not
     # support non-writable tensors. This means writing to this tensor will result
     # in undefined behavior. You may want to copy the array to protect its data or
@@ -154,7 +155,7 @@ class BinTokenDataset(IterableDataset):
         self.seq_len = int(seq_len)
         self.shuffle_files = shuffle_files
         self.align_to_bos = align_to_bos
-        if self.align_to_bos and  bos_token is None:
+        if self.align_to_bos and bos_token is None:
             raise ValueError("bos_token must be provided when align_to_bos is True")
         self.bos_token = bos_token
         self.drop_last = drop_last
@@ -170,7 +171,6 @@ class BinTokenDataset(IterableDataset):
             rng.seed(worker.id + 12345)
         else:
             rng.seed(os.getpid())
-
 
         # ------------------------------------------------------------------
         # Determine the *global* worker id taking both DDP rank and DataLoader
