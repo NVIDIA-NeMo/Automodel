@@ -47,7 +47,7 @@ import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torch.utils.data import IterableDataset, get_worker_info
 
-__all__ = ["BinTokenDataset", "load_bin_shard"]
+__all__ = ["NanogptDataset", "load_bin_shard"]
 
 MAGIC = 2788_95051
 VERSION = 1
@@ -101,11 +101,11 @@ def load_bin_shard(path: str | os.PathLike) -> torch.Tensor:
     return torch.from_numpy(tokens_np)
 
 
-class BinTokenDataset(IterableDataset):
+class NanogptDataset(IterableDataset):
     """
-    Dataset class for Binary Token Dataset.
+    Dataset class for NanoGPT Dataset.
 
-    A Binary Token Dataset is a dataset that stores tokens in a binary file.
+    A NanoGPT Dataset is a dataset that stores tokens in a binary file.
     The header contains:
     - 256x4-byte header (magic number, version, num_tokens, dtype.itemsize)
     - And the tokens themselves.
@@ -185,6 +185,7 @@ class BinTokenDataset(IterableDataset):
         except Exception:
             dist_world_size = 1
             dist_rank = 0
+        print(f"dist_world_size: {dist_world_size} {dist_rank}\n", end='')
 
         dl_num_workers = worker.num_workers if worker is not None else 1
         dl_worker_id = worker.id if worker is not None else 0
@@ -197,22 +198,53 @@ class BinTokenDataset(IterableDataset):
         if not worker_files:
             worker_files = self.files.copy()  # fallback-duplication acceptable for small shard counts
 
+        # ------------------------------------------------------------------
+        # Handle single file case: split the file among workers
+        # ------------------------------------------------------------------
+        split_single_file = len(worker_files) == 1 and total_workers > 1
+        file_start_pos = 0
+        file_end_pos = None
+
+        if split_single_file:
+            # Get the total number of tokens in the single file
+            single_file = worker_files[0]
+            total_tokens = _peek_num_tokens(single_file)
+
+            # Calculate the portion for this worker
+            tokens_per_worker = total_tokens // total_workers
+            file_start_pos = global_worker_id * tokens_per_worker
+
+            # Last worker gets any remaining tokens
+            if global_worker_id == total_workers - 1:
+                file_end_pos = total_tokens
+            else:
+                file_end_pos = file_start_pos + tokens_per_worker
+
+            print(f"Worker {global_worker_id}/{total_workers} processing tokens {file_start_pos}:{file_end_pos} of {single_file}")
+
         if self.shuffle_files:
             rng.shuffle(worker_files)
 
         while True:
             for file in worker_files:
                 tokens = load_bin_shard(file)
-                pos = 0
+
+                # Set start and end positions based on whether we're splitting a single file
+                if split_single_file:
+                    pos = file_start_pos
+                    max_pos = min(file_end_pos, len(tokens))
+                else:
+                    pos = 0
+                    max_pos = len(tokens)
 
                 # Optionally skip leading tokens until first BOS so slices start on BOS.
                 if self.align_to_bos:
-                    while pos < len(tokens) and tokens[pos].item() != self.bos_token:
+                    while pos < max_pos and tokens[pos].item() != self.bos_token:
                         pos += 1
 
-                while pos + self.seq_len < len(tokens):
+                while pos + self.seq_len < max_pos:
                     end = pos + self.seq_len + 1  # +1 for target shift
-                    if end > len(tokens):
+                    if end > max_pos:
                         break
                     buf = tokens[pos:end]
                     assert len(buf) == self.seq_len + 1
@@ -224,13 +256,13 @@ class BinTokenDataset(IterableDataset):
                     if self.align_to_bos:
                         # Find next BOS token for the start of the next sample
                         pos = end
-                        while pos < len(tokens) and tokens[pos].item() != self.bos_token:
+                        while pos < max_pos and tokens[pos].item() != self.bos_token:
                             pos += 1
                     else:
                         pos = end
 
                 # Optionally drop remainder; otherwise cross shard (rarely useful)
-                if not self.drop_last and pos < len(tokens) and not self.align_to_bos:
+                if not self.drop_last and pos < max_pos and not self.align_to_bos:
                     # carry over remainder to next shard (currently unused but left for parity)
                     _carry = tokens[pos:]
                     # The carry is ignored in this implementation to avoid stateful buffering.
@@ -256,11 +288,48 @@ class BinTokenDataset(IterableDataset):
         if self.infinite:
             raise TypeError("`__len__` is undefined when `infinite=True`.")
 
+        # Calculate worker-specific parameters for potential single file splitting
+        try:
+            import torch.distributed as dist
+            dist_world_size = dist.get_world_size() if dist.is_initialized() else 1
+            dist_rank = dist.get_rank() if dist.is_initialized() else 0
+        except Exception:
+            dist_world_size = 1
+            dist_rank = 0
+
+        # Note: We can't easily get DataLoader worker info here since __len__ is called 
+        # before workers are created, so we assume single DataLoader worker for length calculation
+        total_workers = dist_world_size  
+        global_worker_id = dist_rank
+
+        # Determine which files this worker would process
+        worker_files = self.files[global_worker_id::total_workers]
+        if not worker_files:
+            worker_files = self.files.copy()
+
         total_samples = 0
-        for file in self.files:
-            ntokens = _peek_num_tokens(file)
-            # Each sample needs seq_len+1 tokens (for next-token target).
-            total_samples += max(0, ntokens - 1) // (self.seq_len)
+
+        # Handle single file splitting case
+        if len(worker_files) == 1 and total_workers > 1:
+            file = worker_files[0]
+            total_tokens = _peek_num_tokens(file)
+
+            # Calculate this worker's portion
+            tokens_per_worker = total_tokens // total_workers
+            if global_worker_id == total_workers - 1:
+                worker_tokens = total_tokens - (global_worker_id * tokens_per_worker)
+            else:
+                worker_tokens = tokens_per_worker
+
+            # Each sample needs seq_len+1 tokens (for next-token target)
+            total_samples = max(0, worker_tokens - 1) // self.seq_len
+        else:
+            # Original logic for multiple files
+            for file in worker_files:
+                ntokens = _peek_num_tokens(file)
+                # Each sample needs seq_len+1 tokens (for next-token target).
+                total_samples += max(0, ntokens - 1) // (self.seq_len)
+
         return total_samples
 
     def __getitem__(self, index: int):  # type: ignore[override]
@@ -277,20 +346,67 @@ class BinTokenDataset(IterableDataset):
         if self.align_to_bos:
             raise NotImplementedError("__getitem__ with align_to_bos=True is not implemented.")
 
-        # Determine which shard contains *index*
-        running = 0
-        for file in self.files:
-            ntokens = _peek_num_tokens(file)
-            samples_in_file = max(0, ntokens - 1) // (self.seq_len)
-            if index < running + samples_in_file:
-                # The desired sample lives in this file
-                local_idx = index - running
-                start = local_idx * self.seq_len
-                tokens = load_bin_shard(file)
-                buf = tokens[start : start + self.seq_len + 1]
-                inputs = buf[:-1].to(torch.int32)
-                labels = buf[1:].to(torch.int64)
-                return inputs, labels
-            running += samples_in_file
+        # Calculate worker-specific parameters for potential single file splitting
+        try:
+            import torch.distributed as dist
+            dist_world_size = dist.get_world_size() if dist.is_initialized() else 1
+            dist_rank = dist.get_rank() if dist.is_initialized() else 0
+        except Exception:
+            dist_world_size = 1
+            dist_rank = 0
+
+        # Note: We can't easily get DataLoader worker info here, so assume single DataLoader worker
+        total_workers = dist_world_size
+        global_worker_id = dist_rank
+
+        # Determine which files this worker would process
+        worker_files = self.files[global_worker_id::total_workers]
+        if not worker_files:
+            worker_files = self.files.copy()
+
+        # Handle single file splitting case
+        if len(worker_files) == 1 and total_workers > 1:
+            file = worker_files[0]
+            total_tokens = _peek_num_tokens(file)
+
+            # Calculate this worker's portion
+            tokens_per_worker = total_tokens // total_workers
+            file_start_pos = global_worker_id * tokens_per_worker
+
+            if global_worker_id == total_workers - 1:
+                file_end_pos = total_tokens
+            else:
+                file_end_pos = file_start_pos + tokens_per_worker
+
+            worker_tokens = file_end_pos - file_start_pos
+            max_samples = max(0, worker_tokens - 1) // self.seq_len
+
+            if index >= max_samples:
+                raise IndexError(f"index {index} out of range for worker {global_worker_id} (max: {max_samples})")
+
+            # Calculate the absolute position in the file for this sample
+            start = file_start_pos + index * self.seq_len
+            tokens = load_bin_shard(file)
+            buf = tokens[start : start + self.seq_len + 1]
+            inputs = buf[:-1].to(torch.int32)
+            labels = buf[1:].to(torch.int64)
+            return inputs, labels
+
+        else:
+            # Original logic for multiple files
+            running = 0
+            for file in worker_files:
+                ntokens = _peek_num_tokens(file)
+                samples_in_file = max(0, ntokens - 1) // (self.seq_len)
+                if index < running + samples_in_file:
+                    # The desired sample lives in this file
+                    local_idx = index - running
+                    start = local_idx * self.seq_len
+                    tokens = load_bin_shard(file)
+                    buf = tokens[start : start + self.seq_len + 1]
+                    inputs = buf[:-1].to(torch.int32)
+                    labels = buf[1:].to(torch.int64)
+                    return inputs, labels
+                running += samples_in_file
 
         raise IndexError("index out of range")

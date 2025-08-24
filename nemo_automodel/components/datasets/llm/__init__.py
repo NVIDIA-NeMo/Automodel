@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .bin_dataset import BinTokenDataset, load_bin_shard  # noqa: F401
+from .nanogpt_dataset import NanogptDataset  # noqa: F401
 
 __all__ = [
-    "BinTokenDataset",
-    "load_bin_shard",
+    "NanogptDataset",
 ]
