@@ -466,7 +466,7 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
+class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     """Recipe for fine-tuning a model for next-token prediction.
 
     This class orchestrates training, from setup to main training loop.

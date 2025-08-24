@@ -23,7 +23,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction
+from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 
 def load_dcp(ckpt_dir: Path | str) -> tuple[dict, dict]:
@@ -115,7 +115,7 @@ def test_consolidated_llm_checkpoint_with_scalar_weight():
     script_path = Path(__file__).parent.resolve()
     cfg = parse_args_and_load_config(script_path / "llama3_2" / "llama3_2_1b_hellaswag.yaml")
 
-    trainer = FinetuneRecipeForNextTokenPrediction(cfg)
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     scalar_value = 3.14159
     scalar_param_local = _add_scalar_parameter(trainer.model.model, trainer.optimizer, scalar_value)
