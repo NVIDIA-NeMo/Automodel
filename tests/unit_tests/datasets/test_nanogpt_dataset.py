@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from nemo_automodel.components.datasets.llm.bin_dataset import BinTokenDataset, MAGIC, VERSION, load_bin_shard
+from nemo_automodel.components.datasets.llm.nanogpt_dataset import NanogptDataset, MAGIC, VERSION, load_bin_shard
 
 
 def _make_fake_shard(tmpdir: Path, tokens: np.ndarray) -> Path:
@@ -35,14 +35,14 @@ def _make_fake_shard(tmpdir: Path, tokens: np.ndarray) -> Path:
     return shard_path
 
 
-def test_bintoken_dataset_iteration():
+def test_nanogpt_dataset_iteration():
     # Create a tiny synthetic shard: BOS + 4 tokens → exactly one sample when seq_len=4
     bos = 50256
     toks = np.array([bos, 1, 2, 3, 4], dtype=np.uint16)
 
     with tempfile.TemporaryDirectory() as tmp:
         shard = _make_fake_shard(Path(tmp), toks)
-        ds = BinTokenDataset(str(shard), seq_len=4, align_to_bos=True, infinite=False, bos_token=bos)
+        ds = NanogptDataset(str(shard), seq_len=4, align_to_bos=True, infinite=False, bos_token=bos)
         samples = list(iter(ds))
         # Should yield exactly 1 sample dictionary
         assert len(samples) == 1
@@ -67,14 +67,14 @@ def test_bintoken_dataset_iteration():
         assert labels == [1, 2, 3, 4]       # Next 4 tokens (shifted by 1)
 
 
-def test_bintoken_dataset_len():
+def test_nanogpt_dataset_len():
     # 9 tokens total → with seq_len=4 ⇒ floor((9-1)/4)=2 samples
     bos = 50256
     toks = np.concatenate([[bos], np.arange(1, 9, dtype=np.uint16)])
 
     with tempfile.TemporaryDirectory() as tmp:
         shard = _make_fake_shard(Path(tmp), toks)
-        ds = BinTokenDataset(str(shard), seq_len=4, align_to_bos=False, infinite=False, drop_last=True)
+        ds = NanogptDataset(str(shard), seq_len=4, align_to_bos=False, infinite=False, drop_last=True)
         assert len(ds) == 2
 
 
@@ -95,13 +95,13 @@ def test_load_bin_shard():
         assert torch.equal(loaded_tokens, torch.from_numpy(tokens))
 
 
-def test_bintoken_dataset_getitem():
+def test_nanogpt_dataset_getitem():
     """Test random access via __getitem__."""
     tokens = np.array([1, 2, 3, 4, 5, 6, 7, 8, 9], dtype=np.uint16)
 
     with tempfile.TemporaryDirectory() as tmp:
         shard_path = _make_fake_shard(Path(tmp), tokens)
-        ds = BinTokenDataset(str(shard_path), seq_len=4, align_to_bos=False, infinite=False, drop_last=True)
+        ds = NanogptDataset(str(shard_path), seq_len=4, align_to_bos=False, infinite=False, drop_last=True)
 
         # Should have 2 samples: (9-1)//4 = 2
         assert len(ds) == 2
@@ -123,7 +123,7 @@ def test_bintoken_dataset_getitem():
         assert torch.equal(labels, torch.tensor([6, 7, 8, 9], dtype=torch.int64))
 
 
-def test_bintoken_dataset_error_conditions():
+def test_nanogpt_dataset_error_conditions():
     """Test various error conditions."""
     tokens = np.array([1, 2, 3, 4, 5], dtype=np.uint16)
 
@@ -132,13 +132,13 @@ def test_bintoken_dataset_error_conditions():
 
         # Test that align_to_bos=True requires bos_token
         try:
-            ds = BinTokenDataset(str(shard_path), seq_len=4, align_to_bos=True, bos_token=None)
+            ds = NanogptDataset(str(shard_path), seq_len=4, align_to_bos=True, bos_token=None)
             assert False, "Should have raised ValueError"
         except ValueError as e:
             assert "bos_token must be provided when align_to_bos is True" in str(e)
 
         # Test that __len__ raises TypeError when infinite=True
-        ds = BinTokenDataset(str(shard_path), seq_len=4, infinite=True)
+        ds = NanogptDataset(str(shard_path), seq_len=4, infinite=True)
         try:
             len(ds)
             assert False, "Should have raised TypeError"
@@ -153,7 +153,7 @@ def test_bintoken_dataset_error_conditions():
             assert "Random access is not supported when `infinite=True`" in str(e)
 
         # Test that __getitem__ raises NotImplementedError when align_to_bos=True
-        ds = BinTokenDataset(str(shard_path), seq_len=4, align_to_bos=True, bos_token=50256, infinite=False)
+        ds = NanogptDataset(str(shard_path), seq_len=4, align_to_bos=True, bos_token=50256, infinite=False)
         try:
             ds[0]
             assert False, "Should have raised NotImplementedError"
@@ -161,10 +161,10 @@ def test_bintoken_dataset_error_conditions():
             assert "__getitem__ with align_to_bos=True is not implemented" in str(e)
 
 
-def test_bintoken_dataset_no_files_error():
+def test_nanogpt_dataset_no_files_error():
     """Test FileNotFoundError when no files match pattern."""
     try:
-        ds = BinTokenDataset("/nonexistent/path/*.bin", seq_len=4)
+        ds = NanogptDataset("/nonexistent/path/*.bin", seq_len=4)
         assert False, "Should have raised FileNotFoundError"
     except FileNotFoundError as e:
         assert "No files matched pattern" in str(e)
