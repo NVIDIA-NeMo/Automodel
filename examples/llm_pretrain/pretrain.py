@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes.llm.pretrain import PretrainRecipeForNextTokenPrediction
+from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 
 def main(default_config_path="examples/llm/nanogpt_pretrain.yaml"):
@@ -28,7 +28,7 @@ def main(default_config_path="examples/llm/nanogpt_pretrain.yaml"):
     ```
     """
     cfg = parse_args_and_load_config(default_config_path)
-    recipe = PretrainRecipeForNextTokenPrediction(cfg)
+    recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     recipe.setup()
     recipe.run_train_validation_loop()
 
