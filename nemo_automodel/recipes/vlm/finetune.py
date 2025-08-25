@@ -246,7 +246,9 @@ def build_loss_fn(cfg_loss):
     return cfg_loss.instantiate()
 
 
-def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed, micro_batch_size) -> tuple[DataLoader, ProcessorMixin]:
+def build_dataloader(
+    cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed, micro_batch_size
+) -> tuple[DataLoader, ProcessorMixin]:
     """Build a DataLoader for the VLM dataset.
 
     Args:
@@ -303,7 +305,9 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed
                 logging.warning(f"You are using {processor_type} with default collate function.")
             collate_fn = lambda examples: COLLATE_FNS[processor_type](examples, processor)
 
-        return cfg_dl.instantiate(dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=micro_batch_size), processor
+        return cfg_dl.instantiate(
+            dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=micro_batch_size
+        ), processor
 
         # Ensure spawn start method to avoid fork-safety issues with CUDA/JIT
         try:
@@ -314,7 +318,9 @@ def build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed
         except RuntimeError:
             pass
 
-        return cfg_dl.instantiate(dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=micro_batch_size), processor
+        return cfg_dl.instantiate(
+            dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=micro_batch_size
+        ), processor
 
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
@@ -571,7 +577,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.forward_data_store = []
 
         # Scheduler
-        self.step_scheduler = build_step_scheduler(self.cfg.get("step_scheduler", None), self.dataloader, self._get_dp_group_size(), micro_batch_size=self.cfg.get("step_scheduler.micro_batch_size", 1))
+        self.step_scheduler = build_step_scheduler(
+            self.cfg.get("step_scheduler", None),
+            self.dataloader,
+            self._get_dp_group_size(),
+            micro_batch_size=self.cfg.get("step_scheduler.micro_batch_size", 1),
+        )
 
         # Build learning rate scheduler
         self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
