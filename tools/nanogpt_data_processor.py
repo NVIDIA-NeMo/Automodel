@@ -34,12 +34,12 @@ See the make_parser function for CLI options or run `python tools/nanogpt_data_p
 import argparse
 import concurrent.futures
 import json
+import logging
 import multiprocessing as mp
 import os
 import queue  # for Empty exception handling
 from functools import lru_cache
 
-import logging
 import numpy as np
 from transformers import PreTrainedTokenizer
 
@@ -55,6 +55,7 @@ except ImportError:
     HEADER_SIZE = 256
     MAGIC = 2788_95051
     VERSION = 1
+
 
 class _parse_tokens_arg(int):
     """An int subclass that can parse human-friendly token counts (e.g. 500M)."""
