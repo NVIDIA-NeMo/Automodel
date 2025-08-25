@@ -183,6 +183,28 @@ def load_bin_shard(path: str | os.PathLike) -> torch.Tensor:
     # be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:203.)
     return torch.from_numpy(tokens_np)
 
+def _get_next_bos_position(tokens: torch.Tensor, bos_token: int, bos_positions: np.ndarray, pos: int, max_pos: int) -> int:
+    """
+    Get the next BOS token position.
+
+    Args:
+        tokens: Tensor of tokens
+        bos_token: BOS token ID
+        bos_positions: Array of BOS token positions
+        pos: Current position
+        max_pos: Maximum position
+
+    Returns:
+        Next BOS token position
+    """
+    if bos_positions is not None:
+        # Use index file for efficient BOS search
+        pos = _find_next_bos_with_index(bos_positions, pos, max_pos)
+    else:
+        # Fall back to linear search
+        while pos < max_pos and tokens[pos].item() != bos_token:
+            pos += 1
+    return pos
 
 class NanogptDataset(IterableDataset):
     """
@@ -207,12 +229,13 @@ class NanogptDataset(IterableDataset):
             target).  labels are simply ``inputs[1:]``.
         shuffle_files : bool, default False
             Shuffle the order of shards each epoch/iteration.
-        align_to_bos : bool, default True
+        align_to_bos : bool, default False
             Ensure that every slice starts with ``bos_token``.  When enabled, the
             dataset searches forward from the current position until it finds the
             next BOS token and starts there. Uses .bos.idx files when available
             for efficient search, falls back to linear search otherwise.
-        bos_token : int, default 50256
+            Requires ``bos_token`` to be provided.
+        bos_token : int, optional, default None.
             Token ID marking beginning-of-document.
     """
 
@@ -224,7 +247,6 @@ class NanogptDataset(IterableDataset):
         bos_token: int | None = None,
         shuffle_files: bool = False,
         align_to_bos: bool = False,
-        device_mesh: DeviceMesh = None,
     ) -> None:
         super().__init__()
         if isinstance(file_pattern, (str, Path)):
@@ -239,7 +261,6 @@ class NanogptDataset(IterableDataset):
         if self.align_to_bos and bos_token is None:
             raise ValueError("bos_token must be provided when align_to_bos is True")
         self.bos_token = bos_token
-        self.device_mesh = device_mesh
 
     def _setup_worker_context(self, files, shuffle) -> tuple[List[str], random.Random, bool, int, int]:
         """
@@ -268,7 +289,6 @@ class NanogptDataset(IterableDataset):
         except Exception:
             dist_world_size = 1
             dist_rank = 0
-        print(f"dist_world_size: {dist_world_size} {dist_rank}\n", end="")
 
         dl_num_workers = worker.num_workers if worker is not None else 1
         dl_worker_id = worker.id if worker is not None else 0
@@ -300,10 +320,6 @@ class NanogptDataset(IterableDataset):
                 file_end_pos = total_tokens
             else:
                 file_end_pos = file_start_pos + tokens_per_worker
-
-            print(
-                f"Worker {global_worker_id}/{total_workers} processing tokens {file_start_pos}:{file_end_pos} of {single_file}"
-            )
 
         if shuffle:
             rng.shuffle(worker_files)
@@ -346,13 +362,7 @@ class NanogptDataset(IterableDataset):
 
         # Optionally skip leading tokens until first BOS so slices start on BOS.
         if self.align_to_bos:
-            if bos_positions is not None:
-                # Use index file for efficient BOS search
-                pos = _find_next_bos_with_index(bos_positions, pos, max_pos)
-            else:
-                # Fall back to linear search
-                while pos < max_pos and tokens[pos].item() != self.bos_token:
-                    pos += 1
+            pos = _get_next_bos_position(tokens, self.bos_token, bos_positions, pos, max_pos)
 
         while pos + self.seq_len < max_pos:
             end = pos + self.seq_len + 1  # +1 for target shift
@@ -367,22 +377,9 @@ class NanogptDataset(IterableDataset):
             # Advance
             if self.align_to_bos:
                 # Find next BOS token for the start of the next sample
-                pos = end
-                if bos_positions is not None:
-                    # Use index file for efficient BOS search
-                    pos = _find_next_bos_with_index(bos_positions, pos, max_pos)
-                else:
-                    # Fall back to linear search
-                    while pos < max_pos and tokens[pos].item() != self.bos_token:
-                        pos += 1
+                pos = _get_next_bos_position(tokens, self.bos_token, bos_positions, end, max_pos)
             else:
                 pos = end
-
-        # Optionally drop remainder; otherwise cross shard (rarely useful)
-        if pos < max_pos and not self.align_to_bos:
-            # carry over remainder to next shard (currently unused but left for parity)
-            _carry = tokens[pos:]
-            # The carry is ignored in this implementation to avoid stateful buffering.
 
     def _get_file_iterator(
         self,
@@ -409,10 +406,7 @@ class NanogptDataset(IterableDataset):
             for file in worker_files:
                 yield from self._process_file_tokens(file, split_single_file, file_start_pos, file_end_pos)
 
-            if not self.infinite:
-                break
-
-            # Start a new epoch – optionally reshuffle
+            # Start a new epoch, optionally reshuffle
             if self.shuffle_files:
                 rng.shuffle(worker_files)
 
