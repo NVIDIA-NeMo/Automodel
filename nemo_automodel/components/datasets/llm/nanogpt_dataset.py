@@ -63,7 +63,6 @@ from typing import Iterator, List, Sequence
 
 import numpy as np
 import torch
-from torch.distributed.device_mesh import DeviceMesh
 from torch.utils.data import IterableDataset, get_worker_info
 
 __all__ = ["NanogptDataset", "load_bin_shard"]
@@ -103,7 +102,7 @@ def _load_bos_index(path: str | os.PathLike) -> np.ndarray | None:
         path = Path(path)
 
     # Look for .bos.idx file corresponding to the .bin file
-    idx_path = path.with_suffix('.bos.idx')
+    idx_path = path.with_suffix(".bos.idx")
 
     if not idx_path.exists():
         return None
@@ -183,7 +182,10 @@ def load_bin_shard(path: str | os.PathLike) -> torch.Tensor:
     # be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:203.)
     return torch.from_numpy(tokens_np)
 
-def _get_next_bos_position(tokens: torch.Tensor, bos_token: int, bos_positions: np.ndarray, pos: int, max_pos: int) -> int:
+
+def _get_next_bos_position(
+    tokens: torch.Tensor, bos_token: int, bos_positions: np.ndarray, pos: int, max_pos: int
+) -> int:
     """
     Get the next BOS token position.
 
@@ -205,6 +207,7 @@ def _get_next_bos_position(tokens: torch.Tensor, bos_token: int, bos_positions: 
         while pos < max_pos and tokens[pos].item() != bos_token:
             pos += 1
     return pos
+
 
 def _get_start_end_pos_single_file(total_tokens: int, total_workers: int, global_worker_id: int) -> tuple[int, int]:
     """
@@ -229,6 +232,7 @@ def _get_start_end_pos_single_file(total_tokens: int, total_workers: int, global
         file_end_pos = file_start_pos + tokens_per_worker
     return file_start_pos, file_end_pos
 
+
 def _get_worker_id_and_total_workers(worker: get_worker_info) -> tuple[int, int]:
     """
     Get the total number of workers.
@@ -252,6 +256,7 @@ def _get_worker_id_and_total_workers(worker: get_worker_info) -> tuple[int, int]
     global_worker_id = dist_rank * dl_num_workers + dl_worker_id
 
     return global_worker_id, total_workers
+
 
 class NanogptDataset(IterableDataset):
     """
@@ -339,8 +344,7 @@ class NanogptDataset(IterableDataset):
         if split_single_file:
             # Get the total number of tokens in the single file
             total_tokens = _peek_num_tokens(worker_files[0])
-            file_start_pos, file_end_pos = _get_start_end_pos_single_file(
-                total_tokens, total_workers, global_worker_id)
+            file_start_pos, file_end_pos = _get_start_end_pos_single_file(total_tokens, total_workers, global_worker_id)
 
         if shuffle:
             rng.shuffle(worker_files)
@@ -348,11 +352,7 @@ class NanogptDataset(IterableDataset):
         return worker_files, rng, split_single_file, file_start_pos, file_end_pos
 
     def _process_file_tokens(
-        self,
-        file: str,
-        split_single_file: bool,
-        file_start_pos: int,
-        file_end_pos: int
+        self, file: str, split_single_file: bool, file_start_pos: int, file_end_pos: int
     ) -> Iterator[dict]:
         """
         Process tokens from a single file and yield training samples.
@@ -411,7 +411,7 @@ class NanogptDataset(IterableDataset):
         rng: random.Random,
         split_single_file: bool,
         file_start_pos: int,
-        file_end_pos: int
+        file_end_pos: int,
     ) -> Iterator[dict]:
         """
         Generate training samples from all assigned files, handling infinite iteration.
@@ -441,12 +441,11 @@ class NanogptDataset(IterableDataset):
         Yields:
             Dictionary containing 'input_ids' and 'labels' for training
         """
-        worker_files, rng, split_single_file, file_start_pos, file_end_pos = \
-            self._setup_worker_context(self.files, self.shuffle_files)
-
-        yield from self._get_file_iterator(
-            worker_files, rng, split_single_file, file_start_pos, file_end_pos
+        worker_files, rng, split_single_file, file_start_pos, file_end_pos = self._setup_worker_context(
+            self.files, self.shuffle_files
         )
+
+        yield from self._get_file_iterator(worker_files, rng, split_single_file, file_start_pos, file_end_pos)
 
     def __len__(self) -> int:  # type: ignore[override]
         raise NotImplementedError("__len__ is not implemented for NanogptDataset.")
