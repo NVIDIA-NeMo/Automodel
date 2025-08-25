@@ -11,17 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from __future__ import annotations
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 
-def main(default_config_path="examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml"):
-    """Main entry point for the fine-tuning recipe.
+def main(default_config_path="examples/llm/nanogpt_pretrain.yaml"):
+    """Entry-point for launching NanoGPT-style pre-training.
 
-    Loads the configuration, sets up the recipe, and initiates the training loop.
+    The script follows the same invocation pattern as *examples/llm/finetune.py*:
+
+    ```bash
+    torchrun --nproc-per-node <NGPU> examples/llm/pretrain.py \
+        --config examples/llm/nanogpt_pretrain.yaml
+    ```
     """
     cfg = parse_args_and_load_config(default_config_path)
     recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)

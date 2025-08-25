@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,9 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import argparse
 
-from .nanogpt_dataset import NanogptDataset  # noqa: F401
+import nemo_automodel._cli.app as app
 
-__all__ = [
-    "NanogptDataset",
-]
+
+def test_cli_accepts_pretrain(tmp_path, monkeypatch):
+    parser = app.build_parser()
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text("dummy: 1")
+    args = parser.parse_args(["pretrain", "llm", "-c", str(cfg)])
+    assert args.command == "pretrain"
+    assert args.domain == "llm"
+    assert args.config == cfg 

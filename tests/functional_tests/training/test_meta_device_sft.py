@@ -22,7 +22,7 @@ import torch
 import torch.distributed.tensor
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction
+from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
 
@@ -59,7 +59,7 @@ def test_consolidated_llm_checkpoint():
     """
     cfg_path = get_cfg_path()
     if "llm" in cfg_path:
-        recipe_cls = FinetuneRecipeForNextTokenPrediction
+        recipe_cls = TrainFinetuneRecipeForNextTokenPrediction
         default_cfg_path = Path(__file__).parents[3] / "examples" / "llm_finetune" / "llama3_2" / "llama3_2_1b_hellaswag.yaml"
     elif "vlm" in cfg_path:
         recipe_cls = FinetuneRecipeForVLM

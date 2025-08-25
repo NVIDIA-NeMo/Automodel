@@ -27,7 +27,7 @@ import yaml
 
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes.llm.finetune import FinetuneRecipeForNextTokenPrediction, calculate_loss
+from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction, calculate_loss
 
 
 def load_dcp(ckpt_dir: Path | str) -> tuple[dict, dict]:
@@ -170,6 +170,9 @@ def test_dcp_checkpoint():
         "lm_head.weight": ([16000, 512], torch.bfloat16, "cpu"),
     }
     expected_optim_keys = {
+        "optim.state.model.embed_tokens.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.embed_tokens.weight.exp_avg": ([16000, 512], torch.bfloat16, "cpu"),
+        "optim.state.model.embed_tokens.weight.exp_avg_sq": ([16000, 512], torch.bfloat16, "cpu"),
         "optim.state.model.layers.0.self_attn.q_proj.weight.step": ([], torch.float32, "cpu"),
         "optim.state.model.layers.0.self_attn.q_proj.weight.exp_avg": ([256, 512], torch.bfloat16, "cpu"),
         "optim.state.model.layers.0.self_attn.q_proj.weight.exp_avg_sq": ([256, 512], torch.bfloat16, "cpu"),
@@ -750,7 +753,7 @@ def test_dcp_checkpoint():
 
     cfg_path = Path(__file__).parents[3] / "examples" / "llm_finetune" / "llama3_2" / "llama3_2_1b_hellaswag.yaml"
     cfg = parse_args_and_load_config(cfg_path)
-    trainer = FinetuneRecipeForNextTokenPrediction(cfg)
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
 
@@ -830,7 +833,7 @@ def test_dcp_checkpoint():
 
     # check if new model and current model give the same CE loss
     val_batch = next(iter(trainer.val_dataloader))
-    restored_model = FinetuneRecipeForNextTokenPrediction(cfg)
+    restored_model = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     restored_model.setup()
     restored_model = restored_model.model
     source_model_loss = get_validation_loss(trainer.model, val_batch, trainer.loss_fn, trainer.dist_env.device)

@@ -115,7 +115,7 @@ In this guide, we use the `SQuAD v1.1` dataset, but you can specify your own dat
 ## Use a Recipe to Fine-Tune the Model
 
 This example demonstrates how to fine-tune a large language model using NVIDIA's NeMo Automodel library.
-Specifically, we use the LLM [finetune recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py), and in particular, the `FinetuneRecipeForNextTokenPrediction` class to orchestrate the fine-tuning process end-to-end: model loading, dataset preparation, optimizer setup, distributed training, checkpointing, and logging.
+Specifically, we use the LLM [train-finetune recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py), and in particular, the `TrainFinetuneRecipeForNextTokenPrediction` class to orchestrate the fine-tuning process end-to-end: model loading, dataset preparation, optimizer setup, distributed training, checkpointing, and logging.
 
 ### What is a Recipe?
 
@@ -123,7 +123,7 @@ A recipe in NeMo Automodel is a **self-contained orchestration module** that wir
 components needed to perform a specific task (e.g., fine-tuning for next-token prediction or instruction tuning).
 Think of it as the equivalent of a Trainer class, but highly modular, stateful, and reproducible.
 
-The `FinetuneRecipeForNextTokenPrediction` class is one such recipe. It inherits from `BaseRecipe` and implements:
+The `TrainFinetuneRecipeForNextTokenPrediction` class is one such recipe. It inherits from `BaseRecipe` and implements:
 
 - `setup()`: builds all training components from the config
 

@@ -165,8 +165,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         metavar="<command>",
-        choices=["finetune"],
-        help="Command within the domain (e.g., finetune, generate, etc)",
+        choices=["finetune", "pretrain"],
+        help="Command within the domain (e.g., finetune, pretrain, generate, etc)",
     )
     parser.add_argument(
         "domain",
