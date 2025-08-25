@@ -22,7 +22,7 @@ examples/llm_finetune/finetune.py \
   --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
   --step_scheduler.max_steps 3 \
   --step_scheduler.global_batch_size 8 \
-  --step_scheduler.micro_batch_size 8 \
+  --step_scheduler.local_batch_size 8 \
   --dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
   --packed_sequence.packed_sequence_size 2048 \
   --validation_dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \

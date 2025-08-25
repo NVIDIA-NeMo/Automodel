@@ -21,7 +21,7 @@ _OVERRIDES = [
     "model.pretrained_model_name_or_path",
     "step_scheduler.max_steps",
     "step_scheduler.global_batch_size",
-    "step_scheduler.micro_batch_size",
+    "step_scheduler.local_batch_size",
     "dataset.tokenizer.pretrained_model_name_or_path",
     "validation_dataset.tokenizer.pretrained_model_name_or_path",
     "dataset.dataset_name",

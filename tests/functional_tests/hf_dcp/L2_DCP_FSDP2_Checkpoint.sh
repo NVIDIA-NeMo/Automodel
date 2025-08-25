@@ -24,7 +24,7 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
     --step_scheduler.max_steps 10 \
     --step_scheduler.global_batch_size 32 \
-    --step_scheduler.micro_batch_size 8 \
+    --step_scheduler.local_batch_size 8 \
     --dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
     --validation_dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
     --dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \

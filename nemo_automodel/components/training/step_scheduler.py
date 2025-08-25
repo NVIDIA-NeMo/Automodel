@@ -25,7 +25,7 @@ class StepScheduler(Stateful):
     def __init__(
         self,
         global_batch_size: int,
-        micro_batch_size: int,
+        local_batch_size: int,
         dp_size: int,
         ckpt_every_steps: int,
         dataloader: Optional[int],
@@ -40,7 +40,7 @@ class StepScheduler(Stateful):
 
         Args:
             global_batch_size (int): Number of steps for gradient accumulation.
-            micro_batch_size (int): Number of steps for gradient accumulation.
+            local_batch_size (int): Number of steps for gradient accumulation.
             dp_size (int): Number of steps for gradient accumulation.
             ckpt_every_steps (int): Frequency of checkpoint steps.
             dataloader (Optional[int]): The training dataloader.
@@ -50,12 +50,12 @@ class StepScheduler(Stateful):
             num_epochs (int): Total number of epochs.
             max_steps (int): Total number of steps to run. Default is 2^63-1.
         """
-        assert global_batch_size % (micro_batch_size * dp_size) == 0, (
-            "global_batch_size must be divisible by (micro_batch_size * dp_size)"
+        assert global_batch_size % (local_batch_size * dp_size) == 0, (
+            "global_batch_size must be divisible by (local_batch_size * dp_size)"
         )
-        self.grad_acc_steps = global_batch_size // (micro_batch_size * dp_size)
+        self.grad_acc_steps = global_batch_size // (local_batch_size * dp_size)
         assert self.grad_acc_steps >= 1, (
-            "grad_acc_steps must be greater than or equal to 1. Please ensure that global_batch_size >= (micro_batch_size * dp_size)"
+            "grad_acc_steps must be greater than or equal to 1. Please ensure that global_batch_size >= (local_batch_size * dp_size)"
         )
         self.ckpt_every_steps = ckpt_every_steps
         assert ckpt_every_steps > 0, "ckpt_every_steps must be greater than 0"

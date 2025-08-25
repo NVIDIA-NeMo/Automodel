@@ -21,7 +21,7 @@
 
 step_scheduler:
   global_batch_size: 32
-  micro_batch_size: 1 # 1 for benchmark, increase it for better throughput
+  local_batch_size: 1 # 1 for benchmark, increase it for better throughput
   ckpt_every_steps: 200
   val_every_steps: 200  # will run every x number of gradient steps
   num_epochs: 1

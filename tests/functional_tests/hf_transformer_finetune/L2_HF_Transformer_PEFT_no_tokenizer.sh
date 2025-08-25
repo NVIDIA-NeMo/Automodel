@@ -21,7 +21,7 @@ examples/llm_finetune/finetune.py \
   --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
   --step_scheduler.max_steps 3 \
   --step_scheduler.global_batch_size 8 \
-  --step_scheduler.micro_batch_size 8 \
+  --step_scheduler.local_batch_size 8 \
   --dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
   --dataset.limit_dataset_samples 10 \
   --peft._target_ nemo_automodel.components._peft.lora.PeftConfig \

@@ -247,7 +247,7 @@ def build_loss_fn(cfg_loss):
 
 
 def build_dataloader(
-    cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed, micro_batch_size
+    cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed, local_batch_size
 ) -> tuple[DataLoader, ProcessorMixin]:
     """Build a DataLoader for the VLM dataset.
 
@@ -258,7 +258,7 @@ def build_dataloader(
         cfg_processor: Processor configuration or None.
         device_mesh: Device mesh for distributed training.
         seed: Random seed.
-        micro_batch_size: Micro batch size.
+        local_batch_size: Local batch size.
 
     Returns:
         The instantiated DataLoader and processor.
@@ -306,7 +306,7 @@ def build_dataloader(
             collate_fn = lambda examples: COLLATE_FNS[processor_type](examples, processor)
 
         return cfg_dl.instantiate(
-            dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=micro_batch_size
+            dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=local_batch_size
         ), processor
 
         # Ensure spawn start method to avoid fork-safety issues with CUDA/JIT
@@ -319,7 +319,7 @@ def build_dataloader(
             pass
 
         return cfg_dl.instantiate(
-            dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=micro_batch_size
+            dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=local_batch_size
         ), processor
 
 
@@ -337,7 +337,7 @@ def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
     return initialize_distributed(backend=backend, timeout_minutes=timeout)
 
 
-def build_step_scheduler(cfg, dataloader, dp_group_size, micro_batch_size):
+def build_step_scheduler(cfg, dataloader, dp_group_size, local_batch_size):
     """Build the step scheduler.
 
     Args:
@@ -353,7 +353,7 @@ def build_step_scheduler(cfg, dataloader, dp_group_size, micro_batch_size):
     default_kwargs = dict(
         num_epochs=10,
         global_batch_size=32,
-        micro_batch_size=micro_batch_size,
+        local_batch_size=local_batch_size,
         dp_size=dp_group_size,
         ckpt_every_steps=100,
         dataloader=dataloader,
@@ -556,7 +556,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.cfg.get("processor", None),
             device_mesh=self.device_mesh,
             seed=self.cfg.get("seed", 42),
-            micro_batch_size=self.cfg.get("step_scheduler.micro_batch_size", 1),
+            local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
         )
 
         # Build validation dataloader if the config provides it
@@ -569,7 +569,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 self.cfg.get("processor", None),
                 device_mesh=self.device_mesh,
                 seed=self.cfg.get("seed", 42),
-                micro_batch_size=self.cfg.get("step_scheduler.micro_batch_size", 1),
+                local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
             )
 
         # Initialize metrics required for calculating loss
@@ -581,7 +581,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.cfg.get("step_scheduler", None),
             self.dataloader,
             self._get_dp_group_size(),
-            micro_batch_size=self.cfg.get("step_scheduler.micro_batch_size", 1),
+            local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
         )
 
         # Build learning rate scheduler

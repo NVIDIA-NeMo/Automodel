@@ -22,7 +22,7 @@ examples/vlm_finetune/finetune.py \
   --model.output_hidden_states true \
   --step_scheduler.max_steps 3 \
   --step_scheduler.global_batch_size 1 \
-  --step_scheduler.micro_batch_size 1 \
+  --step_scheduler.local_batch_size 1 \
   --step_scheduler.val_every_steps 1 \
   --loss_fn._target_ nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy \
   --dataset._target_=nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset \
