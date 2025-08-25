@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 import torch
 import torch.nn as nn
 import wandb
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoTokenizer
@@ -55,7 +55,6 @@ from nemo_automodel.components.utils.compile_utils import (
 from nemo_automodel.components.utils.dist_utils import get_sync_ctx
 from nemo_automodel.components.utils.model_utils import print_trainable_parameters
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from torch.utils.data import IterableDataset
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -251,12 +250,12 @@ def build_dataloader(
             "rank": device_mesh["dp"].get_local_rank(),
         }
     # if tokenizer is not provided, use the model config to instantiate it
-    if "tokenizer" not in cfg_ds and cfg_model.get('pretrained_model_name_or_path', None) is not None:
-            logging.info("Using model config to instantiate tokenizer")
-            trust_remote_code = getattr(cfg_model, "trust_remote_code", False)
-            tokenizer = AutoTokenizer.from_pretrained(
-                cfg_model.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
-            )
+    if "tokenizer" not in cfg_ds and cfg_model.get("pretrained_model_name_or_path", None) is not None:
+        logging.info("Using model config to instantiate tokenizer")
+        trust_remote_code = getattr(cfg_model, "trust_remote_code", False)
+        tokenizer = AutoTokenizer.from_pretrained(
+            cfg_model.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+        )
     elif cfg_ds.get("tokenizer", None) is None:
         tokenizer = None
     elif "_target_" not in cfg_ds.tokenizer:
@@ -643,11 +642,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
             labels = batch.pop("labels")
 
-            if (
-                "position_ids" not in batch
-                and self.device_mesh is not None
-                and self.device_mesh["cp"].size() > 1
-            ):
+            if "position_ids" not in batch and self.device_mesh is not None and self.device_mesh["cp"].size() > 1:
                 batch["position_ids"] = (
                     torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.dist_env.device)
                 )
