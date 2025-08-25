@@ -327,7 +327,7 @@ class NanogptDataset(IterableDataset):
 
         global_worker_id, total_workers = _get_worker_id_and_total_workers(worker)
         # Slice the file list so that each global worker gets roughly equal number of shards.
-        worker_files = files[global_worker_id::total_workers]
+        worker_files = files[global_worker_id::total_workers].copy()
         if not worker_files:
             worker_files = files.copy()  # fallback-duplication acceptable for small shard counts
 
