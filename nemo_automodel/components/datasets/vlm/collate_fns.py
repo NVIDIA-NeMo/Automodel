@@ -39,12 +39,13 @@ def create_loss_mask_with_start_of_response_token(input_ids, processor, start_of
     Returns:
         loss_mask: List of 0/1 flags where 0 = masked (prompt), 1 = unmasked (response)
     """
+
     def find_sequence_in_list(input_ids, target_sequence):
         """Find the starting index of target_sequence in input_ids"""
         if not target_sequence:
             return -1
         for i in range(len(input_ids) - len(target_sequence) + 1):
-            if input_ids[i:i+len(target_sequence)] == target_sequence:
+            if input_ids[i : i + len(target_sequence)] == target_sequence:
                 return i
         return -1
 
