@@ -185,7 +185,7 @@ class NanogptDataset(IterableDataset):
         except Exception:
             dist_world_size = 1
             dist_rank = 0
-        print(f"dist_world_size: {dist_world_size} {dist_rank}\n", end='')
+        print(f"dist_world_size: {dist_world_size} {dist_rank}\n", end="")
 
         dl_num_workers = worker.num_workers if worker is not None else 1
         dl_worker_id = worker.id if worker is not None else 0
@@ -220,7 +220,9 @@ class NanogptDataset(IterableDataset):
             else:
                 file_end_pos = file_start_pos + tokens_per_worker
 
-            print(f"Worker {global_worker_id}/{total_workers} processing tokens {file_start_pos}:{file_end_pos} of {single_file}")
+            print(
+                f"Worker {global_worker_id}/{total_workers} processing tokens {file_start_pos}:{file_end_pos} of {single_file}"
+            )
 
         if self.shuffle_files:
             rng.shuffle(worker_files)
@@ -291,15 +293,16 @@ class NanogptDataset(IterableDataset):
         # Calculate worker-specific parameters for potential single file splitting
         try:
             import torch.distributed as dist
+
             dist_world_size = dist.get_world_size() if dist.is_initialized() else 1
             dist_rank = dist.get_rank() if dist.is_initialized() else 0
         except Exception:
             dist_world_size = 1
             dist_rank = 0
 
-        # Note: We can't easily get DataLoader worker info here since __len__ is called 
+        # Note: We can't easily get DataLoader worker info here since __len__ is called
         # before workers are created, so we assume single DataLoader worker for length calculation
-        total_workers = dist_world_size  
+        total_workers = dist_world_size
         global_worker_id = dist_rank
 
         # Determine which files this worker would process
@@ -349,6 +352,7 @@ class NanogptDataset(IterableDataset):
         # Calculate worker-specific parameters for potential single file splitting
         try:
             import torch.distributed as dist
+
             dist_world_size = dist.get_world_size() if dist.is_initialized() else 1
             dist_rank = dist.get_rank() if dist.is_initialized() else 0
         except Exception:
