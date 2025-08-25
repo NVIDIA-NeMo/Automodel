@@ -82,12 +82,6 @@ def test_chunked_cross_entropy_matches_compute_cross_entropy():
     )
 
 
-
-# Function to check for GPU availability
-def has_gpu():
-    return torch.cuda.is_available()
-
-@pytest.mark.skipif(not has_gpu(), reason="GPU not available for this test.")
 def test_chunked_cross_entropy_ignore_index_and_mask():
     """
     Tests that ChunkedCrossEntropy properly ignores indices and respects masks.
@@ -110,7 +104,7 @@ def test_chunked_cross_entropy_ignore_index_and_mask():
 
     # Now compute ChunkedCrossEntropy with mask
     chunk_len = 3  # just an arbitrary small chunk size
-    loss_chunked = ChunkedCrossEntropy(chunk_len=chunk_len, ignore_index=ignore_idx)(logits, targets, loss_mask=mask)
+    loss_chunked = ChunkedCrossEntropy(chunk_len=chunk_len, ignore_index=ignore_idx)(logits, targets, mask=mask)
 
     assert torch.allclose(loss_chunked, loss_ref, atol=1e-6), (
         f"Expected chunked loss {loss_ref.item()}, but got {loss_chunked.item()}."
