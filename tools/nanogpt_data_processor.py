@@ -161,7 +161,7 @@ def make_parser():
         "--tokenizer",
         type=str,
         default="gpt2",
-        help="Tokenizer to use for tokenization",
+        help="Tokenizer to use for tokenization; model-id on HF hub.",
     )
     parser.add_argument(
         "--data-cache-dir",
