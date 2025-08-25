@@ -229,6 +229,29 @@ def _get_start_end_pos_single_file(total_tokens: int, total_workers: int, global
         file_end_pos = file_start_pos + tokens_per_worker
     return file_start_pos, file_end_pos
 
+def _get_worker_id_and_total_workers(worker: get_worker_info) -> tuple[int, int]:
+    """
+    Get the total number of workers.
+    """
+    # Determine the *global* worker id taking both DDP rank and DataLoader
+    # worker id into account so that every worker processes a disjoint
+    # subset of shards.
+    try:
+        import torch.distributed as dist
+
+        dist_world_size = dist.get_world_size() if dist.is_initialized() else 1
+        dist_rank = dist.get_rank() if dist.is_initialized() else 0
+    except Exception:
+        dist_world_size = 1
+        dist_rank = 0
+
+    dl_num_workers = worker.num_workers if worker is not None else 1
+    dl_worker_id = worker.id if worker is not None else 0
+
+    total_workers = dist_world_size * dl_num_workers
+    global_worker_id = dist_rank * dl_num_workers + dl_worker_id
+
+    return global_worker_id, total_workers
 
 class NanogptDataset(IterableDataset):
     """
@@ -302,24 +325,7 @@ class NanogptDataset(IterableDataset):
         else:
             rng.seed(os.getpid())
 
-        # Determine the *global* worker id taking both DDP rank and DataLoader
-        # worker id into account so that every worker processes a disjoint
-        # subset of shards.
-        try:
-            import torch.distributed as dist
-
-            dist_world_size = dist.get_world_size() if dist.is_initialized() else 1
-            dist_rank = dist.get_rank() if dist.is_initialized() else 0
-        except Exception:
-            dist_world_size = 1
-            dist_rank = 0
-
-        dl_num_workers = worker.num_workers if worker is not None else 1
-        dl_worker_id = worker.id if worker is not None else 0
-
-        total_workers = dist_world_size * dl_num_workers
-        global_worker_id = dist_rank * dl_num_workers + dl_worker_id
-
+        global_worker_id, total_workers = _get_worker_id_and_total_workers(worker)
         # Slice the file list so that each global worker gets roughly equal number of shards.
         worker_files = files[global_worker_id::total_workers]
         if not worker_files:
