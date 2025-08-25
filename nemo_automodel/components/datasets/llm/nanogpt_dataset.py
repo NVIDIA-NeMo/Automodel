@@ -11,22 +11,41 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch IterableDataset for .bin shards written by the modded-NanoGPT pre-processing script.
+"""PyTorch IterableDataset for .bin shards written by NanoGPT preprocessing scripts.
 
-Each shard has the following layout::
+Supports both legacy fineweb.py format and the newer nanogpt_data_processor.py format.
+
+Legacy format (fineweb.py)::
+
+    int32[256] header
+        header[0] = 20240520        # magic number
+        header[1] = 1               # version
+        header[2] = num_tokens      # number of uint16 tokens that follow
+        header[3] = (unused)        # defaults to 0
+
+    uint16[num_tokens] tokens
+
+New format (nanogpt_data_processor.py)::
 
     int32[256] header
         header[0] = 2788_95051      # magic number
         header[1] = 1               # version
-        header[2] = num_tokens      # number of uint16 tokens that follow
-        header[3] = dtype.itemsize  # bytes per token (2 for uint16)
+        header[2] = num_tokens      # number of tokens that follow
+        header[3] = dtype.itemsize  # bytes per token (2 for uint16, 4 for uint32)
 
-    uint16[num_tokens] tokens
+    uint16/uint32[num_tokens] tokens
+
+Optionally, a corresponding .bos.idx file can exist alongside each .bin file::
+
+    int32[n_bos_tokens] bos_positions
+        # Array of absolute byte positions where BOS tokens occur in the .bin file
 
 The dataset streams one contiguous *seq_len* token slice at a time and
 returns the pair ``(inputs, labels)`` where ``labels`` is shifted by one
 position.  Optionally, slices can be forced to start at the BOS token
-(``align_to_bos=True``).
+(``align_to_bos=True``). When BOS alignment is enabled, the dataset will use
+.bos.idx files for efficient BOS token lookup when available, falling back
+to linear search otherwise.
 
 This file is copied (with minimal adjustments) from
 ``modded-nanogpt/data/bin_dataset.py`` so that projects depending on
@@ -49,17 +68,74 @@ from torch.utils.data import IterableDataset, get_worker_info
 
 __all__ = ["NanogptDataset", "load_bin_shard"]
 
-MAGIC = 2788_95051
+# Support both legacy fineweb.py format and new nanogpt_data_processor.py format
+MAGIC = 2788_95051  # New format magic number
+LEGACY_MAGIC = 20240520  # Legacy fineweb.py magic number
 VERSION = 1
 HEADER_BYTES = 256 * 4  # 256 int32s
+
+# Export both magic numbers for compatibility
+HEADER_SIZE = 256
 
 
 def _peek_num_tokens(path: str | os.PathLike) -> int:
     """
     Returns total number of tokens from the shard header, without traversing the data.
+    Supports both legacy fineweb.py and new nanogpt_data_processor.py formats.
     """
     header = np.memmap(path, dtype=np.int32, mode="r", shape=(256,))
+    # Validate magic number for both supported formats
+    assert header[0] == MAGIC or header[0] == LEGACY_MAGIC, f"{path} magic number mismatch (got {header[0]})"
     return int(header[2])
+
+
+def _load_bos_index(path: str | os.PathLike) -> np.ndarray | None:
+    """
+    Load BOS token positions from a .bos.idx file if it exists.
+
+    Args:
+        path: Path to the .bin file (will look for corresponding .bos.idx file)
+
+    Returns:
+        Array of BOS token positions if index file exists, None otherwise.
+    """
+    if isinstance(path, str):
+        path = Path(path)
+
+    # Look for .bos.idx file corresponding to the .bin file
+    idx_path = path.with_suffix('.bos.idx')
+
+    if not idx_path.exists():
+        return None
+
+    try:
+        # Load BOS positions as int32 array
+        bos_positions = np.fromfile(idx_path, dtype=np.int32)
+        return bos_positions
+    except Exception:
+        # If there's any error loading the index file, return None to fall back to linear search
+        return None
+
+
+def _find_next_bos_with_index(bos_positions: np.ndarray, start_pos: int, max_pos: int) -> int:
+    """
+    Find the next BOS token position using the index.
+
+    Args:
+        bos_positions: Array of BOS token positions
+        start_pos: Current position to search from
+        max_pos: Maximum position to search up to
+
+    Returns:
+        Position of next BOS token, or max_pos if none found.
+    """
+    # Find BOS positions that are >= start_pos and < max_pos
+    valid_positions = bos_positions[(bos_positions >= start_pos) & (bos_positions < max_pos)]
+
+    if len(valid_positions) > 0:
+        return int(valid_positions[0])
+
+    return max_pos
 
 
 def _get_dtype_from_val(n_bytes: int) -> torch.dtype:
@@ -86,10 +162,17 @@ def load_bin_shard(path: str | os.PathLike) -> torch.Tensor:
 
     # Read header to sanity-check
     header = np.memmap(path, dtype=np.int32, mode="r", shape=(256,))
-    assert header[0] == MAGIC, f"{path} magic number mismatch (got {header[0]})"
+    assert header[0] == MAGIC or header[0] == LEGACY_MAGIC, f"{path} magic number mismatch (got {header[0]})"
     assert header[1] == VERSION, f"{path} version mismatch (got {header[1]})"
     num_tokens = int(header[2])
-    dtype = _get_dtype_from_val(int(header[3]))
+
+    # Handle dtype detection for both legacy and new formats
+    if header[0] == LEGACY_MAGIC:
+        # Legacy fineweb.py format: always uint16, header[3] not used
+        dtype = np.uint16
+    else:
+        # New nanogpt_data_processor.py format: header[3] contains bytes per token
+        dtype = _get_dtype_from_val(int(header[3]))
 
     # Memory-map the tokens. Offset skips the 256x4-byte header.
     tokens_np = np.memmap(path, dtype=dtype, mode="r", offset=HEADER_BYTES, shape=(num_tokens,))
@@ -110,6 +193,11 @@ class NanogptDataset(IterableDataset):
     - 256x4-byte header (magic number, version, num_tokens, dtype.itemsize)
     - And the tokens themselves.
 
+    Optionally, a corresponding .bos.idx file can be present alongside each .bin file
+    containing precomputed BOS token positions for efficient alignment when
+    ``align_to_bos=True``. If the index file is not present, the dataset falls back
+    to linear search for BOS tokens.
+
     Args:
         file_pattern : str | Sequence[str]
             Glob pattern (e.g. ``"data/fineweb_*_train_*.bin"``) **or** an explicit
@@ -122,15 +210,10 @@ class NanogptDataset(IterableDataset):
         align_to_bos : bool, default True
             Ensure that every slice starts with ``bos_token``.  When enabled, the
             dataset searches forward from the current position until it finds the
-            next BOS token and starts there.
+            next BOS token and starts there. Uses .bos.idx files when available
+            for efficient search, falls back to linear search otherwise.
         bos_token : int, default 50256
             Token ID marking beginning-of-document.
-        drop_last : bool, default True
-            If the end of a shard does not have enough tokens for a full slice,
-            skip the remainder rather than crossing the shard boundary.
-        infinite : bool, default True
-            Stream forever (wrap around shards).  When ``False``, stop after the
-            last shard is exhausted.
     """
 
     def __init__(
@@ -141,8 +224,6 @@ class NanogptDataset(IterableDataset):
         bos_token: int | None = None,
         shuffle_files: bool = False,
         align_to_bos: bool = False,
-        drop_last: bool = True,
-        infinite: bool = True,
         device_mesh: DeviceMesh = None,
     ) -> None:
         super().__init__()
@@ -158,11 +239,15 @@ class NanogptDataset(IterableDataset):
         if self.align_to_bos and bos_token is None:
             raise ValueError("bos_token must be provided when align_to_bos is True")
         self.bos_token = bos_token
-        self.drop_last = drop_last
-        self.infinite = infinite
         self.device_mesh = device_mesh
 
-    def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:  # noqa: C901
+    def _setup_worker_context(self, files, shuffle) -> tuple[List[str], random.Random, bool, int, int]:
+        """
+        Set up worker-specific context including file assignment and splitting parameters.
+
+        Returns:
+            Tuple of (worker_files, rng, split_single_file, file_start_pos, file_end_pos)
+        """
         # Worker-specific setup
         worker = get_worker_info()
         rng = random.Random()
@@ -172,11 +257,9 @@ class NanogptDataset(IterableDataset):
         else:
             rng.seed(os.getpid())
 
-        # ------------------------------------------------------------------
         # Determine the *global* worker id taking both DDP rank and DataLoader
         # worker id into account so that every worker processes a disjoint
         # subset of shards.
-        # ------------------------------------------------------------------
         try:
             import torch.distributed as dist
 
@@ -194,13 +277,11 @@ class NanogptDataset(IterableDataset):
         global_worker_id = dist_rank * dl_num_workers + dl_worker_id
 
         # Slice the file list so that each global worker gets roughly equal number of shards.
-        worker_files = self.files[global_worker_id::total_workers]
+        worker_files = files[global_worker_id::total_workers]
         if not worker_files:
-            worker_files = self.files.copy()  # fallback-duplication acceptable for small shard counts
+            worker_files = files.copy()  # fallback-duplication acceptable for small shard counts
 
-        # ------------------------------------------------------------------
         # Handle single file case: split the file among workers
-        # ------------------------------------------------------------------
         split_single_file = len(worker_files) == 1 and total_workers > 1
         file_start_pos = 0
         file_end_pos = None
@@ -224,50 +305,109 @@ class NanogptDataset(IterableDataset):
                 f"Worker {global_worker_id}/{total_workers} processing tokens {file_start_pos}:{file_end_pos} of {single_file}"
             )
 
-        if self.shuffle_files:
+        if shuffle:
             rng.shuffle(worker_files)
 
-        while True:
-            for file in worker_files:
-                tokens = load_bin_shard(file)
+        return worker_files, rng, split_single_file, file_start_pos, file_end_pos
 
-                # Set start and end positions based on whether we're splitting a single file
-                if split_single_file:
-                    pos = file_start_pos
-                    max_pos = min(file_end_pos, len(tokens))
+    def _process_file_tokens(
+        self,
+        file: str,
+        split_single_file: bool,
+        file_start_pos: int,
+        file_end_pos: int
+    ) -> Iterator[dict]:
+        """
+        Process tokens from a single file and yield training samples.
+
+        Args:
+            file: Path to the .bin file to process
+            split_single_file: Whether we're splitting a single file among workers
+            file_start_pos: Starting position in the file (for single file splitting)
+            file_end_pos: Ending position in the file (for single file splitting)
+
+        Yields:
+            Dictionary containing 'input_ids' and 'labels' for training
+        """
+        tokens = load_bin_shard(file)
+
+        # Load BOS index if available for efficient BOS alignment
+        bos_positions = None
+        if self.align_to_bos:
+            bos_positions = _load_bos_index(file)
+
+        # Set start and end positions based on whether we're splitting a single file
+        if split_single_file:
+            pos = file_start_pos
+            max_pos = min(file_end_pos, len(tokens))
+        else:
+            pos = 0
+            max_pos = len(tokens)
+
+        # Optionally skip leading tokens until first BOS so slices start on BOS.
+        if self.align_to_bos:
+            if bos_positions is not None:
+                # Use index file for efficient BOS search
+                pos = _find_next_bos_with_index(bos_positions, pos, max_pos)
+            else:
+                # Fall back to linear search
+                while pos < max_pos and tokens[pos].item() != self.bos_token:
+                    pos += 1
+
+        while pos + self.seq_len < max_pos:
+            end = pos + self.seq_len + 1  # +1 for target shift
+            if end > max_pos:
+                break
+            buf = tokens[pos:end]
+            assert len(buf) == self.seq_len + 1
+            inputs = buf[:-1].to(torch.int32).tolist()
+            labels = buf[1:].to(torch.int64).tolist()
+            yield dict(input_ids=inputs, labels=labels)
+
+            # Advance
+            if self.align_to_bos:
+                # Find next BOS token for the start of the next sample
+                pos = end
+                if bos_positions is not None:
+                    # Use index file for efficient BOS search
+                    pos = _find_next_bos_with_index(bos_positions, pos, max_pos)
                 else:
-                    pos = 0
-                    max_pos = len(tokens)
-
-                # Optionally skip leading tokens until first BOS so slices start on BOS.
-                if self.align_to_bos:
+                    # Fall back to linear search
                     while pos < max_pos and tokens[pos].item() != self.bos_token:
                         pos += 1
+            else:
+                pos = end
 
-                while pos + self.seq_len < max_pos:
-                    end = pos + self.seq_len + 1  # +1 for target shift
-                    if end > max_pos:
-                        break
-                    buf = tokens[pos:end]
-                    assert len(buf) == self.seq_len + 1
-                    inputs = buf[:-1].to(torch.int32).tolist()
-                    labels = buf[1:].to(torch.int64).tolist()
-                    yield dict(input_ids=inputs, labels=labels)
+        # Optionally drop remainder; otherwise cross shard (rarely useful)
+        if pos < max_pos and not self.align_to_bos:
+            # carry over remainder to next shard (currently unused but left for parity)
+            _carry = tokens[pos:]
+            # The carry is ignored in this implementation to avoid stateful buffering.
 
-                    # Advance
-                    if self.align_to_bos:
-                        # Find next BOS token for the start of the next sample
-                        pos = end
-                        while pos < max_pos and tokens[pos].item() != self.bos_token:
-                            pos += 1
-                    else:
-                        pos = end
+    def _get_file_iterator(
+        self,
+        worker_files: List[str],
+        rng: random.Random,
+        split_single_file: bool,
+        file_start_pos: int,
+        file_end_pos: int
+    ) -> Iterator[dict]:
+        """
+        Generate training samples from all assigned files, handling infinite iteration.
 
-                # Optionally drop remainder; otherwise cross shard (rarely useful)
-                if not self.drop_last and pos < max_pos and not self.align_to_bos:
-                    # carry over remainder to next shard (currently unused but left for parity)
-                    _carry = tokens[pos:]
-                    # The carry is ignored in this implementation to avoid stateful buffering.
+        Args:
+            worker_files: List of files assigned to this worker
+            rng: Random number generator for shuffling
+            split_single_file: Whether we're splitting a single file among workers
+            file_start_pos: Starting position in file (for single file splitting)
+            file_end_pos: Ending position in file (for single file splitting)
+
+        Yields:
+            Training sample dictionaries from all files
+        """
+        while True:
+            for file in worker_files:
+                yield from self._process_file_tokens(file, split_single_file, file_start_pos, file_end_pos)
 
             if not self.infinite:
                 break
@@ -276,141 +416,22 @@ class NanogptDataset(IterableDataset):
             if self.shuffle_files:
                 rng.shuffle(worker_files)
 
-    # ------------------------------------------------------------------
-    # Optional map-style access (limited)
-    # ------------------------------------------------------------------
+    def __iter__(self) -> Iterator[dict]:
+        """
+        Iterate over training samples from the dataset.
+
+        Yields:
+            Dictionary containing 'input_ids' and 'labels' for training
+        """
+        worker_files, rng, split_single_file, file_start_pos, file_end_pos = \
+            self._setup_worker_context(self.files, self.shuffle_files)
+
+        yield from self._get_file_iterator(
+            worker_files, rng, split_single_file, file_start_pos, file_end_pos
+        )
 
     def __len__(self) -> int:  # type: ignore[override]
-        """Total number of samples available **when** *infinite=False*.
+        raise NotImplementedError("__len__ is not implemented for NanogptDataset.")
 
-        For *infinite=True* datasets the length is undefined and a ``TypeError``
-        is raised because DataLoader would otherwise create an *epoch* concept
-        that never terminates[].
-        """
-        if self.infinite:
-            raise TypeError("`__len__` is undefined when `infinite=True`.")
-
-        # Calculate worker-specific parameters for potential single file splitting
-        try:
-            import torch.distributed as dist
-
-            dist_world_size = dist.get_world_size() if dist.is_initialized() else 1
-            dist_rank = dist.get_rank() if dist.is_initialized() else 0
-        except Exception:
-            dist_world_size = 1
-            dist_rank = 0
-
-        # Note: We can't easily get DataLoader worker info here since __len__ is called
-        # before workers are created, so we assume single DataLoader worker for length calculation
-        total_workers = dist_world_size
-        global_worker_id = dist_rank
-
-        # Determine which files this worker would process
-        worker_files = self.files[global_worker_id::total_workers]
-        if not worker_files:
-            worker_files = self.files.copy()
-
-        total_samples = 0
-
-        # Handle single file splitting case
-        if len(worker_files) == 1 and total_workers > 1:
-            file = worker_files[0]
-            total_tokens = _peek_num_tokens(file)
-
-            # Calculate this worker's portion
-            tokens_per_worker = total_tokens // total_workers
-            if global_worker_id == total_workers - 1:
-                worker_tokens = total_tokens - (global_worker_id * tokens_per_worker)
-            else:
-                worker_tokens = tokens_per_worker
-
-            # Each sample needs seq_len+1 tokens (for next-token target)
-            total_samples = max(0, worker_tokens - 1) // self.seq_len
-        else:
-            # Original logic for multiple files
-            for file in worker_files:
-                ntokens = _peek_num_tokens(file)
-                # Each sample needs seq_len+1 tokens (for next-token target).
-                total_samples += max(0, ntokens - 1) // (self.seq_len)
-
-        return total_samples
-
-    def __getitem__(self, index: int):  # type: ignore[override]
-        """Random access to a specific sample (slow).
-
-        Restrictions
-        ------------
-        * Only supported when ``infinite=False`` and ``align_to_bos=False``.
-        * Access is **O(seq_len)** because we may still need to map the shard
-          containing the sample, but no full scan is performed.
-        """
-        if self.infinite:
-            raise TypeError("Random access is not supported when `infinite=True`.")
-        if self.align_to_bos:
-            raise NotImplementedError("__getitem__ with align_to_bos=True is not implemented.")
-
-        # Calculate worker-specific parameters for potential single file splitting
-        try:
-            import torch.distributed as dist
-
-            dist_world_size = dist.get_world_size() if dist.is_initialized() else 1
-            dist_rank = dist.get_rank() if dist.is_initialized() else 0
-        except Exception:
-            dist_world_size = 1
-            dist_rank = 0
-
-        # Note: We can't easily get DataLoader worker info here, so assume single DataLoader worker
-        total_workers = dist_world_size
-        global_worker_id = dist_rank
-
-        # Determine which files this worker would process
-        worker_files = self.files[global_worker_id::total_workers]
-        if not worker_files:
-            worker_files = self.files.copy()
-
-        # Handle single file splitting case
-        if len(worker_files) == 1 and total_workers > 1:
-            file = worker_files[0]
-            total_tokens = _peek_num_tokens(file)
-
-            # Calculate this worker's portion
-            tokens_per_worker = total_tokens // total_workers
-            file_start_pos = global_worker_id * tokens_per_worker
-
-            if global_worker_id == total_workers - 1:
-                file_end_pos = total_tokens
-            else:
-                file_end_pos = file_start_pos + tokens_per_worker
-
-            worker_tokens = file_end_pos - file_start_pos
-            max_samples = max(0, worker_tokens - 1) // self.seq_len
-
-            if index >= max_samples:
-                raise IndexError(f"index {index} out of range for worker {global_worker_id} (max: {max_samples})")
-
-            # Calculate the absolute position in the file for this sample
-            start = file_start_pos + index * self.seq_len
-            tokens = load_bin_shard(file)
-            buf = tokens[start : start + self.seq_len + 1]
-            inputs = buf[:-1].to(torch.int32)
-            labels = buf[1:].to(torch.int64)
-            return inputs, labels
-
-        else:
-            # Original logic for multiple files
-            running = 0
-            for file in worker_files:
-                ntokens = _peek_num_tokens(file)
-                samples_in_file = max(0, ntokens - 1) // (self.seq_len)
-                if index < running + samples_in_file:
-                    # The desired sample lives in this file
-                    local_idx = index - running
-                    start = local_idx * self.seq_len
-                    tokens = load_bin_shard(file)
-                    buf = tokens[start : start + self.seq_len + 1]
-                    inputs = buf[:-1].to(torch.int32)
-                    labels = buf[1:].to(torch.int64)
-                    return inputs, labels
-                running += samples_in_file
-
-        raise IndexError("index out of range")
+    def __getitem__(self, index: int):
+        raise NotImplementedError("__getitem__ is not implemented for NanogptDataset.")
