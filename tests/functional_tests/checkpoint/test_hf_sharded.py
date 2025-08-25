@@ -184,6 +184,9 @@ def test_hf_sharded_checkpoint():
         "lm_head.weight": ([16000, 512], torch.bfloat16, "cpu"),
     }
     expected_optim_keys = {
+        "optim.state.model.embed_tokens.weight.exp_avg_sq": ([16000, 512], torch.bfloat16, "cpu"),
+        "optim.state.model.embed_tokens.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.embed_tokens.weight.exp_avg": ([16000, 512], torch.bfloat16, "cpu"),
         "optim.state.model.layers.0.self_attn.q_proj.weight.step": ([], torch.float32, "cpu"),
         "optim.state.model.layers.0.self_attn.q_proj.weight.exp_avg": ([256, 512], torch.bfloat16, "cpu"),
         "optim.state.model.layers.0.self_attn.q_proj.weight.exp_avg_sq": ([256, 512], torch.bfloat16, "cpu"),
