@@ -24,7 +24,8 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run \
     --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
     --step_scheduler.max_steps 10 \
-    --step_scheduler.grad_acc_steps 1 \
+    --step_scheduler.global_batch_size 32 \
+    --step_scheduler.micro_batch_size 8 \
     --dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
     --validation_dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
     --dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
