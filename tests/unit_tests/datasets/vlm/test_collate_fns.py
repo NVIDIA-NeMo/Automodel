@@ -85,7 +85,9 @@ class DummyDefaultProcessor:
         conv_list,
         *,
         tokenize: bool,
-        add_generation_prompt: bool,
+        add_generation_prompt: bool = True,
+        padding: bool = False,
+        truncation: bool = False,
         return_tensors: str,
         return_dict: bool,
     ):
@@ -222,31 +224,18 @@ class TestCreateLossMaskWithStartOfResponseToken:
         expected = [1, 1, 1, 1, 1]
         assert result == expected
 
-    def test_start_of_response_token_found_twice(self, collate_mod):
-        """Test when start_of_response_token is found twice (normal case)."""
+    def test_complete_sequence_found(self, collate_mod):
+        """Test when complete start_of_response_token sequence is found."""
         processor = DummyQwen25Processor()
-        # Create input_ids with start_of_turn token (100) appearing twice
-        # [0, 100, 1, 2, 100, 101, 102, 3, 4]
-        input_ids = torch.tensor([0, 100, 1, 2, 100, 101, 102, 3, 4])
+        # Input contains the complete sequence [100, 101, 102] at indices 4-6
+        input_ids = torch.tensor([0, 1, 2, 3, 100, 101, 102, 7, 8])
+        
         result = collate_mod.create_loss_mask_with_start_of_response_token(
             input_ids, processor, start_of_response_token="<start_of_turn>model\n"
         )
 
-        # First occurrence at index 1, second occurrence at index 4
-        # Response starts at index 4 + 3 - 1 = 6 (after the response token sequence)
+        # Complete sequence found at index 4-6, response starts at index 4 (include start token)
         expected = [0, 0, 0, 0, 1, 1, 1, 1, 1]
-        assert result == expected
-
-    def test_start_of_response_token_found_only_once(self, collate_mod):
-        """Test when start_of_response_token is found only once."""
-        processor = DummyQwen25Processor()
-        input_ids = torch.tensor([0, 100, 1, 2, 3])
-
-        result = collate_mod.create_loss_mask_with_start_of_response_token(
-            input_ids, processor, start_of_response_token="<start_of_turn>model\n"
-        )
-
-        expected = [0, 1, 1, 1, 1]
         assert result == expected
 
     def test_start_of_response_token_not_found(self, collate_mod):
@@ -258,33 +247,36 @@ class TestCreateLossMaskWithStartOfResponseToken:
             input_ids, processor, start_of_response_token="<start_of_turn>model\n"
         )
 
-        # Should return all 1s when token is not found
+        # Should return all 1s when token sequence is not found
         expected = [1, 1, 1, 1, 1]
         assert result == expected
 
-    def test_with_tensor_input(self, collate_mod):
-        """Test that function works with tensor input."""
+    def test_partial_sequence_not_matched(self, collate_mod):
+        """Test that partial sequences don't trigger false positives."""
         processor = DummyQwen25Processor()
-        input_ids = torch.tensor([0, 100, 1, 2, 100, 101, 102, 3, 4])
+        # Input has token 100 but not the complete sequence [100, 101, 102]
+        input_ids = torch.tensor([1, 100, 2, 3, 4])  # Changed to avoid padding token at start
 
         result = collate_mod.create_loss_mask_with_start_of_response_token(
             input_ids, processor, start_of_response_token="<start_of_turn>model\n"
         )
 
-        expected = [0, 0, 0, 0, 1, 1, 1, 1, 1]
+        # Complete sequence not found, should return all 1s
+        expected = [1, 1, 1, 1, 1]
         assert result == expected
 
     def test_single_token_response_marker(self, collate_mod):
         """Test with single token response marker."""
         processor = DummyQwen25Processor()
-        input_ids = torch.tensor([0, 100, 1, 2, 100, 3, 4])
+        # Looking for single token [100], first occurrence at index 1
+        input_ids = torch.tensor([0, 100, 1, 2, 3])
 
         result = collate_mod.create_loss_mask_with_start_of_response_token(
             input_ids, processor, start_of_response_token="<start_of_turn>"
         )
 
-        # Response starts at index 4 + 1 - 1 = 4
-        expected = [0, 0, 0, 0, 1, 1, 1]
+        # Single token found at index 1, response starts at index 1 (include start token)
+        expected = [0, 1, 1, 1, 1]
         assert result == expected
 
     def test_padding_tokens_masked(self, collate_mod):
@@ -292,14 +284,14 @@ class TestCreateLossMaskWithStartOfResponseToken:
         processor = DummyQwen25Processor()
         processor.tokenizer = DummyTokenizer(pad_token_id=0)
         # Input with padding tokens (0s) at the end
-        input_ids = torch.tensor([1, 100, 2, 3, 100, 101, 102, 4, 0, 0])
+        input_ids = torch.tensor([1, 2, 100, 101, 102, 3, 4, 0, 0])
 
         result = collate_mod.create_loss_mask_with_start_of_response_token(
             input_ids, processor, start_of_response_token="<start_of_turn>model\n"
         )
 
-        # Response starts at index 4 + 3 = 7, but padding tokens at end should be masked
-        expected = [0, 0, 0, 0, 1, 1, 1, 1, 0, 0]
+        # Complete sequence at index 2-4, response starts at index 2 (include start token), padding tokens masked
+        expected = [0, 0, 1, 1, 1, 1, 1, 0, 0]
         assert result == expected
 
     def test_padding_tokens_in_middle(self, collate_mod):
@@ -307,14 +299,14 @@ class TestCreateLossMaskWithStartOfResponseToken:
         processor = DummyQwen25Processor()
         processor.tokenizer = DummyTokenizer(pad_token_id=0)
         # Input with padding tokens (0s) in the middle
-        input_ids = torch.tensor([1, 100, 0, 3, 100, 101, 102, 4, 5])
+        input_ids = torch.tensor([1, 0, 100, 101, 102, 3, 4])
 
         result = collate_mod.create_loss_mask_with_start_of_response_token(
             input_ids, processor, start_of_response_token="<start_of_turn>model\n"
         )
 
-        # Response starts at index 4 + 3 = 7, but padding token at index 2 should be masked
-        expected = [0, 0, 0, 0, 1, 1, 1, 1, 1]
+        # Complete sequence at index 2-4, response starts at index 2 (include start token), padding token at index 1 masked
+        expected = [0, 0, 1, 1, 1, 1, 1]
         assert result == expected
 
     def test_custom_pad_token_id(self, collate_mod):
@@ -322,14 +314,14 @@ class TestCreateLossMaskWithStartOfResponseToken:
         processor = DummyQwen25Processor()
         processor.tokenizer = DummyTokenizer(pad_token_id=999)
         # Input with custom padding tokens (999s) at the end
-        input_ids = torch.tensor([1, 100, 2, 3, 100, 101, 102, 4, 999, 999])
+        input_ids = torch.tensor([1, 2, 100, 101, 102, 3, 999, 999])
 
         result = collate_mod.create_loss_mask_with_start_of_response_token(
             input_ids, processor, start_of_response_token="<start_of_turn>model\n"
         )
 
-        # Response starts at index 4 + 3 = 7, but padding tokens at end should be masked
-        expected = [0, 0, 0, 0, 1, 1, 1, 1, 0, 0]
+        # Complete sequence at index 2-4, response starts at index 2 (include start token), custom padding tokens masked
+        expected = [0, 0, 1, 1, 1, 1, 0, 0]
         assert result == expected
 
 
@@ -391,8 +383,8 @@ class TestCollateFunctionIntegration:
 
         expected = torch.tensor(
             [
-                [0, 0, 0, 0, 1, 1, 1, 1, 0],  # Padding token at end is masked
-                [0, 0, 0, 0, 1, 1, 1, 1, 1],  # No padding tokens
+                [0, 0, 0, 0, 1, 1, 1, 1, 0],  # Complete sequence at 4-6, response starts at 4 (include start token), padding token masked
+                [0, 0, 0, 0, 1, 1, 1, 1, 1],  # Complete sequence at 4-6, response starts at 4 (include start token), no padding
             ],
             dtype=torch.float,
             device=batch_input_ids.device,
@@ -420,7 +412,7 @@ class TestCollateFunctionIntegration:
 
         expected = torch.tensor(
             [
-                [0, 0, 0, 0, 1, 1, 1, 1, 1],  # Valid response start at position 4
+                [0, 0, 0, 0, 1, 1, 1, 1, 1],  # Complete sequence at 4-6, response starts at 4 (include start token)
                 [1, 1, 1, 1, 1, 1, 1, 1, 1],  # No masking (all 1s)
             ],
             dtype=torch.float,
