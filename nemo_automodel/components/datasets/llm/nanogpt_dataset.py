@@ -340,7 +340,7 @@ class NanogptDataset(IterableDataset):
             # Get the total number of tokens in the single file
             total_tokens = _peek_num_tokens(worker_files[0])
             file_start_pos, file_end_pos = _get_start_end_pos_single_file(
-                total_tokens, total_tokens, total_workers, global_worker_id)
+                total_tokens, total_workers, global_worker_id)
 
         if shuffle:
             rng.shuffle(worker_files)
