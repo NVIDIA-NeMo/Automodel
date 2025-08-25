@@ -206,6 +206,30 @@ def _get_next_bos_position(tokens: torch.Tensor, bos_token: int, bos_positions: 
             pos += 1
     return pos
 
+def _get_start_end_pos_single_file(total_tokens: int, total_workers: int, global_worker_id: int) -> tuple[int, int]:
+    """
+    Get the start and end positions for a single file, accounting for the number of workers.
+
+    Args:
+        total_tokens: Total number of tokens in the file
+        total_workers: Total number of workers
+        global_worker_id: Global worker ID
+
+    Returns:
+        Tuple of (start position, end position)
+    """
+    # Calculate the portion for this worker
+    tokens_per_worker = total_tokens // total_workers
+    file_start_pos = global_worker_id * tokens_per_worker
+
+    # Last worker gets any remaining tokens
+    if global_worker_id == total_workers - 1:
+        file_end_pos = total_tokens
+    else:
+        file_end_pos = file_start_pos + tokens_per_worker
+    return file_start_pos, file_end_pos
+
+
 class NanogptDataset(IterableDataset):
     """
     Dataset class for NanoGPT Dataset.
@@ -308,18 +332,9 @@ class NanogptDataset(IterableDataset):
 
         if split_single_file:
             # Get the total number of tokens in the single file
-            single_file = worker_files[0]
-            total_tokens = _peek_num_tokens(single_file)
-
-            # Calculate the portion for this worker
-            tokens_per_worker = total_tokens // total_workers
-            file_start_pos = global_worker_id * tokens_per_worker
-
-            # Last worker gets any remaining tokens
-            if global_worker_id == total_workers - 1:
-                file_end_pos = total_tokens
-            else:
-                file_end_pos = file_start_pos + tokens_per_worker
+            total_tokens = _peek_num_tokens(worker_files[0])
+            file_start_pos, file_end_pos = _get_start_end_pos_single_file(
+                total_tokens, total_tokens, total_workers, global_worker_id)
 
         if shuffle:
             rng.shuffle(worker_files)
@@ -355,7 +370,10 @@ class NanogptDataset(IterableDataset):
         # Set start and end positions based on whether we're splitting a single file
         if split_single_file:
             pos = file_start_pos
-            max_pos = min(file_end_pos, len(tokens))
+            if file_end_pos is not None:
+                max_pos = min(file_end_pos, len(tokens))
+            else:
+                max_pos = len(tokens)
         else:
             pos = 0
             max_pos = len(tokens)
