@@ -11,7 +11,18 @@ dist_env:
   timeout_minutes: 1
 
 # Model
-# Option 1 – explicit HF config (default):
+# Option 1 – shorthand builder
+model:
+  _target_: nemo_automodel.components.models.gpt2.build_gpt2_model
+  vocab_size: 50258   # default 50257
+  n_positions: 2048   # context length
+  n_embd: 768         # hidden size
+  n_layer: 12         # number of transformer blocks
+  n_head: 12          # attention heads
+  bos_token_id: 50256
+  eos_token_id: 50256
+
+# Option 2 – explicit HF config (uncomment to use)
 # model:
 #   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
 #   config:
@@ -25,17 +36,6 @@ dist_env:
 #     bos_token_id: 50256
 #     eos_token_id: 50256
 
-# Option 2 – shorthand builder (uncomment to use):
-model:
-  _target_: nemo_automodel.components.models.gpt2.build_gpt2_model
-  vocab_size: 50258   # default 50257
-  n_positions: 2048   # context length
-  n_embd: 768         # hidden size
-  n_layer: 12         # number of transformer blocks
-  n_head: 12          # attention heads
-  bos_token_id: 50256
-  eos_token_id: 50256
-
 # Dataset
 # Point this to the location where your *.bin shards live.
 # The pattern below matches the sample shards included in *modded-nanogpt*.
@@ -44,8 +44,8 @@ dataset:
   file_pattern: "modded-nanogpt/data/fineweb_10BT_max_500M/fineweb_train_*.bin"
   seq_len: 1024
   shuffle_files: true
-  drop_last: true
-  infinite: false
+  align_to_bos: false
+  bos_token: 50256 # optional, only needed if align_to_bos is true
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
