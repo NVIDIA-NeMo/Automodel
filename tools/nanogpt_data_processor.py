@@ -22,13 +22,13 @@ with `BinTokenDataset` for efficient streaming pre-training.
 Usage (typical):
 
 ```bash
-python tools/data_preprocessor.py \
+python tools/nanogpt_data_processor.py \
     --dataset HuggingFaceFW/fineweb \
     --set-name sample-10BT \
     --max-tokens 500M
 ```
 
-See the make_parser function for CLI options or run `python tools/data_preprocessor.py --help`.
+See the make_parser function for CLI options or run `python tools/nanogpt_data_processor.py --help`.
 """
 
 import argparse
@@ -39,26 +39,22 @@ import os
 import queue  # for Empty exception handling
 from functools import lru_cache
 
+import logging
 import numpy as np
 from transformers import PreTrainedTokenizer
 
 try:
     from nemo_automodel.components.datasets.llm.nanogpt_dataset import (
-        HEADER_SIZE as BIN_HEADER_SIZE,
-    )
-    from nemo_automodel.components.datasets.llm.nanogpt_dataset import (
-        MAGIC as BIN_MAGIC_NUMBER,
-    )
-    from nemo_automodel.components.datasets.llm.nanogpt_dataset import (
-        VERSION as BIN_VERSION,
+        HEADER_SIZE,
+        MAGIC,
+        VERSION,
     )
 except ImportError:
-    # Fallback to local constants if nemo_automodel is not installed
-    print("nemo_automodel not installed, using local constants")
-    BIN_MAGIC_NUMBER = 2788_95051
-    BIN_HEADER_SIZE = 256
-    BIN_VERSION = 1
-
+    logging.warning("nemo_automodel not installed, using local constants; this is not recommended;")
+    logging.warning("Please install nemo_automodel or modify the PYTHONPATH to include the nemo_automodel directory")
+    HEADER_SIZE = 256
+    MAGIC = 2788_95051
+    VERSION = 1
 
 class _parse_tokens_arg(int):
     """An int subclass that can parse human-friendly token counts (e.g. 500M)."""
@@ -223,9 +219,9 @@ class BinaryDataWriter:
 
         self.dtype = dtype
         # header
-        self.header = np.zeros(BIN_HEADER_SIZE, dtype=np.int32)
-        self.header[0] = BIN_MAGIC_NUMBER
-        self.header[1] = BIN_VERSION  # version
+        self.header = np.zeros(HEADER_SIZE, dtype=np.int32)
+        self.header[0] = MAGIC
+        self.header[1] = VERSION
         self.header[2] = 0  # number of tokens in *toks*
         self.header[3] = dtype.itemsize  # bytes per token
 
