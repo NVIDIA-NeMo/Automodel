@@ -102,29 +102,55 @@ def to_cpu(
     """
     Converts a state dictionary to CPU.
     """
-    return {k: v.cpu() if isinstance(v, torch.Tensor) else to_cpu(v) for k, v in state_dict.items()}
+    return {k: v.cpu() for k, v in state_dict.items() if isinstance(v, torch.Tensor)}
 
 
 def get_validation_loss(
-    model: nn.Module, val_batch: dict[str, torch.Tensor], loss_fn: nn.Module, device: torch.device
+    model_parts: list[nn.Module], val_batch: dict[str, torch.Tensor], loss_fn: nn.Module, device: torch.device, pp_enabled: bool, pp,
 ) -> torch.Tensor:
     """Gets the validation loss for a model."""
+    loss_buffer = []
     val_batch = {k: v.to(device, non_blocking=True) for k, v in val_batch.items()}
-    model.eval()
+    num_label_tokens = (val_batch["labels"] != -100).sum().item()
+    for model_part in model_parts:
+        model_part.eval()
     labels = val_batch.pop("labels")
     loss_mask = val_batch.pop("loss_mask", None)
     if loss_mask is None:
         loss_mask = (labels.detach() != -100).to(torch.int)
 
-    with torch.no_grad():
-        out = model(**val_batch)
-        loss = calculate_loss(
-                loss_fn,
-                logits=out.logits,
-                labels=labels,
-                mask=loss_mask,
-            )
-        return loss
+    if not pp_enabled:
+        with torch.no_grad():
+            out = model_parts[0](**val_batch)
+            loss = calculate_loss(
+                    loss_fn,
+                    logits=out.logits,
+                    labels=labels,
+                    model=model_parts[0],
+                    num_label_tokens=num_label_tokens,
+
+                )
+            return [loss]
+    else:
+        losses = [] if pp.info.has_last_stage else None
+        if pp.info.has_last_stage:
+            masked_labels = labels.clone()
+            targets = masked_labels
+        else:
+            targets = None
+
+        input_ids = val_batch.pop("input_ids")
+        if pp.info.has_first_stage:
+            pp.info.schedule.step(input_ids, target=targets, losses=losses, **val_batch)
+        else:
+            pp.info.schedule.step(target=targets, losses=losses, **val_batch)
+        if pp.info.has_last_stage:
+            local_loss = torch.sum(torch.stack(losses))
+        else:
+            local_loss = torch.tensor(0.0, device=device)
+
+        loss_buffer.append(local_loss.clone().detach())
+        return loss_buffer
 
 
 def test_consolidated_llm_checkpoint():
@@ -786,14 +812,14 @@ def test_consolidated_llm_checkpoint():
     # checkpoint is saved at this point
     # first extract the in-memory checkpoint
     model_state_dict = ModelState(
-        trainer.model,
+        trainer.model_parts,
     ).state_dict()
     optimizer_state_dict = to_cpu(
         OptimizerState(
-            trainer.model,
+            trainer.model_parts,
             trainer.optimizer,
-            trainer.step_scheduler,
-        ).state_dict()["optim"]["state"]
+            trainer.lr_scheduler,
+        ).state_dict()["optim"]
     )
 
     # assert the correct paths exist
@@ -843,7 +869,7 @@ def test_consolidated_llm_checkpoint():
             "test_dcp_checkpoint: lr_scheduler not found in restored trainer"
         )
 
-        restored_lr_state = trainer.lr_scheduler.state_dict()
+        restored_lr_state = trainer.lr_scheduler[0].state_dict()
 
         for key in saved_lr_scheduler_state:
             assert key in restored_lr_state, f"test_dcp_checkpoint: lr_scheduler key {key} missing in restored state"
@@ -874,10 +900,9 @@ def test_consolidated_llm_checkpoint():
     val_batch = next(iter(trainer.val_dataloader))
     restored_model = FinetuneRecipeForNextTokenPrediction(cfg)
     restored_model.setup()
-    restored_model = restored_model.model
-    source_model_loss = get_validation_loss(trainer.model, val_batch, trainer.loss_fn, trainer.dist_env.device)
-    restored_model_loss = get_validation_loss(restored_model, val_batch, trainer.loss_fn, trainer.dist_env.device)
-    assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
+    source_model_loss = get_validation_loss(trainer.model_parts, val_batch, trainer.loss_fn, trainer.dist_env.device, trainer.pp_enabled, trainer.pp)
+    restored_model_loss = get_validation_loss(restored_model.model_parts, val_batch, trainer.loss_fn, trainer.dist_env.device, restored_model.pp_enabled, restored_model.pp)
+    assert sum(source_model_loss) == sum(restored_model_loss), "Model loss mismatch"
 
     # compare the recipe configs
     with open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "config.yaml", "r") as f:
@@ -889,38 +914,20 @@ def test_consolidated_llm_checkpoint():
         AutoModelForCausalLM.from_pretrained(
             Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "model" / "consolidated"
         )
-        .to(trainer.model.dtype)
+        .to(trainer.model_parts[0].dtype)
         .to(trainer.dist_env.device)
     )
     for source_key, source_param in model_state_dict.items():
         for consolidated_key, consolidated_param in consolidated_model.named_parameters():
             if source_key in consolidated_key:
-                assert torch.allclose(source_param.full_tensor(), consolidated_param), (
+                param = source_param.full_tensor() if isinstance(source_param, torch.distributed.tensor.DTensor) else source_param
+                assert torch.allclose(param, consolidated_param), (
                     "Parameter values are different when they should be the same"
                 )
 
-    # similarly, the optimizer states are saved in a dictionary formatted as:
-    # {
-    #     "optim": OptimizerState(...),
-    #     "step_scheduler": StepSchedulerState(...)
-    # }
-    # and in addition, the optimizer state is saved in a dictionary formatted as:
-    # {
-    #     "optim": {
-    #         "state": {
-    #             "model.layers.0.self_attn.q_proj.weight":
-    #                 "step": ...,
-    #                 "exp_avg": ...
-    #                 "exp_avg_sq": ...
-    #         }
-    #     }
-    # }
-    # because of this, DCP will flatten the optimizer state dictionary to:
-    # {
-    #     "optim.state.model.layers.0.self_attn.q_proj.weight.step": ...
-    # }
-    # so we flatten the in-memory optimizer state dictionary to match the on-disk view
-    flattened_optim_dict = _flatten(optimizer_state_dict, parent_key="optim.state")
+    # the saved optimizer state has an "optim." prefix that DCP adds.
+    # For the on-disk view to match, it needs to be prepended with the "optim." prefix
+    optimizer_state_dict = _rename_keys(optimizer_state_dict, "optim.")
 
     # ---------------------------------------------------------------------
     # Compare the flattened in-memory model state with the on-disk view
@@ -942,10 +949,12 @@ def test_consolidated_llm_checkpoint():
     # Note: all ranks should test their own shard of the model state and optimizer state
 
     # Compare the values, shapes, dtype, and device of the in-memory and on-disk model state
-    for k in expected_model_keys.keys():
+    for k in model_state_dict.keys():
         v = model_state_dict[k]
         if isinstance(v, torch.distributed.tensor.DTensor):
             v = v.to_local().cpu()
+        else:
+            v = v.cpu()
         assert k in restored_model_dict, f"Key {k} not found in restored model state"
         assert isinstance(
             restored_model_dict[k],
@@ -954,11 +963,18 @@ def test_consolidated_llm_checkpoint():
 
         # Get expected shape, dtype, device from expected_model_keys
         expected_shape, expected_dtype, expected_device = expected_model_keys[k]
+        expected_shape = expected_shape.copy()
 
-        curr_shard = torch.split(
-            restored_model_dict[k],
-            restored_model_dict[k].shape[0] // 2,
-        )[torch.distributed.get_rank()]
+        if trainer.pp_enabled:
+            if len(expected_shape) > 0:
+                expected_shape[0] *= 2
+            curr_shard = restored_model_dict[k]
+        else:
+            curr_shard = torch.split(
+                restored_model_dict[k],
+                restored_model_dict[k].shape[0] // 2,
+            )[torch.distributed.get_rank()]
+
         assert list(curr_shard.shape) == expected_shape, (
             f"Shape mismatch for key {k}. Expected shape {expected_shape} but got {curr_shard.shape}"
         )
@@ -971,10 +987,12 @@ def test_consolidated_llm_checkpoint():
         assert torch.allclose(v, curr_shard), f"Value mismatch for key {k}. Tensors are not numerically close"
 
     # Compare the values, shapes, dtype, and device of the in-memory and on-disk consolidated model state
-    for k in expected_model_keys.keys():
+    for k in model_state_dict.keys():
         v = model_state_dict[k]
         if isinstance(v, torch.distributed.tensor.DTensor):
             v = v.full_tensor().cpu()
+        else:
+            v = v.cpu()
         assert k in restored_model_dict_consolidated, f"Key {k} not found in restored model state"
         assert isinstance(
             restored_model_dict_consolidated[k],
@@ -983,6 +1001,7 @@ def test_consolidated_llm_checkpoint():
 
         # Get expected shape, dtype, device from expected_model_keys
         expected_shape, expected_dtype, expected_device = expected_model_keys[k]
+        expected_shape = expected_shape.copy()
         expected_shape[0] *= 2  # since the hardcoded shapes are for sharded Tensors
 
         full_shard = restored_model_dict_consolidated[k]
@@ -999,7 +1018,7 @@ def test_consolidated_llm_checkpoint():
         assert torch.allclose(v, full_shard), f"Value mismatch for key {k}. Tensors are not numerically close"
 
     # Compare the values, shapes, dtype, and device of the in-memory and on-disk optimizer state
-    for k, v in flattened_optim_dict.items():
+    for k, v in optimizer_state_dict.items():
         if isinstance(v, torch.distributed.tensor.DTensor):
             v = v.to_local()
         assert k in restored_optim_dict, f"Key {k} not found in restored optimizer state"
@@ -1011,7 +1030,10 @@ def test_consolidated_llm_checkpoint():
         # Get expected shape, dtype, device from expected_optim_keys
         expected_shape, expected_dtype, expected_device = expected_optim_keys[k]
 
-        if restored_optim_dict[k].size():
+        if trainer.pp_enabled and len(expected_shape) > 0:
+            expected_shape[0] *= 2
+
+        if restored_optim_dict[k].size() and not trainer.pp_enabled:
             curr_shard = torch.split(
                 restored_optim_dict[k],
                 restored_optim_dict[k].shape[0] // 2,
@@ -1036,18 +1058,11 @@ def test_consolidated_llm_checkpoint():
     torch.distributed.barrier()
 
 
-def _flatten(d: dict, parent_key: str | None = None):
-    """Recursively flatten *d* using dot-separated keys (à la DCP).
-    The first component in *parent_key* lets us prepend the outer-dict key
-    ("optim" in our case) so that the resulting keys match the exact strings
-    stored on disk by torch.distributed.checkpoint.
+def _rename_keys(d: dict, prepend: str):
+    """Rename the keys of *d* by prepending *prepend* to each key.
     """
-
     flat: dict[str, torch.Tensor] = {}
     for k, v in d.items():
-        key = f"{parent_key}.{k}" if parent_key else k
-        if isinstance(v, dict):
-            flat.update(_flatten(v, key))
-        else:
-            flat[key] = v
+        key = f"{prepend}{k}"
+        flat[key] = v
     return flat

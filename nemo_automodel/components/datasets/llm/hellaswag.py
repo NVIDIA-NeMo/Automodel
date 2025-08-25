@@ -28,7 +28,14 @@ class HellaSwag:
         dataset (Dataset): The processed dataset ready for model training or evaluation.
     """
 
-    def __init__(self, path_or_dataset, tokenizer, split="train", num_samples_limit=None, trust_remote_code=True):
+    def __init__(
+        self,
+        path_or_dataset,
+        tokenizer,
+        split="train",
+        num_samples_limit=None,
+        trust_remote_code=True,
+    ):
         """Initialize the HellaSwag dataset wrapper.
 
         Args:
@@ -37,6 +44,8 @@ class HellaSwag:
             split (str, optional): Dataset split to use (e.g., 'train', 'validation'). Defaults to 'train'.
             num_samples_limit (int, optional): Maximum number of samples to load. Defaults to None.
             trust_remote_code (bool, optional): Whether to trust remote code. Defaults to True.
+            shuffle (bool, optional): Whether to shuffle the dataset. Defaults to False.
+            seed (int, optional): Random seed for shuffling. Defaults to 42.
 
         Notes:
             If num_samples_limit is an integer, it limits the dataset size using slicing.

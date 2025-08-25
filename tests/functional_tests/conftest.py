@@ -42,11 +42,20 @@ _OVERRIDES = [
     "distributed.dp_size",
     "distributed.tp_size",
     "distributed.cp_size",
+    "distributed.pp_size",
     "distributed.sequence_parallel",
     "dataset._target_",
     "dataset.path_or_dataset",
     "validation_dataset.path_or_dataset",
     "validation_dataset.limit_dataset_samples",
+    "autopipeline._target_",
+    "autopipeline.pp_schedule",
+    "autopipeline.pp_microbatch_size",
+    "autopipeline.pp_batch_size",
+    "autopipeline.round_virtual_stages_to_pp_multiple",
+    "autopipeline.scale_grads_in_schedule",
+    "dataset.seq_length",
+    "validation_dataset.seq_length",
 ]
 
 

@@ -118,7 +118,7 @@ def test_consolidated_llm_checkpoint_with_scalar_weight():
     trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     scalar_value = 3.14159
-    scalar_param_local = _add_scalar_parameter(trainer.model.model, trainer.optimizer, scalar_value)
+    scalar_param_local = _add_scalar_parameter(trainer.model_parts[0].model, trainer.optimizer[0], scalar_value)
     scalar_param_name = f"model.{scalar_param_local}"
 
     trainer.run_train_validation_loop()
@@ -130,7 +130,7 @@ def test_consolidated_llm_checkpoint_with_scalar_weight():
         ckpt_dir / "model" / "consolidated" / "model-00001-of-00001.safetensors"
     )
 
-    model_state_dict = ModelState(trainer.model).state_dict()
+    model_state_dict = ModelState(trainer.model_parts).state_dict()
 
     new_model = AutoModelForCausalLM.from_config(AutoConfig.from_pretrained(cfg.model.pretrained_model_name_or_path))
     _add_scalar_parameter(new_model.model, None, 0.0)
@@ -139,7 +139,7 @@ def test_consolidated_llm_checkpoint_with_scalar_weight():
     assert new_model.model.scalar_weight.item() == 0.0 and scalar_value != 0.0
 
     new_model.load_state_dict(restored_model_dict)
-    assert torch.allclose(new_model.model.scalar_weight, trainer.model.model.scalar_weight), (
+    assert torch.allclose(new_model.model.scalar_weight, trainer.model_parts[0].model.scalar_weight), (
         "Scalar parameter mismatch between in-memory and consolidated checkpoint"
     )
 
@@ -162,7 +162,7 @@ def test_consolidated_llm_checkpoint_with_scalar_weight():
     assert consolidated_tensor.shape == expected_shape
 
     # Dtype/device consistency (everything should reside on CPU after load)
-    expected_dtype = trainer.model.dtype
+    expected_dtype = trainer.model_parts[0].dtype
     assert restored_tensor.dtype == expected_dtype
     assert consolidated_tensor.dtype == expected_dtype
     assert str(restored_tensor.device) == "cpu"
@@ -179,3 +179,5 @@ def test_consolidated_llm_checkpoint_with_scalar_weight():
         if ckpt_dir.parent.exists():
             shutil.rmtree(ckpt_dir.parent)
     torch.distributed.barrier()
+
+test_consolidated_llm_checkpoint_with_scalar_weight()
