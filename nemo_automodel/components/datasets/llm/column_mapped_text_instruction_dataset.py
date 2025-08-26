@@ -23,13 +23,13 @@ from torch.utils.data import Dataset
 
 from nemo_automodel.components.datasets.llm.formatting_utils import (
     _add_pad_token,
+    _has_chat_template,
     format_chat_template,
     format_prompt_completion,
-    _has_chat_template,
 )
 
 if TYPE_CHECKING:
-    from transformers import PreTrainedTokenizer
+    pass
 
 # Supported cases:
 # Format:
@@ -114,7 +114,6 @@ def _load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str
         raise RuntimeError("No data files provided")
 
     return load_dataset("json", data_files=data_files, split="train", streaming=streaming)
-
 
 
 def _check_all_values_equal_length(sample: Dict[str, List[int]]) -> bool:
@@ -291,10 +290,22 @@ class ColumnMappedTextInstructionDataset(Dataset):
         prompt = f"{context} {question}" if context else question
         if _has_chat_template(self.tokenizer):
             return format_chat_template(
-                self.tokenizer, prompt, answer, eos_token_id, pad_token_id, seq_length=self.seq_length, start_of_turn_token=self.start_of_turn_token
+                self.tokenizer,
+                prompt,
+                answer,
+                eos_token_id,
+                pad_token_id,
+                seq_length=self.seq_length,
+                start_of_turn_token=self.start_of_turn_token,
             )
         else:
             prompt += " "
             return format_prompt_completion(
-                self.tokenizer, prompt, answer, eos_token_id, pad_token_id, seq_length=self.seq_length, answer_only_loss_mask=self.answer_only_loss_mask
+                self.tokenizer,
+                prompt,
+                answer,
+                eos_token_id,
+                pad_token_id,
+                seq_length=self.seq_length,
+                answer_only_loss_mask=self.answer_only_loss_mask,
             )
