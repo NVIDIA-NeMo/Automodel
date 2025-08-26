@@ -99,6 +99,17 @@ We provide fp8 training configs for popular models:
 
 Check out our [examples directory](https://github.com/NVIDIA/NeMo-Automodel/tree/main/examples/llm_finetune/) for more recipes and configurations.
 
+To run any of these FP8 training recipes, use the following command:
+
+```bash
+uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config <path-to-config.yaml>
+```
+
+For example, to train Llama 3.1 8B with FP8:
+```bash
+uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/llama/llama3_1_8b_hellaswag_fp8.yaml
+```
+
 
 ## Performance Considerations
 
