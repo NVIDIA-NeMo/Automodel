@@ -138,6 +138,7 @@ def _apply_tokenizer_with_chat_template(
 
     input_ids: List[int] = tokenizer.apply_chat_template(messages)
 
+
     # Loss mask computation
     loss_mask: Optional[List[int]] = None
     if answer_only_loss_mask:
@@ -153,17 +154,17 @@ def _apply_tokenizer_with_chat_template(
             response_start = 0
         loss_mask = [0] * response_start + [1] * (len(input_ids) - response_start)
 
-    # Build labels/attention mask
-    labels = input_ids[1:]
+    # Build labels and apply loss mask directly
+    labels = input_ids[1:].copy()
     input_ids = input_ids[:-1]
+
     if loss_mask is not None:
         loss_mask = loss_mask[1:]  # Shift together with labels
-    else:
-        loss_mask = [1] * len(input_ids)
+        # Apply loss_mask directly to labels: set ignored positions to -100
+        labels = [-100 if mask == 0 else label for label, mask in zip(labels, loss_mask)]
 
     out: Dict[str, List[int]] = {
         "input_ids": input_ids,
-        "loss_mask": loss_mask,
         "labels": labels,
     }
     return out
@@ -210,15 +211,15 @@ def _apply_tokenizer_plain(
     labels = input_ids[1:]
     input_ids = input_ids[:-1]
 
+    # Apply loss mask directly to labels
     if answer_only_loss_mask:
         loss_mask = [0] * (len(prompt_ids) - 1) + [1] * len(answer_ids)
-    else:
-        loss_mask = [1] * len(input_ids)
+        # Apply loss_mask directly to labels: set ignored positions to -100
+        labels = [-100 if mask == 0 else label for label, mask in zip(labels, loss_mask)]
 
     out: Dict[str, List[int]] = {
         "input_ids": input_ids,
         "labels": labels,
-        "loss_mask": loss_mask,
     }
     return out
 

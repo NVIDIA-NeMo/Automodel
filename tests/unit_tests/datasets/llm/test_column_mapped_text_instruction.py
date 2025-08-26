@@ -142,7 +142,7 @@ def test_column_mapped_dataset_basic(tmp_path: Path):
 
     assert len(ds) == 2
     first = ds[0]
-    assert set(first.keys()) == {"labels", "input_ids", "loss_mask"}
+    assert set(first.keys()) == {"labels", "input_ids"}
 
 
 def test_column_mapped_dataset_streaming(tmp_path: Path):
