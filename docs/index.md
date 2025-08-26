@@ -54,6 +54,7 @@ guides/checkpointing.md
 guides/llm/dataset.md
 guides/vlm/dataset.md
 guides/llm/column-mapped-text-instruction-dataset.md
+guides/fp8_training.md
 
 apidocs/index.rst
 ```
