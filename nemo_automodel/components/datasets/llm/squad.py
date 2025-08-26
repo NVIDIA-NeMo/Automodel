@@ -26,7 +26,7 @@ def _formatting_prompts_func(example, tokenizer, eos_token_id, pad_token_id, seq
     question = example["question"]
     context = example["context"]
     answer = example["answers"]["text"][0].strip() if example["answers"]["text"] else ""
-    prompt = f"Context: {context}\nQuestion: {question}\nAnswer:"
+    prompt = f"Context: {context} Question: {question} Answer: "
 
     return format_prompt_completion(
         tokenizer=tokenizer,
@@ -44,7 +44,7 @@ def _formatting_prompts_func_with_chat_template(
     context = example["context"]
     question = example["question"]
     answer = example["answers"]["text"][0].strip()
-    prompt = f"Context: {context}\nQuestion: {question}\nAnswer:"
+    prompt = f"Context: {context} Question: {question}"
 
     return format_chat_template(
         tokenizer=tokenizer,
