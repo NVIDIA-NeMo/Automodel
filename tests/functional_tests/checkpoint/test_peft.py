@@ -2064,7 +2064,7 @@ def test_hf_peft_checkpoint(use_triton=False):
             f"Device mismatch for key {k}. Expected device {expected_device} but got {curr_shard.device}"
         )
         try:
-            assert torch.allclose(v, curr_shard), f"Value mismatch for key {k}. Tensors are not numerically close {v.shape} {curr_shard.shape} {v} {curr_shard}"
+            assert torch.allclose(v, curr_shard), f"Value mismatch for key {k}. Tensors are not numerically close"
         except Exception as e:
             if 'moe' in k and 'step' in k:
                 pass
