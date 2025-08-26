@@ -21,6 +21,13 @@ from typing import TYPE_CHECKING, Dict, Iterator, List, Optional, Union
 from datasets import load_dataset
 from torch.utils.data import Dataset
 
+from nemo_automodel.components.datasets.llm.formatting_utils import (
+    _add_pad_token,
+    format_chat_template,
+    format_prompt_completion,
+    _has_chat_template,
+)
+
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
 
@@ -109,142 +116,20 @@ def _load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str
     return load_dataset("json", data_files=data_files, split="train", streaming=streaming)
 
 
-def _apply_tokenizer_with_chat_template(
-    tokenizer: "PreTrainedTokenizer",
-    context: str,
-    question: str,
-    answer: str,
-    start_of_turn_token: Optional[str] = None,
-    answer_only_loss_mask: bool = True,
-) -> Dict[str, List[int]]:
-    """
-    Tokenization path when the tokenizer supports a chat template.
-
-    Args:
-        context: The context of the sample.
-        question: The question of the sample.
-        answer: The answer of the sample.
-
-    Returns:
-        A dictionary with the tokenized columns.
-    """
-
-    # Build conversation
-    user_prompt = "".join(filter(None, [context, " " if context and question else "", question])).strip()
-    messages = [
-        {"role": "user", "content": user_prompt},
-        {"role": "assistant", "content": answer},
-    ]
-
-    input_ids: List[int] = tokenizer.apply_chat_template(messages)
-
-
-    # Loss mask computation
-    loss_mask: Optional[List[int]] = None
-    if answer_only_loss_mask:
-        if isinstance(start_of_turn_token, str):
-            start_ids = tokenizer(start_of_turn_token, add_special_tokens=False)["input_ids"]
-            start_id = start_ids[0]
-            first_idx = input_ids.index(start_id) if start_id in input_ids else 0
-            if input_ids.count(start_id) >= 2:
-                response_start = input_ids.index(start_id, first_idx + 1)
-            else:
-                response_start = 0
-        else:
-            response_start = 0
-        loss_mask = [0] * response_start + [1] * (len(input_ids) - response_start)
-
-    # Build labels and apply loss mask directly
-    labels = input_ids[1:].copy()
-    input_ids = input_ids[:-1]
-
-    if loss_mask is not None:
-        loss_mask = loss_mask[1:]  # Shift together with labels
-        # Apply loss_mask directly to labels: set ignored positions to -100
-        labels = [-100 if mask == 0 else label for label, mask in zip(labels, loss_mask)]
-
-    out: Dict[str, List[int]] = {
-        "input_ids": input_ids,
-        "labels": labels,
-    }
-    return out
-
-
-def _apply_tokenizer_plain(
-    tokenizer: "PreTrainedTokenizer", context: str, question: str, answer: str, answer_only_loss_mask: bool = True
-) -> Dict[str, List[int]]:
-    """
-    Tokenization path when *chat_template* is not available.
-
-    Args:
-        context: The context of the sample.
-        question: The question of the sample.
-        answer: The answer of the sample.
-
-    Returns:
-        A dictionary with the tokenized columns.
-    """
-
-    if context and question:
-        prompt_text = f"{context} {question} "
-    elif context:
-        prompt_text = f"{context} "
-    elif question:
-        prompt_text = f"{question} "
-    else:
-        raise ValueError("Context and question are both missing")
-
-    # Tokenize
-    eos_id = getattr(tokenizer, "eos_token_id", None)
-    bos_id = getattr(tokenizer, "bos_token_id", None)
-
-    prompt_ids: List[int] = tokenizer(prompt_text)["input_ids"]
-    answer_ids: List[int] = tokenizer(str(answer).strip())["input_ids"]
-
-    # Strip trailing EOS from prompt and leading BOS from answer
-    if prompt_ids and eos_id is not None and prompt_ids[-1] == eos_id:
-        prompt_ids = prompt_ids[:-1]
-    if answer_ids and bos_id is not None and answer_ids[0] == bos_id:
-        answer_ids = answer_ids[1:]
-
-    input_ids = prompt_ids + answer_ids
-    labels = input_ids[1:]
-    input_ids = input_ids[:-1]
-
-    # Apply loss mask directly to labels
-    if answer_only_loss_mask:
-        loss_mask = [0] * (len(prompt_ids) - 1) + [1] * len(answer_ids)
-        # Apply loss_mask directly to labels: set ignored positions to -100
-        labels = [-100 if mask == 0 else label for label, mask in zip(labels, loss_mask)]
-
-    out: Dict[str, List[int]] = {
-        "input_ids": input_ids,
-        "labels": labels,
-    }
-    return out
-
-
-def _has_chat_template(tokenizer: "PreTrainedTokenizer") -> bool:
-    """
-    Check if the tokenizer supports a chat template.
-
-    Args:
-        tokenizer: The tokenizer to check.
-
-    Returns:
-        True if the tokenizer supports a chat template, False otherwise.
-    """
-    return getattr(tokenizer, "chat_template", None) is not None and callable(
-        getattr(tokenizer, "apply_chat_template", None)
-    )
-
 
 def _check_all_values_equal_length(sample: Dict[str, List[int]]) -> bool:
     """
     Check if all values in the sample are of the same length.
     """
     len0 = len(sample[next(iter(sample))])
-    return all(map(lambda v: len(v) == len0, sample.values()))
+    all_equal = True
+    for k, v in sample.items():
+        if k == "___PAD_TOKEN_IDS___":
+            continue
+        if len(v) != len0:
+            all_equal = False
+            break
+    return all_equal
 
 
 class ColumnMappedTextInstructionDataset(Dataset):
@@ -268,6 +153,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
         split: Optional[str] = None,
         streaming: bool = False,
         answer_only_loss_mask: bool = True,
+        seq_length: Optional[int] = None,
         start_of_turn_token: Optional[str] = None,
     ) -> None:
         """
@@ -280,6 +166,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
             split: The split of the dataset to load.
             streaming: Whether to load the dataset in streaming mode.
             answer_only_loss_mask: Whether to compute the loss mask only on the answer tokens.
+            seq_length: The sequence length to use for padding.
             start_of_turn_token: The token to use to indicate the start of a turn.
         """
 
@@ -316,6 +203,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
 
         self.answer_only_loss_mask = answer_only_loss_mask
         self.start_of_turn_token = start_of_turn_token
+        self.seq_length = seq_length
 
     def __len__(self) -> int:  # noqa: D401
         """
@@ -397,9 +285,15 @@ class ColumnMappedTextInstructionDataset(Dataset):
         question = sample[ColumnTypes.Question.value]
         answer = sample[ColumnTypes.Answer.value]
 
-        if _has_chat_template(self.tokenizer):
-            return _apply_tokenizer_with_chat_template(
-                self.tokenizer, context, question, answer, self.start_of_turn_token, self.answer_only_loss_mask
-            )
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", 0)
+        pad_token_id = _add_pad_token(self.tokenizer) or eos_token_id
 
-        return _apply_tokenizer_plain(self.tokenizer, context, question, answer, self.answer_only_loss_mask)
+        prompt = f"{context} {question}" if context else question
+        if _has_chat_template(self.tokenizer):
+            return format_chat_template(
+                self.tokenizer, prompt, answer, eos_token_id, pad_token_id, seq_length=self.seq_length, start_of_turn_token=self.start_of_turn_token
+            )
+        else:
+            return format_prompt_completion(
+                self.tokenizer, prompt, answer, eos_token_id, pad_token_id, seq_length=self.seq_length, answer_only_loss_mask=self.answer_only_loss_mask
+            )

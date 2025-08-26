@@ -15,96 +15,46 @@ import logging
 
 from datasets import load_dataset
 
-
-def _pad_to_seq_length(sample, pad_token_id, seq_length):
-    n = seq_length - len(sample)
-    if n == 0:
-        return sample
-    return sample + [pad_token_id] * n
-
-
-def _add_pad_token(tokenizer):
-    pad_token_id = None
-    if not hasattr(tokenizer, "pad_token_id"):
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-    else:
-        pad_token_id = tokenizer.pad_token_id
-    if not hasattr(tokenizer, "pad_token") and hasattr(tokenizer, "eos_token"):
-        tokenizer.pad_token = tokenizer.eos_token
-    return pad_token_id
-
-
-def _package_tokenized_example(has_chat_template, input_ids, eos_token_id, pad_token_id, seq_length, context_len):
-    # llama3 tokenizer does not add eos token
-    # see: https://github.com/huggingface/transformers/issues/22794
-    if not has_chat_template and eos_token_id != input_ids[-1]:
-        input_ids += [eos_token_id]
-
-    labels = input_ids.copy()
-    # [a, b, EOS]
-    input_ids = input_ids[:-1]
-    # input_ids= [a, b] -> attention_mask = [1, 1]
-    attention_mask = [1] * len(input_ids)
-
-    # Labels: mask out prompt tokens
-    labels[:context_len] = [-100] * context_len
-    # remove BOS
-    labels = labels[1:]
-    if not has_chat_template:
-        assert labels[-1] == eos_token_id, f"labels[-1]={labels[-1]} != eos_token_id={eos_token_id}"
-        assert input_ids[-1] != eos_token_id, f"input_ids[-1]={input_ids[-1]} == eos_token_id={eos_token_id}"
-    assert len(input_ids) == len(labels), f"len(input_ids)={len(input_ids)} != len(labels)={len(labels)}"
-
-    if isinstance(seq_length, int):
-        input_ids = _pad_to_seq_length(input_ids, pad_token_id, seq_length)
-        labels = _pad_to_seq_length(labels, -100, seq_length)
-
-    # the attention mask can also be extended in the collator with zeros.
-    attention_mask += [0] * (len(labels) - len(attention_mask))
-    return {
-        "input_ids": input_ids,
-        "labels": labels,
-        "attention_mask": attention_mask,
-        "___PAD_TOKEN_IDS___": {
-            "input_ids": pad_token_id,
-            "labels": -100,
-            "attention_mask": 0,
-        },
-    }
+from nemo_automodel.components.datasets.llm.formatting_utils import (
+    _add_pad_token,
+    format_chat_template,
+    format_prompt_completion,
+)
 
 
 def _formatting_prompts_func(example, tokenizer, eos_token_id, pad_token_id, seq_length=None):
     question = example["question"]
     context = example["context"]
     answer = example["answers"]["text"][0].strip() if example["answers"]["text"] else ""
-
     prompt = f"Context: {context}\nQuestion: {question}\nAnswer:"
-    full_text = prompt + " " + answer
 
-    # Tokenize separately to locate answer start
-    prompt_ids = tokenizer(prompt)["input_ids"]
-    # Tokenize full text
-    input_ids = tokenizer(full_text)["input_ids"]
-    return _package_tokenized_example(False, input_ids, eos_token_id, pad_token_id, seq_length, len(prompt_ids))
+    return format_prompt_completion(
+        tokenizer=tokenizer,
+        prompt=prompt,
+        answer=answer,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        seq_length=seq_length,
+    )
 
 
 def _formatting_prompts_func_with_chat_template(
     example, tokenizer, eos_token_id, pad_token_id, seq_length=None, start_of_turn_token=None
 ):
-    formatted_text = [
-        {"role": "user", "content": f"{example['context']} {example['question']}"},
-        {"role": "assistant", "content": example["answers"]["text"][0].strip()},
-    ]
-    input_ids = tokenizer.apply_chat_template(formatted_text)
-    if isinstance(start_of_turn_token, str):
-        start_of_turn_token_id = tokenizer(start_of_turn_token, add_special_tokens=False)["input_ids"][0]
-        first_start_of_turn_token_id = input_ids.index(start_of_turn_token_id)
-        # Loss mask is starting with the second start of turn token.
-        # labels    = [a b c S d e] ; S is the start of turn token.
-        response_start = input_ids.index(start_of_turn_token_id, first_start_of_turn_token_id + 1)
-    else:
-        response_start = 0
-    return _package_tokenized_example(True, input_ids, eos_token_id, pad_token_id, seq_length, response_start)
+    context = example["context"]
+    question = example["question"]
+    answer = example["answers"]["text"][0].strip()
+    prompt = f"Context: {context}\nQuestion: {question}\nAnswer:"
+
+    return format_chat_template(
+        tokenizer=tokenizer,
+        prompt=prompt,
+        answer=answer,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        seq_length=seq_length,
+        start_of_turn_token=start_of_turn_token,
+    )
 
 
 def make_squad_dataset(

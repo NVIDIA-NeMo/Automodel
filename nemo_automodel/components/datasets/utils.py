@@ -94,6 +94,7 @@ def get_pad_token_from_key(val: str, pad_token_ids: Optional[dict[str, int]] = N
     PAD_TOKEN_IDS = {
         "labels": -100,
         "attention_mask": 0,
+        "loss_mask": 0,
     }
     if pad_token_ids is not None and val in pad_token_ids:
         return pad_token_ids[val]
@@ -131,7 +132,7 @@ def default_collater(batch, pad_seq_len_divisible=None):
     """
     pad_token_ids = batch[0].pop("___PAD_TOKEN_IDS___", None)
     # ans contains a dict with:
-    # key: str (e.g., "input_ids", "attention_mask", "labels")
+    # key: str (e.g., "input_ids", "attention_mask", "labels", "loss_mask")
     # value: list[list[int]] (e.g., [[1, 2, 3], [4, 5, 6]])
     ans = {
         key: pad_within_micro(
@@ -196,6 +197,7 @@ class SFTSingleTurnPreprocessor:
             for c_ids, t_ids in zip(ctx_tok["input_ids"], tgt_tok["input_ids"], strict=False)
         ]
 
+        out["loss_mask"] = [[1 if t != -100 else 0 for t in lbl] for lbl in out["labels"]]
         return out
 
     def _compute_dataset_max_len(self, tokenized_ds):
@@ -219,6 +221,7 @@ class SFTSingleTurnPreprocessor:
                 ([1] * min(len(ids), max_len) + [0] * max(0, max_len - len(ids))) for ids in examples["attention_mask"]
             ]
             examples["labels"] = [(lbl[:max_len] + [-100] * max(0, max_len - len(lbl))) for lbl in examples["labels"]]
+            examples["loss_mask"] = [(lm[:max_len] + [0] * max(0, max_len - len(lm))) for lm in examples["loss_mask"]]
             # return dictionary with sequences all exactly `max_len` long
             return examples
 
