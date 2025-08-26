@@ -120,13 +120,12 @@ uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config ex
 
 FP8 works best when the majority of GEMM operations are sufficiently large such that the speedup achieved by using FP8 tensor cores is greater than the overhead of dynamic quantization.
 
-#### When NOT to Use FP8
+#### Ideal Conditions for FP8 Performance
 
-Avoid FP8 when:
-- Linear layers are small
-- Model has many small operations
-- Using older hardware
-- Numerical precision is critical
+- Linear layers are large and compute-intensive
+- The model consists of fewer small operations and more large matrix multiplications
+- You have modern (H100+) hardware optimized for FP8 acceleration
+- Moderate numerical precision is acceptable and slight approximations won't affect outcomes
 
 
 
