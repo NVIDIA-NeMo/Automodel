@@ -294,6 +294,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
                 self.tokenizer, prompt, answer, eos_token_id, pad_token_id, seq_length=self.seq_length, start_of_turn_token=self.start_of_turn_token
             )
         else:
+            prompt += " "
             return format_prompt_completion(
                 self.tokenizer, prompt, answer, eos_token_id, pad_token_id, seq_length=self.seq_length, answer_only_loss_mask=self.answer_only_loss_mask
             )
