@@ -129,8 +129,7 @@ def format_prompt_completion(
     Returns:
         A dictionary with the formatted example.
     """
-    # Build prompt
-    full_text = prompt + " " + answer
+    full_text = prompt + answer
 
     # Tokenize separately to locate answer start
     if answer_only_loss_mask:
