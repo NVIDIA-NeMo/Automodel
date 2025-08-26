@@ -119,7 +119,7 @@ def make_cp_batch_and_ctx(device_mesh, batch, labels, loss_mask=None):
     if device_mesh is None:
         cp_mesh = None
     else:
-        cp_mesh = device_mesh["context_parallel"]
+        cp_mesh = device_mesh[cp"]
 
     if cp_mesh is None or cp_mesh.size() == 1:
         return nullcontext, batch
@@ -127,7 +127,7 @@ def make_cp_batch_and_ctx(device_mesh, batch, labels, loss_mask=None):
     if (
         "position_ids" not in batch
         and device_mesh is not None
-        and (device_mesh["context_parallel"].size() > 1 or device_mesh["tensor_parallel"].size() > 1)
+        and (device_mesh["cp"].size() > 1 or device_mesh["tp"].size() > 1)
     ):
         batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(batch["input_ids"].device)
 
