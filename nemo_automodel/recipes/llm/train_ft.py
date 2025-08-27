@@ -642,13 +642,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
             labels = batch.pop("labels")
 
-            if "position_ids" not in batch and self.device_mesh is not None and self.device_mesh["cp"].size() > 1:
-                batch["position_ids"] = (
-                    torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.dist_env.device)
-                )
-
             train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
-
             with train_ctx(), get_sync_ctx(self.model, i == num_batches - 1):
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
