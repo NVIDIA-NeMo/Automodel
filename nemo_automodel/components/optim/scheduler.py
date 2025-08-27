@@ -115,6 +115,25 @@ class OptimizerParamScheduler:
         self.step(0)
         logger.info("learning rate decay style: {}".format(self.lr_decay_style))
 
+    def __repr__(self) -> str:
+        """
+        Return a string representation of the OptimizerParamScheduler.
+        """
+        return (
+            f"OptimizerParamScheduler("
+            f"optimizer={type(self.optimizer).__name__}, "
+            f"lr=[{self.init_lr}→{self.max_lr}→{self.min_lr}], "
+            f"lr_steps=[warmup:{self.lr_warmup_steps}, decay:{self.lr_decay_steps}], "
+            f"lr_style='{self.lr_decay_style}', "
+            f"wd=[{self.start_wd}→{self.end_wd}], "
+            f"wd_steps={self.wd_incr_steps}, "
+            f"wd_style='{self.wd_incr_style}', "
+            f"current_step={self.num_steps}"
+            f"{f', wsd_steps={self.wsd_decay_steps}' if self.wsd_decay_steps is not None else ''}"
+            f"{f', lr_wsd_style={self.lr_wsd_decay_style}' if self.lr_wsd_decay_style is not None else ''}"
+            f")"
+        )
+
     def get_wd(self) -> float:
         """
         Weight decay incr functions.
