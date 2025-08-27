@@ -50,6 +50,7 @@ class FSDP2Manager:
         tp_size (Optional[int]): Tensor-parallel group size. Defaults to 1 if zero/None.
         cp_size (int): Context-parallel group size for pipeline-like sharding.
         sequence_parallel (bool): Enables sequence parallelism in the TP plan when True.
+        use_hf_tp_plan (bool): Use Hugging Face TP plan if True.
         mp_policy (MixedPrecisionPolicy): Defines the mixed precision policy for parameters,
             reductions, and outputs.
         offload_policy (CPUOffloadPolicy): Policy to offload parameters or optimizer states
@@ -85,9 +86,17 @@ class FSDP2Manager:
         default=1,
         metadata={"help": "Context-parallel group size (for pipeline-like sharding)."},
     )
+    pp_size: Optional[int] = field(
+        default=1,
+        metadata={"help": "Pipeline-parallel group size (for pipeline-like sharding)."},
+    )
     sequence_parallel: Optional[bool] = field(
         default=False,
         metadata={"help": "Enable sequence parallelism in TP plan if True."},
+    )
+    use_hf_tp_plan: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Use Hugging Face TP plan if True."},
     )
     mp_policy: Optional[MixedPrecisionPolicy] = field(
         default=MixedPrecisionPolicy(
@@ -144,10 +153,13 @@ class FSDP2Manager:
         if self.cp_size is None or self.cp_size <= 0:
             self.cp_size = 1
 
+        if self.pp_size is None or self.pp_size <= 0:
+            self.pp_size = 1
+
         # infer if not provided
         if self.dp_size is None or self.dp_size <= 0:
             # Calculate dp_size to ensure dp_size * tp_size * cp_size == world_size
-            total_parallel_ranks = self.tp_size * self.cp_size
+            total_parallel_ranks = self.tp_size * self.cp_size * self.pp_size
             if self.world_size % total_parallel_ranks != 0:
                 raise ValueError(
                     f"world_size ({self.world_size}) must be divisible by (tp_size * cp_size) "
@@ -174,8 +186,8 @@ class FSDP2Manager:
         return self
 
     def _get_device_mesh(self):
-        mesh_shape = (self.dp_replicate_size, self.dp_shard_size, self.cp_size, self.tp_size)
-        mesh_names = ("dp_replicate", "dp_shard", "cp", "tp")
+        mesh_shape = (self.pp_size, self.dp_replicate_size, self.dp_shard_size, self.cp_size, self.tp_size)
+        mesh_names = ("pp", "dp_replicate", "dp_shard", "cp", "tp")
         for shape, name in zip(mesh_shape, mesh_names):
             assert isinstance(shape, int), "Expected {} to be an int, but got {}".format(name, type(shape))
             assert shape > 0, "Expected {} > 0, {}".format(name, shape)
@@ -186,10 +198,6 @@ class FSDP2Manager:
             mesh_shape=mesh_shape,
             mesh_dim_names=mesh_names,
         )
-        # flatten dp+cp if cp>1
-        if self.cp_size > 1:
-            self.device_mesh[("dp", "cp")]._flatten(mesh_dim_name="dp_cp")
-
         # based on https://github.com/pytorch/torchtitan/blob/d282cf2ce9ca8049b4b8423c1d7578c80426576f/torchtitan/distributed/parallel_dims.py#L191
         # Create all the submesh here to ensure all required process groups are
         # initialized:
@@ -219,7 +227,7 @@ class FSDP2Manager:
         self.device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
         return self.device_mesh
 
-    def parallelize(self, model, use_hf_tp_plan=False):
+    def parallelize(self, model):
         """
         Parallelizes the given model using FSDP2 and TP sharding strategies.
 
@@ -229,7 +237,6 @@ class FSDP2Manager:
 
         Args:
             model (nn.Module): The model to be parallelized.
-            use_hf_tp_plan (bool): if true, will attempt to get the TP plan from the model.
 
         Returns:
             The parallelized model.
@@ -238,7 +245,7 @@ class FSDP2Manager:
             NotImplemented: If the required TP sharding plan is not supported.
         """
         if self.device_mesh["tp"].size() > 1:
-            if use_hf_tp_plan:
+            if self.use_hf_tp_plan:
                 tp_shard_plan = get_hf_tp_shard_plan(model)
             else:
                 # Parallelize the first embedding and the last linear out projection

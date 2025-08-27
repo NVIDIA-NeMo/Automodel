@@ -140,7 +140,7 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
         (
             f"PYTHONPATH={repo_root}:$PYTHONPATH",
             "python3",
-            f"{repo_root}/nemo_automodel/recipes/{args.domain}/{args.command}.py",
+            f"{repo_root}/nemo_automodel/recipes/{args.domain}_{args.command}/{args.command}.py",
             "-c",
             f"{job_conf_path}",
         )
@@ -165,8 +165,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         metavar="<command>",
-        choices=["finetune"],
-        help="Command within the domain (e.g., finetune, generate, etc)",
+        choices=["finetune", "pretrain"],
+        help="Command within the domain (e.g., finetune, pretrain, generate, etc)",
     )
     parser.add_argument(
         "domain",

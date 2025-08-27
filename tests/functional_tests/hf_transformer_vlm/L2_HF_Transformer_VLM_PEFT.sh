@@ -16,11 +16,12 @@
 set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
 TRANSFORMERS_OFFLINE=1 coverage run --data-file=/workspace/.coverage --source=/workspace --parallel-mode \
-examples/vlm/finetune.py \
-  --config examples/vlm/gemma_3_vl_4b_cord_v2_peft.yaml \
+examples/vlm_finetune/finetune.py \
+  --config examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml \
   --model.pretrained_model_name_or_path /home/TestData/huiyingl/hf_gemma3_2l/ \
   --step_scheduler.max_steps 3 \
-  --step_scheduler.grad_acc_steps 1 \
+  --step_scheduler.global_batch_size 1 \
+  --step_scheduler.local_batch_size 1 \
   --dataset._target_=nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset \
   --dataset.path_or_dataset /home/TestData/lite/hf_cache/mini_cord_v2/ \
   --dataset.limit_dataset_samples 100 \

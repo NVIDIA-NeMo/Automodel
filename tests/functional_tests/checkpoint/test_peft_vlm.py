@@ -120,7 +120,7 @@ def to_cpu(
     """
     Converts a state dictionary to CPU.
     """
-    return {k: v.cpu() if isinstance(v, torch.Tensor) else to_cpu(v) for k, v in state_dict.items()}
+    return {k: v.cpu() for k, v in state_dict.items() if isinstance(v, torch.Tensor)}
 
 
 def test_hf_peft_checkpoint():
@@ -631,7 +631,7 @@ def test_hf_peft_checkpoint():
     }
 
     script_path = Path(__file__).parent.resolve()
-    cfg = parse_args_and_load_config(script_path / "gemma_3_vl_4b_cord_v2_peft.yaml")
+    cfg = parse_args_and_load_config(script_path / "gemma3" / "gemma3_vl_4b_cord_v2_peft.yaml")
     trainer = FinetuneRecipeForVLM(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
@@ -646,8 +646,8 @@ def test_hf_peft_checkpoint():
         OptimizerState(
             trainer.model,
             trainer.optimizer,
-            trainer.step_scheduler,
-        ).state_dict()["optim"]["state"]
+            trainer.lr_scheduler,
+        ).state_dict()["optim"]
     )
 
     model_keys_fixture = {}
@@ -657,7 +657,10 @@ def test_hf_peft_checkpoint():
         # PEFT model state is consolidated - use FULL tensor shape (no splitting)
         curr_shard = v
         model_keys_fixture[k] = (list(curr_shard.shape), curr_shard.dtype, str(curr_shard.device))
-    flattened_optim_dict = _flatten(optimizer_state_dict, parent_key="optim.state")
+    
+    # the saved optimizer state has an "optim." prefix that DCP adds.
+    # For the on-disk view to match, it needs to be prepended with the "optim." prefix
+    flattened_optim_dict = _rename_keys(optimizer_state_dict, "optim.")
     optim_keys_fixture = {}
     for k, v in flattened_optim_dict.items():
         if isinstance(v, torch.distributed.tensor.DTensor):
@@ -757,29 +760,6 @@ def test_hf_peft_checkpoint():
         restored_config = yaml.safe_load(f)
     compare_configs(trainer.cfg.raw_config, restored_config)
 
-    # similarly, the optimizer states are saved in a dictionary formatted as:
-    # {
-    #     "optim": OptimizerState(...),
-    #     "step_scheduler": StepSchedulerState(...)
-    # }
-    # and in addition, the optimizer state is saved in a dictionary formatted as:
-    # {
-    #     "optim": {
-    #         "state": {
-    #             "model.layers.0.self_attn.q_proj.weight":
-    #                 "step": ...,
-    #                 "exp_avg": ...
-    #                 "exp_avg_sq": ...
-    #         }
-    #     }
-    # }
-    # because of this, DCP will flatten the optimizer state dictionary to:
-    # {
-    #     "optim.state.model.layers.0.self_attn.q_proj.weight.step": ...
-    # }
-    # so we flatten the in-memory optimizer state dictionary to match the on-disk view
-    flattened_optim_dict = _flatten(optimizer_state_dict, parent_key="optim.state")
-
     # ---------------------------------------------------------------------
     # Compare the flattened in-memory model state with the on-disk view
     # ---------------------------------------------------------------------
@@ -878,20 +858,13 @@ def test_hf_peft_checkpoint():
     torch.distributed.barrier()
 
 
-def _flatten(d: dict, parent_key: str | None = None):
-    """Recursively flatten *d* using dot-separated keys (à la DCP).
-    The first component in *parent_key* lets us prepend the outer-dict key
-    ("optim" in our case) so that the resulting keys match the exact strings
-    stored on disk by torch.distributed.checkpoint.
+def _rename_keys(d: dict, prepend: str):
+    """Rename the keys of *d* by prepending *prepend* to each key.
     """
-
     flat: dict[str, torch.Tensor] = {}
     for k, v in d.items():
-        key = f"{parent_key}.{k}" if parent_key else k
-        if isinstance(v, dict):
-            flat.update(_flatten(v, key))
-        else:
-            flat[key] = v
+        key = f"{prepend}{k}"
+        flat[key] = v
     return flat
 
 

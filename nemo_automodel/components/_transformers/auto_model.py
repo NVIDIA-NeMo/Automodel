@@ -35,8 +35,6 @@ from nemo_automodel.shared.utils import dtype_from_str
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 logger = logging.getLogger(__name__)
 
-from nemo_automodel.components.quantization import apply_fp8_to_model
-
 
 def _assert_same_signature(original, patched):
     """
@@ -118,6 +116,34 @@ def _patch_liger_kernel(model):
         raise RuntimeError("Failed to patch model")
 
 
+def _get_next_fallback_attn(attn_implementation: str) -> str:
+    """
+    Get the next attention implementation in the priority list, in reverse order.
+
+    If a model does not support a given attention implementation, the next
+    implementation in the priority list is returned.
+
+    If the current attention implementation is not in the priority list, it uses eager.
+
+    Args:
+        attn_implementation (str): The current attention implementation.
+
+    Returns:
+        str: The next attention implementation in the priority list.
+    """
+    priorities = [
+        "eager",
+        "sdpa",
+        "flash_attention_2",
+        "flash_attention_3",
+    ]
+    if attn_implementation in priorities:
+        pos = priorities.index(attn_implementation)
+        return priorities[max(0, pos - 1)]
+    else:
+        return priorities[0]
+
+
 class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
     """
     Drop-in replacement for ``_BaseAutoModelClass`` that includes custom-kernels.
@@ -150,7 +176,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         sdpa_method: Optional[List[SDPBackend]] = None,
         torch_dtype="auto",
         attn_implementation: str = "flash_attention_2",
-        fp8_config: Optional[object] = None,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -208,11 +233,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
-                fp8_config=override.get("fp8_config", fp8_config),
                 **kwargs,
             )
 
         # load model
+        model = None
         try:
             name = cls.__name__
             if name.startswith("NeMo"):
@@ -227,8 +252,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             cls.__name__ = name
         except ValueError as e:
             if "does not support" in str(e):
-                logging.warning("Falling back to eager attention.")
-                return _retry(attn_implementation="eager")
+                if model is not None:
+                    del model
+                attn_implementation = _get_next_fallback_attn(attn_implementation)
+                logging.warning("Falling back to {} attention.".format(attn_implementation))
+                return _retry(attn_implementation=attn_implementation)
             raise e
 
         # Kernel patching
@@ -247,28 +275,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             logging.warning("Retrying without SDPA patching.")
             return _retry(use_sdpa_patching=False)
 
-        # Apply FP8 quantization
-        try:
-            if fp8_config is not None:
-                # Ensure precompute is only True when recipe is tensorwise and enable_fsdp_float8_all_gather is True
-                model.precompute_float8_dynamic_scale_for_fsdp = (
-                    fp8_config.precompute_float8_dynamic_scale_for_fsdp
-                    and fp8_config.recipe_name == "tensorwise"
-                    and fp8_config.enable_fsdp_float8_all_gather
-                )
-                model = apply_fp8_to_model(
-                    model,
-                    recipe_name=fp8_config.recipe_name,
-                    filter_fqns=fp8_config.filter_fqns,
-                    enable_fsdp_float8_all_gather=fp8_config.enable_fsdp_float8_all_gather,
-                    force_recompute_fp8_weight_in_bwd=fp8_config.force_recompute_fp8_weight_in_bwd,
-                    emulate=fp8_config.emulate,
-                )
-
-        except RuntimeError:
-            logging.warning("Retrying without FP8 quantization.")
-            return _retry(fp8_config=None)
-
         model.config.update({"nemo_version": __version__})
         return model
 
@@ -282,7 +288,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         sdpa_method: Optional[List[SDPBackend]] = None,
         torch_dtype: Union[str, torch.dtype] = "auto",
         attn_implementation: str = "flash_attention_2",
-        fp8_config: Optional[object] = None,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -334,7 +339,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
-                fp8_config=override.get("fp8_config", fp8_config),
                 **kwargs,
             )
 
@@ -372,27 +376,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         except:
             logging.warning("Retrying without SDPA patching.")
             return _retry(use_sdpa_patching=False)
-
-        # Apply FP8 quantization
-        try:
-            if fp8_config is not None:
-                # Ensure precompute is only True when recipe is tensorwise and enable_fsdp_float8_all_gather is True
-                fp8_config.precompute_float8_dynamic_scale_for_fsdp = (
-                    fp8_config.precompute_float8_dynamic_scale_for_fsdp
-                    and fp8_config.recipe_name == "tensorwise"
-                    and fp8_config.enable_fsdp_float8_all_gather
-                )
-                model = apply_fp8_to_model(
-                    model,
-                    recipe_name=fp8_config.recipe_name,
-                    filter_fqns=fp8_config.filter_fqns,
-                    enable_fsdp_float8_all_gather=fp8_config.enable_fsdp_float8_all_gather,
-                    force_recompute_fp8_weight_in_bwd=fp8_config.force_recompute_fp8_weight_in_bwd,
-                    emulate=fp8_config.emulate,
-                )
-        except RuntimeError:
-            logging.warning("Retrying without FP8 quantization.")
-            return _retry(fp8_config=None)
 
         model.config.update({"nemo_version": __version__})
         return model

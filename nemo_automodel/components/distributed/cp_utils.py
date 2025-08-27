@@ -99,7 +99,7 @@ def create_context_parallel_ctx(
     )
 
 
-def make_cp_batch_and_ctx(device_mesh, batch, labels, loss_mask):
+def make_cp_batch_and_ctx(device_mesh, batch, labels, loss_mask=None):
     """
     Build a CP context manager and shards a batch. If the input device_mesh is None or the size
     of the context_parallel submesh is 1, this function is effectively a no-op.

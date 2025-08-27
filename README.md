@@ -14,7 +14,7 @@
 
 <!-- **Day-0 integration with Hugging Face models automating fine-tuning and pretraining with pytorch-native parallelism, custom-kernels and optimized recipes** -->
 
-[📖 Documentation](https://docs.nvidia.com/nemo/automodel/latest/index.html) • [🔥 Ready-to-Use Recipes](https://github.com/NVIDIA-NeMo/Automodel/#-ready-to-use-recipes) • [💡 Examples](https://github.com/NVIDIA-NeMo/Automodel/tree/main/recipes) • [🤝 Contributing](https://github.com/NVIDIA-NeMo/Automodel/blob/main/CONTRIBUTING.md)
+[📖 Documentation](https://docs.nvidia.com/nemo/automodel/latest/index.html) • [🔥 Ready-to-Use Recipes](https://github.com/NVIDIA-NeMo/Automodel/#-ready-to-use-recipes) • [💡 Examples](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples) • [🤝 Contributing](https://github.com/NVIDIA-NeMo/Automodel/blob/main/CONTRIBUTING.md)
 
 </div>
 
@@ -24,39 +24,67 @@ NeMo Framework is NVIDIA's GPU accelerated, end-to-end training framework for la
 
 > ⚠️ Note: NeMo AutoModel is under active development. New features, improvements, and documentation updates are released regularly. We are working toward a stable release, so expect the interface to solidify over time. Your feedback and contributions are welcome, and we encourage you to follow along as new updates roll out.
 
+## Feature Roadmap
+
+✅ _Available now_ | 🔜 _Coming in 25.09_
+
+- ✅ **HuggingFace Integration** - Works with 1-70B models (Qwen, Llama).
+- ✅ **Distributed Training** - Fully Sharded Data Parallel (FSDP2) support.
+- ✅ **Environment Support** - Support for SLURM and interactive training.
+- ✅ **Learning Algorithms** - SFT (Supervised Fine-Tuning), and PEFT (Parameter Efficient Fine-Tuning).
+- ✅ **Large Model Support** - Native PyTorch support for models up to 70B parameters.
+- ✅ **Advanced Parallelism** - PyTorch native FSDP2, TP, CP, and SP for efficient training.
+- ✅ **Sequence Packing** - Sequence packing in both DTensor and MCore for huge training perf gains.
+- ✅ **DCP** - Distributed Checkpoint support with SafeTensors output.
+- ✅ **HSDP** - Hybrid Sharding Data Parallelism based on FSDP2.
+
+- 🔜 **Pipeline Support** - Torch-native support for pipelining composable with FSDP2 and DTensor (3D Parallelism).
+- 🔜 **Pre-training** - Support for model pre-training, including DeepSeekV3, GPT-OSS and Qwen3 (Coder-480B-A35B, etc).
+- 🔜 **Knowledge Distillation** - Support for knowledge distillation with LLMs; VLM support will be added post 25.09.
+
+
 ## 🎛️ Supported Models
-NeMo AutoModel provides native support for a wide range of models available on the Hugging Face Hub, enabling efficient fine-tuning for various domains.
-
-### Large Language Models
-- **LLaMA Family**: LLaMA 3, LLaMA 3.1, LLaMA 3.2, Code Llama
-- **QWen Family**: QWen3, QWen2.5, Qwen2
-- **Gemma Family**: Gemma2, Gemma3
-- **Phi Family**: Phi2, Phi3, Phi4
-- **And more**: Any causal LM on Hugging Face Hub!
-
-### Vision-Language Models
-- **Qwen2.5-VL**: All variants (3B, 7B, 72B)
-- **Gemma-3-VL**: 3B and other variants
+NeMo AutoModel provides native support for a wide range of models available on the Hugging Face Hub, enabling efficient fine-tuning for various domains. Below is a comprehensive list of all supported models with their available recipes:
 
 ### 📋 Ready-to-Use Recipes
 To get started quickly, NeMo AutoModel provides a collection of ready-to-use recipes for common LLM and VLM fine-tuning tasks. Simply select the recipe that matches your model and training setup (e.g., single-GPU, multi-GPU, or multi-node).
-| Domain | Model ID | Single-GPU | Single-Node | Multi-Node |
-|--------|----------|------------|-------------|------------|
-| [**LLM**](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm/finetune.py) | [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B) | [HellaSwag + LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm/llama_3_2_1b_hellaswag_peft.yaml) |•[HellaSwag](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm/llama_3_2_1b_hellaswag.yaml)<br>•[SQuAD](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm/llama_3_2_1b_squad.yaml) |  [HellaSwag + nvFSDP](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm/llama_3_2_1b_hellaswag_nvfsdp.yaml) |
-| [**VLM**](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm/finetune.py) | [`google/gemma-3-4b-it`](https://huggingface.co/google/gemma-3-4b-it) | [CORD-v2 + LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm/gemma_3_vl_4b_cord_v2_peft.yaml) | [CORD-v2](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm/gemma_3_vl_4b_cord_v2.yaml) | Coming Soon |
 
+| Domain | Model Family | Model ID | Recipes |
+|--------|--------------|----------|---------|
+| **LLM** |  **LLaMA** | [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml) |
+| | | [`meta-llama/Llama-3.2-3B-Instruct`](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama_3_2_3b_instruct_squad.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama_3_2_3b_instruct_squad_peft.yaml) |
+| | | [`meta-llama/Llama-3.1-8B`](https://huggingface.co/meta-llama/Llama-3.1-8B) | [FP8](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_fp8.yaml) |
+| **LLM** | **Mistral** | [`mistralai/Mistral-7B-v0.1`](https://huggingface.co/mistralai/Mistral-7B-v0.1) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mistral_7b_squad.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mistral_7b_squad_peft.yaml), [FP8](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mistral_7b_hellaswag_fp8.yaml) |
+|  |  | [`mistralai/Mistral-Nemo-Base-2407`](https://huggingface.co/mistralai/Mistral-Nemo-Base-2407) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mistral_nemo_2407_squad.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mistral_nemo_2407_squad_peft.yaml), [FP8](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mistral_nemo_2407_hellaswag_fp8.yaml) |
+|  |  | [`mistralai/Mixtral-8x7B-Instruct-v0.1`](https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1) |[PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mixtral_8x7b_instruct_squad_peft.yaml) |
+| **LLM** | **Qwen** | [`Qwen/Qwen2.5-7B`](https://huggingface.co/Qwen/Qwen2.5-7B) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_7b_squad.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_7b_squad_peft.yaml), [FP8](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_7b_hellaswag_fp8.yaml) |
+|  |  | [`Qwen/Qwen3-0.6B`](https://huggingface.co/Qwen/Qwen3-0.6B) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_0p6b_hellaswag_peft.yaml) |
+|  |  | [`Qwen/QwQ-32B`](https://huggingface.co/Qwen/QwQ-32B) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwq_32b_squad.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwq_32b_squad_peft.yaml) |
+| **LLM** | **Gemma** | [`google/gemma-3-270m`](https://huggingface.co/google/gemma-3-270m) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_3_270m_squad.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_3_270m_squad_peft.yaml) |
+| | | [`google/gemma-2-9b-it`](https://huggingface.co/google/gemma-2-9b-it) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_2_9b_it_squad.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_2_9b_it_squad_peft.yaml), [FP8](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_2_9b_it_hellaswag_fp8.yaml) |
+| | | [`google/gemma-7b`](https://huggingface.co/google/gemma-7b) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_7b_squad.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_7b_squad_peft.yaml) |
+| **LLM** | **Phi** | [`microsoft/phi-2`](https://huggingface.co/microsoft/phi-2) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/phi/phi_2_squad.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/phi/phi_2_squad_peft.yaml) |
+|  |  | [`microsoft/Phi-3-mini-4k-instruct`](https://huggingface.co/microsoft/Phi-3-mini-4k-instruct) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/phi/phi_3_mini_it_squad.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/phi/phi_3_mini_it_squad_peft.yaml) |
+|  |  | [`microsoft/phi-4`](https://huggingface.co/microsoft/phi-4) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/phi/phi_4_squad.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/phi/phi_4_squad_peft.yaml), [FP8](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/phi/phi_4_hellaswag_fp8.yaml) |
+| **LLM** | **Seed** | [`ByteDance-Seed/Seed-Coder-8B-Instruct`](https://huggingface.co/ByteDance-Seed/Seed-Coder-8B-Instruct) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/seed/seed_coder_8b_instruct_squad.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/seed/seed_coder_8b_instruct_squad_peft.yaml), [FP8](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/seed/seed_coder_8b_instruct_hellaswag_fp8.yaml) |
+|  |  | [`ByteDance-Seed/Seed-OSS-36B-Instruct`](https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/seed/seed_oss_36B_hellaswag.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/seed/seed_oss_36B_hellaswag_peft.yaml) |
+| **LLM** | **Baichuan** | [`baichuan-inc/Baichuan2-7B-Chat`](https://huggingface.co/baichuan-inc/Baichuan2-7B-Chat) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/baichuan/baichuan_2_7b_squad.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/baichuan/baichuan_2_7b_squad_peft.yaml), [FP8](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/baichuan/baichuan_2_7b_mock_fp8.yaml) |
+| **VLM** | **Gemma** | [`google/gemma-3-4b-it`](https://huggingface.co/google/gemma-3-4b-it) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml) |
+|  |  | [`google/gemma-3n-e4b-it`](https://huggingface.co/google/gemma-3n-e4b-it) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix_peft.yaml) |
+
+**And more**: Check out more [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune) and [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune) examples! Any causal LM on Hugging Face Hub can be used with the base recipe template!
 
 ### Run a Recipe
-To run a NeMo AutoModel recipe, you need a recipe script (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm/finetune.py), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm/finetune.py)) and a YAML config file (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm/llama_3_2_1b_squad.yaml), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm/gemma_3_vl_4b_cord_v2_peft.yaml)):
+To run a NeMo AutoModel recipe, you need a recipe script (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/finetune.py), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/finetune.py)) and a YAML config file (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama/llama3_2_1b_squad.yaml), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml)):
 ```
 # Command invocation format:
 uv run <recipe_script_path> --config <yaml_config_path>
 
 # LLM example: multi-GPU with FSDP2
-uv run torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_hellaswag.yaml
+uv run torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama/llama3_2_1b_hellaswag.yaml
 
 # VLM example: single GPU fine-tuning (Gemma-3-VL) with LoRA
-uv run recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml
+uv run recipes/vlm_finetune/finetune.py --config recipes/vlm_finetune/gemma3/gemma3_vl_3b_cord_v2_peft.yaml
 ```
 
 
@@ -94,7 +122,7 @@ pip3 install uv
 # If you cannot install at the system level, you can install for your user with
 # pip3 install --user uv
 ```
-Run every command with `uv run`. It auto-installs the virtual environment from the lock file and keeps it up to date, so you never need to activate a venv manually. Example: `uv run recipes/llm/finetune.py`. If you prefer to install NeMo Automodel explicitly, please follow the instructions below.
+Run every command with `uv run`. It auto-installs the virtual environment from the lock file and keeps it up to date, so you never need to activate a venv manually. Example: `uv run recipes/llm_finetune/finetune.py`. If you prefer to install NeMo Automodel explicitly, please follow the instructions below.
 
 ### 📦 Install from a Wheel Package
 ```
@@ -154,30 +182,30 @@ These YAML examples illustrate common configurations used with NeMo AutoModel re
 
 ```bash
 # Fine-tune LLaMA on HellaSwag (single GPU)
-python recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_squad.yaml
+python recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama/llama3_2_1b_squad.yaml
 
 # Fine-tune with LoRA (memory efficient)
-python recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_hellaswag_peft.yaml
+python recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama/llama3_2_1b_hellaswag_peft.yaml
 
 # Multi-GPU with FSDP2
-torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_hellaswag.yaml
+torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama/llama_3_2_1b_hellaswag.yaml
 
 # Multi-GPU with nvFSDP
-torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_hellaswag_nvfsdp.yaml
+torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama/llama_3_2_1b_hellaswag_nvfsdp.yaml
 
 ```
 <!-- # #Multi-Node training
 # torchrun --nproc-per-node=8 --nnodes=2 \
-#     recipes/llm/finetune.py --config recipes/llm/llama_3_2_1b_squad_nvfsdp.yaml
+#     recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama/llama3_2_1b_squad_nvfsdp.yaml
 ### Vision-Language Models 
 - ->
 
 ```bash
 # Fine-tune Qwen2.5-VL
-python recipes/vlm/finetune.py --config recipes/vlm/qwen2_5_vl_3b_rdr.yaml
+python recipes/vlm_finetune/finetune.py --config recipes/vlm_finetune/qwen2_5_vl_3b_rdr.yaml
 
 # Fine-tune Gemma-3-VL with LoRA on a single GPU
-python recipes/vlm/finetune.py --config recipes/vlm/gemma_3_vl_3b_cord_v2_peft.yaml
+python recipes/vlm_finetune/finetune.py --config recipes/vlm_finetune/gemma_3_vl_3b_cord_v2_peft.yaml
 ```
 
 ---

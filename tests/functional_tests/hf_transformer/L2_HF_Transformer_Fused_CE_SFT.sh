@@ -16,12 +16,13 @@
 set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
 TRANSFORMERS_OFFLINE=1 coverage run --data-file=/workspace/.coverage --source=/workspace --parallel-mode \
-examples/llm/finetune.py \
-  --config examples/llm/llama_3_2_1b_squad.yaml \
+examples/llm_finetune/finetune.py \
+  --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
   --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
   --model.output_hidden_states true \
   --step_scheduler.max_steps 3 \
-  --step_scheduler.grad_acc_steps 1 \
+  --step_scheduler.global_batch_size 8 \
+  --step_scheduler.local_batch_size 8 \
   --step_scheduler.val_every_steps 1 \
   --loss_fn._target_ nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy \
   --dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \

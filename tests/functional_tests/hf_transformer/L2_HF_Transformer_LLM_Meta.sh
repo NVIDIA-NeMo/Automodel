@@ -20,14 +20,15 @@ export CUDA_VISIBLE_DEVICES="0,1"
 
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
 -m pytest tests/functional_tests/training/test_meta_device_sft.py \
-    --config examples/llm/llama_3_2_1b_squad.yaml \
+    --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
     --dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
     --validation_dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
     --dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
     --validation_dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
     --dataset.limit_dataset_samples 1000 \
-    --dataloader.batch_size 8 \
+    --step_scheduler.global_batch_size 8 \
+    --step_scheduler.local_batch_size 4 \
     --distributed._target_ nemo_automodel.components.distributed.fsdp2.FSDP2Manager \
     --distributed.dp_size none \
     --distributed.tp_size 1 \

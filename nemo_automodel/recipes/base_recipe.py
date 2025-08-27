@@ -21,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.optim import Optimizer
 from transformers.processing_utils import ProcessorMixin
@@ -41,6 +42,8 @@ try:
     import yaml as _yaml
 except Exception:
     _yaml = None
+from transformers.processing_utils import ProcessorMixin
+from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 
 def has_load_restore_state(object):
@@ -81,7 +84,29 @@ def is_lr_scheduler(object):
     Returns:
         bool: returns True if object is an OptimizerParamScheduler.
     """
-    return isinstance(object, OptimizerParamScheduler)
+    return isinstance(object, OptimizerParamScheduler) or (
+        isinstance(object, list)
+        and all(isinstance(item, OptimizerParamScheduler) for item in object)
+        and len(object) > 0
+    )
+
+
+def is_optimizer(object):
+    """
+    Checks whether object is an optimizer.
+    """
+    return isinstance(object, Optimizer) or (
+        isinstance(object, list) and len(object) > 0 and all(isinstance(item, Optimizer) for item in object)
+    )
+
+
+def is_model(object):
+    """
+    Checks whether object is a model.
+    """
+    return isinstance(object, nn.Module) or (
+        isinstance(object, list) and len(object) > 0 and all(isinstance(item, nn.Module) for item in object)
+    )
 
 
 class BaseRecipe:
@@ -108,10 +133,11 @@ class BaseRecipe:
             self.__dict__["__state_tracked"] = set()
         # Track stateful objects unless they are validation/eval components.
         should_track = (
-            isinstance(value, (nn.Module, Optimizer))
+            is_model(value)
             or has_load_restore_state(value)
             or is_tokenizer(value)
             or is_lr_scheduler(value)
+            or is_optimizer(value)
             or isinstance(value, ConfigNode)
         )
 
@@ -132,21 +158,30 @@ class BaseRecipe:
         """
         if not self.checkpoint_config.enabled:
             return
+        is_dist_initialized = torch.distributed.is_initialized()
+        is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
+
+        if not is_dist_initialized:
+            dp_group = None
+        else:
+            dp_group = self._get_dp_group()
 
         path = self.checkpoint_config.checkpoint_dir
         path = os.path.join(path, f"epoch_{epoch}_step_{step}")
-        os.makedirs(path, exist_ok=True)
 
-        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        if is_rank_0:
+            assert not os.path.exists(path), f"Checkpoint directory {path} already exists"
+            os.makedirs(path, exist_ok=True)
             print(f"Saving checkpoint to {path}", flush=True)
-
+        if is_dist_initialized:
+            torch.distributed.barrier(dp_group)
         # TODO(@adil-a): Change this when we create a LR scheduler class
         model, optimizer, scheduler, tokenizer, config = None, None, None, None, None
 
         for key in self.__dict__["__state_tracked"]:
-            if isinstance(getattr(self, key), nn.Module):
+            if is_model(getattr(self, key)):
                 model = getattr(self, key)
-            elif isinstance(getattr(self, key), Optimizer):
+            elif is_optimizer(getattr(self, key)):
                 optimizer = getattr(self, key)
             elif isinstance(getattr(self, key), ConfigNode):
                 config = getattr(self, key)
@@ -155,17 +190,17 @@ class BaseRecipe:
             elif is_tokenizer(getattr(self, key)):
                 tokenizer = getattr(self, key)
             else:
-                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                if is_rank_0:
                     torch.save(
                         getattr(self, key).state_dict(),
                         os.path.join(path, f"{key}.pt"),
                     )
-                if torch.distributed.is_initialized():
-                    torch.distributed.barrier()
 
         save_model(model, path, self.checkpoint_config, peft_config=self.peft_config, tokenizer=tokenizer)
         save_optimizer(optimizer, model, path, scheduler)
         save_config(config.raw_config, path)
+        if is_dist_initialized:
+            torch.distributed.barrier(dp_group)
 
     def load_checkpoint(self, restore_from: str | None = None):
         """
@@ -190,11 +225,10 @@ class BaseRecipe:
             print(f"Loading checkpoint from {ckpt_dir}", flush=True)
 
         model, optimizer, scheduler = None, None, None
-
         for key in self.__dict__["__state_tracked"]:
-            if isinstance(getattr(self, key), nn.Module):
+            if is_model(getattr(self, key)):
                 model = getattr(self, key)
-            elif isinstance(getattr(self, key), Optimizer):
+            elif is_optimizer(getattr(self, key)):
                 optimizer = getattr(self, key)
             elif is_lr_scheduler(getattr(self, key)):
                 scheduler = getattr(self, key)
@@ -282,34 +316,45 @@ class BaseRecipe:
 
     def _log_model_and_optimizer_details(
         self,
-        model: nn.Module | None = None,
-        optimizer: Optimizer | None = None,
-        lr_scheduler: OptimizerParamScheduler | None = None,
+        model: nn.Module | list[nn.Module] | None = None,
+        optimizer: Optimizer | list[Optimizer] | None = None,
+        lr_scheduler: OptimizerParamScheduler | list[OptimizerParamScheduler] | None = None,
     ):
         """Log model repr, parameter stats, param norm, optimizer and lr scheduler with YAML markers."""
         # Model repr
-        if model:
-            model_str = str(model)
+        if not isinstance(model, list):
+            model = [model]
+
+        for i, m in enumerate(model):
+            if m is None:
+                logging.info(f"Model Part {i}: <unavailable>")
+                continue
+
+            model_str = str(m)
             model_lines = model_str.splitlines()
-            logging.info("Model:")
+            logging.info(f"Model Part {i}:")
             for line in model_lines[:40]:
                 logging.info(line)
             if len(model_lines) > 40:
                 logging.info("...")
-        else:
-            logging.info("Model: <unavailable>")
 
         # Optimizer
         if optimizer:
-            for line in ("Optimizer:\n" + str(optimizer)).splitlines():
-                logging.info(line)
+            if not isinstance(optimizer, list):
+                optimizer = [optimizer]
+            for opt in optimizer:
+                for line in ("Optimizer:\n" + str(opt)).splitlines():
+                    logging.info(line)
         else:
             logging.info("Optimizer: <unavailable>")
 
         # LR scheduler
         if lr_scheduler:
-            for line in ("LR scheduler:\n" + str(lr_scheduler)).splitlines():
-                logging.info(line)
+            if not isinstance(lr_scheduler, list):
+                lr_scheduler = [lr_scheduler]
+            for sched in lr_scheduler:
+                for line in ("LR scheduler:\n" + str(sched)).splitlines():
+                    logging.info(line)
         else:
             logging.info("LR scheduler: <unavailable>")
 
@@ -326,6 +371,26 @@ class BaseRecipe:
         logging.info("Step scheduler:")
         for k, v in attrs.items():
             logging.info(f"- {k}: {v}")
+
+    def _get_dp_group(self):
+        if not self.device_mesh:
+            return None
+        elif self.device_mesh["cp"].size() > 1:
+            return self.device_mesh["dp_cp"].get_group()
+        else:
+            return self.device_mesh["dp"].get_group()
+
+    def _get_dp_group_size(self):
+        dp_group = self._get_dp_group()
+        return 1 if dp_group is None else dp_group.size()
+
+    def _dp_allreduce(self, tensor, op=dist.ReduceOp.SUM):
+        dp_group = self._get_dp_group()
+        if dp_group is not None:
+            tensor = tensor.cuda()
+            dist.all_reduce(tensor, op=op, group=dp_group)
+            tensor = tensor.cpu()
+        return tensor
 
 
 def _find_latest_checkpoint(checkpoint_dir):

@@ -28,18 +28,17 @@ import yaml
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM, calculate_loss
+from nemo_automodel.components.training.utils import count_tail_padding
 
 
 def get_validation_loss(
     model: nn.Module, val_batch: dict[str, torch.Tensor], loss_fn: nn.Module, device: torch.device
 ) -> torch.Tensor:
     """Gets the validation loss for a model."""
+    num_tokens_in_batch = val_batch["labels"].numel() - count_tail_padding(val_batch["labels"])
     val_batch = {k: v.to(device, non_blocking=True) for k, v in val_batch.items()}
     model.eval()
     labels = val_batch.pop("labels")
-    loss_mask = val_batch.pop("loss_mask", None)
-    if loss_mask is None:
-        loss_mask = (labels.detach() != -100).to(torch.int)
 
     with torch.no_grad():
         out = model(**val_batch)
@@ -47,7 +46,7 @@ def get_validation_loss(
                 loss_fn,
                 logits=out.logits,
                 labels=labels,
-                mask=loss_mask,
+                num_tokens_in_batch=num_tokens_in_batch,
             )
         return loss
 
@@ -97,7 +96,7 @@ def to_cpu(
     state_dict: dict[str, torch.Tensor | dict[str, torch.Tensor]],
 ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
     """Converts a state dictionary to CPU."""
-    return {k: v.cpu() if isinstance(v, torch.Tensor) else to_cpu(v) for k, v in state_dict.items()}
+    return {k: v.cpu() for k, v in state_dict.items() if isinstance(v, torch.Tensor)}
 
 
 def test_vlm_dcp_checkpoint():
@@ -530,7 +529,7 @@ def test_vlm_dcp_checkpoint():
     }
 
     script_path = Path(__file__).parent.resolve()
-    cfg = parse_args_and_load_config(script_path / "gemma_3_vl_4b_cord_v2.yaml")
+    cfg = parse_args_and_load_config(script_path / "gemma3" / "gemma3_vl_4b_cord_v2.yaml")
     trainer = FinetuneRecipeForVLM(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
@@ -546,8 +545,8 @@ def test_vlm_dcp_checkpoint():
         OptimizerState(
             trainer.model,
             trainer.optimizer,
-            trainer.step_scheduler,
-        ).state_dict()["optim"]["state"]
+            trainer.lr_scheduler,
+        ).state_dict()["optim"]
     )
 
     # assert the correct paths exist
@@ -646,7 +645,7 @@ def test_vlm_dcp_checkpoint():
     #     "optim.state.model.layers.0.self_attn.q_proj.weight.step": ...
     # }
     # so we flatten the in-memory optimizer state dictionary to match the on-disk view
-    flattened_optim_dict = _flatten(optimizer_state_dict, parent_key="optim.state")
+    flattened_optim_dict = _flatten(optimizer_state_dict, parent_key="optim")
 
     # ---------------------------------------------------------------------
     # Compare the flattened in-memory model state with the on-disk view

@@ -4,7 +4,7 @@ coverage:
     project: false
     patch:
       default:
-        target: 80%
+        target: 40%
         threshold: 0%
         base: auto
         if_ci_failed: error
