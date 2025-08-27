@@ -39,7 +39,7 @@ model-coverage/vlm.md
 ```
 
 
-<!-- 
+<!--
 ```{toctree}
 :caption: Datasets
 :hidden:
@@ -51,6 +51,7 @@ guides/vlm/dataset.md
 :caption: Development
 :hidden:
 guides/checkpointing.md
+guides/pipelining.md
 guides/llm/dataset.md
 guides/vlm/dataset.md
 guides/llm/column-mapped-text-instruction-dataset.md

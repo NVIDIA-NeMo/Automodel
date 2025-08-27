@@ -29,6 +29,7 @@ import torch.nn as nn
 import yaml
 from safetensors import safe_open
 from safetensors.torch import save_file
+from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
@@ -105,13 +106,15 @@ def save_model(
         ):
             os.makedirs(consolidated_model_path, exist_ok=True)
             # save the config.json file
-            if hasattr(model, "config"):
+            model_part = model[0] if isinstance(model, list) else model
+
+            if hasattr(model_part, "config"):
                 with open(os.path.join(consolidated_model_path, "config.json"), "w") as f:
-                    f.write(model.config.to_json_string())
+                    f.write(model_part.config.to_json_string())
             # save the generation_config.json file
-            if hasattr(model, "generation_config"):
+            if hasattr(model_part, "generation_config"):
                 with open(os.path.join(consolidated_model_path, "generation_config.json"), "w") as f:
-                    f.write(model.generation_config.to_json_string())
+                    f.write(model_part.generation_config.to_json_string())
 
             # save the tokenizer
             if tokenizer is not None:
@@ -180,6 +183,7 @@ def load_model_from_base_checkpoint(
     root_dir: str,
     model_name: str,
     peft_init_method: str,
+    device_mesh: Optional[DeviceMesh] = None,
 ):
     """
     Load a model from the base Hugging Face checkpoint in parallel.
@@ -231,6 +235,7 @@ def load_model_from_base_checkpoint(
         storage_reader=_HuggingFaceStorageReader(
             model_path, key_mapping=getattr(model, "_checkpoint_conversion_mapping", None)
         ),
+        process_group=device_mesh["pp"].get_group() if device_mesh else None,
     )
     model_state.load_state_dict(model_state_dict)
     if hasattr(model, "tie_weights") and model_state.is_tied_lm_head:
@@ -258,6 +263,8 @@ def load_model(
     model_state = ModelState(model, checkpoint_config.is_peft)
 
     if checkpoint_config.is_peft:
+        # no PP support for PEFT models
+        model = model[0] if isinstance(model, list) else model
         state_dict = model.state_dict()
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             with safe_open(os.path.join(model_path, "adapter_model.safetensors"), framework="pt") as f:
@@ -439,14 +446,14 @@ def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState) -> d
         "QuestionAnswering": "QUESTION_ANS",
         "FeatureExtraction": "FEATURE_EXTRACTION",
     }
-    target_modules = _extract_target_modules(model_state.model)
+    target_modules = _extract_target_modules(model_state.model[0])
     try:
-        model_task = model_state.model.config.architectures[0].split("For")[-1]
+        model_task = model_state.model[0].config.architectures[0].split("For")[-1]
     except (AttributeError, IndexError, TypeError):
         model_task = "N/A"
 
     try:
-        name_or_path = model_state.model.config.name_or_path
+        name_or_path = model_state.model[0].config.name_or_path
     except (AttributeError, TypeError):
         name_or_path = "N/A"
 
@@ -515,6 +522,20 @@ def _apply(module, fn, recurse=True):
         for child in module.children():
             _apply(child, fn, recurse=recurse)
 
+    def compute_should_use_set_data(tensor, tensor_applied):
+        if torch._has_compatible_shallow_copy_type(tensor, tensor_applied):
+            # If the new tensor has compatible tensor type as the existing tensor,
+            # the current behavior is to change the tensor in-place using `.data =`,
+            # and the future behavior is to overwrite the existing tensor. However,
+            # changing the current behavior is a BC-breaking change, and we want it
+            # to happen in future releases. So for now we introduce the
+            # `torch.__future__.get_overwrite_module_params_on_conversion()`
+            # global flag to let the user control whether they want the future
+            # behavior of overwriting the existing tensor or not.
+            return not torch.__future__.get_overwrite_module_params_on_conversion()
+        else:
+            return False
+
     should_use_swap_tensors = torch.__future__.get_swap_module_params_on_conversion()
     for key, param in module._parameters.items():
         if param is None:
@@ -524,6 +545,7 @@ def _apply(module, fn, recurse=True):
         # `with torch.no_grad():`
         with torch.no_grad():
             param_applied = fn(param)
+        p_should_use_set_data = compute_should_use_set_data(param, param_applied)
 
         # subclasses may have multiple child tensors so we need to use swap_tensors
         p_should_use_swap_tensors = should_use_swap_tensors or is_traceable_wrapper_subclass(param_applied)
@@ -541,7 +563,32 @@ def _apply(module, fn, recurse=True):
                 if param_grad is not None:
                     param.grad = param_grad
                 raise RuntimeError(f"_apply(): Couldn't swap {module._get_name()}.{key}") from e
+            out_param = param
+        elif p_should_use_set_data:
+            param.data = param_applied
+            out_param = param
         else:
-            raise RuntimeError(f"_apply(): Couldn't swap {module._get_name()}.{key}")
+            assert isinstance(param, torch.nn.Parameter)
+            assert param.is_leaf
+            out_param = torch.nn.Parameter(param_applied, param.requires_grad)
+            module._parameters[key] = out_param
+
+        if param_grad is not None:
+            with torch.no_grad():
+                grad_applied = fn(param_grad)
+            g_should_use_set_data = compute_should_use_set_data(param_grad, grad_applied)
+            if p_should_use_swap_tensors:
+                grad_applied.requires_grad_(param_grad.requires_grad)
+                try:
+                    torch.utils.swap_tensors(param_grad, grad_applied)
+                except Exception as e:
+                    raise RuntimeError(f"_apply(): Couldn't swap {module._get_name()}.{key}.grad") from e
+                out_param.grad = param_grad
+            elif g_should_use_set_data:
+                assert out_param.grad is not None
+                out_param.grad.data = grad_applied
+            else:
+                assert param_grad.is_leaf
+                out_param.grad = grad_applied.requires_grad_(param_grad.requires_grad)
 
     return module
