@@ -61,7 +61,7 @@ NeMo AutoModel provides native support for a wide range of models available on t
 To get started quickly, NeMo AutoModel provides a collection of ready-to-use recipes for common LLM and VLM fine-tuning tasks. Simply select the recipe that matches your model and training setup (e.g., single-GPU, multi-GPU, or multi-node).
 | Domain | Model ID | Single-GPU | Single-Node | Multi-Node |
 |--------|----------|------------|-------------|------------|
-| [**LLM**](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/finetune.py) | [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B) | [HellaSwag + LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml) |•[HellaSwag](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml)<br>•[SQuAD](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) |  [HellaSwag + nvFSDP](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_nvfsdp.yaml) |
+| [**LLM**](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/finetune.py) | [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B) | [HellaSwag + LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml) |•[HellaSwag](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml)<br>•[SQuAD](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) |  [HellaSwag + MegatronFSDP](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_megatronfsdp.yaml) |
 | [**VLM**](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/finetune.py) | [`google/gemma-3-4b-it`](https://huggingface.co/google/gemma-3-4b-it) | [CORD-v2 + LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml) | [CORD-v2](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml) | Coming Soon |
 
 
@@ -90,7 +90,7 @@ uv run recipes/vlm_finetune/finetune.py --config recipes/vlm_finetune/gemma3/gem
 
 - **Day-0 Hugging Face Support**: Instantly fine-tune any model from the Hugging Face Hub
 - **Lightning Fast Performance**: Custom CUDA kernels and memory optimizations deliver 2–5× speedups
-- **Large-Scale Distributed Training**: Built-in FSDP2 and nvFSDP for seamless multi-node scaling
+- **Large-Scale Distributed Training**: Built-in FSDP2 and MegatronFSDP for seamless multi-node scaling
 - **Vision-Language Model Ready**: Native support for VLMs (Qwen2-VL, Gemma-3-VL, etc)
 - **Advanced PEFT Methods**: LoRA and extensible PEFT system out of the box
 - **Seamless HF Ecosystem**: Fine-tuned models work perfectly with Transformers pipeline, VLM, etc.
@@ -181,13 +181,13 @@ python recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama3_2/l
 # Multi-GPU with FSDP2
 torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama3_2/llama_3_2_1b_hellaswag.yaml
 
-# Multi-GPU with nvFSDP
-torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama3_2/llama_3_2_1b_hellaswag_nvfsdp.yaml
+# Multi-GPU with MegatronFSDP
+torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama3_2/llama_3_2_1b_hellaswag_megatronfsdp.yaml
 
 ```
 <!-- # #Multi-Node training
 # torchrun --nproc-per-node=8 --nnodes=2 \
-#     recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama3_2/llama3_2_1b_squad_nvfsdp.yaml
+#     recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama3_2/llama3_2_1b_squad_megatronfsdp.yaml
 ### Vision-Language Models 
 - ->
 
@@ -209,7 +209,7 @@ python recipes/vlm_finetune/finetune.py --config recipes/vlm_finetune/gemma_3_vl
 
 ```yaml
 distributed:
-  _target_: nemo_automodel.distributed.nvfsdp.NVFSDPManager
+  _target_: nemo_automodel.distributed.megatronfsdp.MegatronFSDPManager
   dp_size: 8
   tp_size: 1
   cp_size: 1
@@ -264,7 +264,6 @@ NeMo AutoModel delivers significant speedups through optimized kernels and distr
 - **Liger Kernel**: Optimized attention and MLP operations
 - **Cut-CrossEntropy**: Memory-efficient loss computation
 - **FSDP2**: Latest fully sharded data parallelism
-- **nvFSDP**: NVIDIA's enterprise FSDP implementation
 - **Mixed Precision**: Automatic FP16/BF16 training
 
 --- -->
@@ -280,7 +279,7 @@ NeMo-Automodel/
 │   ├── datasets/                # Dataset loaders
 │   │   ├── llm/                 # LLM datasets (HellaSwag, SQuAD, etc.)
 │   │   └── vlm/                 # VLM datasets (CORD-v2, rdr etc.)
-│   ├── distributed/             # FSDP2, nvFSDP, parallelization
+│   ├── distributed/             # FSDP2, MegatronFSDP, parallelization
 │   ├── loss/                    # Optimized loss functions
 │   └── training/                # Training recipes and utilities
 ├── recipes/                     # Ready-to-use training recipes

@@ -7,7 +7,7 @@ NeMo Automodel is a PyTorch library for fine-tuning and pre-training models from
 - **Day-0 support** for most LLMs and VLMs on the Hugging Face Hub.
 - **Optimized implementations** for training efficiency, including fused kernels and memory-saving techniques.
 - **Seamless integration** with Hugging Face datasets, tokenizers, and related tools.
-- **Distributed training strategies** using FSDP2 and nvFSDP across multi-GPU and multi-node environments.
+- **Distributed training strategies** using FSDP2 and MegatronFSDP across multi-GPU and multi-node environments.
 - **End-to-end workflows** with recipes for data preparation, training, and evaluation.
 
 
@@ -32,7 +32,7 @@ $ tree -L 1 nemo_automodel/components/
 ├── checkpoint/     - Checkpoint save and load-related logic.
 ├── config/         - Utils to load YAML files and CLI-parsing helpers.
 ├── datasets/       - LLM and VLM datasets and utils (collate functions, preprocessing).
-├── distributed/    - Distributed processing primitives (DDP, FSDP2, nvFSDP).
+├── distributed/    - Distributed processing primitives (DDP, FSDP2, MegatronFSDP).
 ├── launcher/       - Job launcher for interactive and batch (Slurm, K8s) processing.
 ├── loggers/        - Metric/event logging for Weights & Biases and other tools
 ├── loss/           - Loss functions (such as cross-entropy and linear cross-entropy, etc.).

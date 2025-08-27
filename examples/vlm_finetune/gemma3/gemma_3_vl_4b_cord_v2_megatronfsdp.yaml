@@ -16,11 +16,10 @@
 
 
 step_scheduler:
-  global_batch_size: 8
-  local_batch_size: 8
+  grad_acc_steps: 8
   ckpt_every_steps: 100
-  val_every_steps: 10000  # will run every x number of gradient steps
-  max_steps: 10000
+  val_every_steps: 100  # will run every x number of gradient steps
+  max_steps: 1000
 
 dist_env:
   backend: nccl
@@ -32,52 +31,50 @@ rng:
   ranked: true
 
 model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: microsoft/Phi-4-multimodal-instruct
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: google/gemma-3-4b-it
   torch_dtype: torch.bfloat16
-  trust_remote_code: true
-
-processor:
-  _target_: transformers.AutoProcessor.from_pretrained
-  pretrained_model_name_or_path: microsoft/Phi-4-multimodal-instruct
-  trust_remote_code: true
+  use_liger_kernel: false
+  attn_implementation: eager
 
 checkpoint:
   enabled: true
-  checkpoint_dir: phi_4_mm_checkpoints/
+  checkpoint_dir: vlm_checkpoints/
   model_save_format: torch_save
   save_consolidated: false
 
-# distributed:
-#   _target_: nemo_automodel.components.distributed.megatronfsdp.MegatronFSDPManager
-#   dp_size: none
-#   tp_size: 1
-#   cp_size: 1
+distributed:
+  _target_: nemo_automodel.components.distributed.megatronfsdp.MegatronFSDPManager
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_cv17_dataset
-  path_or_dataset: ysdede/commonvoice_17_tr_fixed
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset
+  path_or_dataset: naver-clova-ix/cord-v2
   split: train
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  batch_size: 1
   num_workers: 0
   pin_memory: true
   collate_fn:
-    _target_: nemo_automodel.components.datasets.vlm.collate_fns.phi4_mm_collate_fn
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    start_of_response_token: "<start_of_turn>model\n"
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_cv17_dataset
-  path_or_dataset: ysdede/commonvoice_17_tr_fixed
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset
+  path_or_dataset: naver-clova-ix/cord-v2
   split: validation
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.vlm.collate_fns.phi4_mm_collate_fn
+  batch_size: 1
   
 optimizer:
   _target_: torch.optim.AdamW
@@ -86,12 +83,12 @@ optimizer:
   betas: [0.9, 0.95]
 
 freeze_config:
-  freeze_embeddings: false
+  freeze_embeddings: true
   freeze_vision_tower: true
   freeze_language_model: false
   
 # Uncomment and configure for W&B logging
-# wandb:
+# logger:
 #   wandb_project:
 #   wandb_entity:
 #   wandb_exp_name:
