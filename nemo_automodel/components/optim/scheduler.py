@@ -119,20 +119,35 @@ class OptimizerParamScheduler:
         """
         Return a string representation of the OptimizerParamScheduler.
         """
-        return (
-            f"OptimizerParamScheduler("
-            f"optimizer={type(self.optimizer).__name__}, "
-            f"lr=[{self.init_lr}→{self.max_lr}→{self.min_lr}], "
-            f"lr_steps=[warmup:{self.lr_warmup_steps}, decay:{self.lr_decay_steps}], "
-            f"lr_style='{self.lr_decay_style}', "
-            f"wd=[{self.start_wd}→{self.end_wd}], "
-            f"wd_steps={self.wd_incr_steps}, "
-            f"wd_style='{self.wd_incr_style}', "
-            f"current_step={self.num_steps}"
-            f"{f', wsd_steps={self.wsd_decay_steps}' if self.wsd_decay_steps is not None else ''}"
-            f"{f', lr_wsd_style={self.lr_wsd_decay_style}' if self.lr_wsd_decay_style is not None else ''}"
+        lines = [
+            f"OptimizerParamScheduler(",
+            f"    optimizer: {type(self.optimizer).__name__}",
+            f"    learning_rate:",
+            f"        init_lr: {self.init_lr}",
+            f"        max_lr: {self.max_lr}",
+            f"        min_lr: {self.min_lr}",
+            f"        warmup_steps: {self.lr_warmup_steps}",
+            f"        decay_steps: {self.lr_decay_steps}",
+            f"        decay_style: {self.lr_decay_style}",
+        ]
+
+        if self.lr_decay_style == "WSD" and self.wsd_decay_steps is not None:
+            lines.extend([
+                f"        wsd_decay_steps: {self.wsd_decay_steps}",
+                f"        lr_wsd_decay_style: {self.lr_wsd_decay_style}",
+            ])
+
+        lines.extend([
+            f"    weight_decay:",
+            f"        start_wd: {self.start_wd}",
+            f"        end_wd: {self.end_wd}",
+            f"        incr_steps: {self.wd_incr_steps}",
+            f"        incr_style: {self.wd_incr_style}",
+            f"    current_step: {self.num_steps}",
             f")"
-        )
+        ])
+
+        return "\n".join(lines)
 
     def get_wd(self) -> float:
         """
