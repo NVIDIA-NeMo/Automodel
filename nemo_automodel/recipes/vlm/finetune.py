@@ -174,6 +174,7 @@ def build_model_and_optimizer(
                     cfg_opt.foreach = False
                 optimizer = cfg_opt.instantiate(params=trainable_params)
                 model, optimizer = model_wrapper.parallelize(model, optimizer)
+                model = model.to(device)
                 return model, optimizer
             else:
                 model = model_wrapper.parallelize(model)
@@ -188,9 +189,8 @@ def build_model_and_optimizer(
                         cfg_model.pretrained_model_name_or_path,
                         getattr(cfg_peft, "lora_A_init", None),
                     )
-        else:
-            model = model.to(device)
 
+        model = model.to(device)
         optimizer = _build_optimizer(model, cfg_opt, tp_size)
 
         # Apply torch.compile if configured
