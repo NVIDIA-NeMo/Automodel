@@ -120,9 +120,9 @@ class OptimizerParamScheduler:
         Return a string representation of the OptimizerParamScheduler.
         """
         lines = [
-            f"OptimizerParamScheduler(",
+            "OptimizerParamScheduler(",
             f"    optimizer: {type(self.optimizer).__name__}",
-            f"    learning_rate:",
+            "    learning_rate:",
             f"        init_lr: {self.init_lr}",
             f"        max_lr: {self.max_lr}",
             f"        min_lr: {self.min_lr}",
@@ -132,20 +132,24 @@ class OptimizerParamScheduler:
         ]
 
         if self.lr_decay_style == "WSD" and self.wsd_decay_steps is not None:
-            lines.extend([
-                f"        wsd_decay_steps: {self.wsd_decay_steps}",
-                f"        lr_wsd_decay_style: {self.lr_wsd_decay_style}",
-            ])
+            lines.extend(
+                [
+                    f"        wsd_decay_steps: {self.wsd_decay_steps}",
+                    f"        lr_wsd_decay_style: {self.lr_wsd_decay_style}",
+                ]
+            )
 
-        lines.extend([
-            f"    weight_decay:",
-            f"        start_wd: {self.start_wd}",
-            f"        end_wd: {self.end_wd}",
-            f"        incr_steps: {self.wd_incr_steps}",
-            f"        incr_style: {self.wd_incr_style}",
-            f"    current_step: {self.num_steps}",
-            f")"
-        ])
+        lines.extend(
+            [
+                "    weight_decay:",
+                f"        start_wd: {self.start_wd}",
+                f"        end_wd: {self.end_wd}",
+                f"        incr_steps: {self.wd_incr_steps}",
+                f"        incr_style: {self.wd_incr_style}",
+                f"    current_step: {self.num_steps}",
+                ")",
+            ]
+        )
 
         return "\n".join(lines)
 
