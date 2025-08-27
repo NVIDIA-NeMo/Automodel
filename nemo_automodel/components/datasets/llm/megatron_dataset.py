@@ -169,24 +169,33 @@ class MegatronPretraining:
         Build the datasets using the trainer parameters provided during initialization.
         """
         train_iters = self.trainer_max_steps
-        assert train_iters > 0, f"max_steps {train_iters} should be greater than 0"
-        num_train_samples = int(train_iters * self.global_batch_size)
+        if train_iters is None or train_iters == -1:
+            # Full-epoch training: build exhaustive indices
+            num_train_samples = None
+        else:
+            assert train_iters > 0, f"max_steps {train_iters} should be greater than 0"
+            num_train_samples = int(train_iters * self.global_batch_size)
 
         if self.num_train_samples is not None:
-            assert (
-                self.num_train_samples >= num_train_samples
-            ), f"num_train_samples must be greater than or equal to {num_train_samples}."
+            if num_train_samples is not None:
+                assert (
+                    self.num_train_samples >= num_train_samples
+                ), f"num_train_samples must be greater than or equal to {num_train_samples}."
             num_train_samples = self.num_train_samples
             train_iters = int(num_train_samples / self.global_batch_size)
 
-        eval_iters = (train_iters // self.trainer_val_check_interval) * self.trainer_limit_val_batches
-        num_val_samples = int(eval_iters * self.global_batch_size)
+        if train_iters is None or train_iters == -1:
+            num_val_samples = None
+        else:
+            eval_iters = (train_iters // self.trainer_val_check_interval) * self.trainer_limit_val_batches
+            num_val_samples = int(eval_iters * self.global_batch_size)
 
         test_iters = self.trainer_limit_test_batches
         num_test_samples = int(test_iters * self.global_batch_size)
 
         if self.num_val_samples is not None:
-            assert self.num_val_samples > num_val_samples, f"num_val_samples must be greater than {num_val_samples}."
+            if num_val_samples is not None:
+                assert self.num_val_samples > num_val_samples, f"num_val_samples must be greater than {num_val_samples}."
             num_val_samples = self.num_val_samples
         if self.num_test_samples is not None:
             assert (
