@@ -92,9 +92,9 @@ class MegatronFSDPManager:
     )
 
     # MegatronFSDP config
-    data_parallel_sharding_strategy: Optional[str] = field(
-        default="optim_grads_params",
-        metadata={"help": "Data parallel sharding strategy."},
+    zero_dp_strategy: Optional[int] = field(
+        default=3,
+        metadata={"help": "Zero DP strategy."},
     )
     init_fsdp_with_meta_device: Optional[bool] = field(
         default=False, metadata={"help": "Initialize MegatronFSDP with meta device if True."}
@@ -242,7 +242,7 @@ class MegatronFSDPManager:
             optimizer=optimizer,
             fsdp_unit_modules=self.fsdp_unit_modules,
             tp_shard_plan=tp_shard_plan,
-            data_parallel_sharding_strategy=self.data_parallel_sharding_strategy,
+            zero_dp_strategy=self.zero_dp_strategy,
             init_fsdp_with_meta_device=self.init_fsdp_with_meta_device,
             grad_reduce_in_fp32=self.grad_reduce_in_fp32,
             preserve_fp32_weights=self.preserve_fp32_weights,

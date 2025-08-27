@@ -435,7 +435,7 @@ def megatron_fsdp_strategy_parallelize(
     optimizer=None,
     fsdp_unit_modules: Optional[List[str]] = None,
     tp_shard_plan: Optional[Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]] = None,
-    data_parallel_sharding_strategy: str = "optim_grads_params",
+    zero_dp_strategy: int = 3,
     init_fsdp_with_meta_device: bool = False,
     grad_reduce_in_fp32: bool = False,
     preserve_fp32_weights: bool = False,
@@ -466,10 +466,9 @@ def megatron_fsdp_strategy_parallelize(
             A tensor-parallel sharding plan.
             Keys are module names; values specify the parallel style to apply
             (e.g., RowwiseParallel, ColwiseParallel, SequenceParallel).
-        data_parallel_sharding_strategy (str): Strategy for sharding parameters,
+        zero_dp_strategy (int): Strategy for sharding parameters,
             gradients, and optimizer states across data-parallel ranks.
-            Valid options include "params", "grads_params", and
-            "optim_grads_params" (default).
+            Valid options include 0, 1, 2, 3(default).
         init_fsdp_with_meta_device (bool): If True, construct the model on a
             meta device first and materialize weights lazily to reduce memory
             fragmentation.
@@ -521,7 +520,7 @@ def megatron_fsdp_strategy_parallelize(
 
     if dp_mesh.size() > 1:
         # TODO(boxiangw): remove this once HSDP is supported.
-        assert dp_mesh.ndim == 1, "Hybrid-sharding not supported"
+        assert dp_mesh.ndim == 1, "Hybrid-sharding not yet supported"
 
     # TP sharding.
     if tp_mesh.size() > 1:
@@ -544,7 +543,7 @@ def megatron_fsdp_strategy_parallelize(
         dp_inter_dim=None,
         dp_shard_dim=dp_cp_mesh_name,
         tp_dim=tp_mesh_name,
-        zero_dp_strategy=3,
+        zero_dp_strategy=zero_dp_strategy,
         init_model_with_meta_device=init_fsdp_with_meta_device,
         grad_reduce_in_fp32=grad_reduce_in_fp32,
         preserve_fp32_weights=preserve_fp32_weights,

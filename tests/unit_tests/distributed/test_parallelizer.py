@@ -385,8 +385,9 @@ class TestMegatronFSDPStrategyParallelize:
             model=model,
             device_mesh=mesh,
             optimizer=optimizer,
-            dp_shard_dim="my_dp",
-            tp_dim="my_tp",
+            dp_mesh_name="my_dp",
+            cp_mesh_name="my_cp",
+            tp_shard_dim="my_tp",
         )
 
         # Verify megatron_fsdp_fully_shard was called with custom mesh names
@@ -429,8 +430,9 @@ class TestMegatronFSDPStrategyParallelize:
             device_mesh=mesh,
             optimizer=optimizer,
             tp_shard_plan=tp_plan,
-            dp_shard_dim="custom_data",
-            tp_dim="custom_tensor",
+            dp_mesh_name="custom_data",
+            cp_mesh_name="custom_context",
+            tp_shard_dim="custom_tensor",
         )
 
         # Verify parallelize_module was called for tensor parallelism
