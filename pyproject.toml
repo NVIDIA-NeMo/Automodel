@@ -77,7 +77,8 @@ dependencies = [
     "torchdata",
     "transformers<=4.55.4",
     "wandb",
-    "torchao"
+    "torchao",
+    "megatron-fsdp"
 ]
 
 [project.optional-dependencies]
