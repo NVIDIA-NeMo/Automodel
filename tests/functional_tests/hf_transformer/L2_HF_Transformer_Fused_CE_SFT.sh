@@ -21,7 +21,8 @@ examples/llm_finetune/finetune.py \
   --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
   --model.output_hidden_states true \
   --step_scheduler.max_steps 3 \
-  --step_scheduler.grad_acc_steps 1 \
+  --step_scheduler.global_batch_size 8 \
+  --step_scheduler.local_batch_size 8 \
   --step_scheduler.val_every_steps 1 \
   --loss_fn._target_ nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy \
   --dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \

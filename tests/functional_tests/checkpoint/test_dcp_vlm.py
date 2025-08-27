@@ -96,7 +96,7 @@ def to_cpu(
     state_dict: dict[str, torch.Tensor | dict[str, torch.Tensor]],
 ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
     """Converts a state dictionary to CPU."""
-    return {k: v.cpu() if isinstance(v, torch.Tensor) else to_cpu(v) for k, v in state_dict.items()}
+    return {k: v.cpu() for k, v in state_dict.items() if isinstance(v, torch.Tensor)}
 
 
 def test_vlm_dcp_checkpoint():
@@ -545,8 +545,8 @@ def test_vlm_dcp_checkpoint():
         OptimizerState(
             trainer.model,
             trainer.optimizer,
-            trainer.step_scheduler,
-        ).state_dict()["optim"]["state"]
+            trainer.lr_scheduler,
+        ).state_dict()["optim"]
     )
 
     # assert the correct paths exist
@@ -566,7 +566,7 @@ def test_vlm_dcp_checkpoint():
     ]
 
     for file in output_files:
-        path = Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_2_step_10" / file
+        path = Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / file
         assert path.exists(), f"Expected {path} to exist"
         if "." in file:
             assert path.is_file(), f"Expected {path} to be a file"
@@ -577,7 +577,7 @@ def test_vlm_dcp_checkpoint():
 
     # Load checkpoint data
     restored_optim_dict, saved_lr_scheduler_state = load_dcp(
-        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_2_step_10" / "optim",
+        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "optim",
     )
     # Remove "sched." prefix from keys in saved_lr_scheduler_state if present
     if saved_lr_scheduler_state is not None:
@@ -607,7 +607,7 @@ def test_vlm_dcp_checkpoint():
                 )
 
     restored_model_dict, _ = load_dcp(
-        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_2_step_10" / "model",
+        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "model",
     )
 
     # check if new model and current model give the same CE loss
@@ -620,7 +620,7 @@ def test_vlm_dcp_checkpoint():
     assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
 
     # compare the recipe configs
-    with open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_2_step_10" / "config.yaml", "r") as f:
+    with open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "config.yaml", "r") as f:
         restored_config = yaml.safe_load(f)
     compare_configs(trainer.cfg.raw_config, restored_config)
 
@@ -645,7 +645,7 @@ def test_vlm_dcp_checkpoint():
     #     "optim.state.model.layers.0.self_attn.q_proj.weight.step": ...
     # }
     # so we flatten the in-memory optimizer state dictionary to match the on-disk view
-    flattened_optim_dict = _flatten(optimizer_state_dict, parent_key="optim.state")
+    flattened_optim_dict = _flatten(optimizer_state_dict, parent_key="optim")
 
     # ---------------------------------------------------------------------
     # Compare the flattened in-memory model state with the on-disk view
