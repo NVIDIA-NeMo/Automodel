@@ -45,7 +45,7 @@ from nemo_automodel.components.distributed.init_utils import (
     get_rank_safe,
     initialize_distributed,
 )
-from nemo_automodel.components.distributed.nvfsdp import NVFSDPManager
+from nemo_automodel.components.distributed.megatronfsdp import MegatronFSDPManager
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
@@ -168,9 +168,9 @@ def build_model_and_optimizer(
         model = autopipeline
     else:
         if callable(getattr(model_wrapper, "parallelize", None)):
-            # FSDP2 and nvFSDP should already be on the correct device
-            if isinstance(model_wrapper, NVFSDPManager):
-                # nvFSDP instantiate optimizer inside parallelize_function
+            # FSDP2 and MegatronFSDP should already be on the correct device
+            if isinstance(model_wrapper, MegatronFSDPManager):
+                # MegatronFSDP instantiate optimizer inside parallelize_function
                 trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
                 assert len(trainable_params) > 0, "trainable_params cannot be empty"
                 if tp_size > 1:
@@ -595,8 +595,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             assert autopipeline_cfg is not None, (
                 "AutoPipeline configuration is required when pipeline parallelism is enabled"
             )
-            assert not isinstance(self.model_wrapper, NVFSDPManager), (
-                "NVFSDPManager is not supported when pipeline parallelism is enabled"
+            assert not isinstance(self.model_wrapper, MegatronFSDPManager), (
+                "MegatronFSDPManager is not supported when pipeline parallelism is enabled"
             )
             # Create AutoPipeline from config
             autopipeline = autopipeline_cfg.instantiate(
@@ -869,7 +869,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             if isinstance(grad_norm, torch.Tensor):
                 grad_norm = grad_norm.item()
 
-        # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
+        # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model_parts[0].finish_grad_sync()
 
         for opt in self.optimizer:
@@ -892,7 +892,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         ):
             precompute_float8_dynamic_scale_for_fsdp(self.model_parts[0])
 
-        # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
+        # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model_parts[0].install_optimized_model_weights()
         # self.model_parts[0].zero_grad_buffer()
 
