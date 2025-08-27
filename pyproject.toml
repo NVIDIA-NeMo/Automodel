@@ -109,7 +109,7 @@ linting = [
     "import-linter~=2.4",
 ]
 test = ["coverage", "pytest", "peft"]
-dev = ["nvfsdp", "cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@87a86ab"]
+dev = ["nvfsdp", "cut-cross-entropy @ git+https://github.com/srogawski-nvidia/ml-cross-entropy.git@b2dd50b"]
 
 [tool.uv]
 default-groups = ["build", "docs", "test"]

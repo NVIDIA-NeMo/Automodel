@@ -494,7 +494,7 @@ wheels = [
 [[package]]
 name = "cut-cross-entropy"
 version = "25.3.2"
-source = { git = "https://github.com/apple/ml-cross-entropy.git?rev=87a86ab#87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" }
+source = { git = "https://github.com/srogawski-nvidia/ml-cross-entropy.git?rev=b2dd50b#b2dd50b4b59f519c3b85e06da50ac8b8f9fac19f" }
 dependencies = [
     { name = "setuptools" },
     { name = "torch", version = "2.8.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
@@ -1374,7 +1374,7 @@ build = [
     { name = "torch", marker = "sys_platform == 'darwin'", specifier = "<=2.8.0", index = "https://pypi.org/simple" },
 ]
 dev = [
-    { name = "cut-cross-entropy", git = "https://github.com/apple/ml-cross-entropy.git?rev=87a86ab" },
+    { name = "cut-cross-entropy", git = "https://github.com/srogawski-nvidia/ml-cross-entropy.git?rev=b2dd50b" },
     { name = "nvfsdp", git = "https://github.com/NVIDIA-NeMo/nvFSDP.git?rev=d97136886a65d70f298a4b361571ac75c20198af" },
 ]
 docs = [
