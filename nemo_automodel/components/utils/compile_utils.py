@@ -202,9 +202,9 @@ def compile_model(model: nn.Module, config: CompileConfig) -> nn.Module:
     logger.info(f"Compiling model with backend={config.backend}, mode={config.mode}, dynamic={config.dynamic}")
 
     try:
-        compiled_model = torch.compile(model, **compile_kwargs)
+        model.compile(**compile_kwargs)
         logger.info("Model compilation successful")
-        return compiled_model
+        return model
     except Exception as e:
         logger.error(f"Model compilation failed: {type(e).__name__}: {e}")
         logger.info("Returning original model")
