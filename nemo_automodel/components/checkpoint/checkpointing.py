@@ -235,7 +235,6 @@ def load_model_from_base_checkpoint(
         storage_reader=_HuggingFaceStorageReader(
             model_path, key_mapping=getattr(model, "_checkpoint_conversion_mapping", None)
         ),
-        process_group=device_mesh["pp"].get_group() if device_mesh else None,
     )
     model_state.load_state_dict(model_state_dict)
     if hasattr(model, "tie_weights") and model_state.is_tied_lm_head:
@@ -396,7 +395,9 @@ def get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
             raise FileNotFoundError(f"No snapshot directories found in {snapshots_root}")
 
 
-def to_empty_parameters_only(model: nn.Module, *, device: torch.device, recurse: bool = True) -> nn.Module:
+def to_empty_parameters_only(
+    model: nn.Module, *, device: torch.device, recurse: bool = True, dtype: torch.dtype = torch.bfloat16
+) -> nn.Module:
     """
     Move parameters to the specified device without copying storage, skipping buffers.
 
@@ -410,7 +411,7 @@ def to_empty_parameters_only(model: nn.Module, *, device: torch.device, recurse:
     Returns:
         The same module instance
     """
-    return _apply(model, lambda t: torch.empty_like(t, device=device), recurse=recurse)
+    return _apply(model, lambda t: torch.empty_like(t, device=device, dtype=dtype), recurse=recurse)
 
 
 def _save_peft_adapters(
