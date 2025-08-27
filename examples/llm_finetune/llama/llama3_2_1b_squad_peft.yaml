@@ -38,13 +38,13 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
 
-# torch.compile configuration
-compile:
-  enabled: false
-  mode: "default"  # Options: "default", "reduce-overhead", "max-autotune"
-  fullgraph: false
-  dynamic: true  # Set to false for better performance with fixed shapes
-  backend: null  # Use default backend (inductor)
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: True
+  dim: 8
+  alpha: 32
+  use_triton: True
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
