@@ -96,7 +96,7 @@ def to_cpu(
     """
     Converts a state dictionary to CPU.
     """
-    return {k: v.cpu() if isinstance(v, torch.Tensor) else to_cpu(v) for k, v in state_dict.items()}
+    return {k: v.cpu() for k, v in state_dict.items() if isinstance(v, torch.Tensor)}
 
 
 def get_validation_loss(
@@ -427,8 +427,8 @@ def test_consolidated_vlm_checkpoint():
         OptimizerState(
             trainer.model,
             trainer.optimizer,
-            trainer.step_scheduler,
-        ).state_dict()["optim"]["state"]
+            trainer.lr_scheduler,
+        ).state_dict()["optim"]
     )
 
     # assert the correct paths exist
@@ -558,7 +558,7 @@ def test_consolidated_vlm_checkpoint():
     #     "optim.state.model.layers.0.self_attn.q_proj.weight.step": ...
     # }
     # so we flatten the in-memory optimizer state dictionary to match the on-disk view
-    flattened_optim_dict = _flatten(optimizer_state_dict, parent_key="optim.state")
+    flattened_optim_dict = _flatten(optimizer_state_dict, parent_key="optim")
 
     # ---------------------------------------------------------------------
     # Compare the flattened in-memory model state with the on-disk view
