@@ -222,7 +222,7 @@ def test_autoprocessor_exception_handling(caplog):
         cfg_processor = None  # This triggers the exception path
         
         with caplog.at_level(logging.WARNING):
-            dataloader, processor = build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, None, 123)
+            dataloader, processor = build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, None, 123, 1)
         
         # Verify the results
         assert processor is None
@@ -263,7 +263,7 @@ def test_autoprocessor_with_processor_kwargs(caplog):
         cfg_processor = ProcessorConfig()  # This has to_dict but no instantiate
         
         with caplog.at_level(logging.WARNING):
-            dataloader, processor = build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, None, 123)
+            dataloader, processor = build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, None, 123, 1)
         
         # Verify the results
         assert processor is None

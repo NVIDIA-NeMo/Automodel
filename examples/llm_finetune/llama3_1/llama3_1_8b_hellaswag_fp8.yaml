@@ -20,7 +20,8 @@
 # This example demonstrates FP8 quantization for improved training performance on H100+ GPUs.
 
 step_scheduler:
-  grad_acc_steps: 4
+  global_batch_size: 32
+  local_batch_size: 1 # 1 for benchmark, increase it for better throughput
   ckpt_every_steps: 200
   val_every_steps: 200  # will run every x number of gradient steps
   num_epochs: 1
@@ -87,7 +88,6 @@ dataloader:
   collate_fn:
     _target_: nemo_automodel.components.datasets.utils.default_collater
     pad_seq_len_divisible: 16 # fp8 requires divisible by 16
-  batch_size: 1  # 1 for benchmark, increase it for better throughput
   shuffle: false
 
 validation_dataset:
@@ -101,7 +101,6 @@ validation_dataloader:
   collate_fn:
     _target_: nemo_automodel.components.datasets.utils.default_collater
     pad_seq_len_divisible: 16
-  batch_size: 1
   
 optimizer:
   _target_: torch.optim.Adam

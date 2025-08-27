@@ -2,7 +2,8 @@
 # produced by the `modded-nanogpt` preprocessing pipeline.
 
 step_scheduler:
-  grad_acc_steps: 16
+  global_batch_size: 32
+  local_batch_size: 8
   ckpt_every_steps: 2000
   num_epochs: 1
 
@@ -49,7 +50,6 @@ dataset:
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  batch_size: 8
   shuffle: false
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
 

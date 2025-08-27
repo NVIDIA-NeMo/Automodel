@@ -16,7 +16,8 @@
 
 
 step_scheduler:
-  grad_acc_steps: 8
+  global_batch_size: 8
+  local_batch_size: 8
   ckpt_every_steps: 100
   val_every_steps: 10000  # will run every x number of gradient steps
   max_steps: 10000
@@ -63,7 +64,6 @@ dataset:
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  batch_size: 8
   num_workers: 0
   pin_memory: true
   collate_fn:
@@ -76,7 +76,6 @@ validation_dataset:
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  batch_size: 2
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.phi4_mm_collate_fn
   

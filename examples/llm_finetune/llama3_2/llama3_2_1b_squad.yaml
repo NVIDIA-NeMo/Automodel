@@ -19,7 +19,8 @@
 
 
 step_scheduler:
-  grad_acc_steps: 4
+  global_batch_size: 32
+  local_batch_size: 8
   ckpt_every_steps: 1000
   val_every_steps: 10  # will run every x number of gradient steps
   num_epochs: 1
@@ -67,7 +68,6 @@ packed_sequence:
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  batch_size: 8
   shuffle: false
 
 validation_dataset:
@@ -79,7 +79,6 @@ validation_dataset:
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  batch_size: 8
 
 optimizer:
   _target_: torch.optim.Adam

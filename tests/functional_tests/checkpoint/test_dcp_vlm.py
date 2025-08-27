@@ -566,7 +566,7 @@ def test_vlm_dcp_checkpoint():
     ]
 
     for file in output_files:
-        path = Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_2_step_10" / file
+        path = Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / file
         assert path.exists(), f"Expected {path} to exist"
         if "." in file:
             assert path.is_file(), f"Expected {path} to be a file"
@@ -577,7 +577,7 @@ def test_vlm_dcp_checkpoint():
 
     # Load checkpoint data
     restored_optim_dict, saved_lr_scheduler_state = load_dcp(
-        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_2_step_10" / "optim",
+        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "optim",
     )
     # Remove "sched." prefix from keys in saved_lr_scheduler_state if present
     if saved_lr_scheduler_state is not None:
@@ -607,7 +607,7 @@ def test_vlm_dcp_checkpoint():
                 )
 
     restored_model_dict, _ = load_dcp(
-        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_2_step_10" / "model",
+        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "model",
     )
 
     # check if new model and current model give the same CE loss
@@ -620,7 +620,7 @@ def test_vlm_dcp_checkpoint():
     assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
 
     # compare the recipe configs
-    with open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_2_step_10" / "config.yaml", "r") as f:
+    with open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "config.yaml", "r") as f:
         restored_config = yaml.safe_load(f)
     compare_configs(trainer.cfg.raw_config, restored_config)
 

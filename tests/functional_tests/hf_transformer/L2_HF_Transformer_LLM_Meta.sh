@@ -27,7 +27,8 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
     --validation_dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
     --dataset.limit_dataset_samples 1000 \
-    --dataloader.batch_size 8 \
+    --step_scheduler.global_batch_size 8 \
+    --step_scheduler.local_batch_size 4 \
     --distributed._target_ nemo_automodel.components.distributed.fsdp2.FSDP2Manager \
     --distributed.dp_size none \
     --distributed.tp_size 1 \

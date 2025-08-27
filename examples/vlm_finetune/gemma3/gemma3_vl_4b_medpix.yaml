@@ -17,7 +17,8 @@
 
 
 step_scheduler:
-  grad_acc_steps: 8
+  global_batch_size: 8
+  local_batch_size: 1
   ckpt_every_steps: 100
   val_every_steps: 100  # will run every x number of gradient steps
   max_steps: 1000
@@ -61,7 +62,6 @@ dataset:
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  batch_size: 1
   num_workers: 0
   pin_memory: true
   collate_fn:
@@ -75,7 +75,6 @@ validation_dataset:
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  batch_size: 1
   
 optimizer:
   _target_: torch.optim.AdamW
