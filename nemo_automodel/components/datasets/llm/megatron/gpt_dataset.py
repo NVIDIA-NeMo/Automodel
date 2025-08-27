@@ -13,23 +13,22 @@
 # limitations under the License.
 
 import functools
+import hashlib
+import json
 import logging
+import os
 import re
+import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional, Tuple
-import os
-import time
 
 import numpy
 import torch
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_automodel.components.datasets.llm.megatron.indexed_dataset import IndexedDataset
-
-import json
-import hashlib
-from collections import OrderedDict
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 # taken and modified from https://github.com/NVIDIA/Megatron-LM/blob/5e798111e60f45e82c336ef7b89d8d793c93208f/megatron/core/datasets/gpt_dataset.py
 logger = logging.getLogger(__name__)
@@ -132,6 +131,7 @@ class BlendedMegatronDatasetConfig:
             self.split_matrix = convert_split_vector_to_split_matrix(split_vector)
             logger.info(f"Let split_matrix = {self.split_matrix}")
 
+
 @dataclass
 class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Configuration object for Megatron Core GPT datasets"""
@@ -167,6 +167,7 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.reset_position_ids is not None
         assert self.reset_attention_mask is not None
         assert self.eod_mask_loss is not None
+
 
 def parse_and_normalize_split(split: str) -> List[float]:
     """Parse the dataset split ratios from a string
@@ -281,7 +282,9 @@ class GPTDataset(torch.utils.data.Dataset):
         self.unique_description = json.dumps(
             self.unique_identifiers, indent=4, default=lambda obj: obj.unique_identifiers
         )
-        self.unique_description_hash = hashlib.md5(self.unique_description.encode("utf-8"), usedforsecurity=False).hexdigest()
+        self.unique_description_hash = hashlib.md5(
+            self.unique_description.encode("utf-8"), usedforsecurity=False
+        ).hexdigest()
         self.masks_and_position_ids_are_cacheable = not any(
             [
                 self.config.reset_position_ids,
@@ -596,6 +599,7 @@ class GPTDataset(torch.utils.data.Dataset):
                 sequence_lengths_for_cpp = self.dataset.sequence_lengths
 
             from nemo_automodel.components.datasets.llm.megatron import helpers
+
             sample_index = helpers.build_sample_idx(
                 sequence_lengths_for_cpp,
                 document_index,
@@ -658,7 +662,6 @@ class GPTDataset(torch.utils.data.Dataset):
         logger.info(f"> total number of samples: {sample_index.shape[0] - 1}")
 
         return document_index, sample_index, shuffle_index
-
 
     def _get_num_tokens_per_epoch(self) -> int:
         """Calculate the number of tokens in a single epoch

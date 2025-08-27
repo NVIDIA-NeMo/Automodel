@@ -12,24 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List, Optional, Union
+import logging
+import os
+from importlib.util import find_spec
 from pathlib import Path
-from nemo_automodel.components.datasets.llm.megatron.gpt_dataset import GPTDataset, GPTDatasetConfig
-from nemo_automodel.components.datasets.llm.megatron.megatron_utils import get_blend_from_list, compile_helper
-from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
+from typing import Dict, List, Literal, Optional, Union
+
+import torch.distributed as dist
 from torch.utils import data
 from torchdata.stateful_dataloader import StatefulDataLoader
-from nemo_automodel.components.datasets.llm.megatron.builder import BlendedMegatronDatasetBuilder
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-import os
-import logging
-from typing import Literal
-import torch.distributed as dist
+
+from nemo_automodel.components.datasets.llm.megatron.builder import BlendedMegatronDatasetBuilder
+from nemo_automodel.components.datasets.llm.megatron.gpt_dataset import GPTDatasetConfig
+from nemo_automodel.components.datasets.llm.megatron.megatron_utils import compile_helper, get_blend_from_list
+from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
 
 logger = logging.getLogger(__name__)
 
-class MegatronPretraining:
 
+class MegatronPretraining:
     def __init__(
         self,
         paths: Path | List | Dict[str, List],
@@ -101,13 +103,11 @@ class MegatronPretraining:
             trainer_limit_test_batches (Union[int, float]): Limit for test batches.
             splits_to_build (Optional[Union[str, List[str]]]): Splits to build. If None, builds all splits.
         """
-        try:
-            from nemo_automodel.components.datasets.llm.megatron import helpers_cpp
-        except ImportError:
+        if find_spec("nemo_automodel.components.datasets.llm.megatron.helpers_cpp") is None:
             try:
                 compile_helper()
-                from nemo_automodel.components.datasets.llm.megatron import helpers_cpp
-            except ImportError:
+                assert find_spec("nemo_automodel.components.datasets.llm.megatron.helpers_cpp") is not None
+            except AssertionError:
                 raise ImportError(
                     "Could not compile megatron dataset C++ helper functions and therefore cannot import helpers python file."
                 )
@@ -155,9 +155,11 @@ class MegatronPretraining:
         if isinstance(splits_to_build, str):
             assert splits_to_build in ["train", "validation", "test"], f"Invalid split: {splits_to_build}"
         elif isinstance(splits_to_build, list):
-            assert all(s in ["train", "validation", "test"] for s in splits_to_build), f"Invalid splits: {splits_to_build}"
+            assert all(s in ["train", "validation", "test"] for s in splits_to_build), (
+                f"Invalid splits: {splits_to_build}"
+            )
         self.splits_to_build = splits_to_build
-        
+
         # Store trainer arguments
         self.trainer_max_steps = trainer_max_steps
         self.trainer_val_check_interval = trainer_val_check_interval
@@ -178,9 +180,9 @@ class MegatronPretraining:
 
         if self.num_train_samples is not None:
             if num_train_samples is not None:
-                assert (
-                    self.num_train_samples >= num_train_samples
-                ), f"num_train_samples must be greater than or equal to {num_train_samples}."
+                assert self.num_train_samples >= num_train_samples, (
+                    f"num_train_samples must be greater than or equal to {num_train_samples}."
+                )
             num_train_samples = self.num_train_samples
             train_iters = int(num_train_samples / self.global_batch_size)
 
@@ -195,12 +197,14 @@ class MegatronPretraining:
 
         if self.num_val_samples is not None:
             if num_val_samples is not None:
-                assert self.num_val_samples > num_val_samples, f"num_val_samples must be greater than {num_val_samples}."
+                assert self.num_val_samples > num_val_samples, (
+                    f"num_val_samples must be greater than {num_val_samples}."
+                )
             num_val_samples = self.num_val_samples
         if self.num_test_samples is not None:
-            assert (
-                self.num_test_samples > num_test_samples
-            ), f"num_test_samples must be greater than {num_test_samples}."
+            assert self.num_test_samples > num_test_samples, (
+                f"num_test_samples must be greater than {num_test_samples}."
+            )
             num_test_samples = self.num_test_samples
 
         if (
@@ -238,11 +242,11 @@ class MegatronPretraining:
             rank=dist.get_rank(),
             world_size=dist.get_world_size(),
         )
-        
+
         # Use 0 workers when debugging to enable breakpoints
-        debug_mode = kwargs.pop('debug', False)
+        debug_mode = kwargs.pop("debug", False)
         num_workers = 0 if debug_mode else self.num_workers
-        
+
         dataloader = StatefulDataLoader(
             dataset=dataset,
             num_workers=num_workers,
@@ -253,7 +257,7 @@ class MegatronPretraining:
             **kwargs,
         )
         return dataloader
-        
+
     def train_dataloader(self):
         """
         Get the train dataloader.
@@ -279,7 +283,7 @@ class MegatronPretraining:
         if not hasattr(self, "_test_ds") or self._test_ds is None:
             raise RuntimeError("Test dataset was not built. Include 'test' in splits_to_build to enable it.")
         return self._create_dataloader(self._test_ds)
-    
+
     @property
     def gpt_dataset_config(self) -> "GPTDatasetConfig":
         """
@@ -310,6 +314,7 @@ def is_number_tryexcept(s):
     except ValueError:
         return False
 
+
 def is_zipped_list(paths):
     """
     Check if the paths are zipped.
@@ -322,6 +327,7 @@ def is_zipped_list(paths):
     if any(is_num):
         assert all(is_num), "Got malformatted zipped list"
     return is_num[0]
+
 
 def validate_dataset_asset_accessibility(paths):
     """

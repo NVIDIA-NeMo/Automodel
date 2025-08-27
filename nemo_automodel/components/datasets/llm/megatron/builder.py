@@ -12,21 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
-from typing import Any, Callable, Iterable, List, Optional, Type, Union
 import hashlib
 import json
+import logging
+import math
 import os
 import time
 from collections import OrderedDict
-from typing import Dict, List, Optional, Tuple, Union
-import math
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, Union
 
 import numpy
 import torch
 
-from nemo_automodel.components.datasets.llm.megatron.gpt_dataset import normalize, GPTDataset, GPTDatasetConfig, Split
+from nemo_automodel.components.datasets.llm.megatron.gpt_dataset import GPTDataset, GPTDatasetConfig, Split, normalize
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +67,7 @@ class BlendedDataset(torch.utils.data.Dataset):
 
         # Alert user to unnecessary blending
         if len(datasets) == 1:
-            logger.warning(f"Building a BlendedDataset for a single MegatronDataset")
+            logger.warning("Building a BlendedDataset for a single MegatronDataset")
 
         if size is not None:
             weights = normalize(weights)
@@ -86,9 +85,7 @@ class BlendedDataset(torch.utils.data.Dataset):
         unique_identifiers["weights"] = self.weights
         unique_identifiers["size"] = self.size
 
-        self.unique_description = json.dumps(
-            unique_identifiers, indent=4, default=lambda obj: obj.unique_identifiers
-        )
+        self.unique_description = json.dumps(unique_identifiers, indent=4, default=lambda obj: obj.unique_identifiers)
         self.unique_description_hash = hashlib.md5(
             self.unique_description.encode("utf-8"), usedforsecurity=False
         ).hexdigest()
@@ -137,7 +134,7 @@ class BlendedDataset(torch.utils.data.Dataset):
             logger.info(f"Build and save the {type(self).__name__} indices")
 
             # Build the dataset and dataset sample indexes
-            logger.info(f"\tBuild and save the dataset and dataset sample indexes")
+            logger.info("\tBuild and save the dataset and dataset sample indexes")
             t_beg = time.time()
             from nemo_automodel.components.datasets.llm.megatron import helpers_cpp
 
@@ -199,9 +196,7 @@ class BlendedDataset(torch.utils.data.Dataset):
 
         logger.info(f"\tLoad the dataset sample index from {path_to_dataset_sample_index}")
         t_beg = time.time()
-        dataset_sample_index = numpy.load(
-            path_to_dataset_sample_index, allow_pickle=True, mmap_mode="r"
-        )
+        dataset_sample_index = numpy.load(path_to_dataset_sample_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         logger.debug(f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -239,9 +234,7 @@ class BlendedMegatronDatasetBuilder:
         if torch.distributed.is_initialized():
             gb_rank = torch.distributed.get_rank()
             if gb_rank == 0:
-                assert (
-                    self.is_built_on_rank()
-                ), "is_built_on_rank must return True when global rank = 0"
+                assert self.is_built_on_rank(), "is_built_on_rank must return True when global rank = 0"
 
     def build(self) -> List[Optional[GPTDataset]]:
         """Build all dataset splits according to the provided blend(s)
@@ -335,9 +328,7 @@ class BlendedMegatronDatasetBuilder:
                 )
 
             # Build each dataset in parallel
-            megatron_datasets = self._build_megatron_datasets_parallel(
-                prefixes, split, sizes_per_dataset_buffer
-            )
+            megatron_datasets = self._build_megatron_datasets_parallel(prefixes, split, sizes_per_dataset_buffer)
 
             # Build the top-level datasets
             blended_datasets = [None] * len(Split)
@@ -351,9 +342,7 @@ class BlendedMegatronDatasetBuilder:
                     elif weights_i is None:
                         # Blend according to dataset sizes as-is and (maybe) client-specified size
                         try:
-                            weights_i = [
-                                len(megatron_dataset) for megatron_dataset in megatron_datasets[i]
-                            ]
+                            weights_i = [len(megatron_dataset) for megatron_dataset in megatron_datasets[i]]
                         except TypeError:
                             weights_i = [0 for _ in prefixes]
                         if self.sizes[i] is not None:
@@ -362,9 +351,7 @@ class BlendedMegatronDatasetBuilder:
                             # Build exhaustive indices
                             size_i = None
                     else:
-                        raise ValueError(
-                            "Using client-specified weights requires client-specified size"
-                        )
+                        raise ValueError("Using client-specified weights requires client-specified size")
                     blended_datasets[i] = self.build_generic_dataset(
                         BlendedDataset,
                         self.is_built_on_rank,
@@ -412,23 +399,17 @@ class BlendedMegatronDatasetBuilder:
                             # to be built
                             assert sizes_spoof[i] is None
                         for prefix in prefixes:
-                            ds = self._build_megatron_dataset_splits(
-                                prefix, split_spoof, sizes_spoof
-                            )[i]
+                            ds = self._build_megatron_dataset_splits(prefix, split_spoof, sizes_spoof)[i]
                             validation_datasets.append(ds)
                         blended_datasets[i] = validation_datasets
                         continue
 
                     # Build mid-level datasets
                     if weights is None:
-                        sizes_per_dataset_buffer = [
-                            [None for split in Split] for prefix in prefixes
-                        ]
+                        sizes_per_dataset_buffer = [[None for split in Split] for prefix in prefixes]
                     else:
                         # The number of samples we plan to use per dataset
-                        sizes_per_dataset_target = _get_size_per_split_per_dataset(
-                            weights, sizes_spoof
-                        )
+                        sizes_per_dataset_target = _get_size_per_split_per_dataset(weights, sizes_spoof)
                         # The number of samples we plan to build per dataset
                         sizes_per_dataset_buffer = _get_size_per_split_per_dataset(
                             weights, sizes_spoof, surplus=self.config.mid_level_dataset_surplus
@@ -447,9 +428,7 @@ class BlendedMegatronDatasetBuilder:
                     elif weights is None:
                         # Blend according to dataset sizes as-is and (maybe) client-specified size
                         try:
-                            weights = [
-                                len(megatron_dataset) for megatron_dataset in megatron_datasets
-                            ]
+                            weights = [len(megatron_dataset) for megatron_dataset in megatron_datasets]
                         except TypeError:
                             weights = [0 for _ in prefixes]
                         if self.sizes[i] is not None:
@@ -536,7 +515,7 @@ class BlendedMegatronDatasetBuilder:
                 )
 
         return mid_level_datasets
-    
+
     def _build_megatron_datasets_parallel(
         self, prefixes: List[str], split: List[float], sizes_per_dataset: List[List[int]]
     ) -> List[List[Optional[GPTDataset]]]:
@@ -597,9 +576,7 @@ class BlendedMegatronDatasetBuilder:
                     # if user set num_dataset_builder_threads to 1,
                     # i.e. meant for serial build, do not scale up.
                     num_workers *= min(2, max(1, torch.cuda.device_count()))
-                _threading_helper(
-                    megatron_datasets, num_workers, prefixes, split, sizes_per_dataset
-                )
+                _threading_helper(megatron_datasets, num_workers, prefixes, split, sizes_per_dataset)
 
             torch.distributed.barrier()
 
@@ -613,9 +590,7 @@ class BlendedMegatronDatasetBuilder:
                     sizes_per_dataset,
                 )
         else:
-            _threading_helper(
-                megatron_datasets, num_dataset_builder_threads, prefixes, split, sizes_per_dataset
-            )
+            _threading_helper(megatron_datasets, num_dataset_builder_threads, prefixes, split, sizes_per_dataset)
 
         return megatron_datasets
 
@@ -660,10 +635,10 @@ class BlendedMegatronDatasetBuilder:
                     dataset = cls(*args)
                 except OSError as err:
                     log = (
-                        f"Failed to write dataset materials to the data cache directory. Please "
-                        f"supply a directory to which you have write access via the path_to_cache "
-                        f"attribute in BlendedMegatronDatasetConfig and retry. Refer to the "
-                        f"preserved traceback above for more information."
+                        "Failed to write dataset materials to the data cache directory. Please "
+                        "supply a directory to which you have write access via the path_to_cache "
+                        "attribute in BlendedMegatronDatasetConfig and retry. Refer to the "
+                        "preserved traceback above for more information."
                     )
                     raise Exception(log) from err
 
@@ -722,10 +697,7 @@ def _get_size_per_split_per_dataset(
 
     # Use margin as buffer to ensure we satiate the request
     sizes_per_dataset = [
-        [
-            int(math.ceil(math.ceil(target_size * weight) * (1 + surplus)))
-            for target_size in target_size_per_split
-        ]
+        [int(math.ceil(math.ceil(target_size * weight) * (1 + surplus))) for target_size in target_size_per_split]
         for weight in normalized_weights
     ]
 

@@ -1,10 +1,10 @@
+import logging
 import os
 import subprocess
 from typing import List, Optional, Tuple
 
-import logging
-
 logger = logging.getLogger(__name__)
+
 
 def get_blend_from_list(
     blend: Optional[List[str]],
@@ -46,6 +46,7 @@ def get_blend_from_list(
 
     return prefix_per_dataset, weight_per_dataset
 
+
 def compile_helper():
     """Compile helper function ar runtime. Make sure this
     is invoked on a single process."""
@@ -55,4 +56,5 @@ def compile_helper():
     if ret.returncode != 0:
         logger.error("Making C++ dataset helpers module failed, exiting.")
         import sys
+
         sys.exit(1)

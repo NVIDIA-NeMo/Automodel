@@ -43,6 +43,7 @@ class BaseMegatronSampler:
             the last incomplete global batch will be padded to `global_batch_size`
             when `drop_last` is False.
     """
+
     def __init__(
         self,
         total_samples: int,
@@ -86,9 +87,7 @@ class BaseMegatronSampler:
         self.global_batch_size = global_batch_size
         self.pad_samples_to_global_batch_size = pad_samples_to_global_batch_size
 
-        logging.info(
-            f"Instantiating MegatronPretrainingSampler with total_samples: {total_samples}"
-        )
+        logging.info(f"Instantiating MegatronPretrainingSampler with total_samples: {total_samples}")
 
     def __len__(self):
         """Return the number of micro-batches this sampler will yield.
@@ -124,6 +123,7 @@ class MegatronPretrainingSampler(BaseMegatronSampler):
     Raises:
         RuntimeError: If there are no samples left to consume.
     """
+
     def __init__(
         self,
         total_samples: int,
@@ -179,9 +179,9 @@ class MegatronPretrainingSampler(BaseMegatronSampler):
 
         # Check the last partial batch and see drop_last is set
         if len(batch) > 0 and not self.drop_last:
-            assert (
-                not self.pad_samples_to_global_batch_size
-            ), "with pad_samples_to_global_batch_size all batches should be complete"
+            assert not self.pad_samples_to_global_batch_size, (
+                "with pad_samples_to_global_batch_size all batches should be complete"
+            )
             start_idx, end_idx = self.get_start_end_idx()
             yield batch[start_idx:end_idx]
 
@@ -196,6 +196,7 @@ class MegatronPretrainingRandomSampler(BaseMegatronSampler):
     - Requires `drop_last=True` when the product `micro_batch_size *
       data_parallel_size > 1`.
     """
+
     def __init__(
         self,
         total_samples: int,
@@ -216,9 +217,9 @@ class MegatronPretrainingRandomSampler(BaseMegatronSampler):
             global_batch_size=global_batch_size,
             pad_samples_to_global_batch_size=pad_samples_to_global_batch_size,
         )
-        assert (
-            not pad_samples_to_global_batch_size
-        ), "`MegatronPretrainingRandomSampler` does not support sample padding"
+        assert not pad_samples_to_global_batch_size, (
+            "`MegatronPretrainingRandomSampler` does not support sample padding"
+        )
         if (not drop_last) and self.micro_batch_times_data_parallel_size > 1:
             raise RuntimeError(
                 "`MegatronPretrainingRandomSampler` does not support drop_last=False when micro_batch_size * data_parallel_size > 1. \
@@ -329,7 +330,7 @@ def create_megatron_sampler(
     Raises:
         Exception: If an unsupported `dataloader_type` is provided.
     """
-    if dataloader_type == 'single':
+    if dataloader_type == "single":
         batch_sampler = MegatronPretrainingSampler(
             total_samples=dataset_len,
             micro_batch_size=micro_batch_size,
@@ -339,7 +340,7 @@ def create_megatron_sampler(
             drop_last=drop_last,
             pad_samples_to_global_batch_size=pad_samples_to_global_batch_size,
         )
-    elif dataloader_type == 'cyclic':
+    elif dataloader_type == "cyclic":
         batch_sampler = MegatronPretrainingRandomSampler(
             total_samples=dataset_len,
             micro_batch_size=micro_batch_size,
@@ -348,5 +349,5 @@ def create_megatron_sampler(
             drop_last=drop_last,
         )
     else:
-        raise Exception(f'{dataloader_type} dataloader type is not supported.')
+        raise Exception(f"{dataloader_type} dataloader type is not supported.")
     return batch_sampler
