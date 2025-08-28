@@ -989,7 +989,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         log_data["learning_rate"] = current_lr
 
         if wandb.run is not None:
-            wandb.log(log_data)
+            wandb.log(log_data, step=self.step_scheduler.step)
 
         if self.dist_env.is_main:
             logging.info(

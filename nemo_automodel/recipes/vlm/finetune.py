@@ -809,7 +809,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         log_data["learning_rate"] = current_lr
 
         if wandb.run is not None:
-            wandb.log(log_data)
+            wandb.log(log_data, step=self.step_scheduler.step)
 
         logging.info(
             "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f} | num_label_tokens {}".format(
