@@ -18,15 +18,11 @@ from importlib.util import find_spec
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Union
 
-import torch.distributed as dist
-from torch.utils import data
-from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_automodel.components.datasets.llm.megatron.builder import BlendedMegatronDatasetBuilder
 from nemo_automodel.components.datasets.llm.megatron.gpt_dataset import GPTDatasetConfig
 from nemo_automodel.components.datasets.llm.megatron.megatron_utils import compile_helper, get_blend_from_list
-from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
 
 logger = logging.getLogger(__name__)
 
@@ -39,10 +35,7 @@ class MegatronPretraining:
         tokenizer: Optional[PreTrainedTokenizerBase] = None,
         micro_batch_size: int = 4,
         global_batch_size: int = 8,
-        num_workers: int = 8,
-        pin_memory: bool = True,
-        persistent_workers: bool = False,
-        create_attention_mask: bool = True,
+        create_attention_mask: bool = False,
         seed: int = 1234,
         split: str = "900,50,50",
         index_mapping_dir: Optional[str] = None,
@@ -81,9 +74,6 @@ class MegatronPretraining:
             tokenizer (Optional[PreTrainedTokenizerBase]): An instance of a PreTrainedTokenizerBase object.
             micro_batch_size (int): Batch size per GPU.
             global_batch_size (int): Global batch size.
-            num_workers (int): See ``torch.utils.data.DataLoader`` documentation.
-            pin_memory (bool): See ``torch.utils.data.DataLoader`` documentation.
-            persistent_workers (bool): See ``torch.utils.data.DataLoader`` documentation.
             create_attention_mask (bool): Option to enable the attention masks generation.
                 Not supported with fused and flash attention.
             seed (int): Seed for generating the GPT dataset.
@@ -116,6 +106,10 @@ class MegatronPretraining:
             paths = [paths]
         validate_dataset_asset_accessibility(paths)
 
+        if isinstance(split, (list, tuple)):
+            split = [str(s) for s in split]
+            split = ", ".join(split)
+
         build_kwargs = {}
         build_kwargs["mmap_bin_files"] = mmap_bin_files
         if isinstance(paths, dict):
@@ -140,9 +134,6 @@ class MegatronPretraining:
         self.micro_batch_size = micro_batch_size
         self.global_batch_size = global_batch_size
         self.tokenizer = tokenizer
-        self.num_workers = num_workers
-        self.pin_memory = pin_memory
-        self.persistent_workers = persistent_workers
         self.create_attention_mask = create_attention_mask
         self.seed = seed
         self.split = split
@@ -186,26 +177,23 @@ class MegatronPretraining:
             num_train_samples = self.num_train_samples
             train_iters = int(num_train_samples / self.global_batch_size)
 
-        if train_iters is None or train_iters == -1:
+        if self.num_val_samples is not None:
+            num_val_samples = self.num_val_samples
+        elif train_iters is None or train_iters == -1:
             num_val_samples = None
         else:
-            eval_iters = (train_iters // self.trainer_val_check_interval) * self.trainer_limit_val_batches
-            num_val_samples = int(eval_iters * self.global_batch_size)
-
-        test_iters = self.trainer_limit_test_batches
-        num_test_samples = int(test_iters * self.global_batch_size)
-
-        if self.num_val_samples is not None:
-            if num_val_samples is not None:
-                assert self.num_val_samples > num_val_samples, (
-                    f"num_val_samples must be greater than {num_val_samples}."
-                )
-            num_val_samples = self.num_val_samples
-        if self.num_test_samples is not None:
-            assert self.num_test_samples > num_test_samples, (
-                f"num_test_samples must be greater than {num_test_samples}."
+            num_val_samples = (
+                int(train_iters // self.trainer_val_check_interval)
+                * self.trainer_limit_val_batches
+                * self.global_batch_size
             )
+
+        if self.num_test_samples is not None:
             num_test_samples = self.num_test_samples
+        elif train_iters is None or train_iters == -1:
+            num_test_samples = None
+        else:
+            raise ValueError("num_test_samples must be provided if train_iters is not None or -1")
 
         if (
             self.trainer_limit_val_batches > 0.0
@@ -234,55 +222,17 @@ class MegatronPretraining:
             enabled_splits=self.splits_to_build,
         ).build()
 
-    def _create_dataloader(self, dataset, **kwargs) -> StatefulDataLoader:
-        batch_sampler = create_megatron_sampler(
-            dataset_len=len(dataset),
-            micro_batch_size=self.micro_batch_size,
-            global_batch_size=self.global_batch_size,
-            rank=dist.get_rank(),
-            world_size=dist.get_world_size(),
-        )
-
-        # Use 0 workers when debugging to enable breakpoints
-        debug_mode = kwargs.pop("debug", False)
-        num_workers = 0 if debug_mode else self.num_workers
-
-        dataloader = StatefulDataLoader(
-            dataset=dataset,
-            num_workers=num_workers,
-            pin_memory=self.pin_memory,
-            persistent_workers=self.persistent_workers,
-            collate_fn=getattr(dataset, "collate_fn", data.dataloader.default_collate),
-            batch_sampler=batch_sampler,
-            **kwargs,
-        )
-        return dataloader
-
-    def train_dataloader(self):
+    def get_dataset(self, split: str):
         """
-        Get the train dataloader.
+        Get the dataset for a given split.
         """
-        if not hasattr(self, "_train_ds") or self._train_ds is None:
-            raise RuntimeError("Train dataset was not built. Include 'train' in splits_to_build to enable it.")
-        return self._create_dataloader(self._train_ds)
-
-    def val_dataloader(self):
-        """
-        Get the validation dataloader.
-        """
-        if not hasattr(self, "_validation_ds") or self._validation_ds is None:
+        mapping = {"train": "_train_ds", "validation": "_validation_ds", "test": "_test_ds"}
+        assert split in ["train", "validation", "test"], f"Invalid split: {split}"
+        if not hasattr(self, mapping[split]) or getattr(self, mapping[split]) is None:
             raise RuntimeError(
-                "Validation dataset was not built. Include 'validation' in splits_to_build to enable it."
+                f"Dataset for split {split} was not built. Include '{split}' in splits_to_build to enable it."
             )
-        return self._create_dataloader(self._validation_ds)
-
-    def test_dataloader(self):
-        """
-        Get the test dataloader.
-        """
-        if not hasattr(self, "_test_ds") or self._test_ds is None:
-            raise RuntimeError("Test dataset was not built. Include 'test' in splits_to_build to enable it.")
-        return self._create_dataloader(self._test_ds)
+        return getattr(self, mapping[split])
 
     @property
     def gpt_dataset_config(self) -> "GPTDatasetConfig":
