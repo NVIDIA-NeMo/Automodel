@@ -808,10 +808,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
                 local_loss = calculate_loss(
                     self.loss_fn,
-                    logits=out.logits,
+                    logits=getattr(out, "logits", out),
                     labels=labels,
                     model=model,
-                    hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
+                    hidden_states=getattr(out, "hidden_states", [None])[-1],
                     num_label_tokens=num_label_tokens,
                 )
                 loss_buffer.append(local_loss.clone().detach())
