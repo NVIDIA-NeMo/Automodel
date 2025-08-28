@@ -48,6 +48,7 @@ def test_megatron_dataset_checkpointing():
         val_check_interval=10,
         dp_rank=dp_rank,
         dp_world_size=dp_world_size,
+        pp_enabled=False,
     )[0]
     
     # fast-forward. not necessary, but we want to make sure the dataset is not at the beginning.
@@ -87,6 +88,7 @@ def test_megatron_dataset_checkpointing():
         val_check_interval=10,
         dp_rank=dp_rank,
         dp_world_size=dp_world_size,
+        pp_enabled=False,
     )[0]
 
     initial_batch = next(iter(dataset))
