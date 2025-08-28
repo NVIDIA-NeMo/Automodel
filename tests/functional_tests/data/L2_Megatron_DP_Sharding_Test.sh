@@ -23,7 +23,7 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --config examples/llm_pretrain/megatron_pretrain.yaml \
     --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
     --dataset._target_ nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining \
-    --dataset.paths /home/TestData/adasif/mcore_dataset_fineweb/processed_data_0_text_document /home/TestData/adasif/mcore_dataset_fineweb/processed_data_1_text_document \
+    --dataset.paths '["/home/TestData/adasif/mcore_dataset_fineweb/processed_data_0_text_document", "/home/TestData/adasif/mcore_dataset_fineweb/processed_data_1_text_document"]' \
     --dataset.seq_length 32 \
     --dataset.split "0.99, 0.01, 0.00" \
     --dataset.splits_to_build "train" \
