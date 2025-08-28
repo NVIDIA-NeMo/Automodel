@@ -23,7 +23,6 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 import torch
 import torch.nn as nn
 import wandb
-from modelopt.torch.opt.plugins.huggingface import enable_huggingface_checkpointing
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
@@ -772,7 +771,7 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         labels=labels,
                         model=self.model,
                         hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
-                        num_label_tokens=None,
+                        num_label_tokens=None,  # avoid double-counting denominator
                     )
 
                 total_loss += losses["loss"].item()
@@ -866,10 +865,6 @@ def main(config_path=None):
     if config_path is None:
         config_path = pathlib.Path(__file__).parent.resolve() / "llama_3_2_1b_hellaswag.yaml"
     cfg = parse_args_and_load_config(config_path)
-
-    # [ModelOpt]: Enable save/restore functionality
-    if cfg.get("kd_config", None) is not None:
-        enable_huggingface_checkpointing()
 
     trainer = FinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
