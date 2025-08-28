@@ -494,6 +494,50 @@ def validate_tp_mesh(model, tp_mesh):
     )
 
 
+def _find_largest_module_list(model: nn.Module) -> Optional[nn.ModuleList]:
+    """
+    Heuristic function to find the largest nn.ModuleList in a model.
+    
+    This function recursively traverses the model to find all nn.ModuleList instances
+    and returns the one with the most modules. This is useful as a fallback when
+    the model architecture is unknown, since transformer layers are typically
+    organized in ModuleLists.
+    
+    Args:
+        model (nn.Module): The model to search through.
+        
+    Returns:
+        Optional[nn.ModuleList]: The largest ModuleList found, or None if no ModuleList exists.
+    """
+    largest_module_list = None
+    largest_size = 0
+    
+    def _recursive_search(module: nn.Module, path: str = ""):
+        nonlocal largest_module_list, largest_size
+        
+        for name, child in module.named_children():
+            current_path = f"{path}.{name}" if path else name
+            
+            if isinstance(child, nn.ModuleList):
+                current_size = len(child)
+                if current_size > largest_size:
+                    largest_size = current_size
+                    largest_module_list = child
+                    logger.debug(f"Found ModuleList at {current_path} with {current_size} modules")
+            
+            # Continue recursive search
+            _recursive_search(child, current_path)
+    
+    _recursive_search(model)
+    
+    if largest_module_list is not None:
+        logger.info(f"Largest ModuleList found with {largest_size} modules")
+    else:
+        logger.warning("No ModuleList found in the model")
+    
+    return largest_module_list
+
+
 def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
     """
     Extract layers from different model architectures for parallelization.
@@ -511,70 +555,46 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
     model_cls = type(model)
     layers: List[nn.Module] = []
 
-    # Handle different model structures
-    if model_cls == Gemma3ForConditionalGeneration:
-        # Collect language model layers
-        for layer in model.language_model.layers:
-            layers.append(layer)
-        # Collect vision model layers (siglip encoder has same structure as clip encoder)
-        for layer in model.vision_tower.vision_model.encoder.layers:
-            layers.append(layer)
-
-    elif model_cls in [
-        Qwen2_5_VLForConditionalGeneration,
-        Qwen2VLForConditionalGeneration,
-    ]:
-        # VL models have the language model at model.language_model
-        # Append language model layers
-        for layer in model.language_model.layers:
-            layers.append(layer)
-        # Append visual model layers
-        for layer in model.visual.blocks:
-            layers.append(layer)
-
-    elif model_cls == SmolVLMForConditionalGeneration:
-        # Collect text model layers
-        for layer in model.model.text_model.layers:
-            layers.append(layer)
-        # Collect vision model layers
-        for layer in model.model.vision_model.encoder.layers:
-            layers.append(layer)
-
-    elif model_cls in [
-        LlavaForConditionalGeneration,
-        LlavaNextForConditionalGeneration,
-        LlavaNextVideoForConditionalGeneration,
-        LlavaOnevisionForConditionalGeneration,
-    ]:
-        # Collect language model layers
-        for layer in model.model.language_model.layers:
-            layers.append(layer)
-        # Collect vision model layers
-        for layer in model.vision_tower.vision_model.encoder.layers:
-            layers.append(layer)
-
-    elif model_cls == Mistral3ForConditionalGeneration:
-        # Collect language model layers
-        for layer in model.model.language_model.layers:
-            layers.append(layer)
-        # Collect vision model layers
-        for layer in model.model.vision_tower.transformer.layers:
-            layers.append(layer)
-
-    elif model_cls == Llama4ForConditionalGeneration:
-        # Collect language model layers
-        for layer in model.language_model.model.layers:
-            layers.append(layer)
-        # Collect vision model layers
-        for layer in model.vision_model.model.layers:
-            layers.append(layer)
-    elif model_cls.__name__ == "NemotronHForCausalLM":
+    LAYER_MAP = {
+        Gemma3ForConditionalGeneration: ["language_model.layers", "vision_tower.vision_model.encoder.layers"],
+        Qwen2_5_VLForConditionalGeneration: ["language_model.layers", "visual.blocks"],
+        Qwen2VLForConditionalGeneration: ["language_model.layers", "visual.blocks"],
+        SmolVLMForConditionalGeneration: ["model.text_model.layers", "model.vision_model.encoder.layers"],
+        LlavaForConditionalGeneration: ["model.language_model.layers", "vision_tower.vision_model.encoder.layers"],
+        LlavaNextForConditionalGeneration: ["model.language_model.layers", "vision_tower.vision_model.encoder.layers"],
+        LlavaNextVideoForConditionalGeneration: ["model.language_model.layers", "vision_tower.vision_model.encoder.layers"],
+        LlavaOnevisionForConditionalGeneration: ["model.language_model.layers", "vision_tower.vision_model.encoder.layers"],
+        Mistral3ForConditionalGeneration: ["model.language_model.layers", "model.vision_tower.transformer.layers"],
+        Llama4ForConditionalGeneration: ["language_model.model.layers", "vision_model.model.layers"],
         # NemotronH models use backbone.layers instead of model.layers
-        layers.extend(model.backbone.layers)
-    else:
+        "NemotronHForCausalLM": ["backbone.layers"],
+    }
+    def _reduce_attr(model, attr):
+        parts = attr.split(".")
+        return reduce(getattr, parts, model)
+
+    if model_cls in LAYER_MAP:
+        for attr in LAYER_MAP[model_cls]:
+            layers.extend(_reduce_attr(model, attr))
+    elif model_cls.__name__ == "NemotronHForCausalLM":
+        for attr in LAYER_MAP[model_cls.__name__]:
+            layers.extend(_reduce_attr(model, attr))
+    elif hasattr(model, "model"):
         # Default case for all other models (assumed to be a causal LM)
         layers.extend(model.model.layers)
-
+    elif hasattr(model, "layers"):
+        layers.extend(model.layers)
+    else:
+        # Use heuristic to find the largest ModuleList in the model
+        logger.warning(f"Unknown model type: {model_cls}. Using heuristic to find transformer layers.")
+        largest_module_list = _find_largest_module_list(model)
+        if largest_module_list is not None:
+            layers.extend(largest_module_list)
+            logger.info(f"Successfully extracted {len(largest_module_list)} layers using heuristic")
+        else:
+            # If no ModuleList found, still raise an exception
+            print(model)
+            raise ValueError(f"Unknown model type: {model_cls} and no ModuleList found in model structure")
     return layers
 
 
