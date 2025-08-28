@@ -84,6 +84,7 @@ class BlendedDataset(torch.utils.data.Dataset):
         unique_identifiers["split"] = self.split.name
         unique_identifiers["weights"] = self.weights
         unique_identifiers["size"] = self.size
+        unique_identifiers["tokenizer"] = self.config.tokenizer.name_or_path
 
         self.unique_description = json.dumps(unique_identifiers, indent=4, default=lambda obj: obj.unique_identifiers)
         self.unique_description_hash = hashlib.md5(
@@ -229,7 +230,10 @@ class BlendedMegatronDatasetBuilder:
         self.config = config
         self.enabled_splits_names = enabled_splits
 
-        logger.info(f"Building {GPTDataset.__name__} splits with sizes={self.sizes} and config={self.config}")
+        repr = []
+        for k, v in self.config.__dict__.items():
+            repr.append(f"{k}: {v}" if k != "tokenizer" else f"{k}: {v.name_or_path}")
+        logger.info(f"Building {GPTDataset.__name__} splits with sizes={self.sizes} and config=[{', '.join(repr)}]")
 
         if torch.distributed.is_initialized():
             gb_rank = torch.distributed.get_rank()
