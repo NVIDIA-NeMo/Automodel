@@ -13,7 +13,7 @@ dist_env:
 
 # Model
 # Option 1 – shorthand builder
-model:
+m2odel:
   _target_: nemo_automodel.components.models.gpt2.build_gpt2_model
   vocab_size: 50258   # default 50257
   n_positions: 2048   # context length
@@ -22,6 +22,10 @@ model:
   n_head: 12          # attention heads
   bos_token_id: 50256
   eos_token_id: 50256
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /home/TestData/huiyingl/hf_gemma3_2l/
 
 # Option 2 – explicit HF config (uncomment to use)
 # model:

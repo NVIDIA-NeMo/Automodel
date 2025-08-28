@@ -268,6 +268,7 @@ def build_loss_fn(cfg_loss):
     """
     return cfg_loss.instantiate()
 
+
 def _build_tokenizer(cfg_model, cfg_ds):
     # if tokenizer is not provided, use the model config to instantiate it
     if "tokenizer" not in cfg_ds and cfg_model.get("pretrained_model_name_or_path", None) is not None:
@@ -288,12 +289,13 @@ def _build_tokenizer(cfg_model, cfg_ds):
     if tokenizer is not None and callable(cfg_ds._target_):
         try:
             sig = inspect.signature(cfg_ds._target_)
-            if 'tokenizer' in sig.parameters:
+            if "tokenizer" in sig.parameters:
                 kwargs["tokenizer"] = tokenizer
         except (ValueError, TypeError):
             # If we can't get the signature, skip adding tokenizer
             pass
     return kwargs, tokenizer
+
 
 def build_dataloader(
     cfg_ds, cfg_dl, cfg_model, cfg_ps, device_mesh, seed, local_batch_size
