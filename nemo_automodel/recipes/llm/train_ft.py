@@ -986,7 +986,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     0,
                     batch,
                     loss_buffer=loss_buffer,
-                    num_label_tokens=num_label_tokens,
+                    num_label_tokens=None,  # we will normalize outside.
                     num_batches=1,
                     is_train=False,
                 )
