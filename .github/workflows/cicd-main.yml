@@ -133,9 +133,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # - test-name: L0_Unit_Tests_CPU
-          #   runner: linux-amd64-cpu16
-          #   cpu-only: true
+          - test-name: L0_Unit_Tests_CPU
+            runner: linux-amd64-cpu16
+            cpu-only: true
           # - test-name: L0_Unit_Tests_GPU
           #   runner: self-hosted-nemo
           #   cpu-only: false
