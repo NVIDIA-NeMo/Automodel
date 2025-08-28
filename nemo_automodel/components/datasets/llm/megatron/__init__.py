@@ -11,3 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from importlib.util import find_spec
+
+from nemo_automodel.components.datasets.llm.megatron.megatron_utils import compile_helper
+
+if find_spec("nemo_automodel.components.datasets.llm.megatron.helpers_cpp") is None:
+    try:
+        compile_helper()
+        assert find_spec("nemo_automodel.components.datasets.llm.megatron.helpers_cpp") is not None
+    except AssertionError:
+        raise ImportError(
+            "Could not compile megatron dataset C++ helper functions and therefore cannot import helpers python file."
+        )

@@ -14,7 +14,6 @@
 
 import logging
 import os
-from importlib.util import find_spec
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Union
 
@@ -22,7 +21,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_automodel.components.datasets.llm.megatron.builder import BlendedMegatronDatasetBuilder
 from nemo_automodel.components.datasets.llm.megatron.gpt_dataset import GPTDatasetConfig
-from nemo_automodel.components.datasets.llm.megatron.megatron_utils import compile_helper, get_blend_from_list
+from nemo_automodel.components.datasets.llm.megatron.megatron_utils import get_blend_from_list
 
 logger = logging.getLogger(__name__)
 
@@ -93,15 +92,6 @@ class MegatronPretraining:
             trainer_limit_test_batches (Union[int, float]): Limit for test batches.
             splits_to_build (Optional[Union[str, List[str]]]): Splits to build. If None, builds all splits.
         """
-        if find_spec("nemo_automodel.components.datasets.llm.megatron.helpers_cpp") is None:
-            try:
-                compile_helper()
-                assert find_spec("nemo_automodel.components.datasets.llm.megatron.helpers_cpp") is not None
-            except AssertionError:
-                raise ImportError(
-                    "Could not compile megatron dataset C++ helper functions and therefore cannot import helpers python file."
-                )
-
         if not isinstance(paths, (list, tuple, dict)):
             paths = [paths]
         validate_dataset_asset_accessibility(paths)
