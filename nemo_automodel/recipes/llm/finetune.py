@@ -20,9 +20,14 @@ import time
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
+import modelopt.torch.quantization as mtq
 import torch
 import torch.nn as nn
 import wandb
+from modelopt.torch.opt import apply_mode
+from modelopt.torch.quantization.mode import QuantizeModeRegistry
+from modelopt.torch.quantization.model_quant import calibrate
+from modelopt.torch.quantization.utils import is_quantized
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
@@ -66,6 +71,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------
 #  Stateless helper functions
 # ---------------------------
+
 
 def build_model_and_optimizer(
     device,
@@ -265,9 +271,9 @@ def build_dataloader(
         }
     if "tokenizer" not in cfg_ds:
         logging.info("Using model config to instantiate tokenizer")
-        trust_remote_code = getattr(cfg_model, "trust_remote_code", False)
+        # trust_remote_code = getattr(cfg_model, "trust_remote_code", False)
         tokenizer = AutoTokenizer.from_pretrained(
-            cfg_model.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+            cfg_model.pretrained_model_name_or_path,  # trust_remote_code=trust_remote_code
         )
     elif "_target_" not in cfg_ds.tokenizer:
         tokenizer = AutoTokenizer.from_pretrained(**cfg_ds.tokenizer.to_dict())
@@ -581,6 +587,9 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 seed=self.cfg.get("seed", 42),
             )
 
+            if self.cfg.get("modelopt_quant", None):
+                self._quantize_model()
+
         # Scheduler
         self.step_scheduler = build_step_scheduler(self.cfg.get("step_scheduler", None), self.dataloader)
 
@@ -607,6 +616,43 @@ class FinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
+
+    def _quantize_model(self):
+        """Quantize the model using ModelOpt quantization.
+
+        Performs quantization with calibration using a subset of validation data.
+        """
+        if not is_quantized(self.model):
+            self.quant_cfg = getattr(mtq, self.cfg.modelopt_quant.quant_cfg)
+            # Create a subset of the validation data for calibration
+            calib_dataset = torch.utils.data.Subset(
+                self.val_dataloader.dataset, list(range(self.cfg.modelopt_quant.calib_size))
+            )
+            calib_loader = torch.utils.data.DataLoader(
+                calib_dataset,
+                batch_size=self.val_dataloader.batch_size,
+                collate_fn=self.val_dataloader.collate_fn if hasattr(self.val_dataloader, "collate_fn") else None,
+                shuffle=False,
+            )
+
+            # Define a calibration loop to forward the model with the calibration data
+            def calibrate_loop(_model):
+                for batch in calib_loader:
+                    _model(**batch)
+
+            logger.info("Quantizing the model")
+            # Add quantizers to student model only
+            context = self.model.hide_teacher_model() if hasattr(self.model, "_teacher_model") else nullcontext()
+            with context:
+                self.model = apply_mode(self.model, mode=[("quantize", self.quant_cfg)], registry=QuantizeModeRegistry)
+            # calibrate and quantize the model
+            self.model = calibrate(self.model, self.quant_cfg["algorithm"], forward_loop=calibrate_loop)
+            logger.info("Quantization done!")
+        else:
+            logger.info("Model is already quantized.")
+
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            mtq.print_quant_summary(self.model)
 
     # ------------------ main loop ------------------
     def run_train_validation_loop(self):
