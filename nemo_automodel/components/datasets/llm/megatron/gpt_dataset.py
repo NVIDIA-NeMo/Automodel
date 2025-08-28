@@ -414,14 +414,14 @@ class GPTDataset(torch.utils.data.Dataset):
                 "labels": labels,
                 "attention_mask": attention_mask,
                 "loss_mask": loss_mask,
-                "position_ids": position_ids,
+                # "position_ids": position_ids,
             }
         else:
             return {
                 "input_ids": tokens,
                 "labels": labels,
                 "loss_mask": loss_mask,
-                "position_ids": position_ids,
+                # "position_ids": position_ids,
             }
 
     def _query_document_sample_shuffle_indices(self, idx: int) -> Tuple[numpy.ndarray, numpy.ndarray]:
