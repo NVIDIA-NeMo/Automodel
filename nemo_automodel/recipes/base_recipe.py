@@ -351,6 +351,19 @@ class BaseRecipe:
         dp_group = self._get_dp_group()
         return 1 if dp_group is None else dp_group.size()
 
+    def _get_dp_rank(self):
+        if not self.device_mesh:
+            return 0
+        elif self.device_mesh["cp"].size() > 1:
+            return self.device_mesh.get_local_rank("dp_cp")
+        else:
+            return self.device_mesh.get_local_rank("dp")
+
+    def _get_tp_rank(self):
+        if not self.device_mesh or self.device_mesh["tp"].size() == 1:
+            return 0
+        return self.device_mesh.get_local_rank("tp")
+
     def _dp_allreduce(self, tensor, op=dist.ReduceOp.SUM):
         dp_group = self._get_dp_group()
         if dp_group is not None:
