@@ -28,7 +28,6 @@ _OVERRIDES = [
     "dataset.paths",
     "dataset.splits_to_build",
     "dataset.split",
-    "dataset.seq_length",
     "validation_dataset.dataset_name",
     "dataset.limit_dataset_samples",
     "step_scheduler.ckpt_every_steps",
