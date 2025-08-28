@@ -293,7 +293,7 @@ def _build_tokenizer(cfg_model, cfg_ds):
         except (ValueError, TypeError):
             # If we can't get the signature, skip adding tokenizer
             pass
-    return kwargs
+    return kwargs, tokenizer
 
 def build_dataloader(
     cfg_ds, cfg_dl, cfg_model, cfg_ps, device_mesh, seed, local_batch_size
@@ -324,7 +324,7 @@ def build_dataloader(
         }
 
     with StatefulRNG(seed=seed, ranked=True):
-        kwargs = _build_tokenizer(cfg_model, cfg_ds)
+        kwargs, tokenizer = _build_tokenizer(cfg_model, cfg_ds)
         ds = cfg_ds.instantiate(**kwargs)
         # Apply packing if configured
         if getattr(cfg_ps, "packed_sequence_size", 0) > 0:
