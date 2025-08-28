@@ -77,6 +77,7 @@ class RotaryEmbedParallel(SequenceParallel):
     def _prepare_output_fn(use_local_output, mod, outputs, device_mesh):
         return type(outputs)([o.to_local() if use_local_output else o for o in outputs])
 
+
 def _parallelize_gemma3(
     model: Union[Gemma3ForCausalLM, Gemma3ForConditionalGeneration],
     sequence_parallel: bool = False,
@@ -100,25 +101,17 @@ def _parallelize_gemma3(
     }
 
     base_model_sp_plan = {
-        f"{model_prefix}.embed_tokens": RowwiseParallel(
-            input_layouts=Replicate(), output_layouts=Shard(1)
-        ),
+        f"{model_prefix}.embed_tokens": RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1)),
         f"{model_prefix}.rotary_emb": RotaryEmbedParallel(use_local_output=True),
         f"{model_prefix}.rotary_emb_local": RotaryEmbedParallel(use_local_output=True),
         f"{model_prefix}.layers.*.input_layernorm": SequenceParallel(),
-        f"{model_prefix}.layers.*.self_attn.o_proj": RowwiseParallel(
-            output_layouts=Shard(1)
-        ),
+        f"{model_prefix}.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
         f"{model_prefix}.layers.*.post_attention_layernorm": SequenceParallel(),
         f"{model_prefix}.layers.*.pre_feedforward_layernorm": SequenceParallel(),
-        f"{model_prefix}.layers.*.mlp.down_proj": RowwiseParallel(
-            output_layouts=Shard(1)
-        ),
+        f"{model_prefix}.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
         f"{model_prefix}.layers.*.post_feedforward_layernorm": SequenceParallel(),
         f"{model_prefix}.norm": SequenceParallel(),
-        "lm_head": ColwiseParallel(
-            input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False
-        ),
+        "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False),
     }
 
     if sequence_parallel:
@@ -126,6 +119,7 @@ def _parallelize_gemma3(
         base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
 
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
+
 
 def _parallelize_llama(
     model: LlamaForCausalLM,
@@ -145,17 +139,13 @@ def _parallelize_llama(
     }
 
     base_model_sp_plan = {
-        "model.embed_tokens": RowwiseParallel(
-            input_layouts=Replicate(), output_layouts=Shard(1)
-        ),
+        "model.embed_tokens": RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1)),
         "model.norm": SequenceParallel(),
         "model.layers.*.input_layernorm": SequenceParallel(),
         "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
         "model.layers.*.post_attention_layernorm": SequenceParallel(),
         "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
-        "lm_head": ColwiseParallel(
-            input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False
-        ),
+        "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False),
     }
 
     if sequence_parallel:
@@ -163,6 +153,7 @@ def _parallelize_llama(
         base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
 
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
+
 
 def _parallelize_qwen(
     model: Union[Qwen2ForCausalLM, Qwen3ForCausalLM],
@@ -180,13 +171,9 @@ def _parallelize_qwen(
                 return input_tensor
             elif isinstance(input_tensor, torch.Tensor):
                 # assume the input passed in already sharded on the sequence dim and create the DTensor
-                return DTensor.from_local(
-                    input_tensor, device_mesh, sequence_sharding, run_check=False
-                )
+                return DTensor.from_local(input_tensor, device_mesh, sequence_sharding, run_check=False)
             else:
-                raise ValueError(
-                    f"expecting input of {mod} to be a torch.Tensor or DTensor, but got {input_tensor}"
-                )
+                raise ValueError(f"expecting input of {mod} to be a torch.Tensor or DTensor, but got {input_tensor}")
 
     if sequence_parallel:
         base_model_tp_plan = {
@@ -216,9 +203,7 @@ def _parallelize_qwen(
 
     else:
         base_model_tp_plan = {
-            "lm_head": ColwiseParallel(
-                output_layouts=Shard(-1), use_local_output=False
-            ),
+            "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
             "model.embed_tokens": RowwiseParallel(
                 input_layouts=Replicate(),
             ),
@@ -232,6 +217,7 @@ def _parallelize_qwen(
         }
 
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
+
 
 # Create the model-specific parallel plan mapping
 PARALLELIZE_FUNCTIONS: Dict[type, Callable[..., Dict[str, ParallelStyle]]] = {
