@@ -555,66 +555,30 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
     model_cls = type(model)
     layers: List[nn.Module] = []
 
-    # Handle different model structures
-    if model_cls == Gemma3ForConditionalGeneration:
-        # Collect language model layers
-        for layer in model.language_model.layers:
-            layers.append(layer)
-        # Collect vision model layers (siglip encoder has same structure as clip encoder)
-        for layer in model.vision_tower.vision_model.encoder.layers:
-            layers.append(layer)
-
-    elif model_cls in [
-        Qwen2_5_VLForConditionalGeneration,
-        Qwen2VLForConditionalGeneration,
-    ]:
-        # VL models have the language model at model.language_model
-        # Append language model layers
-        for layer in model.language_model.layers:
-            layers.append(layer)
-        # Append visual model layers
-        for layer in model.visual.blocks:
-            layers.append(layer)
-
-    elif model_cls == SmolVLMForConditionalGeneration:
-        # Collect text model layers
-        for layer in model.model.text_model.layers:
-            layers.append(layer)
-        # Collect vision model layers
-        for layer in model.model.vision_model.encoder.layers:
-            layers.append(layer)
-
-    elif model_cls in [
-        LlavaForConditionalGeneration,
-        LlavaNextForConditionalGeneration,
-        LlavaNextVideoForConditionalGeneration,
-        LlavaOnevisionForConditionalGeneration,
-    ]:
-        # Collect language model layers
-        for layer in model.model.language_model.layers:
-            layers.append(layer)
-        # Collect vision model layers
-        for layer in model.vision_tower.vision_model.encoder.layers:
-            layers.append(layer)
-
-    elif model_cls == Mistral3ForConditionalGeneration:
-        # Collect language model layers
-        for layer in model.model.language_model.layers:
-            layers.append(layer)
-        # Collect vision model layers
-        for layer in model.model.vision_tower.transformer.layers:
-            layers.append(layer)
-
-    elif model_cls == Llama4ForConditionalGeneration:
-        # Collect language model layers
-        for layer in model.language_model.model.layers:
-            layers.append(layer)
-        # Collect vision model layers
-        for layer in model.vision_model.model.layers:
-            layers.append(layer)
-    elif model_cls.__name__ == "NemotronHForCausalLM":
+    LAYER_MAP = {
+        Gemma3ForConditionalGeneration: ["language_model.layers", "vision_tower.vision_model.encoder.layers"],
+        Qwen2_5_VLForConditionalGeneration: ["language_model.layers", "visual.blocks"],
+        Qwen2VLForConditionalGeneration: ["language_model.layers", "visual.blocks"],
+        SmolVLMForConditionalGeneration: ["model.text_model.layers", "model.vision_model.encoder.layers"],
+        LlavaForConditionalGeneration: ["model.language_model.layers", "vision_tower.vision_model.encoder.layers"],
+        LlavaNextForConditionalGeneration: ["model.language_model.layers", "vision_tower.vision_model.encoder.layers"],
+        LlavaNextVideoForConditionalGeneration: ["model.language_model.layers", "vision_tower.vision_model.encoder.layers"],
+        LlavaOnevisionForConditionalGeneration: ["model.language_model.layers", "vision_tower.vision_model.encoder.layers"],
+        Mistral3ForConditionalGeneration: ["model.language_model.layers", "model.vision_tower.transformer.layers"],
+        Llama4ForConditionalGeneration: ["language_model.model.layers", "vision_model.model.layers"],
         # NemotronH models use backbone.layers instead of model.layers
-        layers.extend(model.backbone.layers)
+        "NemotronHForCausalLM": ["backbone.layers"],
+    }
+    def _reduce_attr(model, attr):
+        parts = attr.split(".")
+        return reduce(getattr, parts, model)
+
+    if model_cls in LAYER_MAP:
+        for attr in LAYER_MAP[model_cls]:
+            layers.extend(_reduce_attr(model, attr))
+    elif model_cls.__name__ == "NemotronHForCausalLM":
+        for attr in LAYER_MAP[model_cls.__name__]:
+            layers.extend(_reduce_attr(model, attr))
     elif hasattr(model, "model"):
         # Default case for all other models (assumed to be a causal LM)
         layers.extend(model.model.layers)
@@ -624,7 +588,6 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         # Use heuristic to find the largest ModuleList in the model
         logger.warning(f"Unknown model type: {model_cls}. Using heuristic to find transformer layers.")
         largest_module_list = _find_largest_module_list(model)
-        
         if largest_module_list is not None:
             layers.extend(largest_module_list)
             logger.info(f"Successfully extracted {len(largest_module_list)} layers using heuristic")
