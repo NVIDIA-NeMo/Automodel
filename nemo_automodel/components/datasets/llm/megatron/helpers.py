@@ -16,9 +16,6 @@
 # Explicit imports for readability
 import numpy
 
-from nemo_automodel.components.datasets.llm.megatron.helpers_cpp import *
-from nemo_automodel.components.datasets.llm.megatron.helpers_cpp import build_sample_idx_int32, build_sample_idx_int64
-
 
 def build_sample_idx(
     sizes: numpy.ndarray,
@@ -51,6 +48,10 @@ def build_sample_idx(
     Returns:
         numpy.ndarray: The 2-D sample index
     """
+    from nemo_automodel.components.datasets.llm.megatron.helpers_cpp import (
+        build_sample_idx_int32,
+        build_sample_idx_int64,
+    )
 
     sample_idx_max = max(document_indices.shape[0], sizes.max())
     if sample_idx_max <= numpy.iinfo(numpy.int32).max:
