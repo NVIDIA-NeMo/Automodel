@@ -190,10 +190,8 @@ class MegatronPretraining:
 
         if self.num_test_samples is not None:
             num_test_samples = self.num_test_samples
-        elif train_iters is None or train_iters == -1:
-            num_test_samples = None
         else:
-            raise ValueError("num_test_samples must be provided if train_iters is not None or -1")
+            num_test_samples = None
 
         if (
             self.trainer_limit_val_batches > 0.0
