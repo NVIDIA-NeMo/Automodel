@@ -58,11 +58,12 @@ def test_megatron_data_sharding():
         if i == 2:
             batch_to_test = batch
             break
-        
+
+    batch_to_test = {k: v.to(dist.get_rank()) for k, v in batch_to_test.items()}
+
     # ensure that labels are inputs left shifted by 1
     assert torch.all(batch_to_test["labels"][:, :-1] == batch_to_test["input_ids"][:, 1:]), f"Labels are not inputs left shifted by 1"
 
-    batch_to_test = {k: v.to(dist.get_rank()) for k, v in batch_to_test.items()}
     dist.barrier()
     del dataset
 
