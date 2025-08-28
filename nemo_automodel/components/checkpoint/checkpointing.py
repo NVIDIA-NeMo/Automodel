@@ -43,9 +43,9 @@ from nemo_automodel.components.checkpoint.stateful_wrappers import (
 
 if TYPE_CHECKING:
     from peft import PeftConfig
-    from transformers.tokenization_utils import PreTrainedTokenizerBase
     from torch.utils.data import IterableDataset
     from torchdata.stateful_dataloader import StatefulDataLoader
+    from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 
 @dataclass

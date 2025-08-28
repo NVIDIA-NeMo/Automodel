@@ -23,16 +23,16 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.optim import Optimizer
 from torch.utils.data import Dataset, IterableDataset
 from torchdata.stateful_dataloader import StatefulDataLoader
-from torch.optim import Optimizer
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 from nemo_automodel.components.checkpoint.checkpointing import (
+    load_dataloader,
     load_model,
     load_optimizer,
-    load_dataloader,
     save_config,
     save_dataloader,
     save_model,
