@@ -413,6 +413,8 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamSch
 
     # Total optimizer steps (accounting for gradient accumulation)
     total_steps = (total_epochs * epoch_len) // grad_acc_steps
+    if step_scheduler.max_steps is not None:
+        total_steps = min(total_steps, step_scheduler.max_steps)
 
     # Extract learning rate from optimizer
     base_lrs = [opt.param_groups[0]["lr"] for opt in optimizer]
