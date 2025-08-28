@@ -64,6 +64,8 @@ class Block(nn.Module):
             torch.Tensor: Output tensor after block computation.
             torch.Tensor | None: Auxiliary loss for load balancing (if applicable).
         """
+        if attention_mask is not None and padding_mask is None:
+            padding_mask = attention_mask.bool().logical_not()
 
         attn_out = self.self_attn(
             x=self.input_layernorm(x),
@@ -146,11 +148,17 @@ class DeepseekV3Model(nn.Module):
     def forward(
         self,
         tokens: torch.Tensor,
-        position_ids: torch.Tensor,
+        *,
+        position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if position_ids is None:
+            position_ids = (
+                torch.arange(0, tokens.shape[1], device=tokens.device).unsqueeze(0).expand(tokens.shape[0], -1)
+            )
+
         with torch.no_grad():
             freqs_cis = freqs_cis_from_position_ids(position_ids, self.freqs_cis)
 
@@ -208,6 +216,7 @@ class DeepseekV3ForCausalLM(nn.Module):
         pretrained_model_name_or_path: str | DeepseekV3Config,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        trust_remote_code: bool = False,
     ):
         if isinstance(pretrained_model_name_or_path, str):
             config = DeepseekV3Config.from_pretrained(pretrained_model_name_or_path)
@@ -234,12 +243,15 @@ class DeepseekV3ForCausalLM(nn.Module):
     def forward(
         self,
         tokens: torch.Tensor,
-        position_ids: torch.Tensor,
+        *,
+        position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
-        logits = self.model(tokens, position_ids, attention_mask, padding_mask, **attn_kwargs)
+        logits = self.model(
+            tokens, position_ids=position_ids, attention_mask=attention_mask, padding_mask=padding_mask, **attn_kwargs
+        )
         logits = self.lm_head(logits) if self.lm_head else logits
         return logits
 

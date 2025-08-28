@@ -25,15 +25,42 @@ from nemo_automodel.components.moe.utils import (
 )
 
 
-def _create_kwargs_for_te(attention_mask: torch.Tensor | None = None):
-    if attention_mask is None:
-        return {}
-    else:
-        return {
-            "attn_mask_type": "padding",
-            "window_size": (-1, -1),
-            "attention_mask": attention_mask.unsqueeze(1).unsqueeze(2),
-        }
+def preprocess_args_and_kwargs_for_attn(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attention_mask: torch.Tensor | None, backend: BackendConfig
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    """Preprocess attention inputs based on backend requirements."""
+    # Create attention kwargs based on backend
+    if backend.attn == "te":
+        if attention_mask is None:
+            attn_kwargs = {}
+        else:
+            padding_mask = attention_mask.bool().logical_not()
+            attn_kwargs = {
+                "attn_mask_type": "padding",
+                "window_size": (-1, -1),
+                "attention_mask": padding_mask.unsqueeze(1).unsqueeze(2),
+            }
+    else:  # sdpa
+        if attention_mask is None:
+            attn_kwargs = {}
+        else:
+            attn_kwargs = {
+                "attention_mask": attention_mask.bool(),
+            }
+        # Transpose for SDPA
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
+        attn_kwargs["is_causal"] = True
+
+    return q, k, v, attn_kwargs
+
+
+def postprocess_output_for_attn(x: torch.Tensor, backend: BackendConfig) -> torch.Tensor:
+    """Postprocess attention output based on backend requirements."""
+    if backend.attn == "sdpa":
+        x = x.transpose(1, 2).contiguous()
+    return x
 
 
 class MLA(nn.Module):
@@ -142,8 +169,9 @@ class MLA(nn.Module):
         k_pe = k_pe.unsqueeze(2).expand([bsz, -1, self.n_heads, self.qk_rope_head_dim])
         k = torch.cat([k_nope, k_pe], dim=-1)
 
-        attn_kwargs = _create_kwargs_for_te(attention_mask) if self.backend.attn == "te" else {}
+        q, k, v, attn_kwargs = preprocess_args_and_kwargs_for_attn(q, k, v, attention_mask, self.backend)
         x = self.attn_func(q, k, v, **attn_kwargs)
+        x = postprocess_output_for_attn(x, self.backend)
 
         x = self.o_proj(x.flatten(2))
         return x

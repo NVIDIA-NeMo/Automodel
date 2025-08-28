@@ -187,7 +187,9 @@ def parallelize_model(
     assert tp_axis_name is None or world_mesh[tp_axis_name].size() == 1, (
         "Tensor parallelism not supported for DeepSeek v3 model"
     )
-    assert cp_axis_name is None, "Context parallelism not supported for DeepSeek v3 model"
+    assert cp_axis_name is None or world_mesh[cp_axis_name].size() == 1, (
+        "Context parallelism not supported for DeepSeek v3 model"
+    )
 
     # TODO: Add support for context parallelism
     # if cp_enabled:

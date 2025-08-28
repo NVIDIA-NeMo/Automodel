@@ -49,6 +49,7 @@ def get_expert_slice_for_rank(experts_tensor: torch.Tensor, n_experts: int) -> t
     local_tensor = dtensor.to_local()
 
     device_mesh = dtensor.device_mesh
+    assert "ep" in device_mesh.mesh_dim_names, "ep mesh dimension not found"
     ep_mesh = device_mesh["ep"] if "ep" in device_mesh.mesh_dim_names else device_mesh
     current_rank = ep_mesh.get_local_rank()
 

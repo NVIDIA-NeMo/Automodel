@@ -154,6 +154,7 @@ def build_model_and_optimizer(
                 cfg_model.pretrained_model_name_or_path,
                 getattr(cfg_peft, "lora_A_init", None),
                 device_mesh=autopipeline.world_mesh,
+                moe_mesh=autopipeline.moe_mesh,
             )
 
         # Create optimizer for all model parts
@@ -194,6 +195,8 @@ def build_model_and_optimizer(
                         cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
                         cfg_model.pretrained_model_name_or_path,
                         getattr(cfg_peft, "lora_A_init", None),
+                        device_mesh=model_wrapper.device_mesh,
+                        moe_mesh=model_wrapper.moe_mesh,
                     )
 
         # ensure the model is on device
@@ -570,10 +573,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         setup_logging()
 
         self.device_mesh = None
+        self.moe_mesh = None
         self.model_wrapper = None
         if "distributed" in self.cfg:
             self.model_wrapper = self.cfg.distributed.instantiate(world_size=self.dist_env.world_size)
             self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
+            self.moe_mesh = getattr(self.model_wrapper, "moe_mesh", None)
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -601,7 +606,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # Create AutoPipeline from config
             autopipeline = autopipeline_cfg.instantiate(
                 world_mesh=self.device_mesh,
-                moe_mesh=None,
+                moe_mesh=self.moe_mesh,
                 pp_axis_name="pp",
                 dp_axis_names=(
                     ("dp_replicate", "dp_shard")
@@ -611,8 +616,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 ),
                 cp_axis_name="cp" if "cp" in self.device_mesh.mesh_dim_names else None,
                 tp_axis_name="tp" if "tp" in self.device_mesh.mesh_dim_names else None,
-                ep_axis_name=None,
-                ep_shard_axis_names=None,
+                ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
+                ep_shard_axis_names=(
+                    ("ep_shard",) if self.moe_mesh is not None and "ep_shard" in self.moe_mesh.mesh_dim_names else None
+                ),
                 pp_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
                 device=torch.cuda.current_device(),
             )
@@ -627,6 +634,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
         self.loss_fn = build_loss_fn(self.cfg.loss_fn)
+        parallelize_fn = self.cfg.get("parallelize_fn", None)
+        if parallelize_fn is None:
+            parallelize_fn = partial(parallelize_for_pp, model_wrapper=self.model_wrapper)
+
         model, self.optimizer = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
@@ -640,7 +651,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_compile=self.cfg.get("compile", None),
             autopipeline=autopipeline,
             loss_fn=self.loss_fn,
-            parallelize_fn=partial(parallelize_for_pp, model_wrapper=self.model_wrapper),
+            parallelize_fn=parallelize_fn,
         )
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
@@ -701,7 +712,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
         # Optionally resume
-        self.load_checkpoint(restore_from)
+        self.load_checkpoint(restore_from, moe_mesh=self.moe_mesh)
 
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
@@ -857,6 +868,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     max_grad_norm,
                     foreach=True,
                     pp_mesh=(self.device_mesh["pp"] if self.pp_enabled else None),
+                    ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
                 )
             else:
                 if not self.device_mesh or self.device_mesh["tp"].size() == 1:
