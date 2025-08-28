@@ -806,7 +806,6 @@ def test_dcp_checkpoint():
         "optim",
         "step_scheduler.pt",
         "dataloader/dataloader_dp_rank_0.pt",
-        "dataloader/dataloader_dp_rank_1.pt",
         "model/__0_0.distcp",
         "model/__1_0.distcp",
         "model/.metadata",
@@ -816,6 +815,8 @@ def test_dcp_checkpoint():
         "step_scheduler.pt",
         "config.yaml",
     ]
+    if trainer._get_dp_group_size() > 1:
+        output_files.append("dataloader/dataloader_dp_rank_1.pt")
 
     for file in output_files:
         path = Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / file
