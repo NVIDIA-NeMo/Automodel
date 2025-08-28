@@ -199,6 +199,10 @@ jobs:
             test-folder: hf_transformer_vlm
             runner: self-hosted-nemo
             timeout: 60
+          - test-name: L2_Datasets
+            test-folder: data
+            runner: self-hosted-nemo
+            timeout: 20
     needs: [cicd-unit-tests]
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.test-name }}
