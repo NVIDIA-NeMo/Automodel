@@ -75,5 +75,3 @@ def test_megatron_data_sharding():
             assert torch.any(gathered_tensors[0] != gathered_tensors[1]), f"Expected different tensors for DP > 1"
 
     dist.barrier()
-
-test_megatron_data_sharding()
