@@ -914,7 +914,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         reporting_loss = reporting_loss.cpu().item()
         # fix reporting_loss, tps across ranks
-        return reporting_loss, grad_norm, tps, num_tokens_in_batch_global, num_label_tokens
+        return reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens
 
     @torch.no_grad()
     def _run_validation_epoch(self):
@@ -991,7 +991,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         if self.dist_env.is_main:
             logging.info(
-                "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f} | num_label_tokens {}".format(
+                "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
                     self.step_scheduler.step,
                     self.step_scheduler.epoch,
                     train_loss,
@@ -999,6 +999,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     current_lr,
                     torch.cuda.max_memory_allocated() / 1024**3,
                     tps,
+                    tps / self._get_dp_group_size(),
                     num_label_tokens,
                 )
             )
