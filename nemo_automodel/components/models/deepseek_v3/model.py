@@ -18,8 +18,8 @@ import torch
 import torch.nn as nn
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
-from nemo_automodel.components.moe.deepseek_v3.layers import MLA
-from nemo_automodel.components.moe.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
+from nemo_automodel.components.models.deepseek_v3.layers import MLA
+from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
 from nemo_automodel.components.moe.rope_utils import freqs_cis_from_position_ids, precompute_freqs_cis
 from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
