@@ -255,16 +255,6 @@ def build_dataloader(
     Returns:
         The instantiated DataLoader and tokenizer.
     """
-    dist_sampler_kwargs = {
-        "shuffle": cfg_dl.get("shuffle", True),
-    }
-    if "shuffle" in cfg_dl:
-        del cfg_dl.shuffle
-    if device_mesh is not None:
-        dist_sampler_kwargs |= {
-            "num_replicas": dp_world_size,
-            "rank": dp_rank,
-        }
     # if tokenizer is not provided, use the model config to instantiate it
     if "tokenizer" not in cfg_ds and cfg_model.get("pretrained_model_name_or_path", None) is not None:
         logging.info("Using model config to instantiate tokenizer")
@@ -316,6 +306,15 @@ def build_dataloader(
             )
             dl_kwargs = {"batch_sampler": batch_sampler}
         elif not isinstance(ds, IterableDataset):
+            shuffle = cfg_dl.get("shuffle", True)
+            if "shuffle" in cfg_dl:
+                del cfg_dl.shuffle
+
+            dist_sampler_kwargs = {
+                "num_replicas": dp_world_size,
+                "rank": dp_rank,
+                "shuffle": shuffle,
+            }
             sampler = StatefulDistributedSampler(
                 ds,
                 seed=seed,
