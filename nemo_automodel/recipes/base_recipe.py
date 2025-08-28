@@ -23,6 +23,8 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.utils.data import Dataset, IterableDataset
+from torchdata.stateful_dataloader import StatefulDataLoader
 from torch.optim import Optimizer
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils import PreTrainedTokenizerBase
@@ -30,7 +32,9 @@ from transformers.tokenization_utils import PreTrainedTokenizerBase
 from nemo_automodel.components.checkpoint.checkpointing import (
     load_model,
     load_optimizer,
+    load_dataloader,
     save_config,
+    save_dataloader,
     save_model,
     save_optimizer,
 )
@@ -59,6 +63,19 @@ def has_load_restore_state(object):
         bool: returns True if has callable load_state_dict and state_dict
     """
     return all(callable(getattr(object, attr, None)) for attr in ("load_state_dict", "state_dict"))
+
+
+def is_dataloader(object):
+    """
+    Checks whether object is a dataloader.
+
+    Args:
+        object (any): the object to check.
+
+    Returns:
+        bool: returns True if object is a dataloader.
+    """
+    return isinstance(object, (StatefulDataLoader, IterableDataset, Dataset)) and has_load_restore_state(object)
 
 
 def is_tokenizer(object):
@@ -116,6 +133,7 @@ class BaseRecipe:
             or is_tokenizer(value)
             or is_lr_scheduler(value)
             or isinstance(value, ConfigNode)
+            or is_dataloader(value)
         )
 
         if should_track and not any(substr in key.lower() for substr in ("val", "eval", "test")):
@@ -153,7 +171,7 @@ class BaseRecipe:
         if is_dist_initialized:
             torch.distributed.barrier(dp_group)
         # TODO(@adil-a): Change this when we create a LR scheduler class
-        model, optimizer, scheduler, tokenizer, config = None, None, None, None, None
+        model, optimizer, scheduler, tokenizer, config, dataloader = None, None, None, None, None, None
 
         for key in self.__dict__["__state_tracked"]:
             if isinstance(getattr(self, key), nn.Module):
@@ -166,6 +184,8 @@ class BaseRecipe:
                 scheduler = getattr(self, key)
             elif is_tokenizer(getattr(self, key)):
                 tokenizer = getattr(self, key)
+            elif is_dataloader(getattr(self, key)):
+                dataloader = getattr(self, key)
             else:
                 if is_rank_0:
                     torch.save(
@@ -176,6 +196,7 @@ class BaseRecipe:
         save_model(model, path, self.checkpoint_config, peft_config=self.peft_config, tokenizer=tokenizer)
         save_optimizer(optimizer, model, path, scheduler)
         save_config(config.raw_config, path)
+        save_dataloader(dataloader, path, self._get_dp_rank(), self._get_tp_rank())
         if is_dist_initialized:
             torch.distributed.barrier(dp_group)
 
@@ -201,7 +222,7 @@ class BaseRecipe:
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             print(f"Loading checkpoint from {ckpt_dir}", flush=True)
 
-        model, optimizer, scheduler = None, None, None
+        model, optimizer, scheduler, dataloader = None, None, None, None
 
         for key in self.__dict__["__state_tracked"]:
             if isinstance(getattr(self, key), nn.Module):
@@ -210,6 +231,8 @@ class BaseRecipe:
                 optimizer = getattr(self, key)
             elif is_lr_scheduler(getattr(self, key)):
                 scheduler = getattr(self, key)
+            elif is_dataloader(getattr(self, key)):
+                dataloader = getattr(self, key)
             elif is_tokenizer(getattr(self, key)) or isinstance(getattr(self, key), ConfigNode):
                 # we don't need to load the tokenizer or config from the checkpoint
                 # we only save the tokenizer for consolidated checkpoints for downstream use
@@ -219,6 +242,7 @@ class BaseRecipe:
 
         load_model(model, ckpt_dir, self.checkpoint_config)
         load_optimizer(optimizer, model, ckpt_dir, scheduler)
+        load_dataloader(dataloader, ckpt_dir, self._get_dp_rank())
 
     def _log_experiment_details(self):
         """Log metadata and resolved config on main rank using YAML markers."""
