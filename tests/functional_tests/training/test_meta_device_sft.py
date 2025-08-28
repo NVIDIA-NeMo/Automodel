@@ -76,22 +76,25 @@ def test_consolidated_llm_checkpoint():
     meta_trainer = recipe_cls(cfg)
     meta_trainer.setup()
 
-    for (n, p), (meta_n, meta_p) in zip(trainer.model.named_parameters(), meta_trainer.model.named_parameters()):
-        assert n == meta_n
-        if isinstance(p, torch.distributed.tensor.DTensor):
-            p, meta_p = p.full_tensor(), meta_p.full_tensor()
-        assert torch.allclose(p, meta_p)
-        assert p.device == meta_p.device
-        assert p.dtype == meta_p.dtype
-        assert p.shape == meta_p.shape
-        assert p.requires_grad == meta_p.requires_grad
+    trainer_model_parts = trainer.model_parts if hasattr(trainer, "model_parts") else [trainer.model]
+    meta_trainer_model_parts = meta_trainer.model_parts if hasattr(meta_trainer, "model_parts") else [meta_trainer.model]
+    for model, meta_model in zip(trainer_model_parts, meta_trainer_model_parts):
+        for (n, p), (meta_n, meta_p) in zip(model.named_parameters(), meta_model.named_parameters()):
+            assert n == meta_n
+            if isinstance(p, torch.distributed.tensor.DTensor):
+                p, meta_p = p.full_tensor(), meta_p.full_tensor()
+            assert torch.allclose(p, meta_p)
+            assert p.device == meta_p.device
+            assert p.dtype == meta_p.dtype
+            assert p.shape == meta_p.shape
+            assert p.requires_grad == meta_p.requires_grad
 
-    for (n, b), (meta_n, meta_b) in zip(trainer.model.named_buffers(), meta_trainer.model.named_buffers()):
-        assert n == meta_n
-        if isinstance(b, torch.distributed.tensor.DTensor):
-            b, meta_b = b.full_tensor(), meta_b.full_tensor()
-        assert torch.allclose(b, meta_b)
-        assert b.device == meta_b.device
-        assert b.dtype == meta_b.dtype
-        assert b.shape == meta_b.shape
-        assert b.requires_grad == meta_b.requires_grad
+        for (n, b), (meta_n, meta_b) in zip(model.named_buffers(), meta_model.named_buffers()):
+            assert n == meta_n
+            if isinstance(b, torch.distributed.tensor.DTensor):
+                b, meta_b = b.full_tensor(), meta_b.full_tensor()
+            assert torch.allclose(b, meta_b)
+            assert b.device == meta_b.device
+            assert b.dtype == meta_b.dtype
+            assert b.shape == meta_b.shape
+            assert b.requires_grad == meta_b.requires_grad

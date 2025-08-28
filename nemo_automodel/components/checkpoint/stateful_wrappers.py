@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import partial
 from typing import Any, Optional
 
 import torch
@@ -64,7 +65,9 @@ class ModelState:
         model: The PyTorch model to track.
     """
 
-    def __init__(self, model: torch.nn.Module, is_peft: bool = False, is_init_step: bool = False):
+    def __init__(
+        self, model: torch.nn.Module | list[torch.nn.Module], is_peft: bool = False, is_init_step: bool = False
+    ):
         """
         Initialize a ModelState instance for distributed checkpointing.
 
@@ -79,8 +82,8 @@ class ModelState:
             is_peft (bool): Whether the model is PEFT.
             is_init_step (bool): Whether the model is being initialized.
         """
-        self.model = model
-        self.is_tied_lm_head = getattr(getattr(model, "config", {}), "tie_word_embeddings", False)
+        self.model = [model] if isinstance(model, torch.nn.Module) else model
+        self.is_tied_lm_head = getattr(getattr(self.model[0], "config", {}), "tie_word_embeddings", False)
         self.is_peft = is_peft
         self.is_init_step = is_init_step
 
@@ -98,10 +101,12 @@ class ModelState:
         if self.is_peft:
             options = StateDictOptions(full_state_dict=True, cpu_offload=True, ignore_frozen_params=True)
 
-        model_state_dict = get_model_state_dict(self.model, options=options)
+        func = partial(get_model_state_dict, options=options)
+        model_state_dict = {k: v for sd in map(func, self.model) for k, v in sd.items()}
 
         if self.is_tied_lm_head:
-            _, lm_head_param_name = _get_lm_head_weight_and_name(self.model)
+            # PP models don't have tied embeddings. Safe to pass in model[0] here.
+            _, lm_head_param_name = _get_lm_head_weight_and_name(self.model[0])
             model_state_dict.pop(lm_head_param_name, None)
 
         if self.is_peft:
@@ -122,7 +127,8 @@ class ModelState:
             self._set_base_model_state_dict(state_dict)
             return
 
-        options = None
+        # Multi-stage PP models have different state dicts for each stage.
+        options = StateDictOptions(strict=False) if len(self.model) > 1 else None
         if self.is_peft:
             _drop_outer_prefix(state_dict, "base_model.model.")
             options = StateDictOptions(strict=False, broadcast_from_rank0=True, full_state_dict=True)
@@ -131,21 +137,20 @@ class ModelState:
         # PyTorch will complain during load even with strict=False.
         # To be fully compatible we inject a reference tensor so the key exists.
         if self.is_tied_lm_head and not self.is_peft:
-            lm_head_weight, lm_head_param_name = _get_lm_head_weight_and_name(self.model)
+            # PP models don't have tied embeddings. Safe to pass in model[0] here.
+            lm_head_weight, lm_head_param_name = _get_lm_head_weight_and_name(self.model[0])
             if lm_head_param_name not in state_dict:
                 # weight tying guarantees this is identical to the embedding weight
                 state_dict[lm_head_param_name] = lm_head_weight.detach()
 
-        set_model_state_dict(
-            self.model,
-            state_dict,
-            options=options,
-        )
+        func = partial(set_model_state_dict, model_state_dict=state_dict, options=options)
+        list(map(func, self.model))
 
     def _get_base_model_state_dict(self) -> dict[str, Any]:
-        model_state_dict = get_model_state_dict(self.model)
+        model_state_dict = {k: v for sd in map(get_model_state_dict, self.model) for k, v in sd.items()}
         if self.is_tied_lm_head:
-            _, lm_head_param_name = _get_lm_head_weight_and_name(self.model)
+            # PP models don't have tied embeddings. Safe to pass in model[0] here.
+            _, lm_head_param_name = _get_lm_head_weight_and_name(self.model[0])
             model_state_dict.pop(lm_head_param_name, None)
         if self.is_peft:
             keys_to_remove = [k for k in model_state_dict.keys() if "lora" in k]
@@ -155,7 +160,8 @@ class ModelState:
         return model_state_dict
 
     def _set_base_model_state_dict(self, state_dict: dict[str, Any]) -> None:
-        set_model_state_dict(self.model, state_dict, options=StateDictOptions(strict=False))
+        func = partial(set_model_state_dict, model_state_dict=state_dict, options=StateDictOptions(strict=False))
+        list(map(func, self.model))
 
 
 class OptimizerState:
@@ -173,7 +179,7 @@ class OptimizerState:
 
     def __init__(
         self,
-        model: torch.nn.Module,
+        model: torch.nn.Module | list[torch.nn.Module],
         optimizer: torch.optim.Optimizer,
         scheduler: Optional[Any] = None,
     ):
@@ -194,9 +200,9 @@ class OptimizerState:
             scheduler (Optional[Any], optional): Learning-rate scheduler to track
                 alongside the optimizer. Pass ``None`` if no scheduler is used.
         """
-        self.model = model
-        self.optimizer = optimizer
-        self.scheduler = scheduler
+        self.model = [model] if isinstance(model, torch.nn.Module) else model
+        self.optimizer = [optimizer] if isinstance(optimizer, torch.optim.Optimizer) else optimizer
+        self.scheduler = [scheduler] if isinstance(scheduler, torch.optim.lr_scheduler.LRScheduler) else scheduler
 
     def state_dict(self) -> dict[str, Any]:
         """
@@ -207,16 +213,17 @@ class OptimizerState:
         """
         # this line automatically manages FSDP FQN's, as well as sets the default state dict type
         # to FSDP.SHARDED_STATE_DICT
-        optimizer_state_dict = get_optimizer_state_dict(
-            self.model,
-            self.optimizer,
+        func = partial(
+            get_optimizer_state_dict,
+            options=StateDictOptions(flatten_optimizer_state_dict=True),
         )
+        optimizer_state_dict = {k: v for sd in map(func, self.model, self.optimizer) for k, v in sd.items()}
 
         state_dict = {
             "optim": optimizer_state_dict,
         }
         if self.scheduler is not None:
-            state_dict["sched"] = self.scheduler.state_dict()
+            state_dict["sched"] = self.scheduler[0].state_dict()
 
         return state_dict
 
@@ -228,12 +235,13 @@ class OptimizerState:
             state_dict (dict): State dictionary containing optimizer and scheduler states to load.
         """
         # sets our state dicts on the optimizer, now that we've loaded
-        set_optimizer_state_dict(
-            self.model,
-            self.optimizer,
-            state_dict["optim"],
+        func = partial(
+            set_optimizer_state_dict,
+            optim_state_dict=state_dict["optim"],
+            options=StateDictOptions(flatten_optimizer_state_dict=True),
         )
+        list(map(func, self.model, self.optimizer))
 
         # load the scheduler state if it exists
         if "sched" in state_dict and self.scheduler is not None:
-            self.scheduler.load_state_dict(state_dict["sched"])
+            list(map(lambda x: x.load_state_dict(state_dict["sched"]), self.scheduler))
