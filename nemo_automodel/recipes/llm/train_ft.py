@@ -230,7 +230,6 @@ def build_dataloader(
     cfg_dl,
     cfg_model,
     cfg_ps,
-    device_mesh,
     seed,
     local_batch_size,
     global_batch_size,
@@ -246,7 +245,6 @@ def build_dataloader(
         cfg_dl: DataLoader configuration.
         cfg_model: Model configuration.
         cfg_ps: Packed sequence configuration.
-        device_mesh: Device mesh.
         seed: Random seed.
         local_batch_size: Local batch size.
         global_batch_size: Global batch size.
@@ -264,8 +262,8 @@ def build_dataloader(
         del cfg_dl.shuffle
     if device_mesh is not None:
         dist_sampler_kwargs |= {
-            "num_replicas": device_mesh["dp"].size(),
-            "rank": device_mesh["dp"].get_local_rank(),
+            "num_replicas": dp_world_size,
+            "rank": dp_rank,
         }
     # if tokenizer is not provided, use the model config to instantiate it
     if "tokenizer" not in cfg_ds and cfg_model.get("pretrained_model_name_or_path", None) is not None:
@@ -580,7 +578,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.cfg.dataloader,
             self.cfg.model,
             self.cfg.get("packed_sequence", None),
-            device_mesh=self.device_mesh,
             seed=self.cfg.get("seed", 42),
             local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
             global_batch_size=self.cfg.get("step_scheduler.global_batch_size", 1),
@@ -600,7 +597,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 self.cfg.validation_dataloader,
                 self.cfg.model,
                 cfg_ps=None,  # Use unpacked config for validation
-                device_mesh=self.device_mesh,
                 seed=self.cfg.get("seed", 42),
                 local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
                 global_batch_size=self.cfg.get("step_scheduler.global_batch_size", 1),
