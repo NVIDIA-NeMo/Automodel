@@ -66,18 +66,7 @@ def compile_helper():
     is invoked on a single process."""
 
     path = os.path.abspath(os.path.dirname(__file__))
-
-    pybind11_includes = subprocess.check_output(["python3", "-m", "pybind11", "--includes"]).decode("utf-8").strip()
-
-    # Pass flags to make so the same arguments are used during compilation
-    make_args = [
-        "make",
-        "-C",
-        path,
-        f"CPPFLAGS={pybind11_includes}",
-        "CXXSTD=c++17",
-    ]
-    ret = subprocess.run(make_args)
+    ret = subprocess.run(["make", "-C", path])
     if ret.returncode != 0:
         logger.error("Making C++ dataset helpers module failed, exiting.")
         import sys

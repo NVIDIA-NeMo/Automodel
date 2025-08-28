@@ -1,5 +1,4 @@
-CXXSTD ?= c++11
-CXXFLAGS += -O3 -Wall -shared -std=$(CXXSTD) -fPIC -fdiagnostics-color
+CXXFLAGS += -O3 -Wall -shared -std=c++11 -fPIC -fdiagnostics-color
 CPPFLAGS += $(shell python3 -m pybind11 --includes)
 
 LIBNAME = helpers_cpp
