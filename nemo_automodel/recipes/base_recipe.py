@@ -24,7 +24,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.optim import Optimizer
-from torch.utils.data import Dataset, IterableDataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils import PreTrainedTokenizerBase
@@ -75,7 +74,7 @@ def is_dataloader(object):
     Returns:
         bool: returns True if object is a dataloader.
     """
-    return isinstance(object, (StatefulDataLoader, IterableDataset, Dataset)) and has_load_restore_state(object)
+    return isinstance(object, StatefulDataLoader) and has_load_restore_state(object)
 
 
 def is_tokenizer(object):
