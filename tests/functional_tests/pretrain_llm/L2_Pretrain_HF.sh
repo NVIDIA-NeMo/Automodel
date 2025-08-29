@@ -19,6 +19,6 @@ export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1"
 
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run \
---master-port=29503 --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace  \
+--nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
 -m pytest examples/llm_pretrain/pretrain.py \
-    --config tests/functional_tests/hf_pretrain_llm/nanogpt_pretrain_hf.yaml
+  --config tests/functional_tests/hf_pretrain_llm/nanogpt_pretrain_hf.yaml

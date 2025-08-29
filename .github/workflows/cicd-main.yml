@@ -172,7 +172,7 @@ jobs:
       matrix:
         include:
           - test-name: L2_Pretrain
-            test-folder: hf_pretrain_llm
+            test-folder: pretrain_llm
             runner: self-hosted-nemo
             timeout: 20
           - test-name: L2_HF_Consolidated_FSDP
