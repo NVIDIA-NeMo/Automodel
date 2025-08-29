@@ -35,11 +35,6 @@ main() {
         chmod 600 ~/.netrc
     fi
 
-    # Install dependencies
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y curl git libopenmpi-dev libpython3.12
-
     # Install uv
     UV_VERSION="0.7.2"
     curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh

@@ -24,13 +24,16 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.optim import Optimizer
+from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 from nemo_automodel.components.checkpoint.checkpointing import (
+    load_dataloader,
     load_model,
     load_optimizer,
     save_config,
+    save_dataloader,
     save_model,
     save_optimizer,
 )
@@ -59,6 +62,19 @@ def has_load_restore_state(object):
         bool: returns True if has callable load_state_dict and state_dict
     """
     return all(callable(getattr(object, attr, None)) for attr in ("load_state_dict", "state_dict"))
+
+
+def is_dataloader(object):
+    """
+    Checks whether object is a dataloader.
+
+    Args:
+        object (any): the object to check.
+
+    Returns:
+        bool: returns True if object is a dataloader.
+    """
+    return isinstance(object, StatefulDataLoader) and has_load_restore_state(object)
 
 
 def is_tokenizer(object):
@@ -139,6 +155,7 @@ class BaseRecipe:
             or is_lr_scheduler(value)
             or is_optimizer(value)
             or isinstance(value, ConfigNode)
+            or is_dataloader(value)
         )
 
         if should_track and not any(substr in key.lower() for substr in ("val", "eval", "test")):
@@ -176,7 +193,7 @@ class BaseRecipe:
         if is_dist_initialized:
             torch.distributed.barrier(dp_group)
         # TODO(@adil-a): Change this when we create a LR scheduler class
-        model, optimizer, scheduler, tokenizer, config = None, None, None, None, None
+        model, optimizer, scheduler, tokenizer, config, dataloader = None, None, None, None, None, None
 
         for key in self.__dict__["__state_tracked"]:
             if is_model(getattr(self, key)):
@@ -189,6 +206,8 @@ class BaseRecipe:
                 scheduler = getattr(self, key)
             elif is_tokenizer(getattr(self, key)):
                 tokenizer = getattr(self, key)
+            elif is_dataloader(getattr(self, key)):
+                dataloader = getattr(self, key)
             else:
                 if is_rank_0:
                     torch.save(
@@ -199,6 +218,7 @@ class BaseRecipe:
         save_model(model, path, self.checkpoint_config, peft_config=self.peft_config, tokenizer=tokenizer)
         save_optimizer(optimizer, model, path, scheduler)
         save_config(config.raw_config, path)
+        save_dataloader(dataloader, path, self._get_dp_rank(), self._get_tp_rank())
         if is_dist_initialized:
             torch.distributed.barrier(dp_group)
 
@@ -224,7 +244,8 @@ class BaseRecipe:
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             print(f"Loading checkpoint from {ckpt_dir}", flush=True)
 
-        model, optimizer, scheduler = None, None, None
+        model, optimizer, scheduler, dataloader = None, None, None, None
+
         for key in self.__dict__["__state_tracked"]:
             if is_model(getattr(self, key)):
                 model = getattr(self, key)
@@ -232,6 +253,8 @@ class BaseRecipe:
                 optimizer = getattr(self, key)
             elif is_lr_scheduler(getattr(self, key)):
                 scheduler = getattr(self, key)
+            elif is_dataloader(getattr(self, key)):
+                dataloader = getattr(self, key)
             elif is_tokenizer(getattr(self, key)) or isinstance(getattr(self, key), ConfigNode):
                 # we don't need to load the tokenizer or config from the checkpoint
                 # we only save the tokenizer for consolidated checkpoints for downstream use
@@ -241,6 +264,7 @@ class BaseRecipe:
 
         load_model(model, ckpt_dir, self.checkpoint_config)
         load_optimizer(optimizer, model, ckpt_dir, scheduler)
+        load_dataloader(dataloader, ckpt_dir, self._get_dp_rank())
 
     def _log_experiment_details(self):
         """Log metadata and resolved config on main rank using YAML markers."""
@@ -383,6 +407,19 @@ class BaseRecipe:
     def _get_dp_group_size(self):
         dp_group = self._get_dp_group()
         return 1 if dp_group is None else dp_group.size()
+
+    def _get_dp_rank(self):
+        if not self.device_mesh:
+            return 0
+        elif self.device_mesh["cp"].size() > 1:
+            return self.device_mesh.get_local_rank("dp_cp")
+        else:
+            return self.device_mesh.get_local_rank("dp")
+
+    def _get_tp_rank(self):
+        if not self.device_mesh or self.device_mesh["tp"].size() == 1:
+            return 0
+        return self.device_mesh.get_local_rank("tp")
 
     def _dp_allreduce(self, tensor, op=dist.ReduceOp.SUM):
         dp_group = self._get_dp_group()
