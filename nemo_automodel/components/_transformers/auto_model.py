@@ -265,6 +265,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 model = _patch_liger_kernel(model)
         except RuntimeError:
             logging.warning("Retrying without Liger kernels.")
+            del model
+            import gc
+            gc.collect()
             return _retry(use_liger_kernel=False)
 
         # Patch sdpa attention
