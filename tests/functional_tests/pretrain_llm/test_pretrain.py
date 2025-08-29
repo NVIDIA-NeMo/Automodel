@@ -14,7 +14,7 @@
 
 from tests.utils.test_utils import run_test_script
 
-TEST_FOLDER = "hf_pretrain_llm"
+TEST_FOLDER = "pretrain_llm"
 
 class TestPretrainLLM:
     def test_pretrain(self):
