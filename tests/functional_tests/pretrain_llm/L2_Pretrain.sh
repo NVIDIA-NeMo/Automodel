@@ -18,7 +18,8 @@ set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1"
 
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run \
---nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
--m pytest examples/llm_pretrain/pretrain.py \
-  --config tests/functional_tests/hf_pretrain_llm/nanogpt_pretrain_nn.yaml
+TRANSFORMERS_OFFLINE=1 python3 \
+-m torch.distributed.run --nproc_per_node=2 --nnodes=1 \
+-m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
+examples/llm_pretrain/pretrain.py --config tests/functional_tests/pretrain_llm/nanogpt_pretrain_nn.yaml
+
