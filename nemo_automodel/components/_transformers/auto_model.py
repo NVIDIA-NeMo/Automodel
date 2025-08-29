@@ -24,6 +24,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForSequenceClassification,
+    AutoModelForTextToWaveform,
     PreTrainedModel,
 )
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
@@ -467,6 +468,36 @@ class NeMoAutoModelForSequenceClassification(_BaseNeMoAutoModelClass, AutoModelF
     >>> model = NeMoAutoModelForSequenceClassification.from_pretrained("bert-base-uncased") # try Liger
     >>> model = NeMoAutoModelForSequenceClassification.from_pretrained(
     ...     "bert-base-uncased", use_liger_kernel=False)                            # skip Liger
+    """
+
+    pass
+
+
+class NeMoAutoModelForTextToWaveform(_BaseNeMoAutoModelClass, AutoModelForTextToWaveform):
+    """Drop-in replacement for ``transformers.AutoModelForTextToWaveform`` with custom-kernels.
+
+    The class only overrides ``from_pretrained`` and ``from_config`` to add the
+    optional ``use_liger_kernel`` flag.  If the flag is ``True`` (default) and
+    the Liger kernel is available, the model's attention layers are
+    monkey-patched in place.  If patching fails for any reason, the call is
+    retried once with ``use_liger_kernel=False`` so that users still obtain a
+    functional model.
+
+
+    @akoumpa: currently only supporting liger_kernel for demonstration purposes.
+
+    Notes:
+    -----
+    - No changes are made to the model's public API; forward signatures,
+      generation utilities, and weight shapes remain identical.
+    - Only decoder-style (causal) architectures are currently supported by the
+      Liger patch.  Unsupported models will silently fall back.
+
+    Examples:
+    --------
+    >>> model = NeMoAutoModelForTextToWaveform.from_pretrained("facebook/musicgen-small") # try Liger
+    >>> model = NeMoAutoModelForTextToWaveform.from_pretrained(
+    ...     "facebook/musicgen-small", use_liger_kernel=False)                            # skip Liger
     """
 
     pass
