@@ -20,10 +20,10 @@ from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenP
 def main(default_config_path="examples/llm/nanogpt_pretrain.yaml"):
     """Entry-point for launching NanoGPT-style pre-training.
 
-    The script follows the same invocation pattern as *examples/llm/finetune.py*:
+    The script follows the same invocation pattern as *examples/llm_finetune/finetune.py*:
 
     ```bash
-    torchrun --nproc-per-node <NGPU> examples/llm/pretrain.py \
+    torchrun --nproc-per-node <NGPU> examples/llm_pretrain/pretrain.py \
         --config examples/llm/nanogpt_pretrain.yaml
     ```
     """
