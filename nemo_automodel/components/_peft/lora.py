@@ -322,11 +322,21 @@ def patch_linear_module(
 def apply_lora_to_linear_modules(
     model: nn.Module,
     peft_config: PeftConfig,
+    quantization_config=None,
 ) -> int:
     """
     Replace selected nn.Linear layers with LinearLoRA layers (in-place).
 
-    target_modules accepts wildcard fragments, e.g. ["q_proj", "k_proj", ".*fc.*"].
+    Args:
+        model: The model to apply LoRA to.
+        peft_config: PEFT configuration for LoRA parameters.
+        quantization_config: Optional separate QLoRA quantization configuration.
+
+    Returns:
+        Number of modules that were modified with LoRA.
+
+    Note:
+        target_modules accepts wildcard fragments, e.g. ["q_proj", "k_proj", ".*fc.*"].
     """
     # Freeze base model parameters
     for w in model.parameters():
@@ -347,6 +357,11 @@ def apply_lora_to_linear_modules(
     for name, module in list(model.named_modules()):
         if matcher.match(module, name):
             num_modules_matched += 1
+            # For QLora, set lora_dtype to float16/bfloat16 since base weights are quantized
+            lora_dtype = peft_config.lora_dtype
+            if quantization_config is not None and lora_dtype is None:
+                lora_dtype = quantization_config.bnb_4bit_compute_dtype or "bfloat16"
+            
             patch_linear_module(
                 module,
                 dim=peft_config.dim,
@@ -354,7 +369,7 @@ def apply_lora_to_linear_modules(
                 dropout=peft_config.dropout,
                 dropout_position=peft_config.dropout_position,
                 lora_A_init_method=peft_config.lora_A_init,
-                lora_dtype=peft_config.lora_dtype,
+                lora_dtype=lora_dtype,
                 use_triton=peft_config.use_triton,
             )
 

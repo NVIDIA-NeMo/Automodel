@@ -177,6 +177,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         sdpa_method: Optional[List[SDPBackend]] = None,
         torch_dtype="auto",
         attn_implementation: str = "flash_attention_2",
+        quantization_config=None,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -203,9 +204,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 Data type passed to the underlying `from_pretrained` call.
             attn_implementation (str, default="flash_attention_2"): Desired
                 attention implementation; forwarded to the HF config.
-            fp8_config (FP8Config, optional): FP8 configuration object that
-                specifies all FP8 quantization settings. If provided, FP8 quantization
-                will be applied to the model for improved performance on supported hardware.
+            quantization_config (optional): BitsAndBytesConfig configuration object that
+                specifies all quantization settings. If provided, quantization
+                will be applied to the model.
             **kwargs: Additional keyword arguments forwarded verbatim to
                 `AutoModelForCausalLM.from_pretrained`.
 
@@ -234,6 +235,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
+                quantization_config=quantization_config,
                 **kwargs,
             )
 
@@ -248,6 +250,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 *model_args,
                 torch_dtype=torch_dtype,
                 attn_implementation=attn_implementation,
+                quantization_config=quantization_config,
                 **kwargs,
             )
             cls.__name__ = name
@@ -266,6 +269,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 model = _patch_liger_kernel(model)
         except RuntimeError:
             logging.warning("Retrying without Liger kernels.")
+            del model
+            import gc
+            gc.collect()
             return _retry(use_liger_kernel=False)
 
         # Patch sdpa attention
@@ -289,6 +295,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         sdpa_method: Optional[List[SDPBackend]] = None,
         torch_dtype: Union[str, torch.dtype] = "auto",
         attn_implementation: str = "flash_attention_2",
+        quantization_config=None,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -331,6 +338,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         """
         torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch.bfloat16
 
+        quantization_config = None
+        if quantization_config is not None:
+            from nemo_automodel.components.quantization.qlora import create_bnb_config
+            quantization_config = create_bnb_config(quantization_config)
+
         def _retry(**override):
             """Internal helper to re-enter this function with patched args."""
             return cls.from_config(
@@ -340,6 +352,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
+                quantization_config=quantization_config,
                 **kwargs,
             )
 
@@ -353,6 +366,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 *model_args,
                 attn_implementation=attn_implementation,
                 torch_dtype=torch_dtype,
+                quantization_config=quantization_config,
                 **kwargs,
             )
             cls.__name__ = name
@@ -368,6 +382,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 model = _patch_liger_kernel(model)
         except RuntimeError:
             logging.warning("Retrying without Liger kernels.")
+            del model
+            import gc
+            gc.collect()
             return _retry(use_liger_kernel=False)
 
         # Patch sdpa attention
