@@ -802,7 +802,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             "grad_norm": grad_norm,
             "num_tokens_per_step": num_tokens_in_batch,
             "tps": tps,
-            "mem": torch.cuda.max_memory_allocated() / 1024**3,
         }
         current_lr = self.optimizer.param_groups[0]["lr"]
         log_data["learning_rate"] = current_lr
