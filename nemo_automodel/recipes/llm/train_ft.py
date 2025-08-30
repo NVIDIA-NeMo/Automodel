@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import pathlib
 import time
@@ -274,6 +275,34 @@ def build_loss_fn(cfg_loss):
     return cfg_loss.instantiate()
 
 
+def _build_tokenizer(cfg_model, cfg_ds):
+    # if tokenizer is not provided, use the model config to instantiate it
+    if "tokenizer" not in cfg_ds and cfg_model.get("pretrained_model_name_or_path", None) is not None:
+        logging.info("Using model config to instantiate tokenizer")
+        trust_remote_code = getattr(cfg_model, "trust_remote_code", False)
+        tokenizer = AutoTokenizer.from_pretrained(
+            cfg_model.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+        )
+    elif cfg_ds.get("tokenizer", None) is None:
+        tokenizer = None
+    elif "_target_" not in cfg_ds.tokenizer:
+        tokenizer = AutoTokenizer.from_pretrained(**cfg_ds.tokenizer.to_dict())
+    else:
+        tokenizer = cfg_ds.tokenizer.instantiate()
+
+    # Finally, check if the dataset target accepts a tokenizer parameter
+    kwargs = {}
+    if tokenizer is not None and callable(cfg_ds._target_):
+        try:
+            sig = inspect.signature(cfg_ds._target_)
+            if "tokenizer" in sig.parameters:
+                kwargs["tokenizer"] = tokenizer
+        except (ValueError, TypeError):
+            # If we can't get the signature, skip adding tokenizer
+            pass
+    return kwargs, tokenizer
+
+
 def build_dataloader(
     cfg_ds, cfg_dl, cfg_model, cfg_ps, device_mesh, seed, local_batch_size
 ) -> tuple[DataLoader, PreTrainedTokenizerBase]:
@@ -301,24 +330,9 @@ def build_dataloader(
             "num_replicas": device_mesh["dp"].size(),
             "rank": device_mesh["dp"].get_local_rank(),
         }
-    # if tokenizer is not provided, use the model config to instantiate it
-    if "tokenizer" not in cfg_ds and cfg_model.get("pretrained_model_name_or_path", None) is not None:
-        logging.info("Using model config to instantiate tokenizer")
-        trust_remote_code = getattr(cfg_model, "trust_remote_code", False)
-        tokenizer = AutoTokenizer.from_pretrained(
-            cfg_model.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
-        )
-    elif cfg_ds.get("tokenizer", None) is None:
-        tokenizer = None
-    elif "_target_" not in cfg_ds.tokenizer:
-        tokenizer = AutoTokenizer.from_pretrained(**cfg_ds.tokenizer.to_dict())
-    else:
-        tokenizer = cfg_ds.tokenizer.instantiate()
 
     with StatefulRNG(seed=seed, ranked=True):
-        kwargs = {}
-        if tokenizer is not None:
-            kwargs["tokenizer"] = tokenizer
+        kwargs, tokenizer = _build_tokenizer(cfg_model, cfg_ds)
         ds = cfg_ds.instantiate(**kwargs)
         # Apply packing if configured
         if getattr(cfg_ps, "packed_sequence_size", 0) > 0:
@@ -419,6 +433,8 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamSch
 
     # Total optimizer steps (accounting for gradient accumulation)
     total_steps = (total_epochs * epoch_len) // grad_acc_steps
+    if step_scheduler.max_steps is not None:
+        total_steps = min(total_steps, step_scheduler.max_steps)
 
     # Extract learning rate from optimizer
     base_lrs = [opt.param_groups[0]["lr"] for opt in optimizer]
@@ -815,10 +831,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
                 local_loss = calculate_loss(
                     self.loss_fn,
-                    logits=out.logits,
+                    logits=getattr(out, "logits", out),
                     labels=labels,
                     model=model,
-                    hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
+                    hidden_states=out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None else None,
                     num_label_tokens=num_label_tokens,
                 )
                 loss_buffer.append(local_loss.clone().detach())
@@ -988,17 +1004,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             "grad_norm": grad_norm,
             "num_tokens_per_step": num_tokens_in_batch,
             "tps": tps,
+            "tps_per_gpu": tps / self._get_dp_group_size(),
         }
         # assumes all model parts' optimizers have the same learning rate
         current_lr = self.optimizer[0].param_groups[0]["lr"]
         log_data["learning_rate"] = current_lr
 
         if wandb.run is not None:
-            wandb.log(log_data)
+            wandb.log(log_data, step=self.step_scheduler.step)
 
         if self.dist_env.is_main:
             logging.info(
-                "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f} | num_label_tokens {}".format(
+                "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
                     self.step_scheduler.step,
                     self.step_scheduler.epoch,
                     train_loss,
@@ -1006,6 +1023,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     current_lr,
                     torch.cuda.max_memory_allocated() / 1024**3,
                     tps,
+                    tps / self._get_dp_group_size(),
                     num_label_tokens,
                 )
             )
