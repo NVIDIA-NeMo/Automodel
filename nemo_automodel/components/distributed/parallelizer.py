@@ -43,6 +43,7 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
 )
+from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
 from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
 from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
 from transformers.models.llava_next.modeling_llava_next import (
@@ -571,6 +572,8 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
     elif model_cls.__name__ == "NemotronHForCausalLM":
         # NemotronH models use backbone.layers instead of model.layers
         layers.extend(model.backbone.layers)
+    elif model_cls == GPT2LMHeadModel:
+        layers.extend(model.transformer.h)
     else:
         # Default case for all other models (assumed to be a causal LM)
         layers.extend(model.model.layers)
