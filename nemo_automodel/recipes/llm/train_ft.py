@@ -452,6 +452,8 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamSch
 
     # Total optimizer steps (accounting for gradient accumulation)
     total_steps = (total_epochs * epoch_len) // grad_acc_steps
+    if step_scheduler.max_steps is not None:
+        total_steps = min(total_steps, step_scheduler.max_steps)
 
     # Extract learning rate from optimizer
     base_lrs = [opt.param_groups[0]["lr"] for opt in optimizer]
@@ -1030,17 +1032,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             "grad_norm": grad_norm,
             "num_tokens_per_step": num_tokens_in_batch,
             "tps": tps,
+            "tps_per_gpu": tps / self._get_dp_group_size(),
         }
         # assumes all model parts' optimizers have the same learning rate
         current_lr = self.optimizer[0].param_groups[0]["lr"]
         log_data["learning_rate"] = current_lr
 
         if wandb.run is not None:
-            wandb.log(log_data)
+            wandb.log(log_data, step=self.step_scheduler.step)
 
         if self.dist_env.is_main:
             logging.info(
-                "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f} | num_label_tokens {}".format(
+                "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
                     self.step_scheduler.step,
                     self.step_scheduler.epoch,
                     train_loss,
@@ -1048,6 +1051,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     current_lr,
                     torch.cuda.max_memory_allocated() / 1024**3,
                     tps,
+                    tps / self._get_dp_group_size(),
                     num_label_tokens,
                 )
             )
