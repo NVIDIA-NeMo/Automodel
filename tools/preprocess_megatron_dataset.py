@@ -15,30 +15,33 @@
 # modified from https://github.com/NVIDIA/Megatron-LM/blob/5c05330060e47d4db8a968d979290f6aa1342628/tools/preprocess_data.py
 
 """Processing large data for pretraining."""
+
 import argparse
 import json
 import os
 import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
-                                             os.path.pardir)))
-import time
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 import glob
 import multiprocessing
+import time
+
 try:
     import nltk
     from nltk.tokenize.punkt import PunktLanguageVars
+
     nltk_available = True
 except ImportError:
     PunktLanguageVars = object  # Fallback to the built-in object class
     nltk_available = False
 
-from nemo_automodel.components.datasets.llm.megatron import indexed_dataset
 from transformers import AutoTokenizer
+
+from nemo_automodel.components.datasets.llm.megatron import indexed_dataset
 
 
 # https://stackoverflow.com/questions/33139531/preserve-empty-lines-with-nltks-punkt-tokenizer
 class CustomLanguageVars(PunktLanguageVars):
-
     _period_context_fmt = r"""
         \S*                          # some word material
         %(SentEndChars)s             # a potential sentence ending
@@ -48,6 +51,7 @@ class CustomLanguageVars(PunktLanguageVars):
             |
             (?P<next_tok>\S+)     #  <-- Normally you would have \s+ here
         ))"""
+
 
 class IdentitySplitter(object):
     def tokenize(self, *text):
@@ -75,8 +79,8 @@ class Encoder(object):
             if self.args.keep_newlines:
                 # this prevents punkt from eating newlines after sentences
                 Encoder.splitter = nltk.tokenize.punkt.PunktSentenceTokenizer(
-                    train_text = splitter._params,
-                    lang_vars = CustomLanguageVars())
+                    train_text=splitter._params, lang_vars=CustomLanguageVars()
+                )
             else:
                 Encoder.splitter = splitter
 
@@ -89,7 +93,7 @@ class Encoder(object):
         for key in self.args.json_keys:
             text = data[key]
             max_len = 1000000
-            tokens_list = [Encoder.splitter.tokenize(text[i:i+max_len]) for i in range(0, len(text), max_len)]
+            tokens_list = [Encoder.splitter.tokenize(text[i : i + max_len]) for i in range(0, len(text), max_len)]
             output[key] = [tokens for partial in tokens_list for tokens in partial]
         return json.dumps(output), len(json_line)
 
@@ -127,17 +131,17 @@ class Partition(object):
         if count % self.args.log_interval == 0:
             current = time.time()
             elapsed = current - proc_start
-            mbs = total_bytes_processed/elapsed/1024/1024
+            mbs = total_bytes_processed / elapsed / 1024 / 1024
             source_msg = f" in {os.path.basename(source)}" if source else ""
-            print(f"Processed {count} documents{source_msg}",
-                  f"({count/elapsed} docs/s, {mbs} MB/s).",
-                  file=sys.stderr)
+            print(
+                f"Processed {count} documents{source_msg}", f"({count / elapsed} docs/s, {mbs} MB/s).", file=sys.stderr
+            )
 
     def split_sentences(self, file_name):
         input_file_name, output_file_name = file_name
         print("Opening", input_file_name)
-        fin = open(input_file_name, 'r', encoding='utf-8')
-        fout = open(output_file_name, 'w')
+        fin = open(input_file_name, "r", encoding="utf-8")
+        fout = open(output_file_name, "w")
 
         encoder = Encoder(self.args)
         pool = multiprocessing.Pool(self.workers, initializer=encoder.initializer)
@@ -153,11 +157,10 @@ class Partition(object):
         fin.close()
         fout.close()
 
-
     def process_json_file(self, file_name):
         input_file_name, output_prefix = file_name
         print("Opening", input_file_name)
-        fin = open(input_file_name, 'r', encoding='utf-8')
+        fin = open(input_file_name, "r", encoding="utf-8")
 
         startup_start = time.time()
         encoder = Encoder(self.args)
@@ -174,10 +177,8 @@ class Partition(object):
         builders = {}
 
         for key in self.args.json_keys:
-            output_bin_files[key] = "{}_{}_{}.bin".format(output_prefix,
-                                                          key, level)
-            output_idx_files[key] = "{}_{}_{}.idx".format(output_prefix,
-                                                          key, level)
+            output_bin_files[key] = "{}_{}_{}.bin".format(output_prefix, key, level)
+            output_idx_files[key] = "{}_{}_{}.idx".format(output_prefix, key, level)
             builders[key] = indexed_dataset.IndexedDatasetBuilder(
                 output_bin_files[key],
                 dtype=indexed_dataset.DType.optimal_dtype(len(tokenizer)),
@@ -199,35 +200,39 @@ class Partition(object):
 
 def get_args():
     parser = argparse.ArgumentParser()
-    group = parser.add_argument_group(title='input data')
-    group.add_argument('--input', type=str, required=True,
-                       help='Path to input JSON')
-    group.add_argument('--json-keys', nargs='+', default=['text'],
-                       help='space separate listed of keys to extract from json')
-    group.add_argument('--split-sentences', action='store_true',
-                       help='Split documents into sentences.')
-    group.add_argument('--keep-newlines', action='store_true',
-                       help='Keep newlines between sentences when splitting.')
-    group = parser.add_argument_group(title='tokenization process')
-    group.add_argument('--append-eod', action='store_true',
-                       help='Append an <eod> token to the end of a document.')
-    group.add_argument('--lang', type=str, default='english',
-                       help='Language to use for NLTK-powered sentence splitting.')
-    group = parser.add_argument_group(title='output data')
-    group.add_argument('--output-prefix', type=str, required=True,
-                       help='Path to binary output file without suffix')
-    group.add_argument('--output-path', type=str, default=None,
-                       help=('Directory to write outputs. If provided, this directory '
-                             'will be created if missing and used for all generated files. '
-                             'Overrides any directory component in --output-prefix.'))
-    group = parser.add_argument_group(title='runtime')
-    group.add_argument('--workers', type=int, required=True,
-                       help=('Number of worker processes to launch. '
-                             'Workers are divided across matched input files.'))
-    group.add_argument('--log-interval', type=int, default=1000,
-                       help='Interval between progress updates')
-    group.add_argument('--pretrained-model-name-or-path', type=str, required=True,
-                       help='Pretrained model name or path')
+    group = parser.add_argument_group(title="input data")
+    group.add_argument("--input", type=str, required=True, help="Path to input JSON")
+    group.add_argument(
+        "--json-keys", nargs="+", default=["text"], help="space separate listed of keys to extract from json"
+    )
+    group.add_argument("--split-sentences", action="store_true", help="Split documents into sentences.")
+    group.add_argument("--keep-newlines", action="store_true", help="Keep newlines between sentences when splitting.")
+    group = parser.add_argument_group(title="tokenization process")
+    group.add_argument("--append-eod", action="store_true", help="Append an <eod> token to the end of a document.")
+    group.add_argument(
+        "--lang", type=str, default="english", help="Language to use for NLTK-powered sentence splitting."
+    )
+    group = parser.add_argument_group(title="output data")
+    group.add_argument("--output-prefix", type=str, required=True, help="Path to binary output file without suffix")
+    group.add_argument(
+        "--output-path",
+        type=str,
+        default=None,
+        help=(
+            "Directory to write outputs. If provided, this directory "
+            "will be created if missing and used for all generated files. "
+            "Overrides any directory component in --output-prefix."
+        ),
+    )
+    group = parser.add_argument_group(title="runtime")
+    group.add_argument(
+        "--workers",
+        type=int,
+        required=True,
+        help=("Number of worker processes to launch. Workers are divided across matched input files."),
+    )
+    group.add_argument("--log-interval", type=int, default=1000, help="Interval between progress updates")
+    group.add_argument("--pretrained-model-name-or-path", type=str, required=True, help="Pretrained model name or path")
     args = parser.parse_args()
     return args
 
@@ -246,13 +251,11 @@ def main():
         if nltk_available:
             nltk.download("punkt", quiet=True, download_dir=os.environ.get("NLTK_DATA"))
         else:
-            raise Exception(
-                "nltk library required for sentence splitting is not available.")
+            raise Exception("nltk library required for sentence splitting is not available.")
 
     # Ensure output directory exists if specified
     if args.output_path:
         os.makedirs(args.output_path, exist_ok=True)
-
 
     in_file_names = glob.glob(args.input)
     if len(in_file_names) == 0:
@@ -267,25 +270,22 @@ def main():
         if args.output_path:
             base_name = os.path.basename(file_name)
             sentence_split_file = os.path.join(args.output_path, base_name + "_ss" + extension)
-            output_prefix = os.path.join(
-                args.output_path,
-                f"{os.path.basename(args.output_prefix)}_{idx}"
-            )
+            output_prefix = os.path.join(args.output_path, f"{os.path.basename(args.output_prefix)}_{idx}")
         else:
             sentence_split_file = file_name + "_ss" + extension
             output_prefix = f"{args.output_prefix}_{idx}"
-        in_ss_out_names.append({
-            'partition': in_file,
-            'sentence_split': sentence_split_file,
-            'output_prefix': output_prefix})
+        in_ss_out_names.append(
+            {"partition": in_file, "sentence_split": sentence_split_file, "output_prefix": output_prefix}
+        )
 
     # Optional sentence splitting per file
-    split_sentences_present = check_files_exist(in_ss_out_names, 'sentence_split', len(in_ss_out_names))
+    split_sentences_present = check_files_exist(in_ss_out_names, "sentence_split", len(in_ss_out_names))
     if args.split_sentences and not split_sentences_present:
         processes = []
         for name in in_ss_out_names:
-            p = multiprocessing.Process(target=partition.split_sentences,
-                                        args=((name['partition'], name['sentence_split']),))
+            p = multiprocessing.Process(
+                target=partition.split_sentences, args=((name["partition"], name["sentence_split"]),)
+            )
             p.start()
             processes.append(p)
         for p in processes:
@@ -293,16 +293,17 @@ def main():
 
     # Encode each file independently
     processes = []
-    input_key = 'sentence_split' if args.split_sentences else 'partition'
+    input_key = "sentence_split" if args.split_sentences else "partition"
     for name in in_ss_out_names:
-        p = multiprocessing.Process(target=partition.process_json_file,
-                                    args=((name[input_key], name['output_prefix']),))
+        p = multiprocessing.Process(
+            target=partition.process_json_file, args=((name[input_key], name["output_prefix"]),)
+        )
         p.start()
         processes.append(p)
     for p in processes:
         p.join()
     return
 
-if __name__ == '__main__':
 
+if __name__ == "__main__":
     main()
