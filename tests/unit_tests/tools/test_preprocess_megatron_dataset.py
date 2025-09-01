@@ -14,6 +14,7 @@
 
 import subprocess
 import os
+import tempfile
 
 
 def test_preprocess_megatron_dataset():
@@ -24,24 +25,30 @@ def test_preprocess_megatron_dataset():
         "preprocessed_data_1_text_document.bin",
         "preprocessed_data_1_text_document.idx",
     ]
-    args = [
-        "python",
-        "tools/preprocess_megatron_dataset.py",
-        "--input",
-        jsonl_files_path,
-        "--json-keys",
-        "text",
-        "--output-prefix",
-        "preprocessed_data", 
-        "--workers", "2", 
-        "--pretrained-model-name-or-path", "openai-community/gpt2", 
-        "--append-eod"
-    ]
-    subprocess.run(args, check=True)
-    for file in files_to_exist:
-        file_path = os.path.join(os.getcwd(), file)
-        assert os.path.exists(file_path), f"Expected {file_path} to exist"
-        assert os.path.isfile(file_path), f"Expected {file_path} to be a file"
-        assert os.access(file_path, os.R_OK), f"Expected {file_path} to be readable"
-        assert os.stat(file_path).st_size > 0, f"Expected {file_path} to be non-empty"
-        os.remove(file_path)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Use a nested directory that doesn't exist yet to validate creation
+        output_path = os.path.join(tmpdir, "nested", "out")
+        args = [
+            "python",
+            "tools/preprocess_megatron_dataset.py",
+            "--input",
+            jsonl_files_path,
+            "--json-keys",
+            "text",
+            "--output-prefix",
+            "preprocessed_data",
+            "--output-path",
+            output_path,
+            "--workers", "2",
+            "--pretrained-model-name-or-path",
+            "/home/TestData/akoumparouli/hf_mixtral_2l/",
+            "--append-eod",
+        ]
+        subprocess.run(args, check=True)
+        assert os.path.isdir(output_path), f"Expected output directory {output_path} to be created"
+        for file in files_to_exist:
+            file_path = os.path.join(output_path, file)
+            assert os.path.exists(file_path), f"Expected {file_path} to exist"
+            assert os.path.isfile(file_path), f"Expected {file_path} to be a file"
+            assert os.access(file_path, os.R_OK), f"Expected {file_path} to be readable"
+            assert os.stat(file_path).st_size > 0, f"Expected {file_path} to be non-empty"

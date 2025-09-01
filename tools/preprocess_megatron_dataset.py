@@ -216,6 +216,10 @@ def get_args():
     group = parser.add_argument_group(title='output data')
     group.add_argument('--output-prefix', type=str, required=True,
                        help='Path to binary output file without suffix')
+    group.add_argument('--output-path', type=str, default=None,
+                       help=('Directory to write outputs. If provided, this directory '
+                             'will be created if missing and used for all generated files. '
+                             'Overrides any directory component in --output-prefix.'))
     group = parser.add_argument_group(title='runtime')
     group.add_argument('--workers', type=int, required=True,
                        help=('Number of worker processes to launch. '
@@ -245,6 +249,10 @@ def main():
             raise Exception(
                 "nltk library required for sentence splitting is not available.")
 
+    # Ensure output directory exists if specified
+    if args.output_path:
+        os.makedirs(args.output_path, exist_ok=True)
+
 
     in_file_names = glob.glob(args.input)
     if len(in_file_names) == 0:
@@ -255,8 +263,17 @@ def main():
     in_ss_out_names = []
     for idx, in_file in enumerate(in_file_names):
         file_name, extension = os.path.splitext(in_file)
-        sentence_split_file = file_name + "_ss" + extension
-        output_prefix = f"{args.output_prefix}_{idx}"
+        # Route intermediate and final outputs to the specified output path if provided
+        if args.output_path:
+            base_name = os.path.basename(file_name)
+            sentence_split_file = os.path.join(args.output_path, base_name + "_ss" + extension)
+            output_prefix = os.path.join(
+                args.output_path,
+                f"{os.path.basename(args.output_prefix)}_{idx}"
+            )
+        else:
+            sentence_split_file = file_name + "_ss" + extension
+            output_prefix = f"{args.output_prefix}_{idx}"
         in_ss_out_names.append({
             'partition': in_file,
             'sentence_split': sentence_split_file,
