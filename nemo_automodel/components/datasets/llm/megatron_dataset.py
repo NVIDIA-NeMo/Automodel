@@ -14,6 +14,7 @@
 
 import logging
 import os
+import glob
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Union
@@ -103,7 +104,7 @@ class MegatronPretraining:
                 )
 
         if not isinstance(paths, (list, tuple, dict)):
-            paths = [paths]
+            paths = get_list_of_files(paths)
         validate_dataset_asset_accessibility(paths)
 
         if isinstance(split, (list, tuple)):
@@ -317,3 +318,14 @@ def validate_dataset_asset_accessibility(paths):
             raise FileNotFoundError(f"Expected {str(file_path)} to exist.")
         if not os.access(file_path, os.R_OK):
             raise PermissionError(f"Expected {str(file_path)} to be readable.")
+
+def get_list_of_files(path: str):
+    """
+    Get the list of unique dataset prefixes (full paths without extension) from a glob pattern.
+    """
+    paths = glob.glob(path)
+    unique_paths = set()
+    for path in paths:
+        assert path.endswith(".bin") or path.endswith(".idx"), f"Expected {path} to be a .bin or .idx file."
+        unique_paths.add(str(Path(path).with_suffix("")))
+    return sorted(list(unique_paths))

@@ -19,11 +19,12 @@
 
 
 step_scheduler:
-  global_batch_size: 32
-  local_batch_size: 8
+  global_batch_size: 512
+  local_batch_size: 32
   ckpt_every_steps: 1000
-  val_every_steps: 100  # will run every x number of gradient steps
+  val_every_steps: 250  # will run every x number of gradient steps
   num_epochs: 1
+  max_steps: 18500
 
 dist_env:
   backend: nccl
@@ -35,8 +36,10 @@ rng:
   ranked: true
 
 model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: transformers.AutoConfig.from_pretrained
+    pretrained_model_name_or_path: openai-community/gpt2
 
 checkpoint:
   enabled: true
@@ -57,10 +60,11 @@ loss_fn:
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
-  paths:
-    - fineweb_edu/megatron/processed_data_0_text_document
-    - fineweb_edu/megatron/processed_data_1_text_document
-  index_mapping_dir: fineweb_edu/megatron/mapping_dir
+  paths: fineweb_edu/megatron_gpt2/processed_data_*_text_document*  # REPLACE THIS
+  index_mapping_dir: fineweb_edu/megatron_gpt2/mapping_dir  # REPLACE THIS
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: openai-community/gpt2
   seq_length: 1024
   split: "0.99, 0.01, 0.00"  # train, validation, test
   splits_to_build: "train"  # has to be one of train, validation, test
@@ -72,10 +76,11 @@ dataloader:
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
-  paths:
-    - fineweb_edu/megatron/processed_data_0_text_document
-    - fineweb_edu/megatron/processed_data_1_text_document
-  index_mapping_dir: fineweb_edu/megatron/mapping_dir
+  paths: fineweb_edu/megatron_gpt2/processed_data_*_text_document*  # REPLACE THIS
+  index_mapping_dir: fineweb_edu/megatron_gpt2/mapping_dir  # REPLACE THIS
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: openai-community/gpt2
   seq_length: 1024
   split: "0.99, 0.01, 0.00"  # train, validation, test
   splits_to_build: "validation"  # has to be one of train, validation, test
@@ -87,16 +92,19 @@ validation_dataloader:
   collate_fn: torch.utils.data.default_collate
 
 optimizer:
-  _target_: torch.optim.Adam
-  betas: [0.9, 0.999]
-  eps: 1e-8
-  lr: 1.0e-5
-  weight_decay: 0
-  # min_lr: 1.0e-5
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  lr: 0.0006
+  weight_decay: 0.1
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 700
+  min_lr: 0.0
 
 # Uncomment and configure for W&B logging
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir> 
+#   save_dir: <your_wandb_save_dir>
