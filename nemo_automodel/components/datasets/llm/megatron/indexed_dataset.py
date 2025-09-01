@@ -35,16 +35,16 @@ All three calls below are equivalent:
 
 from __future__ import annotations
 
+import gc
 import logging
 import os
-import struct
-import gc
 import shutil
-from types import TracebackType
+import struct
 from abc import ABC, abstractmethod
 from enum import Enum
 from functools import lru_cache
 from itertools import accumulate
+from types import TracebackType
 from typing import Any, List, Optional, Tuple, Type, Union
 
 import numpy
@@ -517,9 +517,7 @@ class IndexedDatasetBuilder(object):
         multimodal (bool, optional): Whether the dataset is multimodal. Defaults to False.
     """
 
-    def __init__(
-        self, bin_path: str, dtype: Type[numpy.number] = numpy.int32, multimodal: bool = False
-    ) -> None:
+    def __init__(self, bin_path: str, dtype: Type[numpy.number] = numpy.int32, multimodal: bool = False) -> None:
         self.data_file = open(bin_path, "wb")
         self.dtype = dtype
         self.multimodal = multimodal
@@ -542,9 +540,7 @@ class IndexedDatasetBuilder(object):
         if self.multimodal:
             self.sequence_modes.append(mode)
 
-    def add_document(
-        self, tensor: torch.Tensor, lengths: List[int], modes: Optional[List[int]] = None
-    ) -> None:
+    def add_document(self, tensor: torch.Tensor, lengths: List[int], modes: Optional[List[int]] = None) -> None:
         """Add an entire document to the dataset
 
         Args:

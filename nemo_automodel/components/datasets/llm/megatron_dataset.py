@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import glob
 import logging
 import os
-import glob
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Union
@@ -318,6 +318,7 @@ def validate_dataset_asset_accessibility(paths):
             raise FileNotFoundError(f"Expected {str(file_path)} to exist.")
         if not os.access(file_path, os.R_OK):
             raise PermissionError(f"Expected {str(file_path)} to be readable.")
+
 
 def get_list_of_files(path: str):
     """
