@@ -15,9 +15,13 @@
 import subprocess
 import os
 import tempfile
-
+import sys
+import glob
 
 def test_preprocess_megatron_dataset():
+    print("DEBUG matched:", glob.glob("/home/TestData/adasif/mcore_dataset_fineweb/fineweb_sample.val.part_*.jsonl"))
+    print("DEBUG exists(TestData):", os.path.exists("/home/TestData"))
+    print("DEBUG exists(mcore_dataset_fineweb):", os.path.exists("/home/TestData/adasif/mcore_dataset_fineweb/"))
     jsonl_files_path = "/home/TestData/adasif/mcore_dataset_fineweb/fineweb_sample.val.part_00.jsonl"
     files_to_exist = [
         "preprocessed_data_0_text_document.bin",
@@ -29,7 +33,7 @@ def test_preprocess_megatron_dataset():
         # Use a nested directory that doesn't exist yet to validate creation
         output_path = os.path.join(tmpdir, "nested", "out")
         args = [
-            "python",
+            sys.executable,
             "tools/preprocess_megatron_dataset.py",
             "--input",
             jsonl_files_path,
