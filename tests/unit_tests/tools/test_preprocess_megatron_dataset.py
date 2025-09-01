@@ -17,11 +17,23 @@ import os
 import tempfile
 import sys
 import glob
+from importlib import util
+from pathlib import Path
+
+# mod_path = Path(__file__).resolve().parents[3] / "tools" / "preprocess_megatron_dataset.py"
+# spec = util.spec_from_file_location("preprocess_megatron_dataset", mod_path)
+# mod = util.module_from_spec(spec)
+# spec.loader.exec_module(mod)
+# main = mod.main
 
 def test_preprocess_megatron_dataset():
     print("DEBUG matched:", glob.glob("/home/TestData/adasif/mcore_dataset_fineweb/fineweb_sample.val.part_*.jsonl"))
     print("DEBUG exists(TestData):", os.path.exists("/home/TestData"))
     print("DEBUG exists(mcore_dataset_fineweb):", os.path.exists("/home/TestData/adasif/mcore_dataset_fineweb/"))
+    print("DEBUG exists(adasif):", os.path.exists("/home/TestData/adasif/"))
+    # list directories
+    print("DEBUG directories:", os.listdir("/home/TestData/"))
+    print("DEBUG directories:", os.listdir("/home/TestData/adasif/"))
     jsonl_files_path = "/home/TestData/adasif/mcore_dataset_fineweb/fineweb_sample.val.part_00.jsonl"
     files_to_exist = [
         "preprocessed_data_0_text_document.bin",
