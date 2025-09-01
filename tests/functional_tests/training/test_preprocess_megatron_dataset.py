@@ -16,9 +16,6 @@ import subprocess
 import os
 import tempfile
 import sys
-import glob
-from importlib import util
-from pathlib import Path
 
 # mod_path = Path(__file__).resolve().parents[3] / "tools" / "preprocess_megatron_dataset.py"
 # spec = util.spec_from_file_location("preprocess_megatron_dataset", mod_path)
@@ -27,21 +24,12 @@ from pathlib import Path
 # main = mod.main
 
 def test_preprocess_megatron_dataset():
-    print("DEBUG matched:", glob.glob("/home/TestData/adasif/mcore_dataset_fineweb/fineweb_sample.val.part_*.jsonl"))
-    print("DEBUG exists(TestData):", os.path.exists("/home/TestData"))
-    print("DEBUG exists(mcore_dataset_fineweb):", os.path.exists("/home/TestData/adasif/mcore_dataset_fineweb/"))
-    print("DEBUG exists(adasif):", os.path.exists("/home/TestData/adasif/"))
-    print("DEBUG exists(akoumparaouli):", os.path.exists("/home/TestData/akoumparouli/fineweb_sample.val.part_00.jsonl"))
-    # list directories
-    print("DEBUG directories(TestData):", os.listdir("/home/TestData/"))
-    print("DEBUG directories(adasif):", os.listdir("/home/TestData/adasif/"))
-    print("DEBUG directories(akoumparouli):", os.listdir("/home/TestData/akoumparouli/"))
-    jsonl_files_path = "/home/TestData/adasif/mcore_dataset_fineweb/fineweb_sample.val.part_00.jsonl"
+    jsonl_files_path = "/home/TestData/adasif/mcore_dataset_fineweb/fineweb_sample.val.part_0*.jsonl"
     files_to_exist = [
         "preprocessed_data_0_text_document.bin",
         "preprocessed_data_0_text_document.idx",
-        # "preprocessed_data_1_text_document.bin",
-        # "preprocessed_data_1_text_document.idx",
+        "preprocessed_data_1_text_document.bin",
+        "preprocessed_data_1_text_document.idx",
     ]
     with tempfile.TemporaryDirectory() as tmpdir:
         # Use a nested directory that doesn't exist yet to validate creation
