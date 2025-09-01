@@ -1,4 +1,4 @@
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,17 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from tests.utils.test_utils import run_test_script
 
-from nemo_automodel.components._transformers.auto_model import (
-    NeMoAutoModelForCausalLM,
-    NeMoAutoModelForImageTextToText,
-    NeMoAutoModelForSequenceClassification,
-    NeMoAutoModelForTextToWaveform,
-)
+TEST_FOLDER = "pretrain_llm"
 
-__all__ = [
-    "NeMoAutoModelForCausalLM",
-    "NeMoAutoModelForImageTextToText",
-    "NeMoAutoModelForSequenceClassification",
-    "NeMoAutoModelForTextToWaveform",
-]
+class TestPretrainLLM:
+    def test_pretrain(self):
+        run_test_script(TEST_FOLDER, "L2_Pretrain.sh")
+
+    def test_pretrain_hf(self):
+        run_test_script(TEST_FOLDER, "L2_Pretrain_HF.sh")
