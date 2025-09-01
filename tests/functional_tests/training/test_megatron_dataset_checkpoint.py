@@ -27,7 +27,7 @@ This test is to make sure that JSONL dataset can be checkpointed and loaded corr
 """
 
 def test_megatron_dataset_checkpointing():
-    cfg_path = Path(__file__).parents[4] / "examples" / "llm_pretrain" / "megatron_pretrain.yaml"
+    cfg_path = Path(__file__).parents[4] / "examples" / "llm_pretrain" / "megatron_pretrain_gpt2.yaml"
     cfg = parse_args_and_load_config(cfg_path)
     dist_env = build_distributed(cfg.get("dist_env", {}))
     model_wrapper = cfg.distributed.instantiate(world_size=dist_env.world_size)

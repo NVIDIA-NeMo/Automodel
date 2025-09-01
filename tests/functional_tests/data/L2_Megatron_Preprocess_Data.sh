@@ -18,5 +18,5 @@ set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0"
 
-TRANSFORMERS_OFFLINE=1 python -m coverage run --data-file=/workspace/.coverage --source=/workspace --parallel-mode \
+TRANSFORMERS_OFFLINE=1 python -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
 -m pytest tests/functional_tests/training/test_preprocess_megatron_dataset.py

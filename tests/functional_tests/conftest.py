@@ -19,6 +19,7 @@ import pytest
 _OVERRIDES = [
     "config",
     "model.pretrained_model_name_or_path",
+    "model.config.pretrained_model_name_or_path",
     "step_scheduler.max_steps",
     "step_scheduler.global_batch_size",
     "step_scheduler.local_batch_size",
