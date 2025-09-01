@@ -31,9 +31,11 @@ def test_preprocess_megatron_dataset():
     print("DEBUG exists(TestData):", os.path.exists("/home/TestData"))
     print("DEBUG exists(mcore_dataset_fineweb):", os.path.exists("/home/TestData/adasif/mcore_dataset_fineweb/"))
     print("DEBUG exists(adasif):", os.path.exists("/home/TestData/adasif/"))
+    print("DEBUG exists(akoumparaouli):", os.path.exists("/home/TestData/akoumparouli/fineweb_sample.val.part_00.jsonl"))
     # list directories
-    print("DEBUG directories:", os.listdir("/home/TestData/"))
-    print("DEBUG directories:", os.listdir("/home/TestData/adasif/"))
+    print("DEBUG directories(TestData):", os.listdir("/home/TestData/"))
+    print("DEBUG directories(adasif):", os.listdir("/home/TestData/adasif/"))
+    print("DEBUG directories(akoumparouli):", os.listdir("/home/TestData/akoumparouli/"))
     jsonl_files_path = "/home/TestData/adasif/mcore_dataset_fineweb/fineweb_sample.val.part_00.jsonl"
     files_to_exist = [
         "preprocessed_data_0_text_document.bin",
