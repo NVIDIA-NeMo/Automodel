@@ -68,7 +68,6 @@ dataset:
   seq_length: 1024
   split: "0.99, 0.01, 0.00"  # train, validation, test
   splits_to_build: "train"  # has to be one of train, validation, test
-  # meed to pass in mbs, gbs, max steps, val_check_interval manually
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -84,7 +83,6 @@ validation_dataset:
   seq_length: 1024
   split: "0.99, 0.01, 0.00"  # train, validation, test
   splits_to_build: "validation"  # has to be one of train, validation, test
-  # meed to pass in mbs, gbs, max steps, val_check_interval manually
   num_val_samples: 1024
 
 validation_dataloader:
