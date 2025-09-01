@@ -257,7 +257,11 @@ def main():
     if args.output_path:
         os.makedirs(args.output_path, exist_ok=True)
 
-    in_file_names = glob.glob(args.input)
+    if glob.has_magic(args.input):
+        in_file_names = glob.glob(args.input)
+    else:
+        in_file_names = [args.input]
+
     if len(in_file_names) == 0:
         print(f"No files matched input pattern: {args.input}")
         return

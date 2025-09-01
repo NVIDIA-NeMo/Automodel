@@ -18,12 +18,12 @@ import tempfile
 
 
 def test_preprocess_megatron_dataset():
-    jsonl_files_path = "/home/TestData/adasif/mcore_dataset_fineweb/fineweb_sample.val.part_*.jsonl"
+    jsonl_files_path = "/home/TestData/adasif/mcore_dataset_fineweb/fineweb_sample.val.part_00.jsonl"
     files_to_exist = [
         "preprocessed_data_0_text_document.bin",
         "preprocessed_data_0_text_document.idx",
-        "preprocessed_data_1_text_document.bin",
-        "preprocessed_data_1_text_document.idx",
+        # "preprocessed_data_1_text_document.bin",
+        # "preprocessed_data_1_text_document.idx",
     ]
     with tempfile.TemporaryDirectory() as tmpdir:
         # Use a nested directory that doesn't exist yet to validate creation

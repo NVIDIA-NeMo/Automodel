@@ -324,6 +324,8 @@ def get_list_of_files(path: str):
     """
     Get the list of unique dataset prefixes (full paths without extension) from a glob pattern.
     """
+    if not glob.has_magic(path):
+        return [path]
     paths = glob.glob(path)
     unique_paths = set()
     for path in paths:
