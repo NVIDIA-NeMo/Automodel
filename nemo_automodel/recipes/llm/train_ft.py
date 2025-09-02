@@ -62,7 +62,7 @@ from nemo_automodel.components.utils.compile_utils import (
     compile_model,
 )
 from nemo_automodel.components.utils.dist_utils import get_sync_ctx
-from nemo_automodel.components.utils.model_utils import print_trainable_parameters
+from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep, print_trainable_parameters
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
@@ -145,6 +145,10 @@ def build_model_and_optimizer(
 
     print_trainable_parameters(model)
 
+    if not _supports_logits_to_keep(model):
+        logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
+        loss_fn = MaskedCrossEntropy()
+
     if autopipeline is not None:
         autopipeline.build(model, loss_fn=loss_fn, parallelize_fn=parallelize_fn)
         for mp in autopipeline.parts:
@@ -221,7 +225,7 @@ def build_model_and_optimizer(
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         optimizer = [cfg_opt.instantiate(params=trainable_params)]
 
-    return model, optimizer
+    return model, optimizer, loss_fn
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
@@ -258,26 +262,16 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
     return checkpoint_config
 
 
-def build_loss_fn(cfg_loss, cfg_model):
+def build_loss_fn(cfg_loss):
     """Build a loss function.
 
     Args:
         cfg_loss (ConfigNode): Loss function configuration.
-        cfg_model (ConfigNode): Model configuration.
 
     Returns:
         The instantiated loss function on the specified device.
     """
-    with torch.device("meta"), no_init_weights():
-        model = cfg_model.instantiate()
-        has_logits_to_keep = "logits_to_keep" in set(inspect.signature(model.forward).parameters.keys())
-        del model
-        torch.cuda.empty_cache()
-    if not has_logits_to_keep:
-        logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
-        return MaskedCrossEntropy()
-    else:
-        return cfg_loss.instantiate()
+    return cfg_loss.instantiate()
 
 
 def _build_tokenizer(cfg_model, cfg_ds):
@@ -653,8 +647,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.peft_config = None
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
-        self.loss_fn = build_loss_fn(self.cfg.loss_fn, self.cfg.model)
-        model, self.optimizer = build_model_and_optimizer(
+        model, self.optimizer, self.loss_fn = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
             self.cfg.optimizer,
@@ -666,7 +659,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
             autopipeline=autopipeline,
-            loss_fn=self.loss_fn,
+            loss_fn=build_loss_fn(self.cfg.loss_fn),
             parallelize_fn=partial(parallelize_for_pp, model_wrapper=self.model_wrapper),
         )
         if isinstance(model, AutoPipeline):
