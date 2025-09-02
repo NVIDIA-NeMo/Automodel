@@ -48,6 +48,7 @@ from nemo_automodel.components.distributed.init_utils import (
 )
 from nemo_automodel.components.distributed.nvfsdp import NVFSDPManager
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
+from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
@@ -60,7 +61,6 @@ from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
     compile_model,
 )
-from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.utils.model_utils import print_trainable_parameters
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
@@ -363,7 +363,8 @@ def build_dataloader(
                 mp.set_start_method("spawn", force=True)
         except RuntimeError:
             pass
-        return cfg_dl.instantiate(**dl_kwargs), tokenizer
+        with FirstRankPerNode():
+            return cfg_dl.instantiate(**dl_kwargs), tokenizer
 
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
