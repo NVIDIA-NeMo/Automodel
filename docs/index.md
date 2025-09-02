@@ -51,6 +51,7 @@ guides/vlm/dataset.md
 :caption: Development
 :hidden:
 guides/checkpointing.md
+guides/gradient_checkpointing.md
 guides/pipelining.md
 guides/llm/dataset.md
 guides/vlm/dataset.md
