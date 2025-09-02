@@ -133,6 +133,7 @@ def build_model_and_optimizer(
         if cfg_quantization is not None:
             logger.info("Model weight quantization enabled with BitsAndBytes")
             from nemo_automodel.components.quantization.qlora import create_bnb_config
+
             kwargs["quantization_config"] = create_bnb_config(cfg_quantization)
 
         # Instantiate the model in meta device to avoid OOM
@@ -142,7 +143,9 @@ def build_model_and_optimizer(
             # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
             if cfg_peft is not None:
                 assert autopipeline is None, "PEFT is not supported with AutoPipeline"
-                apply_lora_to_linear_modules(model, cfg_peft, quantization_config=kwargs.get("quantization_config", None))
+                apply_lora_to_linear_modules(
+                    model, cfg_peft, quantization_config=kwargs.get("quantization_config", None)
+                )
 
             if cfg_fp8 is not None:
                 fp8_config = build_fp8_config(cfg_fp8)

@@ -361,7 +361,7 @@ def apply_lora_to_linear_modules(
             lora_dtype = peft_config.lora_dtype
             if quantization_config is not None and lora_dtype is None:
                 lora_dtype = quantization_config.bnb_4bit_compute_dtype or "bfloat16"
-            
+
             patch_linear_module(
                 module,
                 dim=peft_config.dim,
