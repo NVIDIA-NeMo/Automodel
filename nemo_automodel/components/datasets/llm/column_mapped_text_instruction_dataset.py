@@ -16,7 +16,7 @@ import logging
 import re
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, Iterator, List, Optional, Union
+from typing import Dict, Iterator, List, Optional, Union
 
 from datasets import load_dataset
 from torch.utils.data import Dataset
