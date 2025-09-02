@@ -51,6 +51,7 @@ from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
 from nemo_automodel.components.training.rng import StatefulRNG
@@ -257,16 +258,21 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
     return checkpoint_config
 
 
-def build_loss_fn(cfg_loss):
+def build_loss_fn(cfg_loss, model):
     """Build a loss function.
 
     Args:
-        cfg_loss: Loss function configuration.
+        cfg_loss (ConfigNode): Loss function configuration.
+        model (nn.Module): Model.
 
     Returns:
         The instantiated loss function on the specified device.
     """
-    return cfg_loss.instantiate()
+    if not "logits_to_keep" in set(inspect.signature(model.forward).parameters.keys()):
+        logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
+        return MaskedCrossEntropy()
+    else:
+        return cfg_loss.instantiate()
 
 
 def _build_tokenizer(cfg_model, cfg_ds):
@@ -642,7 +648,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.peft_config = None
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
-        self.loss_fn = build_loss_fn(self.cfg.loss_fn)
         model, self.optimizer = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
@@ -658,6 +663,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             loss_fn=self.loss_fn,
             parallelize_fn=partial(parallelize_for_pp, model_wrapper=self.model_wrapper),
         )
+        self.loss_fn = build_loss_fn(self.cfg.loss_fn, model)
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
             self.pp = model
