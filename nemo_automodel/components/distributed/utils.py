@@ -31,7 +31,7 @@ class FirstRankPerNode(ContextDecorator):
     Context manager to enforce rank0 to process section over other ranks.
 
       - Lets LOCAL_RANK==0 run the protected code first on each node.
-      - Inserts an extra barrier across *only* the node‑local rank‑0 processes.
+      - Inserts an extra barrier across *only* the node-local rank-0 processes.
       - Works on a single GPU (no env flags, no distributed initialisation).
 
     Note: it is assumed the scoped code is not torch.distributed heavy.
@@ -42,15 +42,15 @@ class FirstRankPerNode(ContextDecorator):
         Create / bootstrap a (distributed) proc. group that rank0 enters first.
 
         Returns:
-            bool: ``True``  – if the current process is node-rank-0
-                  ``False`` – otherwise
+            bool: ``True``  - if the current process is node-rank-0
+                  ``False`` - otherwise
         """
         self._created_pg = False
         self._node0_group = None
-        self._first = True  # default for single‑GPU / no‑dist case
+        self._first = True  # default for single-GPU / no-dist case
 
         # ------------------------------------------------------------------ #
-        # 1. Make sure there is at least *some* process‑group initialised
+        # 1. Make sure there is at least *some* process-group initialised
         # ------------------------------------------------------------------ #
         if not dist.is_initialized():
             self._created_pg = self._try_bootstrap_pg()
@@ -71,7 +71,7 @@ class FirstRankPerNode(ContextDecorator):
         # 3. Synchronisation logic
         # ------------------------------------------------------------------ #
         if not self._first:
-            # Non‑rank‑0 processes wait for their node‑rank-0
+            # Non-rank-0 processes wait for their node-rank-0
             dist.barrier()
 
         return self._first
@@ -98,7 +98,7 @@ class FirstRankPerNode(ContextDecorator):
         """
         try:
             if self._first and dist.is_initialized():
-                # Re‑sync the whole world so that non‑rank‑0s can proceed
+                # Re-sync the whole world so that non-rank-0s can proceed
                 dist.barrier()
                 if exc_type is not None:
                     dist.abort()  # propagate failure to the entire job
