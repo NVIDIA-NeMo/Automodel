@@ -326,7 +326,10 @@ class BlendedMegatronDatasetBuilder:
             else:
                 # The number of samples we plan to use per dataset
                 # Mask sizes for disabled splits so we don't process None entries
-                masked_sizes = [self.sizes[i] if split[i] is not None and self.sizes[i] is not None else 0 for i in range(len(Split))]
+                masked_sizes = [
+                    self.sizes[i] if split[i] is not None and self.sizes[i] is not None else 0
+                    for i in range(len(Split))
+                ]
                 sizes_per_dataset_target = _get_size_per_split_per_dataset(weights, masked_sizes)
                 # The number of samples we plan to build per dataset
                 sizes_per_dataset_buffer = _get_size_per_split_per_dataset(
