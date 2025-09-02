@@ -49,7 +49,6 @@ class FirstRankPerNode(ContextDecorator):
         self._node0_group = None
         self._first = True  # default for single-GPU / no-dist case
 
-
         if not dist.is_initialized():
             # pure single GPU
             return True
@@ -99,7 +98,6 @@ class FirstRankPerNode(ContextDecorator):
 
         # propagate any exception to outer scope
         return False
-
 
 
 def barrier_and_log(string: str) -> None:
