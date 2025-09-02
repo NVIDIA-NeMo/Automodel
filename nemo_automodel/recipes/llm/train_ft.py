@@ -258,17 +258,22 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
     return checkpoint_config
 
 
-def build_loss_fn(cfg_loss, model):
+def build_loss_fn(cfg_loss, cfg_model):
     """Build a loss function.
 
     Args:
         cfg_loss (ConfigNode): Loss function configuration.
-        model (nn.Module): Model.
+        cfg_model (ConfigNode): Model configuration.
 
     Returns:
         The instantiated loss function on the specified device.
     """
-    if not "logits_to_keep" in set(inspect.signature(model.forward).parameters.keys()):
+    with torch.device("meta"), no_init_weights():
+        model = cfg_model.instantiate()
+        has_logits_to_keep = "logits_to_keep" in set(inspect.signature(model.forward).parameters.keys())
+        del model
+        torch.cuda.empty_cache()
+    if not has_logits_to_keep:
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
         return MaskedCrossEntropy()
     else:
@@ -648,6 +653,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.peft_config = None
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
+        self.loss_fn = build_loss_fn(self.cfg.loss_fn, self.cfg.model)
         model, self.optimizer = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
@@ -663,7 +669,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             loss_fn=self.loss_fn,
             parallelize_fn=partial(parallelize_for_pp, model_wrapper=self.model_wrapper),
         )
-        self.loss_fn = build_loss_fn(self.cfg.loss_fn, model)
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
             self.pp = model
