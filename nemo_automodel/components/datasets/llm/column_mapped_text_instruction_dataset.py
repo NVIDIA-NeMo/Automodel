@@ -28,9 +28,6 @@ from nemo_automodel.components.datasets.llm.formatting_utils import (
     format_prompt_completion,
 )
 
-if TYPE_CHECKING:
-    pass
-
 # Supported cases:
 # Format:
 # - Context + question + answer
