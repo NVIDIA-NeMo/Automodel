@@ -293,7 +293,7 @@ def create_megatron_sampler(
     dataset_len: int,
     micro_batch_size: int,
     global_batch_size: int,
-    dataloader_type: Literal["single", "cyclic", "batch"] = "single",
+    dataloader_type: Literal["single", "cyclic"] = "single",
     drop_last: bool = True,
     pad_samples_to_global_batch_size: bool = False,
     rank: int = 0,

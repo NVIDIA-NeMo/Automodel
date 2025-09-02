@@ -357,10 +357,14 @@ def build_dataloader(
 
         if isinstance(ds, MegatronPretraining):
             ds = ds.get_dataset(split=cfg_ds.splits_to_build)
+            dataloader_type = cfg_dl.get("dataloader_type", "single")
+            if "dataloader_type" in cfg_dl:
+                del cfg_dl.dataloader_type
             batch_sampler = create_megatron_sampler(
                 dataset_len=len(ds),
                 micro_batch_size=local_batch_size,
                 global_batch_size=global_batch_size,
+                dataloader_type=dataloader_type,
                 rank=dp_rank,
                 world_size=dp_world_size,
             )

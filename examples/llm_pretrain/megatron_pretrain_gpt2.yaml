@@ -72,6 +72,7 @@ dataset:
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: torch.utils.data.default_collate
+  dataloader_type: "single"  # or "cyclic"
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
@@ -88,6 +89,7 @@ validation_dataset:
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: torch.utils.data.default_collate
+  dataloader_type: "single"
 
 optimizer:
   _target_: torch.optim.AdamW

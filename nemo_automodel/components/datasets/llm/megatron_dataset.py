@@ -17,7 +17,7 @@ import logging
 import os
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Union
+from typing import Dict, List, Optional, Union
 
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
