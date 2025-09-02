@@ -28,9 +28,9 @@ from typing import Dict, List
 
 import pytest
 
-from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import (
-    _apply_tokenizer_plain,
-    _apply_tokenizer_with_chat_template,
+from nemo_automodel.components.datasets.llm.formatting_utils import (
+    format_prompt_completion,
+    format_chat_template,
 )
 
 
@@ -50,7 +50,7 @@ class _StubTokenizerPlain:  # noqa: D401 – minimal interface only
         self._vocab: Dict[str, int] = {}
         self._cursor: int = 3  # start after BOS/EOS
         # *chat_template* is intentionally **absent** so that the code path for
-        # ``_apply_tokenizer_plain`` is exercised.
+        # ``format_prompt_completion`` is exercised.
 
     def _id_for_token(self, tok: str) -> int:
         if tok not in self._vocab:
@@ -62,7 +62,7 @@ class _StubTokenizerPlain:  # noqa: D401 – minimal interface only
         ids: List[int] = []
         if add_special_tokens:
             ids.append(self.bos_token_id)
-        ids.extend(self._id_for_token(tok) for tok in text.strip().split())
+        ids.extend(self._id_for_token(tok) for tok in text.split())
         if add_special_tokens:
             ids.append(self.eos_token_id)
         return {"input_ids": ids}
@@ -89,7 +89,7 @@ class _StubTokenizerChat(_StubTokenizerPlain):  # noqa: D401
         ids.append(self.eos_token_id)
         return ids
 
-    # ``_apply_tokenizer_with_chat_template`` will call the tokenizer on the
+    # ``format_chat_template`` will call the tokenizer on the
     # *start-of-turn* token with ``add_special_tokens=False`` to retrieve the id.
     def __call__(self, text: str, *, add_special_tokens: bool = False):  # type: ignore[override]
         if text == self._start_of_turn_token:
@@ -97,72 +97,89 @@ class _StubTokenizerChat(_StubTokenizerPlain):  # noqa: D401
         return super().__call__(text, add_special_tokens=add_special_tokens)
 
 
-def test_apply_tokenizer_plain_answer_only_mask():
+def testformat_prompt_completion_answer_only_mask():
     tok = _StubTokenizerPlain()
     context = "Context"
     question = "Why?"
     answer = "Because."
-
-    out = _apply_tokenizer_plain(tok, context, question, answer, answer_only_loss_mask=True)
+    prompt = f"{context} {question} "
+    out = format_prompt_completion(tok, prompt, answer,
+         eos_token_id=tok.eos_token_id, pad_token_id=tok.eos_token_id, answer_only_loss_mask=True)
 
     # Basic keys/length checks
-    assert set(out) == {"input_ids", "labels", "loss_mask"}
-    assert len(out["input_ids"]) == len(out["labels"]) == len(out["loss_mask"])
+    del out["___PAD_TOKEN_IDS___"]
+    assert set(out) == {"input_ids", "labels", "attention_mask"}
+    assert len(out["input_ids"]) == len(out["labels"]) == len(out["attention_mask"])
 
-    # Prompt/answer masking logic 
+    # Prompt/answer masking logic
     prompt_text = f"{context} {question} "
     prompt_ids = tok(prompt_text)["input_ids"]
-    # The helper strips the trailing EOS token from the prompt
-    if prompt_ids and prompt_ids[-1] == tok.eos_token_id:
-        prompt_ids = prompt_ids[:-1]
+    full_text = f"{context} {question} {answer}"
+    # @akoumparouli: remove the eos token
+    full_text_ids = tok(full_text)["input_ids"][:-1]
+    # bos + 3; eos has been removed
+    assert len(full_text_ids) == 4
+    assert len(full_text_ids) == len(out["input_ids"])
 
-    answer_ids = tok(answer.strip())["input_ids"]
-    # The helper strips the leading BOS from the answer
-    if answer_ids and answer_ids[0] == tok.bos_token_id:
-        answer_ids = answer_ids[1:]
+    # Exclude the eos token
+    expected_zeros = len(prompt_ids) - 1
+    expected_ones = len(full_text_ids) - expected_zeros
 
-    expected_zeros = len(prompt_ids) - 1  # as per implementation
-    expected_ones = len(answer_ids)
-
-    assert out["loss_mask"].count(0) == expected_zeros
-    assert out["loss_mask"].count(1) == expected_ones
+    num_ignore_labels = out["labels"].count(-100)
+    assert num_ignore_labels == expected_zeros, (out, out["labels"][-4:], len(out["labels"]), num_ignore_labels)
+    assert len(out["labels"]) - num_ignore_labels == expected_ones
 
 
-def test_apply_tokenizer_plain_full_loss_mask():
+def testformat_prompt_completion_full_loss_mask():
     tok = _StubTokenizerPlain()
-    out = _apply_tokenizer_plain(tok, "ctx", "Q?", "A.", answer_only_loss_mask=False)
+    context, question, answer = "ctx", "Q?", "A."
+    prompt = f"{context} {question} "
+    out = format_prompt_completion(tok, prompt, answer,
+         eos_token_id=tok.eos_token_id, pad_token_id=tok.eos_token_id, answer_only_loss_mask=False)
 
     # Loss mask should be *all ones*
-    assert all(v == 1 for v in out["loss_mask"])
+    del out["___PAD_TOKEN_IDS___"]
+    assert set(out) == {"input_ids", "labels", "attention_mask"}
+    assert len(out["labels"]) == len(out["input_ids"]) == len(out["attention_mask"])
+    assert out["labels"].count(-100) == 0
 
 
 def test_apply_tokenizer_chat_template_answer_only_mask():
     tok = _StubTokenizerChat()
     ctx, qst, ans = "Some context", "Life?", "42"
-    out = _apply_tokenizer_with_chat_template(
-        tok, ctx, qst, ans, start_of_turn_token=tok._start_of_turn_token, answer_only_loss_mask=True
+    prompt = f"{ctx} {qst}"
+    out = format_chat_template(
+        tok, prompt, ans,
+        eos_token_id=tok.eos_token_id, pad_token_id=tok.eos_token_id,
+        start_of_turn_token=tok._start_of_turn_token
     )
 
     # Basic invariants
-    assert set(out) == {"input_ids", "labels", "loss_mask"}
-    assert len(out["input_ids"]) == len(out["labels"]) == len(out["loss_mask"])
+    del out["___PAD_TOKEN_IDS___"]
+    assert set(out) == {"input_ids", "labels", "attention_mask"}
+    assert len(out["input_ids"]) == len(out["labels"]) == len(out["attention_mask"])
 
     # The first chunk (user prompt) should be masked out (zeros)
-    first_one_idx = out["loss_mask"].index(1)
-    assert first_one_idx > 0  # we expect at least one *zero*
-    assert all(v == 0 for v in out["loss_mask"][:first_one_idx])
-    assert all(v == 1 for v in out["loss_mask"][first_one_idx:])
+    assert out["input_ids"][0] == tok._start_of_turn_token_id
+    pos = out["input_ids"][1:].index(tok._start_of_turn_token_id)
+    assert pos > 0
+    # we assume first [first start_of_turn_token_id, second start_of_turn_token_id) to be all -100
+    assert all(v == -100 for v in out["labels"][:pos])
+    # and the rest to be != -100
+    assert all(v != -100 for v in out["labels"][pos:])
 
 
 def test_apply_tokenizer_chat_template_full_loss_mask():
     tok = _StubTokenizerChat()
-    out = _apply_tokenizer_with_chat_template(
+    out = format_chat_template(
         tok,
-        "ctx",
-        "Q?",
-        "A.",
+        prompt="ctx Q?",
+        answer="A.",
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.eos_token_id,
         start_of_turn_token=tok._start_of_turn_token,
-        answer_only_loss_mask=False,
     )
-
-    assert all(v == 1 for v in out["loss_mask"]) 
+    del out["___PAD_TOKEN_IDS___"]
+    assert set(out) == {"input_ids", "labels", "attention_mask"}
+    assert len(out["input_ids"]) == len(out["labels"]) == len(out["attention_mask"])
+    assert all(v == 1 for v in out["attention_mask"])
