@@ -1,22 +1,30 @@
-# FP8 Training in NeMo-Automodel
+# FP8 Training in NeMo Automodel
 
-NeMo-Automodel now supports FP8 quantization using [TorchAO](https://github.com/pytorch/ao) and `torch.compile` to accelerate training on compatible hardware.
+NeMo Automodel now supports FP8 quantization using [TorchAO](https://github.com/pytorch/ao) and `torch.compile` to accelerate training on compatible hardware.
 
 FP8 (8-bit floating point) quantization can provide substantial speedups for models where the majority of GEMMs are sufficiently large. The speedup from using FP8 tensor cores must outweigh the overhead of dynamic quantization.
 
-**Important**: `torch.compile` is required to achieve any meaningful speedup with TorchAO FP8 training.
+### Requirements for FP8 Training in NeMo-Automodel
 
-### Hardware Requirements
+To enable FP8 training in NeMo-Automodel, the following hardware and software requirements must be met:
 
-- NVIDIA H100 or newer GPUs
+- **Hardware**:  
+  An NVIDIA H100 GPU or newer is required. These GPUs feature FP8 tensor cores that accelerate training.
 
-## Installation
+- **Software**:  
+  The TorchAO library must be installed.
+
+- **Configuration**:  
+  Both `torch.compile` and `fp8` must be enabled in your training configuration.  
+  **Important**: `torch.compile` is essential for achieving meaningful speedup with TorchAO FP8 training.
+
+## Install TorchAO
 
 Make sure you have TorchAO installed. Follow the [installation guide](https://github.com/pytorch/ao?tab=readme-ov-file#-installation) for TorchAO.
 
 ## Usage
 
-### Basic Configuration
+### Configure FP8
 
 To enable FP8 quantization with `torch.compile`, you need both FP8 and compilation enabled in your configuration:
 
@@ -66,7 +74,7 @@ fp8:
 
 For more on scaling strategies, refer to the [TorchAO FP8 documentation](https://github.com/pytorch/ao/tree/main/torchao/float8).
 
-## Module Filtering
+## Filter Modules
 
 You can exclude specific modules from FP8 conversion using `filter_fqns`:
 
@@ -89,8 +97,8 @@ FP8 quantization provides measurable performance improvements while maintaining 
 
 *Figure: Loss curves comparing FP8 tensorwise scaling + torch.compile vs. BF16 + torch.compile training on 8xH100 with 8k sequence length, demonstrating virtually identical convergence behavior with 1.24x speedup*
 
-## Ready to use recipes
-We provide fp8 training configs for popular models:
+## Ready-to-use recipes
+We provide FP8 training configs for popular models:
 
 - **Llama**: [Llama 3.1 8B](https://github.com/NVIDIA/NeMo-Automodel/blob/main/examples/llm_finetune/llama/llama3_1_8b_hellaswag_fp8.yaml)
 - **Mistral**: [Mistral 7B](https://github.com/NVIDIA/NeMo-Automodel/blob/main/examples/llm_finetune/mistral/mistral_7b_hellaswag_fp8.yaml), [Mistral Nemo 2407](https://github.com/NVIDIA/NeMo-Automodel/blob/main/examples/llm_finetune/mistral/mistral_nemo_2407_hellaswag_fp8.yaml) 
