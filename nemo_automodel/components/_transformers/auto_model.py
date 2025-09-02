@@ -338,11 +338,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         """
         torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch.bfloat16
 
-        quantization_config = None
-        if quantization_config is not None:
-            from nemo_automodel.components.quantization.qlora import create_bnb_config
-            quantization_config = create_bnb_config(quantization_config)
-
         def _retry(**override):
             """Internal helper to re-enter this function with patched args."""
             return cls.from_config(
