@@ -49,7 +49,6 @@ class MegatronPretraining:
         trainer_limit_val_batches: Union[int, float] = 1,
         trainer_limit_test_batches: Union[int, float] = 1,
         mmap_bin_files: bool = True,
-        dataloader_type: Optional[Literal["single", "cyclic", "batch"]] = "single",
         splits_to_build: Optional[Union[str, List[str]]] = None,
     ) -> None:
         """Pretraining dataset class for Megatron-LM datasets.
