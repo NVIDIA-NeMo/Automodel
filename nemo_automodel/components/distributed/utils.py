@@ -49,27 +49,18 @@ class FirstRankPerNode(ContextDecorator):
         self._node0_group = None
         self._first = True  # default for single-GPU / no-dist case
 
-        # ------------------------------------------------------------------ #
-        # 1. Make sure there is at least *some* process-group initialised
-        # ------------------------------------------------------------------ #
-        if not dist.is_initialized():
-            self._created_pg = self._try_bootstrap_pg()
 
         if not dist.is_initialized():
             # pure single GPU
             return True
 
-        # ------------------------------------------------------------------ #
-        # 2. Figure out local/global ranks
-        # ------------------------------------------------------------------ #
+        # Figure out local/global ranks
         env = os.environ
         global_rank = dist.get_rank()
         local_rank = int(env.get("LOCAL_RANK", global_rank))  # fallback
         self._first = local_rank == 0
 
-        # ------------------------------------------------------------------ #
-        # 3. Synchronisation logic
-        # ------------------------------------------------------------------ #
+        # Synchronisation logic
         if not self._first:
             # Non-rank-0 processes wait for their node-rank-0
             dist.barrier()
@@ -109,20 +100,6 @@ class FirstRankPerNode(ContextDecorator):
         # propagate any exception to outer scope
         return False
 
-    def _try_bootstrap_pg(self) -> bool:
-        """
-        Try to create a default pg from env:// variables.
-        """
-        env = os.environ
-        required = ("WORLD_SIZE", "RANK", "MASTER_ADDR", "MASTER_PORT")
-        if all(k in env for k in required):
-            dist.init_process_group(
-                backend="gloo",
-                world_size=int(env.get("WORLD_SIZE")),
-                rank=int(env.get("RANK")),
-            )
-            return True
-        return False
 
 
 def barrier_and_log(string: str) -> None:
