@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import gc
 import inspect
 import logging
 import types
@@ -270,14 +271,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         except RuntimeError:
             logging.warning("Retrying without Liger kernels.")
             del model
-            import gc
             gc.collect()
             return _retry(use_liger_kernel=False)
 
         # Patch sdpa attention
         try:
             if use_sdpa_patching:
-                model = _patch_attention(model, sdpa_method)
+                model = _patch_attention(model, sdpa_method)  # noqa: F821
         except:
             logging.warning("Retrying without SDPA patching.")
             return _retry(use_sdpa_patching=False)
@@ -352,6 +352,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             )
 
         # load model
+        model = None
         try:
             name = cls.__name__
             if name.startswith("NeMo"):
@@ -378,14 +379,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         except RuntimeError:
             logging.warning("Retrying without Liger kernels.")
             del model
-            import gc
             gc.collect()
             return _retry(use_liger_kernel=False)
 
         # Patch sdpa attention
         try:
             if use_sdpa_patching:
-                model = _patch_attention(model, sdpa_method)
+                model = _patch_attention(model, sdpa_method)  # noqa: F821
         except:
             logging.warning("Retrying without SDPA patching.")
             return _retry(use_sdpa_patching=False)
