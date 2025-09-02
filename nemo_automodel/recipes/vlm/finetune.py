@@ -289,7 +289,8 @@ def build_dataloader(
                 processor = None
                 logging.warning(f"AutoProcessor not available for {cfg_model.pretrained_model_name_or_path} ({e}). ")
 
-        ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
+        with FirstRankPerNode():
+            ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
 
         sampler = torch.utils.data.distributed.DistributedSampler(
             ds,
@@ -318,10 +319,9 @@ def build_dataloader(
         except RuntimeError:
             pass
 
-        with FirstRankPerNode():
-            return cfg_dl.instantiate(
-                dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=local_batch_size
-            ), processor
+        return cfg_dl.instantiate(
+            dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=local_batch_size
+        ), processor
 
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821

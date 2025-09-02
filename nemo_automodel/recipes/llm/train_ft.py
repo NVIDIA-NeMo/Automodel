@@ -327,7 +327,8 @@ def build_dataloader(
 
     with StatefulRNG(seed=seed, ranked=True):
         kwargs, tokenizer = _build_tokenizer(cfg_model, cfg_ds)
-        ds = cfg_ds.instantiate(**kwargs)
+        with FirstRankPerNode():
+            ds = cfg_ds.instantiate(**kwargs)
         # Apply packing if configured
         if getattr(cfg_ps, "packed_sequence_size", 0) > 0:
             logger.info(f"Packing dataset with size: {cfg_ps.packed_sequence_size}")
@@ -363,8 +364,7 @@ def build_dataloader(
                 mp.set_start_method("spawn", force=True)
         except RuntimeError:
             pass
-        with FirstRankPerNode():
-            return cfg_dl.instantiate(**dl_kwargs), tokenizer
+        return cfg_dl.instantiate(**dl_kwargs), tokenizer
 
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
