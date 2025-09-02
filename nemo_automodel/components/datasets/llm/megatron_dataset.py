@@ -143,7 +143,6 @@ class MegatronPretraining:
         self.num_train_samples = num_train_samples
         self.num_val_samples = num_val_samples
         self.num_test_samples = num_test_samples
-        self.dataloader_type = dataloader_type
         if isinstance(splits_to_build, str):
             assert splits_to_build in ["train", "validation", "test"], f"Invalid split: {splits_to_build}"
         elif isinstance(splits_to_build, list):
