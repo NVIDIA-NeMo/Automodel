@@ -18,6 +18,7 @@ import importlib.util
 import pytest
 from transformers import AutoTokenizer
 import nemo_automodel.components.datasets.llm.squad as SQUAD
+from nemo_automodel.components.datasets.llm.formatting_utils import _add_pad_token
 
 
 # Explicit set of tokenizer names present in this repo
@@ -59,7 +60,7 @@ def test_formatting_prompts_func_returns_valid_shapes_and_masks(tokenizer_dir: P
         pytest.skip(f"Tokenizer {tokenizer_dir.name} has chat-template")
 
     eos_token_id = getattr(tokenizer, "eos_token_id", 0)
-    pad_token_id = SQUAD._add_pad_token(tokenizer) or eos_token_id
+    pad_token_id = _add_pad_token(tokenizer) or eos_token_id
     result = SQUAD._formatting_prompts_func(example, tokenizer, eos_token_id, pad_token_id, seq_length=seq_length)
 
     # Basic structure
@@ -131,7 +132,7 @@ def test_formatting_with_chat_template_when_available(tokenizer_dir: Path, seq_l
     }
 
     eos_token_id = getattr(tokenizer, "eos_token_id", 0)
-    pad_token_id = SQUAD._add_pad_token(tokenizer) or eos_token_id
+    pad_token_id = _add_pad_token(tokenizer) or eos_token_id
     # We don't assume a specific start-of-turn token string here, since it varies by model family
     result = SQUAD._formatting_prompts_func_with_chat_template(
         example,
