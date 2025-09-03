@@ -50,6 +50,7 @@ from nemo_automodel.components.distributed.init_utils import (
 )
 from nemo_automodel.components.distributed.nvfsdp import NVFSDPManager
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
+from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
@@ -63,7 +64,6 @@ from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
     compile_model,
 )
-from nemo_automodel.components.utils.dist_utils import get_sync_ctx
 from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep, print_trainable_parameters
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
@@ -347,16 +347,16 @@ def build_dataloader(
     """
     with StatefulRNG(seed=seed, ranked=True):
         kwargs, tokenizer = _build_tokenizer(cfg_model, cfg_ds)
-
-        # Megatron specific kwargs
-        if cfg_ds._target_ == MegatronPretraining:
-            kwargs["global_batch_size"] = global_batch_size
-            kwargs["trainer_max_steps"] = max_steps if max_steps is not None else None
-            kwargs["trainer_val_check_interval"] = val_check_interval
-            ds = cfg_ds.instantiate(**kwargs)
-            ds.build()
-        else:
-            ds = cfg_ds.instantiate(**kwargs)
+        with FirstRankPerNode():
+            # Megatron specific kwargs
+            if cfg_ds._target_ == MegatronPretraining:
+                kwargs["global_batch_size"] = global_batch_size
+                kwargs["trainer_max_steps"] = max_steps if max_steps is not None else None
+                kwargs["trainer_val_check_interval"] = val_check_interval
+                ds = cfg_ds.instantiate(**kwargs)
+                ds.build()
+            else:
+                ds = cfg_ds.instantiate(**kwargs)
 
         # Apply packing if configured
         if getattr(cfg_ps, "packed_sequence_size", 0) > 0:
