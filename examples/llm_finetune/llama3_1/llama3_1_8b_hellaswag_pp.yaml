@@ -97,7 +97,7 @@ optimizer:
 
 # Uncomment and configure for W&B logging
 # wandb:
-#   project: automodel-pipelining
-#   entity: nvidia
-#   name: llama3_1_8b_hellaswag_pp
-#   dir: /tmp/wandb
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: <your_wandb_exp_name>
+#   save_dir: <your_wandb_save_dir> 
