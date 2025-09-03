@@ -360,7 +360,7 @@ def apply_lora_to_linear_modules(
             # For QLora, set lora_dtype to float16/bfloat16 since base weights are quantized
             lora_dtype = peft_config.lora_dtype
             if quantization_config is not None and lora_dtype is None:
-                lora_dtype = quantization_config.bnb_4bit_compute_dtype or "bfloat16"
+                lora_dtype = quantization_config.bnb_4bit_compute_dtype or torch.bfloat16
 
             patch_linear_module(
                 module,
