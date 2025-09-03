@@ -32,6 +32,9 @@ from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, O
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM, calculate_loss
 
+import datasets
+datasets.disable_caching()
+
 
 def load_dcp(ckpt_dir: Path | str) -> tuple[dict, dict]:
     """Loads a DCP checkpoint in a state dictionary from a directory."""
@@ -436,7 +439,8 @@ def test_consolidated_vlm_checkpoint():
         "model",
         "optim",
         "step_scheduler.pt",
-        "dataloader.pt",
+        "dataloader/dataloader_dp_rank_0.pt",
+        "dataloader/dataloader_dp_rank_1.pt",
         "model/shard-00001-model-00001-of-00001.safetensors",
         "model/shard-00002-model-00001-of-00001.safetensors",
         "model/consolidated/model-00001-of-00001.safetensors",

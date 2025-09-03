@@ -40,6 +40,8 @@ from wandb import Settings
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig, load_model_from_base_checkpoint
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
+from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
 from nemo_automodel.components.datasets.llm.packed_sequence import PackedSequence
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import (
@@ -51,6 +53,7 @@ from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
 from nemo_automodel.components.training.rng import StatefulRNG
@@ -61,7 +64,7 @@ from nemo_automodel.components.utils.compile_utils import (
     compile_model,
 )
 from nemo_automodel.components.utils.dist_utils import get_sync_ctx
-from nemo_automodel.components.utils.model_utils import print_trainable_parameters
+from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep, print_trainable_parameters
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
@@ -87,6 +90,7 @@ def build_model_and_optimizer(
     tp_size=1,
     cfg_fp8=None,
     cfg_compile=None,
+    cfg_quantization=None,
     autopipeline: AutoPipeline | None = None,
     loss_fn=None,
     parallelize_fn=None,
@@ -129,6 +133,12 @@ def build_model_and_optimizer(
                 "Setting model's attn_implementation to flash_attention_2"
             )
 
+        if cfg_quantization is not None:
+            logger.info("Model weight quantization enabled with BitsAndBytes")
+            from nemo_automodel.components.quantization.qlora import create_bnb_config
+
+            kwargs["quantization_config"] = create_bnb_config(cfg_quantization)
+
         # Instantiate the model in meta device to avoid OOM
         with init_ctx:
             model = cfg_model.instantiate(**kwargs)
@@ -136,13 +146,19 @@ def build_model_and_optimizer(
             # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
             if cfg_peft is not None:
                 assert autopipeline is None, "PEFT is not supported with AutoPipeline"
-                apply_lora_to_linear_modules(model, cfg_peft)
+                apply_lora_to_linear_modules(
+                    model, cfg_peft, quantization_config=kwargs.get("quantization_config", None)
+                )
 
             if cfg_fp8 is not None:
                 fp8_config = build_fp8_config(cfg_fp8)
                 model = apply_fp8_to_model(model, config=fp8_config)
 
     print_trainable_parameters(model)
+
+    if not _supports_logits_to_keep(model):
+        logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
+        loss_fn = MaskedCrossEntropy()
 
     if autopipeline is not None:
         autopipeline.build(model, loss_fn=loss_fn, parallelize_fn=parallelize_fn)
@@ -181,7 +197,7 @@ def build_model_and_optimizer(
 
                 model, optimizer = model_wrapper.parallelize(model, optimizer)
 
-                return model, [optimizer]
+                return model, [optimizer], loss_fn
 
             else:
                 model = model_wrapper.parallelize(model)
@@ -220,7 +236,7 @@ def build_model_and_optimizer(
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         optimizer = [cfg_opt.instantiate(params=trainable_params)]
 
-    return model, optimizer
+    return model, optimizer, loss_fn
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
@@ -261,7 +277,7 @@ def build_loss_fn(cfg_loss):
     """Build a loss function.
 
     Args:
-        cfg_loss: Loss function configuration.
+        cfg_loss (ConfigNode): Loss function configuration.
 
     Returns:
         The instantiated loss function on the specified device.
@@ -298,7 +314,18 @@ def _build_tokenizer(cfg_model, cfg_ds):
 
 
 def build_dataloader(
-    cfg_ds, cfg_dl, cfg_model, cfg_ps, device_mesh, seed, local_batch_size
+    cfg_ds,
+    cfg_dl,
+    cfg_model,
+    cfg_ps,
+    seed,
+    local_batch_size,
+    global_batch_size,
+    max_steps,
+    val_check_interval,
+    dp_rank,
+    dp_world_size,
+    pp_enabled,
 ) -> tuple[DataLoader, PreTrainedTokenizerBase]:
     """Build a DataLoader for the dataset.
 
@@ -307,27 +334,30 @@ def build_dataloader(
         cfg_dl: DataLoader configuration.
         cfg_model: Model configuration.
         cfg_ps: Packed sequence configuration.
-        device_mesh: Device mesh.
         seed: Random seed.
         local_batch_size: Local batch size.
-
+        global_batch_size: Global batch size.
+        max_steps: Maximum number of steps.
+        val_check_interval: Validation check interval.
+        dp_rank: Data parallel rank.
+        dp_world_size: Data parallel world size.
+        pp_enabled: Whether pipeline parallelism is enabled.
     Returns:
         The instantiated DataLoader and tokenizer.
     """
-    dist_sampler_kwargs = {
-        "shuffle": cfg_dl.get("shuffle", True),
-    }
-    if "shuffle" in cfg_dl:
-        del cfg_dl.shuffle
-    if device_mesh is not None:
-        dist_sampler_kwargs |= {
-            "num_replicas": device_mesh["dp"].size(),
-            "rank": device_mesh["dp"].get_local_rank(),
-        }
-
     with StatefulRNG(seed=seed, ranked=True):
         kwargs, tokenizer = _build_tokenizer(cfg_model, cfg_ds)
-        ds = cfg_ds.instantiate(**kwargs)
+
+        # Megatron specific kwargs
+        if cfg_ds._target_ == MegatronPretraining:
+            kwargs["global_batch_size"] = global_batch_size
+            kwargs["trainer_max_steps"] = max_steps if max_steps is not None else None
+            kwargs["trainer_val_check_interval"] = val_check_interval
+            ds = cfg_ds.instantiate(**kwargs)
+            ds.build()
+        else:
+            ds = cfg_ds.instantiate(**kwargs)
+
         # Apply packing if configured
         if getattr(cfg_ps, "packed_sequence_size", 0) > 0:
             logger.info(f"Packing dataset with size: {cfg_ps.packed_sequence_size}")
@@ -339,19 +369,45 @@ def build_dataloader(
                 max_packs=getattr(cfg_ps, "max_packs", None),
             ).pack()
 
-        if not isinstance(ds, IterableDataset):
+        if isinstance(ds, MegatronPretraining):
+            ds = ds.get_dataset(split=cfg_ds.splits_to_build)
+            dataloader_type = cfg_dl.get("dataloader_type", "single")
+            if "dataloader_type" in cfg_dl:
+                del cfg_dl.dataloader_type
+            batch_sampler = create_megatron_sampler(
+                dataset_len=len(ds),
+                micro_batch_size=local_batch_size,
+                global_batch_size=global_batch_size,
+                dataloader_type=dataloader_type,
+                rank=dp_rank,
+                world_size=dp_world_size,
+            )
+            dl_kwargs = {"batch_sampler": batch_sampler}
+        elif not isinstance(ds, IterableDataset):
+            shuffle = cfg_dl.get("shuffle", True)
+            if "shuffle" in cfg_dl:
+                del cfg_dl.shuffle
+
+            dist_sampler_kwargs = {
+                "num_replicas": dp_world_size,
+                "rank": dp_rank,
+                "shuffle": shuffle,
+            }
             sampler = StatefulDistributedSampler(
                 ds,
                 seed=seed,
                 drop_last=True,
                 **dist_sampler_kwargs,
             )
+            dl_kwargs = {"sampler": sampler, "batch_size": local_batch_size}
+            if pp_enabled:
+                dl_kwargs["drop_last"] = True
         else:
             logging.info("Using IterableDataset; skipping sampler.")
-            sampler = None
+            dl_kwargs = {}
 
         # Handle collate_fn instantiation if it's a ConfigNode
-        dl_kwargs = {"dataset": ds, "sampler": sampler, "batch_size": local_batch_size, "drop_last": True}
+        dl_kwargs = dl_kwargs | {"dataset": ds}
         if hasattr(cfg_dl, "collate_fn") and hasattr(cfg_dl.collate_fn, "_target_"):
             collate_cfg = cfg_dl.collate_fn
             dl_kwargs["collate_fn"] = lambda batch: collate_cfg.instantiate(batch=batch)
@@ -642,8 +698,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.peft_config = None
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
-        self.loss_fn = build_loss_fn(self.cfg.loss_fn)
-        model, self.optimizer = build_model_and_optimizer(
+        model, self.optimizer, self.loss_fn = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
             self.cfg.optimizer,
@@ -654,8 +709,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             tp_size=self.cfg.get("distributed.tp_size", 1),
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
+            cfg_quantization=self.cfg.get("quantization", None),
             autopipeline=autopipeline,
-            loss_fn=self.loss_fn,
+            loss_fn=build_loss_fn(self.cfg.loss_fn),
             parallelize_fn=partial(parallelize_for_pp, model_wrapper=self.model_wrapper),
         )
         if isinstance(model, AutoPipeline):
@@ -670,9 +726,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.cfg.dataloader,
             self.cfg.model,
             self.cfg.get("packed_sequence", None),
-            device_mesh=self.device_mesh,
             seed=self.cfg.get("seed", 42),
             local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+            global_batch_size=self.cfg.get("step_scheduler.global_batch_size", 1),
+            max_steps=self.cfg.get("step_scheduler.max_steps", None),
+            val_check_interval=self.cfg.get("step_scheduler.val_every_steps", None),
+            dp_rank=self._get_dp_rank(),
+            dp_world_size=self._get_dp_group_size(),
+            pp_enabled=self.pp_enabled,
         )
 
         # Build validation dataloader if the config provides it
@@ -685,9 +746,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 self.cfg.validation_dataloader,
                 self.cfg.model,
                 cfg_ps=None,  # Use unpacked config for validation
-                device_mesh=self.device_mesh,
                 seed=self.cfg.get("seed", 42),
                 local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+                global_batch_size=self.cfg.get("step_scheduler.global_batch_size", 1),
+                max_steps=self.cfg.get("step_scheduler.max_steps", None),
+                val_check_interval=self.cfg.get("step_scheduler.val_every_steps", None),
+                dp_rank=self._get_dp_rank(),
+                dp_world_size=self._get_dp_group_size(),
+                pp_enabled=self.pp_enabled,
             )
 
         # Scheduler
