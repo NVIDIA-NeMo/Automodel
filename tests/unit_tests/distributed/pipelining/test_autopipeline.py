@@ -893,7 +893,7 @@ class TestAutoPipelineIntegration:
         def loss_fn(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
             return torch.tensor(0.0)
 
-        model, optimizer = ft_mod.build_model_and_optimizer(
+        model, optimizer, loss_fn = ft_mod.build_model_and_optimizer(
             device=torch.device("cpu"),
             cfg_model=CfgModelStub(),
             cfg_opt=CfgOptStub(),

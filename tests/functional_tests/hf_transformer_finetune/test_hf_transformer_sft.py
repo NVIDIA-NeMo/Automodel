@@ -20,7 +20,7 @@ HF_TRANSFORMER_SFT_NVFSDP_FILENAME = "L2_HF_Transformer_SFT_nvfsdp.sh"
 HF_TRANSFORMER_PEFT_FILENAME = "L2_HF_Transformer_PEFT.sh"
 HF_TRANSFORMER_PEFT_NVFSDP_FILENAME = "L2_HF_Transformer_PEFT_nvfsdp.sh"
 HF_TRANSFORMER_PEFT_NO_TOKENIZER_FILENAME = "L2_HF_Transformer_PEFT_no_tokenizer.sh"
-
+HF_TRANSFORMER_SFT_NO_LOGITS_FILENAME = "L2_HF_Transformer_SFT_no_logits.sh"
 
 class TestHFTransformerFinetune:
     def test_hf_transformer_sft(self):
@@ -37,3 +37,6 @@ class TestHFTransformerFinetune:
 
     def test_hf_transformer_peft_no_tokenizer(self):
         run_test_script(TEST_FOLDER, HF_TRANSFORMER_PEFT_NO_TOKENIZER_FILENAME)
+
+    def test_hf_transformer_sft_no_logits(self):
+        run_test_script(TEST_FOLDER, HF_TRANSFORMER_SFT_NO_LOGITS_FILENAME)
