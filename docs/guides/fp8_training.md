@@ -6,7 +6,7 @@ FP8 (8-bit floating point) quantization can provide substantial speedups for mod
 
 ### Requirements for FP8 Training in NeMo-Automodel
 
-To enable FP8 training in NeMo-Automodel, the following hardware and software requirements must be met:
+To enable FP8 training in NeMo Automodel, the following hardware and software requirements must be met:
 
 - **Hardware**:  
   An NVIDIA H100 GPU or newer is required. These GPUs feature FP8 tensor cores that accelerate training.
