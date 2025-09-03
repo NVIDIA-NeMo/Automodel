@@ -30,6 +30,9 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM, calculate_loss
 from nemo_automodel.components.training.utils import count_tail_padding
 
+import datasets
+datasets.disable_caching()
+
 
 def get_validation_loss(
     model: nn.Module, val_batch: dict[str, torch.Tensor], loss_fn: nn.Module, device: torch.device

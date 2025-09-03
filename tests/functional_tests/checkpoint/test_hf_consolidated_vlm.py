@@ -32,6 +32,9 @@ from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, O
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM, calculate_loss
 
+import datasets
+datasets.disable_caching()
+
 
 def load_dcp(ckpt_dir: Path | str) -> tuple[dict, dict]:
     """Loads a DCP checkpoint in a state dictionary from a directory."""

@@ -30,6 +30,9 @@ from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, O
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction, calculate_loss
 
+import datasets
+datasets.disable_caching()
+
 
 def get_validation_loss(
     model_parts: list[nn.Module], val_batch: dict[str, torch.Tensor], loss_fn: nn.Module, device: torch.device, pp_enabled: bool, pp,
