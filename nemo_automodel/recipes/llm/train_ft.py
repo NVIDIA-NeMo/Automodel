@@ -53,6 +53,7 @@ from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
 from nemo_automodel.components.training.rng import StatefulRNG
@@ -63,7 +64,7 @@ from nemo_automodel.components.utils.compile_utils import (
     compile_model,
 )
 from nemo_automodel.components.utils.dist_utils import get_sync_ctx
-from nemo_automodel.components.utils.model_utils import print_trainable_parameters
+from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep, print_trainable_parameters
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
@@ -146,6 +147,10 @@ def build_model_and_optimizer(
 
     print_trainable_parameters(model)
 
+    if not _supports_logits_to_keep(model):
+        logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
+        loss_fn = MaskedCrossEntropy()
+
     if autopipeline is not None:
         autopipeline.build(model, loss_fn=loss_fn, parallelize_fn=parallelize_fn)
         for mp in autopipeline.parts:
@@ -183,7 +188,7 @@ def build_model_and_optimizer(
 
                 model, optimizer = model_wrapper.parallelize(model, optimizer)
 
-                return model, [optimizer]
+                return model, [optimizer], loss_fn
 
             else:
                 model = model_wrapper.parallelize(model)
@@ -222,7 +227,7 @@ def build_model_and_optimizer(
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         optimizer = [cfg_opt.instantiate(params=trainable_params)]
 
-    return model, optimizer
+    return model, optimizer, loss_fn
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
@@ -263,7 +268,7 @@ def build_loss_fn(cfg_loss):
     """Build a loss function.
 
     Args:
-        cfg_loss: Loss function configuration.
+        cfg_loss (ConfigNode): Loss function configuration.
 
     Returns:
         The instantiated loss function on the specified device.
@@ -684,8 +689,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.peft_config = None
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
-        self.loss_fn = build_loss_fn(self.cfg.loss_fn)
-        model, self.optimizer = build_model_and_optimizer(
+        model, self.optimizer, self.loss_fn = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
             self.cfg.optimizer,
@@ -697,7 +701,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
             autopipeline=autopipeline,
-            loss_fn=self.loss_fn,
+            loss_fn=build_loss_fn(self.cfg.loss_fn),
             parallelize_fn=partial(parallelize_for_pp, model_wrapper=self.model_wrapper),
         )
         if isinstance(model, AutoPipeline):
