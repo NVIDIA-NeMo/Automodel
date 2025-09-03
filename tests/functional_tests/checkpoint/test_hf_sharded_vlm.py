@@ -30,6 +30,8 @@ from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, O
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM, calculate_loss
 
+import datasets
+datasets.disable_caching()
 
 def get_validation_loss(
     model: nn.Module, val_batch: dict[str, torch.Tensor], loss_fn: nn.Module, device: torch.device
@@ -563,7 +565,8 @@ def test_hf_vlm_sharded_checkpoint():
         "model",
         "optim",
         "step_scheduler.pt",
-        "dataloader.pt",
+        "dataloader/dataloader_dp_rank_0.pt",
+        "dataloader/dataloader_dp_rank_1.pt",
         "model/shard-00001-model-00001-of-00001.safetensors",
         "model/shard-00002-model-00001-of-00001.safetensors",
         "optim/__0_0.distcp",
