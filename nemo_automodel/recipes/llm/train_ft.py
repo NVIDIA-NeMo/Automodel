@@ -88,6 +88,7 @@ def build_model_and_optimizer(
     tp_size=1,
     cfg_fp8=None,
     cfg_compile=None,
+    cfg_quantization=None,
     autopipeline: AutoPipeline | None = None,
     loss_fn=None,
     parallelize_fn=None,
@@ -130,6 +131,12 @@ def build_model_and_optimizer(
                 "Setting model's attn_implementation to flash_attention_2"
             )
 
+        if cfg_quantization is not None:
+            logger.info("Model weight quantization enabled with BitsAndBytes")
+            from nemo_automodel.components.quantization.qlora import create_bnb_config
+
+            kwargs["quantization_config"] = create_bnb_config(cfg_quantization)
+
         # Instantiate the model in meta device to avoid OOM
         with init_ctx:
             model = cfg_model.instantiate(**kwargs)
@@ -137,7 +144,9 @@ def build_model_and_optimizer(
             # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
             if cfg_peft is not None:
                 assert autopipeline is None, "PEFT is not supported with AutoPipeline"
-                apply_lora_to_linear_modules(model, cfg_peft)
+                apply_lora_to_linear_modules(
+                    model, cfg_peft, quantization_config=kwargs.get("quantization_config", None)
+                )
 
             if cfg_fp8 is not None:
                 fp8_config = build_fp8_config(cfg_fp8)
@@ -658,6 +667,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             tp_size=self.cfg.get("distributed.tp_size", 1),
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
+            cfg_quantization=self.cfg.get("quantization", None),
             autopipeline=autopipeline,
             loss_fn=build_loss_fn(self.cfg.loss_fn),
             parallelize_fn=partial(parallelize_for_pp, model_wrapper=self.model_wrapper),
