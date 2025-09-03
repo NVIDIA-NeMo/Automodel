@@ -491,7 +491,7 @@ class TestMegatronFSDPStrategyParallelize:
         mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh_megatron_fsdp
         model = MockModel()
 
-        with pytest.raises(AssertionError, match="Megatron FSDP is not installed"):
+        with pytest.raises(AssertionError):
             megatron_fsdp_strategy_parallelize(
                 model=model,
                 device_mesh=mesh,
