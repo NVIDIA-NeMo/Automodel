@@ -29,6 +29,8 @@ from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, O
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction, calculate_loss
 
+import datasets
+datasets.disable_caching()
 
 def load_dcp(ckpt_dir: Path | str) -> tuple[dict, dict]:
     """Loads a DCP checkpoint in a state dictionary from a directory."""
@@ -805,7 +807,7 @@ def test_dcp_checkpoint():
         "model",
         "optim",
         "step_scheduler.pt",
-        "dataloader.pt",
+        "dataloader/dataloader_dp_rank_0.pt",
         "model/__0_0.distcp",
         "model/__1_0.distcp",
         "model/.metadata",
@@ -815,6 +817,8 @@ def test_dcp_checkpoint():
         "step_scheduler.pt",
         "config.yaml",
     ]
+    if trainer._get_dp_group_size() > 1:
+        output_files.append("dataloader/dataloader_dp_rank_1.pt")
 
     for file in output_files:
         path = Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / file

@@ -72,6 +72,7 @@ dependencies = [
     "bitsandbytes==0.45.5; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "datasets>=4.0.0",
     "liger-kernel==0.5.8; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
+    "pybind11",
     "pyyaml",
     "torch<=2.8.0",
     "torchdata",
