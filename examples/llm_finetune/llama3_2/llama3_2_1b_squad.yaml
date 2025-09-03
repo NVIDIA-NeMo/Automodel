@@ -19,7 +19,7 @@
 
 
 step_scheduler:
-  global_batch_size: 32
+  global_batch_size: 64
   local_batch_size: 8
   ckpt_every_steps: 1000
   val_every_steps: 10  # will run every x number of gradient steps
@@ -40,7 +40,7 @@ model:
 
 # torch.compile configuration
 compile:
-  enabled: true
+  enabled: false
   mode: "default"  # Options: "default", "reduce-overhead", "max-autotune"
   fullgraph: false
   dynamic: true  # Set to false for better performance with fixed shapes

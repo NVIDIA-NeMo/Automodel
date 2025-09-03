@@ -233,12 +233,12 @@ class TestParallelizeFunctions:
 
         result = _parallelize_gemma3(model, sequence_parallel=False)
 
-        # Should use "language_model" prefix for conditional generation
+        # Should use "model.language_model" prefix for conditional generation
         expected_patterns = [
-            "language_model.layers.*.self_attn.q_proj",
-            "language_model.layers.*.self_attn.k_proj",
-            "language_model.layers.*.self_attn.v_proj",
-            "language_model.layers.*.self_attn.o_proj",
+            "model.language_model.layers.*.self_attn.q_proj",
+            "model.language_model.layers.*.self_attn.k_proj",
+            "model.language_model.layers.*.self_attn.v_proj",
+            "model.language_model.layers.*.self_attn.o_proj",
         ]
 
         for pattern in expected_patterns:
@@ -264,7 +264,7 @@ class TestParallelizeFunctions:
             assert pattern in result
 
         # Check specific types for sequence parallel components
-        assert isinstance(result["model.embed_tokens"], PrepareModuleOutput)
+        assert isinstance(result["model.embed_tokens"], RowwiseParallel)
         assert isinstance(result["model.rotary_emb"], RotaryEmbedParallel)
         assert isinstance(result["model.layers.*.input_layernorm"], SequenceParallel)
 
