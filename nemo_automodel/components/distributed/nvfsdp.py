@@ -24,14 +24,14 @@ from torch.distributed.tensor.parallel import (
 
 from nemo_automodel.components.distributed.parallelizer import (
     get_hf_tp_shard_plan,
-    nvfsdp_strategy_parallelize,
+    megatron_fsdp_strategy_parallelize,
 )
 
 
 @dataclass
-class NVFSDPManager:
+class MegatronFSDPManager:
     """
-    Manager for setting up and parallelizing models using nvFSDP with TP, DP, CP sharding.
+    Manager for setting up and parallelizing models using MegatronFSDP with TP, DP, CP sharding.
 
     This manager initializes the torch.distributed process group, infers the group sizes
     for data parallelism (DP) and tensor parallelism (TP), builds the device mesh for
@@ -72,7 +72,7 @@ class NVFSDPManager:
     )
     sequence_parallel: Optional[bool] = field(
         default=False,
-        metadata={"help": "Enable sequence parallelism in TP plan if True. Not supported with nvFSDP right now."},
+        metadata={"help": "Enable sequence parallelism in TP plan if True. Not supported with MegatronFSDP right now."},
     )
     use_hf_tp_plan: Optional[bool] = field(
         default=False,
@@ -84,20 +84,20 @@ class NVFSDPManager:
         # init=False,
         metadata={"help": "Total number of processes."},
     )
-    nvfsdp_unit_modules: Optional[List[str]] = field(
+    megatron_fsdp_unit_modules: Optional[List[str]] = field(
         default_factory=lambda: [
             "transformers.models.llama.modeling_llama.LlamaDecoderLayer",
         ],
-        metadata={"help": "List of unit modules to be wrapped with nvFSDP."},
+        metadata={"help": "List of unit modules to be wrapped with MegatronFSDP."},
     )
 
-    # nvFSDP config
+    # MegatronFSDP config
     data_parallel_sharding_strategy: Optional[str] = field(
         default="optim_grads_params",
         metadata={"help": "Data parallel sharding strategy."},
     )
-    init_nvfsdp_with_meta_device: Optional[bool] = field(
-        default=False, metadata={"help": "Initialize nvFSDP with meta device if True."}
+    init_megatron_fsdp_with_meta_device: Optional[bool] = field(
+        default=False, metadata={"help": "Initialize MegatronFSDP with meta device if True."}
     )
     grad_reduce_in_fp32: Optional[bool] = field(default=False, metadata={"help": "Reduce gradients in fp32 if True."})
     preserve_fp32_weights: Optional[bool] = field(default=False, metadata={"help": "Preserve fp32 weights if True."})
@@ -202,7 +202,7 @@ class NVFSDPManager:
         if self.data_parallel_sharding_strategy != "optim_grads_params":
             if self.device_mesh.get_rank() == 0:
                 print(
-                    "Warning: nvFSDP data_parallel_sharding_strategy is not optim_grads_params. "
+                    "Warning: MegatronFSDP data_parallel_sharding_strategy is not optim_grads_params. "
                     "Parameters will not be sharded."
                 )
 
@@ -224,7 +224,7 @@ class NVFSDPManager:
                 # TODO(boxiangw): investigate SP
                 if self.sequence_parallel and self.device_mesh.get_rank() == 0:
                     # TODO(boxiangw): Change this to a log
-                    print("Sequence parallelism is disabled. It is not compatible with nvFSDP.")
+                    print("Sequence parallelism is disabled. It is not compatible with MegatronFSDP.")
 
                 tp_shard_plan = base_model_tp_plan
                 # TODO(boxiangw): Change this to a log
@@ -236,14 +236,14 @@ class NVFSDPManager:
         else:
             tp_shard_plan = None
 
-        model = nvfsdp_strategy_parallelize(
+        model = megatron_fsdp_strategy_parallelize(
             model,
             device_mesh=self.device_mesh,
             optimizer=optimizer,
-            nvfsdp_unit_modules=self.nvfsdp_unit_modules,
+            megatron_fsdp_unit_modules=self.megatron_fsdp_unit_modules,
             tp_shard_plan=tp_shard_plan,
             data_parallel_sharding_strategy=self.data_parallel_sharding_strategy,
-            init_nvfsdp_with_meta_device=self.init_nvfsdp_with_meta_device,
+            init_megatron_fsdp_with_meta_device=self.init_megatron_fsdp_with_meta_device,
             grad_reduce_in_fp32=self.grad_reduce_in_fp32,
             preserve_fp32_weights=self.preserve_fp32_weights,
             overlap_grad_reduce=self.overlap_grad_reduce,
