@@ -186,7 +186,7 @@ def build_model_and_optimizer(
 
                 model, optimizer = model_wrapper.parallelize(model, optimizer)
 
-                return model, [optimizer]
+                return model, [optimizer], loss_fn
 
             else:
                 model = model_wrapper.parallelize(model)
