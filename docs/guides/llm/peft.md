@@ -236,6 +236,50 @@ running inference, the adapter and base model weights need to match
 those used for training.
 :::
 
+## QLoRA: Quantized Low-Rank Adaptation
+
+### Introduction to QLoRA
+
+[QLoRA (Quantized LoRA)](https://arxiv.org/abs/2305.14314) is an PEFT technique that combines the benefits of LoRA with 4-bit quantization.
+
+The key innovation of QLoRA is the use of **4-bit NormalFloat (NF4)** quantization, which is specifically designed for normally distributed weights commonly found in neural networks. This quantization technique, combined with double quantization and paged optimizers, dramatically reduces memory usage without significantly impacting model quality.
+
+### Key Benefits of QLoRA
+
+- **Memory Efficiency**: Reduces memory usage by up to 75% compared to full-precision fine-tuning
+- **Hardware Accessibility**: Enables fine-tuning of large models on consumer-grade GPUs
+- **Performance Preservation**: Maintains model quality comparable to full-precision LoRA
+
+### QLoRA Configuration
+
+To use QLoRA with NeMo Automodel, you need to configure both the quantization settings and the PEFT parameters. Here's an example:
+
+``` yaml
+# QLoRA configuration for Llama-3.1-8B on SQuAD dataset
+# Uses 4-bit quantization with LoRA adapters
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.1-8B
+
+# PEFT configuration
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: true  # Apply LoRA to all linear layers
+  dim: 16                 # LoRA rank - can be adjusted based on model size
+  alpha: 32               # LoRA alpha scaling factor
+  dropout: 0.1            # LoRA dropout rate
+
+# Quantization configuration 
+quantization:
+  load_in_4bit: True                        # Enable 4-bit quantization
+  load_in_8bit: False                       # Disable 8-bit (use 4-bit instead)
+  bnb_4bit_compute_dtype: bfloat16          # Computation dtype (bfloat16 or float16)
+  bnb_4bit_use_double_quant: True           # Enable double quantization
+  bnb_4bit_quant_type: nf4                  # Quantization type (nf4 or fp4)
+  bnb_4bit_quant_storage: bfloat16          # Storage dtype for quantized weights
+```
+
 ## Run the Fine-Tune Recipe
 Assuming the above `yaml` is saved in a file named `peft_guide.yaml`, you can run the fine-tuning workflow either using the Automodel CLI or by directly invoking the recipe Python script.
 

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import gc
 import inspect
 import logging
 import types
@@ -177,6 +178,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         sdpa_method: Optional[List[SDPBackend]] = None,
         torch_dtype="auto",
         attn_implementation: str = "flash_attention_2",
+        quantization_config=None,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -203,9 +205,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 Data type passed to the underlying `from_pretrained` call.
             attn_implementation (str, default="flash_attention_2"): Desired
                 attention implementation; forwarded to the HF config.
-            fp8_config (FP8Config, optional): FP8 configuration object that
-                specifies all FP8 quantization settings. If provided, FP8 quantization
-                will be applied to the model for improved performance on supported hardware.
+            quantization_config (optional): BitsAndBytesConfig configuration object that
+                specifies all quantization settings. If provided, quantization
+                will be applied to the model.
             **kwargs: Additional keyword arguments forwarded verbatim to
                 `AutoModelForCausalLM.from_pretrained`.
 
@@ -226,6 +228,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         def _retry(**override):
             """Internal helper to re-enter this function with patched args."""
+            kwargs["quantization_config"] = quantization_config
+            if "quantization_config" in override:
+                if override["quantization_config"] is None:
+                    kwargs.pop("quantization_config")
+                else:
+                    kwargs["quantization_config"] = override["quantization_config"]
+
             return cls.from_pretrained(
                 pretrained_model_name_or_path,
                 *model_args,
@@ -243,6 +252,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             name = cls.__name__
             if name.startswith("NeMo"):
                 cls.__name__ = name[4:]
+            if quantization_config is not None:
+                kwargs["quantization_config"] = quantization_config
             model = super().from_pretrained(
                 pretrained_model_name_or_path,
                 *model_args,
@@ -266,12 +277,14 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 model = _patch_liger_kernel(model)
         except RuntimeError:
             logging.warning("Retrying without Liger kernels.")
+            del model
+            gc.collect()
             return _retry(use_liger_kernel=False)
 
         # Patch sdpa attention
         try:
             if use_sdpa_patching:
-                model = _patch_attention(model, sdpa_method)
+                model = _patch_attention(model, sdpa_method)  # noqa: F821
         except:
             logging.warning("Retrying without SDPA patching.")
             return _retry(use_sdpa_patching=False)
@@ -289,6 +302,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         sdpa_method: Optional[List[SDPBackend]] = None,
         torch_dtype: Union[str, torch.dtype] = "auto",
         attn_implementation: str = "flash_attention_2",
+        quantization_config=None,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -333,6 +347,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         def _retry(**override):
             """Internal helper to re-enter this function with patched args."""
+            if "quantization_config" in override:
+                if override["quantization_config"] is None:
+                    kwargs.pop("quantization_config")
+                else:
+                    kwargs["quantization_config"] = override["quantization_config"]
             return cls.from_config(
                 config,
                 *model_args,
@@ -344,10 +363,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             )
 
         # load model
+        model = None
         try:
             name = cls.__name__
             if name.startswith("NeMo"):
                 cls.__name__ = name[4:]
+            if quantization_config is not None:
+                kwargs["quantization_config"] = quantization_config
             model = super().from_config(
                 config,
                 *model_args,
@@ -368,12 +390,14 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 model = _patch_liger_kernel(model)
         except RuntimeError:
             logging.warning("Retrying without Liger kernels.")
+            del model
+            gc.collect()
             return _retry(use_liger_kernel=False)
 
         # Patch sdpa attention
         try:
             if use_sdpa_patching:
-                model = _patch_attention(model, sdpa_method)
+                model = _patch_attention(model, sdpa_method)  # noqa: F821
         except:
             logging.warning("Retrying without SDPA patching.")
             return _retry(use_sdpa_patching=False)
