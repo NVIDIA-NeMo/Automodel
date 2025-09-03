@@ -97,7 +97,7 @@ FP8 quantization provides measurable performance improvements while maintaining 
 
 *Figure: Loss curves comparing FP8 tensorwise scaling + torch.compile vs. BF16 + torch.compile training on 8xH100 with 8k sequence length, demonstrating virtually identical convergence behavior with 1.24x speedup*
 
-## Ready-to-use recipes
+## Ready-to-Use Recipes
 We provide FP8 training configs for popular models:
 
 - **Llama**: [Llama 3.1 8B](https://github.com/NVIDIA/NeMo-Automodel/blob/main/examples/llm_finetune/llama/llama3_1_8b_hellaswag_fp8.yaml)
