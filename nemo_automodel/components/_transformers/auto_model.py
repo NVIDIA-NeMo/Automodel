@@ -228,6 +228,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         def _retry(**override):
             """Internal helper to re-enter this function with patched args."""
+            kwargs["quantization_config"] = quantization_config
+            if "quantization_config" in override:
+                if override["quantization_config"] is None:
+                    kwargs.pop("quantization_config")
+                else:
+                    kwargs["quantization_config"] = override["quantization_config"]
+
             return cls.from_pretrained(
                 pretrained_model_name_or_path,
                 *model_args,
@@ -236,7 +243,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
-                quantization_config=quantization_config,
                 **kwargs,
             )
 
@@ -246,12 +252,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             name = cls.__name__
             if name.startswith("NeMo"):
                 cls.__name__ = name[4:]
+            if quantization_config is not None:
+                kwargs["quantization_config"] = quantization_config
             model = super().from_pretrained(
                 pretrained_model_name_or_path,
                 *model_args,
                 torch_dtype=torch_dtype,
                 attn_implementation=attn_implementation,
-                quantization_config=quantization_config,
                 **kwargs,
             )
             cls.__name__ = name
@@ -340,6 +347,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         def _retry(**override):
             """Internal helper to re-enter this function with patched args."""
+            if "quantization_config" in override:
+                if override["quantization_config"] is None:
+                    kwargs.pop("quantization_config")
+                else:
+                    kwargs["quantization_config"] = override["quantization_config"]
             return cls.from_config(
                 config,
                 *model_args,
@@ -347,7 +359,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
-                quantization_config=quantization_config,
                 **kwargs,
             )
 
@@ -357,12 +368,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             name = cls.__name__
             if name.startswith("NeMo"):
                 cls.__name__ = name[4:]
+            if quantization_config is not None:
+                kwargs["quantization_config"] = quantization_config
             model = super().from_config(
                 config,
                 *model_args,
                 attn_implementation=attn_implementation,
                 torch_dtype=torch_dtype,
-                quantization_config=quantization_config,
                 **kwargs,
             )
             cls.__name__ = name
