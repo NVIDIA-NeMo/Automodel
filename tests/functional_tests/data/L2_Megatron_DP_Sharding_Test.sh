@@ -18,28 +18,20 @@ set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1"
 
-
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode examples/llm_finetune/finetune.py \
-    --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
-    --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
-    --step_scheduler.max_steps 10 \
-    --step_scheduler.global_batch_size 32 \
-    --step_scheduler.local_batch_size 8 \
+TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace --parallel-mode \
+-m pytest tests/functional_tests/training/test_megatron_data_sharding.py \
+    --config examples/llm_pretrain/megatron_pretrain_gpt2.yaml \
+    --model.config.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
+    --dataset._target_ nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining \
+    --dataset.paths '["/home/TestData/adasif/mcore_dataset_fineweb/processed_data_0_text_document", "/home/TestData/adasif/mcore_dataset_fineweb/processed_data_1_text_document"]' \
+    --dataset.seq_length 32 \
+    --dataset.split "0.99, 0.01, 0.00" \
+    --dataset.splits_to_build "train" \
     --dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
     --validation_dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
-    --dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
-    --validation_dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
-    --dataset.limit_dataset_samples 1000 \
-    --dataset.seq_length 512 \
-    --validation_dataset.seq_length 512 \
-    --checkpoint.enabled false \
+    --checkpoint.checkpoint_dir checkpoints/ \
     --distributed._target_ nemo_automodel.components.distributed.fsdp2.FSDP2Manager \
-    --distributed.dp_size 1 \
+    --distributed.dp_size none \
     --distributed.tp_size 1 \
     --distributed.cp_size 1 \
-    --distributed.pp_size 2 \
-    --distributed.sequence_parallel false \
-    --autopipeline._target_ nemo_automodel.components.distributed.pipelining.AutoPipeline \
-    --autopipeline.pp_schedule 1f1b \
-    --autopipeline.pp_microbatch_size 1 \
-    --autopipeline.scale_grads_in_schedule false
+    --distributed.sequence_parallel false
