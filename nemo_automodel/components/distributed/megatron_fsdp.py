@@ -235,7 +235,7 @@ class MegatronFSDPManager:
                     )
         else:
             tp_shard_plan = None
-        
+
         if self.cp_size > 1:
             dp_shard_dim = "dp_cp"
         else:
