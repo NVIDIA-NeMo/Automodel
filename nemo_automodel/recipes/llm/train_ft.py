@@ -364,13 +364,19 @@ def build_dataloader(
             else:
                 ds = cfg_ds.instantiate(**kwargs)
 
+        packed_sequence_size = getattr(cfg_ps, "packed_sequence_size", 0)
+        # check if packed sequence is supported
+        if packed_sequence_size > 0 and not supports_seq_lens:
+            logging.warning("Packed sequence is not supported without seq_lens; disabling packed sequence")
+            packed_sequence_size = 0
+
         # Apply packing if configured
-        if getattr(cfg_ps, "packed_sequence_size", 0) > 0 and supports_seq_lens:
-            logger.info(f"Packing dataset with size: {cfg_ps.packed_sequence_size}")
+        if packed_sequence_size > 0:
+            logger.info(f"Packing dataset with size: {packed_sequence_size}")
             ds = PackedSequence(
                 ds,
                 split=cfg_ds.split,  # Assumes split is defined in dataset config
-                packed_sequence_size=cfg_ps.packed_sequence_size,
+                packed_sequence_size=packed_sequence_size,
                 split_across_pack=getattr(cfg_ps, "split_across_pack", False),
                 max_packs=getattr(cfg_ps, "max_packs", None),
             ).pack()
