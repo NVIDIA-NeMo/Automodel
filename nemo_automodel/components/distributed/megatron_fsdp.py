@@ -235,6 +235,12 @@ class MegatronFSDPManager:
                     )
         else:
             tp_shard_plan = None
+        
+        if self.cp_size > 1:
+            dp_shard_dim = "dp_cp"
+        else:
+            dp_shard_dim = "dp"
+        tp_dim = "tp"
 
         model = megatron_fsdp_strategy_parallelize(
             model,
@@ -255,6 +261,8 @@ class MegatronFSDPManager:
             keep_fp8_transpose_cache=self.keep_fp8_transpose_cache,
             nccl_ub=self.nccl_ub,
             fsdp_double_buffer=self.fsdp_double_buffer,
+            dp_shard_dim=dp_shard_dim,
+            tp_dim=tp_dim,
         )
 
         return model

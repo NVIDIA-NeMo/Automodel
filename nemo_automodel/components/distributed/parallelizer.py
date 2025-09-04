@@ -786,9 +786,8 @@ def megatron_fsdp_strategy_parallelize(
     keep_fp8_transpose_cache: bool = False,
     nccl_ub: bool = False,
     fsdp_double_buffer: bool = False,
-    dp_mesh_name: str = "dp",
-    cp_mesh_name: str = "cp",
-    tp_mesh_name: str = "tp",
+    dp_shard_dim: str = "dp",
+    tp_dim: str = "tp",
 ):
     """
     Apply tensor/data parallelism (MegatronFSDP) and optional activation-checkpointing to the model.
@@ -830,12 +829,10 @@ def megatron_fsdp_strategy_parallelize(
             latency on some networks.
         fsdp_double_buffer (bool): Enable double buffering of parameters to
             overlap communication and computation in MegatronFSDP.
-        dp_mesh_name (str): Key name for the data parallel mesh in device_mesh.
-            Defaults to "data_parallel".
-        cp_mesh_name (str): Key name for the context parallel mesh in device_mesh.
-            Defaults to "context_parallel".
-        tp_mesh_name (str): Key name for the tensor parallel mesh in device_mesh.
-            Defaults to "tensor_parallel".
+        dp_shard_dim (str): Key name for the data parallel mesh in device_mesh.
+            Defaults to "dp".
+        tp_dim (str): Key name for the tensor parallel mesh in device_mesh.
+            Defaults to "tp".
 
     NOTE: The passed-in model should preferably reside on the meta device.
     Otherwise, ensure the model fits into available GPU or CPU memory.
@@ -850,9 +847,8 @@ def megatron_fsdp_strategy_parallelize(
     )
 
     # DP_CP ranks are sharded by FSDP.
-    dp_mesh = device_mesh[dp_mesh_name]
-    cp_mesh = device_mesh[cp_mesh_name]
-    tp_mesh = device_mesh[tp_mesh_name]
+    dp_mesh = device_mesh[dp_shard_dim]
+    tp_mesh = device_mesh[tp_dim]
 
     if dp_mesh.size() > 1:
         # TODO(boxiangw): remove this once HSDP is supported.
@@ -861,11 +857,6 @@ def megatron_fsdp_strategy_parallelize(
     # TP sharding.
     if tp_mesh.size() > 1:
         parallelize_module(model, tp_mesh, tp_shard_plan)
-
-    if cp_mesh.size() > 1:
-        dp_shard_dim = "dp_cp"
-    else:
-        dp_shard_dim = "dp"
 
     # Import MegatronFSDP unit modules specified by the user.
     megatron_fsdp_unit_modules = import_classes_from_paths(megatron_fsdp_unit_modules)
@@ -877,7 +868,7 @@ def megatron_fsdp_strategy_parallelize(
         fsdp_unit_modules=megatron_fsdp_unit_modules,
         device_mesh=device_mesh,
         dp_shard_dim=dp_shard_dim,
-        tp_dim=tp_mesh_name,
+        tp_dim=tp_dim,
         zero_dp_strategy=zero_dp_strategy,
         init_model_with_meta_device=init_fsdp_with_meta_device,
         grad_reduce_in_fp32=grad_reduce_in_fp32,

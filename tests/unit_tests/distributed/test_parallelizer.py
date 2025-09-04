@@ -344,9 +344,8 @@ class TestMegatronFSDPStrategyParallelize:
         # Verify megatron_fsdp_fully_shard was called with default mesh names
         mock_megatron_fsdp_env["megatron_fsdp"].fully_shard.assert_called_once()
         call_kwargs = mock_megatron_fsdp_env["megatron_fsdp"].fully_shard.call_args[1]
-        assert call_kwargs["dp_mesh_name"] == "dp"
-        assert call_kwargs["tp_mesh_name"] == "tp"
-        assert call_kwargs["cp_mesh_name"] == "cp"
+        assert call_kwargs["dp_shard_dim"] == "dp"
+        assert call_kwargs["tp_dim"] == "tp"
 
     def test_megatron_fsdp_with_custom_mesh_names(self, mock_megatron_fsdp_env):
         """Test Megatron FSDP with custom mesh names."""
@@ -380,66 +379,15 @@ class TestMegatronFSDPStrategyParallelize:
             model=model,
             device_mesh=mesh,
             optimizer=optimizer,
-            dp_mesh_name="my_dp",
-            tp_mesh_name="my_tp",
-            cp_mesh_name="my_cp",
+            dp_shard_dim="my_dp",
+            tp_dim="my_tp",
         )
 
         # Verify megatron_fsdp_fully_shard was called with custom mesh names
         mock_megatron_fsdp_env["megatron_fsdp"].fully_shard.assert_called_once()
         call_kwargs = mock_megatron_fsdp_env["megatron_fsdp"].fully_shard.call_args[1]
-        assert call_kwargs["dp_mesh_name"] == "my_dp"
-        assert call_kwargs["tp_mesh_name"] == "my_tp"
-        assert call_kwargs["cp_mesh_name"] == "my_cp"
-
-    def test_megatron_fsdp_with_tensor_parallelism_custom_names(self, mock_megatron_fsdp_env):
-        """Test Megatron FSDP with tensor parallelism and custom mesh names."""
-        # Create a mock device mesh with custom keys
-        mesh = MagicMock(spec=DeviceMesh)
-        mesh.device_type = "cuda"
-
-        # Mock custom submeshes
-        custom_dp_mesh = MagicMock()
-        custom_tp_mesh = MagicMock()
-        custom_cp_mesh = MagicMock()
-
-        custom_dp_mesh.size.return_value = 2
-        custom_tp_mesh.size.return_value = 2  # Enable TP
-        custom_cp_mesh.size.return_value = 1
-        custom_dp_mesh.ndim = 1
-        custom_tp_mesh.ndim = 1
-        custom_cp_mesh.ndim = 1
-
-        # Configure mesh access with custom names
-        mesh.__getitem__.side_effect = lambda key: {
-            "custom_data": custom_dp_mesh,
-            "custom_tensor": custom_tp_mesh,
-            "custom_context": custom_cp_mesh,
-        }[key]
-
-        model = MockModel()
-        optimizer = MagicMock()
-        tp_plan = {"model.layers.0.self_attn.q_proj": ColwiseParallel()}
-
-        result_model, result_optimizer = megatron_fsdp_strategy_parallelize(
-            model=model,
-            device_mesh=mesh,
-            optimizer=optimizer,
-            tp_shard_plan=tp_plan,
-            dp_mesh_name="custom_data",
-            tp_mesh_name="custom_tensor",
-            cp_mesh_name="custom_context",
-        )
-
-        # Verify parallelize_module was called for tensor parallelism
-        mock_megatron_fsdp_env["parallelize_module"].assert_called_once()
-
-        # Verify megatron_fsdp_fully_shard was called with custom mesh names
-        mock_megatron_fsdp_env["megatron_fsdp"].fully_shard.assert_called_once()
-        call_kwargs = mock_megatron_fsdp_env["megatron_fsdp"].fully_shard.call_args[1]
-        assert call_kwargs["dp_mesh_name"] == "custom_data"
-        assert call_kwargs["tp_mesh_name"] == "custom_tensor"
-        assert call_kwargs["cp_mesh_name"] == "custom_context"
+        assert call_kwargs["dp_shard_dim"] == "my_dp"
+        assert call_kwargs["tp_dim"] == "my_tp"
 
     def test_megatron_fsdp_with_context_parallelism_custom_names(self, mock_megatron_fsdp_env):
         """Test Megatron FSDP with context parallelism and custom mesh names."""
@@ -451,19 +399,23 @@ class TestMegatronFSDPStrategyParallelize:
         custom_dp_mesh = MagicMock()
         custom_tp_mesh = MagicMock()
         custom_cp_mesh = MagicMock()
+        custom_dp_cp_mesh = MagicMock()
 
         custom_dp_mesh.size.return_value = 2
         custom_tp_mesh.size.return_value = 1
         custom_cp_mesh.size.return_value = 2  # Enable CP
+        custom_dp_cp_mesh.size.return_value = 4 # Mock flattening
         custom_dp_mesh.ndim = 1
         custom_tp_mesh.ndim = 1
         custom_cp_mesh.ndim = 1
+        custom_dp_cp_mesh.ndim = 1
 
         # Configure mesh access with custom names
         mesh.__getitem__.side_effect = lambda key: {
             "dp_mesh": custom_dp_mesh,
             "tp_mesh": custom_tp_mesh,
             "cp_mesh": custom_cp_mesh,
+            "dp_cp": custom_dp_cp_mesh,
         }[key]
 
         model = MockModel()
@@ -473,15 +425,15 @@ class TestMegatronFSDPStrategyParallelize:
             model=model,
             device_mesh=mesh,
             optimizer=optimizer,
-            dp_mesh_name="dp_mesh",
-            tp_mesh_name="tp_mesh",
-            cp_mesh_name="cp_mesh",
+            dp_shard_dim="dp_cp",
+            tp_dim="tp_mesh",
         )
 
         # Verify megatron_fsdp_fully_shard was called with dp_cp_mesh_name set correctly
         mock_megatron_fsdp_env["megatron_fsdp"].fully_shard.assert_called_once()
         call_kwargs = mock_megatron_fsdp_env["megatron_fsdp"].fully_shard.call_args[1]
-        assert call_kwargs["dp_cp_mesh_name"] == "dp_cp"  # Should use default when CP > 1
+        assert call_kwargs["dp_shard_dim"] == "dp_cp"  # Should use default when CP > 1
+        assert call_kwargs["tp_dim"] == "tp_mesh"
 
     def test_megatron_fsdp_not_available_error(self, mock_device_mesh_megatron_fsdp, monkeypatch):
         """Test error when Megatron FSDP is not available."""
