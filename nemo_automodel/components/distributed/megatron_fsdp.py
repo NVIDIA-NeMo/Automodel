@@ -201,10 +201,7 @@ class MegatronFSDPManager:
         """
         if self.zero_dp_strategy != 3:
             if self.device_mesh.get_rank() == 0:
-                print(
-                    "Warning: MegatronFSDP zero_dp_strategy is not 3. "
-                    "Parameters will not be sharded."
-                )
+                print("Warning: MegatronFSDP zero_dp_strategy is not 3. Parameters will not be sharded.")
 
         if self.device_mesh["tp"].size() > 1:
             if self.use_hf_tp_plan:
