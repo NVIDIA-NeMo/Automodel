@@ -92,11 +92,11 @@ class MegatronFSDPManager:
     )
 
     # MegatronFSDP config
-    data_parallel_sharding_strategy: Optional[str] = field(
-        default="optim_grads_params",
+    zero_dp_strategy: Optional[int] = field(
+        default=3,
         metadata={"help": "Data parallel sharding strategy."},
     )
-    init_megatron_fsdp_with_meta_device: Optional[bool] = field(
+    init_fsdp_with_meta_device: Optional[bool] = field(
         default=False, metadata={"help": "Initialize MegatronFSDP with meta device if True."}
     )
     grad_reduce_in_fp32: Optional[bool] = field(default=False, metadata={"help": "Reduce gradients in fp32 if True."})
@@ -113,7 +113,7 @@ class MegatronFSDPManager:
     calculate_per_token_loss: Optional[bool] = field(
         default=False, metadata={"help": "Calculate per token loss if True."}
     )
-    keep_fp8_transpose_cache_when_using_custom_fsdp: Optional[bool] = field(
+    keep_fp8_transpose_cache: Optional[bool] = field(
         default=False, metadata={"help": "Keep fp8 transpose cache when using custom FSDP if True."}
     )
     nccl_ub: Optional[bool] = field(default=False, metadata={"help": "Use NCCL UBs if True."})
@@ -242,8 +242,8 @@ class MegatronFSDPManager:
             optimizer=optimizer,
             megatron_fsdp_unit_modules=self.megatron_fsdp_unit_modules,
             tp_shard_plan=tp_shard_plan,
-            data_parallel_sharding_strategy=self.data_parallel_sharding_strategy,
-            init_megatron_fsdp_with_meta_device=self.init_megatron_fsdp_with_meta_device,
+            zero_dp_strategy=self.zero_dp_strategy,
+            init_fsdp_with_meta_device=self.init_fsdp_with_meta_device,
             grad_reduce_in_fp32=self.grad_reduce_in_fp32,
             preserve_fp32_weights=self.preserve_fp32_weights,
             overlap_grad_reduce=self.overlap_grad_reduce,
@@ -252,7 +252,7 @@ class MegatronFSDPManager:
             average_in_collective=self.average_in_collective,
             disable_bucketing=self.disable_bucketing,
             calculate_per_token_loss=self.calculate_per_token_loss,
-            keep_fp8_transpose_cache_when_using_custom_fsdp=self.keep_fp8_transpose_cache_when_using_custom_fsdp,
+            keep_fp8_transpose_cache=self.keep_fp8_transpose_cache,
             nccl_ub=self.nccl_ub,
             fsdp_double_buffer=self.fsdp_double_buffer,
         )

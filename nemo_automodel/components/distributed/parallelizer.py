@@ -773,8 +773,8 @@ def megatron_fsdp_strategy_parallelize(
     optimizer=None,
     megatron_fsdp_unit_modules: Optional[List[str]] = None,
     tp_shard_plan: Optional[Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]] = None,
-    data_parallel_sharding_strategy: str = "optim_grads_params",
-    init_megatron_fsdp_with_meta_device: bool = False,
+    zero_dp_strategy: int = 3,
+    init_fsdp_with_meta_device: bool = False,
     grad_reduce_in_fp32: bool = False,
     preserve_fp32_weights: bool = False,
     overlap_grad_reduce: bool = True,
@@ -783,7 +783,7 @@ def megatron_fsdp_strategy_parallelize(
     average_in_collective: bool = False,
     disable_bucketing: bool = False,
     calculate_per_token_loss: bool = False,
-    keep_fp8_transpose_cache_when_using_custom_fsdp: bool = False,
+    keep_fp8_transpose_cache: bool = False,
     nccl_ub: bool = False,
     fsdp_double_buffer: bool = False,
     dp_mesh_name: str = "dp",
@@ -804,11 +804,8 @@ def megatron_fsdp_strategy_parallelize(
             A tensor-parallel sharding plan.
             Keys are module names; values specify the parallel style to apply
             (e.g., RowwiseParallel, ColwiseParallel, SequenceParallel).
-        data_parallel_sharding_strategy (str): Strategy for sharding parameters,
-            gradients, and optimizer states across data-parallel ranks.
-            Valid options include "params", "grads_params", and
-            "optim_grads_params" (default).
-        init_megatron_fsdp_with_meta_device (bool): If True, construct the model on a
+        zero_dp_strategy (int): The zero-DP strategy to use.
+        init_fsdp_with_meta_device (bool): If True, construct the model on a
             meta device first and materialize weights lazily to reduce memory
             fragmentation.
         grad_reduce_in_fp32 (bool): Reduce gradients in FP32 irrespective of the
@@ -827,7 +824,7 @@ def megatron_fsdp_strategy_parallelize(
             reduced immediately as they are produced.
         calculate_per_token_loss (bool): Compute loss normalized by the number of
             tokens instead of the number of sequences.
-        keep_fp8_transpose_cache_when_using_custom_fsdp (bool): Retain the FP8
+        keep_fp8_transpose_cache (bool): Retain the FP8
             transpose cache when using a custom MegatronFSDP wrapper.
         nccl_ub (bool): Enable NCCL user-buffer API (experimental) for reduced
             latency on some networks.
@@ -866,9 +863,9 @@ def megatron_fsdp_strategy_parallelize(
         parallelize_module(model, tp_mesh, tp_shard_plan)
 
     if cp_mesh.size() > 1:
-        dp_cp_mesh_name = "dp_cp"
+        dp_shard_dim = "dp_cp"
     else:
-        dp_cp_mesh_name = "dp"
+        dp_shard_dim = "dp"
 
     # Import MegatronFSDP unit modules specified by the user.
     megatron_fsdp_unit_modules = import_classes_from_paths(megatron_fsdp_unit_modules)
@@ -879,12 +876,10 @@ def megatron_fsdp_strategy_parallelize(
         optimizer=optimizer,
         fsdp_unit_modules=megatron_fsdp_unit_modules,
         device_mesh=device_mesh,
-        dp_mesh_name=dp_mesh_name,
-        cp_mesh_name=cp_mesh_name,
-        tp_mesh_name=tp_mesh_name,
-        dp_cp_mesh_name=dp_cp_mesh_name,
-        data_parallel_sharding_strategy=data_parallel_sharding_strategy,
-        init_model_with_meta_device=init_megatron_fsdp_with_meta_device,
+        dp_shard_dim=dp_shard_dim,
+        tp_dim=tp_mesh_name,
+        zero_dp_strategy=zero_dp_strategy,
+        init_model_with_meta_device=init_fsdp_with_meta_device,
         grad_reduce_in_fp32=grad_reduce_in_fp32,
         preserve_fp32_weights=preserve_fp32_weights,
         overlap_grad_reduce=overlap_grad_reduce,
@@ -894,7 +889,7 @@ def megatron_fsdp_strategy_parallelize(
         average_in_collective=average_in_collective,
         disable_bucketing=disable_bucketing,
         calculate_per_token_loss=calculate_per_token_loss,
-        keep_fp8_transpose_cache_when_using_custom_fsdp=keep_fp8_transpose_cache_when_using_custom_fsdp,
+        keep_fp8_transpose_cache=keep_fp8_transpose_cache,
         nccl_ub=nccl_ub,
         fsdp_double_buffer=fsdp_double_buffer,
     )
