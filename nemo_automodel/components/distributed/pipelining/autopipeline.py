@@ -25,13 +25,10 @@ from torch.distributed.pipelining.stage import PipelineStage
 from nemo_automodel.components.distributed.pipelining.functional import (
     ParallelizeFnProtocol,
     pipeline_model,
+    scale_grads_by_divisor,
 )
 from nemo_automodel.components.distributed.pipelining.hf_utils import (
     validate_hf_model_for_pipeline_support,
-)
-from nemo_automodel.components.distributed.pipelining.training_utils import (
-    pp_clip_grad_norm,
-    pp_scale_grads_by_divisor,
 )
 
 logger = logging.getLogger(__name__)
@@ -144,6 +141,7 @@ class AutoPipeline:
             cp_axis_name=self.cp_axis_name,
             tp_axis_name=self.tp_axis_name,
             ep_axis_name=self.ep_axis_name,
+            ep_shard_axis_names=self.ep_shard_axis_names,
             layers_per_stage=self.layers_per_stage,
             pipeline_parallel_schedule_csv=self.pp_schedule_csv,
             pipeline_parallel_schedule=self.pp_schedule,
@@ -173,29 +171,7 @@ class AutoPipeline:
         if self._info.stages is None:
             raise RuntimeError("Autopipeline not built. Call build() first.")
 
-        pp_scale_grads_by_divisor(self._info.stages, divisor)
-
-    def clip_grad_norm(
-        self,
-        max_norm: float,
-        norm_type: float = 2.0,
-        error_if_nonfinite: bool = False,
-        foreach: bool | None = None,
-        pp_mesh: DeviceMesh | None = None,
-        ep_axis_name: str | None = None,
-    ) -> torch.Tensor:
-        if self._info.stages is None:
-            raise RuntimeError("Autopipeline not built. Call build() first.")
-
-        return pp_clip_grad_norm(
-            [p for m in self._info.model_parts for p in m.parameters()],
-            max_norm,
-            norm_type,
-            error_if_nonfinite,
-            foreach,
-            pp_mesh,
-            ep_axis_name,
-        )
+        scale_grads_by_divisor(self._info.stages, divisor)
 
     @property
     def info(self) -> PipelineInfo:

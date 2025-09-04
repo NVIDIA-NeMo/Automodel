@@ -58,7 +58,7 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
-from nemo_automodel.components.training.utils import count_tail_padding
+from nemo_automodel.components.training.utils import clip_grad_norm, count_tail_padding
 from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
     compile_model,
@@ -185,7 +185,21 @@ def build_model_and_optimizer(
             )
         model = autopipeline
     else:
-        if callable(getattr(model_wrapper, "parallelize", None)):
+        load_weights = False
+        if parallelize_fn is not None:
+            parallelize_fn(
+                model,
+                world_mesh=model_wrapper.device_mesh,
+                moe_mesh=model_wrapper.moe_mesh,
+                pp_enabled=False,
+                dp_axis_names=("dp_shard",),
+                cp_axis_name="cp",
+                tp_axis_name="tp",
+                ep_axis_name="ep",
+                ep_shard_axis_names=("ep_shard",),
+            )
+            load_weights = True
+        elif callable(getattr(model_wrapper, "parallelize", None)):
             # FSDP2 and nvFSDP should already be on the correct device
             if isinstance(model_wrapper, NVFSDPManager):
                 # nvFSDP instantiate optimizer inside parallelize_function
@@ -201,20 +215,21 @@ def build_model_and_optimizer(
                 return model, [optimizer], loss_fn
 
             else:
+                load_weights = True
                 model = model_wrapper.parallelize(model)
 
-                # Load the weights into the model in parallel.
-                if is_meta_device:
-                    load_model_from_base_checkpoint(
-                        model,
-                        device,
-                        cfg_peft is not None,
-                        cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
-                        cfg_model.pretrained_model_name_or_path,
-                        getattr(cfg_peft, "lora_A_init", None),
-                        device_mesh=model_wrapper.device_mesh,
-                        moe_mesh=model_wrapper.moe_mesh,
-                    )
+        # Load the weights into the model in parallel.
+        if is_meta_device and load_weights:
+            load_model_from_base_checkpoint(
+                model,
+                device,
+                cfg_peft is not None,
+                cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
+                cfg_model.pretrained_model_name_or_path,
+                getattr(cfg_peft, "lora_A_init", None),
+                device_mesh=model_wrapper.device_mesh,
+                moe_mesh=model_wrapper.moe_mesh,
+            )
 
         # ensure the model is on device
         model = model.to(device)
@@ -942,27 +957,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.pp_enabled:
             self.pp.scale_grads_by_divisor(num_label_tokens / self._get_dp_group().size())
 
-        grad_norm = 0
-        # Clip gradients **after** any rescaling.
-        # TODO(@boxiangw): Fix TP gradient clipping
-        if max_grad_norm is not None:
-            if self.pp_enabled:
-                grad_norm = self.pp.clip_grad_norm(
-                    max_grad_norm,
-                    foreach=True,
-                    pp_mesh=(self.device_mesh["pp"] if self.pp_enabled else None),
-                    ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
-                )
-            else:
-                if not self.device_mesh or self.device_mesh["tp"].size() == 1:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        [p for p in self.model_parts[0].parameters() if p.requires_grad], max_grad_norm
-                    )
-                    if hasattr(grad_norm, "full_tensor"):
-                        grad_norm = grad_norm.full_tensor()  # collect the summed grad norm across ranks
-
-            if isinstance(grad_norm, torch.Tensor):
-                grad_norm = grad_norm.item()
+        grad_norm = clip_grad_norm(
+            max_grad_norm,
+            model_parts=self.model_parts,
+            pp_enabled=self.pp_enabled,
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
+            pp_axis_name="pp" if self.pp_enabled else None,
+            foreach=True,
+        )
 
         # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
         # self.model_parts[0].finish_grad_sync()

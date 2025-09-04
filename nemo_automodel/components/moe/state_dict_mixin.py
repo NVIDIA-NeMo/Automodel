@@ -21,6 +21,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from nemo_automodel.components.moe.state_dict_utils import (
     create_dtensor_from_local,
     get_expert_range_for_rank_from_mesh,
+    get_submesh,
     is_dtensor,
     should_load_expert_for_rank,
     split_experts_weights_dtensor_aware,
@@ -65,7 +66,11 @@ class MoEStateDictMixin:
         if device_mesh is not None:
             start_expert, end_expert = get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
             required_experts = list(range(start_expert, end_expert))
-            rank = device_mesh["ep"].get_rank() if "ep" in device_mesh.mesh_dim_names else device_mesh.get_rank()
+            rank = (
+                get_submesh(device_mesh, ("ep",)).get_rank()
+                if "ep" in device_mesh.mesh_dim_names
+                else device_mesh.get_rank()
+            )
             rank_info = f" (rank {rank})"
         else:
             required_experts = list(range(n_experts))
@@ -291,7 +296,11 @@ class MoEStateDictMixin:
         if device_mesh is not None:
             start_expert, end_expert = get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
             expected_experts_per_rank = end_expert - start_expert
-            rank = device_mesh["ep"].get_rank() if "ep" in device_mesh.mesh_dim_names else device_mesh.get_rank()
+            rank = (
+                get_submesh(device_mesh, ("ep",)).get_rank()
+                if "ep" in device_mesh.mesh_dim_names
+                else device_mesh.get_rank()
+            )
         else:
             start_expert, end_expert = 0, n_experts
             expected_experts_per_rank = n_experts
@@ -337,6 +346,7 @@ class MoEStateDictMixin:
                 if len(expert_weights_by_layer[layer_num][native_key]) == expected_experts_per_rank:
                     expert_ids = sorted(expert_weights_by_layer[layer_num][native_key].keys())
                     ordered = [expert_weights_by_layer[layer_num][native_key][i] for i in expert_ids]
+                    ordered = [t.to_local() if is_dtensor(t) else t for t in ordered]
 
                     # Shapes:
                     # gate/up: [inter_dim, dim] -> stacked [n_experts_this_rank, inter_dim, dim]
@@ -369,7 +379,11 @@ class MoEStateDictMixin:
         if device_mesh is not None:
             start_expert, end_expert = get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
             expected_experts_per_rank = end_expert - start_expert
-            rank = device_mesh["ep"].get_rank() if "ep" in device_mesh.mesh_dim_names else device_mesh.get_rank()
+            rank = (
+                get_submesh(device_mesh, ("ep",)).get_rank()
+                if "ep" in device_mesh.mesh_dim_names
+                else device_mesh.get_rank()
+            )
         else:
             start_expert, end_expert = 0, n_experts
             expected_experts_per_rank = n_experts
@@ -424,6 +438,12 @@ class MoEStateDictMixin:
                             gate_weight = expert_data["gate_proj"]  # [inter_dim, dim]
                             up_weight = expert_data["up_proj"]  # [inter_dim, dim]
 
+                            # Extract local tensor if input is already a DTensor
+                            if is_dtensor(gate_weight):
+                                gate_weight = gate_weight.to_local()
+                            if is_dtensor(up_weight):
+                                up_weight = up_weight.to_local()
+
                             gate_t = gate_weight.transpose(0, 1)  # [dim, inter_dim]
                             up_t = up_weight.transpose(0, 1)  # [dim, inter_dim]
                             combined = torch.cat([gate_t, up_t], dim=-1)  # [dim, 2*inter_dim]
@@ -444,6 +464,11 @@ class MoEStateDictMixin:
                         ordered = []
                         for expert_id in expert_ids:
                             down_weight = expert_weights_by_layer[layer_num][native_key][expert_id]  # [dim, inter_dim]
+
+                            # Extract local tensor if input is already a DTensor
+                            if is_dtensor(down_weight):
+                                down_weight = down_weight.to_local()
+
                             down_t = down_weight.transpose(0, 1)  # [inter_dim, dim]
                             ordered.append(down_t)
 

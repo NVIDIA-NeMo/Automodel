@@ -25,6 +25,13 @@ def is_dtensor(tensor: torch.Tensor) -> bool:
     return isinstance(tensor, DTensor)
 
 
+def get_submesh(device_mesh: DeviceMesh, dims: tuple[str, ...]) -> DeviceMesh:
+    from torch.distributed.device_mesh import _mesh_resources
+
+    root_mesh = _mesh_resources.get_root_mesh(device_mesh)
+    return root_mesh[dims]
+
+
 def get_expert_slice_for_rank(experts_tensor: torch.Tensor, n_experts: int) -> tuple[torch.Tensor, int, int]:
     """
     Get the slice of experts present on the current rank for a DTensor.
@@ -50,10 +57,10 @@ def get_expert_slice_for_rank(experts_tensor: torch.Tensor, n_experts: int) -> t
 
     device_mesh = dtensor.device_mesh
     assert "ep" in device_mesh.mesh_dim_names, "ep mesh dimension not found"
-    ep_mesh = device_mesh["ep"] if "ep" in device_mesh.mesh_dim_names else device_mesh
+    ep_mesh = get_submesh(device_mesh, ("ep",))
     current_rank = ep_mesh.get_local_rank()
 
-    placement = dtensor.placements[0]  # Assume single device mesh for now
+    placement = dtensor.placements[-1]  # Assume single device mesh for now
     if isinstance(placement, Shard) and placement.dim == 0:
         # Tensor is sharded along expert dimension
         world_size = ep_mesh.size()
@@ -107,9 +114,49 @@ def split_experts_weights_dtensor_aware(weight: torch.Tensor, n_experts: int) ->
 
     split_weights = []
     expert_ids = []
+
+    # Check if weight is a DTensor to preserve placements
+    is_weight_dtensor = is_dtensor(weight)
+    if is_weight_dtensor:
+        device_mesh = weight.device_mesh
+        original_placements = weight.placements
+        mesh_dim_names = list(weight.device_mesh.mesh_dim_names)
+
+        # 'ep' is guaranteed to be present; remove it
+        ep_dim_idx = mesh_dim_names.index("ep")
+        remaining_mesh_dims = mesh_dim_names[:ep_dim_idx] + mesh_dim_names[ep_dim_idx + 1 :]
+
+        # Build device mesh without 'ep'
+        if remaining_mesh_dims and any(map(lambda x: get_submesh(device_mesh, (x,)).size() > 1, remaining_mesh_dims)):
+            new_device_mesh = get_submesh(device_mesh, tuple(remaining_mesh_dims))
+        else:
+            new_device_mesh = None
+            is_weight_dtensor = False
+
+        # Placements without the 'ep' dimension
+        new_placements_template = original_placements[:ep_dim_idx] + original_placements[ep_dim_idx + 1 :]
+
     for i in range(local_n_experts):
         expert_weight = local_tensor[i]  # Shape: [...] (expert dimension removed)
         global_expert_id = start_expert + i
+
+        # If original weight was DTensor, wrap the sliced expert weight in DTensor with adjusted placements
+        if is_weight_dtensor:
+            new_placements = []
+
+            for placement in new_placements_template:
+                if isinstance(placement, Shard) and placement.dim > 0:
+                    # Adjust shard dimensions since we removed dimension 0
+                    new_placements.append(Shard(placement.dim - 1))
+                elif isinstance(placement, Shard) and placement.dim == 0:
+                    # Can't shard on dim 0 anymore since we removed it
+                    new_placements.append(Replicate())
+                else:
+                    # Keep other placements as-is (e.g., Replicate)
+                    new_placements.append(placement)
+
+            # Create DTensor with new device mesh and placements
+            expert_weight = DTensor.from_local(expert_weight, new_device_mesh, new_placements)
 
         split_weights.append(expert_weight)
         expert_ids.append(global_expert_id)
@@ -139,7 +186,7 @@ def validate_dtensor_expert_sharding(tensor: torch.Tensor, expected_experts: int
     if dtensor.shape[0] != expected_experts:
         raise ValueError(f"{tensor_name} global shape has {dtensor.shape[0]} experts, expected {expected_experts}")
 
-    placement = dtensor.placements[0] if dtensor.placements else None
+    placement = dtensor.placements[-1] if dtensor.placements else None
 
     if isinstance(placement, Shard) and placement.dim == 0:
         return True
@@ -172,7 +219,37 @@ def create_dtensor_from_local(
     if rank is not None and torch.cuda.is_available():
         local_tensor = local_tensor.to(f"cuda:{torch.cuda.current_device()}")
 
-    dtensor = DTensor.from_local(local_tensor, device_mesh, [Shard(0)])
+    # Create placements based on device mesh dimensions
+    placements = []
+    ep_sharded = any(
+        map(
+            lambda x: x in device_mesh.mesh_dim_names and get_submesh(device_mesh, (x,)).size() > 1,
+            ["ep_shard", "ep_replicate"],
+        )
+    )
+    dim_names_for_placements = []
+    mesh_dim_names = device_mesh.mesh_dim_names
+    assert all(map(lambda x: x in ["ep", "ep_shard", "ep_replicate"], mesh_dim_names)), (
+        f"Expected mesh dimension names to contain only 'ep', 'ep_shard', 'ep_replicate', got {mesh_dim_names}"
+    )
+    for _, dim_name in enumerate(mesh_dim_names):
+        if dim_name == "ep":
+            # Expert parallelism: shard across experts (dim 0)
+            placements.append(Shard(0))
+            dim_names_for_placements.append(dim_name)
+        elif dim_name == "ep_shard":
+            if ep_sharded:
+                placements.append(Shard(1))
+                dim_names_for_placements.append(dim_name)
+        elif dim_name == "ep_replicate":
+            if ep_sharded:
+                # Expert replication: replicate across this dimension
+                placements.append(Replicate())
+                dim_names_for_placements.append(dim_name)
+        else:
+            raise ValueError(f"Unexpected mesh dimension name: {dim_name}")
+
+    dtensor = DTensor.from_local(local_tensor, get_submesh(device_mesh, tuple(dim_names_for_placements)), placements)
     return dtensor
 
 
@@ -190,7 +267,7 @@ def get_expert_range_for_rank_from_mesh(device_mesh: Optional["DeviceMesh"], n_e
     if device_mesh is None:
         return 0, n_experts
 
-    ep_mesh = device_mesh["ep"] if "ep" in device_mesh.mesh_dim_names else device_mesh
+    ep_mesh = get_submesh(device_mesh, ("ep",)) if "ep" in device_mesh.mesh_dim_names else device_mesh
     world_size = ep_mesh.size()
     rank = ep_mesh.get_local_rank()
 

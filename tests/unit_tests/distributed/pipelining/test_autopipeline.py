@@ -394,12 +394,10 @@ class TestAutoPipelineBuildAndStep:
         _patch_autopipeline_monkey(monkeypatch)
 
         # Mock the training utils functions at the core module level where they're imported
-        mock_clip_grad_norm = Mock(return_value=torch.tensor(1.5))
         mock_scale_grads = Mock()
 
         import nemo_automodel.components.distributed.pipelining.autopipeline as autopipeline_mod
-        monkeypatch.setattr(autopipeline_mod, "pp_clip_grad_norm", mock_clip_grad_norm)
-        monkeypatch.setattr(autopipeline_mod, "pp_scale_grads_by_divisor", mock_scale_grads)
+        monkeypatch.setattr(autopipeline_mod, "scale_grads_by_divisor", mock_scale_grads)
 
         num_layers = 4
         model = DummyQwenForCausalLM(num_layers=num_layers)
@@ -429,16 +427,6 @@ class TestAutoPipelineBuildAndStep:
             device=torch.device("cpu"),
         )
         ap.build(model, loss_fn=loss_fn)
-
-        # Test gradient clipping
-        result = ap.clip_grad_norm(1.0)
-        assert isinstance(result, torch.Tensor)
-        # Verify the function was called with correct parameters
-        assert mock_clip_grad_norm.called
-
-        # Test with additional parameters
-        ap.clip_grad_norm(2.0, norm_type=1.0, error_if_nonfinite=True, foreach=False)
-        assert mock_clip_grad_norm.call_count == 2
 
         # Test gradient scaling
         ap.scale_grads_by_divisor(4)
@@ -474,9 +462,6 @@ class TestAutoPipelineErrorHandling:
             pp_batch_size=4,
             device=torch.device("cpu"),
         )
-
-        with pytest.raises(RuntimeError, match="Autopipeline not built"):
-            ap.clip_grad_norm(1.0)
 
         with pytest.raises(RuntimeError, match="Autopipeline not built"):
             ap.scale_grads_by_divisor(2)

@@ -305,13 +305,17 @@ def load_model(
         )
 
         if state_dict_adapter:
-            reinstated_state_dict = state_dict_adapter.from_hf(reinstated_state_dict, device_mesh=moe_mesh["ep"])
+            ep_mesh_dims = [dim for dim in moe_mesh.mesh_dim_names if dim != "pp"] if moe_mesh is not None else []
+            ep_mesh = moe_mesh[tuple(ep_mesh_dims)] if ep_mesh_dims else moe_mesh
+            reinstated_state_dict = state_dict_adapter.from_hf(reinstated_state_dict, device_mesh=ep_mesh)
 
-        model_state.load_state_dict(reinstated_state_dict)
+        model_state.load_state_dict(
+            reinstated_state_dict, strict=not (len(model_state.model) > 1 or state_dict_adapter is not None)
+        )
     elif model_save_format == SerializationFormat.TORCH_SAVE:
         reinstated_state_dict = model_state.state_dict()
         dcp.load(reinstated_state_dict, checkpoint_id=model_path if use_checkpoint_id else None)
-        model_state.load_state_dict(reinstated_state_dict)
+        model_state.load_state_dict(reinstated_state_dict, strict=not (len(model_state.model) > 1))
     else:
         raise ValueError(f"Unsupported model save format: {model_save_format}")
 
@@ -460,7 +464,7 @@ def get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
 
 
 def to_empty_parameters_only(
-    model: nn.Module, *, device: torch.device, recurse: bool = True, dtype: torch.dtype = torch.bfloat16
+    model: nn.Module, *, device: torch.device, recurse: bool = True, dtype: torch.dtype | None = None
 ) -> nn.Module:
     """
     Move parameters to the specified device without copying storage, skipping buffers.

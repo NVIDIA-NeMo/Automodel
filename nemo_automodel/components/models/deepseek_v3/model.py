@@ -147,7 +147,7 @@ class DeepseekV3Model(nn.Module):
 
     def forward(
         self,
-        tokens: torch.Tensor,
+        input_ids: torch.Tensor,
         *,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
@@ -156,13 +156,13 @@ class DeepseekV3Model(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if position_ids is None:
             position_ids = (
-                torch.arange(0, tokens.shape[1], device=tokens.device).unsqueeze(0).expand(tokens.shape[0], -1)
+                torch.arange(0, input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand(input_ids.shape[0], -1)
             )
 
         with torch.no_grad():
             freqs_cis = freqs_cis_from_position_ids(position_ids, self.freqs_cis)
 
-        h = self.embed_tokens(tokens) if self.embed_tokens is not None else tokens
+        h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
 
         # Apply the transformer layers.
         aux_losses = []
@@ -188,6 +188,7 @@ class DeepseekV3Model(nn.Module):
                 if isinstance(block.mlp, MoE):
                     block.mlp.gate.update_bias()
 
+    @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
 
@@ -242,7 +243,7 @@ class DeepseekV3ForCausalLM(nn.Module):
 
     def forward(
         self,
-        tokens: torch.Tensor,
+        input_ids: torch.Tensor,
         *,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
@@ -250,7 +251,11 @@ class DeepseekV3ForCausalLM(nn.Module):
         **attn_kwargs: Any,
     ) -> torch.Tensor:
         logits = self.model(
-            tokens, position_ids=position_ids, attention_mask=attention_mask, padding_mask=padding_mask, **attn_kwargs
+            input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            padding_mask=padding_mask,
+            **attn_kwargs,
         )
         logits = self.lm_head(logits) if self.lm_head else logits
         return logits
@@ -262,7 +267,9 @@ class DeepseekV3ForCausalLM(nn.Module):
                     block.mlp.gate.update_bias()
 
     @torch.no_grad()
-    def initialize_weights(self, buffer_device: torch.device | None = None) -> None:
+    def initialize_weights(
+        self, buffer_device: torch.device | None = None, dtype: torch.dtype = torch.bfloat16
+    ) -> None:
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
         with buffer_device:
             self.model.init_weights(buffer_device=buffer_device)
@@ -276,3 +283,12 @@ class DeepseekV3ForCausalLM(nn.Module):
                     a=-cutoff_factor * final_out_std,
                     b=cutoff_factor * final_out_std,
                 )
+
+        self.to(dtype)
+        with buffer_device:
+            self.model.freqs_cis = precompute_freqs_cis(
+                self.config.qk_rope_head_dim,
+                self.model.max_seq_len,
+                self.config.rope_theta,
+                self.config.rope_scaling,
+            )
