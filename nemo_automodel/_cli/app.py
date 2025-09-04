@@ -139,8 +139,8 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
     command = " ".join(
         (
             f"PYTHONPATH={repo_root}:$PYTHONPATH",
-            "python3",
-            f"{repo_root}/nemo_automodel/recipes/{args.domain}_{args.command}/{args.command}.py",
+            "uv run --all-extras",
+            f"{repo_root}/examples/{args.domain}_{args.command}/{args.command}.py",
             "-c",
             f"{job_conf_path}",
         )
