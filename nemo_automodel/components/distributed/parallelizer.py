@@ -146,6 +146,18 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             for i, layer in enumerate(layers):
                 if hasattr(layer, "mlp"):
                     layers[i].mlp = checkpoint_wrapper(layer.mlp)
+                if hasattr(layer, "self_attn"):
+                    layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)  # type: ignore
+
+                if hasattr(layer, "input_layernorm"):
+                    layers[i].input_layernorm = checkpoint_wrapper(
+                        layers[i].input_layernorm  # type: ignore
+                    )
+
+                if hasattr(layer, "post_attention_layernorm"):
+                    layers[i].post_attention_layernorm = checkpoint_wrapper(
+                        layers[i].post_attention_layernorm  # type: ignore
+                    )
 
         # Set up mixed precision policy
         if not mp_policy:
