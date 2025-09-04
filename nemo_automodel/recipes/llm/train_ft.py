@@ -64,7 +64,7 @@ from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
     compile_model,
 )
-from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep, print_trainable_parameters
+from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep, _supports_seq_lens, print_trainable_parameters
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
@@ -326,6 +326,7 @@ def build_dataloader(
     dp_rank,
     dp_world_size,
     pp_enabled,
+    supports_seq_lens,
 ) -> tuple[DataLoader, PreTrainedTokenizerBase]:
     """Build a DataLoader for the dataset.
 
@@ -342,6 +343,7 @@ def build_dataloader(
         dp_rank: Data parallel rank.
         dp_world_size: Data parallel world size.
         pp_enabled: Whether pipeline parallelism is enabled.
+        supports_seq_lens: Whether the model supports seq_lens.
     Returns:
         The instantiated DataLoader and tokenizer.
     """
@@ -359,7 +361,7 @@ def build_dataloader(
                 ds = cfg_ds.instantiate(**kwargs)
 
         # Apply packing if configured
-        if getattr(cfg_ps, "packed_sequence_size", 0) > 0:
+        if getattr(cfg_ps, "packed_sequence_size", 0) > 0 and supports_seq_lens:
             logger.info(f"Packing dataset with size: {cfg_ps.packed_sequence_size}")
             ds = PackedSequence(
                 ds,
@@ -734,6 +736,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             dp_rank=self._get_dp_rank(),
             dp_world_size=self._get_dp_group_size(),
             pp_enabled=self.pp_enabled,
+            supports_seq_lens=_supports_seq_lens(model),
         )
 
         # Build validation dataloader if the config provides it
