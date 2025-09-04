@@ -147,7 +147,6 @@ class ColumnMappedTextInstructionDataset(Dataset):
         tokenizer,
         *,
         split: Optional[str] = None,
-        streaming: bool = False,
         answer_only_loss_mask: bool = True,
         seq_length: Optional[int] = None,
         start_of_turn_token: Optional[str] = None,
@@ -160,7 +159,6 @@ class ColumnMappedTextInstructionDataset(Dataset):
             column_mapping: The mapping of the columns.
             tokenizer: The tokenizer to use.
             split: The split of the dataset to load.
-            streaming: Whether to load the dataset in streaming mode.
             answer_only_loss_mask: Whether to compute the loss mask only on the answer tokens.
             seq_length: The sequence length to use for padding.
             start_of_turn_token: The token to use to indicate the start of a turn.
@@ -177,8 +175,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
         assert tokenizer is not None, "Tokenizer is required"
         self.tokenizer = tokenizer
 
-        self.streaming = streaming
-        self.dataset = _load_dataset(path_or_dataset_id, split=split, streaming=streaming)
+        self.dataset = _load_dataset(path_or_dataset_id, split=split, streaming=False)
 
         # Keep mapping: dest -> source (i.e. public_field -> raw_column_name)
 
@@ -211,8 +208,6 @@ class ColumnMappedTextInstructionDataset(Dataset):
         Raises:
             RuntimeError: If streaming is enabled.
         """
-        if self.streaming:
-            raise RuntimeError("Streaming datasets do not have a defined length")
         return len(self.dataset)
 
     def __getitem__(self, idx):  # noqa: D401
@@ -228,38 +223,11 @@ class ColumnMappedTextInstructionDataset(Dataset):
         Raises:
             RuntimeError: If streaming is enabled.
         """
-        if self.streaming:
-            raise RuntimeError("__getitem__ is not supported when `streaming=True`. Iterate over the dataset instead.")
         row = self.dataset[idx]
         mapped = {dest: row[src] for dest, src in self.column_mapping.items()}
         mapped = self._apply_tokenizer(mapped)
         assert _check_all_values_equal_length(mapped), "All values must be of the same length"
         return mapped
-
-    def __iter__(self):  # noqa: D401
-        """
-        Iterate over the dataset yielding rows with the requested column mapping.
-
-        When *streaming=True* the underlying dataset is consumed lazily.
-
-        If the tokenizer is provided, it will be used to tokenize the dataset.
-
-        Returns:
-            An iterator over the dataset.
-
-        Raises:
-            RuntimeError: If streaming is enabled.
-        """
-        if self.streaming:
-            for row in self.dataset:
-                mapped = {dest: row[src] for dest, src in self.column_mapping.items()}
-                mapped = self._apply_tokenizer(mapped)
-                assert _check_all_values_equal_length(mapped), "All values must be of the same length"
-                yield mapped
-        else:
-            for idx in range(len(self)):
-                # Reuse __getitem__ to avoid duplicating logic.
-                yield self[idx]
 
     def _apply_tokenizer(self, sample: Dict[str, str]) -> Dict[str, List[int]]:
         """
