@@ -139,7 +139,7 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
     command = " ".join(
         (
             f"PYTHONPATH={repo_root}:$PYTHONPATH",
-            "uv run --all-extras",
+            "uv run --frozen --all-extras",
             f"{repo_root}/examples/{args.domain}_{args.command}/{args.command}.py",
             "-c",
             f"{job_conf_path}",

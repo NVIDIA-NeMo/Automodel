@@ -63,7 +63,7 @@ export WORLD_SIZE=$(($NUM_GPUS * $SLURM_NNODES))
 # Experiment env
 export WANDB_API_KEY={wandb_key}
 export HF_HOME={hf_home}
-export HF_TOKEN={hf_token}
+export HF_TOKEN={hf_token}{custom_env_vars}
 
 # User command
 read -r -d '' CMD <<'EOF'
@@ -90,6 +90,16 @@ def render_script(opts: dict, job_dir) -> str:
         opts["gpus_per_node_directive"] = f"\n#SBATCH --gpus-per-node={opts['gpus_per_node']}"
     else:
         opts["gpus_per_node_directive"] = ""
+    
+    # Add custom environment variables
+    env_vars = opts.get("env_vars", {})
+    if env_vars:
+        custom_env_lines = []
+        for key, value in env_vars.items():
+            custom_env_lines.append(f"export {key}={value}")
+        opts["custom_env_vars"] = "\n" + "\n".join(custom_env_lines)
+    else:
+        opts["custom_env_vars"] = ""
     
     return TEMPLATE.format(
         user=getpass.getuser(),
