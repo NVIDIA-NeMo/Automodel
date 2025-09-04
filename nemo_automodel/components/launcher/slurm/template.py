@@ -47,7 +47,7 @@ TEMPLATE = (
 #SBATCH -A {account}
 #SBATCH -p {partition}
 #SBATCH -N {nodes}
-#SBATCH --ntasks-per-node {ntasks_per_node}
+#SBATCH --ntasks-per-node {ntasks_per_node}{gpus_per_node_directive}
 #SBATCH --time {time}
 #SBATCH --mail-type=FAIL
 #SBATCH --exclusive
@@ -85,6 +85,12 @@ srun \\
 
 
 def render_script(opts: dict, job_dir) -> str:
+    # Add GPU directive if gpus_per_node is specified
+    if opts.get("gpus_per_node"):
+        opts["gpus_per_node_directive"] = f"\n#SBATCH --gpus-per-node={opts['gpus_per_node']}"
+    else:
+        opts["gpus_per_node_directive"] = ""
+    
     return TEMPLATE.format(
         user=getpass.getuser(),
         host=socket.gethostname(),
