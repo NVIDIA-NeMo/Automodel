@@ -199,10 +199,10 @@ class MegatronFSDPManager:
         Raises:
             NotImplemented: If the required TP sharding plan is not supported.
         """
-        if self.data_parallel_sharding_strategy != "optim_grads_params":
+        if self.zero_dp_strategy != 3:
             if self.device_mesh.get_rank() == 0:
                 print(
-                    "Warning: MegatronFSDP data_parallel_sharding_strategy is not optim_grads_params. "
+                    "Warning: MegatronFSDP zero_dp_strategy is not 3. "
                     "Parameters will not be sharded."
                 )
 
