@@ -32,11 +32,13 @@ def _supports_logits_to_keep(model: nn.Module) -> bool:
     """
     return "logits_to_keep" in set(inspect.signature(model.forward).parameters.keys())
 
+
 def _supports_seq_lens(model: nn.Module) -> bool:
     """
     Check if the model supports seq_lens.
     """
     return "seq_lens" in set(inspect.signature(model.forward).parameters.keys())
+
 
 def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
     """
