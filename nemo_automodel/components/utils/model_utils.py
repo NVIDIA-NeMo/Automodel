@@ -30,7 +30,7 @@ def _supports_logits_to_keep(model: nn.Module) -> bool:
     Returns:
         bool: True if the model supports logits_to_keep, False otherwise.
     """
-    if callable(getattr(model, 'forward', None)):
+    if callable(getattr(model, "forward", None)):
         return "logits_to_keep" in set(inspect.signature(model.forward).parameters.keys())
     else:
         return False
@@ -40,7 +40,7 @@ def _supports_seq_lens(model: nn.Module) -> bool:
     """
     Check if the model supports seq_lens.
     """
-    if callable(getattr(model, 'forward', None)):
+    if callable(getattr(model, "forward", None)):
         return "seq_lens" in set(inspect.signature(model.forward).parameters.keys())
     else:
         return False
