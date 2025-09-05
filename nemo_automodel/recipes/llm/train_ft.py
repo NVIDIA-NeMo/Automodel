@@ -48,8 +48,9 @@ from nemo_automodel.components.distributed.init_utils import (
     get_rank_safe,
     initialize_distributed,
 )
-from nemo_automodel.components.distributed.nvfsdp import NVFSDPManager
+from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
+from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
@@ -63,8 +64,11 @@ from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
     compile_model,
 )
-from nemo_automodel.components.utils.dist_utils import get_sync_ctx
-from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep, print_trainable_parameters
+from nemo_automodel.components.utils.model_utils import (
+    _supports_logits_to_keep,
+    _supports_seq_lens,
+    print_trainable_parameters,
+)
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
@@ -117,8 +121,8 @@ def build_model_and_optimizer(
     is_meta_device = False
     if hasattr(cfg_model, "is_meta_device"):
         is_meta_device = cfg_model.is_meta_device
-        if is_meta_device and isinstance(model_wrapper, NVFSDPManager):
-            raise ValueError("Meta device initialization is not supported with NVFSDPManager")
+        if is_meta_device and isinstance(model_wrapper, MegatronFSDPManager):
+            raise ValueError("Meta device initialization is not supported with MegatronFSDPManager")
         del cfg_model.is_meta_device
     if autopipeline is not None:
         is_meta_device = True
@@ -200,9 +204,9 @@ def build_model_and_optimizer(
             )
             load_weights = True
         elif callable(getattr(model_wrapper, "parallelize", None)):
-            # FSDP2 and nvFSDP should already be on the correct device
-            if isinstance(model_wrapper, NVFSDPManager):
-                # nvFSDP instantiate optimizer inside parallelize_function
+            # FSDP2 and MegatronFSDP should already be on the correct device
+            if isinstance(model_wrapper, MegatronFSDPManager):
+                # MegatronFSDP instantiate optimizer inside parallelize_function
                 trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
                 assert len(trainable_params) > 0, "trainable_params cannot be empty"
                 if tp_size > 1:
@@ -344,6 +348,7 @@ def build_dataloader(
     dp_rank,
     dp_world_size,
     pp_enabled,
+    supports_seq_lens=True,
 ) -> tuple[DataLoader, PreTrainedTokenizerBase]:
     """Build a DataLoader for the dataset.
 
@@ -360,29 +365,36 @@ def build_dataloader(
         dp_rank: Data parallel rank.
         dp_world_size: Data parallel world size.
         pp_enabled: Whether pipeline parallelism is enabled.
+        supports_seq_lens: Whether the model supports seq_lens (Default: True).
     Returns:
         The instantiated DataLoader and tokenizer.
     """
     with StatefulRNG(seed=seed, ranked=True):
         kwargs, tokenizer = _build_tokenizer(cfg_model, cfg_ds)
+        with FirstRankPerNode():
+            # Megatron specific kwargs
+            if cfg_ds._target_ == MegatronPretraining:
+                kwargs["global_batch_size"] = global_batch_size
+                kwargs["trainer_max_steps"] = max_steps if max_steps is not None else None
+                kwargs["trainer_val_check_interval"] = val_check_interval
+                ds = cfg_ds.instantiate(**kwargs)
+                ds.build()
+            else:
+                ds = cfg_ds.instantiate(**kwargs)
 
-        # Megatron specific kwargs
-        if cfg_ds._target_ == MegatronPretraining:
-            kwargs["global_batch_size"] = global_batch_size
-            kwargs["trainer_max_steps"] = max_steps if max_steps is not None else None
-            kwargs["trainer_val_check_interval"] = val_check_interval
-            ds = cfg_ds.instantiate(**kwargs)
-            ds.build()
-        else:
-            ds = cfg_ds.instantiate(**kwargs)
+        packed_sequence_size = getattr(cfg_ps, "packed_sequence_size", 0)
+        # check if packed sequence is supported
+        if packed_sequence_size > 0 and not supports_seq_lens:
+            logging.warning("Packed sequence is not supported without seq_lens; disabling packed sequence")
+            packed_sequence_size = 0
 
         # Apply packing if configured
-        if getattr(cfg_ps, "packed_sequence_size", 0) > 0:
-            logger.info(f"Packing dataset with size: {cfg_ps.packed_sequence_size}")
+        if packed_sequence_size > 0:
+            logger.info(f"Packing dataset with size: {packed_sequence_size}")
             ds = PackedSequence(
                 ds,
                 split=cfg_ds.split,  # Assumes split is defined in dataset config
-                packed_sequence_size=cfg_ps.packed_sequence_size,
+                packed_sequence_size=packed_sequence_size,
                 split_across_pack=getattr(cfg_ps, "split_across_pack", False),
                 max_packs=getattr(cfg_ps, "max_packs", None),
             ).pack()
@@ -687,8 +699,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             assert autopipeline_cfg is not None, (
                 "AutoPipeline configuration is required when pipeline parallelism is enabled"
             )
-            assert not isinstance(self.model_wrapper, NVFSDPManager), (
-                "NVFSDPManager is not supported when pipeline parallelism is enabled"
+            assert not isinstance(self.model_wrapper, MegatronFSDPManager), (
+                "MegatronFSDPManager is not supported when pipeline parallelism is enabled"
             )
             # Create AutoPipeline from config
             autopipeline = autopipeline_cfg.instantiate(
@@ -761,6 +773,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             dp_rank=self._get_dp_rank(),
             dp_world_size=self._get_dp_group_size(),
             pp_enabled=self.pp_enabled,
+            supports_seq_lens=_supports_seq_lens(model),
         )
 
         # Build validation dataloader if the config provides it
@@ -968,7 +981,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             dp_group_size=self._get_dp_group_size(),
         )
 
-        # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
+        # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model_parts[0].finish_grad_sync()
 
         for opt in self.optimizer:
@@ -991,7 +1004,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         ):
             precompute_float8_dynamic_scale_for_fsdp(self.model_parts[0])
 
-        # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
+        # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model_parts[0].install_optimized_model_weights()
         # self.model_parts[0].zero_grad_buffer()
 

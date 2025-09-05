@@ -1,4 +1,3 @@
-#!/usr/bin/python3
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,7 +31,7 @@ class FirstRankPerNode(ContextDecorator):
     Context manager to enforce rank0 to process section over other ranks.
 
       - Lets LOCAL_RANK==0 run the protected code first on each node.
-      - Inserts an extra barrier across *only* the node‑local rank‑0 processes.
+      - Inserts an extra barrier across *only* the node-local rank-0 processes.
       - Works on a single GPU (no env flags, no distributed initialisation).
 
     Note: it is assumed the scoped code is not torch.distributed heavy.
@@ -43,36 +42,26 @@ class FirstRankPerNode(ContextDecorator):
         Create / bootstrap a (distributed) proc. group that rank0 enters first.
 
         Returns:
-            bool: ``True``  – if the current process is node-rank-0
-                  ``False`` – otherwise
+            bool: ``True``  - if the current process is node-rank-0
+                  ``False`` - otherwise
         """
         self._created_pg = False
         self._node0_group = None
-        self._first = True  # default for single‑GPU / no‑dist case
-
-        # ------------------------------------------------------------------ #
-        # 1. Make sure there is at least *some* process‑group initialised
-        # ------------------------------------------------------------------ #
-        if not dist.is_initialized():
-            self._created_pg = self._try_bootstrap_pg()
+        self._first = True  # default for single-GPU / no-dist case
 
         if not dist.is_initialized():
             # pure single GPU
             return True
 
-        # ------------------------------------------------------------------ #
-        # 2. Figure out local/global ranks
-        # ------------------------------------------------------------------ #
+        # Figure out local/global ranks
         env = os.environ
         global_rank = dist.get_rank()
         local_rank = int(env.get("LOCAL_RANK", global_rank))  # fallback
         self._first = local_rank == 0
 
-        # ------------------------------------------------------------------ #
-        # 3. Synchronisation logic
-        # ------------------------------------------------------------------ #
+        # Synchronisation logic
         if not self._first:
-            # Non‑rank‑0 processes wait for their node‑rank-0
+            # Non-rank-0 processes wait for their node-rank-0
             dist.barrier()
 
         return self._first
@@ -99,7 +88,7 @@ class FirstRankPerNode(ContextDecorator):
         """
         try:
             if self._first and dist.is_initialized():
-                # Re‑sync the whole world so that non‑rank‑0s can proceed
+                # Re-sync the whole world so that non-rank-0s can proceed
                 dist.barrier()
                 if exc_type is not None:
                     dist.abort()  # propagate failure to the entire job
@@ -108,21 +97,6 @@ class FirstRankPerNode(ContextDecorator):
                 dist.destroy_process_group()
 
         # propagate any exception to outer scope
-        return False
-
-    def _try_bootstrap_pg(self) -> bool:
-        """
-        Try to create a default pg from env:// variables.
-        """
-        env = os.environ
-        required = ("WORLD_SIZE", "RANK", "MASTER_ADDR", "MASTER_PORT")
-        if all(k in env for k in required):
-            dist.init_process_group(
-                backend="gloo",
-                world_size=int(env.get("WORLD_SIZE")),
-                rank=int(env.get("RANK")),
-            )
-            return True
         return False
 
 

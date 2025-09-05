@@ -14,15 +14,15 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama3_2/llama3_2_1b_hellaswag_nvfsdp.yaml
+# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml
 # Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
 
 step_scheduler:
   global_batch_size: 64
   local_batch_size: 8
-  ckpt_every_steps: 20
-  val_every_steps: 10  # will run every x number of gradient steps
+  ckpt_every_steps: 200
+  val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 1
 
 dist_env:
@@ -39,16 +39,18 @@ model:
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: torch_save # torch_save or safetensors
   save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 distributed:
-  _target_: nemo_automodel.components.distributed.nvfsdp.NVFSDPManager
-  dp_size: none
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: none # Make sure dp_size (world size here) > 2
+  dp_replicate_size: 2 # dp_shard_size = dp_size / dp_replicate_size and dp_shard_size < dp_size. For DDP usecase, use DDPManager
   tp_size: 1
   cp_size: 1
+  sequence_parallel: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -66,7 +68,7 @@ packed_sequence:
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  shuffle: false
+  shuffle: true
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
@@ -91,4 +93,4 @@ optimizer:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir>
+#   save_dir: <your_wandb_save_dir> 

@@ -38,7 +38,8 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.nvfsdp import NVFSDPManager
+from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
+from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
@@ -51,7 +52,6 @@ from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
     compile_model,
 )
-from nemo_automodel.components.utils.dist_utils import get_sync_ctx
 from nemo_automodel.components.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
@@ -144,8 +144,8 @@ def build_model_and_optimizer(
     init_ctx = nullcontext()
     if hasattr(cfg_model, "is_meta_device"):
         is_meta_device = cfg_model.is_meta_device
-        if is_meta_device and isinstance(model_wrapper, NVFSDPManager):
-            raise ValueError("Meta device initialization is not supported with NVFSDPManager")
+        if is_meta_device and isinstance(model_wrapper, MegatronFSDPManager):
+            raise ValueError("Meta device initialization is not supported with MegatronFSDPManager")
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else init_ctx
         del cfg_model.is_meta_device
 
@@ -167,7 +167,7 @@ def build_model_and_optimizer(
         print_trainable_parameters(model)
 
         if callable(getattr(model_wrapper, "parallelize", None)):
-            if isinstance(model_wrapper, NVFSDPManager):
+            if isinstance(model_wrapper, MegatronFSDPManager):
                 trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
                 assert len(trainable_params) > 0, "trainable_params cannot be empty"
                 if tp_size > 1:
@@ -289,7 +289,8 @@ def build_dataloader(
                 processor = None
                 logging.warning(f"AutoProcessor not available for {cfg_model.pretrained_model_name_or_path} ({e}). ")
 
-        ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
+        with FirstRankPerNode():
+            ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
 
         sampler = torch.utils.data.distributed.DistributedSampler(
             ds,
@@ -698,7 +699,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             if isinstance(grad_norm, torch.Tensor):
                 grad_norm = grad_norm.item()
 
-        # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
+        # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model.finish_grad_sync()
 
         self.optimizer.step()
@@ -718,7 +719,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if self.lr_scheduler is not None:
             self.lr_scheduler.step(1)
 
-        # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
+        # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model.install_optimized_model_weights()
         # self.model.zero_grad_buffer()
 
