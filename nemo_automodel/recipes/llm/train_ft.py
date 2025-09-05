@@ -88,6 +88,7 @@ def build_model_and_optimizer(
     model_wrapper,
     seed,
     tp_size=1,
+    cp_size=1,
     cfg_fp8=None,
     cfg_compile=None,
     cfg_quantization=None,
@@ -108,12 +109,14 @@ def build_model_and_optimizer(
         model_wrapper: Optional parallelism wrapper.
         seed: Random seed.
         tp_size: Tensor parallel size.
+        cp_size: Column parallel size.
         cfg_fp8: Configuration for FP8.
         cfg_compile: Configuration for torch.compile.
 
     Returns:
         The instantiated model on the specified device and optimizer.
     """
+    is_hf_model = cfg_model.get("pretrained_model_name_or_path", None) is not None
     is_meta_device = False
     if hasattr(cfg_model, "is_meta_device"):
         is_meta_device = cfg_model.is_meta_device
@@ -126,7 +129,7 @@ def build_model_and_optimizer(
     init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
     with StatefulRNG(seed=seed, ranked=True):
         kwargs = {}
-        if use_hf_fa2:
+        if use_hf_fa2 and is_hf_model:
             kwargs["attn_implementation"] = "flash_attention_2"
             logger.warning(
                 "Packed sequence is supported only with Flash Attention. "
@@ -141,6 +144,9 @@ def build_model_and_optimizer(
 
         # Instantiate the model in meta device to avoid OOM
         with init_ctx:
+            if is_hf_model and (tp_size > 1 or cp_size > 1):
+                logger.info("Disabling Liger kernel with TP ({}) or CP ({})".format(tp_size, cp_size))
+                kwargs["use_liger_kernel"] = False
             model = cfg_model.instantiate(**kwargs)
 
             # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
@@ -707,6 +713,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.model_wrapper,
             seed=self.cfg.get("seed", 42),
             tp_size=self.cfg.get("distributed.tp_size", 1),
+            cp_size=self.cfg.get("distributed.cp_size", 1)
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
             cfg_quantization=self.cfg.get("quantization", None),
