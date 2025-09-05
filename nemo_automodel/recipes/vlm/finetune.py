@@ -173,11 +173,17 @@ def build_model_and_optimizer(
                 if tp_size > 1:
                     cfg_opt.foreach = False
                 optimizer = cfg_opt.instantiate(params=trainable_params)
-                model, optimizer = model_wrapper.parallelize(model, optimizer)
+                if torch.distributed.get_world_size() == 1:
+                    logger.info("World size is 1, skipping parallelization.")
+                else:
+                    model, optimizer = model_wrapper.parallelize(model, optimizer)
                 model = model.to(device)
                 return model, optimizer
             else:
-                model = model_wrapper.parallelize(model)
+                if torch.distributed.get_world_size() == 1:
+                    logger.info("World size is 1, skipping parallelization.")
+                else:
+                    model = model_wrapper.parallelize(model)
 
                 # Load the weights into the model in parallel.
                 if is_meta_device:
