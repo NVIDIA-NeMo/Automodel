@@ -19,7 +19,7 @@
 
 
 step_scheduler:
-  global_batch_size: 64
+  global_batch_size: 256
   local_batch_size: 32
   ckpt_every_steps: 200
   val_every_steps: 100  # will run every x number of gradient steps
@@ -53,7 +53,7 @@ distributed:
   sequence_parallel: false
 
 autopipeline:
-  _target_: nemo_automodel.components.distributed.autopipeline.core.AutoPipeline
+  _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
   pp_schedule: interleaved1f1b
   pp_microbatch_size: 4
   scale_grads_in_schedule: false
