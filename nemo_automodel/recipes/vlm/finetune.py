@@ -175,13 +175,14 @@ def build_model_and_optimizer(
                 optimizer = cfg_opt.instantiate(params=trainable_params)
                 if get_world_size_safe() == 1:
                     logger.info("World size is 1, skipping parallelization.")
-                    model = model.to(device)
+                    model = model.to(device).to(torch.bfloat16)
                 else:
                     model, optimizer = model_wrapper.parallelize(model, optimizer)
                 return model, optimizer
             else:
                 if get_world_size_safe() == 1:
                     logger.info("World size is 1, skipping parallelization.")
+                    model = model.to(device).to(torch.bfloat16)
                 else:
                     model = model_wrapper.parallelize(model)
 
