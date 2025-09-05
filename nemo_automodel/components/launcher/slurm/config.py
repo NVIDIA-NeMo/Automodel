@@ -58,7 +58,7 @@ class SlurmConfig:
 
     # Misc env / training specifics
     master_port: int = field(default=13742, metadata=dict(help="Port for multinode"))
-    gpus_per_node: int = field(default=8, metadata=dict(help="GPUs per node"))
+    gpus_per_node: Optional[int] = field(default=None, metadata=dict(help="GPUs per node"))
     wandb_key: str = field(default=os.environ.get("WANDB_API_KEY", ""), metadata=dict(help="W&B key or env reference"))
     hf_token: str = field(
         default=os.environ.get("HF_TOKEN", ""),

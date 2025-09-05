@@ -47,7 +47,7 @@ TEMPLATE = (
 #SBATCH -A {account}
 #SBATCH -p {partition}
 #SBATCH -N {nodes}
-#SBATCH --ntasks-per-node {ntasks_per_node}{gpus_per_node_directive}
+#SBATCH --ntasks-per-node 1{gpus_per_node_directive}
 #SBATCH --time {time}
 #SBATCH --mail-type=FAIL
 #SBATCH --exclusive
@@ -57,7 +57,7 @@ TEMPLATE = (
 # Multi-node env
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
 export MASTER_PORT={master_port}
-export NUM_GPUS={gpus_per_node}
+export NUM_GPUS={num_gpus}
 export WORLD_SIZE=$(($NUM_GPUS * $SLURM_NNODES))
 
 # Experiment env
@@ -88,8 +88,10 @@ def render_script(opts: dict, job_dir) -> str:
     # Add GPU directive if gpus_per_node is specified
     if opts.get("gpus_per_node"):
         opts["gpus_per_node_directive"] = f"\n#SBATCH --gpus-per-node={opts['gpus_per_node']}"
+        opts["num_gpus"] = opts["gpus_per_node"]
     else:
         opts["gpus_per_node_directive"] = ""
+        opts["num_gpus"] = "${SLURM_GPUS_PER_NODE:-8}"  # Use Slurm's default or fallback to 8
     
     # Add custom environment variables
     env_vars = opts.get("env_vars", {})
