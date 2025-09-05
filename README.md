@@ -99,7 +99,7 @@ uv run recipes/vlm_finetune/finetune.py --config recipes/vlm_finetune/gemma3/gem
 
 - **Day-0 Hugging Face Support**: Instantly fine-tune any model from the Hugging Face Hub
 - **Lightning Fast Performance**: Custom CUDA kernels and memory optimizations deliver 2–5× speedups
-- **Large-Scale Distributed Training**: Built-in FSDP2 and nvFSDP for seamless multi-node scaling
+- **Large-Scale Distributed Training**: Built-in FSDP2 and Megatron-FSDP for seamless multi-node scaling
 - **Vision-Language Model Ready**: Native support for VLMs (Qwen2-VL, Gemma-3-VL, etc)
 - **Advanced PEFT Methods**: LoRA and extensible PEFT system out of the box
 - **Seamless HF Ecosystem**: Fine-tuned models work perfectly with Transformers pipeline, VLM, etc.
@@ -190,13 +190,13 @@ python recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama/llam
 # Multi-GPU with FSDP2
 torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama/llama_3_2_1b_hellaswag.yaml
 
-# Multi-GPU with nvFSDP
-torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama/llama_3_2_1b_hellaswag_nvfsdp.yaml
+# Multi-GPU with Megatron-FSDP
+torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama/llama_3_2_1b_hellaswag_megatron_fsdp.yaml
 
 ```
 <!-- # #Multi-Node training
 # torchrun --nproc-per-node=8 --nnodes=2 \
-#     recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama/llama3_2_1b_squad_nvfsdp.yaml
+#     recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama/llama3_2_1b_squad_megatron_fsdp.yaml
 ### Vision-Language Models 
 - ->
 
@@ -218,7 +218,7 @@ python recipes/vlm_finetune/finetune.py --config recipes/vlm_finetune/gemma_3_vl
 
 ```yaml
 distributed:
-  _target_: nemo_automodel.distributed.nvfsdp.NVFSDPManager
+  _target_: nemo_automodel.distributed.megatron_fsdp.MegatronFSDPManager
   dp_size: 8
   tp_size: 1
   cp_size: 1
@@ -273,7 +273,7 @@ NeMo AutoModel delivers significant speedups through optimized kernels and distr
 - **Liger Kernel**: Optimized attention and MLP operations
 - **Cut-CrossEntropy**: Memory-efficient loss computation
 - **FSDP2**: Latest fully sharded data parallelism
-- **nvFSDP**: NVIDIA's enterprise FSDP implementation
+- **Megatron FSDP**: NVIDIA's enterprise FSDP implementation
 - **Mixed Precision**: Automatic FP16/BF16 training
 
 --- -->
@@ -289,7 +289,7 @@ NeMo-Automodel/
 │   ├── datasets/                # Dataset loaders
 │   │   ├── llm/                 # LLM datasets (HellaSwag, SQuAD, etc.)
 │   │   └── vlm/                 # VLM datasets (CORD-v2, rdr etc.)
-│   ├── distributed/             # FSDP2, nvFSDP, parallelization
+│   ├── distributed/             # FSDP2, Megatron FSDP, parallelization
 │   ├── loss/                    # Optimized loss functions
 │   └── training/                # Training recipes and utilities
 ├── recipes/                     # Ready-to-use training recipes

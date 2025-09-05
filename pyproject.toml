@@ -110,7 +110,7 @@ linting = [
     "import-linter~=2.4",
 ]
 test = ["coverage", "pytest", "peft"]
-dev = ["nvfsdp", "cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@87a86ab"]
+dev = ["megatron-fsdp", "cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@87a86ab"]
 
 [tool.uv]
 default-groups = ["build", "docs", "test"]
@@ -127,7 +127,6 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv.sources]
-nvfsdp = { git = "https://github.com/NVIDIA-NeMo/nvFSDP.git", rev = "d97136886a65d70f298a4b361571ac75c20198af" }
 torch = [
     { index = "pytorch", marker = "sys_platform != 'darwin'" },
     { index = "pypi", marker = "sys_platform == 'darwin'" },
