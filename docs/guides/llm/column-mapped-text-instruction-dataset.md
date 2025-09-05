@@ -27,7 +27,6 @@ ds = ColumnMappedTextInstructionDataset(
     path_or_dataset_id="Muennighoff/natural-instructions",
     column_mapping={"instruction": "definition", "question": "inputs", "answer": "targets"},
     tokenizer=tokenizer,
-    streaming=True,
     answer_only_loss_mask=False,
 )
 
@@ -140,7 +139,6 @@ remote_ds = ColumnMappedTextInstructionDataset(
     split="train[:5%]",        # demo slice; omit (i.e. `split="train",`) for full data
     answer_only_loss_mask=True,
     start_of_turn_token="<|assistant|>",
-    streaming=True,              # <── stream instead of download whole dataset
 )
 ```
 
@@ -163,7 +161,7 @@ dataset:
 | Arg                     | Default | Description |
 |-------------------------|---------|-------------|
 | `split`                 | `None`  | Which split to pull from a HF repo (`train`, `validation`, *etc.*). Ignored for local files. |
-| `streaming`             | `False` | If `True`, loads the dataset in *streaming* mode (an HF `IterableDataset`). Useful for very large corpora or when you want to start training before the full download completes.  When enabled, `len(...)` and random access (`dataset[idx]`) are **not** available — iterate instead. |
+(`dataset[idx]`) are **not** available — iterate instead. |
 | `answer_only_loss_mask` | `True`  | Create a `loss_mask` where only the answer tokens contribute to the loss. Requires `start_of_turn_token`. |
 | `start_of_turn_token`   | `None`  | String token marking the assistant’s response. Required when `answer_only_loss_mask=True` for tokenizers with chat template. |
 
