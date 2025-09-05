@@ -330,7 +330,7 @@ def build_dataloader(
     dp_rank,
     dp_world_size,
     pp_enabled,
-    supports_seq_lens,
+    supports_seq_lens=True,
 ) -> tuple[DataLoader, PreTrainedTokenizerBase]:
     """Build a DataLoader for the dataset.
 
@@ -347,7 +347,7 @@ def build_dataloader(
         dp_rank: Data parallel rank.
         dp_world_size: Data parallel world size.
         pp_enabled: Whether pipeline parallelism is enabled.
-        supports_seq_lens: Whether the model supports seq_lens.
+        supports_seq_lens: Whether the model supports seq_lens (Default: True).
     Returns:
         The instantiated DataLoader and tokenizer.
     """
