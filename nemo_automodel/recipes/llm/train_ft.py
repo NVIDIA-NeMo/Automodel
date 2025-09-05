@@ -58,7 +58,7 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
-from nemo_automodel.components.training.utils import clip_grad_norm, count_tail_padding
+from nemo_automodel.components.training.utils import count_tail_padding, scale_grads_and_clip_grad_norm
 from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
     compile_model,
@@ -954,18 +954,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
             )
 
-        if self.pp_enabled:
-            self.pp.scale_grads_by_divisor(num_label_tokens / self._get_dp_group().size())
-
-        grad_norm = clip_grad_norm(
+        grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
-            model_parts=self.model_parts,
+            self.model_parts,
+            norm_type=2.0,
             pp_enabled=self.pp_enabled,
             device_mesh=self.device_mesh,
             moe_mesh=self.moe_mesh,
             ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
             pp_axis_name="pp" if self.pp_enabled else None,
             foreach=True,
+            num_label_tokens=num_label_tokens,
+            dp_group_size=self._get_dp_group_size(),
         )
 
         # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api

@@ -197,3 +197,66 @@ def clip_grad_norm(
         grad_norm = grad_norm.item()
 
     return grad_norm
+
+
+@torch.no_grad()
+def scale_grads_and_clip_grad_norm(
+    max_grad_norm: float | None,
+    model_parts: list[torch.nn.Module],
+    *,
+    norm_type: float = 2.0,
+    pp_enabled: bool = False,
+    device_mesh: DeviceMesh | None = None,
+    moe_mesh: DeviceMesh | None = None,
+    ep_axis_name: str | None = None,
+    pp_axis_name: str | None = None,
+    foreach: bool = True,
+    num_label_tokens: int | None = None,
+    dp_group_size: int | None = None,
+):
+    """Scale gradients for PP/EP in a single pass, then clip.
+
+    - PP scaling: divide all local grads by (num_label_tokens / dp_group_size).
+    - EP scaling: for parameters on the expert axis, divide grads by (dp_group_size / ep_shard_size).
+    - Finally, perform grad clipping with PP/EP-aware reductions.
+    """
+
+    # Precompute scale factors
+    pp_divisor: float | None = None
+    if pp_enabled and num_label_tokens is not None and dp_group_size is not None:
+        if dp_group_size != 0:
+            candidate = num_label_tokens / dp_group_size
+            pp_divisor = float(candidate) if candidate != 0 else None
+
+    ep_ratio: float | None = None
+    if moe_mesh is not None and dp_group_size is not None:
+        ep_shard_size = moe_mesh["ep_shard"].size() if "ep_shard" in moe_mesh.mesh_dim_names else 1
+        if ep_shard_size > 0:
+            ep_ratio = float(dp_group_size) / float(ep_shard_size)
+
+    # Single pass over parameters to apply both scalings where applicable
+    if pp_divisor is not None or ep_ratio is not None:
+        for mp in model_parts:
+            for p in mp.parameters():
+                if p.grad is None:
+                    continue
+                if pp_divisor is not None:
+                    p.grad.div_(pp_divisor)
+                if ep_ratio is not None:
+                    # Grad and param must be DTensors for EP-aware scaling
+                    if isinstance(p, DTensor) and isinstance(p.grad, DTensor):
+                        if ep_axis_name and ep_axis_name in p.device_mesh.mesh_dim_names:
+                            p.grad.div_(ep_ratio)
+
+    # Clip with the existing PP/EP-aware helper
+    return clip_grad_norm(
+        max_grad_norm,
+        model_parts,
+        norm_type=norm_type,
+        pp_enabled=pp_enabled,
+        device_mesh=device_mesh,
+        moe_mesh=moe_mesh,
+        ep_axis_name=ep_axis_name,
+        pp_axis_name=pp_axis_name,
+        foreach=foreach,
+    )

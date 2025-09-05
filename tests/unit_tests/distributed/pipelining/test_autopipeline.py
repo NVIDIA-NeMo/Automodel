@@ -389,49 +389,6 @@ class TestAutoPipelineBuildAndStep:
         with pytest.raises(AssertionError, match="model must be a PyTorch module"):
             ap.build("not_a_module", loss_fn=lambda x, y: torch.tensor(0.0))
 
-    def test_autopipeline_gradient_operations(self, monkeypatch):
-        """Test AutoPipeline gradient clipping and scaling."""
-        _patch_autopipeline_monkey(monkeypatch)
-
-        # Mock the training utils functions at the core module level where they're imported
-        mock_scale_grads = Mock()
-
-        import nemo_automodel.components.distributed.pipelining.autopipeline as autopipeline_mod
-        monkeypatch.setattr(autopipeline_mod, "scale_grads_by_divisor", mock_scale_grads)
-
-        num_layers = 4
-        model = DummyQwenForCausalLM(num_layers=num_layers)
-
-        module_fqns = generate_hf_model_fqn_per_model_part(
-            num_stages=2,
-            num_layers=num_layers,
-            include_embeddings=True,
-            include_lm_head=True,
-            include_rotary_emb=True,
-            fqn_prefix="model.",
-        )
-
-        world_mesh = FakeWorldMesh()
-        world_mesh["pp"] = FakePPMesh(size=2, local_rank=0)
-
-        def loss_fn(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-            return torch.tensor(0.0)
-
-        ap = AutoPipeline(
-            world_mesh=world_mesh,
-            pp_axis_name="pp",
-            pp_schedule="1f1b",
-            pp_microbatch_size=1,
-            pp_batch_size=2,
-            module_fqns_per_model_part=module_fqns,
-            device=torch.device("cpu"),
-        )
-        ap.build(model, loss_fn=loss_fn)
-
-        # Test gradient scaling
-        ap.scale_grads_by_divisor(4)
-        mock_scale_grads.assert_called_once_with(ap._info.stages, 4)
-
 
 class TestAutoPipelineErrorHandling:
     """Test AutoPipeline error handling and edge cases."""
@@ -450,22 +407,6 @@ class TestAutoPipelineErrorHandling:
 
         with pytest.raises(RuntimeError, match="Autopipeline not built"):
             _ = ap.parts
-
-    def test_grad_operations_before_build_error(self):
-        """Test that gradient operations fail if build hasn't been called."""
-        world_mesh = FakeDeviceMesh()
-        ap = AutoPipeline(
-            world_mesh=world_mesh,
-            pp_axis_name="pp",
-            pp_schedule="1f1b",
-            pp_microbatch_size=1,
-            pp_batch_size=4,
-            device=torch.device("cpu"),
-        )
-
-        with pytest.raises(RuntimeError, match="Autopipeline not built"):
-            ap.scale_grads_by_divisor(2)
-
 
 class TestAutoPipelineProperties:
     """Test AutoPipeline properties and state management."""

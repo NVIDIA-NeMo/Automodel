@@ -25,7 +25,6 @@ from torch.distributed.pipelining.stage import PipelineStage
 from nemo_automodel.components.distributed.pipelining.functional import (
     ParallelizeFnProtocol,
     pipeline_model,
-    scale_grads_by_divisor,
 )
 from nemo_automodel.components.distributed.pipelining.hf_utils import (
     validate_hf_model_for_pipeline_support,
@@ -166,12 +165,6 @@ class AutoPipeline:
         self._info.stages = stages
 
         return self
-
-    def scale_grads_by_divisor(self, divisor: int) -> None:
-        if self._info.stages is None:
-            raise RuntimeError("Autopipeline not built. Call build() first.")
-
-        scale_grads_by_divisor(self._info.stages, divisor)
 
     @property
     def info(self) -> PipelineInfo:
