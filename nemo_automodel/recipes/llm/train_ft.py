@@ -46,6 +46,7 @@ from nemo_automodel.components.datasets.llm.packed_sequence import PackedSequenc
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import (
     get_rank_safe,
+    get_world_size_safe,
     initialize_distributed,
 )
 from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
@@ -161,7 +162,7 @@ def build_model_and_optimizer(
         loss_fn = MaskedCrossEntropy()
 
     if autopipeline is not None:
-        if torch.distributed.get_world_size() == 1:
+        if get_world_size_safe() == 1:
             logger.info("World size is 1, skipping autopipeline.")
         else:
             autopipeline.build(model, loss_fn=loss_fn, parallelize_fn=parallelize_fn)
@@ -198,7 +199,7 @@ def build_model_and_optimizer(
                     cfg_opt.foreach = False
                 optimizer = cfg_opt.instantiate(params=trainable_params)
 
-                if torch.distributed.get_world_size() == 1:
+                if get_world_size_safe() == 1:
                     logger.info("World size is 1, skipping parallelization.")
                     model = model.to(device)
                 else:
@@ -207,7 +208,7 @@ def build_model_and_optimizer(
                 return model, [optimizer], loss_fn
 
             else:
-                if torch.distributed.get_world_size() == 1:
+                if get_world_size_safe() == 1:
                     logger.info("World size is 1, skipping parallelization.")
                 else:
                     model = model_wrapper.parallelize(model)
