@@ -175,15 +175,13 @@ def build_model_and_optimizer(
                 optimizer = cfg_opt.instantiate(params=trainable_params)
                 if torch.distributed.get_world_size() == 1:
                     logger.info("World size is 1, skipping parallelization.")
-                    model = model.cuda()
+                    model = model.to(device)
                 else:
                     model, optimizer = model_wrapper.parallelize(model, optimizer)
-                model = model.to(device)
                 return model, optimizer
             else:
                 if torch.distributed.get_world_size() == 1:
                     logger.info("World size is 1, skipping parallelization.")
-                    model = model.cuda()
                 else:
                     model = model_wrapper.parallelize(model)
 
