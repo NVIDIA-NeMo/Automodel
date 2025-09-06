@@ -14,7 +14,6 @@
 
 
 import logging
-import os
 from contextlib import ContextDecorator, nullcontext
 from datetime import datetime, timedelta
 from typing import Optional
@@ -63,13 +62,7 @@ def _barrier_with_timeout(timeout: timedelta, group=None):
     Returns:
         bool: True if barrier completed successfully, False if timeout occurred
     """
-    if not dist.is_initialized():
-        return True
-
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-
-    if world_size == 1:
+    if not dist.is_initialized() or dist.get_world_size() == 1:
         return True
 
     # Use Gloo group for barrier operations
@@ -125,10 +118,8 @@ class FirstRankPerNode(ContextDecorator):
             # pure single GPU
             return True
 
-        # Figure out local/global ranks
-        env = os.environ
-        rank = dist.get_rank()
-        self._first = rank == 0
+        # Figure out rank
+        self._first = dist.get_rank() == 0
 
         # Synchronisation logic
         if not self._first:

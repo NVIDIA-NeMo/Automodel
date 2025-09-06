@@ -18,7 +18,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Union
 
-from datasets import load_dataset, VerificationMode
+from datasets import VerificationMode, load_dataset
 from torch.utils.data import Dataset
 
 from nemo_automodel.components.datasets.llm.formatting_utils import (
@@ -104,13 +104,17 @@ def _load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str
         datasets.Dataset: The loaded dataset.
     """
     if isinstance(path_or_dataset_id, str) and _str_is_hf_repo_id(path_or_dataset_id):
-        return load_dataset(path_or_dataset_id, split=split, streaming=streaming, verification_mode=VerificationMode.NO_CHECKS)
+        return load_dataset(
+            path_or_dataset_id, split=split, streaming=streaming, verification_mode=VerificationMode.NO_CHECKS
+        )
 
     data_files = list(make_iterable(path_or_dataset_id))
     if not data_files:
         raise RuntimeError("No data files provided")
 
-    return load_dataset("json", data_files=data_files, split=None, streaming=streaming, verification_mode=VerificationMode.NO_CHECKS)
+    return load_dataset(
+        "json", data_files=data_files, split=None, streaming=streaming, verification_mode=VerificationMode.NO_CHECKS
+    )
 
 
 def _check_all_values_equal_length(sample: Dict[str, List[int]]) -> bool:
