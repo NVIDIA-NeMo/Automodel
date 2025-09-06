@@ -47,9 +47,9 @@ class _DummyDeviceMesh(dict):
 
     def __init__(self, cp_size: int, tp_size: int):
         super().__init__()
-        self["context_parallel"] = _DummySubMesh(cp_size)
-        self["tensor_parallel"] = _DummySubMesh(tp_size)
-
+        self["cp"] = _DummySubMesh(cp_size)
+        self["tp"] = _DummySubMesh(tp_size)
+        self.mesh_dim_names = ["cp", "tp"]
 
 def test_build_position_ids_adds_missing():
     """If ``position_ids`` is absent it should be generated correctly."""
@@ -104,7 +104,6 @@ def test_make_cp_batch_and_ctx_with_cp(monkeypatch):
     def _fake_create_ctx(**kwargs):  # noqa: D401
         """Return a sentinel object so we can verify it was passed through."""
         return dummy_cp_ctx
-
     monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
 
     def _fake_get_train_ctx(enable_loss_parallel, enable_compiled_autograd, cp_ctx):  # noqa: D401
