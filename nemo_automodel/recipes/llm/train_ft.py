@@ -46,6 +46,7 @@ from nemo_automodel.components.datasets.llm.packed_sequence import PackedSequenc
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import (
     get_rank_safe,
+    get_world_size_safe,
     initialize_distributed,
 )
 from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
@@ -171,28 +172,31 @@ def build_model_and_optimizer(
         loss_fn = MaskedCrossEntropy()
 
     if autopipeline is not None:
-        autopipeline.build(model, loss_fn=loss_fn, parallelize_fn=parallelize_fn)
-        for mp in autopipeline.parts:
-            load_model_from_base_checkpoint(
-                mp,
-                device,
-                cfg_peft is not None,
-                cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
-                cfg_model.pretrained_model_name_or_path,
-                getattr(cfg_peft, "lora_A_init", None),
-                device_mesh=autopipeline.world_mesh,
-            )
+        if get_world_size_safe() == 1:
+            logger.info("World size is 1, skipping autopipeline.")
+        else:
+            autopipeline.build(model, loss_fn=loss_fn, parallelize_fn=parallelize_fn)
+            for mp in autopipeline.parts:
+                load_model_from_base_checkpoint(
+                    mp,
+                    device,
+                    cfg_peft is not None,
+                    cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
+                    cfg_model.pretrained_model_name_or_path,
+                    getattr(cfg_peft, "lora_A_init", None),
+                    device_mesh=autopipeline.world_mesh,
+                )
 
-        # Create optimizer for all model parts
-        trainable_params = []
-        for i, model_part in enumerate(autopipeline.parts):
-            trainable_params.append(
-                {
-                    "params": list(filter(lambda x: x.requires_grad, model_part.parameters())),
-                    "name": f"rank_{get_rank_safe()}_model_part_{i}",
-                }
-            )
-        model = autopipeline
+            # Create optimizer for all model parts
+            trainable_params = []
+            for i, model_part in enumerate(autopipeline.parts):
+                trainable_params.append(
+                    {
+                        "params": list(filter(lambda x: x.requires_grad, model_part.parameters())),
+                        "name": f"rank_{get_rank_safe()}_model_part_{i}",
+                    }
+                )
+            model = autopipeline
     else:
         if callable(getattr(model_wrapper, "parallelize", None)):
             # FSDP2 and MegatronFSDP should already be on the correct device
@@ -205,12 +209,20 @@ def build_model_and_optimizer(
                     cfg_opt.foreach = False
                 optimizer = cfg_opt.instantiate(params=trainable_params)
 
-                model, optimizer = model_wrapper.parallelize(model, optimizer)
+                if get_world_size_safe() == 1:
+                    logger.info("World size is 1, skipping parallelization.")
+                    model = model.to(device).to(torch.bfloat16)
+                else:
+                    model, optimizer = model_wrapper.parallelize(model, optimizer)
 
                 return model, [optimizer], loss_fn
 
             else:
-                model = model_wrapper.parallelize(model)
+                if get_world_size_safe() == 1:
+                    logger.info("World size is 1, skipping parallelization.")
+                    model = model.to(device).to(torch.bfloat16)
+                else:
+                    model = model_wrapper.parallelize(model)
 
                 # Load the weights into the model in parallel.
                 if is_meta_device:
