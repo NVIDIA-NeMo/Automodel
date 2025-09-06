@@ -14,9 +14,8 @@
 
 
 import logging
-import os
 from contextlib import ContextDecorator, nullcontext
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import torch
@@ -26,18 +25,84 @@ import torch.distributed as dist
 logger = logging.getLogger(__name__)
 
 
+def _create_gloo_group():
+    """
+    Create a Gloo process group for barrier operations.
+
+    This allows us to use monitored_barrier with Gloo backend while
+    keeping NCCL for the main training operations.
+
+    Returns:
+        ProcessGroup: Gloo process group for barriers
+    """
+    if not dist.is_initialized():
+        return None
+
+    try:
+        # Create a Gloo group for barrier operations
+        gloo_group = dist.new_group(backend="gloo")
+        logger.debug("Created Gloo group for barrier operations")
+        return gloo_group
+    except Exception as e:
+        logger.warning(f"Failed to create Gloo group: {e}")
+        return None
+
+
+def _barrier_with_timeout(timeout: timedelta, group=None):
+    """
+    A timeout wrapper for torch.distributed.barrier() using Gloo backend.
+
+    This approach creates a separate Gloo process group for barrier operations
+    while keeping the main NCCL backend for training operations.
+
+    Args:
+        timeout: Maximum time to wait for the barrier
+        group: Process group for the barrier operation
+
+    Returns:
+        bool: True if barrier completed successfully, False if timeout occurred
+    """
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return True
+
+    # Use Gloo group for barrier operations
+    gloo_group = _create_gloo_group()
+    if gloo_group is None:
+        # Fallback to regular barrier if Gloo group creation fails
+        try:
+            dist.barrier(group=group)
+            return True
+        except Exception as e:
+            logger.warning(f"Barrier failed: {e}")
+            return False
+
+    try:
+        # Use monitored_barrier with Gloo group
+        dist.monitored_barrier(group=gloo_group, timeout=timeout)
+        return True
+    except Exception as e:
+        logger.warning(f"Monitored barrier failed: {e}")
+        return False
+    finally:
+        # Clean up the Gloo group
+        try:
+            dist.destroy_process_group(gloo_group)
+        except Exception:
+            pass
+
+
 class FirstRankPerNode(ContextDecorator):
     """
     Context manager to enforce rank0 to process section over other ranks.
 
-      - Lets LOCAL_RANK==0 run the protected code first on each node.
+      - Lets RANK==0 run the protected code first on each node.
       - Inserts an extra barrier across *only* the node-local rank-0 processes.
       - Works on a single GPU (no env flags, no distributed initialisation).
 
     Note: it is assumed the scoped code is not torch.distributed heavy.
     """
 
-    def __enter__(self):
+    def __enter__(self, timeout=timedelta(hours=10)):
         """
         Create / bootstrap a (distributed) proc. group that rank0 enters first.
 
@@ -48,21 +113,21 @@ class FirstRankPerNode(ContextDecorator):
         self._created_pg = False
         self._node0_group = None
         self._first = True  # default for single-GPU / no-dist case
-
-        if not dist.is_initialized():
+        self._timeout = timeout
+        if not dist.is_initialized() or dist.get_world_size() == 1:
             # pure single GPU
             return True
 
-        # Figure out local/global ranks
-        env = os.environ
-        global_rank = dist.get_rank()
-        local_rank = int(env.get("LOCAL_RANK", global_rank))  # fallback
-        self._first = local_rank == 0
+        # Figure out rank
+        self._first = dist.get_rank() == 0
 
         # Synchronisation logic
         if not self._first:
             # Non-rank-0 processes wait for their node-rank-0
-            dist.barrier()
+            # Use Gloo group for monitored_barrier to avoid NCCL timeout issues
+            success = _barrier_with_timeout(timeout=self._timeout)
+            if not success:
+                logger.warning("Barrier timed out, continuing anyway")
 
         return self._first
 
@@ -89,9 +154,13 @@ class FirstRankPerNode(ContextDecorator):
         try:
             if self._first and dist.is_initialized():
                 # Re-sync the whole world so that non-rank-0s can proceed
-                dist.barrier()
+                # Use Gloo group for monitored_barrier to avoid NCCL timeout issues
+                success = _barrier_with_timeout(timeout=self._timeout)
+                if not success:
+                    logger.warning("Barrier timed out during exit, continuing anyway")
                 if exc_type is not None:
-                    dist.abort()  # propagate failure to the entire job
+                    # TODO: propagate failure to the entire job
+                    quit(1)
         finally:
             if self._created_pg:
                 dist.destroy_process_group()
