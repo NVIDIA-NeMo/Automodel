@@ -12,11 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import logging
 
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
+
+
+def _supports_logits_to_keep(model: nn.Module) -> bool:
+    """
+    Check if the model supports logits_to_keep.
+
+    Args:
+        model (nn.Module): The model to check.
+
+    Returns:
+        bool: True if the model supports logits_to_keep, False otherwise.
+    """
+    if callable(getattr(model, "forward", None)):
+        return "logits_to_keep" in set(inspect.signature(model.forward).parameters.keys())
+    else:
+        return False
+
+
+def _supports_seq_lens(model: nn.Module) -> bool:
+    """
+    Check if the model supports seq_lens.
+    """
+    if callable(getattr(model, "forward", None)):
+        return "seq_lens" in set(inspect.signature(model.forward).parameters.keys())
+    else:
+        return False
 
 
 def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:

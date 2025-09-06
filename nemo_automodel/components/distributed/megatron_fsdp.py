@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -24,14 +25,16 @@ from torch.distributed.tensor.parallel import (
 
 from nemo_automodel.components.distributed.parallelizer import (
     get_hf_tp_shard_plan,
-    nvfsdp_strategy_parallelize,
+    megatron_fsdp_strategy_parallelize,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
-class NVFSDPManager:
+class MegatronFSDPManager:
     """
-    Manager for setting up and parallelizing models using nvFSDP with TP, DP, CP sharding.
+    Manager for setting up and parallelizing models using MegatronFSDP with TP, DP, CP sharding.
 
     This manager initializes the torch.distributed process group, infers the group sizes
     for data parallelism (DP) and tensor parallelism (TP), builds the device mesh for
@@ -72,7 +75,7 @@ class NVFSDPManager:
     )
     sequence_parallel: Optional[bool] = field(
         default=False,
-        metadata={"help": "Enable sequence parallelism in TP plan if True. Not supported with nvFSDP right now."},
+        metadata={"help": "Enable sequence parallelism in TP plan if True. Not supported with MegatronFSDP right now."},
     )
     use_hf_tp_plan: Optional[bool] = field(
         default=False,
@@ -84,20 +87,20 @@ class NVFSDPManager:
         # init=False,
         metadata={"help": "Total number of processes."},
     )
-    nvfsdp_unit_modules: Optional[List[str]] = field(
+    megatron_fsdp_unit_modules: Optional[List[str]] = field(
         default_factory=lambda: [
             "transformers.models.llama.modeling_llama.LlamaDecoderLayer",
         ],
-        metadata={"help": "List of unit modules to be wrapped with nvFSDP."},
+        metadata={"help": "List of unit modules to be wrapped with MegatronFSDP."},
     )
 
-    # nvFSDP config
-    data_parallel_sharding_strategy: Optional[str] = field(
-        default="optim_grads_params",
+    # MegatronFSDP config
+    zero_dp_strategy: Optional[int] = field(
+        default=3,
         metadata={"help": "Data parallel sharding strategy."},
     )
-    init_nvfsdp_with_meta_device: Optional[bool] = field(
-        default=False, metadata={"help": "Initialize nvFSDP with meta device if True."}
+    init_fsdp_with_meta_device: Optional[bool] = field(
+        default=False, metadata={"help": "Initialize MegatronFSDP with meta device if True."}
     )
     grad_reduce_in_fp32: Optional[bool] = field(default=False, metadata={"help": "Reduce gradients in fp32 if True."})
     preserve_fp32_weights: Optional[bool] = field(default=False, metadata={"help": "Preserve fp32 weights if True."})
@@ -113,7 +116,7 @@ class NVFSDPManager:
     calculate_per_token_loss: Optional[bool] = field(
         default=False, metadata={"help": "Calculate per token loss if True."}
     )
-    keep_fp8_transpose_cache_when_using_custom_fsdp: Optional[bool] = field(
+    keep_fp8_transpose_cache: Optional[bool] = field(
         default=False, metadata={"help": "Keep fp8 transpose cache when using custom FSDP if True."}
     )
     nccl_ub: Optional[bool] = field(default=False, metadata={"help": "Use NCCL UBs if True."})
@@ -199,12 +202,13 @@ class NVFSDPManager:
         Raises:
             NotImplemented: If the required TP sharding plan is not supported.
         """
-        if self.data_parallel_sharding_strategy != "optim_grads_params":
+        if dist.get_world_size() == 1:
+            logger.info("World size is 1, skipping parallelization.")
+            return model.cuda(), optimizer
+
+        if self.zero_dp_strategy != 3:
             if self.device_mesh.get_rank() == 0:
-                print(
-                    "Warning: nvFSDP data_parallel_sharding_strategy is not optim_grads_params. "
-                    "Parameters will not be sharded."
-                )
+                print("Warning: MegatronFSDP zero_dp_strategy is not 3. Parameters will not be sharded.")
 
         if self.device_mesh["tp"].size() > 1:
             if self.use_hf_tp_plan:
@@ -224,7 +228,7 @@ class NVFSDPManager:
                 # TODO(boxiangw): investigate SP
                 if self.sequence_parallel and self.device_mesh.get_rank() == 0:
                     # TODO(boxiangw): Change this to a log
-                    print("Sequence parallelism is disabled. It is not compatible with nvFSDP.")
+                    print("Sequence parallelism is disabled. It is not compatible with MegatronFSDP.")
 
                 tp_shard_plan = base_model_tp_plan
                 # TODO(boxiangw): Change this to a log
@@ -236,14 +240,20 @@ class NVFSDPManager:
         else:
             tp_shard_plan = None
 
-        model = nvfsdp_strategy_parallelize(
+        if self.cp_size > 1:
+            dp_shard_dim = "dp_cp"
+        else:
+            dp_shard_dim = "dp"
+        tp_dim = "tp"
+
+        model = megatron_fsdp_strategy_parallelize(
             model,
             device_mesh=self.device_mesh,
             optimizer=optimizer,
-            nvfsdp_unit_modules=self.nvfsdp_unit_modules,
+            megatron_fsdp_unit_modules=self.megatron_fsdp_unit_modules,
             tp_shard_plan=tp_shard_plan,
-            data_parallel_sharding_strategy=self.data_parallel_sharding_strategy,
-            init_nvfsdp_with_meta_device=self.init_nvfsdp_with_meta_device,
+            zero_dp_strategy=self.zero_dp_strategy,
+            init_fsdp_with_meta_device=self.init_fsdp_with_meta_device,
             grad_reduce_in_fp32=self.grad_reduce_in_fp32,
             preserve_fp32_weights=self.preserve_fp32_weights,
             overlap_grad_reduce=self.overlap_grad_reduce,
@@ -252,9 +262,11 @@ class NVFSDPManager:
             average_in_collective=self.average_in_collective,
             disable_bucketing=self.disable_bucketing,
             calculate_per_token_loss=self.calculate_per_token_loss,
-            keep_fp8_transpose_cache_when_using_custom_fsdp=self.keep_fp8_transpose_cache_when_using_custom_fsdp,
+            keep_fp8_transpose_cache=self.keep_fp8_transpose_cache,
             nccl_ub=self.nccl_ub,
             fsdp_double_buffer=self.fsdp_double_buffer,
+            dp_shard_dim=dp_shard_dim,
+            tp_dim=tp_dim,
         )
 
         return model

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -30,6 +31,8 @@ from nemo_automodel.components.distributed.parallelizer import (
     fsdp2_strategy_parallelize,
     get_hf_tp_shard_plan,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -244,6 +247,10 @@ class FSDP2Manager:
         Raises:
             NotImplemented: If the required TP sharding plan is not supported.
         """
+        if dist.get_world_size() == 1:
+            logger.info("World size is 1, skipping parallelization.")
+            return model
+
         if self.device_mesh["tp"].size() > 1:
             if self.use_hf_tp_plan:
                 tp_shard_plan = get_hf_tp_shard_plan(model)

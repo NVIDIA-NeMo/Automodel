@@ -14,7 +14,7 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama3_2/llama3_2_1b_hellaswag_nvfsdp.yaml
+# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama3_2/llama3_2_1b_hellaswag_megatron_fsdp.yaml
 # Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
 
@@ -45,7 +45,7 @@ checkpoint:
   save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 distributed:
-  _target_: nemo_automodel.components.distributed.nvfsdp.NVFSDPManager
+  _target_: nemo_automodel.components.distributed.megatron_fsdp.MegatronFSDPManager
   dp_size: none
   tp_size: 1
   cp_size: 1
