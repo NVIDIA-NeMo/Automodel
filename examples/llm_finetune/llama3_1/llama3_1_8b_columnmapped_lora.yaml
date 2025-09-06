@@ -59,13 +59,28 @@ loss_fn:
 dataset:
   _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
   path_or_dataset_id: Muennighoff/natural-instructions
+  split: train
   column_mapping:
-    instruction: definition
+    context: definition
     question: inputs
     answer: targets
 
 packed_sequence:
   packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+
+# validation_dataset:
+#   _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
+#   path_or_dataset_id: Muennighoff/natural-instructions
+#   split: validation
+#   column_mapping:
+#     instruction: definition
+#     question: inputs
+#     answer: targets
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
