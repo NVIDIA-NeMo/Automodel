@@ -1329,7 +1329,6 @@ fa = [
     { name = "flash-attn" },
 ]
 moe = [
-    { name = "flash-attn" },
     { name = "transformer-engine", extra = ["pytorch"] },
 ]
 vlm = [
@@ -1380,7 +1379,6 @@ requires-dist = [
     { name = "bitsandbytes", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", specifier = "==0.45.5" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "flash-attn", marker = "extra == 'fa'", specifier = "<=2.8.3" },
-    { name = "flash-attn", marker = "extra == 'moe'", specifier = "==2.7.4.post1" },
     { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", specifier = "==0.5.8" },
     { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'" },
     { name = "numba", marker = "extra == 'vlm'" },
