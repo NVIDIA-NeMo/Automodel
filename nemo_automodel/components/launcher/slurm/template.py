@@ -60,6 +60,10 @@ export MASTER_PORT={master_port}
 export NUM_GPUS={num_gpus}
 export WORLD_SIZE=$(($NUM_GPUS * $SLURM_NNODES))
 
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export TORCH_NCCL_AVOID_RECORD_STREAMS=1
+export NCCL_NVLS_ENABLE=0
+
 # Experiment env
 export WANDB_API_KEY={wandb_key}
 export HF_HOME={hf_home}
