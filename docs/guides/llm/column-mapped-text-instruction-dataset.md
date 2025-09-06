@@ -167,7 +167,7 @@ dataset:
 | `split`                 | `None`  | Which split to pull from a HF repo (`train`, `validation`, *etc.*). Ignored for local files. |
 (`dataset[idx]`) are **not** available — iterate instead. |
 | `answer_only_loss_mask` | `True`  | Create a `loss_mask` where only the answer tokens contribute to the loss. Requires `start_of_turn_token`. |
-| `start_of_turn_token`   | `None`  | String token marking the assistant’s response. Required when `answer_only_loss_mask=True` for tokenizers with chat template. |
+| `start_of_turn_token`   | `None`  | String token marking the assistant's response. Required when `answer_only_loss_mask=True` for tokenizers with chat template. |
 
 ---
 ## Tokenisation Paths
@@ -213,10 +213,84 @@ Regardless of the path, the output dict is always:
 ## Parameter Requirements
 
 The following section lists important requirements and caveats for correct usage.
-* `answer_only_loss_mask=True` requires a start_of_turn_token string that exists in the tokenizer’s vocabulary and can be successfully encoded when the helper performs a lookup. Otherwise, a `ValueError` is raised at instantiation time.
+* `answer_only_loss_mask=True` requires a start_of_turn_token string that exists in the tokenizer's vocabulary and can be successfully encoded when the helper performs a lookup. Otherwise, a `ValueError` is raised at instantiation time.
 * Each sample must include at least one of `context` or `question`; omitting both will result in a `ValueError`.
+
+---
+## Slurm Configuration for Distributed Training
+
+For distributed training on Slurm clusters, add a `slurm` section to your YAML configuration. This section configures the Slurm batch job parameters and automatically generates the appropriate `#SBATCH` directives.
+
+### Basic Slurm Configuration
+
+Add the following section to your YAML configuration:
+
+```yaml
+# Your existing model, dataset, training config...
+step_scheduler:
+  grad_acc_steps: 4
+  num_epochs: 1
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
+  path_or_dataset_id: Muennighoff/natural-instructions
+  column_mapping:
+    context: definition
+    question: inputs
+    answer: targets
+
+# Add Slurm configuration
+slurm:
+  job_name: llm-finetune
+  nodes: 1
+  ntasks_per_node: 8
+  time: 00:30:00
+  account: your_account
+  partition: gpu
+  container_image: nvcr.io/nvidia/nemo:25.07
+  gpus_per_node: 8
+```
+
+### Multi-Node Slurm Configuration
+
+:::note
+**Note for Multi-Node Training**: When using Hugging Face datasets in multi-node setups, you need shared storage accessible by all nodes. Set the `HF_DATASETS_CACHE` environment variable to point to a shared directory (e.g., `HF_DATASETS_CACHE=/shared/hf_cache`) in the yaml file as shown, to ensure all nodes can access the cached datasets.
+:::
+
+When using multiple nodes with Hugging Face datasets:
+
+1. **Shared Storage**: Ensure all nodes can access the same storage paths
+2. **HF Cache**: Set `hf_home` to a shared directory accessible by all nodes
+3. **Environment Variables**: Use `env_vars` to set `HF_DATASETS_CACHE` to the shared location
+
+```yaml
+slurm:
+  job_name: llm-finetune-multi-node # name of the slurm job
+  nodes: 4 # number of nodes to use
+  ntasks_per_node: 8 # Number of tasks per node (typically equals number of GPUs)
+  time: 02:00:00 # Maximum job runtime (format: `HH:MM:SS`)
+  account: your_account # Slurm account to charge resources to
+  partition: gpu # Slurm partition to submit to
+  container_image: nvcr.io/nvidia/nemo:25.07 # Container image to use for the job
+  gpus_per_node: 8 # Number of GPUs per node (adds `#SBATCH --gpus-per-node=N`)
+  # Optional: Add extra mount points if needed
+  extra_mounts: # Additional mount points for the container
+    - /lustre:/lustre
+    - /shared:/shared
+  # Optional: Specify custom HF_HOME location
+  hf_home: /shared/hf_cache # Custom Hugging Face cache directory on shared dist space.
+  # Optional: Specify custom env vars
+  env_vars: # Additional environment variables
+    HF_DATASETS_CACHE: /shared/hf_cache  # similar to hf_home, useful when use a different directory for datasets.
+  # Optional: Specify custom job directory
+  job_dir: /path/to/slurm/jobs
+```
 
 
 ---
-### That’s It!
+### That's It!
 With the mapping specified, the rest of the NeMo Automodel pipeline (pre-tokenisation, packing, collate-fn, *etc.*) works as usual.
