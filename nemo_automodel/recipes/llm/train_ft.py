@@ -200,7 +200,7 @@ def build_model_and_optimizer(
             model = autopipeline
     else:
         load_weights = False
-        if parallelize_fn is not None:
+        if parallelize_fn is not None and get_world_size_safe() > 1:
             parallelize_fn(
                 model,
                 world_mesh=model_wrapper.device_mesh,
@@ -233,12 +233,12 @@ def build_model_and_optimizer(
                 return model, [optimizer], loss_fn
 
             else:
+                load_weights = True
                 if get_world_size_safe() == 1:
                     logger.info("World size is 1, skipping parallelization.")
                     model = model.to(device).to(torch.bfloat16)
                 else:
                     model = model_wrapper.parallelize(model)
-                    load_weights = True
 
         # Load the weights into the model in parallel.
         if is_meta_device and load_weights:
@@ -752,7 +752,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.peft_config = self.cfg.peft.instantiate()
         self.loss_fn = build_loss_fn(self.cfg.loss_fn)
         parallelize_fn = self.cfg.get("parallelize_fn", None)
-        if parallelize_fn is None:
+        if parallelize_fn is None and self.pp_enabled:
             parallelize_fn = partial(parallelize_for_pp, model_wrapper=self.model_wrapper)
 
         model, self.optimizer, self.loss_fn = build_model_and_optimizer(
