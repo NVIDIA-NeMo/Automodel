@@ -185,16 +185,23 @@ class ColumnMappedTextInstructionDataset(Dataset):
 
         assert isinstance(column_mapping, dict), "Expected column_mapping to be a dictionary"
         # Ensure required columns are present
-        assert ColumnTypes.Question.value in column_mapping, (
-            "Expected question to be in column_mapping",
-            column_mapping,
-        )
         assert ColumnTypes.Answer.value in column_mapping, ("Expected answer to be in column_mapping", column_mapping)
         if len(column_mapping) == 3:
             assert ColumnTypes.Context.value in column_mapping, (
                 "Expected context to be in column_mapping",
                 column_mapping,
             )
+            assert ColumnTypes.Question.value in column_mapping, (
+                "Expected question to be in column_mapping",
+                column_mapping,
+            )
+        elif len(column_mapping) == 2:
+            assert ColumnTypes.Context.value in column_mapping or ColumnTypes.Question.value in column_mapping, (
+                "Expected context or question to be in column_mapping",
+                column_mapping,
+            )
+        else:
+            raise ValueError(f"Expected 2 or 3 columns in column_mapping, got {len(column_mapping)}")
 
         self.column_mapping = column_mapping
 
@@ -228,7 +235,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
             RuntimeError: If streaming is enabled.
         """
         row = self.dataset[idx]
-        mapped = {dest: row[src] for dest, src in self.column_mapping.items()}
+        mapped = {dest: row[src] for dest, src in self.column_mapping.items() if src in row}
         mapped = self._apply_tokenizer(mapped)
         assert _check_all_values_equal_length(mapped), "All values must be of the same length"
         return mapped
@@ -250,13 +257,14 @@ class ColumnMappedTextInstructionDataset(Dataset):
         assert isinstance(sample, dict), "Expected sample to be a dictionary"
         assert len(sample) >= 2, "Expected at least two columns"
         context = sample.get(ColumnTypes.Context.value, None)
-        question = sample[ColumnTypes.Question.value]
+        question = sample.get(ColumnTypes.Question.value, None)
         answer = sample[ColumnTypes.Answer.value]
 
         eos_token_id = getattr(self.tokenizer, "eos_token_id", 0)
         pad_token_id = _add_pad_token(self.tokenizer) or eos_token_id
 
-        prompt = f"{context} {question}" if context else question
+        prompt = " ".join(filter(lambda x: x is not None, (context, question, "")))
+        assert len(prompt) > 1, "Expected prompt to be non-empty"
         if _has_chat_template(self.tokenizer):
             return format_chat_template(
                 self.tokenizer,
