@@ -113,7 +113,7 @@ def _load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str
         raise RuntimeError("No data files provided")
 
     return load_dataset(
-        "json", data_files=data_files, split=None, streaming=streaming, verification_mode=VerificationMode.NO_CHECKS
+        "json", data_files=data_files, split="train", streaming=streaming, verification_mode=VerificationMode.NO_CHECKS
     )
 
 

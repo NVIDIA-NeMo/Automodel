@@ -53,7 +53,7 @@ def test_load_dataset_local_json(tmp_path: Path):
         json.dump(data, fp)
 
     ds = _load_dataset(str(file_path))
-    assert len(ds) == 2
+    assert len(ds) == 2, ds
     assert ds[0]["q"] == "How are you?"
 
 
