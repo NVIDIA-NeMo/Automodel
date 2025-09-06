@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -82,6 +85,10 @@ class DDPManager:
         Returns:
             torch.nn.parallel.DistributedDataParallel: The DDP-wrapped model.
         """
+        if dist.get_world_size() == 1:
+            logger.info("World size is 1, skipping parallelization.")
+            return model
+
         return DDP(model.to(self.device), device_ids=[self.device] if self.device.type == "cuda" else None)
 
     # @contextmanager
