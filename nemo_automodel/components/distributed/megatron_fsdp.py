@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -26,6 +27,8 @@ from nemo_automodel.components.distributed.parallelizer import (
     get_hf_tp_shard_plan,
     megatron_fsdp_strategy_parallelize,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -199,6 +202,10 @@ class MegatronFSDPManager:
         Raises:
             NotImplemented: If the required TP sharding plan is not supported.
         """
+        if dist.get_world_size() == 1:
+            logger.info("World size is 1, skipping parallelization.")
+            return model.cuda(), optimizer
+
         if self.zero_dp_strategy != 3:
             if self.device_mesh.get_rank() == 0:
                 print("Warning: MegatronFSDP zero_dp_strategy is not 3. Parameters will not be sharded.")
