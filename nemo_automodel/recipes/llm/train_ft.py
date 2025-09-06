@@ -233,12 +233,12 @@ def build_model_and_optimizer(
                 return model, [optimizer], loss_fn
 
             else:
-                load_weights = True
                 if get_world_size_safe() == 1:
                     logger.info("World size is 1, skipping parallelization.")
                     model = model.to(device).to(torch.bfloat16)
                 else:
                     model = model_wrapper.parallelize(model)
+                    load_weights = True
 
         # Load the weights into the model in parallel.
         if is_meta_device and load_weights:
