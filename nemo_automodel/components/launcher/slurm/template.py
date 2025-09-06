@@ -96,7 +96,7 @@ def render_script(opts: dict, job_dir) -> str:
     else:
         opts["gpus_per_node_directive"] = ""
         opts["num_gpus"] = "${SLURM_GPUS_PER_NODE:-8}"  # Use Slurm's default or fallback to 8
-    
+
     # Add custom environment variables
     env_vars = opts.get("env_vars", {})
     if env_vars:
@@ -106,7 +106,7 @@ def render_script(opts: dict, job_dir) -> str:
         opts["custom_env_vars"] = "\n" + "\n".join(custom_env_lines)
     else:
         opts["custom_env_vars"] = ""
-    
+
     return TEMPLATE.format(
         user=getpass.getuser(),
         host=socket.gethostname(),

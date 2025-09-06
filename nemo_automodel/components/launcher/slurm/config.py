@@ -65,7 +65,9 @@ class SlurmConfig:
         default=os.environ.get("HF_TOKEN", ""),
         metadata=dict(help="HF-TOKEN key to use for retrieving gated assets from HuggingFace Hub."),
     )
-    env_vars: dict = field(default_factory=dict, metadata=dict(help="Additional environment variables to set in the job"))
+    env_vars: dict = field(
+        default_factory=dict, metadata=dict(help="Additional environment variables to set in the job")
+    )
     # User command
     command: str = field(default="", metadata=dict(help="Shell command(s) to run inside container"))
     chdir: str = field(default=None, metadata=dict(help="Working directory of the job"))
