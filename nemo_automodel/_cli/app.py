@@ -140,7 +140,11 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
         (
             f"PYTHONPATH={repo_root}:$PYTHONPATH",
             # Use torchrun to launch multiple processes instead
-            f"uv run --frozen --all-extras torchrun --nproc_per_node={slurm_config['ntasks_per_node']}",
+            f"uv run --frozen --all-extras torchrun "
+            f"--nproc_per_node={slurm_config['ntasks_per_node']} "
+            f"--nnodes={slurm_config['nodes']} "
+            f"--rdzv_backend=c10d "
+            f"--rdzv_endpoint=${{MASTER_ADDR}}:${{MASTER_PORT}}",
             f"{repo_root}/examples/{args.domain}_{args.command}/{args.command}.py",
             "-c",
             f"{job_conf_path}",
