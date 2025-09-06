@@ -389,15 +389,15 @@ def build_dataloader(
     """
     with StatefulRNG(seed=seed, ranked=True):
         kwargs, tokenizer = _build_tokenizer(cfg_model, cfg_ds)
-        with FirstRankPerNode():
-            # Megatron specific kwargs
-            if cfg_ds._target_ == MegatronPretraining:
-                kwargs["global_batch_size"] = global_batch_size
-                kwargs["trainer_max_steps"] = max_steps if max_steps is not None else None
-                kwargs["trainer_val_check_interval"] = val_check_interval
-                ds = cfg_ds.instantiate(**kwargs)
-                ds.build()
-            else:
+        # Megatron specific kwargs
+        if cfg_ds._target_ == MegatronPretraining:
+            kwargs["global_batch_size"] = global_batch_size
+            kwargs["trainer_max_steps"] = max_steps if max_steps is not None else None
+            kwargs["trainer_val_check_interval"] = val_check_interval
+            ds = cfg_ds.instantiate(**kwargs)
+            ds.build()
+        else:
+            with FirstRankPerNode():
                 ds = cfg_ds.instantiate(**kwargs)
 
         packed_sequence_size = getattr(cfg_ps, "packed_sequence_size", 0)
