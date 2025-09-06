@@ -204,7 +204,7 @@ def build_model_and_optimizer(
             parallelize_fn(
                 model,
                 world_mesh=model_wrapper.device_mesh,
-                moe_mesh=model_wrapper.moe_mesh,
+                moe_mesh=getattr(model_wrapper, "moe_mesh", None),
                 pp_enabled=False,
                 dp_axis_names=("dp_shard",),
                 cp_axis_name="cp",
@@ -250,7 +250,7 @@ def build_model_and_optimizer(
                 cfg_model.pretrained_model_name_or_path,
                 getattr(cfg_peft, "lora_A_init", None),
                 device_mesh=model_wrapper.device_mesh,
-                moe_mesh=model_wrapper.moe_mesh,
+                moe_mesh=getattr(model_wrapper, "moe_mesh", None),
             )
 
         # ensure the model is on device
