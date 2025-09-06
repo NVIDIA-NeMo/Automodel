@@ -25,7 +25,11 @@ tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B")
 
 ds = ColumnMappedTextInstructionDataset(
     path_or_dataset_id="Muennighoff/natural-instructions",
-    column_mapping={"instruction": "definition", "question": "inputs", "answer": "targets"},
+    column_mapping={
+      "context": "definition",
+      "question": "inputs",
+      "answer": "targets"
+    },
     tokenizer=tokenizer,
     answer_only_loss_mask=False,
 )
@@ -83,7 +87,7 @@ You can configure the dataset entirely from your recipe YAML.  For example:
 ```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
-  path_or_dataset_id: 
+  path_or_dataset_id:
     - /data/my_corpus_1.jsonl
     - /data/my_corpus_2.jsonl
   column_mapping:
@@ -118,7 +122,7 @@ The following are examples from the training split:
 }
 ```
 
-For basic QA fine-tuning, we usually map `definition → instruction`, `inputs → question`, and `targets → answer` as follows:
+For basic QA fine-tuning, we usually map `definition → context`, `inputs → question`, and `targets → answer` as follows:
 
 ```python
 from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import (
@@ -131,7 +135,7 @@ tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B")
 remote_ds = ColumnMappedTextInstructionDataset(
     path_or_dataset_id="Muennighoff/natural-instructions",  # Hugging Face repo ID
     column_mapping={
-        "instruction": "definition",  # high-level instruction
+        "context": "definition",  # high-level context
         "question": "inputs",         # the actual prompt / input
         "answer": "targets",          # expected answer string
     },
@@ -150,9 +154,9 @@ dataset:
   path_or_dataset_id: Muennighoff/natural-instructions
   split: train
   column_mapping:
-    context: context
-    question: question
-    answer: answer
+    context: definition
+    question: inputs
+    answer: targets
   answer_only_loss_mask: true
   start_of_turn_token: "<|assistant|>"
 ```
@@ -215,4 +219,4 @@ The following section lists important requirements and caveats for correct usage
 
 ---
 ### That’s It!
-With the mapping specified, the rest of the NeMo Automodel pipeline (pre-tokenisation, packing, collate-fn, *etc.*) works as usual. 
+With the mapping specified, the rest of the NeMo Automodel pipeline (pre-tokenisation, packing, collate-fn, *etc.*) works as usual.
