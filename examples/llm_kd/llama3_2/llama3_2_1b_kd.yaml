@@ -3,10 +3,11 @@
 #   automodel knowledge_distillation llm -c examples/llm/llama_3_2_1b_kd.yaml
 
 step_scheduler:
-  grad_acc_steps: 4
-  ckpt_every_steps: 20
-  val_every_steps: 10
-  num_epochs: 1
+  global_batch_size: 32
+  local_batch_size: 1
+  ckpt_every_steps: 200
+  val_every_steps: 100  # will run every x number of gradient steps
+  num_epochs: 2
 
 dist_env:
   backend: nccl
@@ -17,30 +18,31 @@ rng:
   seed: 1111
   ranked: true
 
-# ---------------- student ----------------
+# Student
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
   torch_dtype: bf16
 
-# ---------------- teacher ----------------
+# Teacher
 teacher_model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.2-7B
+  pretrained_model_name_or_path: meta-llama/Llama-3.2-3B
   torch_dtype: bf16
-
-# ---------------- knowledge-distillation hyper-params ----------------
-kd_ratio: 0.5          # 0 → pure CE, 1 → pure KD
-temperature: 2.0       # soften probability distributions
-# kd_loss_fn:          # Optional – default is KLDiv
-#   _target_: torch.nn.KLDivLoss
-#   reduction: batchmean
 
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: safetensors
   save_consolidated: false
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  sequence_parallel: false
 
 # PEFT can be enabled by uncommenting below – student weights will remain small
 # peft:
@@ -53,15 +55,31 @@ checkpoint:
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
+# Knowledge-distillation hyper-params
+kd_ratio: 0.5          # 0 → pure CE, 1 → pure KD
+kd_loss_fn:
+  _target_: nemo_automodel.components.loss.kd_loss.KDLoss
+  ignore_index: -100
+  temperature: 1.0
+  fp32_upcast: true
+
+# Optimizer
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0
+
+# Dataset / Dataloader
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: train
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  batch_size: 8
   shuffle: false
 
 validation_dataset:
@@ -73,11 +91,3 @@ validation_dataset:
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  batch_size: 8
-
-optimizer:
-  _target_: torch.optim.Adam
-  betas: [0.9, 0.999]
-  eps: 1e-8
-  lr: 1.0e-5
-  weight_decay: 0 
