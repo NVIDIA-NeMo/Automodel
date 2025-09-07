@@ -14,8 +14,8 @@
 # limitations under the License.
 
 import math
-from unittest.mock import MagicMock
 from functools import partial
+from unittest.mock import MagicMock
 
 null_decorator = partial(lambda x: x)
 
@@ -35,6 +35,7 @@ if not HAVE_TRITON:
     triton.autotune = null_decorator
     triton.heuristics = null_decorator
     tl = MagicMock()
+
 
 # Assign a block to a row([1,topk]), generate a local routing map([1,num_of_local_experts])
 @triton.jit
