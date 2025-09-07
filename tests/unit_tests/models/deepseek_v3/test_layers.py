@@ -33,6 +33,7 @@ except ImportError:
     pass
 
 skip_te = pytest.mark.skipif(not TE_AVAILABLE, reason="Transformer Engine not available")
+skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")
 
 
 class TestPreprocessArgsAndKwargsForAttn:

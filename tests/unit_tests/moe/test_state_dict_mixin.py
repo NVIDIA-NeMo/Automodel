@@ -17,6 +17,8 @@ import torch
 from unittest.mock import Mock, patch, MagicMock
 import re
 
+skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")
+
 from nemo_automodel.components.moe.state_dict_mixin import MoEStateDictMixin
 
 
@@ -92,6 +94,7 @@ class TestValidateExpertAvailability:
 
         mixin._validate_expert_availability(hf_state_dict, 8)
 
+    @skip_if_no_gpu
     @patch("nemo_automodel.components.moe.state_dict_mixin.get_expert_range_for_rank_from_mesh")
     @patch("nemo_automodel.components.moe.state_dict_mixin.get_submesh")
     def test_with_device_mesh(self, mock_get_submesh, mock_get_expert_range):
@@ -461,6 +464,7 @@ class TestFromHfGroupedExperts:
         expected_key = "model.layers.0.mlp.experts.gate_projs"
         assert expected_key in result
 
+    @skip_if_no_gpu
     @patch("nemo_automodel.components.moe.state_dict_mixin.get_expert_range_for_rank_from_mesh")
     @patch("nemo_automodel.components.moe.state_dict_mixin.get_submesh")
     def test_with_device_mesh(self, mock_get_submesh, mock_get_expert_range):

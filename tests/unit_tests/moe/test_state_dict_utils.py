@@ -16,6 +16,8 @@ import pytest
 import torch
 from unittest.mock import Mock, patch, MagicMock
 
+skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")
+
 from nemo_automodel.components.moe.state_dict_utils import (
     is_dtensor,
     get_submesh,
@@ -229,6 +231,7 @@ class TestCreateDtensorFromLocal:
         result = create_dtensor_from_local(local_tensor, None)
         assert torch.equal(result, local_tensor)
 
+    @skip_if_no_gpu
     @patch("nemo_automodel.components.moe.state_dict_utils.get_submesh")
     @patch("torch.cuda.is_available")
     @patch("torch.cuda.current_device")
