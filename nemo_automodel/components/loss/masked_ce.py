@@ -14,9 +14,10 @@
 from typing import Optional
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
-import torch.nn as nn
+
 
 class MaskedCrossEntropy(nn.Module):
     def __init__(self, fp32_upcast: bool = True, ignore_index: int = -100, reduction: str = "sum"):

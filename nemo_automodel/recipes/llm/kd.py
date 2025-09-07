@@ -36,39 +36,28 @@ recipes:
 from __future__ import annotations
 
 import logging
-import pathlib
 import time
 from contextlib import nullcontext
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
-import torch.nn.functional as F
-import torch.distributed as dist
-from torch.distributed.device_mesh import _mesh_resources
 import wandb
-
-from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
-from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
-from nemo_automodel.components.training.rng import StatefulRNG
-from nemo_automodel.components.training.utils import count_tail_padding
-from nemo_automodel.components.distributed.utils import get_sync_ctx
-
-from nemo_automodel.recipes.llm.train_ft import (
-    TrainFinetuneRecipeForNextTokenPrediction,
-    build_dataloader,
-    build_distributed,
-    build_loss_fn,
-    build_lr_scheduler,
-    build_step_scheduler,
-    build_wandb,
-    calculate_loss,
-    build_model_and_optimizer,
-)
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoTokenizer
 
+from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.utils import get_sync_ctx
+from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.components.training.utils import count_tail_padding
+from nemo_automodel.recipes.llm.train_ft import (
+    TrainFinetuneRecipeForNextTokenPrediction,
+    calculate_loss,
+)
+
 logger = logging.getLogger(__name__)
+
 
 def _build_kd_loss_fn(cfg_kd):
     if cfg_kd is None:
@@ -91,7 +80,7 @@ def _build_teacher_model(cfg_teacher, seed, has_packed_sequence, device, model_w
 
         # For teacher model, we'll apply FSDP2 sharding if the same model_wrapper is available
         # but we need to be careful about device placement and parallelization
-        if model_wrapper is not None and hasattr(model_wrapper, 'parallelize'):
+        if model_wrapper is not None and hasattr(model_wrapper, "parallelize"):
             logger.info("Applying FSDP2 sharding to teacher model")
             # Create a new model wrapper instance for the teacher to avoid conflicts
             # with the student model's parallelization
@@ -111,16 +100,24 @@ def _build_teacher_model(cfg_teacher, seed, has_packed_sequence, device, model_w
 
         return teacher_model
 
+
 def _verify_tokenizer_compatibility(student_cfg, teacher_cfg, trust_remote_code=True):
     if student_cfg is None or teacher_cfg is None:
         raise ValueError("Student and teacher model configs are required")
-    student_tokenizer = AutoTokenizer.from_pretrained(student_cfg.pretrained_model_name_or_path, trust_remote_code=trust_remote_code)
-    teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_cfg.pretrained_model_name_or_path, trust_remote_code=trust_remote_code)
+    student_tokenizer = AutoTokenizer.from_pretrained(
+        student_cfg.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+    )
+    teacher_tokenizer = AutoTokenizer.from_pretrained(
+        teacher_cfg.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+    )
     if student_tokenizer.vocab_size != teacher_tokenizer.vocab_size:
-        raise ValueError("Student and teacher tokenizers have different vocab sizes; Support will be added in the future")
+        raise ValueError(
+            "Student and teacher tokenizers have different vocab sizes; Support will be added in the future"
+        )
     if student_tokenizer.pad_token != teacher_tokenizer.pad_token:
         raise ValueError("Student and teacher tokenizers have different pad tokens")
     del student_tokenizer, teacher_tokenizer
+
 
 class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPrediction):
     """Fine-tune a student model via knowledge distillation."""
@@ -138,7 +135,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
 
         # teacher specific
         self.teacher_model = _build_teacher_model(
-            self.cfg.get('teacher_model', None),
+            self.cfg.get("teacher_model", None),
             self.cfg.get("seed", 42),
             self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
             self.dist_env.device,
@@ -150,9 +147,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         self.kd_loss_fn = _build_kd_loss_fn(self.cfg.get("kd_loss_fn", None))
         self.kd_ratio: float = float(self.cfg.get("kd_ratio", 0.5))
         logger.info("KD Loss config: " + str(self.cfg.get("kd_loss_fn", None)))
-        logger.info(
-            f"Knowledge-distillation enabled: ratio={self.kd_ratio}, T={self.kd_loss_fn.temperature}"
-        )
+        logger.info(f"Knowledge-distillation enabled: ratio={self.kd_ratio}, T={self.kd_loss_fn.temperature}")
 
         # Buffers for logging
         self._kd_loss_buffer = []
@@ -171,7 +166,6 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         """Override the forward backward step to include knowledge distillation loss."""
         batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
         labels = batch.pop("labels")
-        num_batch_labels = (labels != -100).sum().item()
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
 
         model = self.model_parts[0]
@@ -185,7 +179,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             else:
                 student_out = model(**batch)
 
-            student_logits = getattr(student_out, 'logits', student_out)  # shape (B, S, V)
+            student_logits = getattr(student_out, "logits", student_out)  # shape (B, S, V)
             # Cross-entropy loss against true labels (same as parent)
             ce_loss = calculate_loss(
                 self.loss_fn,
@@ -198,7 +192,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             # No grad for teacher forward
             with torch.no_grad():
                 teacher_logits = self.teacher_model(**batch)
-                teacher_logits = getattr(teacher_logits, 'logits', teacher_logits).detach()
+                teacher_logits = getattr(teacher_logits, "logits", teacher_logits).detach()
 
             # Reminder: kd_loss is normalized by num_label_tokens,
             # which typically is larger than the number of labels in this batch,
@@ -215,7 +209,6 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 (local_loss * self._get_dp_group_size()).backward()
             # return the losses for logging
             return local_loss.clone().detach(), kd_loss.clone().detach(), ce_loss.clone().detach()
-
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
@@ -294,10 +287,12 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         # fix reporting_loss, tps across ranks
         return reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens
 
-    def log_train_metrics(self, train_loss, grad_norm, num_tokens_in_batch, tps, num_label_tokens, kd_loss=None) -> float:
+    def log_train_metrics(
+        self, train_loss, grad_norm, num_tokens_in_batch, tps, num_label_tokens, kd_loss=None
+    ) -> float:
         """Override to log KD-specific metrics."""
         # Calculate average CE and KD losses from the buffers
-        if len(getattr(self, '_ce_loss_buffer', [])) > 0:
+        if len(getattr(self, "_ce_loss_buffer", [])) > 0:
             ce_loss = self._dp_allreduce(torch.stack(self._ce_loss_buffer).sum()).item()
             kd_loss = self._dp_allreduce(torch.stack(self._kd_loss_buffer).sum()).item()
             # Clear buffers for next step
@@ -306,7 +301,6 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         else:
             ce_loss = 0.0
             kd_loss = 0.0
-
 
         # assumes all model parts' optimizers have the same learning rate
         current_lr = self.optimizer[0].param_groups[0]["lr"]
@@ -327,10 +321,9 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             wandb.log(log_data, step=self.step_scheduler.step)
 
         logging.info(
-            "step {} | epoch {} | "\
-            "loss {:.4f} | ce_loss {:.4f} | kd_loss {:.4f} | "\
-            "lr {:.2e} | tps {:.2f} | kd_ratio {:.2f} | temperature {:.2f}"\
-            .format(
+            "step {} | epoch {} | "
+            "loss {:.4f} | ce_loss {:.4f} | kd_loss {:.4f} | "
+            "lr {:.2e} | tps {:.2f} | kd_ratio {:.2f} | temperature {:.2f}".format(
                 self.step_scheduler.step,
                 self.step_scheduler.epoch,
                 train_loss,
@@ -343,6 +336,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             )
         )
         torch.cuda.reset_peak_memory_stats()
+
 
 # Entry point
 def main(config_path="examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml"):
