@@ -62,7 +62,7 @@ def test_kd_loss_basic(temperature, upcast, unsqueeze):
         teacher_logits = teacher_logits.unsqueeze(0)
         labels = labels.unsqueeze(0)
 
-    loss = KDLoss(temperature=temperature, upcast=upcast)(student_logits, teacher_logits, labels)
+    loss = KDLoss(temperature=temperature, fp32_upcast=upcast)(student_logits, teacher_logits, labels)
     ref = _reference_kd_loss(student_logits, teacher_logits, labels, temperature=temperature)
 
     assert torch.allclose(loss, ref, atol=1e-6), f"Expected {ref}, got {loss}"
