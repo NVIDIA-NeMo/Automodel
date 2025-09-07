@@ -64,7 +64,7 @@
 from typing import Optional
 
 import torch
-
+import torch.nn as nn
 from nemo_automodel.shared.import_utils import MISSING_CUT_CROSS_ENTROPY_MSG
 
 try:
@@ -115,7 +115,7 @@ if HAVE_CUT_CROSS_ENTROPY:
     tl_utils.is_triton_greater_or_equal_3_2_0 = new_is_triton_greater_or_equal_3_2_0
 
 
-class FusedLinearCrossEntropy:
+class FusedLinearCrossEntropy(nn.Module):
     def __init__(self, ignore_index: int = -100, logit_softcapping: float = 0, reduction: str = "sum"):
         """
         Fused linear cross entropy loss.
@@ -125,11 +125,12 @@ class FusedLinearCrossEntropy:
             logit_softcapping (float): Value for softcapping logits (0 means no capping). Defaults to 0.
             reduction (str): Type of reduction. Defaults to "sum".
         """
+        super().__init__()
         self.ignore_index = ignore_index
         self.logit_softcapping = logit_softcapping
         self.reduction = reduction
 
-    def __call__(
+    def forward(
         self,
         hidden_states: torch.Tensor,
         labels: torch.Tensor,

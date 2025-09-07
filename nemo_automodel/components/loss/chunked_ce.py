@@ -15,6 +15,7 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 
 _compiled_compute_cross_entropy = None
 
@@ -39,7 +40,7 @@ def compute_cross_entropy(
     return F.cross_entropy(logits.float(), targets, ignore_index=ignore_index, reduction=reduction)
 
 
-class ChunkedCrossEntropy:
+class ChunkedCrossEntropy(nn.Module):
     def __init__(self, chunk_len: int = 32, compile: bool = True, ignore_index: int = -100, reduction: str = "sum"):
         """
         Chunked cross-entropy loss.
@@ -53,12 +54,13 @@ class ChunkedCrossEntropy:
                 Defaults to -100.
             reduction (str, optional): Type of reduction. Defaults to "sum".
         """
+        super().__init__()
         self.chunk_len = chunk_len
         self.compile = compile
         self.ignore_index = ignore_index
         self.reduction = reduction
 
-    def __call__(
+    def forward(
         self,
         logits: torch.Tensor,
         labels: torch.Tensor,
