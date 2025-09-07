@@ -158,7 +158,7 @@ class BaseRecipe:
             or is_dataloader(value)
         )
 
-        if should_track and not any(substr in key.lower() for substr in ("val", "eval", "test")):
+        if should_track and not any(substr in key.lower() for substr in ("val", "eval", "test", "loss")):
             assert key not in self.__dict__["__state_tracked"]
             self.__dict__["__state_tracked"].add(key)
         super().__setattr__(key, value)
@@ -197,6 +197,8 @@ class BaseRecipe:
 
         for key in self.__dict__["__state_tracked"]:
             if is_model(getattr(self, key)):
+                if key == "teacher_model":
+                    continue
                 model = getattr(self, key)
             elif is_optimizer(getattr(self, key)):
                 optimizer = getattr(self, key)
