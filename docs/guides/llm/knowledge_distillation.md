@@ -16,14 +16,11 @@ predicted distributions.  The student learns from both the ground-truth labels
 loss, **KD**):
 
 
-
-
 $$
-    \mathcal{L} = (1-\alpha) \cdot \mathcal{L}_{\textrm{CE}}(y, \textrm{softmax}(\mathbf{z}_{\textrm{student}}; T=1)) + \alpha \cdot \mathcal{L}_{\textrm{CE}}(\textrm{softmax}(\mathbf{z}_{\textrm{teacher}}; T=\tau), \textrm{softmax}(\mathbf{z}_{\textrm{student}}, T=\tau))
+  \mathcal{L} = (1-\alpha) \cdot \mathcal{L}_{\textrm{CE}}(p^{s}, y) + \alpha \cdot \mathcal{KL}(p^{s}, p^{t})
 $$
 
-where $\(\alpha\)$ is `kd_ratio` and $\(T\)$ is `temperature`.
-
+where $\(\alpha\)$ is `kd_ratio`, $\(T\)$ is `temperature` and $y$ the labels. In addition, $p^{s} = softmax(z^{s}, T)$ and $p^{t} = softmax(z^{t}, T)$
 ---
 
 ## 2. Prepare the YAML config
