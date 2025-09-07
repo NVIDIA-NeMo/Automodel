@@ -14,11 +14,27 @@
 # limitations under the License.
 
 import math
+from unittest.mock import MagicMock
+from functools import partial
+
+null_decorator = partial(lambda x: x)
 
 import torch
-import triton
-import triton.language as tl
 
+try:
+    import triton
+    import triton.language as tl
+
+    HAVE_TRITON = True
+except ImportError:
+    HAVE_TRITON = False
+
+if not HAVE_TRITON:
+    triton = MagicMock()
+    triton.jit = null_decorator
+    triton.autotune = null_decorator
+    triton.heuristics = null_decorator
+    tl = MagicMock()
 
 # Assign a block to a row([1,topk]), generate a local routing map([1,num_of_local_experts])
 @triton.jit
@@ -194,6 +210,7 @@ class IndicesToMultihot(torch.autograd.Function):
             multihot_indices: [num_of_tokens, num_of_local_experts]
             probs_in_multihot: [num_of_tokens, num_of_local_experts]
         """
+        assert HAVE_TRITON, "Triton is not installed"
         num_of_tokens = indices.shape[0]
         assert indices.shape == probs_indices.shape, "indices and probs_indices must have the same shape"
         topk = indices.shape[1]
