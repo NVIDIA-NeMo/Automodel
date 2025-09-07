@@ -18,11 +18,11 @@ import torch.nn.functional as F
 
 
 class KDLoss(nn.Module):
-    def __init__(self, ignore_index: int = -100, temperature: float = 1.0, upcast: bool = True):
+    def __init__(self, ignore_index: int = -100, temperature: float = 1.0, fp32_upcast: bool = True):
         super().__init__()
         self.ignore_index = ignore_index
         self.temperature = temperature
-        self.upcast = upcast
+        self.fp32_upcast = fp32_upcast
 
     def forward(
         self,
@@ -73,7 +73,7 @@ class KDLoss(nn.Module):
         labels = labels[valid_mask]
 
         # Up-cast logits to fp32 for numerical stability
-        if self.upcast:
+        if self.fp32_upcast:
             t_logits = t_logits.float()
             s_logits = s_logits.float()
         #  and apply temperature scaling.
