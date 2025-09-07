@@ -59,14 +59,14 @@ class MaskedCrossEntropy(nn.Module):
         """
         # this may happen with CPUOffloadPolicy
         if labels.device != logits.device:
-            labels = labels.to(logits.device)
+            labels = labels.to(logits.device)  # pragma: no cover
         # reshape to (N, C) and (N,) respectively
         logits = logits.view(-1, logits.size(-1))
         labels = labels.view(-1)
         if mask is not None:
             with torch.no_grad():
                 if mask.device != labels.device:
-                    mask = mask.to(labels.device)
+                    mask = mask.to(labels.device)  # pragma: no cover
                 labels.masked_fill_(mask.view(-1) == 0, self.ignore_index)
                 del mask
         if self.fp32_upcast:

@@ -81,14 +81,14 @@ class ChunkedCrossEntropy(nn.Module):
         # copied the following block from masked_ce
         # this may happen with CPUOffloadPolicy
         if labels.device != logits.device:
-            labels = labels.to(logits.device)
+            labels = labels.to(logits.device)  # pragma: no cover
         # reshape to (N, C) and (N,) respectively
         logits = logits.view(-1, logits.size(-1))
         labels = labels.view(-1)
         if mask is not None:
             with torch.no_grad():
                 if mask.device != labels.device:
-                    mask = mask.to(labels.device)
+                    mask = mask.to(labels.device)  # pragma: no cover
                 labels.masked_fill_(mask.view(-1) == 0, self.ignore_index)
                 del mask
 
@@ -104,5 +104,5 @@ class ChunkedCrossEntropy(nn.Module):
             loss += _compiled_compute_cross_entropy(logits_chunk, targets_chunk, self.ignore_index, self.reduction)
         if num_label_tokens is not None:
             assert self.reduction == "sum", "num_label_tokens is only supported when reduction is 'sum'"
-            loss = loss / num_label_tokens
+            loss = loss / num_label_tokens  # pragma: no cover
         return loss

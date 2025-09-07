@@ -72,8 +72,8 @@ try:
     from cut_cross_entropy import linear_cross_entropy
 
     HAVE_CUT_CROSS_ENTROPY = True
-except ImportError:
-    HAVE_CUT_CROSS_ENTROPY = False
+except ImportError:  # pragma: no cover
+    HAVE_CUT_CROSS_ENTROPY = False  # pragma: no cover
 
 
 def new_is_triton_greater_or_equal(version_str):
