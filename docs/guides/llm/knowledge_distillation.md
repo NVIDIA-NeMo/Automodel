@@ -3,7 +3,7 @@
 This guide walks through fine-tuning a **student** LLM with the help of a
 larger **teacher** model using the new `knowledge_distillation` recipe.
 
-In particular, we will show how to distill a 3B (meta-llama/Llama-3.2-3B) model into a 1B (meta-llama/Llama-3.2-1B) model.
+In particular, we will show how to distill a 3B (`meta-llama/Llama-3.2-3B`) model into a 1B (`meta-llama/Llama-3.2-1B`) model.
 
 ---
 
@@ -15,7 +15,12 @@ predicted distributions.  The student learns from both the ground-truth labels
 (Cross-Entropy loss, **CE**) and the soft targets of the teacher (Kullback-Leibler
 loss, **KD**):
 
-$\[ \mathcal{L}= (1-\alpha)\;\mathcal{L}_{\text{CE}} + \alpha\;T^{2}\;\mathcal{L}_{\text{KD}} \]$
+
+
+
+$$
+    \mathcal{L} = (1-\alpha) \cdot \mathcal{L}_{\textrm{CE}}(y, \textrm{softmax}(\mathbf{z}_{\textrm{student}}; T=1)) + \alpha \cdot \mathcal{L}_{\textrm{CE}}(\textrm{softmax}(\mathbf{z}_{\textrm{teacher}}; T=\tau), \textrm{softmax}(\mathbf{z}_{\textrm{student}}, T=\tau))
+$$
 
 where $\(\alpha\)$ is `kd_ratio` and $\(T\)$ is `temperature`.
 
