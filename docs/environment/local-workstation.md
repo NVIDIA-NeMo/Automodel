@@ -65,7 +65,17 @@ slurm:
   account: your_account
   partition: gpu
   container_image: nvcr.io/nvidia/nemo:25.07
-  gpus_per_node: 8
+  gpus_per_node: 8 # This adds "#SBATCH --gpus-per-node=8" to the script
+  # Optional: Add extra mount points if needed
+  extra_mounts:
+    - /lustre:/lustre
+  # Optional: Specify custom HF_HOME location (will auto-create if not specified)
+  hf_home: /path/to/your/HF_HOME
+  # Optional : Specify custom env vars
+  # env_vars:
+  #   ENV_VAR: value
+  # Optional: Specify custom job directory (defaults to cwd/slurm_jobs)
+  # job_dir: /path/to/slurm/jobs  
 ```
 
 Then submit the job:

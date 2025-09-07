@@ -130,14 +130,23 @@ def test_launch_with_slurm(monkeypatch, tmp_path):
     # fake implementation
     def fake_submit_slurm_job(cfg, job_dir):
         parts = cfg.command.split()
-        assert len(parts) == 5
+        # The command now has the format:
+        # PYTHONPATH=... uv run --frozen --all-extras torchrun --nproc_per_node=8 --nnodes=1 --rdzv_backend=c10d --rdzv_endpoint=... path/to/script.py -c config.yaml
+        assert len(parts) == 13  # Updated to match new torchrun command format
         assert parts[0].startswith("PYTHONPATH=")
         assert parts[0].endswith(":$PYTHONPATH")
-        assert parts[1] == "python3"
-        assert parts[2].endswith("recipes/llm_finetune/finetune.py")
-        assert parts[3] == "-c"
-        assert parts[4] == "/tmp/a/0123456789/y.conf"
-
+        assert parts[1] == "uv"
+        assert parts[2] == "run"
+        assert parts[3] == "--frozen"
+        assert parts[4] == "--all-extras"
+        assert parts[5] == "torchrun"
+        assert parts[6].startswith("--nproc_per_node=")
+        assert parts[7].startswith("--nnodes=")
+        assert parts[8] == "--rdzv_backend=c10d"
+        assert parts[9].startswith("--rdzv_endpoint=")
+        assert parts[10].endswith("examples/llm_finetune/finetune.py")
+        assert parts[11] == "-c"
+        assert parts[12] == "/tmp/a/0123456789/y.conf"
 
         # whatever you want to check
         return "FAKE_JOB_ID"
@@ -146,14 +155,30 @@ def test_launch_with_slurm(monkeypatch, tmp_path):
     monkeypatch.setattr(slurm_utils, "submit_slurm_job", fake_submit_slurm_job)
     job_dir = '/tmp/a/0123456789/'
 
-    # Provide a valid repo_root in slurm_config to avoid the path detection logic
-    slurm_config_with_repo = {"repo_root": str(repo_root)}
-    module.launch_with_slurm(dummy_args, job_dir +'y.conf', job_dir, slurm_config=slurm_config_with_repo)
+    # Create a proper SlurmConfig object with defaults, then add repo_root
+    from nemo_automodel.components.launcher.slurm.config import SlurmConfig
+    slurm_config_obj = SlurmConfig(job_name="test_job")  # Required field
+    # Convert to dict and add repo_root (which is handled separately in launch_with_slurm)
+    slurm_config_dict = {}
+    for key, value in slurm_config_obj.__dict__.items():
+        # Skip fields that will be overridden in launch_with_slurm to avoid conflicts
+        if key in ['command', 'chdir']:
+            continue
+        # Convert Path objects to strings for dictionary representation
+        elif hasattr(value, '__fspath__'):  # Path-like objects
+            slurm_config_dict[key] = str(value)
+        # Initialize list fields as empty lists if they're None (to avoid AttributeError on append)
+        elif key in ['extra_mounts'] and value is None:
+            slurm_config_dict[key] = []
+        else:
+            slurm_config_dict[key] = value
+    slurm_config_dict["repo_root"] = str(repo_root)
+    module.launch_with_slurm(dummy_args, job_dir +'y.conf', job_dir, slurm_config=slurm_config_dict)
 
     # maybe separate test?
     with pytest.raises(AssertionError, match='Expected last dir to be unix timestamp'):
         job_dir = '/tmp/a/123456789/'
-        module.launch_with_slurm(dummy_args, job_dir +'y.conf', job_dir, slurm_config=slurm_config_with_repo)
+        module.launch_with_slurm(dummy_args, job_dir +'y.conf', job_dir, slurm_config=slurm_config_dict)
 
 def test_main_single_node(monkeypatch, tmp_yaml_file):
     config_path = tmp_yaml_file

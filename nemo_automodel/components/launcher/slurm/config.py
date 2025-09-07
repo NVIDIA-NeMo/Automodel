@@ -15,6 +15,7 @@
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,11 +59,14 @@ class SlurmConfig:
 
     # Misc env / training specifics
     master_port: int = field(default=13742, metadata=dict(help="Port for multinode"))
-    gpus_per_node: int = field(default=8, metadata=dict(help="GPUs per node"))
+    gpus_per_node: Optional[int] = field(default=None, metadata=dict(help="GPUs per node"))
     wandb_key: str = field(default=os.environ.get("WANDB_API_KEY", ""), metadata=dict(help="W&B key or env reference"))
     hf_token: str = field(
         default=os.environ.get("HF_TOKEN", ""),
         metadata=dict(help="HF-TOKEN key to use for retrieving gated assets from HuggingFace Hub."),
+    )
+    env_vars: dict = field(
+        default_factory=dict, metadata=dict(help="Additional environment variables to set in the job")
     )
     # User command
     command: str = field(default="", metadata=dict(help="Shell command(s) to run inside container"))
