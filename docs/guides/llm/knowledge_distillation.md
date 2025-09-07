@@ -15,9 +15,9 @@ predicted distributions.  The student learns from both the ground-truth labels
 (Cross-Entropy loss, **CE**) and the soft targets of the teacher (Kullback-Leibler
 loss, **KD**):
 
-\[ \mathcal{L}= (1-\alpha)\;\mathcal{L}_{\text{CE}} + \alpha\;T^{2}\;\mathcal{L}_{\text{KD}} \]
+$\[ \mathcal{L}= (1-\alpha)\;\mathcal{L}_{\text{CE}} + \alpha\;T^{2}\;\mathcal{L}_{\text{KD}} \]$
 
-where \(\alpha\) is `kd_ratio` and \(T\) is `temperature`.
+where $\(\alpha\)$ is `kd_ratio` and $\(T\)$ is `temperature`.
 
 ---
 
