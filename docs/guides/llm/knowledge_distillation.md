@@ -20,7 +20,9 @@ $$
   \mathcal{L} = (1-\alpha) \cdot \mathcal{L}_{\textrm{CE}}(p^{s}, y) + \alpha \cdot \mathcal{KL}(p^{s}, p^{t})
 $$
 
-where $\(\alpha\)$ is `kd_ratio`, $\(T\)$ is `temperature` and $y$ the labels. In addition, $p^{s} = softmax(z^{s}, T)$ and $p^{t} = softmax(z^{t}, T)$
+where $\(\alpha\)$ is the `kd_ratio`, $\(T\)$ softmax `temperature` and $y$ the labels. For the arguments p:
+$$p^{s} = softmax(z^{s}, T)$$.
+
 ---
 
 ## 2. Prepare the YAML config
