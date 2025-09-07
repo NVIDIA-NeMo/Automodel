@@ -109,3 +109,30 @@ def test_chunked_cross_entropy_ignore_index_and_mask():
     assert torch.allclose(loss_chunked, loss_ref, atol=1e-6), (
         f"Expected chunked loss {loss_ref.item()}, but got {loss_chunked.item()}."
     )
+
+def test_chunked_cross_entropy_num_label_tokens_normalization():
+    """Ensure that the loss is divided by ``num_label_tokens`` when provided."""
+
+    seq_len = 12
+    num_classes = 6
+
+    logits = torch.randn(seq_len, num_classes)
+    targets = torch.randint(0, num_classes, (seq_len,))
+
+    # Compute the reference (sum reduction) loss first
+    loss_sum = compute_cross_entropy(logits, targets).detach()
+
+    # Pick an arbitrary num_label_tokens (could be less than seq_len due to masking in real cases)
+    num_label_tokens = 9
+
+    # Expected normalized loss
+    expected_loss = loss_sum / num_label_tokens
+
+    # Loss from ChunkedCrossEntropy with num_label_tokens specified
+    loss_chunked = ChunkedCrossEntropy(chunk_len=4)(
+        logits, targets, num_label_tokens=num_label_tokens
+    ).detach()
+
+    assert torch.allclose(loss_chunked, expected_loss, atol=1e-6), (
+        f"Expected normalized loss {expected_loss.item()}, but got {loss_chunked.item()}."
+    )

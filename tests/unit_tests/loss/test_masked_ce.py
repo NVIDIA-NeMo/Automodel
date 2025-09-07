@@ -85,3 +85,31 @@ def test_masked_cross_entropy_gpu():
 
     # Double-check it runs without error
     assert loss_gpu is not None
+
+
+def test_masked_cross_entropy_num_label_tokens_normalization():
+    """Ensure that the loss is divided by ``num_label_tokens`` when provided."""
+
+    seq_len = 12
+    num_classes = 6
+
+    logits = torch.randn(seq_len, num_classes)
+    targets = torch.randint(0, num_classes, (seq_len,))
+
+    # Compute the reference (sum reduction) loss first
+    loss_sum = F.cross_entropy(logits, targets, reduction="sum").detach()
+
+    # Pick an arbitrary num_label_tokens (could be less than seq_len due to masking in real cases)
+    num_label_tokens = 9
+
+    # Expected normalized loss
+    expected_loss = loss_sum / num_label_tokens
+
+    # Loss from ChunkedCrossEntropy with num_label_tokens specified
+    loss_masked = MaskedCrossEntropy()(
+        logits, targets, num_label_tokens=num_label_tokens
+    )
+
+    assert torch.allclose(loss_masked, expected_loss, atol=1e-6), (
+        f"Expected normalized loss {expected_loss.item()}, but got {loss_masked.item()}."
+    )

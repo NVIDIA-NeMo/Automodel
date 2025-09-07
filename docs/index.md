@@ -52,6 +52,7 @@ guides/vlm/dataset.md
 :caption: Development
 :hidden:
 guides/checkpointing.md
+guides/llm/knowledge_distillation.md
 guides/pipelining.md
 guides/llm/dataset.md
 guides/vlm/dataset.md

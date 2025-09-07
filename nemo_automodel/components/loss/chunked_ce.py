@@ -14,6 +14,7 @@
 from typing import Optional
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 _compiled_compute_cross_entropy = None
@@ -39,7 +40,7 @@ def compute_cross_entropy(
     return F.cross_entropy(logits.float(), targets, ignore_index=ignore_index, reduction=reduction)
 
 
-class ChunkedCrossEntropy:
+class ChunkedCrossEntropy(nn.Module):
     def __init__(self, chunk_len: int = 32, compile: bool = True, ignore_index: int = -100, reduction: str = "sum"):
         """
         Chunked cross-entropy loss.
@@ -53,12 +54,13 @@ class ChunkedCrossEntropy:
                 Defaults to -100.
             reduction (str, optional): Type of reduction. Defaults to "sum".
         """
+        super().__init__()
         self.chunk_len = chunk_len
         self.compile = compile
         self.ignore_index = ignore_index
         self.reduction = reduction
 
-    def __call__(
+    def forward(
         self,
         logits: torch.Tensor,
         labels: torch.Tensor,
@@ -79,14 +81,14 @@ class ChunkedCrossEntropy:
         # copied the following block from masked_ce
         # this may happen with CPUOffloadPolicy
         if labels.device != logits.device:
-            labels = labels.to(logits.device)
+            labels = labels.to(logits.device)  # pragma: no cover
         # reshape to (N, C) and (N,) respectively
         logits = logits.view(-1, logits.size(-1))
         labels = labels.view(-1)
         if mask is not None:
             with torch.no_grad():
                 if mask.device != labels.device:
-                    mask = mask.to(labels.device)
+                    mask = mask.to(labels.device)  # pragma: no cover
                 labels.masked_fill_(mask.view(-1) == 0, self.ignore_index)
                 del mask
 
@@ -102,5 +104,5 @@ class ChunkedCrossEntropy:
             loss += _compiled_compute_cross_entropy(logits_chunk, targets_chunk, self.ignore_index, self.reduction)
         if num_label_tokens is not None:
             assert self.reduction == "sum", "num_label_tokens is only supported when reduction is 'sum'"
-            loss = loss / num_label_tokens
+            loss = loss / num_label_tokens  # pragma: no cover
         return loss
