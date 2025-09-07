@@ -116,13 +116,24 @@ def make_cp_batch_and_ctx(device_mesh, batch, labels, loss_mask=None):
     """
     from contextlib import nullcontext
 
-    if device_mesh is None:
-        cp_mesh = None
-    else:
-        cp_mesh = device_mesh["cp"]
+    def _get_submesh(device_mesh, name):
+        if name in getattr(device_mesh, "mesh_dim_names", {}):
+            return device_mesh[name]
+        return None
 
-    if cp_mesh is None or cp_mesh.size() == 1:
+    def _get_mesh_size(mesh):
+        if mesh is None:
+            return 0
+        return mesh.size()
+
+    cp_mesh = _get_submesh(device_mesh, "cp")
+    tp_mesh = _get_submesh(device_mesh, "tp")
+
+    if _get_mesh_size(cp_mesh) <= 1:
         return nullcontext, batch
+
+    if "position_ids" not in batch and (_get_mesh_size(cp_mesh) > 1 or _get_mesh_size(tp_mesh) > 1):
+        batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(batch["input_ids"].device)
 
     input_ids = batch["input_ids"]
     position_ids = batch["position_ids"]
