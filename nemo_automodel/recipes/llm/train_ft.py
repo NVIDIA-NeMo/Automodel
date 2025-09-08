@@ -67,7 +67,6 @@ from nemo_automodel.components.utils.compile_utils import (
 )
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
-    _supports_seq_lens,
     print_trainable_parameters,
 )
 from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -770,7 +769,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             dp_rank=self._get_dp_rank(),
             dp_world_size=self._get_dp_group_size(),
             pp_enabled=self.pp_enabled,
-            supports_seq_lens=_supports_seq_lens(model),
+            supports_seq_lens=True,
         )
 
         # Build validation dataloader if the config provides it
