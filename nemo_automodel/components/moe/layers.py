@@ -56,6 +56,7 @@ class MoEConfig:
     inter_dim: int
     moe_inter_dim: int
     norm_topk_prob: bool
+    topk_method: str
 
     def __post_init__(self):
         if self.aux_loss_coeff > 0:
@@ -432,13 +433,15 @@ class Gate(nn.Module):
         self.bias_update_factor = config.gate_bias_update_factor
         self.aux_loss_coeff = config.aux_loss_coeff
         self.norm_topk_prob = config.norm_topk_prob
+        self.topk_method = config.topk_method
 
         if self.bias_update_factor > 0:
             assert self.train_gate, "Require train_gate to be set to True to apply the bias update"
 
         self.weight = nn.Parameter(torch.empty(config.n_routed_experts, config.dim), requires_grad=self.train_gate)
-        self.e_score_correction_bias = nn.Parameter(torch.empty(config.n_routed_experts), requires_grad=False)
-        self.e_score_correction_bias_master = None
+        if self.topk_method == "noaux_tc":
+            self.e_score_correction_bias = nn.Parameter(torch.empty(config.n_routed_experts), requires_grad=False)
+            self.e_score_correction_bias_master = None
 
         # Cumulative expert load is a tensor representing the number of tokens
         # routed to each expert on the current rank, accumulated across gradient
@@ -472,23 +475,33 @@ class Gate(nn.Module):
             scores = scores.sigmoid()
         original_scores = scores
 
-        # Add correction bias to balance tokens across gates.
-        if self.e_score_correction_bias is not None:
-            scores = scores + self.e_score_correction_bias
+        if self.topk_method == "noaux_tc":
 
-        if self.n_groups > 1:
-            scores = scores.view(x.size(0), self.n_groups, -1)
-            if self.e_score_correction_bias is None:
-                group_scores = scores.amax(dim=-1)
-            else:
-                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
+            # Add correction bias to balance tokens across gates.
+            if self.e_score_correction_bias is not None:
+                scores = scores + self.e_score_correction_bias
 
-            indices = group_scores.topk(self.topk_groups, dim=-1)[1]
-            mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
-            scores = (scores * mask.unsqueeze(-1)).flatten(1)
+            if self.n_groups > 1:
+                scores = scores.view(x.size(0), self.n_groups, -1)
+                if self.e_score_correction_bias is None:
+                    group_scores = scores.amax(dim=-1)
+                else:
+                    group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
 
-        indices = torch.topk(scores, self.topk, dim=-1)[1]
-        weights = original_scores.gather(1, indices)
+                indices = group_scores.topk(self.topk_groups, dim=-1)[1]
+                mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
+                scores = (scores * mask.unsqueeze(-1)).flatten(1)
+
+            indices = torch.topk(scores, self.topk, dim=-1)[1]
+            weights = original_scores.gather(1, indices)
+        elif self.topk_method == "greedy":
+            weights, indices = torch.topk(
+                scores, k=self.top_k, dim=-1, sorted=False
+            )
+        else:
+            raise NotImplementedError(
+                f"Unsupported top-k function for MoE gating: {self.topk_method}"
+            )
 
         if self.score_func == "sigmoid" and self.norm_topk_prob and self.topk > 1:
             # Use out-of-place division to keep autograd versions intact.
@@ -498,6 +511,8 @@ class Gate(nn.Module):
             original_scores = original_scores / denom_s
         weights *= self.route_scale
 
+
+        aux_loss = None
         if self.bias_update_factor > 0 or self.aux_loss_coeff > 0:
             expert_load = self._compute_expert_load(indices, token_mask)
 
@@ -507,7 +522,6 @@ class Gate(nn.Module):
             else:
                 self._cumulative_expert_load += expert_load.detach()
 
-        aux_loss = None
         if self.aux_loss_coeff > 0 and self.training:
             aux_loss = self._compute_aux_loss(original_scores, expert_load, token_mask, cp_mesh)
 
