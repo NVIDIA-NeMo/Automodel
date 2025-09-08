@@ -6,10 +6,6 @@ on:
         required: true
         type: string
         description: "The target branch to bump"
-      nvfsdp-target-branch:
-        required: true
-        type: string
-        description: "The target branch to bump"
     secrets:
       PAT:
         required: true
@@ -38,7 +34,7 @@ jobs:
   update-lockfile:
     environment: nemo-ci
     runs-on: linux-amd64-cpu16
-    needs: [nvfsdp, pre-flight]
+    needs: [pre-flight]
     env:
       SOURCE_BRANCH: ${{ needs.pre-flight.outputs.bump-branch }}
       TARGET_BRANCH: ${{ inputs.target-branch }}

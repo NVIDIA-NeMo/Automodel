@@ -72,6 +72,7 @@ dependencies = [
     "bitsandbytes==0.45.5; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "datasets>=4.0.0",
     "liger-kernel==0.5.8; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
+    "megatron-fsdp",
     "pybind11",
     "pyyaml",
     "torch<=2.8.0",
@@ -122,7 +123,7 @@ linting = [
     "import-linter~=2.4",
 ]
 test = ["coverage", "pytest", "peft"]
-dev = ["megatron-fsdp", "cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@87a86ab"]
+dev = ["cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@87a86ab"]
 
 [tool.uv]
 default-groups = ["build", "docs", "test"]

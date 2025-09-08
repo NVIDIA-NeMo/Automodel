@@ -13,7 +13,6 @@ jobs:
     runs-on: ubuntu-latest
     environment: nemo-ci
     outputs:
-      nvfsdp: ${{ steps.get-branch.outputs.nvfsdp_release_branch }}
       automodel: ${{ steps.get-branch.outputs.automodel_release_branch }}
     steps:
       - name: Get release branch names
@@ -21,11 +20,6 @@ jobs:
         env:
           PAT: ${{ secrets.PAT }}
         run: |
-          latest_branch=$(git ls-remote --heads https://token:${PAT}@github.com/NVIDIA-NeMo/NVFSDP.git 'refs/heads/r*' | 
-            grep -o 'r[0-9]\+\.[0-9]\+\.[0-9]\+' | 
-            sort -V | 
-            tail -n1)
-          echo "nvfsdp_release_branch=$latest_branch" >> $GITHUB_OUTPUT
 
           latest_branch=$(git ls-remote --heads https://token:${PAT}@github.com/NVIDIA-NeMo/automodel.git 'refs/heads/r*' | 
             grep -o 'r[0-9]\+\.[0-9]\+\.[0-9]\+' | 
@@ -39,13 +33,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - nvfsdp-target-branch: ${{ needs.get-release-branch-names.outputs.nvfsdp }}
-            target-branch: ${{ needs.get-release-branch-names.outputs.automodel }}
-          - nvfsdp-target-branch: main
-            target-branch: main
+          - target-branch: ${{ needs.get-release-branch-names.outputs.automodel }}
+          - target-branch: main
     uses: ./.github/workflows/_update_dependencies.yml
     with:
-      nvfsdp-target-branch: ${{ matrix.nvfsdp-target-branch }}
       target-branch: ${{ matrix.target-branch }}
     secrets:
       PAT: ${{ secrets.PAT }}
