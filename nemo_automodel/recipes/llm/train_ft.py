@@ -60,7 +60,7 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
-from nemo_automodel.components.training.utils import count_tail_padding
+from nemo_automodel.components.training.utils import count_tail_padding, scale_grads_and_clip_grad_norm
 from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
     compile_model,
@@ -184,6 +184,7 @@ def build_model_and_optimizer(
                     cfg_model.pretrained_model_name_or_path,
                     getattr(cfg_peft, "lora_A_init", None),
                     device_mesh=autopipeline.world_mesh,
+                    moe_mesh=autopipeline.moe_mesh,
                 )
 
             # Create optimizer for all model parts
@@ -197,7 +198,21 @@ def build_model_and_optimizer(
                 )
             model = autopipeline
     else:
-        if callable(getattr(model_wrapper, "parallelize", None)):
+        load_weights = False
+        if parallelize_fn is not None and get_world_size_safe() > 1:
+            parallelize_fn(
+                model,
+                world_mesh=model_wrapper.device_mesh,
+                moe_mesh=getattr(model_wrapper, "moe_mesh", None),
+                pp_enabled=False,
+                dp_axis_names=("dp_shard",),
+                cp_axis_name="cp",
+                tp_axis_name="tp",
+                ep_axis_name="ep",
+                ep_shard_axis_names=("ep_shard",),
+            )
+            load_weights = True
+        elif callable(getattr(model_wrapper, "parallelize", None)):
             # FSDP2 and MegatronFSDP should already be on the correct device
             if isinstance(model_wrapper, MegatronFSDPManager):
                 # MegatronFSDP instantiate optimizer inside parallelize_function
@@ -217,22 +232,25 @@ def build_model_and_optimizer(
                 return model, [optimizer], loss_fn
 
             else:
+                load_weights = True
                 if get_world_size_safe() == 1:
                     logger.info("World size is 1, skipping parallelization.")
                     model = model.to(device).to(torch.bfloat16)
                 else:
                     model = model_wrapper.parallelize(model)
 
-                # Load the weights into the model in parallel.
-                if is_meta_device:
-                    load_model_from_base_checkpoint(
-                        model,
-                        device,
-                        cfg_peft is not None,
-                        cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
-                        cfg_model.pretrained_model_name_or_path,
-                        getattr(cfg_peft, "lora_A_init", None),
-                    )
+        # Load the weights into the model in parallel.
+        if is_meta_device and load_weights:
+            load_model_from_base_checkpoint(
+                model,
+                device,
+                cfg_peft is not None,
+                cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
+                cfg_model.pretrained_model_name_or_path,
+                getattr(cfg_peft, "lora_A_init", None),
+                device_mesh=model_wrapper.device_mesh,
+                moe_mesh=getattr(model_wrapper, "moe_mesh", None),
+            )
 
         # ensure the model is on device
         model = model.to(device)
@@ -671,10 +689,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         setup_logging()
 
         self.device_mesh = None
+        self.moe_mesh = None
         self.model_wrapper = None
         if "distributed" in self.cfg:
             self.model_wrapper = self.cfg.distributed.instantiate(world_size=self.dist_env.world_size)
             self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
+            self.moe_mesh = getattr(self.model_wrapper, "moe_mesh", None)
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -702,7 +722,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # Create AutoPipeline from config
             autopipeline = autopipeline_cfg.instantiate(
                 world_mesh=self.device_mesh,
-                moe_mesh=None,
+                moe_mesh=self.moe_mesh,
                 pp_axis_name="pp",
                 dp_axis_names=(
                     ("dp_replicate", "dp_shard")
@@ -712,8 +732,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 ),
                 cp_axis_name="cp" if "cp" in self.device_mesh.mesh_dim_names else None,
                 tp_axis_name="tp" if "tp" in self.device_mesh.mesh_dim_names else None,
-                ep_axis_name=None,
-                ep_shard_axis_names=None,
+                ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
+                ep_shard_axis_names=(
+                    ("ep_shard",) if self.moe_mesh is not None and "ep_shard" in self.moe_mesh.mesh_dim_names else None
+                ),
                 pp_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
                 device=torch.cuda.current_device(),
             )
@@ -727,6 +749,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.peft_config = None
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
+        self.loss_fn = build_loss_fn(self.cfg.loss_fn)
+        parallelize_fn = self.cfg.get("parallelize_fn", None)
+        if parallelize_fn is None and self.pp_enabled:
+            parallelize_fn = partial(parallelize_for_pp, model_wrapper=self.model_wrapper)
+
         model, self.optimizer, self.loss_fn = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
@@ -741,8 +768,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_compile=self.cfg.get("compile", None),
             cfg_quantization=self.cfg.get("quantization", None),
             autopipeline=autopipeline,
-            loss_fn=build_loss_fn(self.cfg.loss_fn),
-            parallelize_fn=partial(parallelize_for_pp, model_wrapper=self.model_wrapper),
+            loss_fn=self.loss_fn,
+            parallelize_fn=parallelize_fn,
         )
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
@@ -814,7 +841,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
         # Optionally resume
-        self.load_checkpoint(restore_from)
+        self.load_checkpoint(restore_from, moe_mesh=self.moe_mesh)
 
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
@@ -945,29 +972,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
             )
 
-        if self.pp_enabled:
-            self.pp.scale_grads_by_divisor(num_label_tokens / self._get_dp_group().size())
-
-        grad_norm = 0
-        # Clip gradients **after** any rescaling.
-        # TODO(@boxiangw): Fix TP gradient clipping
-        if max_grad_norm is not None:
-            if self.pp_enabled:
-                grad_norm = self.pp.clip_grad_norm(
-                    max_grad_norm,
-                    foreach=True,
-                    pp_mesh=(self.device_mesh["pp"] if self.pp_enabled else None),
-                )
-            else:
-                if not self.device_mesh or self.device_mesh["tp"].size() == 1:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        [p for p in self.model_parts[0].parameters() if p.requires_grad], max_grad_norm
-                    )
-                    if hasattr(grad_norm, "full_tensor"):
-                        grad_norm = grad_norm.full_tensor()  # collect the summed grad norm across ranks
-
-            if isinstance(grad_norm, torch.Tensor):
-                grad_norm = grad_norm.item()
+        grad_norm = scale_grads_and_clip_grad_norm(
+            max_grad_norm,
+            self.model_parts,
+            norm_type=2.0,
+            pp_enabled=self.pp_enabled,
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
+            pp_axis_name="pp" if self.pp_enabled else None,
+            foreach=True,
+            num_label_tokens=num_label_tokens,
+            dp_group_size=self._get_dp_group_size(),
+        )
 
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model_parts[0].finish_grad_sync()

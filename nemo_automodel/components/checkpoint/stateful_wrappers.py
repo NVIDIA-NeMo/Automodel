@@ -116,7 +116,7 @@ class ModelState:
 
         return model_state_dict
 
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+    def load_state_dict(self, state_dict: dict[str, Any], strict: bool = True) -> None:
         """
         Load the state dictionary into the model.
 
@@ -128,7 +128,7 @@ class ModelState:
             return
 
         # Multi-stage PP models have different state dicts for each stage.
-        options = StateDictOptions(strict=False) if len(self.model) > 1 else None
+        options = StateDictOptions(strict=strict)
         if self.is_peft:
             _drop_outer_prefix(state_dict, "base_model.model.")
             options = StateDictOptions(strict=False, broadcast_from_rank0=True, full_state_dict=True)

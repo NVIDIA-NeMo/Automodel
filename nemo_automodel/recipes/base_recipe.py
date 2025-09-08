@@ -19,10 +19,12 @@ import re
 import socket
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.device_mesh import DeviceMesh
 from torch.optim import Optimizer
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.processing_utils import ProcessorMixin
@@ -224,7 +226,7 @@ class BaseRecipe:
         if is_dist_initialized:
             torch.distributed.barrier(dp_group)
 
-    def load_checkpoint(self, restore_from: str | None = None):
+    def load_checkpoint(self, restore_from: str | None = None, moe_mesh: Optional[DeviceMesh] = None):
         """
         Loads the latest checkpoint.
         """
@@ -264,7 +266,13 @@ class BaseRecipe:
             else:
                 getattr(self, key).load_state_dict(torch.load(os.path.join(ckpt_dir, f"{key}.pt"), weights_only=False))
 
-        load_model(model, ckpt_dir, self.checkpoint_config)
+        load_model(
+            model,
+            os.path.join(ckpt_dir, "model"),
+            self.checkpoint_config.model_save_format,
+            is_peft=self.checkpoint_config.is_peft,
+            moe_mesh=moe_mesh,
+        )
         load_optimizer(optimizer, model, ckpt_dir, scheduler)
         load_dataloader(dataloader, ckpt_dir, self._get_dp_rank())
 
