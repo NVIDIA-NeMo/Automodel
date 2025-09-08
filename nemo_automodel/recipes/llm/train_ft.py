@@ -384,7 +384,7 @@ def build_dataloader(
         packed_sequence_size = getattr(cfg_ps, "packed_sequence_size", 0)
         # check if packed sequence is supported
         if packed_sequence_size > 0 and not supports_seq_lens:
-            logging.info("Packed sequence is not supported without seq_lens; disabling packed sequence")
+            logging.warning("Packed sequence is not supported without seq_lens; disabling packed sequence")
             packed_sequence_size = 0
 
         # Apply packing if configured
