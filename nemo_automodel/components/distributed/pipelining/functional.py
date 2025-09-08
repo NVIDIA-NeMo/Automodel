@@ -52,6 +52,16 @@ class ParallelizeFnProtocol(Protocol):
     ) -> None: ...
 
 
+@torch.no_grad()
+def scale_grads_by_divisor(
+    stages: list[PipelineStage],
+    divisor: int,
+) -> None:
+    for stage in stages:
+        if hasattr(stage, "scale_grads"):
+            stage.scale_grads(divisor)
+
+
 def stage_ids_this_rank(pp_rank: int, pp_size: int, num_stages: int, style: str = "loop") -> tuple[int]:
     """Compute the stage ids for the stages that will run on this pp rank for either a looped or V style schedule"""
     assert num_stages % pp_size == 0, f"num_stages {num_stages} must be evenly divisible by pp_size {pp_size}"
