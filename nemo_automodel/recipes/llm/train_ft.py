@@ -385,7 +385,7 @@ def build_dataloader(
         packed_sequence_size = getattr(cfg_ps, "packed_sequence_size", 0)
         # check if packed sequence is supported
         if packed_sequence_size > 0 and not supports_seq_lens:
-            logging.warning("Packed sequence is not supported without seq_lens; disabling packed sequence")
+            logging.info("Packed sequence is not supported without seq_lens; disabling packed sequence")
             packed_sequence_size = 0
 
         # Apply packing if configured
@@ -765,7 +765,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             dp_rank=self._get_dp_rank(),
             dp_world_size=self._get_dp_group_size(),
             pp_enabled=self.pp_enabled,
-            supports_seq_lens=_supports_seq_lens(model),
+            supports_seq_lens=True,
         )
 
         # Build validation dataloader if the config provides it
