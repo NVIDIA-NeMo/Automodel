@@ -44,7 +44,7 @@ Feel free to tweak these values as required.
 ```yaml
 # Example config for knowledge distillation fine-tuning
 # Run with:
-#   automodel knowledge_distillation llm -c examples/llm/llama_3_2_1b_kd.yaml
+#   automodel knowledge_distillation llm -c examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml
 
 step_scheduler:
   global_batch_size: 32

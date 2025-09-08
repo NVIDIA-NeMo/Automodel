@@ -115,7 +115,7 @@ uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config <p
 
 For example, to train Llama 3.1 8B with FP8:
 ```bash
-uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/llama/llama3_1_8b_hellaswag_fp8.yaml
+uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_fp8.yaml
 ```
 
 
