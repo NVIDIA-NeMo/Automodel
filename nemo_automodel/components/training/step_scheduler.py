@@ -51,7 +51,7 @@ class StepScheduler(Stateful):
             max_steps (int): Total number of steps to run. Default is 2^63-1.
         """
         assert global_batch_size % (local_batch_size * dp_size) == 0, (
-            "global_batch_size must be divisible by (local_batch_size * dp_size)"
+            f"global_batch_size ({global_batch_size}) must be divisible by local_batch_size * dp_size ({local_batch_size} * {dp_size})"
         )
         self.grad_acc_steps = global_batch_size // (local_batch_size * dp_size)
         assert self.grad_acc_steps >= 1, (
