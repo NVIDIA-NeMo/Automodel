@@ -39,6 +39,8 @@ from torch.distributed.tensor.parallel import (
     SequenceParallel,
     parallelize_module,
 )
+from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
+
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
@@ -135,7 +137,9 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             validate_tp_mesh(model, tp_mesh)
 
             # Generate or use tensor parallel plan
-            model_parallel_plan = _get_parallel_plan(model, sequence_parallel, tp_shard_plan)
+            model_parallel_plan = {k: translate_to_lora(v)
+                for k, v in _get_parallel_plan(model, sequence_parallel, tp_shard_plan).items()
+            }
 
             # Apply tensor parallelism
             if model_parallel_plan:
