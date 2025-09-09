@@ -31,16 +31,17 @@ from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 from nemo_automodel.components.checkpoint.checkpointing import (
-    load_dataloader,
+    load_dp_aware_helper,
     load_model,
     load_optimizer,
     save_config,
-    save_dataloader,
+    save_dp_aware_helper,
     save_model,
     save_optimizer,
 )
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 
 try:
@@ -195,7 +196,7 @@ class BaseRecipe:
         if is_dist_initialized:
             torch.distributed.barrier(dp_group)
         # TODO(@adil-a): Change this when we create a LR scheduler class
-        model, optimizer, scheduler, tokenizer, config, dataloader = None, None, None, None, None, None
+        model, optimizer, scheduler, tokenizer, config = None, None, None, None, None
 
         for key in self.__dict__["__state_tracked"]:
             if is_model(getattr(self, key)):
@@ -210,8 +211,8 @@ class BaseRecipe:
                 scheduler = getattr(self, key)
             elif is_tokenizer(getattr(self, key)):
                 tokenizer = getattr(self, key)
-            elif is_dataloader(getattr(self, key)):
-                dataloader = getattr(self, key)
+            elif is_dataloader(getattr(self, key)) or isinstance(getattr(self, key), StatefulRNG):
+                save_dp_aware_helper(getattr(self, key), key, path, self._get_dp_rank(), self._get_tp_rank())
             else:
                 if is_rank_0:
                     torch.save(
@@ -222,7 +223,6 @@ class BaseRecipe:
         save_model(model, path, self.checkpoint_config, peft_config=self.peft_config, tokenizer=tokenizer)
         save_optimizer(optimizer, model, path, scheduler)
         save_config(config.raw_config, path)
-        save_dataloader(dataloader, path, self._get_dp_rank(), self._get_tp_rank())
         if is_dist_initialized:
             torch.distributed.barrier(dp_group)
 
@@ -248,7 +248,7 @@ class BaseRecipe:
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             print(f"Loading checkpoint from {ckpt_dir}", flush=True)
 
-        model, optimizer, scheduler, dataloader = None, None, None, None
+        model, optimizer, scheduler = None, None, None
 
         for key in self.__dict__["__state_tracked"]:
             if is_model(getattr(self, key)):
@@ -257,8 +257,8 @@ class BaseRecipe:
                 optimizer = getattr(self, key)
             elif is_lr_scheduler(getattr(self, key)):
                 scheduler = getattr(self, key)
-            elif is_dataloader(getattr(self, key)):
-                dataloader = getattr(self, key)
+            elif is_dataloader(getattr(self, key)) or isinstance(getattr(self, key), StatefulRNG):
+                load_dp_aware_helper(getattr(self, key), key, ckpt_dir, self._get_dp_rank())
             elif is_tokenizer(getattr(self, key)) or isinstance(getattr(self, key), ConfigNode):
                 # we don't need to load the tokenizer or config from the checkpoint
                 # we only save the tokenizer for consolidated checkpoints for downstream use
@@ -274,7 +274,6 @@ class BaseRecipe:
             moe_mesh=moe_mesh,
         )
         load_optimizer(optimizer, model, ckpt_dir, scheduler)
-        load_dataloader(dataloader, ckpt_dir, self._get_dp_rank())
 
     def _log_experiment_details(self):
         """Log metadata and resolved config on main rank using YAML markers."""

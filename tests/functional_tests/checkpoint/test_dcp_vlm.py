@@ -559,6 +559,8 @@ def test_vlm_dcp_checkpoint():
         "step_scheduler.pt",
         "dataloader/dataloader_dp_rank_0.pt",
         "dataloader/dataloader_dp_rank_1.pt",
+        "rng/rng_dp_rank_0.pt",
+        "rng/rng_dp_rank_1.pt",
         "model/__0_0.distcp",
         "model/__1_0.distcp",
         "model/.metadata",
