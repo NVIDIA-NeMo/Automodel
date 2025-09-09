@@ -120,7 +120,7 @@ def build_model_and_optimizer(
     freeze_embeddings=True,
     cfg_fp8=None,
     cfg_compile=None,
-) -> tuple[nn.Module, "Optimizer"]:  # noqa: F821
+) -> tuple[nn.Module, list[str], "Optimizer"]:  # noqa: F821
     """
     Build and initialize a model for VLM.
 
@@ -138,7 +138,7 @@ def build_model_and_optimizer(
         cfg_compile: Configuration for torch.compile.
 
     Returns:
-        The instantiated model on the specified device and optimizer.
+        The instantiated model on the specified device, the state dict keys before any parallelization, and the optimizer.
     """
     is_meta_device = False
     init_ctx = nullcontext()
@@ -166,6 +166,9 @@ def build_model_and_optimizer(
 
         print_trainable_parameters(model)
 
+        # hold a copy of the model state dict keys before any parallelization
+        state_dict_keys = model.state_dict().keys()
+
         if callable(getattr(model_wrapper, "parallelize", None)):
             if isinstance(model_wrapper, MegatronFSDPManager):
                 trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
@@ -178,7 +181,7 @@ def build_model_and_optimizer(
                     model = model.to(device).to(torch.bfloat16)
                 else:
                     model, optimizer = model_wrapper.parallelize(model, optimizer)
-                return model, optimizer
+                return model, state_dict_keys, optimizer
             else:
                 if get_world_size_safe() == 1:
                     logger.info("World size is 1, skipping parallelization.")
@@ -205,10 +208,10 @@ def build_model_and_optimizer(
             compile_config = build_compile_config(cfg_compile)
             model = compile_model(model, compile_config)
 
-        return model, optimizer
+        return model, state_dict_keys, optimizer
 
 
-def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
+def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft, state_dict_keys) -> CheckpointingConfig:
     """Build a checkpoint configuration.
 
     Args:
@@ -216,6 +219,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         cache_dir: Cache directory for the model.
         model_repo_id: Model repository ID.
         is_peft: Whether the model is PEFT.
+        state_dict_keys: Copy of the model state dict keys before any parallelization.
 
     Returns:
         The instantiated checkpoint configuration.
@@ -228,6 +232,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
         save_consolidated=False,
         is_peft=is_peft,
+        model_state_dict_keys=state_dict_keys,
     )
     if cfg_ckpt is not None:
         cfg_ckpt = cfg_ckpt.to_dict()
@@ -546,7 +551,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.peft_config = None
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
-        self.model, self.optimizer = build_model_and_optimizer(
+        self.model, model_state_dict_keys, self.optimizer = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
             self.cfg.optimizer,
@@ -607,6 +612,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.cfg.get("model.cache_dir", None),
             self.cfg.model.pretrained_model_name_or_path,
             True if self.cfg.get("peft", None) else False,
+            model_state_dict_keys,
         )
 
         # Set up the stateful random number generator

@@ -2100,5 +2100,3 @@ def _compare_dicts(expected: dict, restored: dict):
             assert sorted(restored[k]) == sorted(v), error_msg.format(sorted(v), sorted(restored[k]))
         else:
             assert restored[k] == v, error_msg.format(v, restored[k])
-
-test_hf_peft_checkpoint()
