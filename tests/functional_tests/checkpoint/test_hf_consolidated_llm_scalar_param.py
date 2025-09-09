@@ -181,5 +181,3 @@ def test_consolidated_llm_checkpoint_with_scalar_weight():
         if ckpt_dir.parent.exists():
             shutil.rmtree(ckpt_dir.parent)
     torch.distributed.barrier()
-
-test_consolidated_llm_checkpoint_with_scalar_weight()

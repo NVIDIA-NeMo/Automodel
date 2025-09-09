@@ -146,7 +146,7 @@ def test_build_model_and_optimizer_basic():
     cfg_opt = DummyOptConfig(lr=0.01)
 
     device = torch.device("cpu")
-    model, optim = build_model_and_optimizer(
+    model, _, optim = build_model_and_optimizer(
         device=device,
         cfg_model=cfg_model,
         cfg_opt=cfg_opt,
