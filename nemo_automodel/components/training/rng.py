@@ -56,7 +56,6 @@ class StatefulRNG:
             seed (int): Base seed for RNGs.
             ranked (bool): Adjust seed based on process rank.
         """
-        self._saved_state = None
         self.seed = seed
         self.ranked = ranked
         init_all_rng(self.seed, self.ranked)
@@ -95,37 +94,9 @@ class ScopedRNG:
             seed (int): Base seed for RNGs.
             ranked (bool): Adjust seed based on process rank.
         """
-        self._init_state = self.state_dict()
         self._saved_state = None
         self.seed = seed
         self.ranked = ranked
-
-    def __del__(self):
-        self.load_state_dict(self._init_state)
-
-    def state_dict(self):
-        """Get current RNG states.
-
-        Returns:
-            dict: RNG states for random, NumPy, and PyTorch.
-        """
-        return {
-            "random_rng_state": random.getstate(),
-            "np_rng_state": np.random.get_state(),
-            "torch_rng_state": torch.get_rng_state(),
-            "cuda_rng_state": torch.cuda.get_rng_state_all(),
-        }
-
-    def load_state_dict(self, state):  # pragma: no cover
-        """Restore RNG states from a saved state.
-
-        Args:
-            state (dict): RNG states as returned by state_dict().
-        """
-        random.setstate(state["random_rng_state"])
-        np.random.set_state(state["np_rng_state"])
-        torch.set_rng_state(state["torch_rng_state"])
-        torch.cuda.set_rng_state_all(state["cuda_rng_state"])
 
     def __enter__(self):
         """Save current RNG states."""
