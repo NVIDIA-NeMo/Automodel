@@ -60,6 +60,7 @@ class CheckpointingConfig:
     model_repo_id: str
     save_consolidated: bool
     is_peft: bool
+    model_state_dict_keys: list[str]  # copy of the model state dict keys before any parallelization
 
     def __post_init__(self):
         """
@@ -151,6 +152,14 @@ def save_model(
                 fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(
                     index_path, getattr(model, "_checkpoint_conversion_mapping", None)
                 )
+                # some HF models like Moonlight-16B have non-persistent buffers in the base checkpoint
+                # however, HF initializes buffers with persistent=False, so we need to make sure these
+                # buffer keys are not saved during checkpointing
+                keys_to_remove = list(
+                    set(fqn_to_file_index_mapping.keys()) - set(checkpoint_config.model_state_dict_keys)
+                )
+                for key in keys_to_remove:
+                    fqn_to_file_index_mapping.pop(key)
             else:
                 fqn_to_file_index_mapping = {k: 1 for k in model_state_dict.keys()}
 
@@ -158,7 +167,7 @@ def save_model(
             # These will go to the same file as the last file (or file 1 for single-file models)
             default_index = max(fqn_to_file_index_mapping.values())
 
-            # TODO:(@adil-a): This will need to change when we add PP. Maybe we can cache the keys in ModelState.
+            # add any additional keys that are not in the base checkpoint
             for fqn in list(model_state_dict.keys()):
                 fqn_to_file_index_mapping[fqn] = fqn_to_file_index_mapping.get(fqn, default_index)
 
