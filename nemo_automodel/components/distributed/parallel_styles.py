@@ -12,22 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from torch.distributed.tensor.parallel import (
-    ColwiseParallel,
-    ParallelStyle,
-    RowwiseParallel,
-    SequenceParallel,
-    parallelize_module,
-)
 import torch.nn as nn
 from torch.distributed.tensor import (
-    DeviceMesh,
-    distribute_module,
-    distribute_tensor,
-    DTensor,
-    Replicate,
     Shard,
+    distribute_tensor,
 )
+from torch.distributed.tensor.parallel import (
+    ColwiseParallel,
+    RowwiseParallel,
+)
+
+
 class ColwiseParallelLora(ColwiseParallel):
     def _partition_linear_fn(self, name, module, device_mesh):
         # colwise shard weight/bias to Shard(0), weight be Shard(0)
@@ -36,19 +31,18 @@ class ColwiseParallelLora(ColwiseParallel):
         def _distribute_param(_module, name):
             param = getattr(_module, name)
             dist_param = nn.Parameter(
-                distribute_tensor(
-                    param, device_mesh, [Shard(0)], src_data_rank=self.src_data_rank
-                )
+                distribute_tensor(param, device_mesh, [Shard(0)], src_data_rank=self.src_data_rank)
             )
             _module.register_parameter(name, dist_param)
 
         for name, param in module.named_parameters():
-            if name.endswith('lora_A.weight'):
+            if name.endswith("lora_A.weight"):
                 _distribute_param(module.lora_A, "weight")
-            elif name.endswith('lora_B.weight'):
+            elif name.endswith("lora_B.weight"):
                 _distribute_param(module.lora_B, "weight")
             else:
                 _distribute_param(module, name)
+
 
 class RowwiseParallelLora(RowwiseParallel):
     def _partition_linear_fn(self, name, module, device_mesh):
@@ -61,6 +55,7 @@ class RowwiseParallelLora(RowwiseParallel):
         if hasattr(module, "lora_A"):
             super()._partition_linear_fn(name, module.lora_A, device_mesh)
             super()._partition_linear_fn(name, module.lora_B, device_mesh)
+
 
 def translate_to_lora(plan):
     if isinstance(plan, ColwiseParallel):
