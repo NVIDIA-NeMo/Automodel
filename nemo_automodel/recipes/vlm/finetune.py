@@ -53,6 +53,7 @@ from nemo_automodel.components.utils.compile_utils import (
     compile_model,
 )
 from nemo_automodel.components.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
+from nemo_automodel.components._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
@@ -526,6 +527,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         torch.cuda.reset_peak_memory_stats()
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
         setup_logging()
+
+        apply_cache_compatibility_patches()
 
         self.device_mesh = None
         self.model_wrapper = None

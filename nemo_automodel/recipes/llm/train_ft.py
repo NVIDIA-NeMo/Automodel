@@ -69,6 +69,7 @@ from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     print_trainable_parameters,
 )
+from nemo_automodel.components._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
@@ -687,6 +688,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
         # setups logging and adds the rankfilter to logging
         setup_logging()
+
+        apply_cache_compatibility_patches()
 
         self.device_mesh = None
         self.moe_mesh = None
