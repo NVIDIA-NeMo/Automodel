@@ -239,6 +239,8 @@ class ConfigNode:
         config_kwargs.update(kwargs)
 
         try:
+            print(args)
+            print(config_kwargs)
             return func(*args, **config_kwargs)
         except Exception as e:
             sig = inspect.signature(func)

@@ -496,7 +496,7 @@ class Gate(nn.Module):
             weights = original_scores.gather(1, indices)
         elif self.topk_method == "greedy":
             weights, indices = torch.topk(
-                scores, k=self.top_k, dim=-1, sorted=False
+                scores, k=self.topk, dim=-1, sorted=False
             )
         else:
             raise NotImplementedError(
@@ -767,7 +767,8 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
     with torch.device(buffer_device):
         if isinstance(module, Gate):
             to_local(module.weight).normal_(mean=0.0, std=init_std)
-            to_local(module.e_score_correction_bias).zero_()
+            if hasattr(module, 'e_score_correction_bias'):
+                to_local(module.e_score_correction_bias).zero_()
         elif isinstance(module, GroupedExperts):
             to_local(module.gate_projs).normal_(mean=0.0, std=init_std)
             to_local(module.up_projs).normal_(mean=0.0, std=init_std)
