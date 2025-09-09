@@ -49,8 +49,6 @@ class RowwiseParallelLora(RowwiseParallel):
         # Rowwise shard weight to Shard(1), bias to Replicate(), weight be Shard(1)
         # means Rowwise as nn.Linear is input * weight^T + bias, where
         # weight would become Shard(0)
-        if isinstance(module, nn.Dropout):
-            return
         super()._partition_linear_fn(name, module, device_mesh)
         if hasattr(module, "lora_A"):
             super()._partition_linear_fn(name, module.lora_A, device_mesh)
