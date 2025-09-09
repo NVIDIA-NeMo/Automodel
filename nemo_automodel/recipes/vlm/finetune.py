@@ -45,7 +45,7 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
-from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.components.training.rng import StatefulRNG, RNGCtxManager
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import count_tail_padding
 from nemo_automodel.components.utils.compile_utils import (
@@ -149,7 +149,7 @@ def build_model_and_optimizer(
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else init_ctx
         del cfg_model.is_meta_device
 
-    with StatefulRNG(seed=seed, ranked=True):
+    with RNGCtxManager(seed=seed, ranked=True):
         kwargs = {}
 
         # Instantiate the model in meta device to avoid OOM
@@ -279,7 +279,7 @@ def build_dataloader(
             "rank": device_mesh["dp"].get_local_rank(),
         }
 
-    with StatefulRNG(seed=seed, ranked=True):
+    with RNGCtxManager(seed=seed, ranked=True):
         processor = None
         processor_kwargs = {}
         if cfg_processor is not None and hasattr(cfg_processor, "instantiate"):
@@ -737,7 +737,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
     @torch.no_grad()
     def _run_validation_epoch(self):
         """Run one pass over `self.val_dataloader`."""
-        with StatefulRNG(seed=1, ranked=True):
+        with RNGCtxManager(seed=1, ranked=True):
             self.model.eval()
 
             total_loss = 0.0
