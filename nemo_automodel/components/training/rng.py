@@ -45,12 +45,14 @@ def init_all_rng(seed: int, ranked: bool = False):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+
 @dataclass
 class RNGState:
     random_rng_state: tuple
     np_rng_state: tuple
     torch_rng_state: torch.Tensor
     cuda_rng_state: torch.Tensor
+
 
 def _get_rng_state():
     """Get current RNG states.
@@ -65,6 +67,7 @@ def _get_rng_state():
         cuda_rng_state=torch.cuda.get_rng_state_all(),
     )
 
+
 def _restore_rng_state(state):
     """Restore RNG states from a saved state.
 
@@ -75,6 +78,7 @@ def _restore_rng_state(state):
     np.random.set_state(state.np_rng_state)
     torch.set_rng_state(state.torch_rng_state)
     torch.cuda.set_rng_state_all(state.cuda_rng_state)
+
 
 class StatefulRNG:
     """
@@ -107,6 +111,7 @@ class StatefulRNG:
         """
         _restore_rng_state(state)
 
+
 class ScopedRNG:
     """Context manager for reproducible RNG states across random, NumPy, and PyTorch."""
 
@@ -121,7 +126,6 @@ class ScopedRNG:
         self.seed = seed
         self.ranked = ranked
 
-
     def __enter__(self):
         """Save current RNG states."""
         assert self._saved_state is None
@@ -133,4 +137,3 @@ class ScopedRNG:
         """Restore RNG states on context exit."""
         _restore_rng_state(self._saved_state)
         self._saved_state = None
-
