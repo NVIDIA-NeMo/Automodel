@@ -49,7 +49,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
-from nemo_automodel.components.training.rng import RNGCtxManager
+from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.utils import count_tail_padding
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
@@ -71,7 +71,7 @@ def _build_teacher_model(cfg_teacher, seed, has_packed_sequence, device, model_w
     logger.info("Instantiating teacher model")
 
     # Build teacher model using the same approach as student model
-    with RNGCtxManager(seed=seed, ranked=True):
+    with ScopedRNG(seed=seed, ranked=True):
         kwargs: Dict[str, Any] = {}
         if has_packed_sequence > 0:
             kwargs["attn_implementation"] = "flash_attention_2"

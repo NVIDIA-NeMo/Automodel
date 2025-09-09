@@ -85,7 +85,7 @@ class StatefulRNG:
         torch.set_rng_state(state["torch_rng_state"])
         torch.cuda.set_rng_state_all(state["cuda_rng_state"])
 
-class RNGCtxManager:
+class ScopedRNG:
     """Context manager for reproducible RNG states across random, NumPy, and PyTorch."""
 
     def __init__(self, seed: int, ranked: bool = False):
@@ -138,3 +138,4 @@ class RNGCtxManager:
         """Restore RNG states on context exit."""
         self.load_state_dict(self._saved_state)
         self._saved_state = None
+
