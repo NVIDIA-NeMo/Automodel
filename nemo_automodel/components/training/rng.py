@@ -26,7 +26,7 @@ def init_all_rng(seed: int, ranked: bool = False):
         seed (int): Base seed value.
         ranked (bool): Adjust seed by process rank if True.
     """
-    assert isinstance(seed, int) and seed > 0, "Seed must be a positive integer"
+    assert isinstance(seed, int) and seed > 0, ("Seed must be a positive integer", seed)
     assert isinstance(ranked, bool), "Ranked must be a boolean"
 
     if ranked:
@@ -115,7 +115,7 @@ class StatefulRNG:
 class ScopedRNG:
     """Context manager for reproducible RNG states across random, NumPy, and PyTorch."""
 
-    def __init__(self, seed: int, ranked: bool = False):
+    def __init__(self, seed: int = 95050, ranked: bool = False):
         """Initialize and optionally rank-adjust RNGs with a given seed.
 
         Args:
