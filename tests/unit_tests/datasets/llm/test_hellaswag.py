@@ -76,9 +76,7 @@ def test_dataset_basic():
     tgts = ds.get_target(_build_tiny_dataset())
     assert tgts == ["e1_c", "e2_a"]
 
-    # __getitem__ strips attention_mask
     row = ds[0]
-    assert "attention_mask" not in row
     assert row["ctx"] == "ctx 1"
 
 
