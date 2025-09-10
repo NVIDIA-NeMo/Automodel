@@ -117,7 +117,7 @@ def test_plain_tokenizer_basic():
       • produce loss_mask = [0]*len(context_ids) + [1]*len(answer_ids)
     """
     tok = DummyTokenizer()
-    ds = make_squad_dataset(tok, split="train", seq_length=None)
+    ds = make_squad_dataset(tok, split="train", max_seq_length=None)
     # The dataset should have 2 examples (mocked dataset length)
     assert len(ds) == 2
     sample = ds[0]
@@ -143,7 +143,7 @@ def test_sequence_max_len_enforced():
     """
     tok = DummyTokenizer()
     pad_len = 32
-    ds = make_squad_dataset(tok, seq_length=pad_len)
+    ds = make_squad_dataset(tok, max_seq_length=pad_len)
     for row in ds:
         for key, val in row.items():
             if key == "___PAD_TOKEN_IDS___":
@@ -181,7 +181,7 @@ def test_chat_template_path():
     ds = make_squad_dataset(
         tok,
         start_of_turn_token=start_token,
-        seq_length=None,  # no padding
+        max_seq_length=None,  # no padding
     )
     row = ds[0]
     n = len(row['input_ids'])

@@ -154,7 +154,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
         *,
         split: Optional[str] = None,
         answer_only_loss_mask: bool = True,
-        seq_length: Optional[int] = None,
+        max_seq_length: Optional[int] = None,
         start_of_turn_token: Optional[str] = None,
     ) -> None:
         """
@@ -166,7 +166,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
             tokenizer: The tokenizer to use.
             split: The split of the dataset to load.
             answer_only_loss_mask: Whether to compute the loss mask only on the answer tokens.
-            seq_length: The sequence length to use for padding.
+            max_seq_length: The sequence length to use for padding.
             start_of_turn_token: The token to use to indicate the start of a turn.
         """
 
@@ -209,7 +209,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
 
         self.answer_only_loss_mask = answer_only_loss_mask
         self.start_of_turn_token = start_of_turn_token
-        self.seq_length = seq_length
+        self.max_seq_length = max_seq_length
 
     def __len__(self) -> int:  # noqa: D401
         """
@@ -291,7 +291,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
                 formatted_text,
                 eos_token_id,
                 pad_token_id,
-                max_seq_length=self.seq_length,
+                max_seq_length=self.max_seq_length,
                 start_of_turn_token=self.start_of_turn_token,
             )
         else:
@@ -303,6 +303,6 @@ class ColumnMappedTextInstructionDataset(Dataset):
                 answer,
                 eos_token_id,
                 pad_token_id,
-                max_seq_length=self.seq_length,
+                max_seq_length=self.max_seq_length,
                 answer_only_loss_mask=self.answer_only_loss_mask,
             )
