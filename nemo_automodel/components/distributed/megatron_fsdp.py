@@ -122,6 +122,12 @@ class MegatronFSDPManager:
     nccl_ub: Optional[bool] = field(default=False, metadata={"help": "Use NCCL UBs if True."})
     fsdp_double_buffer: Optional[bool] = field(default=False, metadata={"help": "Use double buffer if True."})
 
+    # Gradient / Activation checkpointing
+    activation_checkpointing: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Enable activation checkpointing for transformer MLP layers to save memory."},
+    )
+
     def __post_init__(self):
         """
         Post-initialization hook that sets up the distributed environment.
