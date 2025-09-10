@@ -15,6 +15,10 @@
 import os
 
 import pytest
+<<<<<<< HEAD
+=======
+from fsspec.implementations.local import LocalFileSystem
+>>>>>>> 7b55cab (fix: patch transformer dynamiccache (#443))
 
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
     _write_sub_tensor_to_file_optimized,
@@ -30,6 +34,11 @@ def test_write_scalar_tensor(tmp_path):
     which produced corrupt `.safetensors` files (incomplete metadata).
     """
 
+<<<<<<< HEAD
+=======
+    fs = LocalFileSystem()
+
+>>>>>>> 7b55cab (fix: patch transformer dynamiccache (#443))
     # Prepare an empty temporary output file
     output_file = tmp_path / "scalar_tensor.bin"
     output_file.write_bytes(b"")  # create the file
@@ -38,22 +47,35 @@ def test_write_scalar_tensor(tmp_path):
     sub_tensor_bytes = b"\x34\x12"
     element_size = len(sub_tensor_bytes)  # 2 bytes for BF16
 
+<<<<<<< HEAD
     # Prepare destination buffer for a scalar tensor (element_size bytes)
     full_tensor_mv = memoryview(bytearray(element_size))
 
     # Call the routine under test: scalar has empty shapes and offsets
     _write_sub_tensor_to_file_optimized(
         full_tensor_mv,
+=======
+    # Call the routine under test: scalar has empty shapes and offsets
+    _write_sub_tensor_to_file_optimized(
+        fs,
+>>>>>>> 7b55cab (fix: patch transformer dynamiccache (#443))
         sub_tensor_bytes,
         element_size,
         tensor_shape=[],  # scalar
         sub_tensor_offsets=[],
         sub_tensor_shape=[],
+<<<<<<< HEAD
     )
 
     # Emulate file write as done by the caller in production code
     output_file.write_bytes(full_tensor_mv.tobytes())
 
+=======
+        output_file_path=str(output_file),
+        output_start_byte=0,
+    )
+
+>>>>>>> 7b55cab (fix: patch transformer dynamiccache (#443))
     # The file must now contain exactly the scalar payload
     written = output_file.read_bytes()
     assert written == sub_tensor_bytes

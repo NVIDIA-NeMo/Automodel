@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+<<<<<<< HEAD
 import logging
+=======
+>>>>>>> 7b55cab (fix: patch transformer dynamiccache (#443))
 import re
 from typing import Any, Optional
 
@@ -22,6 +25,7 @@ from transformers import DeepseekV3Config
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.moe.layers import MoEConfig
+<<<<<<< HEAD
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
 from nemo_automodel.components.moe.utils import BackendConfig
 
@@ -32,6 +36,13 @@ BLOCK_SIZE = 128
 
 
 class DeepSeekV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
+=======
+from nemo_automodel.components.moe.state_dict_mixin import MoEStateDictMixin
+from nemo_automodel.components.moe.utils import BackendConfig
+
+
+class DeepSeekV3StateDictAdapter(MoEStateDictMixin, StateDictAdapter):
+>>>>>>> 7b55cab (fix: patch transformer dynamiccache (#443))
     def __init__(
         self,
         config: DeepseekV3Config,
@@ -44,6 +55,10 @@ class DeepSeekV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         self.backend = backend
         self.dtype = dtype
         self._uses_model_prefix = True
+<<<<<<< HEAD
+=======
+        self._had_scale_inv_tensors = False
+>>>>>>> 7b55cab (fix: patch transformer dynamiccache (#443))
         self.from_hf_map = {
             "model.layers.{}.mlp.experts.{}.gate_proj.weight": "model.layers.{}.mlp.experts.gate_projs",
             "model.layers.{}.mlp.experts.{}.up_proj.weight": "model.layers.{}.mlp.experts.up_projs",
@@ -79,6 +94,7 @@ class DeepSeekV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             if key.endswith(".weight") and not any(
                 non_quantized_key in key for non_quantized_key in non_quantized_keys
             ):
+<<<<<<< HEAD
                 value = value.to(dtype=torch.float8_e4m3fn)
                 state_dict[key] = value
                 expected_scale_shape = calculate_scale_shape(value)
@@ -86,10 +102,15 @@ class DeepSeekV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
                 weight_scale_inv_state_dict[key + "_scale_inv"] = torch.ones(
                     expected_scale_shape, dtype=torch.float32, device=value.device
                 )
+=======
+                expected_scale_shape = calculate_scale_shape(value)
+                weight_scale_inv_state_dict[key + "_scale_inv"] = torch.ones(expected_scale_shape, dtype=self.dtype)
+>>>>>>> 7b55cab (fix: patch transformer dynamiccache (#443))
 
         state_dict.update(weight_scale_inv_state_dict)
         return state_dict
 
+<<<<<<< HEAD
     def to_hf(
         self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
     ) -> dict[str, Any]:
@@ -97,11 +118,25 @@ class DeepSeekV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         Automatically detects format based on backend.enable_deepep configuration.
         """
         hf_state_dict = self._to_hf_w_split_experts(state_dict)
+=======
+    def to_hf(self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None) -> dict[str, Any]:
+        """Convert from native model state dict to HuggingFace format.
+        Automatically detects format based on backend.enable_deepep configuration.
+        """
+        if self.backend.enable_deepep:
+            hf_state_dict = self._to_hf_deepep(state_dict)
+        else:
+            hf_state_dict = self._to_hf_grouped_experts(state_dict)
+>>>>>>> 7b55cab (fix: patch transformer dynamiccache (#443))
 
         if exclude_key_regex:
             hf_state_dict = {k: v for k, v in hf_state_dict.items() if not re.match(exclude_key_regex, k)}
 
+<<<<<<< HEAD
         if quantization:
+=======
+        if self._had_scale_inv_tensors:
+>>>>>>> 7b55cab (fix: patch transformer dynamiccache (#443))
             return self._add_quantization_scale_inv_tensors(hf_state_dict)
         else:
             return hf_state_dict
@@ -110,7 +145,11 @@ class DeepSeekV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         self,
         hf_state_dict: dict[str, Any],
         device_mesh: Optional["DeviceMesh"] = None,
+<<<<<<< HEAD
         **kwargs,
+=======
+        target_format: str = "auto",
+>>>>>>> 7b55cab (fix: patch transformer dynamiccache (#443))
     ) -> dict[str, Any]:
         """Convert HF checkpoint to native format.
         - Dequantize FP8 tensors if scale_inv buffers are provided
@@ -120,6 +159,7 @@ class DeepSeekV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         for key in hf_state_dict.keys():
             if ".mlp.experts." in key and key.endswith(".weight"):
                 self._uses_model_prefix = key.startswith("model.")
+<<<<<<< HEAD
 
         hf_state_dict = self._dequantize(hf_state_dict)
         return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
@@ -179,3 +219,54 @@ def dequantize_from_fp8(
             dequantized[row_start:row_end, col_start:col_end] = block_converted
 
     return dequantized
+=======
+            if key.endswith("_scale_inv"):
+                self._had_scale_inv_tensors = True
+
+        hf_state_dict = self._dequantize(hf_state_dict)
+
+        if target_format == "auto":
+            actual_target_format = "deepep" if self.backend.enable_deepep else "grouped_experts"
+        else:
+            if target_format not in ["grouped_experts", "deepep"]:
+                raise ValueError(f"target_format must be 'auto', 'grouped_experts' or 'deepep', got '{target_format}'")
+            actual_target_format = target_format
+
+        if actual_target_format == "deepep":
+            return self._from_hf_deepep(hf_state_dict, device_mesh)
+        else:
+            return self._from_hf_grouped_experts(hf_state_dict, device_mesh)
+
+
+def dequantize_from_fp8(
+    weight: torch.Tensor, scale_inv: torch.Tensor, dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    """
+    Minimal FP8 dequantization: cast to dtype and divide by inverse scale.
+    Broadcasts scale_inv over the last dimension of weight.
+    """
+    w = weight.to(dtype)
+    s = scale_inv.to(dtype)
+    # Ensure broadcast shape: append singleton dims to scale_inv to match weight
+    if s.ndim < w.ndim:
+        expand_shape = list(s.shape) + [1] * (w.ndim - s.ndim)
+        s = s.view(*expand_shape)
+    return w / s
+
+
+def calculate_scale_shape(weight: torch.Tensor) -> tuple[int, ...]:
+    """
+    Compute expected shape for per-row inverse scales.
+    - 2D [out, in] -> [out, 1]
+    - 3D [N, out, in] -> [N, out, 1]
+    Fallback: last dim collapsed to 1
+    """
+    if weight.ndim == 2:
+        return (weight.shape[0], 1)
+    if weight.ndim == 3:
+        return (weight.shape[0], weight.shape[1], 1)
+    shape = list(weight.shape)
+    if len(shape) > 0:
+        shape[-1] = 1
+    return tuple(shape)
+>>>>>>> 7b55cab (fix: patch transformer dynamiccache (#443))

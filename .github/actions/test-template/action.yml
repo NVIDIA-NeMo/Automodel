@@ -163,10 +163,15 @@ runs:
           --shm-size=64g \
           --env TRANSFORMERS_OFFLINE=0 \
           --env HYDRA_FULL_ERROR=1 \
+<<<<<<< HEAD
           --env HF_CACHE=/home/TestData/lite/hf_cache \
           --env HF_HOME=/home/TestData/HF_HOME \
           --env RUN_ID=${{ github.run_id }} \
           --env TEST_DATA_DIR=/home/TestData/automodel \
+=======
+          --env HF_HOME=/home/TestData/HF_HOME \
+          --env RUN_ID=${{ github.run_id }} \
+>>>>>>> 7b55cab (fix: patch transformer dynamiccache (#443))
           --volume $(pwd)/NeMo-Automodel:/workspace \
           --workdir /workspace \
           --volume $MNT_PATH/TestData:/home/TestData \
