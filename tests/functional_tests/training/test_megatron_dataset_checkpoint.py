@@ -35,6 +35,7 @@ def test_megatron_dataset_checkpointing():
     dp_rank = device_mesh["dp"].get_local_rank()
     dp_world_size = device_mesh["dp"].size()
     tp_rank = device_mesh["tp"].get_local_rank()
+    pp_rank = device_mesh["pp"].get_local_rank()
 
     dataset = build_dataloader(
         cfg_ds=cfg.dataset,
@@ -55,7 +56,7 @@ def test_megatron_dataset_checkpointing():
     for i, batch in enumerate(dataset):
         if i == 2:
             # save checkpoint
-            save_dp_aware_helper(dataset, "dataloader", cfg.checkpoint.checkpoint_dir, dp_rank, tp_rank)
+            save_dp_aware_helper(dataset, "dataloader", cfg.checkpoint.checkpoint_dir, dp_rank, tp_rank, pp_rank)
         elif i == 3:
             expected_batch = batch
             break
