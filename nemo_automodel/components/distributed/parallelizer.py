@@ -68,7 +68,6 @@ from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGe
 
 # Import model-specific tensor parallel plans from the dedicated module
 from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE_FUNCTIONS
-from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
 
 # TODO(boxiangw): Change to MegatronFSDP once it got published
 HAVE_MEGATRON_FSDP = False
@@ -98,6 +97,7 @@ class ParallelizationStrategy(ABC):
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
+        fp8_config: Optional["FP8Config"] = None,
     ) -> nn.Module:
         """Apply parallelization strategy to the model."""
         pass
@@ -118,6 +118,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
+        fp8_config: Optional["FP8Config"] = None,
     ) -> nn.Module:
         """Apply the default parallelization flow."""
         tp_mesh = device_mesh[tp_mesh_name]
@@ -135,10 +136,14 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             # Validate that attention heads are divisible by TP size
             validate_tp_mesh(model, tp_mesh)
 
-            # Generate or use tensor parallel plan
-            model_parallel_plan = {
-                k: translate_to_lora(v) for k, v in _get_parallel_plan(model, sequence_parallel, tp_shard_plan).items()
-            }
+            # Generate or use tensor parallel plan with FP8 support
+            model_parallel_plan = _get_parallel_plan(
+                model, 
+                sequence_parallel, 
+                tp_shard_plan, 
+                fp8_config=fp8_config, 
+                tp_size=tp_mesh.size()
+            )
 
             # Apply tensor parallelism
             if model_parallel_plan:
@@ -202,10 +207,15 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
+        fp8_config: Optional["FP8Config"] = None,
     ) -> nn.Module:
         """Apply NemotronH-specific parallelization."""
         assert not sequence_parallel, "Sequence parallelism is not supported for NemotronHForCausalLM"
         assert tp_shard_plan is None, "Custom parallel plan is not supported for NemotronHForCausalLM"
+        
+        # Note: FP8+TP is not yet implemented for NemotronH models
+        if fp8_config is not None and fp8_config.enabled:
+            print("Warning: FP8+TP is not yet implemented for NemotronH models. FP8 config will be ignored for tensor parallelism.")
 
         tp_mesh = device_mesh[tp_mesh_name]
         dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
@@ -657,12 +667,11 @@ def _get_parallel_plan(
     model: nn.Module,
     sequence_parallel: bool = False,
     tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+    fp8_config: Optional["FP8Config"] = None,
+    tp_size: int = 1,
 ) -> Dict[str, ParallelStyle]:
-    """
-    Get the parallel plan for the model.
-    """
+    """Get the parallel plan for the model."""
 
-    # Generate or use tensor parallel plan
     model_parallel_plan = None
     model_cls = type(model)
 
@@ -683,32 +692,23 @@ def _get_parallel_plan(
                 )
                 print("Using provided parallel plan (from path).")
             except Exception as e:
-                raise ValueError(
-                    f"Custom parallel plan '{tp_shard_plan}' is not valid. "
-                    f"Please ensure it is one of the following:\n"
-                    "1. A dictionary mapping module names to parallel styles\n"
-                    "2. A path to a dictionary\n"
-                    "3. A path to a function that returns a dictionary\n"
-                    f"Error: {e}"
-                )
+                raise ValueError(f"Custom parallel plan '{tp_shard_plan}' is not valid: {e}")
 
-    # 2. Use optimized parallel plan based on model type
+    # 2. Use optimized plan (now handles FP8+TP internally)
     elif model_cls in PARALLELIZE_FUNCTIONS:
         try:
             func = PARALLELIZE_FUNCTIONS[model_cls]
             model_parallel_plan = func(model, sequence_parallel)
             print("Using optimized parallel plan.")
         except Exception as e:
-            print(f"Optimized parallel plan is not available: {e}. Falling back to the HF tp plan.")
-            assert not sequence_parallel, "sequence_parallel is not supported in HF tp plan."
-            model_parallel_plan = get_hf_tp_shard_plan(model)
+            print(f"Optimized parallel plan failed: {e}. Using HF TP plan.")
+            model_parallel_plan = None
 
-    # 3. Use HF TP plan as fallback
-    else:
-        if model_cls not in PARALLELIZE_FUNCTIONS:
-            print(f"Optimized parallel plan is not supported for {model_cls}. Falling back to the HF tp plan.")
-        assert not sequence_parallel, "sequence_parallel is not supported in HF tp plan."
+    # 3. Fallback to HF TP plan
+    if model_parallel_plan is None:
+        assert not sequence_parallel, "sequence_parallel not supported in HF TP plan."
         model_parallel_plan = get_hf_tp_shard_plan(model)
+        print("Using HF TP plan.")
 
     return model_parallel_plan
 
@@ -726,6 +726,7 @@ def fsdp2_strategy_parallelize(
     dp_replicate_mesh_name: str = "dp_replicate",
     dp_shard_cp_mesh_name: str = "dp_shard_cp",
     tp_mesh_name: str = "tp",
+    fp8_config: Optional["FP8Config"] = None,
 ):
     """
     Apply parallelisms and activation checkpointing to the model.
@@ -738,6 +739,7 @@ def fsdp2_strategy_parallelize(
     - Activation checkpointing for MLP layers
     - Model validation (attention heads divisible by TP size)
     - Better fallback logic
+    - FP8+TP support for enhanced performance
 
     Args:
         model: The model to be parallelized.
@@ -757,6 +759,7 @@ def fsdp2_strategy_parallelize(
             Used when data parallel shard is enabled. Defaults to "dp_shard_cp".
         tp_mesh_name (str): Key name for the tensor parallel mesh in device_mesh.
             Defaults to "tp".
+        fp8_config (Optional[FP8Config]): FP8 configuration for enabling FP8+TP optimizations.
 
     Returns:
         The parallelized model.
@@ -767,7 +770,7 @@ def fsdp2_strategy_parallelize(
     # Get the appropriate parallelization strategy for this model
     strategy = get_parallelization_strategy(model)
 
-    # Delegate to the strategy
+    # Apply the strategy with FP8 support
     return strategy.parallelize(
         model=model,
         device_mesh=device_mesh,
@@ -779,6 +782,7 @@ def fsdp2_strategy_parallelize(
         dp_replicate_mesh_name=dp_replicate_mesh_name,
         dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
         tp_mesh_name=tp_mesh_name,
+        fp8_config=fp8_config,
     )
 
 

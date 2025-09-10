@@ -7,7 +7,7 @@
 import logging
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -22,6 +22,17 @@ try:
     HAVE_TORCHAO = True
 except ImportError:
     HAVE_TORCHAO = False
+
+# Try to import Float8 tensor parallel classes
+try:
+    from torchao.float8.float8_tensor_parallel import (
+        Float8ColwiseParallel,
+        Float8RowwiseParallel,
+        PrepareFloat8ModuleInput,
+    )
+    HAVE_FLOAT8_TP = True
+except ImportError:
+    HAVE_FLOAT8_TP = False
 
 
 @dataclass
@@ -53,6 +64,9 @@ class FP8Config:
     emulate: bool = False
     """If True, emulation is used instead of hardware accelerated gemm. This is for test purpose only"""
 
+    enable_tensorwise_tp: bool = False
+    """Whether to enable Float8 tensorwise tensor parallelism. Requires tensorwise recipe and TP > 1."""
+
     def __init__(
         self,
         enabled: bool = False,
@@ -62,6 +76,7 @@ class FP8Config:
         force_recompute_fp8_weight_in_bwd: bool = False,
         filter_fqns: List[str] = None,
         emulate: bool = False,
+        enable_tensorwise_tp: bool = False,
     ):
         self.enabled = enabled
         self.recipe_name = recipe_name
@@ -70,6 +85,7 @@ class FP8Config:
         self.force_recompute_fp8_weight_in_bwd = force_recompute_fp8_weight_in_bwd
         self.filter_fqns = filter_fqns or []
         self.emulate = emulate
+        self.enable_tensorwise_tp = enable_tensorwise_tp
 
     @classmethod
     def from_config_node(cls, config_node):
@@ -93,6 +109,7 @@ class FP8Config:
             "force_recompute_fp8_weight_in_bwd": self.force_recompute_fp8_weight_in_bwd,
             "fp8_filter_fqns": self.filter_fqns,
             "fp8_emulate": self.emulate,
+            "enable_tensorwise_tp": self.enable_tensorwise_tp,
         }
 
 
@@ -140,6 +157,65 @@ def _module_filter_fn(module, name, filter_fqns: List[str] = None):
     return True
 
 
+def get_fp8_tensor_parallel_classes(enable_float8_tensorwise_tp: bool = False):
+    """
+    Get the appropriate tensor parallel classes for FP8 or regular training.
+    
+    Args:
+        enable_float8_tensorwise_tp: Whether to use Float8 tensor parallel classes
+        
+    Returns:
+        Tuple of (rowwise_parallel_class, colwise_parallel_class, prepare_module_input_class)
+    """
+    from torch.distributed.tensor.parallel import (
+        ColwiseParallel,
+        RowwiseParallel,
+        PrepareModuleInput,
+    )
+    
+    if enable_float8_tensorwise_tp and HAVE_FLOAT8_TP:
+        return Float8RowwiseParallel, Float8ColwiseParallel, PrepareFloat8ModuleInput
+    else:
+        if enable_float8_tensorwise_tp and not HAVE_FLOAT8_TP:
+            logger.warning("Float8 TP classes not available, using regular TP classes")
+        
+        return RowwiseParallel, ColwiseParallel, PrepareModuleInput
+
+
+def should_enable_float8_tensorwise_tp(fp8_config: FP8Config, tp_size: int = 1) -> bool:
+    """
+    Determine if Float8 tensorwise tensor parallelism should be enabled.
+    
+    Args:
+        fp8_config: FP8 configuration
+        tp_size: Tensor parallel size
+        
+    Returns:
+        True if Float8 tensorwise TP should be enabled
+    """
+    if not fp8_config.enabled:
+        return False
+        
+    if not fp8_config.enable_tensorwise_tp:
+        return False
+        
+    if tp_size <= 1:
+        return False
+        
+    # Only enable for tensorwise recipe (not rowwise)
+    if fp8_config.recipe_name is not None and fp8_config.recipe_name != "tensorwise":
+        return False
+        
+    # Check if Float8 TP classes are available
+    if not HAVE_FLOAT8_TP:
+        logger.warning(
+            "Float8 tensorwise TP requested but torchao.float8.float8_tensor_parallel is not available"
+        )
+        return False
+        
+    return True
+
+
 def apply_fp8_to_model(
     model: nn.Module,
     config: Optional[FP8Config] = None,
@@ -151,6 +227,7 @@ def apply_fp8_to_model(
     emulate: bool = False,
     enabled: bool = True,
     precompute_float8_dynamic_scale_for_fsdp: bool = False,
+    enable_tensorwise_tp: bool = False,
 ) -> nn.Module:
     """
     Apply FP8 quantization to a PyTorch model using torchao.
@@ -170,6 +247,7 @@ def apply_fp8_to_model(
         emulate: Use emulation instead of hardware acceleration (for testing on older GPUs)
         enabled: Whether FP8 quantization is enabled (only used when config is None)
         precompute_float8_dynamic_scale_for_fsdp: Whether to precompute float8 scales dynamically
+        enable_tensorwise_tp: Whether to enable Float8 tensorwise tensor parallelism
 
     Returns:
         The model with FP8 linear layers (modified in-place)
@@ -192,6 +270,7 @@ def apply_fp8_to_model(
             force_recompute_fp8_weight_in_bwd=force_recompute_fp8_weight_in_bwd,
             filter_fqns=filter_fqns or [],
             emulate=emulate,
+            enable_tensorwise_tp=enable_tensorwise_tp,
         )
 
     # Check if FP8 is disabled
@@ -250,7 +329,8 @@ def apply_fp8_to_model(
         logger.info(
             f"Successfully converted model to FP8 with torchAO, recipe: {fp8_config.recipe_name or 'tensorwise'}, "
             f"fp8 all-gather enabled: {torchao_config.enable_fsdp_float8_all_gather}, "
-            f"force recompute FP8 weight in backward pass: {torchao_config.force_recompute_fp8_weight_in_bwd}"
+            f"force recompute FP8 weight in backward pass: {torchao_config.force_recompute_fp8_weight_in_bwd}, "
+            f"tensorwise TP enabled: {fp8_config.enable_tensorwise_tp}"
         )
         verify_fp8_conversion(model)
         logger.info("FP8 quantization applied successfully")
@@ -333,6 +413,7 @@ def create_fp8_config_from_dict(config_dict: Dict[str, Any]) -> FP8Config:
         force_recompute_fp8_weight_in_bwd=config_dict.get("force_recompute_fp8_weight_in_bwd", False),
         filter_fqns=config_dict.get("filter_fqns", []),
         emulate=config_dict.get("emulate", False),
+        enable_tensorwise_tp=config_dict.get("enable_tensorwise_tp", False),
     )
 
 
@@ -350,3 +431,24 @@ def build_fp8_config(cfg: Optional[Dict[str, Any]]) -> FP8Config:
         return FP8Config(enabled=False)
     else:
         return create_fp8_config_from_dict(cfg)
+
+
+def precompute_fp8_dynamic_scale_for_fsdp(model: nn.Module):
+    """
+    Precompute FP8 dynamic scales for FSDP if the model has the attribute set.
+    
+    Args:
+        model: The model to precompute scales for
+    """
+    if not HAVE_TORCHAO:
+        return
+        
+    if hasattr(model, "precompute_float8_dynamic_scale_for_fsdp") and model.precompute_float8_dynamic_scale_for_fsdp:
+        try:
+            from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp as torchao_precompute
+            torchao_precompute(model)
+            logger.debug("Precomputed FP8 dynamic scales for FSDP")
+        except ImportError:
+            logger.warning("Could not import precompute_float8_dynamic_scale_for_fsdp from torchao")
+        except Exception as e:
+            logger.warning(f"Failed to precompute FP8 dynamic scales: {e}")

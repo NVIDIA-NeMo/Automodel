@@ -705,7 +705,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.moe_mesh = None
         self.model_wrapper = None
         if "distributed" in self.cfg:
-            self.model_wrapper = self.cfg.distributed.instantiate(world_size=self.dist_env.world_size)
+            # Pass FP8 config to model wrapper if available
+            instantiate_kwargs = {"world_size": self.dist_env.world_size}
+            if self.cfg.get("fp8", None) is not None:
+                from nemo_automodel.components.quantization.fp8 import build_fp8_config
+                fp8_config = build_fp8_config(self.cfg.fp8)
+                instantiate_kwargs["fp8_config"] = fp8_config
+            
+            self.model_wrapper = self.cfg.distributed.instantiate(**instantiate_kwargs)
             self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
             self.moe_mesh = getattr(self.model_wrapper, "moe_mesh", None)
 

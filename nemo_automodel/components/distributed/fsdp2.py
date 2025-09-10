@@ -124,6 +124,10 @@ class FSDP2Manager:
         # init=False,
         metadata={"help": "Total number of processes."},
     )
+    fp8_config: Optional["FP8Config"] = field(
+        default=None,
+        metadata={"help": "FP8 configuration for enabling FP8+TP optimizations."},
+    )
 
     def __post_init__(self):
         """
@@ -283,16 +287,46 @@ class FSDP2Manager:
             if self.use_hf_tp_plan:
                 tp_shard_plan = get_hf_tp_shard_plan(model)
             else:
+                # Get appropriate parallel classes (regular or FP8)
+                # Check if model actually has Float8Linear modules
+                enable_fp8_tp = False
+                if self.fp8_config and self.fp8_config.enabled:
+                    try:
+                        from torchao.float8.float8_linear import Float8Linear
+                        has_any_linear = False
+                        for module in model.modules():
+                            if isinstance(module, (torch.nn.Linear, Float8Linear)):
+                                has_any_linear = True
+                                if isinstance(module, torch.nn.Linear):
+                                    # Found a regular Linear module, can't use Float8 TP
+                                    enable_fp8_tp = False
+                                    break
+                        else:
+                            # Only enable if we found linear modules and all were Float8Linear
+                            enable_fp8_tp = has_any_linear
+                    except ImportError:
+                        pass
+                
+                if enable_fp8_tp:
+                    try:
+                        from nemo_automodel.components.quantization.fp8 import get_fp8_tensor_parallel_classes
+                        RowwiseParallelClass, ColwiseParallelClass, _ = get_fp8_tensor_parallel_classes(True)
+                    except ImportError:
+                        RowwiseParallelClass, ColwiseParallelClass = RowwiseParallel, ColwiseParallel
+                else:
+                    RowwiseParallelClass, ColwiseParallelClass = RowwiseParallel, ColwiseParallel
+                
                 # Parallelize the first embedding and the last linear out projection
                 base_model_tp_plan = {
                     "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
-                    "model.layers.*.self_attn.q_proj": ColwiseParallel(),
-                    "model.layers.*.self_attn.k_proj": ColwiseParallel(),
-                    "model.layers.*.self_attn.v_proj": ColwiseParallel(),
-                    "model.layers.*.self_attn.o_proj": RowwiseParallel(),
-                    "model.layers.*.mlp.up_proj": ColwiseParallel(),
-                    "model.layers.*.mlp.gate_proj": ColwiseParallel(),
-                    "model.layers.*.mlp.down_proj": RowwiseParallel(),
+                    "model.layers.*.self_attn.q_proj": ColwiseParallelClass(),
+                    "model.layers.*.self_attn.k_proj": ColwiseParallelClass(),
+                    "model.layers.*.self_attn.v_proj": ColwiseParallelClass(),
+                    "model.layers.*.self_attn.o_proj": RowwiseParallelClass(),
+                    "model.layers.*.mlp.up_proj": ColwiseParallelClass(),
+                    "model.layers.*.mlp.gate_proj": ColwiseParallelClass(),
+                    "model.layers.*.mlp.down_proj": RowwiseParallelClass(),
+                    # Always use regular TP for lm_head (may be filtered out from FP8)
                     "lm_head": ColwiseParallel(output_layouts=Replicate()),
                 }
 
@@ -300,9 +334,10 @@ class FSDP2Manager:
                     "model.embed_tokens": RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1)),
                     "model.norm": SequenceParallel(),
                     "model.layers.*.input_layernorm": SequenceParallel(),
-                    "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
+                    "model.layers.*.self_attn.o_proj": RowwiseParallelClass(output_layouts=Shard(1)),
                     "model.layers.*.post_attention_layernorm": SequenceParallel(),
-                    "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
+                    "model.layers.*.mlp.down_proj": RowwiseParallelClass(output_layouts=Shard(1)),
+                    # Always use regular TP for lm_head (may be filtered out from FP8)
                     "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate()),
                 }
 
@@ -327,5 +362,6 @@ class FSDP2Manager:
             mp_policy=self.mp_policy,
             tp_shard_plan=tp_shard_plan,
             offload_policy=self.offload_policy,
+            fp8_config=self.fp8_config,
         )
         return model
