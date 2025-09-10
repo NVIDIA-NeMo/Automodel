@@ -39,3 +39,12 @@ def sliding_window_overwrite(model_name: str) -> dict[str, Any]:
         print(f"use_sliding_window=False in config - overriding sliding_window parameter to None: {overwrite_dict}")
 
     return overwrite_dict
+
+
+def apply_cache_compatibility_patches():
+    """Apply compatibility patches for transformers cache utilities."""
+    # Alias cache API for models expecting get_usable_length
+    from transformers.cache_utils import DynamicCache
+
+    if not hasattr(DynamicCache, "get_usable_length") and hasattr(DynamicCache, "get_seq_length"):
+        DynamicCache.get_usable_length = DynamicCache.get_seq_length
