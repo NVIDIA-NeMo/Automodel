@@ -181,11 +181,6 @@ class BaseRecipe:
         is_dist_initialized = torch.distributed.is_initialized()
         is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
 
-        if not is_dist_initialized:
-            dp_group = None
-        else:
-            dp_group = self._get_dp_group()
-
         path = self.checkpoint_config.checkpoint_dir
         path = os.path.join(path, f"epoch_{epoch}_step_{step}")
 
@@ -194,7 +189,7 @@ class BaseRecipe:
             os.makedirs(path, exist_ok=True)
             print(f"Saving checkpoint to {path}", flush=True)
         if is_dist_initialized:
-            torch.distributed.barrier(dp_group)
+            torch.distributed.barrier()
         # TODO(@adil-a): Change this when we create a LR scheduler class
         model, optimizer, scheduler, tokenizer, config = None, None, None, None, None
 
@@ -212,7 +207,9 @@ class BaseRecipe:
             elif is_tokenizer(getattr(self, key)):
                 tokenizer = getattr(self, key)
             elif is_dataloader(getattr(self, key)) or isinstance(getattr(self, key), StatefulRNG):
-                save_dp_aware_helper(getattr(self, key), key, path, self._get_dp_rank(), self._get_tp_rank())
+                save_dp_aware_helper(
+                    getattr(self, key), key, path, self._get_dp_rank(), self._get_tp_rank(), self._get_pp_rank()
+                )
             else:
                 if is_rank_0:
                     torch.save(
@@ -224,7 +221,7 @@ class BaseRecipe:
         save_optimizer(optimizer, model, path, scheduler)
         save_config(config.raw_config, path)
         if is_dist_initialized:
-            torch.distributed.barrier(dp_group)
+            torch.distributed.barrier()
 
     def load_checkpoint(self, restore_from: str | None = None, moe_mesh: Optional[DeviceMesh] = None):
         """
@@ -429,6 +426,11 @@ class BaseRecipe:
         if not self.device_mesh or self.device_mesh["tp"].size() == 1:
             return 0
         return self.device_mesh.get_local_rank("tp")
+
+    def _get_pp_rank(self):
+        if not self.device_mesh or self.device_mesh["pp"].size() == 1:
+            return 0
+        return self.device_mesh.get_local_rank("pp")
 
     def _dp_allreduce(self, tensor, op=dist.ReduceOp.SUM):
         dp_group = self._get_dp_group()

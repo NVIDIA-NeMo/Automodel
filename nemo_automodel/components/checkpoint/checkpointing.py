@@ -380,6 +380,7 @@ def save_dp_aware_helper(
     path: str,
     dp_rank: int,
     tp_rank: int,
+    pp_rank: int,
 ):
     """
     Save the stateful object.
@@ -392,10 +393,11 @@ def save_dp_aware_helper(
         path: Path to save stateful object
         dp_rank: Data parallel rank
         tp_rank: Tensor parallel rank
+        pp_rank: Pipeline parallel rank
     """
     state_dir = os.path.join(path, state_name)
     os.makedirs(state_dir, exist_ok=True)
-    if tp_rank == 0:
+    if tp_rank == 0 and pp_rank == 0:
         torch.save(state.state_dict(), os.path.join(state_dir, f"{state_name}_dp_rank_{dp_rank}.pt"))
 
 
