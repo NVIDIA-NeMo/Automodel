@@ -38,6 +38,7 @@ from transformers.utils.hub import TRANSFORMERS_CACHE
 from wandb import Settings
 
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
+from nemo_automodel.components._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig, load_model_from_base_checkpoint
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
@@ -696,6 +697,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # setups logging and adds the rankfilter to logging
         setup_logging()
 
+        apply_cache_compatibility_patches()
         # Set up the stateful random number generator
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
