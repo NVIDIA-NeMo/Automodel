@@ -74,7 +74,9 @@ class MLA(nn.Module):
         self.kv_lora_rank = config.kv_lora_rank
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.qk_head_dim = config.qk_head_dim
+        self.qk_head_dim = (
+            config.qk_head_dim if hasattr(config, "qk_head_dim") else (self.qk_nope_head_dim + self.qk_rope_head_dim)
+        )
         self.v_head_dim = config.v_head_dim
 
         self.backend = backend

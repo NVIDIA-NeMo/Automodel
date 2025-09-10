@@ -105,7 +105,9 @@ def run_benchmark(cfg):
 
         init_all_rng(seed, ranked=False)
 
-        config = AutoConfig.from_pretrained(cfg.model.pretrained_model_name_or_path)
+        config = AutoConfig.from_pretrained(
+            cfg.model.pretrained_model_name_or_path, trust_remote_code=cfg.model.get("trust_remote_code", False)
+        )
         if cfg.model.num_layers is not None:
             config.num_hidden_layers = cfg.model.num_layers
 
@@ -116,6 +118,8 @@ def run_benchmark(cfg):
         }
         if "num_layers" in cfg.model:
             del cfg.model.__dict__["num_layers"]
+        if "trust_remote_code" in cfg.model:
+            del cfg.model.__dict__["trust_remote_code"]
 
         with torch.device("meta"):
             model = cfg.model.instantiate(**kwargs)
@@ -190,7 +194,6 @@ def run_benchmark(cfg):
         )
 
     # Log setup time
-    rank = torch.distributed.get_rank()
     torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
 
     # Training loop over dummy data
