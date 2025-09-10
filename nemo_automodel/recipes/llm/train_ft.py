@@ -70,6 +70,7 @@ from nemo_automodel.components.utils.model_utils import (
     print_trainable_parameters,
 )
 from nemo_automodel.recipes.base_recipe import BaseRecipe
+from nemo_automodel.components.loggers.jsonl_logger import JSONLLogger
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -711,6 +712,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             suppress_wandb_log_messages()
             run = build_wandb(self.cfg)
             logging.info("🚀 View run at {}".format(run.url))
+        # Initialize JSONL loggers on main rank
+        if self.dist_env.is_main:
+            self.jsonl_train_logger = JSONLLogger("training.jsonl", flush=True)
+            self.jsonl_val_logger = JSONLLogger("validation.jsonl", flush=True)
+        else:
+            self.jsonl_train_logger = None
+            self.jsonl_val_logger = None
 
         # Log experiment details on main rank
         self._log_experiment_details()
@@ -888,6 +896,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     self._run_validation_epoch()
                     for mp in self.model_parts:
                         mp.train()
+        # Close JSONL loggers after training loop completes
+        if self.dist_env.is_main:
+            if getattr(self, "jsonl_train_logger", None) is not None:
+                self.jsonl_train_logger.close()
+            if getattr(self, "jsonl_val_logger", None) is not None:
+                self.jsonl_val_logger.close()
 
     # ------------------ helpers ------------------
     def _forward_backward_step(
@@ -1078,6 +1092,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.dist_env.is_main:
             if wandb.run is not None:
                 wandb.log({"val_loss": val_loss, "step": self.step_scheduler.step, "epoch": self.step_scheduler.epoch})
+            # JSONL validation log
+            if getattr(self, "jsonl_val_logger", None) is not None:
+                try:
+                    self.jsonl_val_logger.log({
+                        "step": self.step_scheduler.step,
+                        "epoch": self.step_scheduler.epoch,
+                        "val_loss": val_loss,
+                        "learning_rate": current_lr,
+                        "num_label_tokens": total_num_label_tokens,
+                    })
+                except Exception:
+                    pass
 
         # assumes all model parts' optimizers have the same learning rate
         current_lr = self.optimizer[0].param_groups[0]["lr"]
@@ -1115,6 +1141,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         if wandb.run is not None:
             wandb.log(log_data, step=self.step_scheduler.step)
+        # JSONL training log
+        if getattr(self, "jsonl_train_logger", None) is not None:
+            try:
+                self.jsonl_train_logger.log(log_data)
+            except Exception:
+                pass
 
         if self.dist_env.is_main:
             logging.info(
