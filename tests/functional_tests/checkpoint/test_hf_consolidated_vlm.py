@@ -441,6 +441,8 @@ def test_consolidated_vlm_checkpoint():
         "step_scheduler.pt",
         "dataloader/dataloader_dp_rank_0.pt",
         "dataloader/dataloader_dp_rank_1.pt",
+        "rng/rng_dp_rank_0.pt",
+        "rng/rng_dp_rank_1.pt",
         "model/shard-00001-model-00001-of-00001.safetensors",
         "model/shard-00002-model-00001-of-00001.safetensors",
         "model/consolidated/model-00001-of-00001.safetensors",

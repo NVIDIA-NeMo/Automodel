@@ -44,8 +44,6 @@ from nemo_automodel.components.checkpoint.stateful_wrappers import (
 
 if TYPE_CHECKING:
     from peft import PeftConfig
-    from torch.utils.data import IterableDataset
-    from torchdata.stateful_dataloader import StatefulDataLoader
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 
@@ -376,42 +374,52 @@ def load_optimizer(
     optimizer_state.load_state_dict(reinstated_state_dict)
 
 
-def save_dataloader(
-    dataloader: "StatefulDataLoader | IterableDataset",
+def save_dp_aware_helper(
+    state: Any,
+    state_name: str,
     path: str,
     dp_rank: int,
     tp_rank: int,
+    pp_rank: int,
 ):
     """
-    Save the dataloader state.
+    Save the stateful object.
+
+    This function is a helper function currently used to save the dataloader and rng state.
 
     Args:
-        dataloader: Dataloader to save
-        path: Path to save dataloader
+        state: Stateful object to save
+        state_name: Name of the stateful object
+        path: Path to save stateful object
         dp_rank: Data parallel rank
         tp_rank: Tensor parallel rank
+        pp_rank: Pipeline parallel rank
     """
-    dataloader_dir = os.path.join(path, "dataloader")
-    os.makedirs(dataloader_dir, exist_ok=True)
-    if tp_rank == 0:
-        torch.save(dataloader.state_dict(), os.path.join(dataloader_dir, f"dataloader_dp_rank_{dp_rank}.pt"))
+    state_dir = os.path.join(path, state_name)
+    os.makedirs(state_dir, exist_ok=True)
+    if tp_rank == 0 and pp_rank == 0:
+        torch.save(state.state_dict(), os.path.join(state_dir, f"{state_name}_dp_rank_{dp_rank}.pt"))
 
 
-def load_dataloader(
-    dataloader: "StatefulDataLoader | IterableDataset",
+def load_dp_aware_helper(
+    state: Any,
+    state_name: str,
     path: str,
     dp_rank: int,
 ):
     """
-    Load the dataloader state.
+    Load the stateful object.
+
+    This function is a helper function currently used to load the dataloader and rng state.
 
     Args:
-        dataloader: Dataloader to load
-        path: Path to load dataloader
+        state: Stateful object to load
+        state_name: Name of the stateful object
+        path: Path to load stateful object
         dp_rank: Data parallel rank
     """
-    dataloader_dir = os.path.join(path, "dataloader")
-    dataloader.load_state_dict(torch.load(os.path.join(dataloader_dir, f"dataloader_dp_rank_{dp_rank}.pt")))
+    state_dir = os.path.join(path, state_name)
+    state.load_state_dict(torch.load(os.path.join(state_dir, f"{state_name}_dp_rank_{dp_rank}.pt"), weights_only=False))
 
 
 def save_config(config: dict[str, Any], weights_path: str):
