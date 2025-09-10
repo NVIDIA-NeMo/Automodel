@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 import torch
 
-from nemo_automodel.components.training.rng import StatefulRNG, init_all_rng
+from nemo_automodel.components.training.rng import StatefulRNG, ScopedRNG, init_all_rng
 
 
 def _next_values():
@@ -96,7 +96,7 @@ def test_stateful_rng_restores_state():
         np.random.get_state(),
         torch.get_rng_state(),
     )
-    with StatefulRNG(None):
+    with ScopedRNG():
         # Advance RNGs arbitrarily
         _ = [_next_values() for _ in range(5)]
 
@@ -120,7 +120,7 @@ def test_stateful_rng_cuda_state_restored():
     init_all_rng(99)
     pre_cuda = torch.cuda.get_rng_state_all()
 
-    with StatefulRNG(777):
+    with ScopedRNG(777):
         _ = torch.cuda.FloatTensor(10).uniform_()  # advance CUDA RNG
 
     post_cuda = torch.cuda.get_rng_state_all()
