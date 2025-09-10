@@ -99,7 +99,7 @@ def build_model_and_optimizer(
     autopipeline: AutoPipeline | None = None,
     loss_fn=None,
     parallelize_fn=None,
-) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
+) -> tuple[nn.Module | AutoPipeline, list[str], list["Optimizer"], nn.Module]:  # noqa: F821
     """
     Build and initialize a model and optimizer.
 
@@ -118,7 +118,7 @@ def build_model_and_optimizer(
         cfg_compile: Configuration for torch.compile.
 
     Returns:
-        The instantiated model on the specified device and optimizer.
+        The instantiated model on the specified device, the state dict keys before any parallelization, the optimizer, and the loss function.
     """
     is_hf_model = cfg_model.get("pretrained_model_name_or_path", None) is not None
     is_meta_device = False
@@ -168,6 +168,9 @@ def build_model_and_optimizer(
                 model = apply_fp8_to_model(model, config=fp8_config)
 
     print_trainable_parameters(model)
+
+    # hold a copy of the model state dict keys before any parallelization
+    state_dict_keys = model.state_dict().keys()
 
     if not _supports_logits_to_keep(model):
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
@@ -232,7 +235,7 @@ def build_model_and_optimizer(
                 else:
                     model, optimizer = model_wrapper.parallelize(model, optimizer)
 
-                return model, [optimizer], loss_fn
+                return model, state_dict_keys, [optimizer], loss_fn
 
             else:
                 load_weights = True
@@ -278,10 +281,10 @@ def build_model_and_optimizer(
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         optimizer = [cfg_opt.instantiate(params=trainable_params)]
 
-    return model, optimizer, loss_fn
+    return model, state_dict_keys, optimizer, loss_fn
 
 
-def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
+def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft, state_dict_keys) -> CheckpointingConfig:
     """Build a checkpoint configuration.
 
     Args:
@@ -289,6 +292,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         cache_dir: Cache directory for the model.
         model_repo_id: Model repository ID.
         is_peft: Whether the model is PEFT.
+        state_dict_keys: Copy of the model state dict keys before any parallelization.
 
     Returns:
         The instantiated checkpoint configuration.
@@ -302,6 +306,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
         save_consolidated=False,
         is_peft=is_peft,
+        model_state_dict_keys=state_dict_keys,
     )
     if cfg_ckpt is not None:
         cfg_ckpt = cfg_ckpt.to_dict()
@@ -757,7 +762,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if parallelize_fn is None and self.pp_enabled:
             parallelize_fn = partial(parallelize_for_pp, model_wrapper=self.model_wrapper)
 
-        model, self.optimizer, self.loss_fn = build_model_and_optimizer(
+        model, model_state_dict_keys, self.optimizer, self.loss_fn = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
             self.cfg.optimizer,
@@ -838,6 +843,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.cfg.get("model.cache_dir", None),
             self.cfg.model.get("pretrained_model_name_or_path", None),
             True if self.cfg.get("peft", None) else False,
+            model_state_dict_keys,
         )
 
         # Set up the stateful random number generator
