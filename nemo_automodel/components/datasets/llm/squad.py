@@ -62,7 +62,6 @@ def make_squad_dataset(
     seq_length=None,
     limit_dataset_samples=None,
     start_of_turn_token=None,
-    fp8=False,
     split="train",
     dataset_name="squad",
 ):
@@ -86,8 +85,6 @@ def make_squad_dataset(
         start_of_turn_token (str or None): If using a chat template, the
             token that marks the start of each turn. Used to compute the
             response offset for `labels`.
-        fp8 (bool): Flag for future use (e.g., mixed precision). Currently
-            unused.
         split (str): Which split of the dataset to load (e.g. 'train',
             'validation').
         dataset_name (str): Identifier for the Hugging Face dataset
