@@ -62,7 +62,7 @@ def _formatting_prompts_func_with_chat_template(
 
 def make_squad_dataset(
     tokenizer,
-    seq_length=None,
+    max_seq_length=None,
     limit_dataset_samples=None,
     start_of_turn_token=None,
     split="train",
@@ -81,8 +81,8 @@ def make_squad_dataset(
         tokenizer: A Hugging Face tokenizer with attributes
             `eos_token_id`, optional `bos_id`, optional `eos_id`, and
             optionally `chat_template`/`apply_chat_template`.
-        seq_length (int, optional): If set, pad/truncate each example to this
-            length.
+        max_seq_length (int, optional): If set, will truncate each example to this
+            length. If smaller than max_seq_length, the sequence is left as is.
         limit_dataset_samples (int, optional): If set, limit the number of
             examples loaded from the split.
         start_of_turn_token (str or None): If using a chat template, the
@@ -116,10 +116,10 @@ def make_squad_dataset(
     pad_token_id = _add_pad_token(tokenizer) or eos_token_id
 
     if chat_template is None:
-        fmt_fn = lambda x: _formatting_prompts_func(x, tokenizer, eos_token_id, pad_token_id, seq_length)
+        fmt_fn = lambda x: _formatting_prompts_func(x, tokenizer, eos_token_id, pad_token_id, max_seq_length)
     else:
         fmt_fn = lambda x: _formatting_prompts_func_with_chat_template(
-            x, tokenizer, eos_token_id, pad_token_id, seq_length, start_of_turn_token
+            x, tokenizer, eos_token_id, pad_token_id, max_seq_length, start_of_turn_token
         )  # noqa: E731
 
     # map the dataset
