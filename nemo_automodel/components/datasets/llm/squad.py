@@ -34,7 +34,7 @@ def _formatting_prompts_func(example, tokenizer, eos_token_id, pad_token_id, seq
         answer=answer,
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
-        seq_length=seq_length,
+        max_seq_length=seq_length,
     )
 
 
@@ -52,7 +52,7 @@ def _formatting_prompts_func_with_chat_template(
         answer=answer,
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
-        seq_length=seq_length,
+        max_seq_length=seq_length,
         start_of_turn_token=start_of_turn_token,
     )
 
