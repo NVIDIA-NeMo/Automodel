@@ -53,6 +53,7 @@ guides/vlm/dataset.md
 :hidden:
 guides/checkpointing.md
 guides/gradient_checkpointing.md
+guides/llm/knowledge_distillation.md
 guides/pipelining.md
 guides/llm/dataset.md
 guides/vlm/dataset.md

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -30,6 +31,8 @@ from nemo_automodel.components.distributed.parallelizer import (
     fsdp2_strategy_parallelize,
     get_hf_tp_shard_plan,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -89,6 +92,10 @@ class FSDP2Manager:
     pp_size: Optional[int] = field(
         default=1,
         metadata={"help": "Pipeline-parallel group size (for pipeline-like sharding)."},
+    )
+    ep_size: Optional[int] = field(
+        default=1,
+        metadata={"help": "Expert-parallel group size (for expert-parallel sharding)."},
     )
     sequence_parallel: Optional[bool] = field(
         default=False,
@@ -156,6 +163,9 @@ class FSDP2Manager:
         if self.pp_size is None or self.pp_size <= 0:
             self.pp_size = 1
 
+        if self.ep_size is None or self.ep_size <= 0:
+            self.ep_size = 1
+
         # infer if not provided
         if self.dp_size is None or self.dp_size <= 0:
             # Calculate dp_size to ensure dp_size * tp_size * cp_size == world_size
@@ -178,10 +188,16 @@ class FSDP2Manager:
         assert self.dp_replicate_size < self.dp_size or self.dp_replicate_size == 1, (
             "dp_replicate_size must be less than dp_size since ddp usecase is not supported by FSDP2"
         )
+        assert self.dp_size % self.ep_size == 0, "dp_size must be a multiple of ep_size"
+        if self.ep_size < self.dp_size:
+            self.ep_shard_size = self.dp_size // self.ep_size
+        else:
+            self.ep_shard_size = 1
 
         self.dp_shard_size = self.dp_size // self.dp_replicate_size
 
         self.device_mesh = self._get_device_mesh()
+        self.moe_mesh = self._get_moe_mesh() if self.ep_size > 1 else None
 
         return self
 
@@ -227,6 +243,21 @@ class FSDP2Manager:
         self.device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
         return self.device_mesh
 
+    def _get_moe_mesh(self):
+        mesh_shape = (self.pp_size, self.ep_shard_size, self.ep_size)
+        mesh_names = ("pp", "ep_shard", "ep")
+        for shape, name in zip(mesh_shape, mesh_names):
+            assert isinstance(shape, int), "Expected {} to be an int, but got {}".format(name, type(shape))
+            assert shape > 0, "Expected {} > 0, {}".format(name, shape)
+
+        # build mesh [dp, cp, tp]
+        self.moe_mesh = init_device_mesh(
+            device_type="cuda" if self.backend == "nccl" else "cpu",
+            mesh_shape=mesh_shape,
+            mesh_dim_names=mesh_names,
+        )
+        return self.moe_mesh
+
     def parallelize(self, model):
         """
         Parallelizes the given model using FSDP2 and TP sharding strategies.
@@ -244,6 +275,10 @@ class FSDP2Manager:
         Raises:
             NotImplemented: If the required TP sharding plan is not supported.
         """
+        if dist.get_world_size() == 1:
+            logger.info("World size is 1, skipping parallelization.")
+            return model
+
         if self.device_mesh["tp"].size() > 1:
             if self.use_hf_tp_plan:
                 tp_shard_plan = get_hf_tp_shard_plan(model)

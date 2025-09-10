@@ -46,9 +46,10 @@ from nemo_automodel.components.datasets.llm.packed_sequence import PackedSequenc
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import (
     get_rank_safe,
+    get_world_size_safe,
     initialize_distributed,
 )
-from nemo_automodel.components.distributed.nvfsdp import NVFSDPManager
+from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -57,14 +58,17 @@ from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
-from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
-from nemo_automodel.components.training.utils import count_tail_padding
+from nemo_automodel.components.training.utils import count_tail_padding, scale_grads_and_clip_grad_norm
 from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
     compile_model,
 )
-from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep, print_trainable_parameters
+from nemo_automodel.components.utils.model_utils import (
+    _supports_logits_to_keep,
+    print_trainable_parameters,
+)
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
@@ -88,13 +92,14 @@ def build_model_and_optimizer(
     model_wrapper,
     seed,
     tp_size=1,
+    cp_size=1,
     cfg_fp8=None,
     cfg_compile=None,
     cfg_quantization=None,
     autopipeline: AutoPipeline | None = None,
     loss_fn=None,
     parallelize_fn=None,
-) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
+) -> tuple[nn.Module | AutoPipeline, list[str], list["Optimizer"], nn.Module]:  # noqa: F821
     """
     Build and initialize a model and optimizer.
 
@@ -108,25 +113,27 @@ def build_model_and_optimizer(
         model_wrapper: Optional parallelism wrapper.
         seed: Random seed.
         tp_size: Tensor parallel size.
+        cp_size: Column parallel size.
         cfg_fp8: Configuration for FP8.
         cfg_compile: Configuration for torch.compile.
 
     Returns:
-        The instantiated model on the specified device and optimizer.
+        The instantiated model on the specified device, the state dict keys before any parallelization, the optimizer, and the loss function.
     """
+    is_hf_model = cfg_model.get("pretrained_model_name_or_path", None) is not None
     is_meta_device = False
     if hasattr(cfg_model, "is_meta_device"):
         is_meta_device = cfg_model.is_meta_device
-        if is_meta_device and isinstance(model_wrapper, NVFSDPManager):
-            raise ValueError("Meta device initialization is not supported with NVFSDPManager")
+        if is_meta_device and isinstance(model_wrapper, MegatronFSDPManager):
+            raise ValueError("Meta device initialization is not supported with MegatronFSDPManager")
         del cfg_model.is_meta_device
     if autopipeline is not None:
         is_meta_device = True
 
     init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
-    with StatefulRNG(seed=seed, ranked=True):
+    with ScopedRNG(seed=seed, ranked=True):
         kwargs = {}
-        if use_hf_fa2:
+        if use_hf_fa2 and is_hf_model:
             kwargs["attn_implementation"] = "flash_attention_2"
             logger.warning(
                 "Packed sequence is supported only with Flash Attention. "
@@ -141,10 +148,16 @@ def build_model_and_optimizer(
 
         # Instantiate the model in meta device to avoid OOM
         with init_ctx:
+            if is_hf_model and (tp_size > 1 or cp_size > 1):
+                logger.info("Disabling Liger kernel with TP ({}) or CP ({})".format(tp_size, cp_size))
+                kwargs["use_liger_kernel"] = False
             model = cfg_model.instantiate(**kwargs)
 
             # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
             if cfg_peft is not None:
+                if tp_size > 1:
+                    logger.info("Disabling Triton with TP ({})".format(tp_size))
+                    cfg_peft.use_triton = False
                 assert autopipeline is None, "PEFT is not supported with AutoPipeline"
                 apply_lora_to_linear_modules(
                     model, cfg_peft, quantization_config=kwargs.get("quantization_config", None)
@@ -156,38 +169,59 @@ def build_model_and_optimizer(
 
     print_trainable_parameters(model)
 
+    # hold a copy of the model state dict keys before any parallelization
+    state_dict_keys = model.state_dict().keys()
+
     if not _supports_logits_to_keep(model):
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
         loss_fn = MaskedCrossEntropy()
 
     if autopipeline is not None:
-        autopipeline.build(model, loss_fn=loss_fn, parallelize_fn=parallelize_fn)
-        for mp in autopipeline.parts:
-            load_model_from_base_checkpoint(
-                mp,
-                device,
-                cfg_peft is not None,
-                cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
-                cfg_model.pretrained_model_name_or_path,
-                getattr(cfg_peft, "lora_A_init", None),
-                device_mesh=autopipeline.world_mesh,
-            )
+        if get_world_size_safe() == 1:
+            logger.info("World size is 1, skipping autopipeline.")
+        else:
+            autopipeline.build(model, loss_fn=loss_fn, parallelize_fn=parallelize_fn)
+            for mp in autopipeline.parts:
+                load_model_from_base_checkpoint(
+                    mp,
+                    device,
+                    cfg_peft is not None,
+                    cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
+                    cfg_model.pretrained_model_name_or_path,
+                    getattr(cfg_peft, "lora_A_init", None),
+                    device_mesh=autopipeline.world_mesh,
+                    moe_mesh=autopipeline.moe_mesh,
+                )
 
-        # Create optimizer for all model parts
-        trainable_params = []
-        for i, model_part in enumerate(autopipeline.parts):
-            trainable_params.append(
-                {
-                    "params": list(filter(lambda x: x.requires_grad, model_part.parameters())),
-                    "name": f"rank_{get_rank_safe()}_model_part_{i}",
-                }
-            )
-        model = autopipeline
+            # Create optimizer for all model parts
+            trainable_params = []
+            for i, model_part in enumerate(autopipeline.parts):
+                trainable_params.append(
+                    {
+                        "params": list(filter(lambda x: x.requires_grad, model_part.parameters())),
+                        "name": f"rank_{get_rank_safe()}_model_part_{i}",
+                    }
+                )
+            model = autopipeline
     else:
-        if callable(getattr(model_wrapper, "parallelize", None)):
-            # FSDP2 and nvFSDP should already be on the correct device
-            if isinstance(model_wrapper, NVFSDPManager):
-                # nvFSDP instantiate optimizer inside parallelize_function
+        load_weights = False
+        if parallelize_fn is not None and get_world_size_safe() > 1:
+            parallelize_fn(
+                model,
+                world_mesh=model_wrapper.device_mesh,
+                moe_mesh=getattr(model_wrapper, "moe_mesh", None),
+                pp_enabled=False,
+                dp_axis_names=("dp_shard",),
+                cp_axis_name="cp",
+                tp_axis_name="tp",
+                ep_axis_name="ep",
+                ep_shard_axis_names=("ep_shard",),
+            )
+            load_weights = True
+        elif callable(getattr(model_wrapper, "parallelize", None)):
+            # FSDP2 and MegatronFSDP should already be on the correct device
+            if isinstance(model_wrapper, MegatronFSDPManager):
+                # MegatronFSDP instantiate optimizer inside parallelize_function
                 trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
                 assert len(trainable_params) > 0, "trainable_params cannot be empty"
                 if tp_size > 1:
@@ -195,23 +229,34 @@ def build_model_and_optimizer(
                     cfg_opt.foreach = False
                 optimizer = cfg_opt.instantiate(params=trainable_params)
 
-                model, optimizer = model_wrapper.parallelize(model, optimizer)
+                if get_world_size_safe() == 1:
+                    logger.info("World size is 1, skipping parallelization.")
+                    model = model.to(device).to(torch.bfloat16)
+                else:
+                    model, optimizer = model_wrapper.parallelize(model, optimizer)
 
-                return model, [optimizer], loss_fn
+                return model, state_dict_keys, [optimizer], loss_fn
 
             else:
-                model = model_wrapper.parallelize(model)
+                load_weights = True
+                if get_world_size_safe() == 1:
+                    logger.info("World size is 1, skipping parallelization.")
+                    model = model.to(device).to(torch.bfloat16)
+                else:
+                    model = model_wrapper.parallelize(model)
 
-                # Load the weights into the model in parallel.
-                if is_meta_device:
-                    load_model_from_base_checkpoint(
-                        model,
-                        device,
-                        cfg_peft is not None,
-                        cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
-                        cfg_model.pretrained_model_name_or_path,
-                        getattr(cfg_peft, "lora_A_init", None),
-                    )
+        # Load the weights into the model in parallel.
+        if is_meta_device and load_weights:
+            load_model_from_base_checkpoint(
+                model,
+                device,
+                cfg_peft is not None,
+                cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
+                cfg_model.pretrained_model_name_or_path,
+                getattr(cfg_peft, "lora_A_init", None),
+                device_mesh=model_wrapper.device_mesh,
+                moe_mesh=getattr(model_wrapper, "moe_mesh", None),
+            )
 
         # ensure the model is on device
         model = model.to(device)
@@ -236,10 +281,10 @@ def build_model_and_optimizer(
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         optimizer = [cfg_opt.instantiate(params=trainable_params)]
 
-    return model, optimizer, loss_fn
+    return model, state_dict_keys, optimizer, loss_fn
 
 
-def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
+def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft, state_dict_keys) -> CheckpointingConfig:
     """Build a checkpoint configuration.
 
     Args:
@@ -247,6 +292,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         cache_dir: Cache directory for the model.
         model_repo_id: Model repository ID.
         is_peft: Whether the model is PEFT.
+        state_dict_keys: Copy of the model state dict keys before any parallelization.
 
     Returns:
         The instantiated checkpoint configuration.
@@ -260,6 +306,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
         save_consolidated=False,
         is_peft=is_peft,
+        model_state_dict_keys=state_dict_keys,
     )
     if cfg_ckpt is not None:
         cfg_ckpt = cfg_ckpt.to_dict()
@@ -326,6 +373,7 @@ def build_dataloader(
     dp_rank,
     dp_world_size,
     pp_enabled,
+    supports_seq_lens=True,
 ) -> tuple[DataLoader, PreTrainedTokenizerBase]:
     """Build a DataLoader for the dataset.
 
@@ -342,29 +390,36 @@ def build_dataloader(
         dp_rank: Data parallel rank.
         dp_world_size: Data parallel world size.
         pp_enabled: Whether pipeline parallelism is enabled.
+        supports_seq_lens: Whether the model supports seq_lens (Default: True).
     Returns:
         The instantiated DataLoader and tokenizer.
     """
-    with StatefulRNG(seed=seed, ranked=True):
+    with ScopedRNG(seed=seed, ranked=True):
         kwargs, tokenizer = _build_tokenizer(cfg_model, cfg_ds)
-        with FirstRankPerNode():
-            # Megatron specific kwargs
-            if cfg_ds._target_ == MegatronPretraining:
-                kwargs["global_batch_size"] = global_batch_size
-                kwargs["trainer_max_steps"] = max_steps if max_steps is not None else None
-                kwargs["trainer_val_check_interval"] = val_check_interval
-                ds = cfg_ds.instantiate(**kwargs)
-                ds.build()
-            else:
+        # Megatron specific kwargs
+        if cfg_ds._target_ == MegatronPretraining:
+            kwargs["global_batch_size"] = global_batch_size
+            kwargs["trainer_max_steps"] = max_steps if max_steps is not None else None
+            kwargs["trainer_val_check_interval"] = val_check_interval
+            ds = cfg_ds.instantiate(**kwargs)
+            ds.build()
+        else:
+            with FirstRankPerNode():
                 ds = cfg_ds.instantiate(**kwargs)
 
+        packed_sequence_size = getattr(cfg_ps, "packed_sequence_size", 0)
+        # check if packed sequence is supported
+        if packed_sequence_size > 0 and not supports_seq_lens:
+            logging.warning("Packed sequence is not supported without seq_lens; disabling packed sequence")
+            packed_sequence_size = 0
+
         # Apply packing if configured
-        if getattr(cfg_ps, "packed_sequence_size", 0) > 0:
-            logger.info(f"Packing dataset with size: {cfg_ps.packed_sequence_size}")
+        if packed_sequence_size > 0:
+            logger.info(f"Packing dataset with size: {packed_sequence_size}")
             ds = PackedSequence(
                 ds,
                 split=cfg_ds.split,  # Assumes split is defined in dataset config
-                packed_sequence_size=cfg_ps.packed_sequence_size,
+                packed_sequence_size=packed_sequence_size,
                 split_across_pack=getattr(cfg_ps, "split_across_pack", False),
                 max_packs=getattr(cfg_ps, "max_packs", None),
             ).pack()
@@ -641,11 +696,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # setups logging and adds the rankfilter to logging
         setup_logging()
 
+        # Set up the stateful random number generator
+        self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
+
         self.device_mesh = None
+        self.moe_mesh = None
         self.model_wrapper = None
         if "distributed" in self.cfg:
             self.model_wrapper = self.cfg.distributed.instantiate(world_size=self.dist_env.world_size)
             self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
+            self.moe_mesh = getattr(self.model_wrapper, "moe_mesh", None)
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -667,13 +727,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             assert autopipeline_cfg is not None, (
                 "AutoPipeline configuration is required when pipeline parallelism is enabled"
             )
-            assert not isinstance(self.model_wrapper, NVFSDPManager), (
-                "NVFSDPManager is not supported when pipeline parallelism is enabled"
+            assert not isinstance(self.model_wrapper, MegatronFSDPManager), (
+                "MegatronFSDPManager is not supported when pipeline parallelism is enabled"
             )
             # Create AutoPipeline from config
             autopipeline = autopipeline_cfg.instantiate(
                 world_mesh=self.device_mesh,
-                moe_mesh=None,
+                moe_mesh=self.moe_mesh,
                 pp_axis_name="pp",
                 dp_axis_names=(
                     ("dp_replicate", "dp_shard")
@@ -683,8 +743,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 ),
                 cp_axis_name="cp" if "cp" in self.device_mesh.mesh_dim_names else None,
                 tp_axis_name="tp" if "tp" in self.device_mesh.mesh_dim_names else None,
-                ep_axis_name=None,
-                ep_shard_axis_names=None,
+                ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
+                ep_shard_axis_names=(
+                    ("ep_shard",) if self.moe_mesh is not None and "ep_shard" in self.moe_mesh.mesh_dim_names else None
+                ),
                 pp_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
                 device=torch.cuda.current_device(),
             )
@@ -698,7 +760,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.peft_config = None
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
-        model, self.optimizer, self.loss_fn = build_model_and_optimizer(
+        self.loss_fn = build_loss_fn(self.cfg.loss_fn)
+        parallelize_fn = self.cfg.get("parallelize_fn", None)
+        if parallelize_fn is None and self.pp_enabled:
+            parallelize_fn = partial(parallelize_for_pp, model_wrapper=self.model_wrapper)
+
+        model, model_state_dict_keys, self.optimizer, self.loss_fn = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
             self.cfg.optimizer,
@@ -707,12 +774,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.model_wrapper,
             seed=self.cfg.get("seed", 42),
             tp_size=self.cfg.get("distributed.tp_size", 1),
+            cp_size=self.cfg.get("distributed.cp_size", 1),
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
             cfg_quantization=self.cfg.get("quantization", None),
             autopipeline=autopipeline,
-            loss_fn=build_loss_fn(self.cfg.loss_fn),
-            parallelize_fn=partial(parallelize_for_pp, model_wrapper=self.model_wrapper),
+            loss_fn=self.loss_fn,
+            parallelize_fn=parallelize_fn,
         )
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
@@ -734,6 +802,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             dp_rank=self._get_dp_rank(),
             dp_world_size=self._get_dp_group_size(),
             pp_enabled=self.pp_enabled,
+            supports_seq_lens=True,
         )
 
         # Build validation dataloader if the config provides it
@@ -777,13 +846,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.cfg.get("model.cache_dir", None),
             self.cfg.model.get("pretrained_model_name_or_path", None),
             True if self.cfg.get("peft", None) else False,
+            model_state_dict_keys,
         )
 
-        # Set up the stateful random number generator
-        self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
-
         # Optionally resume
-        self.load_checkpoint(restore_from)
+        self.load_checkpoint(restore_from, moe_mesh=self.moe_mesh)
 
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
@@ -835,19 +902,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     ):
         batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
         labels = batch.pop("labels")
-
-        if (
-            "position_ids" not in batch
-            and self.device_mesh is not None
-            and (self.device_mesh["cp"].size() > 1 or self.device_mesh["tp"].size() > 1)
-        ):
-            batch["position_ids"] = (
-                torch.arange(0, batch["input_ids"].shape[1])
-                .unsqueeze(0)
-                .expand(batch["input_ids"].shape[0], -1)
-                .to(self.dist_env.device)
-            )
-
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
         if self.pp_enabled:
             if not is_train:
@@ -927,31 +981,21 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
             )
 
-        if self.pp_enabled:
-            self.pp.scale_grads_by_divisor(num_label_tokens / self._get_dp_group().size())
+        grad_norm = scale_grads_and_clip_grad_norm(
+            max_grad_norm,
+            self.model_parts,
+            norm_type=2.0,
+            pp_enabled=self.pp_enabled,
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
+            pp_axis_name="pp" if self.pp_enabled else None,
+            foreach=True,
+            num_label_tokens=num_label_tokens,
+            dp_group_size=self._get_dp_group_size(),
+        )
 
-        grad_norm = 0
-        # Clip gradients **after** any rescaling.
-        # TODO(@boxiangw): Fix TP gradient clipping
-        if max_grad_norm is not None:
-            if self.pp_enabled:
-                grad_norm = self.pp.clip_grad_norm(
-                    max_grad_norm,
-                    foreach=True,
-                    pp_mesh=(self.device_mesh["pp"] if self.pp_enabled else None),
-                )
-            else:
-                if not self.device_mesh or self.device_mesh["tp"].size() == 1:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        [p for p in self.model_parts[0].parameters() if p.requires_grad], max_grad_norm
-                    )
-                    if hasattr(grad_norm, "full_tensor"):
-                        grad_norm = grad_norm.full_tensor()  # collect the summed grad norm across ranks
-
-            if isinstance(grad_norm, torch.Tensor):
-                grad_norm = grad_norm.item()
-
-        # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
+        # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model_parts[0].finish_grad_sync()
 
         for opt in self.optimizer:
@@ -974,7 +1018,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         ):
             precompute_float8_dynamic_scale_for_fsdp(self.model_parts[0])
 
-        # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
+        # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model_parts[0].install_optimized_model_weights()
         # self.model_parts[0].zero_grad_buffer()
 
@@ -1005,7 +1049,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             logger.warning("Validation is not supported for pipeline parallelism")
             return
 
-        with StatefulRNG(seed=1, ranked=True):
+        with ScopedRNG(seed=1, ranked=True):
             for mp in self.model_parts:
                 mp.eval()
 

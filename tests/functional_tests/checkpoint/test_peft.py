@@ -1890,6 +1890,8 @@ def test_hf_peft_checkpoint(use_triton=False):
         "step_scheduler.pt",
         "dataloader/dataloader_dp_rank_0.pt",
         "dataloader/dataloader_dp_rank_1.pt",
+        "rng/rng_dp_rank_0.pt",
+        "rng/rng_dp_rank_1.pt",
         "model/adapter_model.safetensors",
         "model/adapter_config.json",
         "model/automodel_peft_config.json",
@@ -2100,5 +2102,3 @@ def _compare_dicts(expected: dict, restored: dict):
             assert sorted(restored[k]) == sorted(v), error_msg.format(sorted(v), sorted(restored[k]))
         else:
             assert restored[k] == v, error_msg.format(v, restored[k])
-
-test_hf_peft_checkpoint()

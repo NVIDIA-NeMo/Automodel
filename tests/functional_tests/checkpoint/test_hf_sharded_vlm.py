@@ -567,6 +567,8 @@ def test_hf_vlm_sharded_checkpoint():
         "step_scheduler.pt",
         "dataloader/dataloader_dp_rank_0.pt",
         "dataloader/dataloader_dp_rank_1.pt",
+        "rng/rng_dp_rank_0.pt",
+        "rng/rng_dp_rank_1.pt",
         "model/shard-00001-model-00001-of-00001.safetensors",
         "model/shard-00002-model-00001-of-00001.safetensors",
         "optim/__0_0.distcp",

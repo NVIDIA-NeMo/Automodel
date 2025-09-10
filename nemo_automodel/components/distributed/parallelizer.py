@@ -68,13 +68,14 @@ from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGe
 
 # Import model-specific tensor parallel plans from the dedicated module
 from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE_FUNCTIONS
+from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
 
-# TODO(boxiangw): Change to nvFSDP once it got published
-HAVE_NVFSDP = False
+# TODO(boxiangw): Change to MegatronFSDP once it got published
+HAVE_MEGATRON_FSDP = False
 try:
-    from nvfsdp import fully_shard as nvfsdp_fully_shard
+    from megatron_fsdp import fully_shard as megatron_fsdp_fully_shard
 
-    HAVE_NVFSDP = True
+    HAVE_MEGATRON_FSDP = True
 except:
     pass
 
@@ -135,7 +136,9 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             validate_tp_mesh(model, tp_mesh)
 
             # Generate or use tensor parallel plan
-            model_parallel_plan = _get_parallel_plan(model, sequence_parallel, tp_shard_plan)
+            model_parallel_plan = {
+                k: translate_to_lora(v) for k, v in _get_parallel_plan(model, sequence_parallel, tp_shard_plan).items()
+            }
 
             # Apply tensor parallelism
             if model_parallel_plan:
@@ -146,6 +149,18 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             for i, layer in enumerate(layers):
                 if hasattr(layer, "mlp"):
                     layers[i].mlp = checkpoint_wrapper(layer.mlp)
+                if hasattr(layer, "self_attn"):
+                    layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)  # type: ignore
+
+                if hasattr(layer, "input_layernorm"):
+                    layers[i].input_layernorm = checkpoint_wrapper(
+                        layers[i].input_layernorm  # type: ignore
+                    )
+
+                if hasattr(layer, "post_attention_layernorm"):
+                    layers[i].post_attention_layernorm = checkpoint_wrapper(
+                        layers[i].post_attention_layernorm  # type: ignore
+                    )
 
         # Set up mixed precision policy
         if not mp_policy:
@@ -767,14 +782,14 @@ def fsdp2_strategy_parallelize(
     )
 
 
-def nvfsdp_strategy_parallelize(
+def megatron_fsdp_strategy_parallelize(
     model,
     device_mesh: DeviceMesh,
     optimizer=None,
-    nvfsdp_unit_modules: Optional[List[str]] = None,
+    megatron_fsdp_unit_modules: Optional[List[str]] = None,
     tp_shard_plan: Optional[Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]] = None,
-    data_parallel_sharding_strategy: str = "optim_grads_params",
-    init_nvfsdp_with_meta_device: bool = False,
+    zero_dp_strategy: int = 3,
+    init_fsdp_with_meta_device: bool = False,
     grad_reduce_in_fp32: bool = False,
     preserve_fp32_weights: bool = False,
     overlap_grad_reduce: bool = True,
@@ -783,32 +798,28 @@ def nvfsdp_strategy_parallelize(
     average_in_collective: bool = False,
     disable_bucketing: bool = False,
     calculate_per_token_loss: bool = False,
-    keep_fp8_transpose_cache_when_using_custom_fsdp: bool = False,
+    keep_fp8_transpose_cache: bool = False,
     nccl_ub: bool = False,
     fsdp_double_buffer: bool = False,
-    dp_mesh_name: str = "dp",
-    cp_mesh_name: str = "cp",
-    tp_mesh_name: str = "tp",
+    dp_shard_dim: str = "dp",
+    tp_dim: str = "tp",
 ):
     """
-    Apply tensor/data parallelism (nvFSDP) and optional activation-checkpointing to the model.
+    Apply tensor/data parallelism (MegatronFSDP) and optional activation-checkpointing to the model.
 
     Args:
         model: The model to be parallelized.
         device_mesh (DeviceMesh): The device mesh describing the physical devices
             used for distributed training.
-        nvfsdp_unit_modules (Optional[List[str]]): Names of sub-modules that should
-            become individual nvFSDP units. If None, the full model is wrapped as
+        megatron_fsdp_unit_modules (Optional[List[str]]): Names of sub-modules that should
+            become individual MegatronFSDP units. If None, the full model is wrapped as
             a single unit.
         tp_shard_plan (Optional[Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]]):
             A tensor-parallel sharding plan.
             Keys are module names; values specify the parallel style to apply
             (e.g., RowwiseParallel, ColwiseParallel, SequenceParallel).
-        data_parallel_sharding_strategy (str): Strategy for sharding parameters,
-            gradients, and optimizer states across data-parallel ranks.
-            Valid options include "params", "grads_params", and
-            "optim_grads_params" (default).
-        init_nvfsdp_with_meta_device (bool): If True, construct the model on a
+        zero_dp_strategy (int): The zero-DP strategy to use.
+        init_fsdp_with_meta_device (bool): If True, construct the model on a
             meta device first and materialize weights lazily to reduce memory
             fragmentation.
         grad_reduce_in_fp32 (bool): Reduce gradients in FP32 irrespective of the
@@ -827,18 +838,16 @@ def nvfsdp_strategy_parallelize(
             reduced immediately as they are produced.
         calculate_per_token_loss (bool): Compute loss normalized by the number of
             tokens instead of the number of sequences.
-        keep_fp8_transpose_cache_when_using_custom_fsdp (bool): Retain the FP8
-            transpose cache when using a custom nvFSDP wrapper.
+        keep_fp8_transpose_cache (bool): Retain the FP8
+            transpose cache when using a custom MegatronFSDP wrapper.
         nccl_ub (bool): Enable NCCL user-buffer API (experimental) for reduced
             latency on some networks.
         fsdp_double_buffer (bool): Enable double buffering of parameters to
-            overlap communication and computation in nvFSDP.
-        dp_mesh_name (str): Key name for the data parallel mesh in device_mesh.
-            Defaults to "data_parallel".
-        cp_mesh_name (str): Key name for the context parallel mesh in device_mesh.
-            Defaults to "context_parallel".
-        tp_mesh_name (str): Key name for the tensor parallel mesh in device_mesh.
-            Defaults to "tensor_parallel".
+            overlap communication and computation in MegatronFSDP.
+        dp_shard_dim (str): Key name for the data parallel mesh in device_mesh.
+            Defaults to "dp".
+        tp_dim (str): Key name for the tensor parallel mesh in device_mesh.
+            Defaults to "tp".
 
     NOTE: The passed-in model should preferably reside on the meta device.
     Otherwise, ensure the model fits into available GPU or CPU memory.
@@ -846,15 +855,15 @@ def nvfsdp_strategy_parallelize(
     NOTE: The user must ensure that the provided tp_shard_plan is compatible
     with the model architecture.
     """
-    assert HAVE_NVFSDP, (
-        "nvFSDP is not installed, please visit \
-        https://github.com/NVIDIA-NeMo/nvFSDP for more information"
+    assert HAVE_MEGATRON_FSDP, (
+        "MegatronFSDP is not installed, please visit \
+        https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/distributed/fsdp/src for \
+        more information"
     )
 
     # DP_CP ranks are sharded by FSDP.
-    dp_mesh = device_mesh[dp_mesh_name]
-    cp_mesh = device_mesh[cp_mesh_name]
-    tp_mesh = device_mesh[tp_mesh_name]
+    dp_mesh = device_mesh[dp_shard_dim]
+    tp_mesh = device_mesh[tp_dim]
 
     if dp_mesh.size() > 1:
         # TODO(boxiangw): remove this once HSDP is supported.
@@ -864,26 +873,19 @@ def nvfsdp_strategy_parallelize(
     if tp_mesh.size() > 1:
         parallelize_module(model, tp_mesh, tp_shard_plan)
 
-    if cp_mesh.size() > 1:
-        dp_cp_mesh_name = "dp_cp"
-    else:
-        dp_cp_mesh_name = "dp"
+    # Import MegatronFSDP unit modules specified by the user.
+    megatron_fsdp_unit_modules = import_classes_from_paths(megatron_fsdp_unit_modules)
 
-    # Import nvFSDP unit modules specified by the user.
-    nvfsdp_unit_modules = import_classes_from_paths(nvfsdp_unit_modules)
-
-    # Wrap model with nvFSDP.
-    model, optimizer = nvfsdp_fully_shard(
+    # Wrap model with MegatronFSDP.
+    model, optimizer = megatron_fsdp_fully_shard(
         module=model,
         optimizer=optimizer,
-        fsdp_unit_modules=nvfsdp_unit_modules,
+        fsdp_unit_modules=megatron_fsdp_unit_modules,
         device_mesh=device_mesh,
-        dp_mesh_name=dp_mesh_name,
-        cp_mesh_name=cp_mesh_name,
-        tp_mesh_name=tp_mesh_name,
-        dp_cp_mesh_name=dp_cp_mesh_name,
-        data_parallel_sharding_strategy=data_parallel_sharding_strategy,
-        init_model_with_meta_device=init_nvfsdp_with_meta_device,
+        dp_shard_dim=dp_shard_dim,
+        tp_dim=tp_dim,
+        zero_dp_strategy=zero_dp_strategy,
+        init_model_with_meta_device=init_fsdp_with_meta_device,
         grad_reduce_in_fp32=grad_reduce_in_fp32,
         preserve_fp32_weights=preserve_fp32_weights,
         overlap_grad_reduce=overlap_grad_reduce,
@@ -893,7 +895,7 @@ def nvfsdp_strategy_parallelize(
         average_in_collective=average_in_collective,
         disable_bucketing=disable_bucketing,
         calculate_per_token_loss=calculate_per_token_loss,
-        keep_fp8_transpose_cache_when_using_custom_fsdp=keep_fp8_transpose_cache_when_using_custom_fsdp,
+        keep_fp8_transpose_cache=keep_fp8_transpose_cache,
         nccl_ub=nccl_ub,
         fsdp_double_buffer=fsdp_double_buffer,
     )

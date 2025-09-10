@@ -44,8 +44,6 @@ from nemo_automodel.components.checkpoint.stateful_wrappers import (
 
 if TYPE_CHECKING:
     from peft import PeftConfig
-    from torch.utils.data import IterableDataset
-    from torchdata.stateful_dataloader import StatefulDataLoader
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 
@@ -62,6 +60,7 @@ class CheckpointingConfig:
     model_repo_id: str
     save_consolidated: bool
     is_peft: bool
+    model_state_dict_keys: list[str]  # copy of the model state dict keys before any parallelization
 
     def __post_init__(self):
         """
@@ -138,6 +137,9 @@ def save_model(
 
     elif checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
         model_state_dict = model_state.state_dict()
+        state_dict_adapter = getattr((model[0] if isinstance(model, list) else model), "state_dict_adapter", None)
+        if state_dict_adapter:
+            model_state_dict = state_dict_adapter.to_hf(model_state_dict, exclude_key_regex=r".*_extra_state.*")
         fqn_to_file_index_mapping = None
         if checkpoint_config.save_consolidated:
             # we first need to find the FQN -> .safetensors mapping
@@ -150,6 +152,14 @@ def save_model(
                 fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(
                     index_path, getattr(model, "_checkpoint_conversion_mapping", None)
                 )
+                # some HF models like Moonlight-16B have non-persistent buffers in the base checkpoint
+                # however, HF initializes buffers with persistent=False, so we need to make sure these
+                # buffer keys are not saved during checkpointing
+                keys_to_remove = list(
+                    set(fqn_to_file_index_mapping.keys()) - set(checkpoint_config.model_state_dict_keys)
+                )
+                for key in keys_to_remove:
+                    fqn_to_file_index_mapping.pop(key)
             else:
                 fqn_to_file_index_mapping = {k: 1 for k in model_state_dict.keys()}
 
@@ -157,7 +167,7 @@ def save_model(
             # These will go to the same file as the last file (or file 1 for single-file models)
             default_index = max(fqn_to_file_index_mapping.values())
 
-            # TODO:(@adil-a): This will need to change when we add PP. Maybe we can cache the keys in ModelState.
+            # add any additional keys that are not in the base checkpoint
             for fqn in list(model_state_dict.keys()):
                 fqn_to_file_index_mapping[fqn] = fqn_to_file_index_mapping.get(fqn, default_index)
 
@@ -186,6 +196,7 @@ def load_model_from_base_checkpoint(
     model_name: str,
     peft_init_method: str,
     device_mesh: Optional[DeviceMesh] = None,
+    moe_mesh: Optional[DeviceMesh] = None,
 ):
     """
     Load a model from the base Hugging Face checkpoint in parallel.
@@ -225,46 +236,55 @@ def load_model_from_base_checkpoint(
     # init peft adapters with the scaled weights
     _init_peft_adapters(model, peft_init_method)
 
-    model_state = ModelState(model, is_peft=is_peft, is_init_step=True)
-    model_state_dict = model_state.state_dict()
-    if os.path.exists(model_name):
-        # offline models will pass in the model path directly
-        model_path = model_name
-    else:
-        model_path = get_safetensors_index_path(root_dir, model_name)
-    dcp.load(
-        model_state_dict,
-        storage_reader=_HuggingFaceStorageReader(
-            model_path, key_mapping=getattr(model, "_checkpoint_conversion_mapping", None)
-        ),
-        process_group=device_mesh["pp"].get_group() if device_mesh else None,
+    load_model(
+        model,
+        model_path=model_name if os.path.exists(model_name) else get_safetensors_index_path(root_dir, model_name),
+        model_save_format=SerializationFormat.SAFETENSORS,
+        is_peft=is_peft,
+        is_init_step=True,
+        use_checkpoint_id=False,
+        key_mapping=getattr(model, "_checkpoint_conversion_mapping", None),
+        load_peft_adapters=False,
+        moe_mesh=moe_mesh,
     )
-    model_state.load_state_dict(model_state_dict)
-    if hasattr(model, "tie_weights") and model_state.is_tied_lm_head:
+
+    is_tied_lm_head = getattr(getattr(model, "config", {}), "tie_word_embeddings", False)
+    if hasattr(model, "tie_weights") and is_tied_lm_head:
         model.tie_weights()
 
 
 def load_model(
     model: torch.nn.Module,
-    weights_path: str,
-    checkpoint_config: CheckpointingConfig,
+    model_path: str,
+    model_save_format: SerializationFormat,
+    *,
+    is_peft: bool = False,
+    is_init_step: bool = False,
+    use_checkpoint_id: bool = True,
+    key_mapping: Optional[dict[str, str]] = None,
+    load_peft_adapters: bool = True,
+    moe_mesh: Optional[DeviceMesh] = None,
 ):
     """
     Load a model state dictionary from a weights path.
 
     Args:
         model: Model to load state into
-        weights_path: Path to load model weights from
-        checkpoint_config: Checkpointing configuration
+        model_path: Path to load model weights from
+        model_save_format: Model save format
+        is_peft: Whether the model is PEFT
+        is_init_step: Whether the model is being initialized
+        use_checkpoint_id: Whether to use the checkpoint ID
+        key_mapping: Key mapping for the model
+        load_peft_adapters: Whether to load PEFT adapters
+        moe_mesh: MoE mesh for distributed loading
     """
-    model_path = os.path.join(weights_path, "model")
-
     # Validate checkpoint directory
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model path {model_path} does not exist")
-    model_state = ModelState(model, checkpoint_config.is_peft)
+    model_state = ModelState(model, is_peft=is_peft, is_init_step=is_init_step)
 
-    if checkpoint_config.is_peft:
+    if is_peft and load_peft_adapters:
         # no PP support for PEFT models
         model = model[0] if isinstance(model, list) else model
         state_dict = model.state_dict()
@@ -275,22 +295,36 @@ def load_model(
         # the call below will broadcast from rank0 to all other ranks
         model_state.load_state_dict(state_dict)
 
-    elif checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
-        storage_reader = _HuggingFaceStorageReader(path=model_path)
+    elif model_save_format == SerializationFormat.SAFETENSORS:
+        storage_reader = _HuggingFaceStorageReader(path=model_path, key_mapping=key_mapping)
 
         reinstated_state_dict = model_state.state_dict()
+        state_dict_adapter = getattr((model[0] if isinstance(model, list) else model), "state_dict_adapter", None)
+        if state_dict_adapter:
+            reinstated_state_dict = state_dict_adapter.to_hf(
+                reinstated_state_dict, exclude_key_regex=r".*_extra_state.*"
+            )
+
         dcp.load(
             reinstated_state_dict,
-            checkpoint_id=model_path,
+            checkpoint_id=model_path if use_checkpoint_id else None,
             storage_reader=storage_reader,
         )
-        model_state.load_state_dict(reinstated_state_dict)
-    elif checkpoint_config.model_save_format == SerializationFormat.TORCH_SAVE:
+
+        if state_dict_adapter:
+            ep_mesh_dims = [dim for dim in moe_mesh.mesh_dim_names if dim != "pp"] if moe_mesh is not None else []
+            ep_mesh = moe_mesh[tuple(ep_mesh_dims)] if ep_mesh_dims else moe_mesh
+            reinstated_state_dict = state_dict_adapter.from_hf(reinstated_state_dict, device_mesh=ep_mesh)
+
+        model_state.load_state_dict(
+            reinstated_state_dict, strict=not (len(model_state.model) > 1 or state_dict_adapter is not None)
+        )
+    elif model_save_format == SerializationFormat.TORCH_SAVE:
         reinstated_state_dict = model_state.state_dict()
-        dcp.load(reinstated_state_dict, checkpoint_id=model_path)
-        model_state.load_state_dict(reinstated_state_dict)
+        dcp.load(reinstated_state_dict, checkpoint_id=model_path if use_checkpoint_id else None)
+        model_state.load_state_dict(reinstated_state_dict, strict=not (len(model_state.model) > 1))
     else:
-        raise ValueError(f"Unsupported model save format: {checkpoint_config.model_save_format}")
+        raise ValueError(f"Unsupported model save format: {model_save_format}")
 
 
 def save_optimizer(
@@ -340,42 +374,52 @@ def load_optimizer(
     optimizer_state.load_state_dict(reinstated_state_dict)
 
 
-def save_dataloader(
-    dataloader: "StatefulDataLoader | IterableDataset",
+def save_dp_aware_helper(
+    state: Any,
+    state_name: str,
     path: str,
     dp_rank: int,
     tp_rank: int,
+    pp_rank: int,
 ):
     """
-    Save the dataloader state.
+    Save the stateful object.
+
+    This function is a helper function currently used to save the dataloader and rng state.
 
     Args:
-        dataloader: Dataloader to save
-        path: Path to save dataloader
+        state: Stateful object to save
+        state_name: Name of the stateful object
+        path: Path to save stateful object
         dp_rank: Data parallel rank
         tp_rank: Tensor parallel rank
+        pp_rank: Pipeline parallel rank
     """
-    dataloader_dir = os.path.join(path, "dataloader")
-    os.makedirs(dataloader_dir, exist_ok=True)
-    if tp_rank == 0:
-        torch.save(dataloader.state_dict(), os.path.join(dataloader_dir, f"dataloader_dp_rank_{dp_rank}.pt"))
+    state_dir = os.path.join(path, state_name)
+    os.makedirs(state_dir, exist_ok=True)
+    if tp_rank == 0 and pp_rank == 0:
+        torch.save(state.state_dict(), os.path.join(state_dir, f"{state_name}_dp_rank_{dp_rank}.pt"))
 
 
-def load_dataloader(
-    dataloader: "StatefulDataLoader | IterableDataset",
+def load_dp_aware_helper(
+    state: Any,
+    state_name: str,
     path: str,
     dp_rank: int,
 ):
     """
-    Load the dataloader state.
+    Load the stateful object.
+
+    This function is a helper function currently used to load the dataloader and rng state.
 
     Args:
-        dataloader: Dataloader to load
-        path: Path to load dataloader
+        state: Stateful object to load
+        state_name: Name of the stateful object
+        path: Path to load stateful object
         dp_rank: Data parallel rank
     """
-    dataloader_dir = os.path.join(path, "dataloader")
-    dataloader.load_state_dict(torch.load(os.path.join(dataloader_dir, f"dataloader_dp_rank_{dp_rank}.pt")))
+    state_dir = os.path.join(path, state_name)
+    state.load_state_dict(torch.load(os.path.join(state_dir, f"{state_name}_dp_rank_{dp_rank}.pt"), weights_only=False))
 
 
 def save_config(config: dict[str, Any], weights_path: str):
@@ -436,7 +480,9 @@ def get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
             raise FileNotFoundError(f"No snapshot directories found in {snapshots_root}")
 
 
-def to_empty_parameters_only(model: nn.Module, *, device: torch.device, recurse: bool = True) -> nn.Module:
+def to_empty_parameters_only(
+    model: nn.Module, *, device: torch.device, recurse: bool = True, dtype: torch.dtype | None = None
+) -> nn.Module:
     """
     Move parameters to the specified device without copying storage, skipping buffers.
 
@@ -450,7 +496,7 @@ def to_empty_parameters_only(model: nn.Module, *, device: torch.device, recurse:
     Returns:
         The same module instance
     """
-    return _apply(model, lambda t: torch.empty_like(t, device=device), recurse=recurse)
+    return _apply(model, lambda t: torch.empty_like(t, device=device, dtype=dtype), recurse=recurse)
 
 
 def _save_peft_adapters(

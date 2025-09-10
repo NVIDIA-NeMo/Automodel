@@ -37,15 +37,15 @@ from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConf
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
-from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.nvfsdp import NVFSDPManager
+from nemo_automodel.components.distributed.init_utils import get_world_size_safe, initialize_distributed
+from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
-from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import count_tail_padding
 from nemo_automodel.components.utils.compile_utils import (
@@ -120,7 +120,7 @@ def build_model_and_optimizer(
     freeze_embeddings=True,
     cfg_fp8=None,
     cfg_compile=None,
-) -> tuple[nn.Module, "Optimizer"]:  # noqa: F821
+) -> tuple[nn.Module, list[str], "Optimizer"]:  # noqa: F821
     """
     Build and initialize a model for VLM.
 
@@ -138,18 +138,18 @@ def build_model_and_optimizer(
         cfg_compile: Configuration for torch.compile.
 
     Returns:
-        The instantiated model on the specified device and optimizer.
+        The instantiated model on the specified device, the state dict keys before any parallelization, and the optimizer.
     """
     is_meta_device = False
     init_ctx = nullcontext()
     if hasattr(cfg_model, "is_meta_device"):
         is_meta_device = cfg_model.is_meta_device
-        if is_meta_device and isinstance(model_wrapper, NVFSDPManager):
-            raise ValueError("Meta device initialization is not supported with NVFSDPManager")
+        if is_meta_device and isinstance(model_wrapper, MegatronFSDPManager):
+            raise ValueError("Meta device initialization is not supported with MegatronFSDPManager")
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else init_ctx
         del cfg_model.is_meta_device
 
-    with StatefulRNG(seed=seed, ranked=True):
+    with ScopedRNG(seed=seed, ranked=True):
         kwargs = {}
 
         # Instantiate the model in meta device to avoid OOM
@@ -166,18 +166,28 @@ def build_model_and_optimizer(
 
         print_trainable_parameters(model)
 
+        # hold a copy of the model state dict keys before any parallelization
+        state_dict_keys = model.state_dict().keys()
+
         if callable(getattr(model_wrapper, "parallelize", None)):
-            if isinstance(model_wrapper, NVFSDPManager):
+            if isinstance(model_wrapper, MegatronFSDPManager):
                 trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
                 assert len(trainable_params) > 0, "trainable_params cannot be empty"
                 if tp_size > 1:
                     cfg_opt.foreach = False
                 optimizer = cfg_opt.instantiate(params=trainable_params)
-                model, optimizer = model_wrapper.parallelize(model, optimizer)
-                model = model.to(device)
-                return model, optimizer
+                if get_world_size_safe() == 1:
+                    logger.info("World size is 1, skipping parallelization.")
+                    model = model.to(device).to(torch.bfloat16)
+                else:
+                    model, optimizer = model_wrapper.parallelize(model, optimizer)
+                return model, state_dict_keys, optimizer
             else:
-                model = model_wrapper.parallelize(model)
+                if get_world_size_safe() == 1:
+                    logger.info("World size is 1, skipping parallelization.")
+                    model = model.to(device).to(torch.bfloat16)
+                else:
+                    model = model_wrapper.parallelize(model)
 
                 # Load the weights into the model in parallel.
                 if is_meta_device:
@@ -198,10 +208,10 @@ def build_model_and_optimizer(
             compile_config = build_compile_config(cfg_compile)
             model = compile_model(model, compile_config)
 
-        return model, optimizer
+        return model, state_dict_keys, optimizer
 
 
-def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
+def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft, state_dict_keys) -> CheckpointingConfig:
     """Build a checkpoint configuration.
 
     Args:
@@ -209,6 +219,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         cache_dir: Cache directory for the model.
         model_repo_id: Model repository ID.
         is_peft: Whether the model is PEFT.
+        state_dict_keys: Copy of the model state dict keys before any parallelization.
 
     Returns:
         The instantiated checkpoint configuration.
@@ -221,6 +232,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
         save_consolidated=False,
         is_peft=is_peft,
+        model_state_dict_keys=state_dict_keys,
     )
     if cfg_ckpt is not None:
         cfg_ckpt = cfg_ckpt.to_dict()
@@ -272,7 +284,7 @@ def build_dataloader(
             "rank": device_mesh["dp"].get_local_rank(),
         }
 
-    with StatefulRNG(seed=seed, ranked=True):
+    with ScopedRNG(seed=seed, ranked=True):
         processor = None
         processor_kwargs = {}
         if cfg_processor is not None and hasattr(cfg_processor, "instantiate"):
@@ -520,6 +532,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
         setup_logging()
 
+        # Set up the stateful random number generator
+        self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
+
         self.device_mesh = None
         self.model_wrapper = None
         if "distributed" in self.cfg:
@@ -539,7 +554,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.peft_config = None
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
-        self.model, self.optimizer = build_model_and_optimizer(
+        self.model, model_state_dict_keys, self.optimizer = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
             self.cfg.optimizer,
@@ -600,10 +615,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.cfg.get("model.cache_dir", None),
             self.cfg.model.pretrained_model_name_or_path,
             True if self.cfg.get("peft", None) else False,
+            model_state_dict_keys,
         )
-
-        # Set up the stateful random number generator
-        self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
         # Optionally resume
         self.load_checkpoint(restore_from)
@@ -660,13 +673,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
             labels = batch.pop("labels")
 
-            if (
-                "position_ids" not in batch
-                and self.device_mesh is not None
-                and (self.device_mesh["cp"].size() > 1 or self.device_mesh["tp"].size() > 1)
-            ):
-                batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model.device)
-
             train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
             with train_ctx(), get_sync_ctx(self.model, i == num_batches - 1):
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
@@ -699,7 +705,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             if isinstance(grad_norm, torch.Tensor):
                 grad_norm = grad_norm.item()
 
-        # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
+        # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model.finish_grad_sync()
 
         self.optimizer.step()
@@ -719,7 +725,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if self.lr_scheduler is not None:
             self.lr_scheduler.step(1)
 
-        # Note(nvFSDP): Need to call these functions for nvFSDP if not using latest api
+        # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model.install_optimized_model_weights()
         # self.model.zero_grad_buffer()
 
@@ -737,7 +743,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
     @torch.no_grad()
     def _run_validation_epoch(self):
         """Run one pass over `self.val_dataloader`."""
-        with StatefulRNG(seed=1, ranked=True):
+        with ScopedRNG(seed=1, ranked=True):
             self.model.eval()
 
             total_loss = 0.0

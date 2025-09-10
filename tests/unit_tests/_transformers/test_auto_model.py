@@ -196,7 +196,7 @@ class TestNeMoAutoModelForCausalLM:
         assert "Falling back to sdpa attention." in caplog.text
 
         # Verify from_pretrained was called twice (first failed, second succeeded)
-        assert mock_from_pretrained.call_count == 2 + int(HAS_LIGER_KERNEL)
+        assert mock_from_pretrained.call_count == 2 + int(not HAS_LIGER_KERNEL)
 
         # Verify the final returned model is the successful one
         assert returned is model2
@@ -276,10 +276,10 @@ class TestNeMoAutoModelForCausalLM:
             assert returned.config["nemo_version"] == __version__
 
         # Verify the method was called twice for retry
-        assert mock_from_pretrained.call_count == 2 + int(HAS_LIGER_KERNEL)
+        assert mock_from_pretrained.call_count == 2 + int(not HAS_LIGER_KERNEL)
 
         # Verify both models were created during the process
-        assert len(models_created) == 2 + int(HAS_LIGER_KERNEL)
+        assert len(models_created) == 2 + int(not HAS_LIGER_KERNEL)
         assert models_created[0] is model1  # First attempt
         assert models_created[1] is model2  # Successful retry
 
@@ -338,7 +338,7 @@ class TestNeMoAutoModelForCausalLM:
         assert "Falling back to eager attention." in caplog.text
 
         # Verify from_config was called twice (first failed, second succeeded)
-        assert mock_from_config.call_count == 2 + int(HAS_LIGER_KERNEL)
+        assert mock_from_config.call_count == 2 + int(not HAS_LIGER_KERNEL)
 
         # Verify the final returned model is the successful one
         assert returned is model2
@@ -764,6 +764,3 @@ def test_liger_apply_failure_raises(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Failed to patch model"):
         tgt._patch_liger_kernel(DummyModel())
-
-
-

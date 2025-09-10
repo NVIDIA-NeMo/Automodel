@@ -18,7 +18,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Union
 
-from datasets import load_dataset
+from datasets import VerificationMode, load_dataset
 from torch.utils.data import Dataset
 
 from nemo_automodel.components.datasets.llm.formatting_utils import (
@@ -104,13 +104,17 @@ def _load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str
         datasets.Dataset: The loaded dataset.
     """
     if isinstance(path_or_dataset_id, str) and _str_is_hf_repo_id(path_or_dataset_id):
-        return load_dataset(path_or_dataset_id, split=split or "train", streaming=streaming)
+        return load_dataset(
+            path_or_dataset_id, split=split, streaming=streaming, verification_mode=VerificationMode.NO_CHECKS
+        )
 
     data_files = list(make_iterable(path_or_dataset_id))
     if not data_files:
         raise RuntimeError("No data files provided")
 
-    return load_dataset("json", data_files=data_files, split="train", streaming=streaming)
+    return load_dataset(
+        "json", data_files=data_files, split="train", streaming=streaming, verification_mode=VerificationMode.NO_CHECKS
+    )
 
 
 def _check_all_values_equal_length(sample: Dict[str, List[int]]) -> bool:
@@ -129,7 +133,7 @@ def _check_all_values_equal_length(sample: Dict[str, List[int]]) -> bool:
 
 
 class ColumnMappedTextInstructionDataset(Dataset):
-    """Generic *instruction‐tuning* dataset that maps arbitrary column names.
+    """Generic instruction-tuning dataset that maps arbitrary column names.
 
     The class is intentionally lightweight: it simply loads the raw samples
     (either from HF or from local JSON/JSONL files) and remaps the columns so
@@ -147,7 +151,6 @@ class ColumnMappedTextInstructionDataset(Dataset):
         tokenizer,
         *,
         split: Optional[str] = None,
-        streaming: bool = False,
         answer_only_loss_mask: bool = True,
         seq_length: Optional[int] = None,
         start_of_turn_token: Optional[str] = None,
@@ -160,7 +163,6 @@ class ColumnMappedTextInstructionDataset(Dataset):
             column_mapping: The mapping of the columns.
             tokenizer: The tokenizer to use.
             split: The split of the dataset to load.
-            streaming: Whether to load the dataset in streaming mode.
             answer_only_loss_mask: Whether to compute the loss mask only on the answer tokens.
             seq_length: The sequence length to use for padding.
             start_of_turn_token: The token to use to indicate the start of a turn.
@@ -177,23 +179,29 @@ class ColumnMappedTextInstructionDataset(Dataset):
         assert tokenizer is not None, "Tokenizer is required"
         self.tokenizer = tokenizer
 
-        self.streaming = streaming
-        self.dataset = _load_dataset(path_or_dataset_id, split=split, streaming=streaming)
+        self.dataset = _load_dataset(path_or_dataset_id, split=split, streaming=False)
 
         # Keep mapping: dest -> source (i.e. public_field -> raw_column_name)
 
         assert isinstance(column_mapping, dict), "Expected column_mapping to be a dictionary"
         # Ensure required columns are present
-        assert ColumnTypes.Question.value in column_mapping, (
-            "Expected question to be in column_mapping",
-            column_mapping,
-        )
         assert ColumnTypes.Answer.value in column_mapping, ("Expected answer to be in column_mapping", column_mapping)
         if len(column_mapping) == 3:
             assert ColumnTypes.Context.value in column_mapping, (
                 "Expected context to be in column_mapping",
                 column_mapping,
             )
+            assert ColumnTypes.Question.value in column_mapping, (
+                "Expected question to be in column_mapping",
+                column_mapping,
+            )
+        elif len(column_mapping) == 2:
+            assert ColumnTypes.Context.value in column_mapping or ColumnTypes.Question.value in column_mapping, (
+                "Expected context or question to be in column_mapping",
+                column_mapping,
+            )
+        else:
+            raise ValueError(f"Expected 2 or 3 columns in column_mapping, got {len(column_mapping)}")
 
         self.column_mapping = column_mapping
 
@@ -211,8 +219,6 @@ class ColumnMappedTextInstructionDataset(Dataset):
         Raises:
             RuntimeError: If streaming is enabled.
         """
-        if self.streaming:
-            raise RuntimeError("Streaming datasets do not have a defined length")
         return len(self.dataset)
 
     def __getitem__(self, idx):  # noqa: D401
@@ -228,38 +234,11 @@ class ColumnMappedTextInstructionDataset(Dataset):
         Raises:
             RuntimeError: If streaming is enabled.
         """
-        if self.streaming:
-            raise RuntimeError("__getitem__ is not supported when `streaming=True`. Iterate over the dataset instead.")
         row = self.dataset[idx]
-        mapped = {dest: row[src] for dest, src in self.column_mapping.items()}
+        mapped = {dest: row[src] for dest, src in self.column_mapping.items() if src in row}
         mapped = self._apply_tokenizer(mapped)
         assert _check_all_values_equal_length(mapped), "All values must be of the same length"
         return mapped
-
-    def __iter__(self):  # noqa: D401
-        """
-        Iterate over the dataset yielding rows with the requested column mapping.
-
-        When *streaming=True* the underlying dataset is consumed lazily.
-
-        If the tokenizer is provided, it will be used to tokenize the dataset.
-
-        Returns:
-            An iterator over the dataset.
-
-        Raises:
-            RuntimeError: If streaming is enabled.
-        """
-        if self.streaming:
-            for row in self.dataset:
-                mapped = {dest: row[src] for dest, src in self.column_mapping.items()}
-                mapped = self._apply_tokenizer(mapped)
-                assert _check_all_values_equal_length(mapped), "All values must be of the same length"
-                yield mapped
-        else:
-            for idx in range(len(self)):
-                # Reuse __getitem__ to avoid duplicating logic.
-                yield self[idx]
 
     def _apply_tokenizer(self, sample: Dict[str, str]) -> Dict[str, List[int]]:
         """
@@ -278,13 +257,14 @@ class ColumnMappedTextInstructionDataset(Dataset):
         assert isinstance(sample, dict), "Expected sample to be a dictionary"
         assert len(sample) >= 2, "Expected at least two columns"
         context = sample.get(ColumnTypes.Context.value, None)
-        question = sample[ColumnTypes.Question.value]
+        question = sample.get(ColumnTypes.Question.value, None)
         answer = sample[ColumnTypes.Answer.value]
 
         eos_token_id = getattr(self.tokenizer, "eos_token_id", 0)
         pad_token_id = _add_pad_token(self.tokenizer) or eos_token_id
 
-        prompt = f"{context} {question}" if context else question
+        prompt = " ".join(filter(lambda x: x is not None, (context, question, "")))
+        assert len(prompt) > 1, "Expected prompt to be non-empty"
         if _has_chat_template(self.tokenizer):
             return format_chat_template(
                 self.tokenizer,

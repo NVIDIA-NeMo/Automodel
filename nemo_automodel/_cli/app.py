@@ -139,8 +139,13 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
     command = " ".join(
         (
             f"PYTHONPATH={repo_root}:$PYTHONPATH",
-            "python3",
-            f"{repo_root}/nemo_automodel/recipes/{args.domain}_{args.command}/{args.command}.py",
+            # Use torchrun to launch multiple processes instead
+            f"uv run --frozen --all-extras torchrun "
+            f"--nproc_per_node={slurm_config['ntasks_per_node']} "
+            f"--nnodes={slurm_config['nodes']} "
+            f"--rdzv_backend=c10d "
+            f"--rdzv_endpoint=${{MASTER_ADDR}}:${{MASTER_PORT}}",
+            f"{repo_root}/examples/{args.domain}_{args.command}/{args.command}.py",
             "-c",
             f"{job_conf_path}",
         )
@@ -148,7 +153,9 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
     # Add extra mounts
     if not "extra_mounts" in slurm_config:
         slurm_config["extra_mounts"] = []
-    slurm_config["extra_mounts"].append(VolumeMapping(Path(repo_root), Path(repo_root)))
+    # only append to mount if repo_root exists since it could be /opt/Automodel
+    if Path(repo_root).exists():
+        slurm_config["extra_mounts"].append(VolumeMapping(Path(repo_root), Path(repo_root)))
     return submit_slurm_job(SlurmConfig(**slurm_config, command=command, chdir=repo_root), job_dir)
 
 
@@ -165,8 +172,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         metavar="<command>",
-        choices=["finetune", "pretrain"],
-        help="Command within the domain (e.g., finetune, pretrain, generate, etc)",
+        choices=["finetune", "pretrain", "kd"],
+        help="Command within the domain (e.g., finetune, pretrain, kd, etc)",
     )
     parser.add_argument(
         "domain",
