@@ -155,6 +155,9 @@ def build_model_and_optimizer(
 
             # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
             if cfg_peft is not None:
+                if tp_size > 1:
+                    logger.info("Disabling Triton with TP ({})".format(tp_size))
+                    cfg_peft.use_triton = False
                 assert autopipeline is None, "PEFT is not supported with AutoPipeline"
                 apply_lora_to_linear_modules(
                     model, cfg_peft, quantization_config=kwargs.get("quantization_config", None)

@@ -176,7 +176,7 @@ class LinearLoRA(nn.Linear):
         obj.lora_A = nn.Linear(in_features, dim, bias=False, dtype=dtype, device=device)
         obj.lora_B = nn.Linear(dim, out_features, bias=False, dtype=dtype, device=device)
         LinearLoRA.init_lora_weights(obj, lora_A_init_method)
-        obj.dropout = nn.Dropout(p=dropout)
+        obj.dropout_p = dropout
         assert dropout_position in ["pre", "post"], ("dropout position can only be pre/post", dropout_position)
         obj.dropout_position = dropout_position
 
@@ -204,11 +204,11 @@ class LinearLoRA(nn.Linear):
             res = F.linear(x, self.weight, self.bias)
 
         if self.dropout_position == "pre":
-            x = self.dropout(x)
+            x = F.dropout(x, p=self.dropout_p, training=self.training)
         lora_res = self.lora_B(self.lora_A(x))
         lora_res = lora_res * self.scale
         if self.dropout_position == "post":
-            lora_res = self.dropout(lora_res)
+            lora_res = F.dropout(lora_res, p=self.dropout_p, training=self.training)
         return res + lora_res
 
 
@@ -247,10 +247,10 @@ class TritonLinearLoRA(LinearLoRA):
             res = F.linear(x, self.weight, self.bias)
 
         if self.dropout_position == "pre":
-            x = self.dropout(x)
+            x = F.dropout(x, p=self.dropout_p, training=self.training)
         lora_res = LoRATritonFunction.apply(x, self.lora_A.weight, self.lora_B.weight, self.scale, x.dtype)
         if self.dropout_position == "post":
-            lora_res = self.dropout(lora_res)
+            lora_res = F.dropout(lora_res, p=self.dropout_p, training=self.training)
 
         return res + lora_res
 
@@ -316,9 +316,7 @@ def patch_linear_module(
     return orig_linear
 
 
-# -----------------------------------------------------------------------------#
-# 2.  Convenience: patch a model in-place                                      #
-# -----------------------------------------------------------------------------#
+# patch a model in-place
 def apply_lora_to_linear_modules(
     model: nn.Module,
     peft_config: PeftConfig,
