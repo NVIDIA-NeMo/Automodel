@@ -20,7 +20,7 @@ import torch
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.llm.train_ft import build_distributed, build_dataloader
-from nemo_automodel.components.checkpoint.checkpointing import save_dataloader, load_dataloader
+from nemo_automodel.components.checkpoint.checkpointing import save_dp_aware_helper, load_dp_aware_helper
 
 """
 This test is to make sure that JSONL dataset can be checkpointed and loaded correctly.
@@ -35,6 +35,7 @@ def test_megatron_dataset_checkpointing():
     dp_rank = device_mesh["dp"].get_local_rank()
     dp_world_size = device_mesh["dp"].size()
     tp_rank = device_mesh["tp"].get_local_rank()
+    pp_rank = device_mesh["pp"].get_local_rank()
 
     dataset = build_dataloader(
         cfg_ds=cfg.dataset,
@@ -55,7 +56,7 @@ def test_megatron_dataset_checkpointing():
     for i, batch in enumerate(dataset):
         if i == 2:
             # save checkpoint
-            save_dataloader(dataset, cfg.checkpoint.checkpoint_dir, dp_rank, tp_rank)
+            save_dp_aware_helper(dataset, "dataloader", cfg.checkpoint.checkpoint_dir, dp_rank, tp_rank, pp_rank)
         elif i == 3:
             expected_batch = batch
             break
@@ -96,7 +97,7 @@ def test_megatron_dataset_checkpointing():
         assert torch.any(initial_batch[k] != expected_batch[k]), f"Initial batch key {k, initial_batch[k]} should not be equal to expected batch key {k, expected_batch[k]}"
 
     # load checkpoint
-    load_dataloader(dataset, cfg.checkpoint.checkpoint_dir, dp_rank)
+    load_dp_aware_helper(dataset, "dataloader", cfg.checkpoint.checkpoint_dir, dp_rank)
 
     for i, batch in enumerate(dataset):
         for k in batch.keys():
