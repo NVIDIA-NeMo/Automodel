@@ -16,6 +16,7 @@ import logging
 import re
 from enum import Enum
 from pathlib import Path
+from random import randint
 from typing import Dict, Iterator, List, Optional, Union
 
 from datasets import VerificationMode, load_dataset
@@ -241,11 +242,11 @@ class ColumnMappedTextInstructionDataset(Dataset):
             RuntimeError: If streaming is enabled.
         """
         # Try current idx, then successive ones, to find a sample that fits max_seq_length
-        attempts = 0
         total = len(self.dataset)
-        cur_idx = idx % total
+        cur_idx = idx
         last_error: Optional[Exception] = None
-        while attempts < min(16, total):
+        max_attempts = min(64, total)
+        for _ in range(max_attempts):
             row = self.dataset[cur_idx]
             mapped = {dest: row[src] for dest, src in self.column_mapping.items() if src in row}
             try:
@@ -254,8 +255,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
                 return mapped
             except NoContextLeftError as e:
                 last_error = e
-                attempts += 1
-                cur_idx = (cur_idx + 1) % total
+                cur_idx = randint(0, total - 1)  # randint [start, end] (inclusive)
                 continue
         # If we exhausted attempts, re-raise the last error for visibility
         if last_error is not None:
