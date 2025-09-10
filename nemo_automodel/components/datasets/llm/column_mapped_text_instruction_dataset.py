@@ -162,12 +162,11 @@ class ColumnMappedTextInstructionDataset(Dataset):
         Initialize the dataset.
 
         Args:
-            path_or_dataset_id: The path or dataset id of the dataset.
-            column_mapping: The mapping of the columns.
-            tokenizer: The tokenizer to use.
-            split: The split of the dataset to load.
-            answer_only_loss_mask: Whether to compute the loss mask only on the answer tokens.
-            max_seq_length: The sequence length to use for padding.
+            path_or_dataset_id (str, list[str]): The path or dataset id of the dataset.
+            column_mapping (dict): The mapping of the columns.
+            tokenizer (Tokenizer): The tokenizer to use.
+            split (str, optional): The split of the dataset to load.
+            answer_only_loss_mask (bool, optional): Whether to compute the loss mask only on the answer tokens.
             start_of_turn_token: The token to use to indicate the start of a turn.
             limit_dataset_samples: The number of samples to load from the dataset.
         """
