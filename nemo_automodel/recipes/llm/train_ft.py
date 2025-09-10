@@ -58,7 +58,7 @@ from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
-from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import count_tail_padding, scale_grads_and_clip_grad_norm
 from nemo_automodel.components.utils.compile_utils import (
@@ -131,7 +131,7 @@ def build_model_and_optimizer(
         is_meta_device = True
 
     init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
-    with StatefulRNG(seed=seed, ranked=True):
+    with ScopedRNG(seed=seed, ranked=True):
         kwargs = {}
         if use_hf_fa2 and is_hf_model:
             kwargs["attn_implementation"] = "flash_attention_2"
@@ -394,7 +394,7 @@ def build_dataloader(
     Returns:
         The instantiated DataLoader and tokenizer.
     """
-    with StatefulRNG(seed=seed, ranked=True):
+    with ScopedRNG(seed=seed, ranked=True):
         kwargs, tokenizer = _build_tokenizer(cfg_model, cfg_ds)
         # Megatron specific kwargs
         if cfg_ds._target_ == MegatronPretraining:
@@ -696,6 +696,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # setups logging and adds the rankfilter to logging
         setup_logging()
 
+        # Set up the stateful random number generator
+        self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
+
         self.device_mesh = None
         self.moe_mesh = None
         self.model_wrapper = None
@@ -845,9 +848,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             True if self.cfg.get("peft", None) else False,
             model_state_dict_keys,
         )
-
-        # Set up the stateful random number generator
-        self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
         # Optionally resume
         self.load_checkpoint(restore_from, moe_mesh=self.moe_mesh)
@@ -1049,7 +1049,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             logger.warning("Validation is not supported for pipeline parallelism")
             return
 
-        with StatefulRNG(seed=1, ranked=True):
+        with ScopedRNG(seed=1, ranked=True):
             for mp in self.model_parts:
                 mp.eval()
 
