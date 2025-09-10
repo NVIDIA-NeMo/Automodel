@@ -527,6 +527,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
         setup_logging()
 
+        # Set up the stateful random number generator
+        self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
+
         self.device_mesh = None
         self.model_wrapper = None
         if "distributed" in self.cfg:
@@ -608,9 +611,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.cfg.model.pretrained_model_name_or_path,
             True if self.cfg.get("peft", None) else False,
         )
-
-        # Set up the stateful random number generator
-        self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
         # Optionally resume
         self.load_checkpoint(restore_from)

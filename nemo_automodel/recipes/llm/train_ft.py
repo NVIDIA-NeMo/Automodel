@@ -688,6 +688,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # setups logging and adds the rankfilter to logging
         setup_logging()
 
+        # Set up the stateful random number generator
+        self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
+
         self.device_mesh = None
         self.moe_mesh = None
         self.model_wrapper = None
@@ -836,9 +839,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.cfg.model.get("pretrained_model_name_or_path", None),
             True if self.cfg.get("peft", None) else False,
         )
-
-        # Set up the stateful random number generator
-        self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
         # Optionally resume
         self.load_checkpoint(restore_from, moe_mesh=self.moe_mesh)
