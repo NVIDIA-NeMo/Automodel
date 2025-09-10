@@ -139,9 +139,7 @@ def _truncate_prompt_to_fit_plain(
     while True:
         context_len = len(tokenizer(current_prompt)["input_ids"]) if answer_only_loss_mask else 0
         full_ids = tokenizer(current_prompt + answer)["input_ids"]
-        packaged = _package_tokenized_example(
-            False, full_ids, eos_token_id, pad_token_id, max_seq_length, context_len
-        )
+        packaged = _package_tokenized_example(False, full_ids, eos_token_id, pad_token_id, max_seq_length, context_len)
         if len(packaged["labels"]) <= max_seq_length:
             return current_prompt
         # remove up to the first space from the left
