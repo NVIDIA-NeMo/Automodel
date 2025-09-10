@@ -24,6 +24,10 @@ if TYPE_CHECKING:
 GENERATION_REGEX = re.compile(r"\{%-?\s+generation\s+-?%\}")
 
 
+class NoContextLeftError(RuntimeError):
+    """Raised when context must be fully removed to satisfy max_seq_length."""
+
+
 def _pad_to_seq_length(sample, pad_token_id, seq_length):
     """Pad a sample to a specific sequence length."""
     n = seq_length - len(sample)
@@ -100,11 +104,7 @@ def _package_tokenized_example(
         assert input_ids[-1] != eos_token_id, f"input_ids[-1]={input_ids[-1]} == eos_token_id={eos_token_id}"
     assert len(input_ids) == len(labels), f"len(input_ids)={len(input_ids)} != len(labels)={len(labels)}"
 
-    if isinstance(seq_length, int):
-        input_ids = _pad_to_seq_length(input_ids, pad_token_id, seq_length)
-        labels = _pad_to_seq_length(labels, -100, seq_length)
-
-    # the attention mask can also be extended in the collator with zeros.
+    # No padding is applied here. We only ensure mask matches length.
     attention_mask += [0] * (len(labels) - len(attention_mask))
     return {
         "input_ids": input_ids,
@@ -118,13 +118,93 @@ def _package_tokenized_example(
     }
 
 
+def _truncate_prompt_to_fit_plain(
+    tokenizer: "PreTrainedTokenizer",
+    prompt: str,
+    answer: str,
+    eos_token_id: int,
+    pad_token_id: int,
+    max_seq_length: Optional[int],
+    answer_only_loss_mask: bool,
+) -> str:
+    """Iteratively remove leading context words until packaged length fits.
+
+    Splits on spaces to avoid mid-word truncation. Raises NoContextLeftError
+    if the prompt must be fully removed to satisfy the constraint.
+    """
+    if not isinstance(max_seq_length, int):
+        return prompt
+
+    current_prompt = prompt
+    while True:
+        context_len = len(tokenizer(current_prompt)["input_ids"]) if answer_only_loss_mask else 0
+        full_ids = tokenizer(current_prompt + answer)["input_ids"]
+        packaged = _package_tokenized_example(
+            False, full_ids, eos_token_id, pad_token_id, max_seq_length, context_len
+        )
+        if len(packaged["labels"]) <= max_seq_length:
+            return current_prompt
+        # remove up to the first space from the left
+        cut = current_prompt.find(" ")
+        if cut == -1:
+            raise NoContextLeftError("Context fully removed but sequence still exceeds max_seq_length")
+        current_prompt = current_prompt[cut + 1 :]
+        # Skip any additional spaces
+        while current_prompt.startswith(" "):
+            current_prompt = current_prompt[1:]
+        if not current_prompt:
+            raise NoContextLeftError("No context left after truncation")
+
+
+def _truncate_prompt_to_fit_chat(
+    tokenizer: "PreTrainedTokenizer",
+    prompt: str,
+    answer: str,
+    eos_token_id: int,
+    pad_token_id: int,
+    max_seq_length: Optional[int],
+    start_of_turn_token: Optional[str],
+) -> str:
+    """Iteratively remove leading context words for chat-template path."""
+    if not isinstance(max_seq_length, int):
+        return prompt
+
+    current_prompt = prompt
+    while True:
+        messages = [
+            {"role": "user", "content": current_prompt},
+            {"role": "assistant", "content": answer},
+        ]
+        input_ids = tokenizer.apply_chat_template(messages)
+        if isinstance(start_of_turn_token, str):
+            start_of_turn_token_id = tokenizer(start_of_turn_token, add_special_tokens=False)["input_ids"][0]
+            first_start_of_turn_token_id = input_ids.index(start_of_turn_token_id)
+            response_start = input_ids.index(start_of_turn_token_id, first_start_of_turn_token_id + 1)
+        else:
+            response_start = 0
+        packaged = _package_tokenized_example(
+            True, input_ids, eos_token_id, pad_token_id, max_seq_length, response_start
+        )
+        if len(packaged["labels"]) <= max_seq_length:
+            return current_prompt
+        # remove up to the first space from the left
+        cut = current_prompt.find(" ")
+        if cut == -1:
+            raise NoContextLeftError("Context fully removed but sequence still exceeds max_seq_length")
+        current_prompt = current_prompt[cut + 1 :]
+        while current_prompt.startswith(" "):
+            current_prompt = current_prompt[1:]
+        if not current_prompt:
+            raise NoContextLeftError("No context left after truncation")
+
+
 def format_prompt_completion(
     tokenizer: "PreTrainedTokenizer",
     prompt: str,
     answer: str,
     eos_token_id: int,
     pad_token_id: int,
-    seq_length: Optional[int] = None,
+    max_seq_length: Optional[int] = None,
     answer_only_loss_mask: bool = True,
 ) -> Dict[str, List[int]]:
     """
@@ -136,21 +216,26 @@ def format_prompt_completion(
         answer: The answer string.
         eos_token_id: The end-of-sequence token id.
         pad_token_id: The padding token id.
-        seq_length: Optional sequence length for padding.
+        max_seq_length: Optional maximum sequence length. If the packaged
+            sequence exceeds this length, context is removed from the left at
+            space boundaries. No padding is applied.
 
     Returns:
         A dictionary with the formatted example.
     """
-    full_text = prompt + answer
+    # Optionally truncate prompt to fit the requested maximum length
+    truncated_prompt = _truncate_prompt_to_fit_plain(
+        tokenizer, prompt, answer, eos_token_id, pad_token_id, max_seq_length, answer_only_loss_mask
+    )
 
     # Tokenize separately to locate answer start
     if answer_only_loss_mask:
-        prompt_ids = tokenizer(prompt)["input_ids"]
+        prompt_ids = tokenizer(truncated_prompt)["input_ids"]
         len_prompt_ids = len(prompt_ids)
     else:
         len_prompt_ids = 0
     # Tokenize full text
-    input_ids = tokenizer(full_text)["input_ids"]
+    input_ids = tokenizer(truncated_prompt + answer)["input_ids"]
 
     # Create assistant_masks: 0 for prompt tokens, 1 for answer tokens
     assistant_masks = [0] * len_prompt_ids + [1] * (len(input_ids) - len_prompt_ids)

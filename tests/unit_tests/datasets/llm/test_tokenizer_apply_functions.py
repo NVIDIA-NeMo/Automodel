@@ -31,6 +31,7 @@ import pytest
 from nemo_automodel.components.datasets.llm.formatting_utils import (
     format_prompt_completion,
     format_chat_template,
+    NoContextLeftError,
 )
 
 
@@ -154,7 +155,7 @@ def testformat_prompt_completion_answer_only_mask():
     # Exclude the eos token
     expected_zeros = len(prompt_ids) - 1
     expected_ones = len(full_text_ids) - expected_zeros
-
+    
     num_ignore_labels = out["labels"].count(-100)
     assert num_ignore_labels == expected_zeros, (out, out["labels"][-4:], len(out["labels"]), num_ignore_labels)
     assert len(out["labels"]) - num_ignore_labels == expected_ones
@@ -217,4 +218,47 @@ def test_apply_tokenizer_chat_template_full_loss_mask():
     del out["___PAD_TOKEN_IDS___"]
     assert set(out) == {"input_ids", "labels", "attention_mask"}
     assert len(out["input_ids"]) == len(out["labels"]) == len(out["attention_mask"])
-    assert all(v == 1 for v in out["attention_mask"])
+    assert all(v == 1 for v in out["attention_mask"])  # type: ignore[index]
+
+
+def test_truncation_raises_when_answer_alone_exceeds_max_len():
+    tok = _StubTokenizerPlain()
+    # Prompt with multiple words; answer is one token; set max very small
+    prompt = "one two three "
+    answer = "ok"
+    with pytest.raises(NoContextLeftError):
+        format_prompt_completion(
+            tok,
+            prompt,
+            answer,
+            eos_token_id=tok.eos_token_id,
+            pad_token_id=tok.eos_token_id,
+            max_seq_length=1,
+        )
+
+
+def test_space_aware_left_truncation_keeps_whole_words():
+    tok = _StubTokenizerPlain()
+    # Five-word context; one-word answer; max length allows only last two context words
+    prompt = "one two three four five "
+    answer = "ok"
+    S = 4  # max_seq_length
+    out = format_prompt_completion(
+        tok,
+        prompt,
+        answer,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.eos_token_id,
+        max_seq_length=S,
+        answer_only_loss_mask=True,
+    )
+    del out["___PAD_TOKEN_IDS___"]
+    # Total packaged length must be <= S
+    assert len(out["labels"]) <= S
+    # Compute number of prompt tokens kept from the count of -100s
+    num_ignore = out["labels"].count(-100)
+    kept_prompt_tokens = num_ignore - 1  # discount prompt EOS
+    # With S=4 and one-word answer, only 2 prompt tokens can be kept
+    assert kept_prompt_tokens == 2
+    # Length equals kept_prompt + answer(1) + 1 (due to BOS/EOS accounting in labels)
+    assert len(out["labels"]) == kept_prompt_tokens + 1 + 1

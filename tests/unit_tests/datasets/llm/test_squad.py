@@ -149,11 +149,10 @@ def test_plain_tokenizer_basic():
         assert all(v == 1 for v in sample["loss_mask"][first_one:])
 
 
-def test_sequence_padding():
+def test_sequence_max_len_enforced():
     """
-    When `seq_length` is supplied, every field must be padded to that exact
-    length; `loss_mask` should be padded with zeros; `input_ids` & `labels`
-    with eos.
+    When `seq_length` is supplied, total tokenized length must not exceed it
+    after space-aware context truncation; no padding should be added.
     """
     tok = DummyTokenizer()
     pad_len = 32
@@ -162,12 +161,11 @@ def test_sequence_padding():
         for key, val in row.items():
             if key == "___PAD_TOKEN_IDS___":
                 continue
-            assert len(val) == pad_len
-        # last id in labels must equal eos
-        assert list(filter(lambda x: x != -100, row["labels"])) == [0]
-        if 'loss_mask' in row:
-            # loss mask padding must be zeros
-            assert row["loss_mask"][-1] == 0
+            assert len(val) <= pad_len
+        # labels should still end with eos (filtered of -100)
+        assert list(filter(lambda x: x != -100, row["labels"]))[-1] == tok.eos_token_id
+        # attention masks should be ones (no padding zeros)
+        assert all(v == 1 for v in row["attention_mask"])  # type: ignore[index]
 
 
 def test_limit_dataset_samples(monkeypatch):

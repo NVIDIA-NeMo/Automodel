@@ -26,6 +26,7 @@ from nemo_automodel.components.datasets.llm.formatting_utils import (
     _has_chat_template,
     format_chat_template,
     format_prompt_completion,
+    NoContextLeftError,
 )
 
 # Supported cases:
@@ -239,11 +240,27 @@ class ColumnMappedTextInstructionDataset(Dataset):
         Raises:
             RuntimeError: If streaming is enabled.
         """
-        row = self.dataset[idx]
-        mapped = {dest: row[src] for dest, src in self.column_mapping.items() if src in row}
-        mapped = self._apply_tokenizer(mapped)
-        assert _check_all_values_equal_length(mapped), "All values must be of the same length"
-        return mapped
+        # Try current idx, then successive ones, to find a sample that fits max_seq_length
+        attempts = 0
+        total = len(self.dataset)
+        cur_idx = idx % total
+        last_error: Optional[Exception] = None
+        while attempts < min(16, total):
+            row = self.dataset[cur_idx]
+            mapped = {dest: row[src] for dest, src in self.column_mapping.items() if src in row}
+            try:
+                mapped = self._apply_tokenizer(mapped)
+                assert _check_all_values_equal_length(mapped), "All values must be of the same length"
+                return mapped
+            except NoContextLeftError as e:
+                last_error = e
+                attempts += 1
+                cur_idx = (cur_idx + 1) % total
+                continue
+        # If we exhausted attempts, re-raise the last error for visibility
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Failed to retrieve a valid sample")
 
     def _apply_tokenizer(self, sample: Dict[str, str]) -> Dict[str, List[int]]:
         """
@@ -290,6 +307,6 @@ class ColumnMappedTextInstructionDataset(Dataset):
                 answer,
                 eos_token_id,
                 pad_token_id,
-                seq_length=self.seq_length,
+                max_seq_length=self.seq_length,
                 answer_only_loss_mask=self.answer_only_loss_mask,
             )
