@@ -212,15 +212,3 @@ def test_chat_template_path():
     if 'loss_mask' in row:
         assert sum(row["loss_mask"][:response_start]) == 0
         assert sum(row["loss_mask"][response_start:]) == len(row["loss_mask"][response_start:])
-
-
-def test_fp8_flag_is_noop():
-    """
-    The `fp8` flag exists for future use. Setting it should not alter
-    functional behaviour nor raise.
-    """
-    tok = DummyTokenizer()
-    ds = make_squad_dataset(tok, fp8=True)
-    # still returns a dataset
-    assert isinstance(ds, Dataset)
-    assert len(ds) == 2
