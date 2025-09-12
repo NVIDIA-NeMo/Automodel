@@ -13,8 +13,8 @@
 # limitations under the License.
 
 distributed:
-  pp_size: 2
-  ep_size: 4
+  pp_size: 1
+  ep_size: 8
   dp_replicate_size: 1
 
 model:
@@ -33,9 +33,9 @@ model:
 parallelize_fn: nemo_automodel.components.models.deepseek_v3.parallelizer.parallelize_model
 
 training:
-  seq_len: 1024
-  global_batch_size: 128
-  local_batch_size: 32
+  seq_len: 2048
+  global_batch_size: 256
+  local_batch_size: 16
   steps: 30
   warmup_steps: 10
   seed: 1234
@@ -52,7 +52,7 @@ optimizer:
   weight_decay: 0
 
 pipelining:
-  pp_microbatch_size: 1
+  pp_microbatch_size: 4
   layers_per_stage: 2
   pipeline_parallel_schedule: interleaved1f1b
   patch_inner_model: false
