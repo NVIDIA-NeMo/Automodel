@@ -99,7 +99,7 @@ We recommend **uv** for reproducible environments.
 ```bash
 uv venv
 uv pip install nemo_automodel # latest release
-# or: uv pip install git+https://nam11.safelinks.protection.outlook.com/?url=https%3A%2F%2Fgithub.com%2FNVIDIA-NeMo%2FAutomodel.git&data=05%7C02%7Cakoumparouli%40nvidia.com%7C88f177d2fa09407d30c408ddf316ef59%7C43083d15727340c1b7db39efd9ccc17a%7C0%7C0%7C638934002060056854%7CUnknown%7CTWFpbGZsb3d8eyJFbXB0eU1hcGkiOnRydWUsIlYiOiIwLjAuMDAwMCIsIlAiOiJXaW4zMiIsIkFOIjoiTWFpbCIsIldUIjoyfQ%3D%3D%7C0%7C%7C%7C&sdata=5CnwNAdBiwubNW9zK5QC%2FGLAiDqVIJoNFix47upiIeE%3D&reserved=0
+# or: uv pip install git+https://github.com/NVIDIA-NeMo/Automodel.git
 uv run python -c "import nemo_automodel; print('AutoModel ready')"
 ```
 
