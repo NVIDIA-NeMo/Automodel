@@ -15,7 +15,7 @@
 <!-- **Day-0 integration with Hugging Face models automating fine-tuning and pretraining with pytorch-native parallelism, custom-kernels and optimized recipes** -->
 **DTensor‑native SPMD library for large‑scale training, with Hugging Face‑native fine‑tuning and pretraining.**
 
-[📖 Documentation](https://docs.nvidia.com/nemo/automodel/latest/index.html) • [🔥 Ready-to-Use Recipes](https://github.com/NVIDIA-NeMo/Automodel/#-ready-to-use-recipes) • [💡 Examples](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples) • [🤝 Contributing](https://github.com/NVIDIA-NeMo/Automodel/blob/main/CONTRIBUTING.md)
+[📖 Documentation](https://docs.nvidia.com/nemo/automodel/latest/index.html) • [🔥 Ready-to-Use Recipes](https://github.com/NVIDIA-NeMo/Automodel/#supported-models) • [💡 Examples](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples) • [🤝 Contributing](https://github.com/NVIDIA-NeMo/Automodel/blob/main/CONTRIBUTING.md)
 
 </div>
 
@@ -34,7 +34,7 @@ NeMo Framework is NVIDIA's GPU accelerated, end-to-end training framework for la
 - [Supported Models](#supported-models)
 - [Performance](#performance)
 - [Interoperability](#interoperability)
-- [Contributing](#contributing)
+- [Contributing](#-contributing)
 - [License](#license)
 
 
@@ -198,20 +198,36 @@ for DPO/RM/GRPO pipelines.
 
 ```
 NeMo-Automodel/
-├── nemo_automodel/              # Core library
-│   ├── _peft/                   # PEFT implementations (LoRA)
-│   ├── _transformers/           # HF model integrations  
-│   ├── checkpoint/              # Distributed checkpointing
-│   ├── datasets/                # Dataset loaders
-│   │   ├── llm/                 # LLM datasets (HellaSwag, SQuAD, etc.)
-│   │   └── vlm/                 # VLM datasets (CORD-v2, rdr etc.)
-│   ├── distributed/             # FSDP2, Megatron FSDP, parallelization
-│   ├── loss/                    # Optimized loss functions
-│   └── training/                # Training recipes and utilities
-├── recipes/                     # Ready-to-use training recipes
-│   ├── llm/                     # LLM fine-tuning recipes
-│   └── vlm/                     # VLM fine-tuning recipes  
-└── tests/                       # Comprehensive test suite
+├── examples
+│   ├── llm_finetune            # LLM finetune recipes
+│   ├── llm_kd                  # LLM knowledge-distillation recipes
+│   ├── llm_pretrain            # LLM pretrain recipes
+│   ├── vlm_finetune            # VLM finetune recipes
+│   └── vlm_generate            # VLM generate recipes
+├── nemo_automodel
+│   ├── _cli
+│   │   └── app.py              # the `automodel` CLI job launcher
+│   ├── components              # Core library
+│   │   ├── _peft               # PEFT implementations (LoRA)
+│   │   ├── _transformers       # HF model integrations
+│   │   ├── checkpoint          # Distributed checkpointing
+│   │   ├── config
+│   │   ├── datasets            # LLM (HellaSwag, etc.) & VLM datasets
+│   │   ├── distributed         # FSDP2, Megatron FSDP, Pipelining, etc.
+│   │   ├── launcher            # The job launcher component (SLURM)
+│   │   ├── loggers             # loggers
+│   │   ├── loss                # Optimized loss functions
+│   │   ├── models              # User-defined model examples
+│   │   ├── moe                 # Optimized kernels for MoE models
+│   │   ├── optim               # Optimizer/LR scheduler components
+│   │   ├── quantization        # FP8
+│   │   ├── training            # Train utils
+│   │   └── utils               # Misc utils
+│   ├── recipes
+│   │   ├── llm                 # Main LLM train loop
+│   │   └── vlm                 # Main VLM train loop
+│   └── shared
+└── tests/                      # Comprehensive test suite
 ```
 
 ---
