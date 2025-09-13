@@ -231,9 +231,11 @@ NeMo-Automodel/
 ```
 
 ---
+
 ## 🤝 Contributing
 
 We welcome contributions! Please see our [Contributing Guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/CONTRIBUTING.md) for details.
+
 ---
 
 ## 🔗 Links
