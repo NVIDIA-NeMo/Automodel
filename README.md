@@ -195,7 +195,7 @@ for specific workflows.
 - **NeMo RL**: Use AutoModel checkpoints directly as starting points
 for DPO/RM/GRPO pipelines.
 
---
+---
 
 ## 🗂️ Project Structure
 
