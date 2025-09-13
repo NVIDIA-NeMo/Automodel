@@ -30,15 +30,12 @@ NeMo Framework is NVIDIA's GPU accelerated, end-to-end training framework for la
 - [Design Principles](#design-principles)
 - [Key Features](#key-features)
 - [Getting Started](#getting-started)
-- [Quick Start](#quick-start)
-- [Mesh‑Aware Checkpointing](#mesh-aware-checkpointing)
 - [Training Examples](#training-examples)
 - [Supported Models](#supported-models)
 - [Performance](#performance)
 - [Interoperability](#interoperability)
 - [Contributing](#contributing)
 - [License](#license)
-- [Citation](#citation)
 
 
 ## Feature Roadmap
@@ -223,16 +220,13 @@ NeMo-Automodel/
 We welcome contributions! Please see our [Contributing Guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/CONTRIBUTING.md) for details.
 ---
 
-## 📄 License
-
-NVIDIA NeMo AutoModel is licensed under the [Apache License 2.0](https://github.com/NVIDIA-NeMo/Automodel/blob/main/LICENSE).
-
----
-
-
 ## 🔗 Links
 
 - **Documentation**: https://docs.nvidia.com/nemo-framework/user-guide/latest/automodel/index.html
 - **Hugging Face Hub**: https://huggingface.co/models
 - **Issues**: https://github.com/NVIDIA-NeMo/Automodel/issues
 - **Discussions**: https://github.com/NVIDIA-NeMo/Automodel/discussions
+
+## 📄 License
+
+NVIDIA NeMo AutoModel is licensed under the [Apache License 2.0](https://github.com/NVIDIA-NeMo/Automodel/blob/main/LICENSE).
