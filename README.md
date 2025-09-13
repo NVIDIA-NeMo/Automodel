@@ -125,14 +125,24 @@ model_save_format: safetensors
 ```bash
 # Memory‑efficient SFT with LoRA
 uv run examples/llm_finetune/finetune.py \
---config examples/llm_finetune/llama/llama3_2_1b_hellaswag_peft.yaml
+--config examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml
+
+# You can always overwrite parameters by appending them to the command, for example,
+# if you want to increase the micro-batch size you can do
+uv run examples/llm_finetune/finetune.py \
+--config examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml \
+--step_scheduler.local_batch_size 16
+
+# The above command will modify the `local_batch_size` variable to have value 16 in the
+# section `step_scheduler` of the yaml file.
 ```
+
 
 **VLM**
 ```bash
 # Qwen2.5‑VL on a single GPU
 uv run examples/vlm_finetune/finetune.py \
---config examples/vlm_finetune/qwen2_5_vl_3b_rdr.yaml
+--config examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml
 ```
 
 
@@ -171,10 +181,10 @@ To run a NeMo AutoModel recipe, you need a recipe script (e.g., [LLM](https://gi
 uv run <recipe_script_path> --config <yaml_config_path>
 
 # LLM example: multi-GPU with FSDP2
-uv run torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama/llama3_2_1b_hellaswag.yaml
+uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml
 
 # VLM example: single GPU fine-tuning (Gemma-3-VL) with LoRA
-uv run recipes/vlm_finetune/finetune.py --config recipes/vlm_finetune/gemma3/gemma3_vl_3b_cord_v2_peft.yaml
+uv run examples/vlm_finetune/finetune.py --config examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml
 ```
 
 See `examples/` for the latest matrix.
