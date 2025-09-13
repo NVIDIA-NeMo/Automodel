@@ -186,11 +186,9 @@ Coming soon..
 
 ## Interoperability
 
-- **Hugging Face**: Train from and export to native 🤗 formats.
-- **Megatron Bridge**: Optional conversions to/from Megatron formats
-for specific workflows.
-- **NeMo RL**: Use AutoModel checkpoints directly as starting points
-for DPO/RM/GRPO pipelines.
+- **[Hugging Face](https://github.com/huggingface/transformers)**: Train from and export to native 🤗 formats.
+- **[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)**: Optional conversions to/from Megatron formats for specific workflows.
+- **[NeMo RL](https://github.com/NVIDIA-NeMo/RL)**: Use AutoModel checkpoints directly as starting points for DPO/RM/GRPO pipelines.
 
 ---
 
