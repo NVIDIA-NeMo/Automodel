@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🚀 NeMo AutoModel
+# NeMo AutoModel
 
 </div>
 
@@ -13,6 +13,7 @@
 [![GitHub Stars](https://img.shields.io/github/stars/NVIDIA-NeMo/Automodel.svg?style=social&label=Star)](https://github.com/NVIDIA-NeMo/Automodel/stargazers/)
 
 <!-- **Day-0 integration with Hugging Face models automating fine-tuning and pretraining with pytorch-native parallelism, custom-kernels and optimized recipes** -->
+**DTensor‑native SPMD library for large‑scale training, with Hugging Face‑native fine‑tuning and pretraining.**
 
 [📖 Documentation](https://docs.nvidia.com/nemo/automodel/latest/index.html) • [🔥 Ready-to-Use Recipes](https://github.com/NVIDIA-NeMo/Automodel/#-ready-to-use-recipes) • [💡 Examples](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples) • [🤝 Contributing](https://github.com/NVIDIA-NeMo/Automodel/blob/main/CONTRIBUTING.md)
 
@@ -24,9 +25,25 @@ NeMo Framework is NVIDIA's GPU accelerated, end-to-end training framework for la
 
 > ⚠️ Note: NeMo AutoModel is under active development. New features, improvements, and documentation updates are released regularly. We are working toward a stable release, so expect the interface to solidify over time. Your feedback and contributions are welcome, and we encourage you to follow along as new updates roll out.
 
+## Table of Contents
+- [Feature Roadmap](#feature-roadmap)
+- [Design Principles](#design-principles)
+- [Key Features](#key-features)
+- [Getting Started](#getting-started)
+- [Quick Start](#quick-start)
+- [Mesh‑Aware Checkpointing](#mesh-aware-checkpointing)
+- [Training Examples](#training-examples)
+- [Supported Models](#supported-models)
+- [Performance](#performance)
+- [Interoperability](#interoperability)
+- [Contributing](#contributing)
+- [License](#license)
+- [Citation](#citation)
+
+
 ## Feature Roadmap
 
-✅ _Available now_ | 🔜 _Coming in 25.09_
+✅ _Available now_ | 🔜 _Coming in 25.11_
 
 - ✅ **HuggingFace Integration** - Works with 1-70B models (Qwen, Llama).
 - ✅ **Distributed Training** - Fully Sharded Data Parallel (FSDP2) support.
@@ -37,17 +54,93 @@ NeMo Framework is NVIDIA's GPU accelerated, end-to-end training framework for la
 - ✅ **Sequence Packing** - Sequence packing in both DTensor and MCore for huge training perf gains.
 - ✅ **DCP** - Distributed Checkpoint support with SafeTensors output.
 - ✅ **HSDP** - Hybrid Sharding Data Parallelism based on FSDP2.
+- ✅ **Pipeline Support** - Torch-native support for pipelining composable with FSDP2 and DTensor (3D Parallelism).
+- ✅ **Pre-training** - Support for model pre-training, including DeepSeekV3.
+- ✅ **Knowledge Distillation** - Support for knowledge distillation with LLMs; VLM support will be added post 25.09.
 
-- 🔜 **Pipeline Support** - Torch-native support for pipelining composable with FSDP2 and DTensor (3D Parallelism).
-- 🔜 **Pre-training** - Support for model pre-training, including DeepSeekV3, GPT-OSS and Qwen3 (Coder-480B-A35B, etc).
-- 🔜 **Knowledge Distillation** - Support for knowledge distillation with LLMs; VLM support will be added post 25.09.
+- 🔜 **Extended MoE support** - GPT-OSS, Qwen3 (Coder-480B-A35B, etc), Qwen-next.
+
+## Design Principles
+
+- **DTensor‑native**: Partition model/optimizer states with `DeviceMesh` + placements (`Shard`, `Replicate`).
+- **SPMD first**: Parallelism is configuration. No model rewrites when scaling up or changing strategy.
+- **HF integration**: Operate on native 🤗 checkpoints/configs for frictionless fine‑tuning and pretraining.
+- **Minimal ceremony**: YAML‑driven recipes; override any field via CLI.
+
+## Why SPMD instead of framework‑specific parallel?
+
+- **One program, any scale**: The same training script runs on 1 GPU or 100+ by changing the mesh.
+- **Decoupled concerns**: Model code stays pure PyTorch; parallel strategy lives in config.
+- **Composability**: Mix **tensor**, **sequence**, and **data** parallel by editing placements.
+- **Portability**: Fewer bespoke abstractions; easier to reason about failure modes and restarts.
+- **Interoperability**: HF models/tokenizers/optimizers plug in directly; no format round‑trips.
+
+> TL;DR: SPMD turns “how to parallelize” into a *runtime layout choice*, not a code fork.
+
+## Key Features
+
+- **Mesh‑defined parallelism**: Compose tensor/sequence/data parallel by changing placements and sizes.
+- **FSDP2 on DTensor**: Memory‑efficient sharding (HSDP included) for large models.
+- **Pretraining & fine‑tuning**: Day‑0 support for both regimes with shared configs/utilities.
+- **HF‑native I/O**: Train from 🤗 configs/weights; export consolidated HF checkpoints.
+- **Mixed precision**: BF16/FP16/FP8; sequence packing; optimized CUDA kernels.
+- **PEFT built‑in**: LoRA and hooks for custom adapters.
+- **Mesh‑aware DCP**: Sharded SafeTensors with merge/reshard utilities.
+- **Flexible Configuration**: YAML-based configuration system for reproducible experiments
+- **FP8 Precision**: Native FP8 training & inference for higher throughput and lower memory use
+- **Day-0 Hugging Face Support**: Instantly fine-tune any model from the Hugging Face Hub
+- **Large-Scale Distributed Training**: Built-in FSDP2 and Megatron-FSDP for seamless multi-node scaling
+- **Vision-Language Model Ready**: Native support for VLMs (Qwen2-VL, Gemma-3-VL, etc)
+
+## Getting Started
+
+We recommend **uv** for reproducible environments.
+
+```bash
+uv venv
+uv pip install nemo_automodel # latest release
+# or: uv pip install git+https://nam11.safelinks.protection.outlook.com/?url=https%3A%2F%2Fgithub.com%2FNVIDIA-NeMo%2FAutomodel.git&data=05%7C02%7Cakoumparouli%40nvidia.com%7C88f177d2fa09407d30c408ddf316ef59%7C43083d15727340c1b7db39efd9ccc17a%7C0%7C0%7C638934002060056854%7CUnknown%7CTWFpbGZsb3d8eyJFbXB0eU1hcGkiOnRydWUsIlYiOiIwLjAuMDAwMCIsIlAiOiJXaW4zMiIsIkFOIjoiTWFpbCIsIldUIjoyfQ%3D%3D%7C0%7C%7C%7C&sdata=5CnwNAdBiwubNW9zK5QC%2FGLAiDqVIJoNFix47upiIeE%3D&reserved=0
+uv run python -c "import nemo_automodel; print('AutoModel ready')"
+```
+
+> Ensure recent CUDA/PyTorch. Some kernels (e.g., FlashAttention‑style) may JIT on first run.
+
+## Mesh‑Aware Checkpointing
+
+AutoModel writes **Distributed Checkpoints (DCP)** with SafeTensors
+shards. Checkpoints carry partition metadata to:
+
+- **Merge** into a single HF‑compatible checkpoint for inference.
+- **Reshard** when loading onto a different mesh/topology.
+
+YAML sketch:
+```yaml
+checkpoint:
+enabled: true
+checkpoint_dir: ./checkpoints
+save_consolidated: true
+model_save_format: safetensors
+```
+
+## Training Examples
+
+**LLM**
+```bash
+# Memory‑efficient SFT with LoRA
+uv run examples/llm_finetune/finetune.py \
+--config examples/llm_finetune/llama/llama3_2_1b_hellaswag_peft.yaml
+```
+
+**VLM**
+```bash
+# Qwen2.5‑VL on a single GPU
+uv run examples/vlm_finetune/finetune.py \
+--config examples/vlm_finetune/qwen2_5_vl_3b_rdr.yaml
+```
 
 
-## 🎛️ Supported Models
-NeMo AutoModel provides native support for a wide range of models available on the Hugging Face Hub, enabling efficient fine-tuning for various domains. Below is a comprehensive list of all supported models with their available recipes:
-
-### 📋 Ready-to-Use Recipes
-To get started quickly, NeMo AutoModel provides a collection of ready-to-use recipes for common LLM and VLM fine-tuning tasks. Simply select the recipe that matches your model and training setup (e.g., single-GPU, multi-GPU, or multi-node).
+## Supported Models
+NeMo AutoModel provides native support for a wide range of models available on the Hugging Face Hub, enabling efficient fine-tuning for various domains. Below is a small sample of ready‑to‑use families (train as‑is or swap any compatible 🤗 causal LM):
 
 | Domain | Model Family | Model ID | Recipes |
 |--------|--------------|----------|---------|
@@ -87,196 +180,22 @@ uv run torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config rec
 uv run recipes/vlm_finetune/finetune.py --config recipes/vlm_finetune/gemma3/gemma3_vl_3b_cord_v2_peft.yaml
 ```
 
-
-<!-- 
-### PEFT Methods
-- **LoRA**: Low-Rank Adaptation
-<!-- - **DoRA**: Weight-Decomposed Low-Rank Adaptation
-- **Custom**: Easy to implement new PEFT methods -->
-
-
-## 🚀 Key Features
-
-- **Day-0 Hugging Face Support**: Instantly fine-tune any model from the Hugging Face Hub
-- **Lightning Fast Performance**: Custom CUDA kernels and memory optimizations deliver 2–5× speedups
-- **Large-Scale Distributed Training**: Built-in FSDP2 and Megatron-FSDP for seamless multi-node scaling
-- **Vision-Language Model Ready**: Native support for VLMs (Qwen2-VL, Gemma-3-VL, etc)
-- **Advanced PEFT Methods**: LoRA and extensible PEFT system out of the box
-- **Seamless HF Ecosystem**: Fine-tuned models work perfectly with Transformers pipeline, VLM, etc.
-- **Robust Infrastructure**: Distributed checkpointing with integrated logging and monitoring
-- **Optimized Recipes**: Pre-built configurations for common models and datasets
-- **Flexible Configuration**: YAML-based configuration system for reproducible experiments
-- **FP8 Precision**: Native FP8 training & inference for higher throughput and lower memory use
-- **INT4 / INT8 Quantization**: Turn-key quantization workflows for ultra-compact, low-memory training
-
+See `examples/` for the latest matrix.
 
 ---
-## ✨ Install NeMo AutoModel
-NeMo AutoModel is offered both as a standard Python package installable via pip and as a ready-to-run NeMo Framework Docker container.
+## Performance
 
-### Prerequisites
-```
-# We use `uv` for package management and environment isolation.
-pip3 install uv
+Coming soon..
 
-# If you cannot install at the system level, you can install for your user with
-# pip3 install --user uv
-```
-Run every command with `uv run`. It auto-installs the virtual environment from the lock file and keeps it up to date, so you never need to activate a venv manually. Example: `uv run recipes/llm_finetune/finetune.py`. If you prefer to install NeMo Automodel explicitly, please follow the instructions below.
+## Interoperability
 
-### 📦 Install from a Wheel Package
-```
-# Install the latest stable release from PyPI
-# We first need to initialize the virtual environment using uv
-uv venv
+- **Hugging Face**: Train from and export to native 🤗 formats.
+- **Megatron Bridge**: Optional conversions to/from Megatron formats
+for specific workflows.
+- **NeMo RL**: Use AutoModel checkpoints directly as starting points
+for DPO/RM/GRPO pipelines.
 
-uv pip install nemo_automodel   # or: uv pip install --upgrade nemo_automodel
-```
-
-### 🔧 Install from Source
-```
-# Install the latest NeMo Automodel from the GitHub repo (best for development).
-# We first need to initialize the virtual environment using uv
-uv venv
-
-# We can now install from source
-uv pip install git+https://github.com/NVIDIA-NeMo/Automodel.git
-```
-
-<!-- ### 🐳 NeMo Container
-```bash
-# Pull the latest NeMo Framework container
-docker pull nvcr.io/nvidia/nemo:25.07
-
-# Run with GPU support
-docker run --gpus all -it --rm \
-    -v $(pwd):/workspace \
-    nvcr.io/nvidia/nemo:25.07 bash
-``` -->
-
-### Verify the Installation
-```
-uv run python -c "import nemo_automodel; print('✅ NeMo AutoModel ready')"
-```
-
----
-
-<!-- ## 🔥 Quickstart -->
-
-<!-- ### 30-Second Fine-tuning
-
-```python
-import nemo_automodel as na
-
-# Load any Hugging Face model
-model = na.NeMoAutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
-
-# Apply LoRA with one line
-na.peft.lora(model, rank=16, alpha=32)
-
-# Your model is ready for training!
-``` -->
-
-<!-- ## Run with Pre-built Recipes
-These YAML examples illustrate common configurations used with NeMo AutoModel recipes.
-
-```bash
-# Fine-tune LLaMA on HellaSwag (single GPU)
-python recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama/llama3_2_1b_squad.yaml
-
-# Fine-tune with LoRA (memory efficient)
-python recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama/llama3_2_1b_hellaswag_peft.yaml
-
-# Multi-GPU with FSDP2
-torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama/llama_3_2_1b_hellaswag.yaml
-
-# Multi-GPU with Megatron-FSDP
-torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama/llama_3_2_1b_hellaswag_megatron_fsdp.yaml
-
-```
-<!-- # #Multi-Node training
-# torchrun --nproc-per-node=8 --nnodes=2 \
-#     recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama/llama3_2_1b_squad_megatron_fsdp.yaml
-### Vision-Language Models 
-- ->
-
-```bash
-# Fine-tune Qwen2.5-VL
-python recipes/vlm_finetune/finetune.py --config recipes/vlm_finetune/qwen2_5_vl_3b_rdr.yaml
-
-# Fine-tune Gemma-3-VL with LoRA on a single GPU
-python recipes/vlm_finetune/finetune.py --config recipes/vlm_finetune/gemma_3_vl_3b_cord_v2_peft.yaml
-```
-
----
- -->
-
-## 📋 YAML Configuration Examples
-
-
-### 1. Distributed Training Configuration
-
-```yaml
-distributed:
-  _target_: nemo_automodel.distributed.megatron_fsdp.MegatronFSDPManager
-  dp_size: 8
-  tp_size: 1
-  cp_size: 1
-
-```
-
-### 2. LoRA Configuration
-```yaml
-peft:
-  peft_fn: nemo_automodel._peft.lora.apply_lora_to_linear_modules
-  match_all_linear: True
-  dim: 8
-  alpha: 32
-  use_triton: True
-```
-
-### 3. Vision-Language Model Fine-Tuning
-```yaml
-model:
-  _target_: nemo_automodel._transformers.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
-
-processor:
-  _target_: transformers.AutoProcessor.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
-  min_pixels: 200704
-  max_pixels: 1003520
-```
-
-### 4. Checkpointing and Resume
-```yaml
-checkpoint:
-  enabled: true
-  checkpoint_dir: ./checkpoints
-  save_consolidated: true      # HF-compatible safetensors
-  model_save_format: safetensors
-```
-
----
-
-<!-- ## ⚡ Performance (Do we have a table like to show/do we want to show it?)
-
-NeMo AutoModel delivers significant speedups through optimized kernels and distributed training:
-
-| Model | Method | Speedup | Memory Savings |
-|-------|--------|---------|----------------|
-| LLaMA-3-8B | LoRA + Liger | **3.2x** | 60% |
-| Qwen2.5-7B | Full FT + FSDP2 | **2.8x** | 40% |  
-| Gemma-2-9B | DoRA + Cut-CE | **4.1x** | 55% |
-
-### Optimizations Included
-- **Liger Kernel**: Optimized attention and MLP operations
-- **Cut-CrossEntropy**: Memory-efficient loss computation
-- **FSDP2**: Latest fully sharded data parallelism
-- **Megatron FSDP**: NVIDIA's enterprise FSDP implementation
-- **Mixed Precision**: Automatic FP16/BF16 training
-
---- -->
+--
 
 ## 🗂️ Project Structure
 
@@ -299,11 +218,9 @@ NeMo-Automodel/
 ```
 
 ---
-
 ## 🤝 Contributing
 
 We welcome contributions! Please see our [Contributing Guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/CONTRIBUTING.md) for details.
-
 ---
 
 ## 📄 License
@@ -319,13 +236,3 @@ NVIDIA NeMo AutoModel is licensed under the [Apache License 2.0](https://github.
 - **Hugging Face Hub**: https://huggingface.co/models
 - **Issues**: https://github.com/NVIDIA-NeMo/Automodel/issues
 - **Discussions**: https://github.com/NVIDIA-NeMo/Automodel/discussions
-
----
-
-<div align="center">
-
-**Made with ❤️ by NVIDIA**
-
-*Accelerating AI for everyone*
-
-</div>
