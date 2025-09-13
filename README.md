@@ -1,6 +1,6 @@
 <div align="center">
 
-# NeMo AutoModel
+# 🚀 NeMo AutoModel
 
 </div>
 
