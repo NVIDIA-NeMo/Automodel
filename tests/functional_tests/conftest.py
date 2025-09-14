@@ -49,6 +49,7 @@ _OVERRIDES = [
     "distributed.cp_size",
     "distributed.pp_size",
     "distributed.sequence_parallel",
+    "distributed.activation_checkpointing",
     "dataset._target_",
     "dataset.path_or_dataset",
     "validation_dataset.path_or_dataset",

@@ -30,4 +30,5 @@ examples/llm_finetune/finetune.py \
   --dataset.limit_dataset_samples 10 \
   --validation_dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
   --validation_dataset.limit_dataset_samples 10 \
+  --distributed.activation_checkpointing true
 
