@@ -12,43 +12,22 @@ Add the `activation_checkpointing: true` flag under your distributed strategy.
 Example (snippet):
 
 ```yaml
-# examples/llm/llama_3_2_1b_my_finetune.yaml
+# examples/llm_finetune/llama_3_2_1b_my_finetune.yaml
 ...
-# NVFSDP
+
+# FSDP-2
 distributed:
-  _target_: nemo_automodel.components.distributed.nvfsdp.NVFSDPManager
-  tp_size: 2                 # Tensor Parallel = 2
-  dp_size: 4                 # Data Parallel   = 4
-  activation_checkpointing: true   # <-- enable GC
-  sequence_parallel: false
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  activation_checkpointing: true
   ...
-
-# FSDP-2 (upstream PyTorch ≥ 2.3)
-# Uncomment this block *instead* if you wish to stay on stock PyTorch FSDP-2
-# distributed:
-#   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
-#   tp_size: 2
-#   dp_size: 4
-#   activation_checkpointing: true
-#   sequence_parallel: false
-#   ...
 ```
-
-If you are using the FSDP2 strategy (for PyTorch 2.3+), set the flag in exactly the same place - the underlying manager will forward it to the `fsdp2_strategy_parallelize(...)` helper.
 
 ### 1.2. Programmatically
 ```python
-from nemo_automodel.components.distributed.nvfsdp import NVFSDPManager
-# or for FSDP2
-# from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
+from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 
-# -- NVFSDP --
-nv_manager = NVFSDPManager(tp_size=2, dp_size=4, activation_checkpointing=True)
-model, optimizer = nv_manager.parallelize(model, optimizer)
-
-# -- OR: FSDP-2 --
-# fsdp2_manager = FSDP2Manager(tp_size=2, dp_size=4, activation_checkpointing=True)
-# model = fsdp2_manager.parallelize(model)
+fsdp2_manager = FSDP2Manager(activation_checkpointing=True)
+model = fsdp2_manager.parallelize(model)
 ```
 
 ---
@@ -59,6 +38,10 @@ Linear-Cut Cross-Entropy (LC-CE) reduces the hidden-state memory required to com
 It is already available via `nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy` and can be enabled in recipes by using the following:
 
 ```yaml
+model:
+  ...
+  output_hidden_states: true
+
 loss_fn:
   _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 ```
@@ -67,17 +50,17 @@ LC-CE and gradient checkpointing target **different memory hot-spots** (output l
 
 ---
 
-## 3. Example Memory Savings (A100-80GB, Llama-3-8B)
+## 3. Example Memory Savings (H100-80GB, Llama-3.2-1B)
 | Technique | Max GPU Mem (GB) | Δ vs Baseline |
 |-----------|-----------------|---------------|
-| Baseline (no sharding) | 71.2 | - |
-| + FSDP (dp=4, tp=2) | 22.5 | ↓ 68 % |
-| + LC-CE | 19.3 | ↓ 73 % |
-| + Gradient Checkpointing | 12.1 | ↓ 83 % |
-| **FSDP + LC-CE + Checkpointing** | **7.9** | **↓ 89 %** |
+| Baseline | 53.03 | - |
+| + FSDP (dp_size=8) | 47.59 | ↓ 10 % |
+| + Gradient Checkpointing | 33.06 | ↓ 38 % |
+| + LC-CE | 7.30 | ↓ 86 % |
+| **FSDP + LC-CE + Checkpointing** | **7.30** | **↓ 86 %** |
 
 Notes:
-* Measurements taken with batch size = 4, sequence len = 2048, AdamW, PyTorch 2.3.
+* Measurements taken with local batch size = 8, sequence len = 2048, AdamW, PyTorch 2.8.
 * Peak memory reported by `torch.cuda.max_memory_allocated()` averaged across DP ranks.
 * Expect ±5 % variance depending on exact model, sequence length and GPU architecture.
 
@@ -86,21 +69,25 @@ Notes:
 ## 4. Performance Considerations
 1. **Extra compute** - Each checkpointed segment is recomputed once during the backward pass. In practice the wall-clock overhead is ≈ 5-10 % for transformer models.
 2. **Throughput vs Batch Size** - The goal is usually to _increase batch size_ or _sequence length_ while keeping throughput constant.
-3. **Selective Checkpointing** - For very long models you can checkpoint every _k_-th layer by replacing the boolean flag with an integer (e.g. `activation_checkpointing: 2` → every second layer). This is exposed via the same flag in the YAML.
 
 ---
 
 ## 5. Verifying It Works
-Run your training script with `CUDA_VISIBLE_DEVICES=0` and inspect the peak memory:
+Run your training script and inspect the peak memory:
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -m torch.distributed.run \
-    --nproc-per-node 1 \
-    nemo_automodel/recipes/llm/finetune.py \
-    -c examples/llm/llama_3_2_1b_my_finetune.yaml
+
+# If running on 8x GPUs
+uv run torchrun --nproc-per-node=8 \
+  examples/llm_finetune/finetune.py \
+  -c examples/llm_finetune/llama3_2/llama_3_2_1b_my_finetune.yaml
+
+# If running on 1x GPU
+uv run examples/llm_finetune/finetune.py \
+  -c examples/llm_finetune/llama3_2/llama_3_2_1b_my_finetune.yaml
 ```
-Look for a log line similar to:
+If we run with the above settings (activation ckpt = on, lc-ce = on, fsdp = on), look for a log line similar to:
 ```
-[rank0] peak memory: 7.9 GB (activation ckpt = on, lc-ce = on, fsdp = on)
+... | mem 7.30 GiB | ...
 ```
 
 ---
