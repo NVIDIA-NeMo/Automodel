@@ -13,13 +13,13 @@
 # limitations under the License.
 
 distributed:
-  pp_size: 1
-  ep_size: 8
+  pp_size: 2
+  ep_size: 16
   dp_replicate_size: 1
 
 model:
   _target_: nemo_automodel.components.models.gpt_oss.model.GptOssForCausalLM.from_config
-  pretrained_model_name_or_path: openai/gpt-oss-20b
+  pretrained_model_name_or_path: openai/gpt-oss-120b
   num_layers: null  # Optionally override the number of hidden layers (null = use model default)
   backend:
     _target_: nemo_automodel.components.moe.utils.BackendConfig
