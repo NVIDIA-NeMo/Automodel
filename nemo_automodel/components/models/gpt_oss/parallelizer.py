@@ -13,13 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import functools
 import logging
 
 import torch
 import torch.nn as nn
-from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
@@ -30,7 +28,7 @@ from torch.distributed.tensor import Shard, distribute_module, distribute_tensor
 from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
-from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3Model
+from nemo_automodel.components.models.gpt_oss.model import GptOssModel
 from nemo_automodel.components.moe.layers import (
     GroupedExpertsDeepEP,
     MoE,
@@ -40,51 +38,27 @@ logger = logging.getLogger(__name__)
 
 
 class ExpertParallel(ParallelStyle):
-    """
-    ExpertParallel class is used to shard the MoE parameters on the EP mesh.
-    Dim `0` of each parameter is sharded since that is the expert dimension.
-    """
-
     def _partition_fn(self, name, module, device_mesh):
-        # shard on the expert dimension
         assert device_mesh.ndim == 1
-
         for name, param in module.named_parameters(recurse=False):
             dist_param = nn.Parameter(distribute_tensor(param, device_mesh, [Shard(0)]))
             module.register_parameter(name, dist_param)
-
         if isinstance(module, GroupedExpertsDeepEP):
             module.init_token_dispatcher(ep_mesh=device_mesh)
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
-        return distribute_module(
-            module,
-            device_mesh,
-            self._partition_fn,
-        )
+        return distribute_module(module, device_mesh, self._partition_fn)
 
 
 def apply_ep(model: nn.Module, ep_mesh: DeviceMesh):
-    """Applies EP to MoE module."""
     assert ep_mesh.size() > 1
-
-    if hasattr(model, "model") and model.model is not None:
-        _model = model.model
-    else:
-        _model = model
-
+    _model = model.model if hasattr(model, "model") and model.model is not None else model
     for _, block in _model.layers.named_children():
         if isinstance(block.mlp, MoE):
-            parallelize_module(
-                module=block.mlp.experts,
-                device_mesh=ep_mesh,
-                parallelize_plan=ExpertParallel(),
-            )
+            parallelize_module(module=block.mlp.experts, device_mesh=ep_mesh, parallelize_plan=ExpertParallel())
 
 
 def apply_ac(model: nn.Module, ignore_router: bool = False):
-    """Apply activation checkpointing to the model."""
-
     def _custom_policy(ctx, func, *args, **kwargs):
         if func == torch.ops.aten.mm.default:
             if len(args) == 2 and (args[1].shape == (7168, 256) or args[1].shape == (2048, 64)):
@@ -97,10 +71,7 @@ def apply_ac(model: nn.Module, ignore_router: bool = False):
     def selective_checkpointing_context_fn():
         return create_selective_checkpoint_contexts(_custom_policy)
 
-    if hasattr(model, "model") and model.model is not None:
-        _model = model.model
-    else:
-        _model = model
+    _model = model.model if hasattr(model, "model") and model.model is not None else model
     for layer_id, block in _model.layers.named_children():
         if ignore_router:
             block = ptd_checkpoint_wrapper(
@@ -108,12 +79,11 @@ def apply_ac(model: nn.Module, ignore_router: bool = False):
             )
         else:
             block = ptd_checkpoint_wrapper(block, preserve_rng_state=True)
-
         _model.layers.register_module(layer_id, block)
 
 
 def apply_fsdp(
-    model: DeepseekV3Model,
+    model: GptOssModel,
     fsdp_mesh: DeviceMesh,
     pp_enabled: bool,
     ep_enabled: bool,
@@ -135,31 +105,19 @@ def apply_fsdp(
         offload_policy=offload_policy,
     )
 
-    if hasattr(model, "model") and model.model is not None:
-        _model = model.model
-    else:
-        _model = model
+    _model = model.model if hasattr(model, "model") and model.model is not None else model
 
     for _, block in _model.layers.named_children():
         if isinstance(block.mlp, MoE) and ep_shard_enabled:
-            # Apply FSDP on dim=1 for grouped experts since we may have more
-            # shards than experts (dim=0).
             fully_shard(
                 block.mlp.experts,
                 mesh=ep_shard_mesh,
                 shard_placement_fn=lambda _: Shard(1),
                 reshard_after_forward=not pp_enabled,
             )
-        # If FSDP is disabled for grouped experts because the parameters are already
-        # fully sharded by PP and EP, then we need to explicitly remove the parameters
-        # from FSDP for the transformer block.
-        # If FSDP is enabled for grouped experts, the parameters are automatically
-        # removed from the FSDP for the transformer block due to the rules of the
-        # PyTorch FSDP implementation.
         ignored_params = None
         if isinstance(block.mlp, MoE) and ep_enabled:
             ignored_params = set(block.mlp.experts.parameters())
-
         fully_shard_default(block, ignored_params=ignored_params)
 
     if hasattr(_model, "embed_tokens") and _model.embed_tokens is not None:
@@ -173,7 +131,7 @@ def apply_fsdp(
 
 
 def parallelize_model(
-    model: DeepseekV3Model,
+    model: GptOssModel,
     world_mesh: DeviceMesh,
     moe_mesh: DeviceMesh | None,
     *,
@@ -185,31 +143,22 @@ def parallelize_model(
     ep_shard_axis_names: tuple[str, ...] | None = None,
 ):
     assert tp_axis_name is None or world_mesh[tp_axis_name].size() == 1, (
-        "Tensor parallelism not supported for DeepSeek v3 model"
+        "Tensor parallelism not supported for GPT-OSS model"
     )
     assert cp_axis_name is None or world_mesh[cp_axis_name].size() == 1, (
-        "Context parallelism not supported for DeepSeek v3 model"
+        "Context parallelism not supported for GPT-OSS model"
     )
-
-    # TODO: Add support for context parallelism
-    # if cp_enabled:
-    #     apply_cp(model, meshes["default"]["cp"], parallel_dims)
 
     ep_enabled = ep_axis_name is not None and moe_mesh is not None and moe_mesh[ep_axis_name].size() > 1
     if ep_enabled:
-        assert model.model.moe_config.n_routed_experts % moe_mesh[ep_axis_name].size() == 0, (
-            f"n_routed_experts {model.model.moe_config.n_routed_experts} must be divisible by "
-            f"expert_parallel_degree {moe_mesh[ep_axis_name].size()}"
+        assert model.config.num_local_experts % moe_mesh[ep_axis_name].size() == 0, (
+            f"num_local_experts {model.config.num_local_experts} must be divisible by expert_parallel_degree {moe_mesh[ep_axis_name].size()}"
         )
-
         apply_ep(model, moe_mesh[ep_axis_name])
 
-    # apply_ac(model)
+    apply_ac(model)
 
-    if ep_shard_axis_names is not None:
-        ep_shard_mesh = moe_mesh[ep_shard_axis_names]
-    else:
-        ep_shard_mesh = None
+    ep_shard_mesh = moe_mesh[ep_shard_axis_names] if ep_shard_axis_names is not None else None
 
     fsdp_enabled = (
         dp_axis_names is not None

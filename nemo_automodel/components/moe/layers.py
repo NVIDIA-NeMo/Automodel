@@ -14,7 +14,7 @@
 
 from dataclasses import dataclass
 from functools import partial
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 import torch.nn as nn
@@ -33,11 +33,16 @@ try:
 except ImportError:
     print("grouped_gemm is not available. Please run:pip install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4")
 
-from nemo_automodel.components.moe.megatron.moe_utils import WeightedSwiGLUFunction
+from nemo_automodel.components.moe.megatron.moe_utils import (
+    MoEAuxLossAutoScaler,
+    weighted_bias_quick_geglu_impl,
+    weighted_bias_swiglu_impl,
+)
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEConfig as MegatronMoEConfig
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher
 
 _shared_experts_stream: Optional[torch.cuda.Stream] = None
+_bias_computation_stream: Optional[torch.cuda.Stream] = None
 
 
 @dataclass(kw_only=True)
@@ -56,10 +61,11 @@ class MoEConfig:
     inter_dim: int
     moe_inter_dim: int
     norm_topk_prob: bool
-
-    def __post_init__(self):
-        if self.aux_loss_coeff > 0:
-            raise ValueError("aux loss coeff not supported")
+    router_bias: bool = False
+    expert_bias: bool = False
+    expert_activation: Literal["swiglu", "quick_geglu"] = "swiglu"
+    activation_alpha: float = 1.702
+    activation_limit: float = 7.0
 
 
 class MLP(nn.Module):
@@ -108,6 +114,15 @@ class MLP(nn.Module):
         self.apply(init_weights_fn)
 
 
+def get_expert_activation(config: MoEConfig):
+    if config.expert_activation == "swiglu":
+        return swiglu
+    elif config.expert_activation == "quick_geglu":
+        return partial(quick_geglu, alpha=config.activation_alpha, limit=config.activation_limit)
+    else:
+        raise ValueError(f"Invalid expert activation: {config.expert_activation}")
+
+
 class GroupedExperts(nn.Module):
     """
     Sparse MoE implementation using all-gather/reduce-scatter primitives.
@@ -132,9 +147,17 @@ class GroupedExperts(nn.Module):
         """
         super().__init__()
         self.n_routed_experts = config.n_routed_experts
+        self.expert_bias = config.expert_bias
         self.gate_projs = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim, config.dim))
         self.up_projs = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim, config.dim))
         self.down_projs = nn.Parameter(torch.empty(config.n_routed_experts, config.dim, config.moe_inter_dim))
+
+        if self.expert_bias:
+            self.gate_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim))
+            self.up_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim))
+            self.down_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.dim))
+
+        self.expert_activation = get_expert_activation(config)
 
     def forward(
         self,
@@ -207,10 +230,25 @@ class GroupedExperts(nn.Module):
             down_proj = get_local_proj(self.down_projs, i)
             up_proj = get_local_proj(self.up_projs, i)
 
+            gate_bias = get_local_proj(self.gate_bias, i) if self.expert_bias else None
+            up_bias = get_local_proj(self.up_bias, i) if self.expert_bias else None
+            down_bias = get_local_proj(self.down_bias, i) if self.expert_bias else None
+
             idx_b = idx[:, None].expand(-1, x.size(1))
             x_idx = x.gather(dim=0, index=idx_b)
 
-            expert_out = swiglu(x_idx, gate_proj, down_proj, up_proj) * weights[idx, top, None]
+            expert_out = (
+                self.expert_activation(
+                    x_idx,
+                    gate_proj=gate_proj,
+                    down_proj=down_proj,
+                    up_proj=up_proj,
+                    gate_bias=gate_bias,
+                    up_bias=up_bias,
+                    down_bias=down_bias,
+                )
+                * weights[idx, top, None]
+            )
 
             y.scatter_add_(dim=0, index=idx_b, src=expert_out)
 
@@ -219,7 +257,21 @@ class GroupedExperts(nn.Module):
             gate_proj = get_local_proj(self.gate_projs, experts_start_idx)
             down_proj = get_local_proj(self.down_projs, experts_start_idx)
             up_proj = get_local_proj(self.up_projs, experts_start_idx)
-            expert_out = swiglu(torch.zeros_like(x[0]), gate_proj, down_proj, up_proj) * weights[0, 0, None]
+            gate_bias = get_local_proj(self.gate_bias, experts_start_idx) if self.expert_bias else None
+            up_bias = get_local_proj(self.up_bias, experts_start_idx) if self.expert_bias else None
+            down_bias = get_local_proj(self.down_bias, experts_start_idx) if self.expert_bias else None
+            expert_out = (
+                self.expert_activation(
+                    torch.zeros_like(x[0]),
+                    gate_proj=gate_proj,
+                    down_proj=down_proj,
+                    up_proj=up_proj,
+                    gate_bias=gate_bias,
+                    up_bias=up_bias,
+                    down_bias=down_bias,
+                )
+                * weights[0, 0, None]
+            )
             y[0] += expert_out
 
         if ep_size > 1:
@@ -230,6 +282,29 @@ class GroupedExperts(nn.Module):
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         self.apply(partial(_init_weights, buffer_device=buffer_device, init_std=init_std))
+
+
+def get_expert_activation_for_deepep(config: MoEConfig):
+    if config.expert_activation == "swiglu":
+        return weighted_bias_swiglu_impl
+    elif config.expert_activation == "quick_geglu":
+        return partial(
+            weighted_bias_quick_geglu_impl,
+            clamp_value=config.activation_limit,
+            linear_offset=1.0,
+            alpha=config.activation_alpha,
+        )
+    else:
+        raise ValueError(f"Invalid expert activation: {config.expert_activation}")
+
+
+# Optimized function for creating bias indices
+@torch.compile(mode="reduce-overhead", disable=not torch.cuda.is_available())
+def _create_expert_bias_indices(tokens_per_expert, device):
+    """Create indices for expert bias expansion using optimized repeat_interleave."""
+    return torch.repeat_interleave(
+        torch.arange(len(tokens_per_expert), device=device, dtype=torch.long), tokens_per_expert.to(device)
+    )
 
 
 class GroupedExpertsDeepEP(nn.Module):
@@ -257,11 +332,17 @@ class GroupedExpertsDeepEP(nn.Module):
         super().__init__()
 
         self.config = config
+        self.expert_bias = config.expert_bias
         self.gate_and_up_projs = nn.Parameter(
             torch.empty(config.n_routed_experts, config.dim, config.moe_inter_dim * 2)
         )
         self.down_projs = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim, config.dim))
-        self.config = config
+
+        if self.expert_bias:
+            self.gate_and_up_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim * 2))
+            self.down_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.dim))
+
+        self.expert_activation = get_expert_activation_for_deepep(config)
 
     def init_token_dispatcher(self, ep_mesh: DeviceMesh):
         self.ep_size = ep_mesh.size()
@@ -335,15 +416,61 @@ class GroupedExpertsDeepEP(nn.Module):
                 tokens_per_expert,
                 trans_b=False,
             )
-            output1_ = WeightedSwiGLUFunction.apply(output1, permuted_probs, False)
+
+            # Prepare bias data in a separate stream to overlap with GMM
+            if self.expert_bias:
+                global _bias_computation_stream
+                if _bias_computation_stream is None:
+                    _bias_computation_stream = torch.cuda.Stream()
+
+                # _bias_computation_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(_bias_computation_stream):
+                    gate_and_up_bias = self.gate_and_up_bias.to_local()
+                    down_bias = self.down_bias.to_local()
+
+                    # Create bias indices while output1 GMM is computing
+                    num_tokens = permuted_local_hidden_states.size(0)
+                    if num_tokens > 0:
+                        expert_indices = _create_expert_bias_indices(
+                            tokens_per_expert.to(permuted_local_hidden_states.device),
+                            permuted_local_hidden_states.device,
+                        )
+                        # Pre-index biases
+                        gate_up_bias_expanded = gate_and_up_bias[expert_indices]
+                        down_bias_expanded = down_bias[expert_indices]
+                    else:
+                        gate_up_bias_expanded = None
+                        down_bias_expanded = None
+
+                torch.cuda.current_stream().wait_stream(_bias_computation_stream)
+                output1 = output1 + gate_up_bias_expanded
+            else:
+                gate_up_bias_expanded = None
+                down_bias_expanded = None
+
+            output1_ = self.expert_activation(output1, None, permuted_probs)
             output2 = ops.gmm(output1_, self.down_projs.to_local(), tokens_per_expert, trans_b=False)
+
+            # Add bias for down projection if enabled
+            if self.expert_bias and down_bias_expanded is not None:
+                output2 = output2 + down_bias_expanded
         else:
             output1 = torch.matmul(x[0] * 0, self.gate_and_up_projs.to_local()[0])
-            output1_ = WeightedSwiGLUFunction.apply(output1, permuted_probs, False)
+
+            # Add bias if enabled
+            if self.expert_bias:
+                bias = self.gate_and_up_bias.to_local()[0]
+            else:
+                bias = None
+
+            output1_ = self.expert_activation(output1, bias, permuted_probs)
             output2 = torch.matmul(output1_, self.down_projs.to_local()[0])
 
-        y = self.token_dispatcher.token_unpermutation(output2)
+            # Add bias for down projection if enabled
+            if self.expert_bias:
+                output2 = output2 + self.down_bias.to_local()[0]
 
+        y = self.token_dispatcher.token_unpermutation(output2)
         return y
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
@@ -437,6 +564,10 @@ class Gate(nn.Module):
             assert self.train_gate, "Require train_gate to be set to True to apply the bias update"
 
         self.weight = nn.Parameter(torch.empty(config.n_routed_experts, config.dim), requires_grad=self.train_gate)
+        if config.router_bias:
+            self.bias = nn.Parameter(torch.empty(config.n_routed_experts), requires_grad=self.train_gate)
+        else:
+            self.bias = None
         self.e_score_correction_bias = nn.Parameter(torch.empty(config.n_routed_experts), requires_grad=False)
         self.e_score_correction_bias_master = None
 
@@ -510,6 +641,10 @@ class Gate(nn.Module):
         aux_loss = None
         if self.aux_loss_coeff > 0 and self.training:
             aux_loss = self._compute_aux_loss(original_scores, expert_load, token_mask, cp_mesh)
+            # Scale the aux_loss by the number of tokens.
+            # Training scales all gradients by 1/(number of tokens).
+            # To correct this scaling, we need to scale the aux_loss by number of tokens here.
+            MoEAuxLossAutoScaler.apply(weights, aux_loss * weights.shape[0])
 
         return weights.type_as(x), indices, aux_loss
 
@@ -650,9 +785,35 @@ class Gate(nn.Module):
 
 
 @torch.compile
-def swiglu(x, gate_proj, down_proj, up_proj):
-    inter = F.silu(F.linear(x, gate_proj)) * F.linear(x, up_proj)
-    return F.linear(inter, down_proj)
+def swiglu(x, *, gate_proj, down_proj, up_proj, gate_bias=None, up_bias=None, down_bias=None):
+    gate_out = F.linear(x, gate_proj, gate_bias)
+    up_out = F.linear(x, up_proj, up_bias)
+    inter = F.silu(gate_out) * up_out
+    return F.linear(inter, down_proj, down_bias)
+
+
+@torch.compile
+def quick_geglu(
+    x,
+    *,
+    gate_proj,
+    down_proj,
+    up_proj,
+    gate_bias=None,
+    up_bias=None,
+    down_bias=None,
+    alpha: float = 1.702,
+    limit: float | None = 7.0,
+):
+    gate_out = F.linear(x, gate_proj, gate_bias)
+    up_out = F.linear(x, up_proj, up_bias)
+    # Clamp the input values
+    gate_out = gate_out.clamp(min=None, max=limit)
+    up_out = up_out.clamp(min=-limit, max=limit)
+    out_glu = gate_out * torch.sigmoid(alpha * gate_out)
+    # Note we add an extra bias of 1 to the linear layer
+    inter = out_glu * (up_out + 1)
+    return F.linear(inter, down_proj, down_bias)
 
 
 class MoE(nn.Module):
@@ -690,7 +851,11 @@ class MoE(nn.Module):
             self.experts = GroupedExpertsDeepEP(config)
         else:
             self.experts = GroupedExperts(config)
-        self.shared_experts = MLP(config.dim, config.n_shared_experts * config.moe_inter_dim, backend.linear)
+
+        if config.n_shared_experts > 0:
+            self.shared_experts = MLP(config.dim, config.n_shared_experts * config.moe_inter_dim, backend.linear)
+        else:
+            self.shared_experts = None
 
     def forward(
         self,
@@ -719,6 +884,10 @@ class MoE(nn.Module):
 
         weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
 
+        if self.shared_experts is None:
+            y = self.experts(x, token_mask, weights, indices)
+            return y.view(shape)
+
         # Execute shared experts in a separate stream to overlap compute with the
         # communication for grouped experts.
         global _shared_experts_stream
@@ -736,7 +905,7 @@ class MoE(nn.Module):
         torch.cuda.current_stream().wait_stream(_shared_experts_stream)
 
         # Reshape the outputs back to 3-D.
-        return (y + z).view(shape), aux_loss
+        return (y + z).view(shape)
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         init_weights_fn = partial(_init_weights, buffer_device=buffer_device, init_std=init_std)
@@ -754,13 +923,22 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
         if isinstance(module, Gate):
             to_local(module.weight).normal_(mean=0.0, std=init_std)
             to_local(module.e_score_correction_bias).zero_()
+            if module.bias is not None:
+                to_local(module.bias).zero_()
         elif isinstance(module, GroupedExperts):
             to_local(module.gate_projs).normal_(mean=0.0, std=init_std)
             to_local(module.up_projs).normal_(mean=0.0, std=init_std)
             to_local(module.down_projs).normal_(mean=0.0, std=init_std)
+            if module.expert_bias:
+                to_local(module.gate_bias).zero_()
+                to_local(module.up_bias).zero_()
+                to_local(module.down_bias).zero_()
         elif isinstance(module, GroupedExpertsDeepEP):
             to_local(module.gate_and_up_projs).normal_(mean=0.0, std=init_std)
             to_local(module.down_projs).normal_(mean=0.0, std=init_std)
+            if module.expert_bias:
+                to_local(module.gate_and_up_bias).zero_()
+                to_local(module.down_bias).zero_()
         elif isinstance(module, MLP):
             to_local(module.gate_proj.weight).normal_(mean=0.0, std=init_std)
             to_local(module.down_proj.weight).normal_(mean=0.0, std=init_std)
