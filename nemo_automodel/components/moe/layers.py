@@ -42,7 +42,6 @@ from nemo_automodel.components.moe.megatron.token_dispatcher import MoEConfig as
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher
 
 _shared_experts_stream: Optional[torch.cuda.Stream] = None
-_bias_computation_stream: Optional[torch.cuda.Stream] = None
 
 
 @dataclass(kw_only=True)
@@ -298,15 +297,6 @@ def get_expert_activation_for_deepep(config: MoEConfig):
         raise ValueError(f"Invalid expert activation: {config.expert_activation}")
 
 
-# Optimized function for creating bias indices
-@torch.compile(mode="reduce-overhead", disable=not torch.cuda.is_available())
-def _create_expert_bias_indices(tokens_per_expert, device):
-    """Create indices for expert bias expansion using optimized repeat_interleave."""
-    return torch.repeat_interleave(
-        torch.arange(len(tokens_per_expert), device=device, dtype=torch.long), tokens_per_expert.to(device)
-    )
-
-
 class GroupedExpertsDeepEP(nn.Module):
     """
     Sparse MoE implementation using DeepEP.
@@ -320,6 +310,25 @@ class GroupedExpertsDeepEP(nn.Module):
         gate_and_up_projs part2 / up_projs (nn.Parameter): Linear layer for input-to-hidden transformation.
         down_projs (nn.Parameter): Linear layer for hidden-to-output transformation.
     """
+
+    @staticmethod
+    def _apply_bias(value, bias, tokens_per_expert):
+        if bias is None:
+            return value
+        shape = value.shape
+        return (
+            torch.cat(
+                [
+                    t + b
+                    for t, b in zip(
+                        torch.split(value.view(-1, shape[-1]), tokens_per_expert.tolist()),
+                        bias,
+                    )
+                ]
+            )
+            .view(shape)
+            .to(value.dtype)
+        )
 
     def __init__(self, config: MoEConfig):
         """
@@ -417,43 +426,20 @@ class GroupedExpertsDeepEP(nn.Module):
                 trans_b=False,
             )
 
-            # Prepare bias data in a separate stream to overlap with GMM
+            # Apply bias using the new broadcast method
             if self.expert_bias:
-                global _bias_computation_stream
-                if _bias_computation_stream is None:
-                    _bias_computation_stream = torch.cuda.Stream()
-
-                # _bias_computation_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(_bias_computation_stream):
-                    gate_and_up_bias = self.gate_and_up_bias.to_local()
-                    down_bias = self.down_bias.to_local()
-
-                    # Create bias indices while output1 GMM is computing
-                    num_tokens = permuted_local_hidden_states.size(0)
-                    if num_tokens > 0:
-                        expert_indices = _create_expert_bias_indices(
-                            tokens_per_expert.to(permuted_local_hidden_states.device),
-                            permuted_local_hidden_states.device,
-                        )
-                        # Pre-index biases
-                        gate_up_bias_expanded = gate_and_up_bias[expert_indices]
-                        down_bias_expanded = down_bias[expert_indices]
-                    else:
-                        gate_up_bias_expanded = None
-                        down_bias_expanded = None
-
-                torch.cuda.current_stream().wait_stream(_bias_computation_stream)
-                output1 = output1 + gate_up_bias_expanded
+                gate_and_up_bias = self.gate_and_up_bias.to_local()
+                output1 = self._apply_bias(output1, gate_and_up_bias, tokens_per_expert)
             else:
-                gate_up_bias_expanded = None
-                down_bias_expanded = None
+                gate_and_up_bias = None
 
             output1_ = self.expert_activation(output1, None, permuted_probs)
             output2 = ops.gmm(output1_, self.down_projs.to_local(), tokens_per_expert, trans_b=False)
 
-            # Add bias for down projection if enabled
-            if self.expert_bias and down_bias_expanded is not None:
-                output2 = output2 + down_bias_expanded
+            # Apply bias for down projection using the new broadcast method
+            if self.expert_bias:
+                down_bias = self.down_bias.to_local()
+                output2 = self._apply_bias(output2, down_bias, tokens_per_expert)
         else:
             output1 = torch.matmul(x[0] * 0, self.gate_and_up_projs.to_local()[0])
 
