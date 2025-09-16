@@ -31,20 +31,10 @@ NeMo Framework is NVIDIA's GPU accelerated, end-to-end training framework for la
 - [Key Features](#key-features)
 - [Getting Started](#getting-started)
 - [LLM Pre-training](#llm-pre-training)
-   - [LLM Pre-training Single Node](#llm-pre-training-single-node)
-   - [LLM Pre-training Multi Node](#llm-pre-training-multi-node)
 - [LLM Supervised Fine-Tuning (SFT)](#llm-supervised-fine-tuning-sft)
-   - [LLM SFT Single Node](#llm-sft-single-node)
-   - [LLM SFT Multi Node](#llm-sft-multi-node)
 - [LLM Parameter-Efficient Fine-Tuning (PEFT)](#llm-parameter-efficient-fine-tuning-peft)
-   - [LLM PEFT Single Node](#llm-peft-single-node)
-   - [LLM PEFT Multi Node](#llm-peft-multi-node)
 - [VLM Supervised Fine-Tuning (SFT)](#vlm-supervised-fine-tuning-SFT)
-   - [VLM SFT Single Node](#vlm-sft-single-node)
-   - [VLM SFT Multi Node](#vlm-sft-multi-node)
 - [VLM Parameter-Efficient Fine-Tuning (PEFT)](#vlm-parameter-efficient-fine-tuning-peft)
-  - [VLM PEFT Single Node](#vlm-peft-single-node)
-  - [VLM PEFT Multi Node](#vlm-peft-multi-node)
 - [Supported Models](#supported-models)
 - [Performance](#performance)
 - [Interoperability](#interoperability)
@@ -113,30 +103,57 @@ uv run python -c "import nemo_automodel; print('AutoModel ready')"
 
 > Ensure recent CUDA/PyTorch. Some kernels (e.g., FlashAttention‑style) may JIT on first run.
 
-## Mesh‑Aware Checkpointing
-
-AutoModel writes **Distributed Checkpoints (DCP)** with SafeTensors
-shards. Checkpoints carry partition metadata to:
-
-- **Merge** into a single HF‑compatible checkpoint for inference.
-- **Reshard** when loading onto a different mesh/topology.
-
-YAML sketch:
-```yaml
-checkpoint:
-enabled: true
-checkpoint_dir: ./checkpoints
-save_consolidated: true
-model_save_format: safetensors
-```
-
 ## LLM Pre-training
 ### LLM Pre-training Single Node
 ### LLM Pre-training Multi Node
 
 ## LLM Supervised Fine-Tuning (SFT)
+We provide an example SFT experiment using the [SQuAD dataset](https://rajpurkar.github.io/SQuAD-explorer/).
+
 ### LLM SFT Single Node
+
+The default SFT configuration is set to run on a single GPU. To start the experiment:
+
+```sh
+uv run python3 \
+    examples/llm_finetune/finetune.py \
+    -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+```
+
+This fine-tunes the `Llama3.2-1B` model on the SQuAD dataset using a 1 GPU.
+
+To use multiple GPUs on a single node in an interactive environment, you can run the same command
+using torchrun and adjust the `--proc-per-node` argument to the number of needed GPUs.
+
+```sh
+uv run torchrun --nproc-per-node=8 \
+    examples/llm_finetune/finetune.py \
+    -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+```
+
+Refer to `examples/configs/sft.yaml` for a full list of parameters that can be overridden.
+
+
 ### LLM SFT Multi Node
+
+```sh
+# Run from the root of NeMo RL repo
+NUM_ACTOR_NODES=2
+
+COMMAND="uv run ./examples/run_sft.py --config examples/configs/sft.yaml cluster.num_nodes=2 cluster.gpus_per_node=8 checkpointing.checkpoint_dir='results/sft_llama8b_2nodes' logger.wandb_enabled=True logger.wandb.name='sft-llama8b'" \
+CONTAINER=YOUR_CONTAINER \
+MOUNTS="$PWD:$PWD" \
+sbatch \
+    --nodes=${NUM_ACTOR_NODES} \
+    --account=YOUR_ACCOUNT \
+    --job-name=YOUR_JOBNAME \
+    --partition=YOUR_PARTITION \
+    --time=4:0:0 \
+    --gres=gpu:8 \
+    ray.sub
+```
+
+
 ```bash
 # Memory‑efficient SFT with LoRA
 uv run examples/llm_finetune/finetune.py \
@@ -226,6 +243,23 @@ Coming soon..
 - **[NeMo RL](https://github.com/NVIDIA-NeMo/RL)**: Use AutoModel checkpoints directly as starting points for DPO/RM/GRPO pipelines.
 - **[Hugging Face](https://github.com/huggingface/transformers)**: Train from and export to native 🤗 formats.
 - **[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)**: Optional conversions to/from Megatron formats for specific workflows.
+
+## Mesh‑Aware Checkpointing
+
+AutoModel writes **Distributed Checkpoints (DCP)** with SafeTensors
+shards. Checkpoints carry partition metadata to:
+
+- **Merge** into a single HF‑compatible checkpoint for inference.
+- **Reshard** when loading onto a different mesh/topology.
+
+YAML sketch:
+```yaml
+checkpoint:
+enabled: true
+checkpoint_dir: ./checkpoints
+save_consolidated: true
+model_save_format: safetensors
+```
 
 ---
 
