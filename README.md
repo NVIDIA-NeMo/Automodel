@@ -86,11 +86,11 @@ NeMo Framework is NVIDIA's GPU accelerated, end-to-end training framework for la
 - **Mixed precision**: BF16/FP16/FP8; sequence packing; optimized CUDA kernels.
 - **PEFT built‑in**: LoRA and hooks for custom adapters.
 - **Mesh‑aware DCP**: Sharded SafeTensors with merge/reshard utilities.
-- **Flexible Configuration**: YAML-based configuration system for reproducible experiments
-- **FP8 Precision**: Native FP8 training & inference for higher throughput and lower memory use
-- **Day-0 Hugging Face Support**: Instantly fine-tune any model from the Hugging Face Hub
-- **Large-Scale Distributed Training**: Built-in FSDP2 and Megatron-FSDP for seamless multi-node scaling
-- **Vision-Language Model Ready**: Native support for VLMs (Qwen2-VL, Gemma-3-VL, etc)
+- **Flexible Configuration**: YAML-based configuration system for reproducible experiments.
+- **FP8 Precision**: Native FP8 training & inference for higher throughput and lower memory use.
+- **Day-0 Hugging Face Support**: Instantly fine-tune any model from the Hugging Face Hub.
+- **Large-Scale Distributed Training**: Built-in FSDP2 and Megatron-FSDP for seamless multi-node scaling.
+- **Vision-Language Model Ready**: Native support for VLMs (Qwen2-VL, Gemma-3-VL, etc).
 
 ## Getting Started
 
