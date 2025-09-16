@@ -30,11 +30,13 @@ NeMo Framework is NVIDIA's GPU accelerated, end-to-end training framework for la
 - [Design Principles](#design-principles)
 - [Key Features](#key-features)
 - [Getting Started](#getting-started)
-- [LLM Pre-training](#llm-pre-training)
-- [LLM Supervised Fine-Tuning (SFT)](#llm-supervised-fine-tuning-sft)
-- [LLM Parameter-Efficient Fine-Tuning (PEFT)](#llm-parameter-efficient-fine-tuning-peft)
-- [VLM Supervised Fine-Tuning (SFT)](#vlm-supervised-fine-tuning-SFT)
-- [VLM Parameter-Efficient Fine-Tuning (PEFT)](#vlm-parameter-efficient-fine-tuning-peft)
+- LLM
+  - [Pre-training](#llm-pre-training)
+  - [Supervised Fine-Tuning (SFT)](#llm-supervised-fine-tuning-sft)
+  - [Parameter-Efficient Fine-Tuning (PEFT)](#llm-parameter-efficient-fine-tuning-peft)
+- VLM
+  - [Supervised Fine-Tuning (SFT)](#vlm-supervised-fine-tuning-SFT)
+  - [Parameter-Efficient Fine-Tuning (PEFT)](#vlm-parameter-efficient-fine-tuning-peft)
 - [Supported Models](#supported-models)
 - [Performance](#performance)
 - [Interoperability](#interoperability)
