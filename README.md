@@ -30,15 +30,26 @@ NeMo Framework is NVIDIA's GPU accelerated, end-to-end training framework for la
 - [Design Principles](#design-principles)
 - [Key Features](#key-features)
 - [Getting Started](#getting-started)
-- [Training Examples](#training-examples)
+- [LLM Pre-training](#llm-pre-training)
+   - [LLM Pre-training Single Node](#llm-pre-training-single-node)
+   - [LLM Pre-training Multi Node](#llm-pre-training-multi-node)
+- [LLM Supervised Fine-Tuning (SFT)](#llm-supervised-fine-tuning-sft)
+   - [LLM SFT Single Node](#llm-sft-single-node)
+   - [LLM SFT Multi Node](#llm-sft-multi-node)
+- [LLM Parameter-Efficient Fine-Tuning (PEFT)](#llm-parameter-efficient-fine-tuning-peft)
+   - [LLM PEFT Single Node](#llm-peft-single-node)
+   - [LLM PEFT Multi Node](#llm-peft-multi-node)
+- [VLM Supervised Fine-Tuning (SFT)](#vlm-supervised-fine-tuning-SFT)
+   - [VLM SFT Single Node](#vlm-sft-single-node)
+   - [VLM SFT Multi Node](#vlm-sft-multi-node)
+- [VLM Parameter-Efficient Fine-Tuning (PEFT)](#vlm-parameter-efficient-fine-tuning-peft)
+  - [VLM PEFT Single Node](#vlm-peft-single-node)
+  - [VLM PEFT Multi Node](#vlm-peft-multi-node)
 - [Supported Models](#supported-models)
 - [Performance](#performance)
 - [Interoperability](#interoperability)
 - [Contributing](#-contributing)
 - [License](#license)
-
-
-## Feature Roadmap
 
 ✅ _Available now_ | 🔜 _Coming in 25.11_
 
@@ -119,9 +130,13 @@ save_consolidated: true
 model_save_format: safetensors
 ```
 
-## Training Examples
+## LLM Pre-training
+### LLM Pre-training Single Node
+### LLM Pre-training Multi Node
 
-**LLM**
+## LLM Supervised Fine-Tuning (SFT)
+### LLM SFT Single Node
+### LLM SFT Multi Node
 ```bash
 # Memory‑efficient SFT with LoRA
 uv run examples/llm_finetune/finetune.py \
@@ -136,6 +151,18 @@ uv run examples/llm_finetune/finetune.py \
 # The above command will modify the `local_batch_size` variable to have value 16 in the
 # section `step_scheduler` of the yaml file.
 ```
+
+## LLM Parameter-Efficient Fine-Tuning (PEFT)
+### LLM PEFT Single Node
+### LLM PEFT Multi Node
+
+## VLM Supervised Fine-Tuning (SFT)
+### VLM SFT Single Node
+### VLM SFT Multi Node
+
+## VLM Parameter-Efficient Fine-Tuning (PEFT)
+### VLM PEFT Single Node
+### VLM PEFT Multi Node
 
 
 **VLM**
@@ -196,9 +223,9 @@ Coming soon..
 
 ## Interoperability
 
+- **[NeMo RL](https://github.com/NVIDIA-NeMo/RL)**: Use AutoModel checkpoints directly as starting points for DPO/RM/GRPO pipelines.
 - **[Hugging Face](https://github.com/huggingface/transformers)**: Train from and export to native 🤗 formats.
 - **[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)**: Optional conversions to/from Megatron formats for specific workflows.
-- **[NeMo RL](https://github.com/NVIDIA-NeMo/RL)**: Use AutoModel checkpoints directly as starting points for DPO/RM/GRPO pipelines.
 
 ---
 
