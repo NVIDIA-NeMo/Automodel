@@ -188,11 +188,14 @@ uv run examples/llm_finetune/finetune.py \
 uv run examples/vlm_finetune/finetune.py \
 --config examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml
 ```
-### VLM SFT Multi Node
 
 ## VLM Parameter-Efficient Fine-Tuning (PEFT)
 ### VLM PEFT Single Node
-### VLM PEFT Multi Node
+```bash
+# Qwen2.5‑VL on a single GPU
+uv run examples/vlm_finetune/finetune.py \
+--config examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix_peft.yaml
+```
 
 
 
