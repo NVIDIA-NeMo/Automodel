@@ -248,12 +248,6 @@ NeMo AutoModel provides native support for a wide range of models available on t
 
 Coming soon..
 
-## Interoperability
-
-- **[NeMo RL](https://github.com/NVIDIA-NeMo/RL)**: Use AutoModel checkpoints directly as starting points for DPO/RM/GRPO pipelines.
-- **[Hugging Face](https://github.com/huggingface/transformers)**: Train from and export to native 🤗 formats.
-- **[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)**: Optional conversions to/from Megatron formats for specific workflows.
-
 ## Mesh‑Aware Checkpointing
 
 AutoModel writes **Distributed Checkpoints (DCP)** with SafeTensors
@@ -270,6 +264,14 @@ checkpoint_dir: ./checkpoints
 save_consolidated: true
 model_save_format: safetensors
 ```
+
+## Interoperability
+
+- **[NeMo RL](https://github.com/NVIDIA-NeMo/RL)**: Use AutoModel checkpoints directly as starting points for DPO/RM/GRPO pipelines.
+- **[Hugging Face](https://github.com/huggingface/transformers)**: Train from and export to native 🤗 formats.
+- **[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)**: Optional conversions to/from Megatron formats for specific workflows.
+
+
 
 ---
 
