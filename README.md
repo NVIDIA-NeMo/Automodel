@@ -268,7 +268,7 @@ model_save_format: safetensors
 ## 🔌 Interoperability
 
 - **[NeMo RL](https://github.com/NVIDIA-NeMo/RL)**: Use AutoModel checkpoints directly as starting points for DPO/RM/GRPO pipelines.
-- **[Hugging Face](https://github.com/huggingface/transformers)**: Train from and export to native 🤗 formats.
+- **[Hugging Face](https://github.com/huggingface/transformers)**: Train any LLM/VLM from 🤗 without format conversion.
 - **[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)**: Optional conversions to/from Megatron formats for specific workflows.
 
 
