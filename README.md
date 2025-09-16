@@ -153,7 +153,8 @@ sbatch \
     ray.sub
 ```
 
-
+## LLM Parameter-Efficient Fine-Tuning (PEFT)
+### LLM PEFT Single Node
 ```bash
 # Memory‑efficient SFT with LoRA
 uv run examples/llm_finetune/finetune.py \
@@ -168,13 +169,16 @@ uv run examples/llm_finetune/finetune.py \
 # The above command will modify the `local_batch_size` variable to have value 16 in the
 # section `step_scheduler` of the yaml file.
 ```
-
-## LLM Parameter-Efficient Fine-Tuning (PEFT)
-### LLM PEFT Single Node
 ### LLM PEFT Multi Node
+
 
 ## VLM Supervised Fine-Tuning (SFT)
 ### VLM SFT Single Node
+```bash
+# Qwen2.5‑VL on a single GPU
+uv run examples/vlm_finetune/finetune.py \
+--config examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml
+```
 ### VLM SFT Multi Node
 
 ## VLM Parameter-Efficient Fine-Tuning (PEFT)
@@ -182,12 +186,6 @@ uv run examples/llm_finetune/finetune.py \
 ### VLM PEFT Multi Node
 
 
-**VLM**
-```bash
-# Qwen2.5‑VL on a single GPU
-uv run examples/vlm_finetune/finetune.py \
---config examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml
-```
 
 
 ## Supported Models
