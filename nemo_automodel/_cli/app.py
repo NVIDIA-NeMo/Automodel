@@ -226,7 +226,8 @@ def get_repo_root():
 def run_interactive(args):
     from torch.distributed.run import determine_local_world_size, get_args_parser
     from torch.distributed.run import run as thrun
-    COMMAND_ALIASES = {'finetune': 'train_ft', 'pretrain': 'train_ft'}
+
+    COMMAND_ALIASES = {"finetune": "train_ft", "pretrain": "train_ft"}
     # remap commands: finetune -> train_ft
     command = COMMAND_ALIASES.get(args.command, args.command)
     config_path = args.config.resolve()
