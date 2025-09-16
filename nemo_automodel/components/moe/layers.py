@@ -554,7 +554,10 @@ class Gate(nn.Module):
             self.bias = nn.Parameter(torch.empty(config.n_routed_experts), requires_grad=self.train_gate)
         else:
             self.bias = None
-        self.e_score_correction_bias = nn.Parameter(torch.empty(config.n_routed_experts), requires_grad=False)
+        if self.bias_update_factor > 0:
+            self.e_score_correction_bias = nn.Parameter(torch.empty(config.n_routed_experts), requires_grad=False)
+        else:
+            self.e_score_correction_bias = None
         self.e_score_correction_bias_master = None
 
         # Cumulative expert load is a tensor representing the number of tokens
@@ -908,7 +911,8 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
     with torch.device(buffer_device):
         if isinstance(module, Gate):
             to_local(module.weight).normal_(mean=0.0, std=init_std)
-            to_local(module.e_score_correction_bias).zero_()
+            if module.e_score_correction_bias is not None:
+                to_local(module.e_score_correction_bias).zero_()
             if module.bias is not None:
                 to_local(module.bias).zero_()
         elif isinstance(module, GroupedExperts):
