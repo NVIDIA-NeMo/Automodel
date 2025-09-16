@@ -39,7 +39,7 @@ NeMo Framework is NVIDIA's GPU accelerated, end-to-end training framework for la
   - [Parameter-Efficient Fine-Tuning (PEFT)](#vlm-parameter-efficient-fine-tuning-peft)
 - [Supported Models](#supported-models)
 - [Performance](#performance)
-- [Interoperability](#interoperability)
+- [Interoperability](#-interoperability)
 - [Contributing](#-contributing)
 - [License](#license)
 
@@ -265,7 +265,7 @@ save_consolidated: true
 model_save_format: safetensors
 ```
 
-## Interoperability
+## 🔌 Interoperability
 
 - **[NeMo RL](https://github.com/NVIDIA-NeMo/RL)**: Use AutoModel checkpoints directly as starting points for DPO/RM/GRPO pipelines.
 - **[Hugging Face](https://github.com/huggingface/transformers)**: Train from and export to native 🤗 formats.
