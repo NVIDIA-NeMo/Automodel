@@ -107,6 +107,13 @@ uv run python -c "import nemo_automodel; print('AutoModel ready')"
 
 ## LLM Pre-training
 ### LLM Pre-training Single Node
+We provide an example SFT experiment using the [Fineweb dataset](https://huggingface.co/datasets/HuggingFaceFW/fineweb/) with a nano-GPT model, ideal for single node experiments.
+```sh
+uv run torchrun --nproc-per-node=8 \
+    examples/llm_pretrain/pretrain.py \
+    -c examples/llm_pretrain/nanogpt_pretrain.yaml
+```
+
 ### LLM Pre-training Multi Node
 
 ## LLM Supervised Fine-Tuning (SFT)
