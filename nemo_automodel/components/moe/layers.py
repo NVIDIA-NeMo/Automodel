@@ -499,7 +499,7 @@ class Gate(nn.Module):
             )
         else:
             raise NotImplementedError(
-                f"Unsupported top-k function for MoE gating: {self.topk_method}"
+                f"Unsupported MoE Top-K function: {self.topk_method}"
             )
 
         if self.score_func == "sigmoid" and self.norm_topk_prob and self.topk > 1:
