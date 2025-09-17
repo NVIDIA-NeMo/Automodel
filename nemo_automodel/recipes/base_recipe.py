@@ -265,7 +265,7 @@ class BaseRecipe:
 
         load_model(
             model,
-            os.path.join(ckpt_dir, "model"),
+            ckpt_dir,
             self.checkpoint_config.model_save_format,
             is_peft=self.checkpoint_config.is_peft,
             moe_mesh=moe_mesh,
