@@ -37,6 +37,9 @@ else
     export ADDITIONAL_ARGS="--cpu --with_downloads"
 fi
 
+# Ensure the repo root is on PYTHONPATH so 'tests' is importable during collection
+export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
+
 if [[ "$UNIT_TEST" == "true" ]]; then
     export TEST_DIR="tests/unit_tests"
     coverage run \
