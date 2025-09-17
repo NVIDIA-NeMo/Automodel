@@ -39,18 +39,23 @@ fi
 
 if [[ "$UNIT_TEST" == "true" ]]; then
     export TEST_DIR="tests/unit_tests"
+    coverage run \
+        --data-file=/workspace/.coverage \
+        --source=/workspace/ \
+        --parallel-mode \
+        -m pytest \
+        $TEST_DIR \
+        -o log_cli=true \
+        -o log_cli_level=INFO \
+        -vs -m "not pleasefixme" --tb=short -rA \
+        $ADDITIONAL_ARGS
 else
     export TEST_DIR="tests/functional_tests/$TEST_NAME"
+        pytest \
+        $TEST_DIR \
+        -o log_cli=true \
+        -o log_cli_level=INFO \
+        -vs -m "not pleasefixme" --tb=short -rA \
+        $ADDITIONAL_ARGS
 fi
 
-coverage run \
-    --data-file=/workspace/.coverage \
-    --source=/workspace/ \
-    --parallel-mode \
-    -m pytest \
-    $TEST_DIR \
-    -o log_cli=true \
-    -o log_cli_level=INFO \
-    -vs -m "not pleasefixme" --tb=short -rA \
-    $ADDITIONAL_ARGS
-coverage combine -q
