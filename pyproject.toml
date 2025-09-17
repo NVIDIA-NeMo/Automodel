@@ -27,7 +27,7 @@ version = { attr = "nemo_automodel.package_info.__version__" } # any module attr
 readme = { file = "README.md", content-type = "text/markdown" }
 
 [project]
-description = "NeMo Automodel - Provides Day-0 support for any Hugging Face model leveraging PyTorch native functionalities while providing performance and memory optimized training and inference recipes."
+description = "DTensor-native pretraining and fine-tuning for LLMs/VLMs with day-0 Hugging Face support, GPU-acceleration, and memory efficiency."
 name = "nemo-automodel"
 dynamic = ["version"]
 readme = "README.md"
