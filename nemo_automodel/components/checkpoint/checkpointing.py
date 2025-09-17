@@ -255,7 +255,7 @@ def load_model_from_base_checkpoint(
 
 def load_model(
     model: torch.nn.Module,
-    model_path: str,
+    weights_path: str,
     model_save_format: SerializationFormat,
     *,
     is_peft: bool = False,
@@ -270,7 +270,7 @@ def load_model(
 
     Args:
         model: Model to load state into
-        model_path: Path to load model weights from
+        weights_path: Path to load model weights from
         model_save_format: Model save format
         is_peft: Whether the model is PEFT
         is_init_step: Whether the model is being initialized
@@ -279,6 +279,7 @@ def load_model(
         load_peft_adapters: Whether to load PEFT adapters
         moe_mesh: MoE mesh for distributed loading
     """
+    model_path = os.path.join(weights_path, "model")
     # Validate checkpoint directory
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model path {model_path} does not exist")
