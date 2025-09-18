@@ -34,4 +34,5 @@ examples/llm_finetune/finetune.py \
   --distributed.dp_size none \
   --distributed.tp_size 2 \
   --distributed.cp_size 1 \
-  --distributed.sequence_parallel false
+  --distributed.sequence_parallel false \
+  --distributed.activation_checkpointing true

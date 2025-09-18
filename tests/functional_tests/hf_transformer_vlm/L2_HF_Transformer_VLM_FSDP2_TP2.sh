@@ -30,4 +30,5 @@ examples/vlm_finetune/finetune.py \
   --distributed._target_ nemo_automodel.components.distributed.fsdp2.FSDP2Manager \
   --distributed.dp_size none \
   --distributed.tp_size 2 \
-  --distributed.cp_size 1
+  --distributed.cp_size 1 \
+  --distributed.activation_checkpointing true

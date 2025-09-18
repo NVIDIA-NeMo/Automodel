@@ -124,6 +124,10 @@ class FSDP2Manager:
         # init=False,
         metadata={"help": "Total number of processes."},
     )
+    activation_checkpointing: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Enable activation checkpointing if True. Applies to linear layers."},
+    )
 
     def __post_init__(self):
         """
@@ -277,6 +281,12 @@ class FSDP2Manager:
         """
         if dist.get_world_size() == 1:
             logger.info("World size is 1, skipping parallelization.")
+            model.to("cuda").to(torch.bfloat16)
+            if self.activation_checkpointing:
+                if hasattr(model, "gradient_checkpointing_enable"):
+                    model.gradient_checkpointing_enable()
+                else:
+                    logger.error("Model does not support gradient checkpointing.")
             return model
 
         if self.device_mesh["tp"].size() > 1:
@@ -327,5 +337,6 @@ class FSDP2Manager:
             mp_policy=self.mp_policy,
             tp_shard_plan=tp_shard_plan,
             offload_policy=self.offload_policy,
+            activation_checkpointing=self.activation_checkpointing,
         )
         return model

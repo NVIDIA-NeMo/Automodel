@@ -16,6 +16,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor.parallel import (
@@ -122,6 +123,12 @@ class MegatronFSDPManager:
     nccl_ub: Optional[bool] = field(default=False, metadata={"help": "Use NCCL UBs if True."})
     fsdp_double_buffer: Optional[bool] = field(default=False, metadata={"help": "Use double buffer if True."})
 
+    # Gradient / Activation checkpointing
+    activation_checkpointing: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Enable activation checkpointing for transformer MLP layers to save memory."},
+    )
+
     def __post_init__(self):
         """
         Post-initialization hook that sets up the distributed environment.
@@ -204,7 +211,16 @@ class MegatronFSDPManager:
         """
         if dist.get_world_size() == 1:
             logger.info("World size is 1, skipping parallelization.")
-            return model.cuda(), optimizer
+            model = model.to("cuda").to(torch.bfloat16)
+            if self.activation_checkpointing:
+                if hasattr(model, "gradient_checkpointing_enable"):
+                    model.gradient_checkpointing_enable()
+                else:
+                    logger.error("Model does not support gradient checkpointing. Skipping.")
+            return model, optimizer
+
+        if self.activation_checkpointing:
+            logger.error("Activation checkpointing is not yet supported with MegatronFSDP. Skipping.")
 
         if self.zero_dp_strategy != 3:
             if self.device_mesh.get_rank() == 0:

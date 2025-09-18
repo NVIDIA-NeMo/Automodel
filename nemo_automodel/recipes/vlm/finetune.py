@@ -38,7 +38,7 @@ from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConf
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
-from nemo_automodel.components.distributed.init_utils import get_world_size_safe, initialize_distributed
+from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -177,18 +177,10 @@ def build_model_and_optimizer(
                 if tp_size > 1:
                     cfg_opt.foreach = False
                 optimizer = cfg_opt.instantiate(params=trainable_params)
-                if get_world_size_safe() == 1:
-                    logger.info("World size is 1, skipping parallelization.")
-                    model = model.to(device).to(torch.bfloat16)
-                else:
-                    model, optimizer = model_wrapper.parallelize(model, optimizer)
+                model, optimizer = model_wrapper.parallelize(model, optimizer)
                 return model, state_dict_keys, optimizer
             else:
-                if get_world_size_safe() == 1:
-                    logger.info("World size is 1, skipping parallelization.")
-                    model = model.to(device).to(torch.bfloat16)
-                else:
-                    model = model_wrapper.parallelize(model)
+                model = model_wrapper.parallelize(model)
 
                 # Load the weights into the model in parallel.
                 if is_meta_device:
