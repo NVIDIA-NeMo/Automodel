@@ -14,7 +14,7 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/moonlight/moonlight_16b_te_slurm.yaml
+# torchrun --nproc-per-node=8 examples/llm_pretrain/pretrain.py --config examples/llm_pretrain/megatron_pretrain_moonlight_16b_te_slurm.yaml
 # Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
 
