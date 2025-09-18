@@ -19,13 +19,14 @@ import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoConfig
 
-from nemo_automodel.components.checkpoint.checkpointing import to_empty_parameters_only
+from nemo_automodel.components.checkpoint.checkpointing import load_model_from_base_checkpoint
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.pipelining.functional import pipeline_model
 from nemo_automodel.components.training.rng import init_all_rng
 from nemo_automodel.components.training.timers import Timers
 from nemo_automodel.components.utils.flops_utils import get_flops_formula_for_hf_config
+from transformers.utils import TRANSFORMERS_CACHE
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -179,8 +180,16 @@ def run_benchmark(cfg):
         # Allocate parameters for each stage on its GPU and init
         device = torch.cuda.current_device()
         for mp in model_parts:
-            to_empty_parameters_only(mp, device=device, dtype=torch.bfloat16)
-            mp.initialize_weights(buffer_device=torch.device(f"cuda:{device}"))
+            load_model_from_base_checkpoint(
+                    mp,
+                    device,
+                    False,
+                    TRANSFORMERS_CACHE,
+                    cfg.model.pretrained_model_name_or_path,
+                    None,
+                    device_mesh=mesh["default"],
+                    moe_mesh=mesh["moe"],
+                )
             mp.train()
 
         optimizer = cfg.optimizer.instantiate(

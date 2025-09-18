@@ -22,6 +22,7 @@ from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
 from nemo_automodel.components.moe.rope_utils import freqs_cis_from_position_ids, precompute_freqs_cis
 from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GptOssStateDictAdapter
 
 
 class Block(nn.Module):
@@ -196,6 +197,11 @@ class GptOssForCausalLM(nn.Module):
         self.backend = backend or BackendConfig()
         self.model = GptOssModel(config, backend=self.backend, moe_config=moe_config)
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
+        # State dict adapter
+        if self.backend.enable_hf_state_dict_adapter:
+            self.state_dict_adapter = GptOssStateDictAdapter(
+                self.config, self.model.moe_config, self.backend, dtype=torch.bfloat16
+            )
 
     def forward(
         self,
