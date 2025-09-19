@@ -494,13 +494,9 @@ class Gate(nn.Module):
             indices = torch.topk(scores, self.topk, dim=-1)[1]
             weights = original_scores.gather(1, indices)
         elif self.topk_method == "greedy":
-            weights, indices = torch.topk(
-                scores, k=self.topk, dim=-1, sorted=False
-            )
+            weights, indices = torch.topk(scores, k=self.topk, dim=-1, sorted=False)
         else:
-            raise NotImplementedError(
-                f"Unsupported MoE Top-K function: {self.topk_method}"
-            )
+            raise NotImplementedError(f"Unsupported MoE Top-K function: {self.topk_method}")
 
         if self.score_func == "sigmoid" and self.norm_topk_prob and self.topk > 1:
             # Use out-of-place division to keep autograd versions intact.
@@ -765,7 +761,7 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
     with torch.device(buffer_device):
         if isinstance(module, Gate):
             to_local(module.weight).normal_(mean=0.0, std=init_std)
-            if hasattr(module, 'e_score_correction_bias'):
+            if hasattr(module, "e_score_correction_bias"):
                 to_local(module.e_score_correction_bias).zero_()
         elif isinstance(module, GroupedExperts):
             to_local(module.gate_projs).normal_(mean=0.0, std=init_std)
