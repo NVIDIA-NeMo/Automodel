@@ -490,7 +490,7 @@ def pipeline_model(
     # Apply parallelization if provided
     for i, m in enumerate(model_parts):
         if parallelize_fn is not None:
-            parallelize_fn(
+            parallelize_fn.instantiate(
                 m,
                 world_mesh=world_mesh,
                 moe_mesh=moe_mesh,
