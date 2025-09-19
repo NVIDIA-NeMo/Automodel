@@ -145,8 +145,7 @@ def format_prompt_completion(
 
 def format_chat_template(
     tokenizer: "PreTrainedTokenizer",
-    prompt: str,
-    answer: str,
+    formatted_text: List[Dict[str, str]],
     eos_token_id: int,
     pad_token_id: int,
     seq_length: Optional[int] = None,
@@ -157,8 +156,7 @@ def format_chat_template(
 
     Args:
         tokenizer: The tokenizer to use.
-        prompt: The prompt string (e.g. context + question).
-        answer: The answer string.
+        formatted_text: The formatted text, with role tags embedded in the content.
         eos_token_id: The end-of-sequence token id.
         pad_token_id: The padding token id.
         seq_length: Optional sequence length for padding.
@@ -167,10 +165,6 @@ def format_chat_template(
     Returns:
         A dictionary with the formatted example.
     """
-    formatted_text = [
-        {"role": "user", "content": prompt},
-        {"role": "assistant", "content": answer},
-    ]
     input_ids = tokenizer.apply_chat_template(formatted_text)
     if isinstance(start_of_turn_token, str):
         start_of_turn_token_id = tokenizer(start_of_turn_token, add_special_tokens=False)["input_ids"][0]
