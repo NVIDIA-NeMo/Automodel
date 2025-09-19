@@ -120,6 +120,7 @@ def _parallelize_gemma3(
 
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
+from torch.distributed.tensor.parallel import PrepareModuleOutput, PrepareModuleInput
 
 def _parallelize_decilm(
     model,
@@ -129,14 +130,23 @@ def _parallelize_decilm(
 
     # This is not complete, for nas arch, we should generate the tp plan based on the per block config.
     base_model_tp_plan: dict[str, ParallelStyle] = {
-        "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
+        'model.layers.*.self_attn': PrepareModuleInput(
+            input_kwarg_layouts={"attention_mask": Replicate()},
+            desired_input_kwarg_layouts={"attention_mask": Replicate()},
+        ),
+        "model.embed_tokens": RowwiseParallel(input_layouts=Replicate(), output_layouts=Replicate(), use_local_output=True),
         "model.layers.*.self_attn.q_proj": ColwiseParallel(use_local_output=False),
         "model.layers.*.self_attn.k_proj": ColwiseParallel(use_local_output=False),
         "model.layers.*.self_attn.v_proj": ColwiseParallel(use_local_output=False),
-        "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
+        "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Replicate(),use_local_output=True),
+        "model.layers.*.self_attn.rotary_emb": PrepareModuleOutput(
+            output_layouts=(Replicate(), Replicate()),
+            desired_output_layouts=(Replicate(), Replicate()),
+            use_local_output=False,
+        ), 
         "model.layers.*.mlp.up_proj": ColwiseParallel(),
         "model.layers.*.mlp.gate_proj": ColwiseParallel(),
-        "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
+        "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Replicate(), use_local_output=True),
         "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
     }
 
