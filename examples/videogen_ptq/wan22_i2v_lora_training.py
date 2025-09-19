@@ -1,8 +1,7 @@
-# wan22_i2v_lora_training.py
-# Distributed LoRA training for Wan 2.2 Image-to-Video
-# Uses PyTorch FSDP with proper I2V conditioning
+# wan22_i2v_lora_training_diffusers_native.py
+# WAN 2.2 I2V LoRA training using Diffusers-native LoRA (no PEFT)
+# Hybrid approach: FSDP on base transformers + manual gradient sync on LoRA params
 
-import inspect
 import logging
 import os
 import warnings
@@ -14,8 +13,7 @@ import torch.nn as nn
 import wandb
 from dataloader import MetaFilesDataset, collate_fn
 from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
-from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
-from peft import LoraConfig, TaskType, get_peft_model
+from diffusers.models.attention_processor import LoRAAttnProcessor2_0
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.fully_sharded_data_parallel import (
     BackwardPrefetch,
@@ -25,22 +23,19 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import (
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 
+
 # --------------------------- Utility Functions ---------------------------
 
-
 def is_main_process() -> bool:
-    """Check if current process is rank 0."""
     return not dist.is_initialized() or dist.get_rank() == 0
 
 
 def print0(*args, **kwargs):
-    """Print only from rank 0."""
     if is_main_process():
         print(*args, **kwargs)
 
 
 def configure_logging():
-    """Configure logging to be quiet on non-main processes."""
     level = logging.INFO if is_main_process() else logging.ERROR
     logging.basicConfig(level=level)
     if dist.is_initialized() and dist.get_rank() != 0:
@@ -48,110 +43,113 @@ def configure_logging():
 
 
 def setup_distributed():
-    """Initialize distributed training."""
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     configure_logging()
 
-    # Force BF16 precision settings
+    # Force BF16 settings (WAN models are bf16-friendly)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
 
+    # Seed per-rank
+    torch.manual_seed(42 + dist.get_rank())
+    torch.cuda.manual_seed_all(42 + dist.get_rank())
     return local_rank
 
 
 def cast_model_to_dtype(module: nn.Module, dtype: torch.dtype):
-    """Cast all floating point parameters and buffers to specified dtype."""
-    for param in module.parameters(recurse=True):
-        if param.dtype.is_floating_point:
-            param.data = param.data.to(dtype)
-
-    for buffer in module.buffers(recurse=True):
-        if buffer.dtype.is_floating_point:
-            buffer.data = buffer.data.to(dtype)
+    for p in module.parameters(recurse=True):
+        if p.dtype.is_floating_point:
+            p.data = p.data.to(dtype)
+    for b in module.buffers(recurse=True):
+        if b.dtype.is_floating_point:
+            b.data = b.data.to(dtype)
 
 
-def validate_model_dtype(module: nn.Module, expected_dtype: torch.dtype, model_name: str):
-    """Validate that all floating point parameters have the expected dtype."""
-    param_dtypes = {p.dtype for p in module.parameters() if p.dtype.is_floating_point}
-    buffer_dtypes = {b.dtype for b in module.buffers() if b.dtype.is_floating_point}
-    all_dtypes = param_dtypes | buffer_dtypes
+# --------------------------- LoRA Helpers (WAN) ---------------------------
 
-    if all_dtypes != {expected_dtype}:
-        raise ValueError(f"{model_name} has mixed dtypes {all_dtypes}, expected {expected_dtype}")
-
-
-def collect_lora_target_modules(transformer: nn.Module) -> List[str]:
-    """Collect target module names for LoRA adaptation."""
-    target_modules = []
-    for name, module in transformer.named_modules():
-        if isinstance(module, nn.Linear):
-            # Target attention and MLP projections
-            if any(keyword in name for keyword in ["to_q", "to_k", "to_v", "to_out", "fc1", "fc2", "proj"]):
-                target_modules.append(name)
-    return target_modules
-
-
-def prepare_image_latents_for_i2v(
-    image_latents: torch.Tensor,
-    num_frames: int,
-    scheduler: FlowMatchEulerDiscreteScheduler,
-    strength: float = 0.8,
-    generator: Optional[torch.Generator] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _install_wan_lora_processors(transformer: nn.Module):
     """
-    Prepare image latents for I2V training following WAN pipeline logic.
-
-    Args:
-        image_latents: Encoded image latents (B, C, H, W)
-        num_frames: Number of video frames
-        scheduler: Diffusion scheduler
-        strength: How much noise to add (0.0 = no noise, 1.0 = full noise)
-        generator: Random generator for reproducibility
-
-    Returns:
-        Tuple of (final_latents, noise, timestep)
+    Replace every attention processor with LoRAAttnProcessor2_0 (zero-arg for WAN).
     """
-    batch_size, channels, height, width = image_latents.shape
+    if not hasattr(transformer, "attn_processors") or len(transformer.attn_processors) == 0:
+        raise RuntimeError("Transformer has no attn_processors; cannot install LoRA.")
 
-    # 1. Broadcast image latents to all frames
-    image_latents_broadcast = image_latents.unsqueeze(2).repeat(1, 1, num_frames, 1, 1)
-
-    # 2. Generate noise for all frames
-    noise = torch.randn_like(image_latents_broadcast, generator=generator)
-
-    # 3. Sample timestep based on strength
-    timesteps = scheduler.timesteps
-    timestep_idx = int(strength * (len(timesteps) - 1))
-    timestep = timesteps[timestep_idx]
-
-    # 4. Add noise using scheduler
-    noisy_latents = scheduler.add_noise(image_latents_broadcast, noise, timestep)
-
-    # 5. Apply temporal mask to preserve first frame
-    frame_mask = torch.ones(num_frames, device=image_latents.device, dtype=image_latents.dtype)
-    frame_mask[0] = 0.0  # Keep first frame clean
-    frame_mask = frame_mask.view(1, 1, num_frames, 1, 1)
-
-    # 6. Combine clean first frame with noisy subsequent frames
-    final_latents = image_latents_broadcast * (1 - frame_mask) + noisy_latents * frame_mask
-
-    return final_latents, noise, timestep
+    attn_procs = {}
+    for name in transformer.attn_processors.keys():
+        attn_procs[name] = LoRAAttnProcessor2_0()
+    transformer.set_attn_processor(attn_procs)
+    print0(f"[INFO] Installed {len(attn_procs)} WAN LoRA processors")
 
 
-class WanI2VLoRATrainer:
-    """WAN 2.2 Image-to-Video LoRA trainer using PyTorch FSDP."""
+def _collect_wan_lora_params(transformer: nn.Module) -> List[nn.Parameter]:
+    """
+    Collect nn.Parameters from WAN's LoRA processors by introspection.
+    Expected attributes on each processor: to_q_lora, to_k_lora, to_v_lora, to_out_lora
+    Each of those (when present) has submodules lora_up, lora_down containing Parameters.
+    """
+    if not hasattr(transformer, "attn_processors"):
+        return []
+
+    lora_params: List[nn.Parameter] = []
+
+    def _maybe_collect(module):
+        if module is None:
+            return
+        # Try both common patterns
+        submods = []
+        if hasattr(module, "lora_up"):
+            submods.append(module.lora_up)
+        if hasattr(module, "lora_down"):
+            submods.append(module.lora_down)
+        # A few builds use weight_A/weight_B naming; catch-all:
+        for attr in ("A", "B", "up", "down"):
+            sub = getattr(module, attr, None)
+            if isinstance(sub, nn.Module):
+                submods.append(sub)
+
+        for sm in submods:
+            for _, p in sm.named_parameters(recurse=True):
+                p.requires_grad = True
+                lora_params.append(p)
+
+    for proc in transformer.attn_processors.values():
+        # Standard names in diffusers for LoRAAttnProcessor2_0
+        for attr in ("to_q_lora", "to_k_lora", "to_v_lora", "to_out_lora"):
+            _maybe_collect(getattr(proc, attr, None))
+
+    # Deduplicate while preserving object identity
+    seen = set()
+    unique_params = []
+    for p in lora_params:
+        if id(p) not in seen:
+            unique_params.append(p)
+            seen.add(id(p))
+    return unique_params
+
+
+def _move_params(params: List[nn.Parameter], device: torch.device, dtype: torch.dtype):
+    for p in params:
+        p.data = p.data.to(device=device, dtype=dtype)
+
+
+# --------------------------- Trainer ---------------------------
+
+class WanI2VDiffusersLoRATrainer:
+    """WAN 2.2 I2V trainer using Diffusers-native LoRA with FSDP hybrid approach."""
 
     def __init__(
         self,
         model_id: str = "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-        lora_rank: int = 16,
-        lora_alpha: int = 32,
+        lora_rank: int = 16,    # not used by WAN’s zero-arg proc – kept for CLI parity
+        lora_alpha: int = 32,   # not used by WAN’s zero-arg proc – kept for CLI parity
         learning_rate: float = 1e-4,
         num_frames: int = 81,
         height: int = 480,
         width: int = 832,
+        boundary_ratio: Optional[float] = 0.5,
+        debug: bool = False,
     ):
         self.model_id = model_id
         self.lora_rank = lora_rank
@@ -160,339 +158,332 @@ class WanI2VLoRATrainer:
         self.num_frames = num_frames
         self.height = height
         self.width = width
+        self.boundary_ratio = boundary_ratio
         self.bf16 = torch.bfloat16
+        self.debug = debug
 
-        # Initialize distributed training
         self.local_rank = setup_distributed()
         self.world_size = dist.get_world_size()
         self.device = torch.device("cuda", self.local_rank)
 
-        print0("[INFO] WAN 2.2 I2V LoRA training initialized")
-        print0(f"[INFO] World size: {self.world_size} GPUs")
-        print0(f"[INFO] Local rank: {self.local_rank}")
+        print0("[INFO] WAN 2.2 I2V Diffusers-native LoRA training initialized")
+        print0(f"[INFO] world_size={self.world_size}  local_rank={self.local_rank}")
+        print0(f"[INFO] boundary_ratio={boundary_ratio}")
 
-        # Initialize components
         self.pipe = None
-        self.lora_models = []
+        self.model_map: Dict[str, Dict] = {}
+        self.transformer_names: List[str] = []
         self.optimizer = None
         self.lr_scheduler = None
 
+    # -------- Pipeline --------
+
     def setup_pipeline(self):
-        """Load and setup the WAN 2.2 pipeline components."""
         print0("[INFO] Loading WAN 2.2 I2V pipeline...")
-
-        # Load pipeline components
         vae = AutoencoderKLWan.from_pretrained(self.model_id, subfolder="vae", torch_dtype=torch.float32)
-
-        self.pipe = WanImageToVideoPipeline.from_pretrained(self.model_id, vae=vae, torch_dtype=torch.float32)
-
-        # Cast and move frozen components to device
-        cast_model_to_dtype(self.pipe.vae, self.bf16)
-        self.pipe.vae.to(device=self.device, dtype=self.bf16)
-        self.pipe.vae.requires_grad_(False)
-
-        if hasattr(self.pipe, "text_encoder") and self.pipe.text_encoder is not None:
-            cast_model_to_dtype(self.pipe.text_encoder, self.bf16)
-            self.pipe.text_encoder.to(device=self.device, dtype=self.bf16)
-            self.pipe.text_encoder.requires_grad_(False)
-
-        if hasattr(self.pipe, "image_encoder") and self.pipe.image_encoder is not None:
-            cast_model_to_dtype(self.pipe.image_encoder, self.bf16)
-            self.pipe.image_encoder.to(device=self.device, dtype=self.bf16)
-            self.pipe.image_encoder.requires_grad_(False)
-
-        print0("[INFO] Pipeline loaded, frozen components configured")
-
-    def debug_transformer_signature(self, transformer: nn.Module, name: str):
-        """Debug transformer forward signature for compatibility."""
-        try:
-            sig = inspect.signature(transformer.forward)
-            params = list(sig.parameters.keys())
-            print0(f"[DEBUG] {name} forward signature: {params}")
-
-            expected_params = ["sample", "timestep", "encoder_hidden_states"]
-            has_standard_sig = all(param in params for param in expected_params)
-            print0(f"[DEBUG] {name} has standard diffusion signature: {has_standard_sig}")
-
-            return has_standard_sig, params
-        except Exception as e:
-            print0(f"[WARNING] Could not inspect {name} signature: {e}")
-            return False, []
-
-    def setup_lora_and_fsdp(self):
-        """Setup LoRA adapters outside FSDP and base transformers with FSDP."""
-        print0("[INFO] Setting up LoRA (outside FSDP) + base transformers (with FSDP)...")
-
-        # Find available transformers
-        transformer_names = []
-        for name in ["transformer", "transformer_2"]:
-            if hasattr(self.pipe, name) and getattr(self.pipe, name) is not None:
-                transformer_names.append(name)
-
-        if not transformer_names:
-            raise RuntimeError("No transformers found in pipeline")
-
-        print0(f"[INFO] Found transformers: {transformer_names}")
-
-        # FSDP configuration for base transformers only
-        mixed_precision_policy = MixedPrecision(
-            param_dtype=self.bf16,
-            reduce_dtype=self.bf16,
-            buffer_dtype=self.bf16,
+        self.pipe = WanImageToVideoPipeline.from_pretrained(
+            self.model_id, vae=vae, torch_dtype=torch.float32, boundary_ratio=self.boundary_ratio
         )
 
-        self.lora_models = []
-        self.base_transformers = []
+        # Freeze & cast encoders/vae
+        cast_model_to_dtype(self.pipe.vae, self.bf16)
+        self.pipe.vae.to(device=self.device, dtype=self.bf16).requires_grad_(False)
 
-        for name in transformer_names:
-            transformer = getattr(self.pipe, name)
+        if getattr(self.pipe, "text_encoder", None) is not None:
+            cast_model_to_dtype(self.pipe.text_encoder, self.bf16)
+            self.pipe.text_encoder.to(device=self.device, dtype=self.bf16).requires_grad_(False)
 
-            # Cast to BF16 and freeze base model
-            cast_model_to_dtype(transformer, self.bf16)
-            transformer.requires_grad_(False)
+        if getattr(self.pipe, "image_encoder", None) is not None:
+            cast_model_to_dtype(self.pipe.image_encoder, self.bf16)
+            self.pipe.image_encoder.to(device=self.device, dtype=self.bf16).requires_grad_(False)
 
-            # Validate dtype consistency
-            if is_main_process():
-                validate_model_dtype(transformer, self.bf16, name)
+        print0("[INFO] Pipeline loaded.")
 
-            print0(f"[INFO] Debugging {name} signature...")
-            self.debug_transformer_signature(transformer, name)
+    def _num_train_timesteps(self) -> int:
+        sch = self.pipe.scheduler
+        if hasattr(sch, "num_train_timesteps") and isinstance(sch.num_train_timesteps, int):
+            return sch.num_train_timesteps
+        if hasattr(sch, "config") and hasattr(sch.config, "num_train_timesteps"):
+            return int(sch.config.num_train_timesteps)
+        return 1000
 
-            # Move base transformer to device
-            transformer = transformer.to(self.device)
+    def get_boundary_timestep(self, num_train_timesteps: Optional[int] = None) -> int:
+        if self.boundary_ratio is None:
+            return 0
+        if num_train_timesteps is None:
+            num_train_timesteps = self._num_train_timesteps()
+        return max(0, int(self.boundary_ratio * num_train_timesteps))
 
-            # Wrap ONLY the base transformer with FSDP
-            print0(f"[INFO] Wrapping base {name} with FSDP...")
-            fsdp_base_transformer = FSDP(
-                transformer,
-                sharding_strategy=ShardingStrategy.NO_SHARD,
-                mixed_precision=mixed_precision_policy,
+    # -------- DDP helpers for LoRA params --------
+
+    def _broadcast_lora_params(self):
+        if self.world_size == 1:
+            return
+        print0("[INFO] Broadcasting LoRA parameters...")
+        dist.barrier()
+        for name in self.transformer_names:
+            for p in self.model_map[name]["lora_params"]:
+                dist.broadcast(p.data, src=0)
+        dist.barrier()
+
+    def _allreduce_lora_grads(self):
+        if self.world_size == 1:
+            return
+        for name in self.transformer_names:
+            for p in self.model_map[name]["lora_params"]:
+                if p.grad is not None:
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                    p.grad.div_(self.world_size)
+
+    # -------- Hybrid parallelism --------
+
+    def setup_hybrid_parallelism(self):
+        print0("[INFO] Setting up FSDP + LoRA hybrid...")
+        self.transformer_names = []
+        for name in ["transformer", "transformer_2"]:
+            if getattr(self.pipe, name, None) is not None:
+                self.transformer_names.append(name)
+        if not self.transformer_names:
+            raise RuntimeError("No transformers found in pipeline")
+        print0(f"[INFO] Found transformers: {self.transformer_names}")
+
+        fsdp_mixed_precision = MixedPrecision(
+            param_dtype=self.bf16, reduce_dtype=self.bf16, buffer_dtype=self.bf16
+        )
+
+        self.model_map = {}
+        for name in self.transformer_names:
+            base_transformer = getattr(self.pipe, name)
+
+            # Cast & move the base transformer (non-LoRA) first
+            cast_model_to_dtype(base_transformer, self.bf16)
+            base_transformer.to(self.device)
+
+            # Install WAN LoRA processors (zero-arg)
+            _install_wan_lora_processors(base_transformer)
+
+            # Collect LoRA params by introspection and move to device/dtype
+            lora_params = _collect_wan_lora_params(base_transformer)
+            if len(lora_params) == 0:
+                raise RuntimeError(f"No LoRA parameters found for {name}")
+            _move_params(lora_params, self.device, self.bf16)
+            print0(f"[INFO] {name}: {len(lora_params)} LoRA trainable tensors")
+
+            # FSDP wrap ONLY the base transformer
+            fsdp_wrapped = FSDP(
+                base_transformer,
+                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                mixed_precision=fsdp_mixed_precision,
                 auto_wrap_policy=None,
                 backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
                 device_id=self.local_rank,
                 sync_module_states=True,
-                param_init_fn=None,
-                use_orig_params=True,
+                use_orig_params=False,
+                ignored_modules=[],  # processors aren't modules; nothing to ignore
             )
+            fsdp_wrapped.train()
 
-            # Now add LoRA adapters OUTSIDE of FSDP
-            print0(f"[INFO] Adding LoRA to {name} (outside FSDP)...")
-            target_modules = collect_lora_target_modules(fsdp_base_transformer)
-            print0(f"[INFO] {name} LoRA targeting {len(target_modules)} modules")
+            self.model_map[name] = {
+                "fsdp": fsdp_wrapped,
+                "lora_params": lora_params,
+                "base_transformer": base_transformer,  # keep ref for save/load swap
+            }
+            setattr(self.pipe, name, fsdp_wrapped)
 
-            lora_config = LoraConfig(
-                r=self.lora_rank,
-                lora_alpha=self.lora_alpha,
-                target_modules=target_modules,
-                lora_dropout=0.0,
-                bias="none",
-                task_type=TaskType.FEATURE_EXTRACTION,
-            )
+        print0("[INFO] Hybrid setup complete.")
 
-            # Apply LoRA to the FSDP-wrapped base transformer
-            transformer_with_lora = get_peft_model(fsdp_base_transformer, lora_config)
-            if is_main_process():
-                transformer_with_lora.print_trainable_parameters()
-
-            # Cast LoRA parameters to BF16 (they're added as float32)
-            for name_param, param in transformer_with_lora.named_parameters():
-                if "lora_" in name_param and param.requires_grad:
-                    param.data = param.data.to(self.bf16)
-
-            # Validate setup
-            print0(f"[INFO] Validating {name} setup...")
-            lora_param_count = sum(
-                1
-                for param_name, param in transformer_with_lora.named_parameters()
-                if "lora_" in param_name and param.requires_grad
-            )
-            print0(f"[INFO] {name} has {lora_param_count} trainable LoRA parameters (outside FSDP)")
-
-            transformer_with_lora.train()
-
-            # Replace in pipeline and track
-            setattr(self.pipe, name, transformer_with_lora)
-            self.lora_models.append(transformer_with_lora)
-            self.base_transformers.append(fsdp_base_transformer)
-
-        print0("[INFO] Setup complete: Base transformers in FSDP, LoRA adapters outside FSDP")
+    # -------- Optimizer / Scheduler --------
 
     def setup_optimizer_and_scheduler(self):
-        """Setup optimizer and learning rate scheduler for LoRA parameters outside FSDP."""
-        # Collect trainable LoRA parameters (they're outside FSDP)
-        lora_params = []
-        for model in self.lora_models:
-            for param_name, param in model.named_parameters():
-                if "lora_" in param_name and param.requires_grad:
-                    lora_params.append(param)
+        all_lora_params = []
+        for name in self.transformer_names:
+            all_lora_params.extend(self.model_map[name]["lora_params"])
 
-        print0(f"[INFO] Optimizing {len(lora_params)} LoRA parameters (outside FSDP)")
+        if not all_lora_params:
+            raise RuntimeError("No trainable LoRA parameters found!")
 
-        # Since LoRA params are outside FSDP, we need to handle gradient sync manually
-        self.lora_params = lora_params
-
-        self.optimizer = torch.optim.AdamW(lora_params, lr=self.learning_rate, weight_decay=0.01, betas=(0.9, 0.999))
-
-        # Cosine annealing scheduler
-        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=1000, eta_min=1e-6)
-
-    def create_dataloader(self, meta_folder: str, batch_size: int = 1):
-        """Create distributed dataloader."""
-        dataset = MetaFilesDataset(
-            meta_folder=meta_folder,
-            device="cpu",  # Load on CPU, move to GPU in training loop
+        self.optimizer = torch.optim.AdamW(
+            all_lora_params, lr=self.learning_rate, weight_decay=0.01, betas=(0.9, 0.999)
+        )
+        # Temp scheduler; reset after dataloader is built
+        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=1000, eta_min=1e-6
         )
 
-        sampler = DistributedSampler(dataset, num_replicas=self.world_size, rank=dist.get_rank(), shuffle=True)
+    # -------- Data --------
 
+    def create_dataloader(self, meta_folder: str, batch_size: int = 1):
+        dataset = MetaFilesDataset(meta_folder=meta_folder, device="cpu")
+        sampler = DistributedSampler(dataset, num_replicas=self.world_size, rank=dist.get_rank(), shuffle=True)
         dataloader = DataLoader(
             dataset, batch_size=batch_size, sampler=sampler, collate_fn=collate_fn, num_workers=2, pin_memory=True
         )
-
         return dataloader, sampler
 
-    def training_step(self, batch: Dict) -> torch.Tensor:
-        """Execute single training step with proper I2V conditioning."""
-        # Extract data from batch (only these 4 fields are available)
-        text_embeddings = batch["text_embeddings"]  # (batch_size, seq_len, embed_dim)
-        video_latents = batch["video_latents"]  # (batch_size, channels, frames, h, w)
-        metadata = batch["metadata"]  # List of metadata dicts
-        file_info = batch["file_info"]  # List of file info dicts
+    # -------- I2V conditioning --------
+
+    def prepare_i2v_conditioning(
+        self, video_latents: torch.Tensor, timesteps: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        noise = torch.randn_like(video_latents)
+        noisy_video_latents = self.pipe.scheduler.add_noise(video_latents, noise, timesteps)
+
+        condition_mask = torch.zeros_like(video_latents, dtype=self.bf16)
+        condition_mask[:, :, 0] = 1.0  # keep first frame clean
+
+        conditioned_latents = condition_mask * video_latents + (1 - condition_mask) * noisy_video_latents
+        return conditioned_latents, noise, condition_mask
+
+    # -------- Train step --------
 
     def training_step(self, batch: Dict) -> torch.Tensor:
-        """Execute single training step with proper I2V conditioning."""
-        # Extract data from batch (only these 4 fields are available)
-        text_embeddings = batch["text_embeddings"]  # (batch_size, seq_len, embed_dim)
-        video_latents = batch["video_latents"]  # (batch_size, channels, frames, h, w)
-        metadata = batch["metadata"]  # List of metadata dicts
-        file_info = batch["file_info"]  # List of file info dicts
+        text_embeddings = batch["text_embeddings"].to(self.device, dtype=self.bf16)
+        video_latents = batch["video_latents"].to(self.device, dtype=torch.float32)
 
-    def training_step(self, batch: Dict) -> torch.Tensor:
-        """Execute single training step with proper I2V conditioning."""
-        # Extract data from batch (only these 4 fields are available)
-        text_embeddings = batch["text_embeddings"]  # (batch_size, seq_len, embed_dim)
-        video_latents = batch["video_latents"]  # (batch_size, channels, frames, h, w)
-        metadata = batch["metadata"]  # List of metadata dicts
-        file_info = batch["file_info"]  # List of file info dicts
-
-        # Move tensors to device with proper dtypes
-        text_embeddings = text_embeddings.to(self.device, dtype=self.bf16)
-        video_latents = video_latents.to(self.device, dtype=torch.float32)
-
-        # Debug: Check actual tensor shapes
-        if is_main_process():
-            print0(f"[DEBUG] text_embeddings shape: {text_embeddings.shape}")
-            print0(f"[DEBUG] video_latents shape: {video_latents.shape}")
-
-        # Handle the actual dataloader format
-        # Your dataloader provides samples with shape (1, C, F, H, W)
-        # When batched, this becomes (batch_size, 1, C, F, H, W) - 6D tensor
-        if len(video_latents.shape) == 6:
-            # Remove the extra dimension: (batch_size, 1, C, F, H, W) -> (batch_size, C, F, H, W)
+        if video_latents.ndim == 6:
             video_latents = video_latents.squeeze(1)
-            batch_size, channels, frames, height, width = video_latents.shape
-        elif len(video_latents.shape) == 5:
-            batch_size, channels, frames, height, width = video_latents.shape
-        else:
-            raise ValueError(f"Unexpected video_latents shape: {video_latents.shape}")
-
-        # Similarly handle text_embeddings if needed
-        if len(text_embeddings.shape) == 4:
-            # (batch_size, 1, seq_len, embed_dim) -> (batch_size, seq_len, embed_dim)
+        if text_embeddings.ndim == 4:
             text_embeddings = text_embeddings.squeeze(1)
 
-        if is_main_process():
-            print0(f"[DEBUG] After reshape - text_embeddings: {text_embeddings.shape}")
-            print0(f"[DEBUG] After reshape - video_latents: {video_latents.shape}")
-            print0(f"[DEBUG] Parsed dimensions: B={batch_size}, C={channels}, F={frames}, H={height}, W={width}")
+        num_train_timesteps = self._num_train_timesteps()
+        timesteps = torch.randint(0, num_train_timesteps, (video_latents.shape[0],), device=self.device)
 
-        # Extract first frame as the base for I2V generation
-        # In I2V training, we use the first frame as the starting point
-        image_latents = video_latents[:, :, 0]  # (B, C, H, W)
-
-        # Sample random timesteps for diffusion training
-        timesteps = torch.randint(
-            0, len(self.pipe.scheduler.timesteps), (batch_size,), device=self.device, dtype=torch.long
-        )
-
-        # Prepare latents for I2V training
         with torch.no_grad():
-            # 1. Broadcast first frame to all temporal positions
-            # This simulates the I2V pipeline where we start from a single image
-            image_latents_broadcast = image_latents.unsqueeze(2).repeat(1, 1, frames, 1, 1)
+            conditioned_latents, noise, condition_mask = self.prepare_i2v_conditioning(video_latents, timesteps)
 
-            # 2. Generate noise for the full video sequence
-            noise = torch.randn_like(video_latents)
-
-            # 3. Add noise to the TARGET video (what model should learn to denoise to)
-            noisy_latents = self.pipe.scheduler.add_noise(video_latents, noise, timesteps)
-
-            # 4. Create temporal mask for I2V conditioning
-            # In I2V: first frame stays clean (image input), subsequent frames are noisy
-            frame_mask = torch.ones(frames, device=self.device, dtype=torch.float32)
-            frame_mask[0] = 0.0  # First frame = clean image input
-            frame_mask = frame_mask.view(1, 1, frames, 1, 1)
-
-            # 5. INPUT to model: clean first frame + noisy subsequent frames
-            # This teaches the model: "given clean frame 0, denoise frames 1-N"
-            input_latents = (
-                image_latents_broadcast * (1 - frame_mask)  # Clean first frame
-                + noisy_latents * frame_mask  # Noisy subsequent frames
-            )
-
-        # Convert to BF16 for model forward pass
-        input_latents = input_latents.to(self.bf16)
+        conditioned_latents = conditioned_latents.to(self.bf16)
         noise = noise.to(self.bf16)
 
-        # Forward pass through transformer(s)
+        boundary_timestep = self.get_boundary_timestep(num_train_timesteps)
+        use_t1 = timesteps >= boundary_timestep
+        use_t2 = ~use_t1
+
+        total_loss = None
+        num_samples = 0
+
         with torch.autocast(device_type="cuda", dtype=self.bf16):
-            # Select appropriate transformer based on pipeline configuration
-            transformer = self.pipe.transformer
+            if use_t1.any():
+                idx = use_t1.nonzero(as_tuple=True)[0]
+                model = self.model_map["transformer"]["fsdp"]
+                out = model(
+                    hidden_states=conditioned_latents[idx],
+                    timestep=timesteps[idx],
+                    encoder_hidden_states=text_embeddings[idx],
+                    return_dict=False,
+                )
+                noise_pred = out[0] if isinstance(out, tuple) else out
+                non_cond = (1 - condition_mask[idx])
+                loss = torch.nn.functional.mse_loss(noise_pred * non_cond, noise[idx] * non_cond)
+                total_loss = loss * len(idx) if total_loss is None else total_loss + loss * len(idx)
+                num_samples += len(idx)
 
-            # Predict noise - use exact signature from debug
-            try:
-                noise_pred = transformer(
-                    sample=input_latents, timestep=timesteps, encoder_hidden_states=text_embeddings, return_dict=False
-                )[0]
-            except TypeError as e:
-                # Fallback: try without return_dict if signature doesn't support it
-                print0(f"[WARNING] Trying fallback forward call due to: {e}")
-                noise_pred = transformer(input_latents, timesteps, text_embeddings)
-                if isinstance(noise_pred, tuple):
-                    noise_pred = noise_pred[0]
+            if use_t2.any() and "transformer_2" in self.model_map:
+                idx = use_t2.nonzero(as_tuple=True)[0]
+                model = self.model_map["transformer_2"]["fsdp"]
+                out = model(
+                    hidden_states=conditioned_latents[idx],
+                    timestep=timesteps[idx],
+                    encoder_hidden_states=text_embeddings[idx],
+                    return_dict=False,
+                )
+                noise_pred = out[0] if isinstance(out, tuple) else out
+                non_cond = (1 - condition_mask[idx])
+                loss = torch.nn.functional.mse_loss(noise_pred * non_cond, noise[idx] * non_cond)
+                total_loss = loss * len(idx) if total_loss is None else total_loss + loss * len(idx)
+                num_samples += len(idx)
 
-            # Compute MSE loss between predicted and actual noise
-            loss = torch.nn.functional.mse_loss(noise_pred, noise)
+        if total_loss is None:
+            raise ValueError("No samples processed in training step")
+        final_loss = total_loss / num_samples
 
-        return loss
+        if torch.isnan(final_loss) or torch.isinf(final_loss):
+            raise ValueError(f"Invalid loss: {final_loss.item()}")
+
+        return final_loss
+
+    # -------- Save / Load (swap out FSDP for lora save/load) --------
+
+    def _swap_fsdp_for_io(self, use_base: bool):
+        """
+        If use_base=True, put base transformers on the pipeline for IO.
+        Else, restore FSDP-wrapped ones.
+        """
+        for name in self.transformer_names:
+            if use_base:
+                setattr(self.pipe, name, self.model_map[name]["base_transformer"])
+            else:
+                setattr(self.pipe, name, self.model_map[name]["fsdp"])
 
     def save_checkpoint(self, output_dir: str, step: int):
-        """Save LoRA checkpoint."""
         if not is_main_process():
             return
+        ckpt = os.path.join(output_dir, f"checkpoint-{step}")
+        os.makedirs(ckpt, exist_ok=True)
+        try:
+            self._swap_fsdp_for_io(use_base=True)
+            self.pipe.save_lora_weights(ckpt)
+            print0(f"[INFO] Saved LoRA weights to {ckpt}")
+        except Exception as e:
+            print0(f"[ERROR] Failed to save LoRA weights: {e}")
+        finally:
+            self._swap_fsdp_for_io(use_base=False)
 
-        checkpoint_dir = os.path.join(output_dir, f"checkpoint-{step}")
-        os.makedirs(checkpoint_dir, exist_ok=True)
-
-        # Save LoRA adapters
-        for i, lora_model in enumerate(self.lora_models):
-            lora_save_path = os.path.join(checkpoint_dir, f"transformer_{i}_lora")
-
-            # Extract PEFT model from FSDP wrapper
-            peft_model = lora_model.module if hasattr(lora_model, "module") else lora_model
-            peft_model.save_pretrained(lora_save_path)
-
-        # Save training state
         torch.save(
             {
                 "step": step,
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "scheduler_state_dict": self.lr_scheduler.state_dict(),
+                "boundary_ratio": self.boundary_ratio,
+                "transformer_names": self.transformer_names,
+                "model_id": self.model_id,
             },
-            os.path.join(checkpoint_dir, "training_state.pt"),
+            os.path.join(ckpt, "training_state.pt"),
         )
 
-        print0(f"[INFO] Checkpoint saved at step {step}")
+    def load_checkpoint(self, checkpoint_path: str) -> int:
+        state_path = os.path.join(checkpoint_path, "training_state.pt")
+        if not os.path.exists(state_path):
+            print0(f"[WARNING] No training_state.pt at {checkpoint_path}")
+            return 0
+
+        state = torch.load(state_path, map_location="cpu")
+        self.optimizer.load_state_dict(state["optimizer_state_dict"])
+        self.lr_scheduler.load_state_dict(state["scheduler_state_dict"])
+
+        try:
+            self._swap_fsdp_for_io(use_base=True)
+            self.pipe.load_lora_weights(checkpoint_path)
+            print0(f"[INFO] Loaded LoRA weights from {checkpoint_path}")
+        except Exception as e:
+            print0(f"[ERROR] Failed to load LoRA weights: {e}")
+        finally:
+            self._swap_fsdp_for_io(use_base=False)
+
+        if self.world_size > 1:
+            self._broadcast_lora_params()
+
+        return int(state.get("step", 0))
+
+    # -------- Validation --------
+
+    @torch.no_grad()
+    def validate(self, val_dataloader) -> float:
+        for name in self.transformer_names:
+            self.model_map[name]["fsdp"].eval()
+
+        total_loss = 0.0
+        n = 0
+        for batch in tqdm(val_dataloader, desc="Validation", disable=not is_main_process()):
+            loss = self.training_step(batch)
+            total_loss += loss.item()
+            n += 1
+
+        for name in self.transformer_names:
+            self.model_map[name]["fsdp"].train()
+
+        return total_loss / max(n, 1)
+
+    # -------- Train loop --------
 
     def train(
         self,
@@ -501,135 +492,198 @@ class WanI2VLoRATrainer:
         batch_size: int = 1,
         save_every: int = 1000,
         log_every: int = 100,
-        output_dir: str = "./wan_i2v_lora_checkpoints",
+        validate_every: int = 500,
+        output_dir: str = "./wan_i2v_outputs",
+        val_meta_folder: Optional[str] = None,
+        resume_checkpoint: Optional[str] = None,
     ):
-        """Main training loop."""
-        print0(f"[INFO] Starting training for {num_epochs} epochs")
+        print0(f"[INFO] Starting LoRA training for {num_epochs} epochs")
 
-        # Setup all components
-        try:
-            self.setup_pipeline()
-            self.setup_lora_and_fsdp()
-            self.setup_optimizer_and_scheduler()
-        except Exception as e:
-            print0(f"[ERROR] Setup failed: {e}")
-            raise
+        # Setup
+        self.setup_pipeline()
+        self.setup_hybrid_parallelism()
+        self._broadcast_lora_params()
+        self.setup_optimizer_and_scheduler()
 
-        # Create dataloader
+        # Data
         dataloader, sampler = self.create_dataloader(meta_folder, batch_size)
+        val_dataloader = None
+        if val_meta_folder:
+            val_dataloader, _ = self.create_dataloader(val_meta_folder, batch_size)
 
-        # Initialize output directory and logging
+        steps_per_epoch = len(dataloader)
+        total_steps = num_epochs * steps_per_epoch
+        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=total_steps, eta_min=1e-6
+        )
+        print0(f"[INFO] Scheduler set for {total_steps} steps")
+
+        # Resume
+        global_step = 0
+        start_epoch = 0
+        if resume_checkpoint:
+            global_step = self.load_checkpoint(resume_checkpoint)
+            start_epoch = global_step // max(steps_per_epoch, 1)
+
+        # Logging
         if is_main_process():
             os.makedirs(output_dir, exist_ok=True)
             wandb.init(
-                project="wan-i2v-lora",
+                project="wan-i2v-diffusers-lora",
                 config={
                     "model_id": self.model_id,
-                    "lora_rank": self.lora_rank,
-                    "lora_alpha": self.lora_alpha,
                     "learning_rate": self.learning_rate,
                     "num_epochs": num_epochs,
                     "batch_size": batch_size,
-                    "num_frames": self.num_frames,
-                    "height": self.height,
-                    "width": self.width,
+                    "total_batch_size": batch_size * self.world_size,
+                    "boundary_ratio": self.boundary_ratio,
+                    "approach": "diffusers_native_wan_lora_fsdp_hybrid",
                 },
+                resume=resume_checkpoint is not None,
             )
+        if dist.is_initialized():
+            dist.barrier()
 
-        global_step = 0
-
-        # Training loop
-        for epoch in range(num_epochs):
+        # Train
+        for epoch in range(start_epoch, num_epochs):
             sampler.set_epoch(epoch)
-
-            if is_main_process():
-                pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}")
-            else:
-                pbar = dataloader
+            pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}", disable=not is_main_process())
 
             epoch_loss = 0.0
+            num_steps = 0
 
-            for step, batch in enumerate(pbar):
-                self.optimizer.zero_grad()
-
+            for _, batch in enumerate(pbar):
                 try:
-                    # Training step
+                    self.optimizer.zero_grad(set_to_none=True)
                     loss = self.training_step(batch)
                     loss.backward()
 
-                    # Manual gradient synchronization for LoRA parameters (outside FSDP)
-                    if dist.is_initialized():
-                        for param in self.lora_params:
-                            if param.grad is not None:
-                                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-                                param.grad /= self.world_size
+                    # sync LoRA grads
+                    self._allreduce_lora_grads()
 
-                    # Gradient clipping on LoRA parameters
-                    torch.nn.utils.clip_grad_norm_(self.lora_params, max_norm=1.0)
+                    # clip
+                    grads = [p for name in self.transformer_names for p in self.model_map[name]["lora_params"] if p.grad is not None]
+                    grad_norm = 0.0
+                    if grads:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(grads, max_norm=1.0)
+                        grad_norm = float(grad_norm) if torch.is_tensor(grad_norm) else grad_norm
 
                     self.optimizer.step()
                     self.lr_scheduler.step()
 
                     epoch_loss += loss.item()
+                    num_steps += 1
                     global_step += 1
 
-                    # Logging
-                    if global_step % log_every == 0 and is_main_process():
-                        avg_loss = epoch_loss / (step + 1)
-                        current_lr = self.optimizer.param_groups[0]["lr"]
-
-                        print0(f"Step {global_step}: Loss={avg_loss:.6f}, LR={current_lr:.2e}")
-
+                    if is_main_process() and global_step % log_every == 0:
+                        avg_loss = epoch_loss / num_steps
                         wandb.log(
-                            {"loss": avg_loss, "learning_rate": current_lr, "epoch": epoch, "global_step": global_step}
+                            {
+                                "train/loss": loss.item(),
+                                "train/avg_loss": avg_loss,
+                                "train/lr": self.optimizer.param_groups[0]["lr"],
+                                "train/grad_norm": grad_norm,
+                                "train/epoch": epoch,
+                                "train/step": global_step,
+                            },
+                            step=global_step,
                         )
+                        pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{avg_loss:.4f}", gn=f"{grad_norm:.2f}")
 
-                    # Save checkpoint
-                    if global_step % save_every == 0:
+                    if validate_every > 0 and (global_step % validate_every == 0) and val_dataloader:
+                        val_loss = self.validate(val_dataloader)
+                        if is_main_process():
+                            print0(f"[INFO] step {global_step}: val_loss={val_loss:.6f}")
+                            wandb.log({"val/loss": val_loss}, step=global_step)
+
+                    if global_step % save_every == 0 and is_main_process():
                         self.save_checkpoint(output_dir, global_step)
 
-                except Exception as e:
-                    print0(f"[ERROR] Training step failed: {e}")
-                    print0("[ERROR] Stopping training due to critical error")
-                    import traceback
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        print0("[WARN] OOM; clearing cache & continuing.")
+                        self.optimizer.zero_grad(set_to_none=True)
+                        torch.cuda.empty_cache()
+                        torch.cuda.reset_peak_memory_stats()
+                        continue
+                    raise
 
-                    traceback.print_exc()
-                    if is_main_process():
-                        wandb.finish()
-                    return  # Stop training completely
-
-            print0(f"[INFO] Epoch {epoch + 1} completed, avg loss: {epoch_loss / (step + 1):.6f}")
+            if is_main_process():
+                wandb.log({"epoch/avg_loss": epoch_loss / max(num_steps, 1), "epoch/num": epoch + 1}, step=global_step)
 
         # Final save
         if is_main_process():
             self.save_checkpoint(output_dir, global_step)
+            final_dir = os.path.join(output_dir, "final")
+            os.makedirs(final_dir, exist_ok=True)
+            try:
+                self._swap_fsdp_for_io(use_base=True)
+                self.pipe.save_lora_weights(final_dir)
+                print0(f"[INFO] Saved final LoRA weights to {final_dir}")
+            finally:
+                self._swap_fsdp_for_io(use_base=False)
             wandb.finish()
-            print0("[INFO] Training completed successfully")
+
+        print0("[INFO] Training complete.")
 
 
 def main():
-    """Main function."""
-    trainer = WanI2VLoRATrainer(
-        model_id="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-        lora_rank=16,
-        lora_alpha=32,
-        learning_rate=1e-4,
-        num_frames=81,
-        height=480,
-        width=832,
+    import argparse
+    parser = argparse.ArgumentParser(description="WAN 2.2 I2V Diffusers-native LoRA Training")
+
+    # Model
+    parser.add_argument("--model_id", type=str, default="Wan-AI/Wan2.2-I2V-A14B-Diffusers")
+    parser.add_argument("--lora_rank", type=int, default=16)   # kept for CLI parity; WAN ignores
+    parser.add_argument("--lora_alpha", type=int, default=32)  # kept for CLI parity; WAN ignores
+    parser.add_argument("--boundary_ratio", type=float, default=0.5)
+
+    # Train
+    parser.add_argument("--meta_folder", type=str, required=True)
+    parser.add_argument("--val_meta_folder", type=str, default=None)
+    parser.add_argument("--num_epochs", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
+
+    # Video (kept for completeness; your dataloader should honor these)
+    parser.add_argument("--num_frames", type=int, default=81)
+    parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--width", type=int, default=832)
+
+    # IO
+    parser.add_argument("--output_dir", type=str, default="./wan_i2v_outputs")
+    parser.add_argument("--save_every", type=int, default=500)
+    parser.add_argument("--log_every", type=int, default=50)
+    parser.add_argument("--validate_every", type=int, default=500)
+    parser.add_argument("--resume_checkpoint", type=str, default=None)
+
+    parser.add_argument("--debug", action="store_true")
+
+    args = parser.parse_args()
+
+    trainer = WanI2VDiffusersLoRATrainer(
+        model_id=args.model_id,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        learning_rate=args.learning_rate,
+        num_frames=args.num_frames,
+        height=args.height,
+        width=args.width,
+        boundary_ratio=args.boundary_ratio,
+        debug=args.debug,
     )
 
     trainer.train(
-        meta_folder="/linnanw/hdvilla_sample/processed_meta",
-        num_epochs=5,
-        batch_size=1,
-        save_every=500,
-        log_every=50,
-        output_dir="./wan_i2v_lora_outputs",
+        meta_folder=args.meta_folder,
+        val_meta_folder=args.val_meta_folder,
+        num_epochs=args.num_epochs,
+        batch_size=args.batch_size,
+        save_every=args.save_every,
+        log_every=args.log_every,
+        validate_every=args.validate_every,
+        output_dir=args.output_dir,
+        resume_checkpoint=args.resume_checkpoint,
     )
 
 
 if __name__ == "__main__":
     main()
-
-# Run with: torchrun --nproc-per-node=8 wan22_i2v_lora_training.py
