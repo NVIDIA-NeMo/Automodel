@@ -121,6 +121,41 @@ def _parallelize_gemma3(
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
 
+def _parallelize_decilm(
+    model,
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    """Parallelizes a DeciLMForCausalLM model across data and tensor parallel dimensions."""
+
+    # This is not complete, for nas arch, we should generate the tp plan based on the per block config.
+    base_model_tp_plan: dict[str, ParallelStyle] = {
+        "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
+        "model.layers.*.self_attn.q_proj": ColwiseParallel(use_local_output=False),
+        "model.layers.*.self_attn.k_proj": ColwiseParallel(use_local_output=False),
+        "model.layers.*.self_attn.v_proj": ColwiseParallel(use_local_output=False),
+        "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
+        "model.layers.*.mlp.up_proj": ColwiseParallel(),
+        "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+        "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
+        "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+    }
+
+    base_model_sp_plan = {
+        "model.embed_tokens": RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1)),
+        "model.norm": SequenceParallel(),
+        "model.layers.*.input_layernorm": SequenceParallel(),
+        "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
+        "model.layers.*.post_attention_layernorm": SequenceParallel(),
+        "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
+        "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False),
+    }
+
+    if sequence_parallel:
+        # Enable sequence parallelism only if TP size > 1
+        base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
+
+    return cast(dict[str, ParallelStyle], base_model_tp_plan)
+
 def _parallelize_llama(
     model: LlamaForCausalLM,
     sequence_parallel: bool = False,
@@ -228,4 +263,8 @@ PARALLELIZE_FUNCTIONS: Dict[type, Callable[..., Dict[str, ParallelStyle]]] = {
     Gemma3ForCausalLM: _parallelize_gemma3,
     # The larger gemma models use Gemma3ForConditionalGeneration, which are for text-image input
     Gemma3ForConditionalGeneration: _parallelize_gemma3,
+}
+
+PARALLELIZE_FUNCTIONS_FOR_MODEL_ARCH: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
+    "DeciLMForCausalLM": _parallelize_decilm,
 }
