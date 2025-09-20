@@ -718,6 +718,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
         autopipeline_cfg = self.cfg.get("autopipeline", None)
         if self.pp_enabled:
+            pp_batch_size = self.cfg.step_scheduler.local_batch_size
+            assert pp_batch_size // self.cfg.autopipeline.pp_microbatch_size >= self.model_wrapper.pp_size, (
+                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {self.cfg.autopipeline.pp_microbatch_size} must be greater than or equal to pp_size {self.model_wrapper.pp_size}"
+            )
             assert autopipeline_cfg is not None, (
                 "AutoPipeline configuration is required when pipeline parallelism is enabled"
             )
@@ -741,7 +745,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 ep_shard_axis_names=(
                     ("ep_shard",) if self.moe_mesh is not None and "ep_shard" in self.moe_mesh.mesh_dim_names else None
                 ),
-                pp_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+                pp_batch_size=pp_batch_size,
                 device=torch.cuda.current_device(),
             )
             assert isinstance(autopipeline, AutoPipeline), (
