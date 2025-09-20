@@ -14,6 +14,8 @@ from torch.nn.attention.flex_attention import (
 FLEX_ATTN_MASK_T = tuple[str, int | None]
 
 
+# Adapted from https://github.com/pytorch/torchtitan/pull/1559
+# Reference: https://github.com/KhoomeiK/torchtitan/blob/d0a54fb7de5382a5683205b4826543bd4c227b08/torchtitan/models/attention.py
 class FlexAttention(torch.nn.Module):
     """FlexAttention module that uses torch.nn.attention.flex_attention.
 
@@ -35,8 +37,6 @@ class FlexAttention(torch.nn.Module):
     # We registered flex_attention related attributes as class variables as we
     # need to amortize the cost of compilation.
     flex_attn: ClassVar[Callable] = torch.compile(flex_attention, mode="max-autotune-no-cudagraphs")
-    compiled_create_block_mask: ClassVar[Callable] = torch.compile(create_block_mask)
-    used_attn_mask_types: ClassVar[set[FLEX_ATTN_MASK_T]] = set()
     # Attention mask type to the created BlockMask.
     # This allows us to keep track the created block masks for each
     # new batch. We will use this to update the block mask when a
@@ -68,14 +68,14 @@ class FlexAttention(torch.nn.Module):
                 mask_mod = FlexAttention._get_sliding_window_mask_mod(sliding_window)
             else:
                 mask_mod = FlexAttention._get_causal_mask_mod()
-            block_mask = FlexAttention.compiled_create_block_mask(
+            block_mask = create_block_mask(
                 mask_mod,
                 B,
                 H_q,
                 S_q,
                 S_kv,
-                _compile=False,
-                device=q.device,  # NOTE: set _compile=False if sampling for debugging
+                _compile=False,  # NOTE: _compile=True leads to hangs during sampling, so setting it to False for now
+                device=q.device,
             )
             FlexAttention.block_masks[mask_key] = block_mask
 
@@ -155,32 +155,3 @@ class FlexAttention(torch.nn.Module):
         blocked_mask_mod.__name__ = f"blocked_mask_mod_{mask_mod.__name__}_fixed_block_size_{fixed_block_size}"
 
         return blocked_mask_mod
-
-    # @staticmethod
-    # @torch.no_grad()
-    # def init_attention_mask(batch: torch.Tensor, eos_id: int | None) -> None:
-    #     # batch is [b, s, h, d] shape
-    #     for mask_key in FlexAttention.used_attn_mask_types:
-    #         attn_mask_type, fixed_block_size = mask_key
-    #         match attn_mask_type:
-    #             case "causal":
-    #                 if FlexAttention.block_masks.get(mask_key, None) is not None:
-    #                     continue
-    #                 # We don't care about batch dimension --
-    #                 # all samples have the same lower triangle mask.
-    #                 batch_dimension = 1
-    #                 mask_mod = FlexAttention._get_causal_mask_mod()
-    #             case "block_causal":
-    #                 if eos_id is None:
-    #                     raise RuntimeError("eos_id must be provided for block_causal mask.")
-    #                 batch_dimension = batch.shape[0]
-    #                 mask_mod = FlexAttention._get_block_causal_mask_mod(batch, eos_id)
-    #             case _:
-    #                 raise RuntimeError(f"Shouldn't reach here. {attn_mask_type}")
-
-    #         if fixed_block_size is not None and fixed_block_size > 0:
-    #             mask_mod = FlexAttention._fixed_block_mask_mod(mask_mod, fixed_block_size)
-
-    #         seq_len = batch.shape[1]
-    #         block_mask = FlexAttention.compiled_create_block_mask(mask_mod, batch_dimension, None, seq_len, seq_len)
-    #         FlexAttention.block_masks[mask_key] = block_mask

@@ -250,17 +250,14 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
         return tmp, wgrad, None
 
 
-def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False):
+def weighted_bias_swiglu_impl(input, weights, fp8_input_store=False):
     """
     Token-wise-weighted bias swiglu fusion.
     """
     ori_shape = input.shape
     assert len(ori_shape) in [2, 3]
     input = input.view(-1, ori_shape[-1])
-    if bias is not None:
-        raise NotImplementedError("Bias is not supported for weighted swiglu fusion")
-    else:
-        output = WeightedSwiGLUFunction.apply(input, weights, fp8_input_store)
+    output = WeightedSwiGLUFunction.apply(input, weights, fp8_input_store)
 
     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 
@@ -447,7 +444,7 @@ def weighted_bias_quick_geglu_impl(
         output: [num_selected_experts * seq_len, hidden_size]
     """
     ori_shape = input.shape
-    assert len(ori_shape) in [2, 3]
+    assert len(ori_shape) in [2, 3], f"Input shape must be of length 2 or 3, but got {ori_shape=}"
     if clamp_value is not None:
         x_glu, x_linear = input.chunk(2, -1)
         input = torch.cat(

@@ -18,9 +18,9 @@ import torch
 import torch.nn as nn
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
-from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention
+from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention, RotaryEmbedding
+from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSStateDictAdapter
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
-from nemo_automodel.components.moe.rope_utils import freqs_cis_from_position_ids, precompute_freqs_cis
 from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 
 
@@ -104,18 +104,24 @@ class GptOssModel(nn.Module):
             self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, backend)
         self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
 
-        # RoPE precompute using shared utils (like DeepSeek-V3)
+        # Rotary embedding cached at model-level (inv_freq + concentration via YaRN/NTK-by-parts)
         self.max_seq_len = config.max_position_embeddings
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.register_buffer(
-            "freqs_cis",
-            precompute_freqs_cis(
-                self.head_dim,
-                self.max_seq_len,
-                getattr(config, "rope_theta", 10000.0),
-                getattr(config, "rope_scaling", None),
-            ),
-            persistent=False,
+        rope_scaling = getattr(config, "rope_scaling", None) or {
+            "factor": 1.0,
+            "beta_fast": 32.0,
+            "beta_slow": 1.0,
+            "original_max_position_embeddings": self.max_seq_len,
+        }
+        self.rotary_emb = RotaryEmbedding(
+            head_dim=self.head_dim,
+            base=getattr(config, "rope_theta", 10000.0),
+            dtype=torch.float32,
+            initial_context_length=rope_scaling["original_max_position_embeddings"],
+            scaling_factor=rope_scaling["factor"],
+            ntk_alpha=rope_scaling["beta_slow"],
+            ntk_beta=rope_scaling["beta_fast"],
+            device=torch.device(f"cuda:{torch.cuda.current_device()}"),
         )
 
     def forward(
@@ -132,8 +138,15 @@ class GptOssModel(nn.Module):
                 torch.arange(0, input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand(input_ids.shape[0], -1)
             )
 
+        # Compute cos/sin from RotaryEmbedding inv_freq and current position_ids; then concat [cos, sin]
         with torch.no_grad():
-            freqs_cis = freqs_cis_from_position_ids(position_ids, self.freqs_cis)
+            concentration, inv_freq = self.rotary_emb._compute_concentration_and_inv_freq()
+            inv_freq = inv_freq.to(device=position_ids.device, dtype=torch.float32)
+            # angles: (B, T, D/2)
+            angles = torch.einsum("bt,d->btd", position_ids.to(dtype=torch.float32), inv_freq)
+            cos = torch.cos(angles) * concentration
+            sin = torch.sin(angles) * concentration
+            freqs_cis = torch.cat([cos, sin], dim=-1)  # (B, T, D)
 
         h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
 
@@ -157,13 +170,8 @@ class GptOssModel(nn.Module):
                 nn.init.normal_(self.embed_tokens.weight)
             if self.norm is not None:
                 self.norm.reset_parameters()
-            # refresh rope cache to target device
-            self.freqs_cis = precompute_freqs_cis(
-                self.head_dim,
-                self.max_seq_len,
-                self.config.rope_theta,
-                self.config.rope_scaling,
-            ).to(buffer_device)
+            # Ensure rotary embedding uses correct device
+            self.rotary_emb.device = buffer_device
 
         for layer in self.layers.values():
             if layer is not None:
@@ -196,6 +204,10 @@ class GptOssForCausalLM(nn.Module):
         self.backend = backend or BackendConfig()
         self.model = GptOssModel(config, backend=self.backend, moe_config=moe_config)
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
+        if self.backend.enable_hf_state_dict_adapter:
+            self.state_dict_adapter = GPTOSSStateDictAdapter(
+                self.config, self.model.moe_config, self.backend, dtype=torch.bfloat16
+            )
 
     def forward(
         self,
@@ -236,10 +248,5 @@ class GptOssForCausalLM(nn.Module):
 
         self.to(dtype)
         with buffer_device:
-            self.model.freqs_cis = precompute_freqs_cis(
-                self.config.head_dim,
-                self.model.max_seq_len,
-                self.config.rope_theta,
-                self.config.rope_scaling,
-            )
-            self.model.freqs_cis = self.model.freqs_cis.to(buffer_device)
+            # Ensure rotary embedding uses correct device after dtype move
+            self.model.rotary_emb.device = buffer_device

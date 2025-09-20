@@ -35,7 +35,6 @@ except ImportError:
 
 from nemo_automodel.components.moe.megatron.moe_utils import (
     MoEAuxLossAutoScaler,
-    weighted_bias_quick_geglu_impl,
     weighted_bias_swiglu_impl,
 )
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEConfig as MegatronMoEConfig
@@ -113,6 +112,47 @@ class MLP(nn.Module):
         self.apply(init_weights_fn)
 
 
+@torch.compile
+def swiglu(x, *, gate_and_up_proj, down_proj, gate_up_proj_bias=None, down_proj_bias=None):
+    gate_and_up_out = x @ gate_and_up_proj
+    if gate_up_proj_bias is not None:
+        gate_and_up_out = gate_and_up_out + gate_up_proj_bias
+    gate_out, up_out = torch.chunk(gate_and_up_out, 2, -1)
+    inter = F.silu(gate_out) * up_out
+
+    inter = inter @ down_proj
+    if down_proj_bias is not None:
+        inter = inter + down_proj_bias
+    return inter
+
+
+@torch.compile
+def quick_geglu(
+    x,
+    *,
+    gate_and_up_proj,
+    down_proj,
+    gate_up_proj_bias=None,
+    down_proj_bias=None,
+    alpha: float = 1.702,
+    limit: float | None = 7.0,
+):
+    gate_and_up_out = x @ gate_and_up_proj
+    if gate_up_proj_bias is not None:
+        gate_and_up_out = gate_and_up_out + gate_up_proj_bias
+    gate_out, up_out = gate_and_up_out[:, ::2], gate_and_up_out[:, 1::2]
+    # Clamp the input values
+    gate_out = gate_out.clamp(min=None, max=limit)
+    up_out = up_out.clamp(min=-limit, max=limit)
+    out_glu = gate_out * torch.sigmoid(alpha * gate_out)
+    # Note we add an extra bias of 1 to the linear layer
+    inter = out_glu * (up_out + 1)
+    inter = inter @ down_proj
+    if down_proj_bias is not None:
+        inter = inter + down_proj_bias
+    return inter
+
+
 def get_expert_activation(config: MoEConfig):
     if config.expert_activation == "swiglu":
         return swiglu
@@ -147,14 +187,17 @@ class GroupedExperts(nn.Module):
         super().__init__()
         self.n_routed_experts = config.n_routed_experts
         self.expert_bias = config.expert_bias
-        self.gate_projs = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim, config.dim))
-        self.up_projs = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim, config.dim))
-        self.down_projs = nn.Parameter(torch.empty(config.n_routed_experts, config.dim, config.moe_inter_dim))
+        self.gate_and_up_projs = nn.Parameter(
+            torch.empty(config.n_routed_experts, config.dim, config.moe_inter_dim * 2)
+        )
+        self.down_projs = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim, config.dim))
 
         if self.expert_bias:
-            self.gate_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim))
-            self.up_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim))
-            self.down_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.dim))
+            self.gate_up_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim * 2))
+            self.down_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.dim))
+        else:
+            self.gate_up_proj_bias = None
+            self.down_proj_bias = None
 
         self.expert_activation = get_expert_activation(config)
 
@@ -183,8 +226,8 @@ class GroupedExperts(nn.Module):
         """
         assert not isinstance(x, DTensor)
 
-        if isinstance(self.gate_projs, DTensor):
-            ep_mesh = self.gate_projs.device_mesh
+        if isinstance(self.gate_and_up_projs, DTensor):
+            ep_mesh = self.gate_and_up_projs.device_mesh
             assert ep_mesh is not None
             assert ep_mesh.ndim == 1, "We only support 1D mesh for MoE"
             ep_size = ep_mesh.size()
@@ -225,13 +268,11 @@ class GroupedExperts(nn.Module):
                 continue
             active_local_experts += 1
 
-            gate_proj = get_local_proj(self.gate_projs, i)
+            gate_and_up_proj = get_local_proj(self.gate_and_up_projs, i)
             down_proj = get_local_proj(self.down_projs, i)
-            up_proj = get_local_proj(self.up_projs, i)
 
-            gate_bias = get_local_proj(self.gate_bias, i) if self.expert_bias else None
-            up_bias = get_local_proj(self.up_bias, i) if self.expert_bias else None
-            down_bias = get_local_proj(self.down_bias, i) if self.expert_bias else None
+            gate_up_proj_bias = get_local_proj(self.gate_up_proj_bias, i) if self.expert_bias else None
+            down_proj_bias = get_local_proj(self.down_proj_bias, i) if self.expert_bias else None
 
             idx_b = idx[:, None].expand(-1, x.size(1))
             x_idx = x.gather(dim=0, index=idx_b)
@@ -239,12 +280,10 @@ class GroupedExperts(nn.Module):
             expert_out = (
                 self.expert_activation(
                     x_idx,
-                    gate_proj=gate_proj,
+                    gate_and_up_proj=gate_and_up_proj,
                     down_proj=down_proj,
-                    up_proj=up_proj,
-                    gate_bias=gate_bias,
-                    up_bias=up_bias,
-                    down_bias=down_bias,
+                    gate_up_proj_bias=gate_up_proj_bias,
+                    down_proj_bias=down_proj_bias,
                 )
                 * weights[idx, top, None]
             )
@@ -253,25 +292,21 @@ class GroupedExperts(nn.Module):
 
         if active_local_experts == 0:
             # We need to handle the case where no token selects the experts on this device.
-            gate_proj = get_local_proj(self.gate_projs, experts_start_idx)
+            gate_and_up_proj = get_local_proj(self.gate_and_up_projs, experts_start_idx)
             down_proj = get_local_proj(self.down_projs, experts_start_idx)
-            up_proj = get_local_proj(self.up_projs, experts_start_idx)
-            gate_bias = get_local_proj(self.gate_bias, experts_start_idx) if self.expert_bias else None
-            up_bias = get_local_proj(self.up_bias, experts_start_idx) if self.expert_bias else None
-            down_bias = get_local_proj(self.down_bias, experts_start_idx) if self.expert_bias else None
+            gate_up_proj_bias = get_local_proj(self.gate_up_proj_bias, experts_start_idx) if self.expert_bias else None
+            down_proj_bias = get_local_proj(self.down_proj_bias, experts_start_idx) if self.expert_bias else None
             expert_out = (
                 self.expert_activation(
-                    torch.zeros_like(x[0]),
-                    gate_proj=gate_proj,
+                    torch.zeros_like(x[0]).unsqueeze(0),
+                    gate_and_up_proj=gate_and_up_proj,
                     down_proj=down_proj,
-                    up_proj=up_proj,
-                    gate_bias=gate_bias,
-                    up_bias=up_bias,
-                    down_bias=down_bias,
+                    gate_up_proj_bias=gate_up_proj_bias,
+                    down_proj_bias=down_proj_bias,
                 )
                 * weights[0, 0, None]
             )
-            y[0] += expert_out
+            y[0] += expert_out[0]
 
         if ep_size > 1:
             y = DTensor.from_local(y, device_mesh=ep_mesh, placements=[Partial()])
@@ -283,15 +318,33 @@ class GroupedExperts(nn.Module):
         self.apply(partial(_init_weights, buffer_device=buffer_device, init_std=init_std))
 
 
+@torch.compile
+def quick_geglu_deepep(
+    x,
+    permuted_probs,
+    alpha: float = 1.702,
+    limit: float = 7.0,
+    linear_offset: float = 1.0,
+):
+    gate_out, up_out = x[..., ::2], x[..., 1::2]
+    # Clamp the input values
+    gate_out = gate_out.clamp(min=None, max=limit)
+    up_out = up_out.clamp(min=-limit, max=limit)
+    out_glu = gate_out * torch.sigmoid(alpha * gate_out)
+    # Note we add an extra bias of 1 to the linear layer
+    inter = out_glu * (up_out + linear_offset)
+    return (inter * permuted_probs).to(x.dtype)
+
+
 def get_expert_activation_for_deepep(config: MoEConfig):
     if config.expert_activation == "swiglu":
         return weighted_bias_swiglu_impl
     elif config.expert_activation == "quick_geglu":
         return partial(
-            weighted_bias_quick_geglu_impl,
-            clamp_value=config.activation_limit,
-            linear_offset=1.0,
+            quick_geglu_deepep,
+            limit=config.activation_limit,
             alpha=config.activation_alpha,
+            linear_offset=1.0,
         )
     else:
         raise ValueError(f"Invalid expert activation: {config.expert_activation}")
@@ -312,23 +365,35 @@ class GroupedExpertsDeepEP(nn.Module):
     """
 
     @staticmethod
-    def _apply_bias(value, bias, tokens_per_expert):
+    def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
         if bias is None:
             return value
         shape = value.shape
-        return (
-            torch.cat(
-                [
-                    t + b
-                    for t, b in zip(
-                        torch.split(value.view(-1, shape[-1]), tokens_per_expert.tolist()),
-                        bias,
-                    )
-                ]
+        if permuted_probs is not None:
+            output = (
+                torch.cat(
+                    [
+                        t + b * p
+                        for t, b, p in zip(
+                            torch.split(value.view(-1, shape[-1]), tokens_per_expert.tolist()),
+                            bias,
+                            torch.split(permuted_probs, tokens_per_expert.tolist()),
+                        )
+                    ]
+                )
+                .view(shape)
+                .to(value.dtype)
             )
-            .view(shape)
-            .to(value.dtype)
-        )
+        else:
+            output = (
+                torch.cat(
+                    [t + b for t, b in zip(torch.split(value.view(-1, shape[-1]), tokens_per_expert.tolist()), bias)]
+                )
+                .view(shape)
+                .to(value.dtype)
+            )
+
+        return output
 
     def __init__(self, config: MoEConfig):
         """
@@ -348,8 +413,11 @@ class GroupedExpertsDeepEP(nn.Module):
         self.down_projs = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim, config.dim))
 
         if self.expert_bias:
-            self.gate_and_up_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim * 2))
-            self.down_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.dim))
+            self.gate_up_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim * 2))
+            self.down_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.dim))
+        else:
+            self.gate_up_proj_bias = None
+            self.down_proj_bias = None
 
         self.expert_activation = get_expert_activation_for_deepep(config)
 
@@ -426,35 +494,22 @@ class GroupedExpertsDeepEP(nn.Module):
                 trans_b=False,
             )
 
-            # Apply bias using the new broadcast method
             if self.expert_bias:
-                gate_and_up_bias = self.gate_and_up_bias.to_local()
+                gate_and_up_bias = self.gate_up_proj_bias.to_local()
                 output1 = self._apply_bias(output1, gate_and_up_bias, tokens_per_expert)
             else:
                 gate_and_up_bias = None
 
-            output1_ = self.expert_activation(output1, None, permuted_probs)
-            output2 = ops.gmm(output1_, self.down_projs.to_local(), tokens_per_expert, trans_b=False)
+            output1 = self.expert_activation(output1, permuted_probs)
+            output2 = ops.gmm(output1, self.down_projs.to_local(), tokens_per_expert, trans_b=False)
 
-            # Apply bias for down projection using the new broadcast method
             if self.expert_bias:
-                down_bias = self.down_bias.to_local()
-                output2 = self._apply_bias(output2, down_bias, tokens_per_expert)
+                down_bias = self.down_proj_bias.to_local()
+                output2 = self._apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
         else:
             output1 = torch.matmul(x[0] * 0, self.gate_and_up_projs.to_local()[0])
-
-            # Add bias if enabled
-            if self.expert_bias:
-                bias = self.gate_and_up_bias.to_local()[0]
-            else:
-                bias = None
-
-            output1_ = self.expert_activation(output1, bias, permuted_probs)
-            output2 = torch.matmul(output1_, self.down_projs.to_local()[0])
-
-            # Add bias for down projection if enabled
-            if self.expert_bias:
-                output2 = output2 + self.down_bias.to_local()[0]
+            output1 = self.expert_activation(output1, permuted_probs)
+            output2 = torch.matmul(output1, self.down_projs.to_local()[0])
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
@@ -554,7 +609,12 @@ class Gate(nn.Module):
             self.bias = nn.Parameter(torch.empty(config.n_routed_experts), requires_grad=self.train_gate)
         else:
             self.bias = None
-        self.e_score_correction_bias = nn.Parameter(torch.empty(config.n_routed_experts), requires_grad=False)
+
+        if self.bias_update_factor > 0:
+            self.e_score_correction_bias = nn.Parameter(torch.empty(config.n_routed_experts), requires_grad=False)
+        else:
+            self.e_score_correction_bias = None
+
         self.e_score_correction_bias_master = None
 
         # Cumulative expert load is a tensor representing the number of tokens
@@ -581,39 +641,42 @@ class Gate(nn.Module):
             indices (torch.Tensor): Indices of the selected experts.
             aux_loss (Optional[torch.Tensor]): Auxiliary loss for load balancing.
         """
-        scores = F.linear(x, self.weight)
+        scores = F.linear(x, self.weight, bias=self.bias)
 
         if self.score_func == "softmax":
-            scores = scores.softmax(dim=-1, dtype=torch.float32)
+            values, indices = torch.topk(scores, k=self.topk, dim=-1)
+            weights = torch.nn.functional.softmax(values, dim=1)
+            original_scores = scores
         else:
             scores = scores.sigmoid()
-        original_scores = scores
+            original_scores = scores
 
-        # Add correction bias to balance tokens across gates.
-        if self.e_score_correction_bias is not None:
-            scores = scores + self.e_score_correction_bias
+            # Add correction bias to balance tokens across gates.
+            if self.e_score_correction_bias is not None:
+                scores = scores + self.e_score_correction_bias
 
-        if self.n_groups > 1:
-            scores = scores.view(x.size(0), self.n_groups, -1)
-            if self.e_score_correction_bias is None:
-                group_scores = scores.amax(dim=-1)
-            else:
-                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
+            if self.n_groups > 1:
+                scores = scores.view(x.size(0), self.n_groups, -1)
+                if self.e_score_correction_bias is None:
+                    group_scores = scores.amax(dim=-1)
+                else:
+                    group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
 
-            indices = group_scores.topk(self.topk_groups, dim=-1)[1]
-            mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
-            scores = (scores * mask.unsqueeze(-1)).flatten(1)
+                indices = group_scores.topk(self.topk_groups, dim=-1)[1]
+                mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
+                scores = (scores * mask.unsqueeze(-1)).flatten(1)
 
-        indices = torch.topk(scores, self.topk, dim=-1)[1]
-        weights = original_scores.gather(1, indices)
+            indices = torch.topk(scores, self.topk, dim=-1)[1]
+            weights = original_scores.gather(1, indices)
 
-        if self.score_func == "sigmoid" and self.norm_topk_prob and self.topk > 1:
-            # Use out-of-place division to keep autograd versions intact.
-            denom_w = weights.sum(dim=-1, keepdim=True) + 1e-20
-            denom_s = original_scores.sum(dim=-1, keepdim=True) + 1e-20
-            weights = weights / denom_w
-            original_scores = original_scores / denom_s
-        weights *= self.route_scale
+            if self.score_func == "sigmoid" and self.norm_topk_prob and self.topk > 1:
+                # Use out-of-place division to keep autograd versions intact.
+                denom_w = weights.sum(dim=-1, keepdim=True) + 1e-20
+                denom_s = original_scores.sum(dim=-1, keepdim=True) + 1e-20
+                weights = weights / denom_w
+                original_scores = original_scores / denom_s
+
+        weights = weights * self.route_scale
 
         if self.bias_update_factor > 0 or self.aux_loss_coeff > 0:
             expert_load = self._compute_expert_load(indices, token_mask)
@@ -770,38 +833,6 @@ class Gate(nn.Module):
         self.apply(partial(_init_weights, buffer_device=buffer_device, init_std=init_std))
 
 
-@torch.compile
-def swiglu(x, *, gate_proj, down_proj, up_proj, gate_bias=None, up_bias=None, down_bias=None):
-    gate_out = F.linear(x, gate_proj, gate_bias)
-    up_out = F.linear(x, up_proj, up_bias)
-    inter = F.silu(gate_out) * up_out
-    return F.linear(inter, down_proj, down_bias)
-
-
-@torch.compile
-def quick_geglu(
-    x,
-    *,
-    gate_proj,
-    down_proj,
-    up_proj,
-    gate_bias=None,
-    up_bias=None,
-    down_bias=None,
-    alpha: float = 1.702,
-    limit: float | None = 7.0,
-):
-    gate_out = F.linear(x, gate_proj, gate_bias)
-    up_out = F.linear(x, up_proj, up_bias)
-    # Clamp the input values
-    gate_out = gate_out.clamp(min=None, max=limit)
-    up_out = up_out.clamp(min=-limit, max=limit)
-    out_glu = gate_out * torch.sigmoid(alpha * gate_out)
-    # Note we add an extra bias of 1 to the linear layer
-    inter = out_glu * (up_out + 1)
-    return F.linear(inter, down_proj, down_bias)
-
-
 class MoE(nn.Module):
     """
     Mixture-of-Experts (MoE) module.
@@ -908,23 +939,16 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
     with torch.device(buffer_device):
         if isinstance(module, Gate):
             to_local(module.weight).normal_(mean=0.0, std=init_std)
-            to_local(module.e_score_correction_bias).zero_()
+            if module.e_score_correction_bias is not None:
+                to_local(module.e_score_correction_bias).zero_()
             if module.bias is not None:
                 to_local(module.bias).zero_()
-        elif isinstance(module, GroupedExperts):
-            to_local(module.gate_projs).normal_(mean=0.0, std=init_std)
-            to_local(module.up_projs).normal_(mean=0.0, std=init_std)
-            to_local(module.down_projs).normal_(mean=0.0, std=init_std)
-            if module.expert_bias:
-                to_local(module.gate_bias).zero_()
-                to_local(module.up_bias).zero_()
-                to_local(module.down_bias).zero_()
-        elif isinstance(module, GroupedExpertsDeepEP):
+        elif isinstance(module, (GroupedExperts, GroupedExpertsDeepEP)):
             to_local(module.gate_and_up_projs).normal_(mean=0.0, std=init_std)
             to_local(module.down_projs).normal_(mean=0.0, std=init_std)
             if module.expert_bias:
-                to_local(module.gate_and_up_bias).zero_()
-                to_local(module.down_bias).zero_()
+                to_local(module.gate_up_proj_bias).zero_()
+                to_local(module.down_proj_bias).zero_()
         elif isinstance(module, MLP):
             to_local(module.gate_proj.weight).normal_(mean=0.0, std=init_std)
             to_local(module.down_proj.weight).normal_(mean=0.0, std=init_std)
