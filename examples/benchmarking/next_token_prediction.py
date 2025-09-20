@@ -18,6 +18,10 @@ import torch
 import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoConfig
+from transformers import AutoTokenizer
+from torch.utils.data import DataLoader
+from itertools import cycle
+from nemo_automodel.components.datasets.llm.hellaswag import HellaSwag
 
 from nemo_automodel.components.checkpoint.checkpointing import to_empty_parameters_only
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -111,6 +115,12 @@ def run_benchmark(cfg):
         if cfg.model.num_layers is not None:
             config.num_hidden_layers = cfg.model.num_layers
 
+        # Build tokenizer and dataset (HellaSwag)
+        tokenizer = AutoTokenizer.from_pretrained(
+            cfg.model.pretrained_model_name_or_path,
+            trust_remote_code=cfg.model.get("trust_remote_code", False),
+        )
+
         backend = cfg.model.backend.instantiate()
         kwargs = {
             "pretrained_model_name_or_path": config,
@@ -123,6 +133,27 @@ def run_benchmark(cfg):
 
         with torch.device("meta"):
             model = cfg.model.instantiate(**kwargs)
+
+        # Prepare HellaSwag dataset and dataloader
+        hellaswag = HellaSwag(
+            path_or_dataset="rowan/hellaswag",
+            tokenizer=tokenizer,
+            split="train",
+        )
+        hellaswag_ds = hellaswag.dataset
+        # Return tensors for "input_ids" and "labels"
+        try:
+            hellaswag_ds.set_format(type="torch", columns=["input_ids", "labels"])
+        except Exception:
+            pass
+        data_loader = DataLoader(
+            hellaswag_ds,
+            batch_size=cfg.training.local_batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=0,
+        )
+        data_iter = cycle(data_loader)
 
         flops_formula = get_flops_formula_for_hf_config(config)
         flops = flops_formula(config, gbs=cfg.training.global_batch_size, seq_len=cfg.training.seq_len)
@@ -218,16 +249,9 @@ def run_benchmark(cfg):
         iter_timer = "iteration_warmup" if i < cfg.training.warmup_steps else "iteration"
         with timers(iter_timer, log_level=1):
             for _ga_step_idx in range(ga_steps):
-                tokens = torch.randint(
-                    0, config.vocab_size, (cfg.training.local_batch_size, cfg.training.seq_len), device=device
-                )
-                labels = torch.cat(
-                    [
-                        tokens[:, 1:],
-                        torch.full((cfg.training.local_batch_size, 1), -100, device=device, dtype=tokens.dtype),
-                    ],
-                    dim=1,
-                )
+                batch = next(data_iter)
+                tokens = batch["input_ids"].to(device, non_blocking=True)
+                labels = batch["labels"].to(device, non_blocking=True)
                 position_ids = (
                     torch.arange(tokens.shape[1], device=tokens.device).unsqueeze(0).expand(tokens.shape[0], -1)
                 )
