@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import re
 from typing import Any, Optional
 
@@ -23,6 +24,11 @@ from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAda
 from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.components.moe.state_dict_mixin import MoEStateDictMixin
 from nemo_automodel.components.moe.utils import BackendConfig
+
+logger = logging.getLogger(__name__)
+
+# Fixed block size of 128x128 as specified in the algorithm
+BLOCK_SIZE = 128
 
 
 class DeepSeekV3StateDictAdapter(MoEStateDictMixin, StateDictAdapter):
@@ -38,7 +44,6 @@ class DeepSeekV3StateDictAdapter(MoEStateDictMixin, StateDictAdapter):
         self.backend = backend
         self.dtype = dtype
         self._uses_model_prefix = True
-        self._had_scale_inv_tensors = False
         self.from_hf_map = {
             "model.layers.{}.mlp.experts.{}.gate_proj.weight": "model.layers.{}.mlp.experts.gate_projs",
             "model.layers.{}.mlp.experts.{}.up_proj.weight": "model.layers.{}.mlp.experts.up_projs",
@@ -74,13 +79,20 @@ class DeepSeekV3StateDictAdapter(MoEStateDictMixin, StateDictAdapter):
             if key.endswith(".weight") and not any(
                 non_quantized_key in key for non_quantized_key in non_quantized_keys
             ):
+                value = value.to(dtype=torch.float8_e4m3fn)
+                state_dict[key] = value
                 expected_scale_shape = calculate_scale_shape(value)
-                weight_scale_inv_state_dict[key + "_scale_inv"] = torch.ones(expected_scale_shape, dtype=self.dtype)
+                # Create scale_inv on the same device as the weight to avoid device mismatch during dequantization
+                weight_scale_inv_state_dict[key + "_scale_inv"] = torch.ones(
+                    expected_scale_shape, dtype=torch.float32, device=value.device
+                )
 
         state_dict.update(weight_scale_inv_state_dict)
         return state_dict
 
-    def to_hf(self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None) -> dict[str, Any]:
+    def to_hf(
+        self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, is_base: bool = False
+    ) -> dict[str, Any]:
         """Convert from native model state dict to HuggingFace format.
         Automatically detects format based on backend.enable_deepep configuration.
         """
@@ -92,7 +104,7 @@ class DeepSeekV3StateDictAdapter(MoEStateDictMixin, StateDictAdapter):
         if exclude_key_regex:
             hf_state_dict = {k: v for k, v in hf_state_dict.items() if not re.match(exclude_key_regex, k)}
 
-        if self._had_scale_inv_tensors:
+        if is_base:
             return self._add_quantization_scale_inv_tensors(hf_state_dict)
         else:
             return hf_state_dict
@@ -111,8 +123,6 @@ class DeepSeekV3StateDictAdapter(MoEStateDictMixin, StateDictAdapter):
         for key in hf_state_dict.keys():
             if ".mlp.experts." in key and key.endswith(".weight"):
                 self._uses_model_prefix = key.startswith("model.")
-            if key.endswith("_scale_inv"):
-                self._had_scale_inv_tensors = True
 
         hf_state_dict = self._dequantize(hf_state_dict)
 
@@ -129,34 +139,60 @@ class DeepSeekV3StateDictAdapter(MoEStateDictMixin, StateDictAdapter):
             return self._from_hf_grouped_experts(hf_state_dict, device_mesh)
 
 
+def calculate_scale_shape(weight: torch.Tensor, BLOCK_SIZE: int = BLOCK_SIZE) -> torch.Size:
+    # Calculate the scale tensor shape
+    orig_shape = weight.shape
+
+    # Calculate number of blocks needed
+    block_rows = (orig_shape[0] + BLOCK_SIZE - 1) // BLOCK_SIZE
+    block_cols = (orig_shape[1] + BLOCK_SIZE - 1) // BLOCK_SIZE
+
+    # Verify scale_inv shape matches expected block dimensions
+    expected_scale_shape = torch.Size((block_rows, block_cols))
+
+    return expected_scale_shape
+
+
 def dequantize_from_fp8(
-    weight: torch.Tensor, scale_inv: torch.Tensor, dtype: torch.dtype = torch.float32
+    weight: torch.Tensor,
+    scale_inv: torch.Tensor,
+    dtype=torch.bfloat16,
+    BLOCK_SIZE: int = BLOCK_SIZE,
 ) -> torch.Tensor:
-    """
-    Minimal FP8 dequantization: cast to dtype and divide by inverse scale.
-    Broadcasts scale_inv over the last dimension of weight.
-    """
-    w = weight.to(dtype)
-    s = scale_inv.to(dtype)
-    # Ensure broadcast shape: append singleton dims to scale_inv to match weight
-    if s.ndim < w.ndim:
-        expand_shape = list(s.shape) + [1] * (w.ndim - s.ndim)
-        s = s.view(*expand_shape)
-    return w / s
+    # Convert to float32 for computation
+    float_weight = weight.to(torch.float32)
+    scale_inv = scale_inv.to(device=weight.device)
+    # Get original dimensions
+    orig_shape = weight.shape
 
+    # Verify scale_inv shape matches expected block dimensions
+    expected_scale_shape = calculate_scale_shape(weight, BLOCK_SIZE)
+    block_rows, block_cols = expected_scale_shape
+    if scale_inv.shape != expected_scale_shape:
+        logger.warning(f"scale_inv shape {scale_inv.shape} doesn't match expected shape {expected_scale_shape}")
 
-def calculate_scale_shape(weight: torch.Tensor) -> tuple[int, ...]:
-    """
-    Compute expected shape for per-row inverse scales.
-    - 2D [out, in] -> [out, 1]
-    - 3D [N, out, in] -> [N, out, 1]
-    Fallback: last dim collapsed to 1
-    """
-    if weight.ndim == 2:
-        return (weight.shape[0], 1)
-    if weight.ndim == 3:
-        return (weight.shape[0], weight.shape[1], 1)
-    shape = list(weight.shape)
-    if len(shape) > 0:
-        shape[-1] = 1
-    return tuple(shape)
+    # NOTE: When processing large models on-the-fly, misalignment between block boundaries
+    # and DTensor local shape partitioning can lead to silent numerical inaccuracies.
+    dequantized = float_weight.detach().clone().to(dtype=dtype)
+
+    # Apply scaling factors to each block
+    for i in range(block_rows):
+        row_start = i * BLOCK_SIZE
+        row_end = min(row_start + BLOCK_SIZE, orig_shape[0])
+
+        for j in range(block_cols):
+            col_start = j * BLOCK_SIZE
+            col_end = min(col_start + BLOCK_SIZE, orig_shape[1])
+
+            # Get the block
+            block = float_weight[row_start:row_end, col_start:col_end]
+
+            scale = scale_inv[i, j]
+            block = block * scale
+
+            # Explicitly convert block to dtype
+            block_converted = block.to(dtype=torch.float32)
+            # Store the dequantized block
+            dequantized[row_start:row_end, col_start:col_end] = block_converted
+
+    return dequantized
