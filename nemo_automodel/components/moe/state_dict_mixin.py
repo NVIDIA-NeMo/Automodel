@@ -29,7 +29,7 @@ from nemo_automodel.components.moe.state_dict_utils import (
 )
 
 
-class MoEStateDictMixin:
+class MoESplitExpertsStateDictMixin:
     """Mixin class providing MoE state dict conversion utilities.
 
     This mixin provides methods for:
@@ -161,70 +161,7 @@ class MoEStateDictMixin:
 
         return None
 
-    def _to_hf_grouped_experts(self, state_dict: dict[str, Any]) -> dict[str, Any]:
-        """Convert GroupedExperts format to HuggingFace format.
-        Handles: gate_projs, up_projs, down_projs -> individual expert weights
-        """
-
-        n_experts = self.moe_config.n_routed_experts
-        hf_state_dict: dict[str, Any] = {}
-
-        for key, value in list(state_dict.items()):
-            if ".mlp.experts.gate_projs" in key and key.endswith(".gate_projs"):
-                # GroupedExperts: [n_experts, inter_dim, dim] -> per-expert gate_proj [inter_dim, dim]
-                layer_num = re.search(r"layers\.(\d+)", key).group(1)
-
-                if is_dtensor(value):
-                    validate_dtensor_expert_sharding(value, n_experts, f"gate_projs layer {layer_num}")
-
-                splits = self._split_experts_weights(value, n_experts)
-                for i, w in enumerate(splits):
-                    expert_id = self._last_expert_ids[i]
-                    prefix = "model." if self._uses_model_prefix else ""
-                    new_key = f"{prefix}layers.{layer_num}.mlp.experts.{expert_id}.gate_proj.weight"
-                    hf_state_dict[new_key] = w
-                continue
-
-            if ".mlp.experts.up_projs" in key and key.endswith(".up_projs"):
-                # GroupedExperts: [n_experts, inter_dim, dim]
-                layer_num = re.search(r"layers\.(\d+)", key).group(1)
-
-                if is_dtensor(value):
-                    validate_dtensor_expert_sharding(value, n_experts, f"up_projs layer {layer_num}")
-
-                splits = self._split_experts_weights(value, n_experts)
-                for i, w in enumerate(splits):
-                    expert_id = self._last_expert_ids[i]
-                    prefix = "model." if self._uses_model_prefix else ""
-                    new_key = f"{prefix}layers.{layer_num}.mlp.experts.{expert_id}.up_proj.weight"
-                    hf_state_dict[new_key] = w
-                continue
-
-            if ".mlp.experts.down_projs" in key and key.endswith(".down_projs") and value.ndim == 3:
-                # GroupedExperts: [n_experts, dim, inter_dim] -> per-expert down_proj [dim, inter_dim]
-                layer_num = re.search(r"layers\.(\d+)", key).group(1)
-
-                if is_dtensor(value):
-                    validate_dtensor_expert_sharding(value, n_experts, f"down_projs layer {layer_num}")
-
-                splits = self._split_experts_weights(value, n_experts)
-                for i, w in enumerate(splits):
-                    expert_id = self._last_expert_ids[i]
-                    prefix = "model." if self._uses_model_prefix else ""
-                    new_key = f"{prefix}layers.{layer_num}.mlp.experts.{expert_id}.down_proj.weight"
-                    hf_state_dict[new_key] = w
-                continue
-
-        for key, value in state_dict.items():
-            if ".mlp.experts." in key and (
-                key.endswith(".gate_projs") or key.endswith(".up_projs") or key.endswith(".down_projs")
-            ):
-                continue
-            hf_state_dict[key] = value
-
-        return hf_state_dict
-
-    def _to_hf_deepep(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+    def _to_hf_w_split_experts(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         """Convert DeepEP format to HuggingFace format.
         Handles: gate_and_up_projs, down_projs -> individual expert weights
         """
@@ -280,90 +217,7 @@ class MoEStateDictMixin:
 
         return hf_state_dict
 
-    def _from_hf_grouped_experts(
-        self,
-        hf_state_dict: dict[str, Any],
-        device_mesh: Optional["DeviceMesh"] = None,
-    ) -> dict[str, Any]:
-        """Convert HF checkpoint to GroupedExperts format.
-        Creates separate gate_projs, up_projs, and down_projs tensors.
-        """
-
-        n_experts = self.moe_config.n_routed_experts
-
-        self._validate_expert_availability(hf_state_dict, n_experts, device_mesh)
-
-        if device_mesh is not None:
-            start_expert, end_expert = get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
-            expected_experts_per_rank = end_expert - start_expert
-            rank = (
-                get_submesh(device_mesh, ("ep",)).get_rank()
-                if "ep" in device_mesh.mesh_dim_names
-                else device_mesh.get_rank()
-            )
-        else:
-            start_expert, end_expert = 0, n_experts
-            expected_experts_per_rank = n_experts
-            rank = None
-
-        state_dict: dict[str, Any] = {}
-        expert_weights_by_layer: dict[str, dict[str, dict[int, torch.Tensor]]] = {}
-
-        for key, value in hf_state_dict.items():
-            if ".mlp.experts." in key and key.endswith(".weight"):
-                # Handle both formats:
-                # - model.layers.{L}.mlp.experts.{E}.gate_proj.weight (with model prefix)
-                # - layers.{L}.mlp.experts.{E}.gate_proj.weight (without model prefix)
-                m = re.match(
-                    r"(?:model\.)?layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight", key
-                )
-                if m is None:
-                    state_dict[key] = value
-                    continue
-
-                layer_num, expert_num, which = m.groups()
-                expert_num = int(expert_num)
-
-                if not should_load_expert_for_rank(expert_num, device_mesh, n_experts):
-                    continue
-
-                if layer_num not in expert_weights_by_layer:
-                    expert_weights_by_layer[layer_num] = {}
-
-                abstract_key = {
-                    "gate_proj": "model.layers.{}.mlp.experts.gate_projs",
-                    "up_proj": "model.layers.{}.mlp.experts.up_projs",
-                    "down_proj": "model.layers.{}.mlp.experts.down_projs",
-                }[which]
-
-                native_key = abstract_key.format(layer_num)
-
-                if native_key not in expert_weights_by_layer[layer_num]:
-                    expert_weights_by_layer[layer_num][native_key] = {}
-
-                expert_weights_by_layer[layer_num][native_key][expert_num] = value
-
-                if len(expert_weights_by_layer[layer_num][native_key]) == expected_experts_per_rank:
-                    expert_ids = sorted(expert_weights_by_layer[layer_num][native_key].keys())
-                    ordered = [expert_weights_by_layer[layer_num][native_key][i] for i in expert_ids]
-                    ordered = [t.to_local() if is_dtensor(t) else t for t in ordered]
-
-                    # Shapes:
-                    # gate/up: [inter_dim, dim] -> stacked [n_experts_this_rank, inter_dim, dim]
-                    # down:    [dim, inter_dim] -> stacked [n_experts_this_rank, dim, inter_dim]
-                    stacked = torch.stack(ordered, dim=0)
-                    stacked = stacked.to(self.dtype)
-
-                    dtensor = create_dtensor_from_local(stacked, device_mesh, rank)
-                    state_dict[native_key] = dtensor
-
-            else:
-                if not key.endswith("_scale_inv"):
-                    state_dict[key] = value
-
-        return state_dict
-
-    def _from_hf_deepep(
+    def _from_hf_w_merged_experts(
         self,
         hf_state_dict: dict[str, Any],
         device_mesh: Optional["DeviceMesh"] = None,

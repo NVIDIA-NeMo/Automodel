@@ -1,0 +1,82 @@
+import math
+import torch
+import pytest
+
+from nemo_automodel.components.attention.flex_attention import FlexAttention
+
+
+def sdpa(Q, K, V, S, sm_scale, sliding_window=0):
+    # sliding_window == 0 means no sliding window
+    n_tokens, n_heads, q_mult, d_head = Q.shape
+    assert K.shape == (n_tokens, n_heads, d_head)
+    assert V.shape == (n_tokens, n_heads, d_head)
+    K = K[:, :, None, :].expand(-1, -1, q_mult, -1)
+    V = V[:, :, None, :].expand(-1, -1, q_mult, -1)
+    S = S.reshape(n_heads, q_mult, 1, 1).expand(-1, -1, n_tokens, -1)
+    mask = torch.triu(Q.new_full((n_tokens, n_tokens), -float("inf")), diagonal=1)
+    if sliding_window > 0:
+        mask += torch.tril(
+            mask.new_full((n_tokens, n_tokens), -float("inf")), diagonal=-sliding_window
+        )
+    QK = torch.einsum("qhmd,khmd->hmqk", Q, K)
+    QK *= sm_scale
+    QK += mask[None, None, :, :]
+    QK = torch.cat([QK, S], dim=-1)
+    W = torch.softmax(QK.float(), dim=-1)
+    W = W[..., :-1].to(V.dtype)
+    attn = torch.einsum("hmqk,khmd->qhmd", W, V)
+    return attn.reshape(n_tokens, -1)
+
+
+def _flex_forward_from_qkm(Q, K, V, S_vec, sm_scale, sliding_window=0, device=None, dtype=torch.bfloat16):
+    # Q: [S, H_kv, q_mult, D], K/V: [S, H_kv, D]
+    S, H_kv, q_mult, D = Q.shape
+    H_q = H_kv * q_mult
+    q = Q.permute(1, 2, 0, 3).contiguous().view(H_q, S, D).unsqueeze(0).to(device=device, dtype=dtype)
+    k = K.permute(1, 0, 2).contiguous().unsqueeze(0).to(device=device, dtype=dtype)
+    v = V.permute(1, 0, 2).contiguous().unsqueeze(0).to(device=device, dtype=dtype)
+
+    sink_weights = S_vec.to(device=device, dtype=dtype)  # [H_q]
+
+    attn = FlexAttention().to(device)
+    # Map window semantics if non-zero to match <= vs < difference
+    flex_window = int(sliding_window)
+    out = attn(
+        q,
+        k,
+        v,
+        scale=sm_scale,
+        sink_weights=sink_weights,
+        sliding_window=flex_window,
+        enable_gqa=True,
+    )
+    out = out.squeeze(0).permute(1, 0, 2).contiguous().view(S, -1)
+    return out
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_flex_attention_matches_sdpa():
+    torch.manual_seed(123)
+    device = f"cuda:0"
+    dtype = torch.bfloat16
+
+    S = 64
+    H_kv = 4
+    q_mult = 2
+    D = 32
+    H_q = H_kv * q_mult
+
+    Q = torch.randn(S, H_kv, q_mult, D, device=device, dtype=dtype)
+    K = torch.randn(S, H_kv, D, device=device, dtype=dtype)
+    V = torch.randn(S, H_kv, D, device=device, dtype=dtype)
+    S_vec = torch.randn(H_q, device=device, dtype=dtype) / math.sqrt(D)
+    sm_scale = 1.0 / math.sqrt(D)
+
+    for window in (8, 16):
+        ref = sdpa(Q, K, V, S_vec, sm_scale, sliding_window=window)
+        out = _flex_forward_from_qkm(Q, K, V, S_vec, sm_scale, sliding_window=window, device=device, dtype=dtype)
+
+        assert ref.shape == out.shape == (S, H_q * D)
+        atol = 1e-2 if dtype == torch.bfloat16 else 5e-4
+        rtol = 1e-2 if dtype == torch.bfloat16 else 5e-4
+        max_err = (ref - out).abs().max().item()
+        assert torch.allclose(ref, out, rtol=rtol, atol=atol), f"Mismatch (window={window}); max_err={max_err:.4e}"

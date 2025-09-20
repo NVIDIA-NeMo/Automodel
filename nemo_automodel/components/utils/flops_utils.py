@@ -662,9 +662,6 @@ def gpt_oss_flops_calculator(
 
 def gpt_oss_flops(config, gbs=1, seq_len=None):
     """Model FLOPs for GPT-OSS"""
-    if seq_len is None:
-        seq_len = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 2048
-
     # Map config fields
     num_layers = config.num_hidden_layers
     hidden_size = config.hidden_size
@@ -676,7 +673,7 @@ def gpt_oss_flops(config, gbs=1, seq_len=None):
     moe_ffn_hidden_size = (
         config.moe_ffn_hidden_size if hasattr(config, "moe_ffn_hidden_size") else config.intermediate_size
     )
-    moe_router_topk = config.moe_router_topk if hasattr(config, "moe_router_topk") else 1
+    moe_router_topk = config.num_experts_per_tok
     kv_channels = config.kv_channels if hasattr(config, "kv_channels") else (hidden_size // num_attention_heads)
     swa_window_size = config.window_size[0] if hasattr(config, "window_size") and config.window_size else 128
     window_attn_skip_freq = config.window_attn_skip_freq if hasattr(config, "window_attn_skip_freq") else 2
@@ -732,6 +729,8 @@ def get_flops_formula_for_hf_config(config: Any) -> Optional[Callable]:
         "ElectraConfig": bert_flops,
         # DeepSeek V3
         "DeepseekV3Config": deepseekv3_flops,
+        # GPT-OSS
+        "GptOssConfig": gpt_oss_flops,
         # T5 family (encoder-decoder)
         "T5Config": transformer_flops,
         "MT5Config": transformer_flops,
