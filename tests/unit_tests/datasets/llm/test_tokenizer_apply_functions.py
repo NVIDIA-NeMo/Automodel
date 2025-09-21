@@ -147,9 +147,13 @@ def testformat_prompt_completion_full_loss_mask():
 def test_apply_tokenizer_chat_template_answer_only_mask():
     tok = _StubTokenizerChat()
     ctx, qst, ans = "Some context", "Life?", "42"
-    prompt = f"{ctx} {qst}"
     out = format_chat_template(
-        tok, prompt, ans,
+        tok,
+        formatted_text=[
+            {"role": "system", "content": ctx},
+            {"role": "user", "content": qst},
+            {"role": "assistant", "content": ans},
+        ],
         eos_token_id=tok.eos_token_id, pad_token_id=tok.eos_token_id,
         start_of_turn_token=tok._start_of_turn_token
     )
@@ -173,8 +177,11 @@ def test_apply_tokenizer_chat_template_full_loss_mask():
     tok = _StubTokenizerChat()
     out = format_chat_template(
         tok,
-        prompt="ctx Q?",
-        answer="A.",
+        formatted_text=[
+            {"role": "system", "content": "ctx"},
+            {"role": "user", "content": "Q?"},
+            {"role": "assistant", "content": "A."},
+        ],
         eos_token_id=tok.eos_token_id,
         pad_token_id=tok.eos_token_id,
         start_of_turn_token=tok._start_of_turn_token,
