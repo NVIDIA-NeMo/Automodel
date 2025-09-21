@@ -263,20 +263,23 @@ class ColumnMappedTextInstructionDataset(Dataset):
         eos_token_id = getattr(self.tokenizer, "eos_token_id", 0)
         pad_token_id = _add_pad_token(self.tokenizer) or eos_token_id
 
-        prompt = " ".join(filter(lambda x: x is not None, (context, question, "")))
-        assert len(prompt) > 1, "Expected prompt to be non-empty"
         if _has_chat_template(self.tokenizer):
+            formatted_text = [
+                {"role": "system", "content": context or ""},
+                {"role": "user", "content": question or ""},
+                {"role": "assistant", "content": answer},
+            ]
             return format_chat_template(
                 self.tokenizer,
-                prompt,
-                answer,
+                formatted_text,
                 eos_token_id,
                 pad_token_id,
                 seq_length=self.seq_length,
                 start_of_turn_token=self.start_of_turn_token,
             )
         else:
-            prompt += " "
+            prompt = " ".join(filter(lambda x: x is not None, (context, question, "")))
+            assert len(prompt) > 1, "Expected prompt to be non-empty"
             return format_prompt_completion(
                 self.tokenizer,
                 prompt,
