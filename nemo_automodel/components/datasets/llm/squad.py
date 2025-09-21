@@ -41,15 +41,18 @@ def _formatting_prompts_func(example, tokenizer, eos_token_id, pad_token_id, seq
 def _formatting_prompts_func_with_chat_template(
     example, tokenizer, eos_token_id, pad_token_id, seq_length=None, start_of_turn_token=None
 ):
-    context = example["context"]
-    question = example["question"]
+    context = example.get("context", None) or ""
+    question = example.get("question", None) or ""
     answer = example["answers"]["text"][0].strip()
-    prompt = f"Context: {context} Question: {question}"
 
+    formatted_text = [
+        {"role": "system", "content": context},
+        {"role": "user", "content": question},
+        {"role": "assistant", "content": answer},
+    ]
     return format_chat_template(
         tokenizer=tokenizer,
-        prompt=prompt,
-        answer=answer,
+        formatted_text=formatted_text,
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
         seq_length=seq_length,
