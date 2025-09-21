@@ -30,12 +30,14 @@ model:
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: false
 
-parallelize_fn: nemo_automodel.components.models.deepseek_v3.parallelizer.parallelize_model
+parallelizer:
+  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
+  enable_ac: false
 
 training:
   seq_len: 2048
   global_batch_size: 256
-  local_batch_size: 16
+  local_batch_size: 4
   steps: 30
   warmup_steps: 10
   seed: 1234

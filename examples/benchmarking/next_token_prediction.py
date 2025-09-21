@@ -26,9 +26,10 @@ from nemo_automodel.components.distributed.pipelining.functional import pipeline
 from nemo_automodel.components.training.rng import init_all_rng
 from nemo_automodel.components.training.timers import Timers
 from nemo_automodel.components.utils.flops_utils import get_flops_formula_for_hf_config
+from nemo_automodel.components.utils.model_utils import print_trainable_parameters
 
-logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 def calculate_mfu(tflops, world_size, time_seconds, reference_mfu=1979.0):
@@ -123,6 +124,7 @@ def run_benchmark(cfg):
 
         with torch.device("meta"):
             model = cfg.model.instantiate(**kwargs)
+            print_trainable_parameters(model)
 
         flops_formula = get_flops_formula_for_hf_config(config)
         flops = flops_formula(config, gbs=cfg.training.global_batch_size, seq_len=cfg.training.seq_len)
@@ -150,7 +152,7 @@ def run_benchmark(cfg):
                 layers_per_stage=cfg.pipelining.layers_per_stage,
                 pipeline_parallel_schedule_csv=None,
                 pipeline_parallel_schedule=cfg.pipelining.pipeline_parallel_schedule,
-                parallelize_fn=cfg.parallelize_fn,
+                parallelize_fn=cfg.parallelizer.instantiate,
                 microbatch_size=cfg.pipelining.pp_microbatch_size,
                 local_batch_size=cfg.training.local_batch_size,
                 device=torch.device(f"cuda:{torch.cuda.current_device()}"),
@@ -160,7 +162,7 @@ def run_benchmark(cfg):
                 round_to_pp_multiple=cfg.pipelining.round_to_pp_multiple,
             )
         else:
-            cfg.parallelize_fn(
+            cfg.parallelizer.instantiate(
                 model,
                 world_mesh=mesh["default"],
                 moe_mesh=mesh["moe"],
@@ -179,7 +181,7 @@ def run_benchmark(cfg):
         # Allocate parameters for each stage on its GPU and init
         device = torch.cuda.current_device()
         for mp in model_parts:
-            to_empty_parameters_only(mp, device=device, dtype=torch.bfloat16)
+            to_empty_parameters_only(mp, device=device)
             mp.initialize_weights(buffer_device=torch.device(f"cuda:{device}"))
             mp.train()
 

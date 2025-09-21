@@ -30,7 +30,6 @@ from torch.distributed.tensor import Shard, distribute_module, distribute_tensor
 from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
-from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3Model
 from nemo_automodel.components.moe.layers import (
     GroupedExpertsDeepEP,
     MoE,
@@ -113,7 +112,7 @@ def apply_ac(model: nn.Module, ignore_router: bool = False):
 
 
 def apply_fsdp(
-    model: DeepseekV3Model,
+    model: torch.nn.Module,
     fsdp_mesh: DeviceMesh,
     pp_enabled: bool,
     ep_enabled: bool,
@@ -124,7 +123,7 @@ def apply_fsdp(
 ):
     if mp_policy is None:
         mp_policy = MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16, output_dtype=torch.bfloat16
+            param_dtype=torch.bfloat16, reduce_dtype=torch.float32, output_dtype=torch.bfloat16
         )
 
     fully_shard_default = functools.partial(
@@ -173,7 +172,7 @@ def apply_fsdp(
 
 
 def parallelize_model(
-    model: DeepseekV3Model,
+    model: torch.nn.Module,
     world_mesh: DeviceMesh,
     moe_mesh: DeviceMesh | None,
     *,
@@ -183,6 +182,7 @@ def parallelize_model(
     tp_axis_name: str | None = None,
     ep_axis_name: str | None = None,
     ep_shard_axis_names: tuple[str, ...] | None = None,
+    enable_ac: bool = False,
 ):
     assert tp_axis_name is None or world_mesh[tp_axis_name].size() == 1, (
         "Tensor parallelism not supported for DeepSeek v3 model"
@@ -204,7 +204,8 @@ def parallelize_model(
 
         apply_ep(model, moe_mesh[ep_axis_name])
 
-    # apply_ac(model)
+    if enable_ac:
+        apply_ac(model)
 
     if ep_shard_axis_names is not None:
         ep_shard_mesh = moe_mesh[ep_shard_axis_names]

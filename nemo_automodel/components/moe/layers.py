@@ -245,7 +245,7 @@ class GroupedExperts(nn.Module):
         # used by this implementation for correctness.
         if ep_size > 1:
             x = DTensor.from_local(x, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
-            weights = DTensor.from_local(weights, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
+            weights = DTensor.from_local(weights.float(), device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
             indices = DTensor.from_local(indices, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
             token_mask = DTensor.from_local(token_mask, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
 
@@ -288,25 +288,7 @@ class GroupedExperts(nn.Module):
                 * weights[idx, top, None]
             )
 
-            y.scatter_add_(dim=0, index=idx_b, src=expert_out)
-
-        if active_local_experts == 0:
-            # We need to handle the case where no token selects the experts on this device.
-            gate_and_up_proj = get_local_proj(self.gate_and_up_projs, experts_start_idx)
-            down_proj = get_local_proj(self.down_projs, experts_start_idx)
-            gate_up_proj_bias = get_local_proj(self.gate_up_proj_bias, experts_start_idx) if self.expert_bias else None
-            down_proj_bias = get_local_proj(self.down_proj_bias, experts_start_idx) if self.expert_bias else None
-            expert_out = (
-                self.expert_activation(
-                    torch.zeros_like(x[0]).unsqueeze(0),
-                    gate_and_up_proj=gate_and_up_proj,
-                    down_proj=down_proj,
-                    gate_up_proj_bias=gate_up_proj_bias,
-                    down_proj_bias=down_proj_bias,
-                )
-                * weights[0, 0, None]
-            )
-            y[0] += expert_out[0]
+            y.scatter_add_(dim=0, index=idx_b, src=expert_out.to(x.dtype))
 
         if ep_size > 1:
             y = DTensor.from_local(y, device_mesh=ep_mesh, placements=[Partial()])
@@ -507,9 +489,7 @@ class GroupedExpertsDeepEP(nn.Module):
                 down_bias = self.down_proj_bias.to_local()
                 output2 = self._apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
         else:
-            output1 = torch.matmul(x[0] * 0, self.gate_and_up_projs.to_local()[0])
-            output1 = self.expert_activation(output1, permuted_probs)
-            output2 = torch.matmul(output1, self.down_projs.to_local()[0])
+            output2 = torch.zeros((1, x.size(-1)), dtype=x.dtype, device=x.device)
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y

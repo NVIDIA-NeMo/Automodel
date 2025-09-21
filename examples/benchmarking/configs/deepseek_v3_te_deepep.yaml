@@ -31,7 +31,9 @@ model:
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: false
 
-parallelize_fn: nemo_automodel.components.models.deepseek_v3.parallelizer.parallelize_model
+parallelizer:
+  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
+  enable_ac: true
 
 training:
   seq_len: 4096

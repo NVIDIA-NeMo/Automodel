@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 step_scheduler:
-  global_batch_size: 256
-  local_batch_size: 32
+  global_batch_size: 512
+  local_batch_size: 64
   ckpt_every_steps: 500
   val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 2
@@ -35,14 +34,14 @@ parallelizer:
   enable_ac: false
 
 model:
-  _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_config
+  _target_: nemo_automodel.components.models.gpt_oss.model.GptOssForCausalLM.from_config
   # _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained_config
-  pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
+  pretrained_model_name_or_path: unsloth/gpt-oss-20b-BF16
   trust_remote_code: true
   is_meta_device: true
   backend:
     _target_: nemo_automodel.components.moe.utils.BackendConfig
-    attn: te
+    attn: flex
     linear: te
     rms_norm: te
     enable_deepep: true
@@ -50,7 +49,7 @@ model:
     enable_hf_state_dict_adapter: true
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: /tmp/checkpoints/
   model_save_format: safetensors # torch_save or safetensors
   save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
@@ -85,7 +84,7 @@ dataset:
 packed_sequence:
   # Set packed_sequence_size > 0 to run with packed sequences
   packed_sequence_size: 0
-  split_across_pack: False
+  split_across_pack: false
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
