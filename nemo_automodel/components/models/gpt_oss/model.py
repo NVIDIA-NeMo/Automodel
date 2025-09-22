@@ -16,80 +16,47 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
+from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
-from nemo_automodel.components.models.deepseek_v3.layers import MLA
-from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
+from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention, RotaryEmbedding
+from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSStateDictAdapter
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
-from nemo_automodel.components.moe.rope_utils import freqs_cis_from_position_ids, precompute_freqs_cis
 from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 
 
 class Block(nn.Module):
-    def __init__(
-        self,
-        layer_idx: int,
-        config: DeepseekV3Config,
-        moe_config: MoEConfig,
-        backend: BackendConfig,
-    ):
+    def __init__(self, layer_idx: int, config: GptOssConfig, moe_config: MoEConfig, backend: BackendConfig):
         super().__init__()
-        self.self_attn = MLA(config, backend)
-        if layer_idx < config.first_k_dense_replace:
-            self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear)
-        else:
-            self.mlp = MoE(moe_config, backend)
+        self.self_attn = GptOssAttention(
+            config, backend, use_sliding_attention=config.layer_types[layer_idx] == "sliding_attention"
+        )
+        self.mlp = MoE(moe_config, backend)
         self.input_layernorm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps
         )
-        self.layer_idx = layer_idx
 
     def forward(
         self,
         x: torch.Tensor,
+        *,
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
-        seq_lens: torch.Tensor | None = None,
-        **attn_kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """
-        Forward pass for the Transformer block.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-            freqs_cis (torch.Tensor): Precomputed complex exponential values for rotary embeddings.
-            padding_mask (torch.Tensor): Boolean tensor indicating padding positions.
-
-        Returns:
-            torch.Tensor: Output tensor after block computation.
-            torch.Tensor | None: Auxiliary loss for load balancing (if applicable).
-        """
         if attention_mask is not None and padding_mask is None:
             padding_mask = attention_mask.bool().logical_not()
 
-        attn_out = self.self_attn(
-            x=self.input_layernorm(x),
-            freqs_cis=freqs_cis,
-            attention_mask=attention_mask,
-            **attn_kwargs,
-        )
+        # TODO: Support arbitrary attention masks
+        attn_out = self.self_attn(self.input_layernorm(x), freqs_cis=freqs_cis)
         x = x + attn_out
 
-        mlp_out = self._mlp(
-            x=self.post_attention_layernorm(x),
-            padding_mask=padding_mask,
-        )
+        mlp_in = self.post_attention_layernorm(x)
+        mlp_out = self._mlp(mlp_in, padding_mask)
         x = x + mlp_out
-
         return x
 
-    def _mlp(
-        self,
-        x: torch.Tensor,
-        padding_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    def _mlp(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
         if isinstance(self.mlp, MLP):
             return self.mlp(x)
         else:
@@ -103,49 +70,58 @@ class Block(nn.Module):
         self.mlp.init_weights(buffer_device)
 
 
-class DeepseekV3Model(nn.Module):
-    def __init__(
-        self,
-        config: DeepseekV3Config,
-        backend: BackendConfig,
-        *,
-        moe_config: MoEConfig | None = None,
-    ):
+class GptOssModel(nn.Module):
+    def __init__(self, config: GptOssConfig, backend: BackendConfig, *, moe_config: MoEConfig | None = None):
         super().__init__()
         self.backend = backend
         self.config = config
+        # GPT-OSS is MoE everywhere; set shared experts to 0 to disable shared path in our MoE wrapper.
         self.moe_config = moe_config or MoEConfig(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
-            moe_inter_dim=config.moe_intermediate_size,
-            n_routed_experts=config.n_routed_experts,
-            n_shared_experts=config.n_shared_experts,
+            moe_inter_dim=config.intermediate_size,
+            n_routed_experts=config.num_local_experts,
+            n_shared_experts=0,
             n_activated_experts=config.num_experts_per_tok,
-            n_expert_groups=config.n_group,
-            n_limited_groups=config.topk_group,
+            n_expert_groups=getattr(config, "n_group", 1),
+            n_limited_groups=getattr(config, "topk_group", 1),
             train_gate=True,
-            gate_bias_update_factor=0.001,
-            score_func="sigmoid",
-            route_scale=config.routed_scaling_factor,
-            aux_loss_coeff=0,
-            norm_topk_prob=config.norm_topk_prob,
+            gate_bias_update_factor=0,
+            score_func="softmax",
+            route_scale=1.0,
+            aux_loss_coeff=config.router_aux_loss_coef,
+            norm_topk_prob=getattr(config, "norm_topk_prob", False),
+            expert_bias=True,
+            router_bias=True,
+            expert_activation="quick_geglu",
+            activation_alpha=1.702,
+            activation_limit=getattr(config, "swiglu_limit", 7.0),
         )
+
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, backend)
         self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
 
+        # Rotary embedding cached at model-level (inv_freq + concentration via YaRN/NTK-by-parts)
         self.max_seq_len = config.max_position_embeddings
-        self.register_buffer(
-            "freqs_cis",
-            precompute_freqs_cis(
-                config.qk_rope_head_dim,
-                self.max_seq_len,
-                config.rope_theta,
-                config.rope_scaling,
-            ),
-            persistent=False,
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        rope_scaling = getattr(config, "rope_scaling", None) or {
+            "factor": 1.0,
+            "beta_fast": 32.0,
+            "beta_slow": 1.0,
+            "original_max_position_embeddings": self.max_seq_len,
+        }
+        self.rotary_emb = RotaryEmbedding(
+            head_dim=self.head_dim,
+            base=getattr(config, "rope_theta", 10000.0),
+            dtype=torch.float32,
+            initial_context_length=rope_scaling["original_max_position_embeddings"],
+            scaling_factor=rope_scaling["factor"],
+            ntk_alpha=rope_scaling["beta_slow"],
+            ntk_beta=rope_scaling["beta_fast"],
+            device=torch.device(f"cuda:{torch.cuda.current_device()}"),
         )
 
     def forward(
@@ -155,89 +131,81 @@ class DeepseekV3Model(nn.Module):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
-        seq_lens: torch.Tensor | None = None,
         **attn_kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> torch.Tensor:
         if position_ids is None:
             position_ids = (
                 torch.arange(0, input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand(input_ids.shape[0], -1)
             )
 
+        # Compute cos/sin from RotaryEmbedding inv_freq and current position_ids; then concat [cos, sin]
         with torch.no_grad():
-            freqs_cis = freqs_cis_from_position_ids(position_ids, self.freqs_cis)
+            concentration, inv_freq = self.rotary_emb._compute_concentration_and_inv_freq()
+            inv_freq = inv_freq.to(device=position_ids.device, dtype=torch.float32)
+            # angles: (B, T, D/2)
+            angles = torch.einsum("bt,d->btd", position_ids.to(dtype=torch.float32), inv_freq)
+            cos = torch.cos(angles) * concentration
+            sin = torch.sin(angles) * concentration
+            freqs_cis = torch.cat([cos, sin], dim=-1)  # (B, T, D)
 
         h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
 
-        # Apply the transformer layers.
         for layer in self.layers.values():
             h = layer(
-                x=h,
+                h,
                 freqs_cis=freqs_cis,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
-                seq_lens=seq_lens,
-                **attn_kwargs,
             )
 
         h = self.norm(h) if self.norm else h
         return h
-
-    def update_moe_gate_bias(self) -> None:
-        with torch.no_grad():
-            for _, block in self.layers.named_children():
-                if isinstance(block.mlp, MoE):
-                    block.mlp.gate.update_bias()
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
 
         with buffer_device:
-            self.freqs_cis = precompute_freqs_cis(
-                self.config.qk_rope_head_dim,
-                self.max_seq_len,
-                self.config.rope_theta,
-                self.config.rope_scaling,
-            )
-            self.freqs_cis = self.freqs_cis.to(buffer_device)
             if self.embed_tokens is not None:
                 nn.init.normal_(self.embed_tokens.weight)
             if self.norm is not None:
                 self.norm.reset_parameters()
+            # Ensure rotary embedding uses correct device
+            self.rotary_emb.device = buffer_device
 
         for layer in self.layers.values():
             if layer is not None:
                 layer.init_weights(buffer_device=buffer_device)
 
 
-class DeepseekV3ForCausalLM(nn.Module):
+class GptOssForCausalLM(nn.Module):
     @classmethod
     def from_config(
         cls,
-        pretrained_model_name_or_path: str | DeepseekV3Config,
+        pretrained_model_name_or_path: str | GptOssConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
         trust_remote_code: bool = False,
     ):
         if isinstance(pretrained_model_name_or_path, str):
-            config = DeepseekV3Config.from_pretrained(pretrained_model_name_or_path)
+            config = GptOssConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=trust_remote_code)
         else:
             config = pretrained_model_name_or_path
         return cls(config, moe_config, backend)
 
     def __init__(
         self,
-        config: DeepseekV3Config,
+        config: GptOssConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
     ):
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig()
-        self.model = DeepseekV3Model(config, backend=backend, moe_config=moe_config)
-        self.lm_head = initialize_linear_module(backend.linear, config.hidden_size, config.vocab_size, bias=False)
+        self.model = GptOssModel(config, backend=self.backend, moe_config=moe_config)
+        self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
-            self.state_dict_adapter = DeepSeekV3StateDictAdapter(
+            self.state_dict_adapter = GPTOSSStateDictAdapter(
                 self.config, self.model.moe_config, self.backend, dtype=torch.bfloat16
             )
 
@@ -248,25 +216,17 @@ class DeepseekV3ForCausalLM(nn.Module):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
-        seq_lens: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
-        logits = self.model(
+        hidden = self.model(
             input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
             padding_mask=padding_mask,
-            seq_lens=seq_lens,
             **attn_kwargs,
         )
-        logits = self.lm_head(logits) if self.lm_head else logits
+        logits = self.lm_head(hidden) if self.lm_head else hidden
         return logits
-
-    def update_moe_gate_bias(self) -> None:
-        with torch.no_grad():
-            for _, block in self.model.layers.named_children():
-                if isinstance(block.mlp, MoE):
-                    block.mlp.gate.update_bias()
 
     @torch.no_grad()
     def initialize_weights(
@@ -288,9 +248,5 @@ class DeepseekV3ForCausalLM(nn.Module):
 
         self.to(dtype)
         with buffer_device:
-            self.model.freqs_cis = precompute_freqs_cis(
-                self.config.qk_rope_head_dim,
-                self.model.max_seq_len,
-                self.config.rope_theta,
-                self.config.rope_scaling,
-            )
+            # Ensure rotary embedding uses correct device after dtype move
+            self.model.rotary_emb.device = buffer_device
