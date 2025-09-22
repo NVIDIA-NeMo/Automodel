@@ -27,7 +27,7 @@ from nemo_automodel.components.moe.utils import BackendConfig
 
 logger = logging.getLogger(__name__)
 
-# Fixed block size of 128x128 as specified in the algorithm
+# Fixed block size of 128x128 as specified in https://arxiv.org/pdf/2412.19437
 BLOCK_SIZE = 128
 
 
@@ -91,7 +91,7 @@ class DeepSeekV3StateDictAdapter(MoEStateDictMixin, StateDictAdapter):
         return state_dict
 
     def to_hf(
-        self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, is_base: bool = False
+        self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
     ) -> dict[str, Any]:
         """Convert from native model state dict to HuggingFace format.
         Automatically detects format based on backend.enable_deepep configuration.
@@ -104,7 +104,7 @@ class DeepSeekV3StateDictAdapter(MoEStateDictMixin, StateDictAdapter):
         if exclude_key_regex:
             hf_state_dict = {k: v for k, v in hf_state_dict.items() if not re.match(exclude_key_regex, k)}
 
-        if is_base:
+        if quantization:
             return self._add_quantization_scale_inv_tensors(hf_state_dict)
         else:
             return hf_state_dict
@@ -114,6 +114,7 @@ class DeepSeekV3StateDictAdapter(MoEStateDictMixin, StateDictAdapter):
         hf_state_dict: dict[str, Any],
         device_mesh: Optional["DeviceMesh"] = None,
         target_format: str = "auto",
+        **kwargs,
     ) -> dict[str, Any]:
         """Convert HF checkpoint to native format.
         - Dequantize FP8 tensors if scale_inv buffers are provided
@@ -147,10 +148,7 @@ def calculate_scale_shape(weight: torch.Tensor, BLOCK_SIZE: int = BLOCK_SIZE) ->
     block_rows = (orig_shape[0] + BLOCK_SIZE - 1) // BLOCK_SIZE
     block_cols = (orig_shape[1] + BLOCK_SIZE - 1) // BLOCK_SIZE
 
-    # Verify scale_inv shape matches expected block dimensions
-    expected_scale_shape = torch.Size((block_rows, block_cols))
-
-    return expected_scale_shape
+    return torch.Size((block_rows, block_cols))
 
 
 def dequantize_from_fp8(

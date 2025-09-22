@@ -100,6 +100,7 @@ def build_model_and_optimizer(
     autopipeline: AutoPipeline | None = None,
     loss_fn=None,
     parallelize_fn=None,
+    dequantize_base_checkpoint=False,
 ) -> tuple[nn.Module | AutoPipeline, list[str], list["Optimizer"], nn.Module]:  # noqa: F821
     """
     Build and initialize a model and optimizer.
@@ -192,6 +193,7 @@ def build_model_and_optimizer(
                     getattr(cfg_peft, "lora_A_init", None),
                     device_mesh=autopipeline.world_mesh,
                     moe_mesh=autopipeline.moe_mesh,
+                    quantization=dequantize_base_checkpoint,
                 )
 
             # Create optimizer for all model parts
@@ -783,6 +785,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             autopipeline=autopipeline,
             loss_fn=self.loss_fn,
             parallelize_fn=parallelize_fn,
+            dequantize_base_checkpoint=self.cfg.get("checkpoint.dequantize_base_checkpoint", False),
         )
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts

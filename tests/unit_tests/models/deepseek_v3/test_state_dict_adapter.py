@@ -242,7 +242,7 @@ class TestDeepSeekV3StateDictAdapter:
             assert "also_keep" in result
             assert "exclude_this" not in result
 
-    def test_to_hf_is_base_true(self):
+    def test_to_hf_quantization_true(self):
         config = self.create_mock_config()
         moe_config = self.create_mock_moe_config()
         backend = self.create_mock_backend_config(enable_deepep=False)
@@ -257,10 +257,55 @@ class TestDeepSeekV3StateDictAdapter:
             mock_grouped.return_value = {"converted_key": torch.randn(10, 10)}
             mock_add_quant.return_value = {"quantized_key": torch.randn(10, 10)}
 
-            result = adapter.to_hf(state_dict, is_base=True)
+            result = adapter.to_hf(state_dict, quantization=True)
 
             mock_add_quant.assert_called_once()
             assert "quantized_key" in result
+
+    def test_to_hf_quantization_false(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config(enable_deepep=False)
+
+        adapter = DeepSeekV3StateDictAdapter(config, moe_config, backend)
+
+        state_dict = {"test_key": torch.randn(10, 10)}
+
+        with patch.object(adapter, '_to_hf_grouped_experts') as mock_grouped, \
+             patch.object(adapter, '_add_quantization_scale_inv_tensors') as mock_add_quant:
+
+            weight = torch.randn(8, 8)
+            mock_grouped.return_value = {"keep_key.weight": weight.clone()}
+
+            result = adapter.to_hf(state_dict, quantization=False)
+
+            mock_add_quant.assert_not_called()
+            assert "keep_key.weight" in result
+            assert "keep_key.weight_scale_inv" not in result
+            assert result["keep_key.weight"].dtype == weight.dtype
+
+    def test_to_hf_exclude_then_quantize(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config(enable_deepep=False)
+
+        adapter = DeepSeekV3StateDictAdapter(config, moe_config, backend)
+
+        state_dict = {"test_key": torch.randn(10, 10)}
+
+        with patch.object(adapter, '_to_hf_grouped_experts') as mock_grouped:
+            mock_grouped.return_value = {
+                "keep_key.weight": torch.randn(16, 16),
+                "exclude_key.weight": torch.randn(16, 16),
+            }
+
+            result = adapter.to_hf(state_dict, exclude_key_regex=r"exclude.*", quantization=True)
+
+            assert "exclude_key.weight" not in result
+            assert not any(k.startswith("exclude_key.") for k in result.keys())
+            assert "keep_key.weight" in result
+            assert "keep_key.weight_scale_inv" in result
+            assert result["keep_key.weight"].dtype == torch.float8_e4m3fn
 
     def test_from_hf_detects_model_prefix(self):
         config = self.create_mock_config()
