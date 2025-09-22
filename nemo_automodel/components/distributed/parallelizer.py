@@ -451,11 +451,10 @@ def translate_to_torch_parallel_style(style: str):
     else:
         raise ValueError(f"Unknown parallel style: {style}")
 
+
 def validate_tp_mesh_for_nemotron_nas(model, tp_size):
     num_attention_heads = model.config.num_attention_heads
-    assert num_attention_heads % tp_size == 0, (
-        "num_attention_heads in config does not match the TP size"
-    )
+    assert num_attention_heads % tp_size == 0, "num_attention_heads in config does not match the TP size"
 
     assert len(model.config.block_configs) >= model.config.num_hidden_layers, (
         "num_hidden_layers in config does not match the number of block configs"
@@ -474,6 +473,7 @@ def validate_tp_mesh_for_nemotron_nas(model, tp_size):
                 )
             else:
                 assert model.config.block_configs[i].attention.no_op == True
+
 
 def validate_tp_mesh(model, tp_mesh):
     """
