@@ -215,25 +215,23 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         assert not sequence_parallel, "Sequence parallelism is not supported for NemotronHForCausalLM"
         assert tp_shard_plan is None, "Custom parallel plan is not supported for NemotronHForCausalLM"
 
-        tp_mesh = device_mesh[tp_mesh_name]
-        dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-        dp_mesh = device_mesh[dp_mesh_dim_names]
-
-        model_tp_plan: dict[str, ParallelStyle] = {
-            "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
-        }
-
-        mlp_tp_plan: dict[str, ParallelStyle] = {
-            "mixer.up_proj": ColwiseParallel(),
-            "mixer.down_proj": RowwiseParallel(),
-        }
-
         layers: torch.nn.ModuleList = model.backbone.layers
-        parallelize_module(model, tp_mesh, model_tp_plan)
+        tp_mesh = device_mesh[tp_mesh_name]
+        if tp_mesh.size() > 1:
+            model_tp_plan: dict[str, ParallelStyle] = {
+                "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+            }
 
-        for layer in model.backbone.layers:
-            if layer.block_type == "mlp":
-                parallelize_module(layer, tp_mesh, mlp_tp_plan)
+            mlp_tp_plan: dict[str, ParallelStyle] = {
+                "mixer.up_proj": ColwiseParallel(),
+                "mixer.down_proj": RowwiseParallel(),
+            }
+
+            parallelize_module(model, tp_mesh, model_tp_plan)
+
+            for layer in model.backbone.layers:
+                if layer.block_type == "mlp":
+                    parallelize_module(layer, tp_mesh, mlp_tp_plan)
 
         if activation_checkpointing:
             for i in range(len(layers)):
@@ -242,6 +240,9 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
 
                 if layers[i].block_type == "mamba":
                     layers[i] = checkpoint_wrapper(layers[i])
+
+        dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
+        dp_mesh = device_mesh[dp_mesh_dim_names]
 
         for layer in layers:
             fully_shard(layer, mesh=dp_mesh, mp_policy=mp_policy, offload_policy=offload_policy)

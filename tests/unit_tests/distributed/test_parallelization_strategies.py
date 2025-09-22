@@ -386,13 +386,15 @@ class TestNemotronHParallelizationStrategy:
                 tp_shard_plan={"test": ColwiseParallel()},
             )
 
+    @pytest.mark.parametrize("tp_size", [1, 2])
     @patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     def test_nemotron_specific_parallelization(self, mock_fully_shard, mock_parallelize_module,
-                                             strategy, mock_device_mesh, nemotron_model):
-        """Test NemotronH-specific parallelization logic."""
+                                             strategy, mock_device_mesh, nemotron_model, tp_size):
+        """Test NemotronH-specific parallelization logic for tp_size 1 and 2."""
         mesh, _, dp_shard_mesh, tp_mesh = mock_device_mesh
         mock_fully_shard.side_effect = lambda model, **kwargs: model
+        tp_mesh.size.return_value = tp_size
 
         result = strategy.parallelize(
             model=nemotron_model,
@@ -400,14 +402,15 @@ class TestNemotronHParallelizationStrategy:
             activation_checkpointing=False,
         )
 
-        # Should call parallelize_module for model-level TP plan
-        assert mock_parallelize_module.call_count >= 1
+        if tp_size == 1:
+            # No TP parallelization when tp_size == 1
+            assert mock_parallelize_module.call_count == 0
+        else:
+            # Should call parallelize_module for model-level TP plan
+            expected_calls = len([layer for layer in nemotron_model.backbone.layers if layer.block_type == "mlp"]) + 1  # +1 for model level
+            assert mock_parallelize_module.call_count == expected_calls
 
-        # Should call parallelize_module for each MLP layer
-        expected_calls = len([layer for layer in nemotron_model.backbone.layers if layer.block_type == "mlp"])
-        assert mock_parallelize_module.call_count == expected_calls + 1  # +1 for model level
-
-        # Should call fully_shard for each layer and the root model
+        # Should call fully_shard for each layer and the root model regardless of TP size
         expected_fully_shard_calls = len(nemotron_model.backbone.layers) + 1  # +1 for root
         assert mock_fully_shard.call_count == expected_fully_shard_calls
 
