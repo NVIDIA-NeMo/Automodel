@@ -144,8 +144,16 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             if model_parallel_plan:
                 parallelize_module(model, tp_mesh, model_parallel_plan)
 
-        # Apply activation checkpointing to MLP layers if requested
+        # Apply activation checkpointing to linear layers if requested
         if activation_checkpointing:
+            # Disable KV caching during training to ensure deterministic
+            # shapes between forward and checkpoint recomputation.
+            if hasattr(model, "config") and getattr(model.config, "use_cache", None) is not False:
+                try:
+                    model.config.use_cache = False
+                except Exception:
+                    pass
+
             for i, layer in enumerate(layers):
                 if hasattr(layer, "mlp"):
                     layers[i].mlp = checkpoint_wrapper(layer.mlp)
@@ -666,7 +674,10 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         layers.extend(model.transformer.h)
     elif hasattr(model, "model"):
         # Default case for all other models (assumed to be a causal LM)
-        layers.extend(model.model.layers)
+        if isinstance(model.model.layers, nn.ModuleDict):
+            layers.extend(model.model.layers.values())
+        else:
+            layers.extend(model.model.layers)
     elif hasattr(model, "layers"):
         layers.extend(model.layers)
     else:
@@ -766,7 +777,7 @@ def fsdp2_strategy_parallelize(
     - Polymorphic parallelization strategies for different model families
     - Custom parallel plan support (dict or string path)
     - Sequence parallel support
-    - Activation checkpointing for MLP layers
+    - Activation checkpointing for linear layers
     - Model validation (attention heads divisible by TP size)
     - Better fallback logic
 
