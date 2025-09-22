@@ -493,8 +493,14 @@ def validate_tp_mesh(model, tp_mesh):
 
     model_cls = type(model)
 
-    # There are cases like DeciLMForCausalLM is defined in transformers_modules which hardly has predefined path to import.
-    model_arch = model.config.architectures[0]
+    # There are cases like DeciLMForCausalLM is defined in transformers_modules
+    # which hardly has predefined path to import. Guard access to config/architectures.
+    model_arch = None
+    if hasattr(model, "config") and hasattr(model.config, "architectures") and model.config.architectures:
+        try:
+            model_arch = model.config.architectures[0]
+        except Exception:
+            model_arch = None
 
     if model_cls in [
         Qwen2_5_VLForConditionalGeneration,
@@ -528,7 +534,7 @@ def validate_tp_mesh(model, tp_mesh):
     elif model_cls == Gemma3ForConditionalGeneration:
         num_attention_heads = model.config.text_config.num_attention_heads
         num_key_value_heads = model.config.text_config.num_key_value_heads
-    elif model_arch == "DeciLMForCausalLM" and model.config.model_type == "nemotron-nas":
+    elif model_arch == "DeciLMForCausalLM" and getattr(model.config, "model_type", None) == "nemotron-nas":
         validate_tp_mesh_for_nemotron_nas(model, tp_mesh.size())
 
         # SKip following code and return.
