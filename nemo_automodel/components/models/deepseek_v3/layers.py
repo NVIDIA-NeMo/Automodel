@@ -12,6 +12,8 @@
 # See the License for the specific governing permissions and
 # limitations under the License.
 
+from typing import Any
+
 import torch
 from torch import nn
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
@@ -34,10 +36,10 @@ def preprocess_args_and_kwargs_for_attn(
         if attention_mask is None:
             attn_kwargs = {}
         else:
-            padding_mask = attention_mask.bool().logical_not()
+            padding_mask = attention_mask.logical_not()
             attn_kwargs = {
-                "attn_mask_type": "padding",
-                "window_size": (-1, -1),
+                "attn_mask_type": "padding_causal",
+                "window_size": (-1, 0),
                 "attention_mask": padding_mask.unsqueeze(1).unsqueeze(2),
             }
     else:  # sdpa
@@ -72,7 +74,9 @@ class MLA(nn.Module):
         self.kv_lora_rank = config.kv_lora_rank
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.qk_head_dim = config.qk_head_dim
+        self.qk_head_dim = (
+            config.qk_head_dim if hasattr(config, "qk_head_dim") else (self.qk_nope_head_dim + self.qk_rope_head_dim)
+        )
         self.v_head_dim = config.v_head_dim
 
         self.backend = backend
@@ -145,6 +149,7 @@ class MLA(nn.Module):
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        **attn_kwargs: Any,
     ):
         bsz, local_seq_len, _ = x.size()
 
