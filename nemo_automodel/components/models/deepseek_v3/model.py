@@ -129,6 +129,7 @@ class DeepseekV3Model(nn.Module):
             route_scale=config.routed_scaling_factor,
             aux_loss_coeff=0,
             norm_topk_prob=config.norm_topk_prob,
+            topk_method="tc",
         )
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = torch.nn.ModuleDict()
