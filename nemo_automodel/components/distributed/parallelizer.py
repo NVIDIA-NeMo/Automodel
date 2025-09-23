@@ -461,6 +461,29 @@ def translate_to_torch_parallel_style(style: str):
         raise ValueError(f"Unknown parallel style: {style}")
 
 
+def validate_tp_mesh_for_nemotron_nas(model, tp_size):
+    num_attention_heads = model.config.num_attention_heads
+    assert num_attention_heads % tp_size == 0, "num_attention_heads in config does not match the TP size"
+
+    assert len(model.config.block_configs) >= model.config.num_hidden_layers, (
+        "num_hidden_layers in config does not match the number of block configs"
+    )
+
+    for i in range(model.config.num_hidden_layers):
+        # Valid layer
+        if model.config.block_configs[i].attention.replace_with_linear:
+            print(f"By pass checking for linear layer in layer {i}")
+            # TODO: Check if the linear layer could support TP.
+        else:
+            if model.config.block_configs[i].attention.n_heads_in_group is not None:
+                num_key_value_heads = num_attention_heads // model.config.block_configs[i].attention.n_heads_in_group
+                assert num_key_value_heads % tp_size == 0, (
+                    f"layer {i}: num_key_value_heads in config does not match the TP size"
+                )
+            else:
+                assert model.config.block_configs[i].attention.no_op == True
+
+
 def validate_tp_mesh(model, tp_mesh):
     """
     Validate that attention heads and key value heads are divisible by TP size
@@ -469,6 +492,15 @@ def validate_tp_mesh(model, tp_mesh):
         return  # if tp_mesh.size() == 1, we don't need to validate
 
     model_cls = type(model)
+
+    # There are cases like DeciLMForCausalLM is defined in transformers_modules
+    # which hardly has predefined path to import. Guard access to config/architectures.
+    model_arch = None
+    if hasattr(model, "config") and hasattr(model.config, "architectures") and model.config.architectures:
+        try:
+            model_arch = model.config.architectures[0]
+        except Exception:
+            model_arch = None
 
     if model_cls in [
         Qwen2_5_VLForConditionalGeneration,
@@ -502,6 +534,11 @@ def validate_tp_mesh(model, tp_mesh):
     elif model_cls == Gemma3ForConditionalGeneration:
         num_attention_heads = model.config.text_config.num_attention_heads
         num_key_value_heads = model.config.text_config.num_key_value_heads
+    elif model_arch == "DeciLMForCausalLM" and getattr(model.config, "model_type", None) == "nemotron-nas":
+        validate_tp_mesh_for_nemotron_nas(model, tp_mesh.size())
+
+        # SKip following code and return.
+        return
     elif hasattr(model, "config"):
         num_attention_heads = getattr(model.config, "num_attention_heads", 0)
         num_key_value_heads = getattr(model.config, "num_key_value_heads", 0)
