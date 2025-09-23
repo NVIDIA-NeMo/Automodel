@@ -110,7 +110,6 @@ class DeepSeekV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         self,
         hf_state_dict: dict[str, Any],
         device_mesh: Optional["DeviceMesh"] = None,
-        target_format: str = "auto",
         **kwargs,
     ) -> dict[str, Any]:
         """Convert HF checkpoint to native format.
