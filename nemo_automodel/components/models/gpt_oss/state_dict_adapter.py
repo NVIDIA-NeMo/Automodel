@@ -65,7 +65,9 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
             new_state_dict[new_key] = value
         return new_state_dict
 
-    def to_hf(self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None) -> dict[str, Any]:
+    def to_hf(
+        self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
+    ) -> dict[str, Any]:
         """Convert from native model state dict to HuggingFace format."""
         hf_state_dict = dict(state_dict)
         hf_state_dict = self._apply_key_mapping(hf_state_dict, self.internal_to_hf_map)
@@ -80,7 +82,7 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         self,
         hf_state_dict: dict[str, Any],
         device_mesh: Optional["DeviceMesh"] = None,
-        target_format: str = "auto",
+        **kwargs,
     ) -> dict[str, Any]:
         """Convert HF checkpoint to native format.
         - Apply key mappings from HF to internal format
