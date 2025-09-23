@@ -263,6 +263,7 @@ class TestGptOssAttention:
         assert attention.o_proj.in_features == gpt_config.num_attention_heads * gpt_config.head_dim
         assert attention.o_proj.out_features == gpt_config.hidden_size
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_forward_shape_correctness(self, gpt_config, backend_config, device):
         """Test forward pass output shapes."""
         attention = GptOssAttention(gpt_config, backend_config)
@@ -304,6 +305,7 @@ class TestGptOssAttention:
         except Exception as e:
             pytest.fail(f"GPU forward pass failed: {e}")
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_init_weights(self, gpt_config, backend_config, device):
         """Test weight initialization."""
         attention = GptOssAttention(gpt_config, backend_config)
@@ -318,6 +320,7 @@ class TestGptOssAttention:
         assert not torch.equal(attention.q_proj.weight, original_q_weight)
         assert not torch.equal(attention.sinks, original_sinks)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_rotary_embedding_application(self, gpt_config, backend_config, device):
         """Test that rotary embedding is correctly applied to q and k."""
         attention = GptOssAttention(gpt_config, backend_config)

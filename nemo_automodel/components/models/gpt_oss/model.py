@@ -107,12 +107,14 @@ class GptOssModel(nn.Module):
         # Rotary embedding cached at model-level (inv_freq + concentration via YaRN/NTK-by-parts)
         self.max_seq_len = config.max_position_embeddings
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        rope_scaling = getattr(config, "rope_scaling", None) or {
-            "factor": 1.0,
-            "beta_fast": 32.0,
-            "beta_slow": 1.0,
-            "original_max_position_embeddings": self.max_seq_len,
-        }
+        rope_scaling = getattr(config, "rope_scaling", None)
+        if rope_scaling is None:
+            rope_scaling = {
+                "factor": 1.0,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0,
+                "original_max_position_embeddings": 4096,
+            }
         self.rotary_emb = RotaryEmbedding(
             head_dim=self.head_dim,
             base=getattr(config, "rope_theta", 10000.0),

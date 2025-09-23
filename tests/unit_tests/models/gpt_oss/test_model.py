@@ -47,6 +47,14 @@ def gpt_config():
         num_local_experts=8,
         num_experts_per_tok=2,
         router_aux_loss_coef=0.01,
+        rope_scaling={
+            "rope_type": "yarn",
+            "factor": 32.0,
+            "beta_fast": 32.0,
+            "beta_slow": 1.0,
+            "truncate": False,
+            "original_max_position_embeddings": 4096,
+        }
     )
 
 
@@ -109,6 +117,7 @@ class TestBlock:
         # Verify sliding window is set correctly in attention
         assert block.self_attn.sliding_window == gpt_config.sliding_window
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_forward_shape_preservation(self, gpt_config, moe_config, backend_config, device):
         """Test that Block forward preserves input shape."""
         block = Block(0, gpt_config, moe_config, backend_config)
@@ -132,6 +141,7 @@ class TestBlock:
             assert output.shape == x.shape
             assert output.device == device
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_forward_with_attention_mask(self, gpt_config, moe_config, backend_config, device):
         """Test Block forward with attention mask."""
         block = Block(0, gpt_config, moe_config, backend_config)
