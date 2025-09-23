@@ -195,7 +195,10 @@ def build_model_and_optimizer(
                         moe_mesh=autopipeline.moe_mesh,
                     )
                 else:
-                    model.init_weights()
+                    from nemo_automodel.components.checkpoint.checkpointing import to_empty_parameters_only
+
+                    to_empty_parameters_only(model, device=device)
+                    model.initialize_weights()
 
             # Create optimizer for all model parts
             trainable_params = []
@@ -263,8 +266,10 @@ def build_model_and_optimizer(
                     moe_mesh=getattr(model_wrapper, "moe_mesh", None),
                 )
             else:
-                model.init_weights()
+                from nemo_automodel.components.checkpoint.checkpointing import to_empty_parameters_only
 
+                to_empty_parameters_only(model, device=device)
+                model.initialize_weights()
 
         # ensure the model is on device
         model = model.to(device)
