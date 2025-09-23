@@ -22,7 +22,6 @@ from nemo_automodel.components.models.gpt_oss.model import Block, GptOssForCausa
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
 from nemo_automodel.components.moe.utils import BackendConfig
 
-
 @pytest.fixture
 def device():
     if torch.cuda.is_available():
@@ -212,6 +211,7 @@ class TestBlock:
             mock_mlp_init.assert_called_once_with(device)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 class TestGptOssModel:
     """Test GptOssModel."""
 
@@ -336,6 +336,7 @@ class TestGptOssModel:
             assert model.rotary_emb.device == device
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 class TestGptOssForCausalLM:
     """Test GptOssForCausalLM."""
 
