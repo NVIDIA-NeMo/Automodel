@@ -197,7 +197,7 @@ def build_model_and_optimizer(
                 else:
                     from nemo_automodel.components.checkpoint.checkpointing import to_empty_parameters_only
 
-                    #to_empty_parameters_only(model, device=device)
+                    to_empty_parameters_only(model, device=device)
                     model.initialize_weights()
 
             # Create optimizer for all model parts
@@ -268,7 +268,7 @@ def build_model_and_optimizer(
             else:
                 from nemo_automodel.components.checkpoint.checkpointing import to_empty_parameters_only
 
-                #to_empty_parameters_only(model, device=device)
+                to_empty_parameters_only(model, device=device)
                 model.initialize_weights()
 
         # ensure the model is on device
