@@ -24,6 +24,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from nemo_automodel.components.datasets.llm.megatron.builder import BlendedMegatronDatasetBuilder
 from nemo_automodel.components.datasets.llm.megatron.gpt_dataset import GPTDatasetConfig
 from nemo_automodel.components.datasets.llm.megatron.megatron_utils import compile_helper, get_blend_from_list
+import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
@@ -94,13 +95,13 @@ class MegatronPretraining:
             splits_to_build (Optional[Union[str, List[str]]]): Splits to build. If None, builds all splits.
         """
         if find_spec("nemo_automodel.components.datasets.llm.megatron.helpers_cpp") is None:
-            try:
+            if dist.is_available() and dist.is_initialized():
+                if dist.get_rank() == 0:
+                    compile_helper()
+                dist.barrier()
+            else:
                 compile_helper()
-                assert find_spec("nemo_automodel.components.datasets.llm.megatron.helpers_cpp") is not None
-            except AssertionError:
-                raise ImportError(
-                    "Could not compile megatron dataset C++ helper functions and therefore cannot import helpers python file."
-                )
+            assert find_spec("nemo_automodel.components.datasets.llm.megatron.helpers_cpp") is not None
 
         if not isinstance(paths, (list, tuple, dict)):
             paths = get_list_of_files(paths)
