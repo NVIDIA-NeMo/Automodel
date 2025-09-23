@@ -236,24 +236,24 @@ def load_model_from_base_checkpoint(
             )
 
     # init peft adapters with the scaled weights
-    _init_peft_adapters(model, peft_init_method)
+    # _init_peft_adapters(model, peft_init_method)
 
-    load_model(
-        model,
-        model_path=model_name if os.path.exists(model_name) else get_safetensors_index_path(root_dir, model_name),
-        model_save_format=SerializationFormat.SAFETENSORS,
-        is_peft=is_peft,
-        is_init_step=True,
-        use_checkpoint_id=False,
-        key_mapping=getattr(model, "_checkpoint_conversion_mapping", None),
-        load_peft_adapters=False,
-        moe_mesh=moe_mesh,
-        quantization=quantization,
-    )
+    # load_model(
+    #     model,
+    #     model_path=model_name if os.path.exists(model_name) else get_safetensors_index_path(root_dir, model_name),
+    #     model_save_format=SerializationFormat.SAFETENSORS,
+    #     is_peft=is_peft,
+    #     is_init_step=True,
+    #     use_checkpoint_id=False,
+    #     key_mapping=getattr(model, "_checkpoint_conversion_mapping", None),
+    #     load_peft_adapters=False,
+    #     moe_mesh=moe_mesh,
+    #     quantization=quantization,
+    # )
 
-    is_tied_lm_head = getattr(getattr(model, "config", {}), "tie_word_embeddings", False)
-    if hasattr(model, "tie_weights") and is_tied_lm_head:
-        model.tie_weights()
+    # is_tied_lm_head = getattr(getattr(model, "config", {}), "tie_word_embeddings", False)
+    # if hasattr(model, "tie_weights") and is_tied_lm_head:
+    #     model.tie_weights()
 
 
 def load_model(
