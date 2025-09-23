@@ -29,7 +29,7 @@ class StateDictAdapter(ABC):
     """
 
     @abstractmethod
-    def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+    def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
         """Convert from native model state dict to HuggingFace format.
 
         Args:
@@ -42,7 +42,10 @@ class StateDictAdapter(ABC):
 
     @abstractmethod
     def from_hf(
-        self, hf_state_dict: dict[str, Any], device_mesh: Optional["DeviceMesh"] = None, target_format: str = "auto"
+        self,
+        hf_state_dict: dict[str, Any],
+        device_mesh: Optional["DeviceMesh"] = None,
+        **kwargs,
     ) -> dict[str, Any]:
         """Obtain native model state dict from HuggingFace format.
 
@@ -50,7 +53,6 @@ class StateDictAdapter(ABC):
             hf_state_dict: The HuggingFace format state dict
             device_mesh: Optional device mesh for DTensor expert parallelism.
                         If provided, only loads experts needed for the current rank.
-            target_format: Target format for the conversion ("auto", "grouped_experts" or "deepep")
 
         Returns:
             The converted native model state dict
