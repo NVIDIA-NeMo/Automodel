@@ -40,6 +40,7 @@ from wandb import Settings
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig, load_model_from_base_checkpoint
+from nemo_automodel.components.checkpoint.checkpointing import initialize_model_randomly
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
@@ -183,16 +184,19 @@ def build_model_and_optimizer(
         else:
             autopipeline.build(model, loss_fn=loss_fn, parallelize_fn=parallelize_fn)
             for mp in autopipeline.parts:
-                load_model_from_base_checkpoint(
-                    mp,
-                    device,
-                    cfg_peft is not None,
-                    cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
-                    cfg_model.pretrained_model_name_or_path,
-                    getattr(cfg_peft, "lora_A_init", None),
-                    device_mesh=autopipeline.world_mesh,
-                    moe_mesh=autopipeline.moe_mesh,
-                )
+                if cfg_model.get("load_base_checkpoint", True):
+                    load_model_from_base_checkpoint(
+                        mp,
+                        device,
+                        cfg_peft is not None,
+                        cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
+                        cfg_model.pretrained_model_name_or_path,
+                        getattr(cfg_peft, "lora_A_init", None),
+                        device_mesh=autopipeline.world_mesh,
+                        moe_mesh=autopipeline.moe_mesh,
+                    )
+                else:
+                    model.init_weights()
 
             # Create optimizer for all model parts
             trainable_params = []
@@ -248,16 +252,20 @@ def build_model_and_optimizer(
 
         # Load the weights into the model in parallel.
         if is_meta_device and load_weights:
-            load_model_from_base_checkpoint(
-                model,
-                device,
-                cfg_peft is not None,
-                cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
-                cfg_model.pretrained_model_name_or_path,
-                getattr(cfg_peft, "lora_A_init", None),
-                device_mesh=model_wrapper.device_mesh,
-                moe_mesh=getattr(model_wrapper, "moe_mesh", None),
-            )
+            if cfg_model.get("load_base_checkpoint", True):
+                load_model_from_base_checkpoint(
+                    model,
+                    device,
+                    cfg_peft is not None,
+                    cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
+                    cfg_model.pretrained_model_name_or_path,
+                    getattr(cfg_peft, "lora_A_init", None),
+                    device_mesh=model_wrapper.device_mesh,
+                    moe_mesh=getattr(model_wrapper, "moe_mesh", None),
+                )
+            else:
+                model.init_weights()
+
 
         # ensure the model is on device
         model = model.to(device)
