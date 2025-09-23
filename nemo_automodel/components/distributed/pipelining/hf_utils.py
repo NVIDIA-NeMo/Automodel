@@ -91,6 +91,14 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         position_embeddings = None
         if hasattr(self, "rotary_emb") and self.rotary_emb is not None:
             position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        elif hasattr(self, "freqs_cis") and getattr(self, "freqs_cis", None) is not None:
+            try:
+                from nemo_automodel.components.moe.rope_utils import freqs_cis_from_position_ids
+
+                freqs = self.freqs_cis.to(hidden_states.device)
+                position_embeddings = freqs_cis_from_position_ids(position_ids, freqs)
+            except Exception:
+                position_embeddings = None
 
         if hasattr(self, "layers") and self.layers is not None:
             # Works for dict-like or list-like containers

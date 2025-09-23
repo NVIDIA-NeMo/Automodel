@@ -48,7 +48,7 @@ class Block(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+        freqs_cis: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         **kwargs: Any,
@@ -67,6 +67,9 @@ class Block(nn.Module):
         """
         if attention_mask is not None and padding_mask is None:
             padding_mask = attention_mask.bool().logical_not()
+
+        if freqs_cis is None:
+            freqs_cis = kwargs.get("position_embeddings", None)
 
         attn_out = self.self_attn(
             x=self.input_layernorm(x),
