@@ -51,6 +51,7 @@ class Block(nn.Module):
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Forward pass for the Transformer block.
