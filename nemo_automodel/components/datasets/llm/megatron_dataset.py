@@ -96,10 +96,8 @@ class MegatronPretraining:
         """
         if find_spec("nemo_automodel.components.datasets.llm.megatron.helpers_cpp") is None:
             if dist.is_available() and dist.is_initialized():
-                if dist.get_rank() == 0:
-                    print("*" * 100)
+                if int(os.environ.get("LOCAL_RANK")) == 0:
                     print("Compiling megatron dataset C++ helper functions")
-                    print("*" * 100)
                     compile_helper()
                 dist.barrier()
             else:
