@@ -67,11 +67,8 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
             # Router mapping
             "mlp.router.weight": "mlp.gate.weight",
             "mlp.router.bias": "mlp.gate.bias",
-            # Expert projection mappings (when enable_deepep=True, use gate_and_up_projs)
             "mlp.experts.gate_up_proj": "mlp.experts.gate_and_up_projs",
-            # "mlp.experts.gate_up_proj_bias": "mlp.experts.gate_and_up_bias" if backend.enable_deepep else None,
             "mlp.experts.down_proj": "mlp.experts.down_projs",
-            # "mlp.experts.down_proj_bias": "mlp.experts.down_bias",
         }
 
         # Reverse mapping for to_hf conversion
@@ -93,7 +90,7 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         for key in keys_to_remove:
             del state_dict[key]
         return new_state_dict
-    
+
     def _add_quantization_block_scale_tensors(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         for key, value in list(state_dict.items()):
             if key.endswith("gate_up_proj") or key.endswith("down_proj"):
@@ -102,8 +99,12 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
                 layer_name, projection_type = key.rsplit(".", 1)
                 placements, device_mesh = value.placements, value.device_mesh
                 n_experts, _, dim = value.shape
-                blocks_tensors = torch.distributed.tensor.ones((n_experts, dim, 90, 16), placements=placements, device_mesh=device_mesh, dtype=torch.uint8)
-                scales_tensors = torch.distributed.tensor.ones((n_experts, dim, 90), placements=placements, device_mesh=device_mesh, dtype=torch.uint8)
+                blocks_tensors = torch.distributed.tensor.ones(
+                    (n_experts, dim, 90, 16), placements=placements, device_mesh=device_mesh, dtype=torch.uint8
+                )
+                scales_tensors = torch.distributed.tensor.ones(
+                    (n_experts, dim, 90), placements=placements, device_mesh=device_mesh, dtype=torch.uint8
+                )
                 state_dict[f"{layer_name}.{projection_type}_blocks"] = blocks_tensors
                 state_dict[f"{layer_name}.{projection_type}_scales"] = scales_tensors
 
@@ -115,7 +116,7 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         torch.cuda.empty_cache()
         gc.collect()
         return state_dict
-    
+
     def _dequantize_block_scale_tensors(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         layer_name_to_quantized_weights = defaultdict(dict)
 
@@ -130,12 +131,11 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         for layer_name, quantized_dict in layer_name_to_quantized_weights.items():
             dequantized_weights = self._convert_moe_packed_tensors(quantized_dict["blocks"], quantized_dict["scales"])
             state_dict[layer_name] = dequantized_weights
-        
+
         # clean up the memory
         torch.cuda.empty_cache()
         gc.collect()
         return state_dict
-
 
     def _convert_moe_packed_tensors(
         self,
@@ -166,7 +166,9 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         blocks = blocks.reshape(rows_total, B)
         scales = scales.reshape(rows_total, 1)
 
-        out = torch.distributed.tensor.empty((rows_total, B * 2), placements=blocks.placements, device_mesh=blocks.device_mesh, dtype=dtype)
+        out = torch.distributed.tensor.empty(
+            (rows_total, B * 2), placements=blocks.placements, device_mesh=blocks.device_mesh, dtype=dtype
+        )
 
         for r0 in range(0, rows_total, rows_per_chunk):
             r1 = min(r0 + rows_per_chunk, rows_total)
@@ -197,8 +199,9 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         del blocks, scales, lut
         return out.transpose(1, 2).contiguous()
 
-
-    def to_hf(self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs) -> dict[str, Any]:
+    def to_hf(
+        self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
+    ) -> dict[str, Any]:
         """Convert from native model state dict to HuggingFace format."""
         hf_state_dict = dict(state_dict)
         hf_state_dict = self._apply_key_mapping(hf_state_dict, self.internal_to_hf_map)
@@ -218,7 +221,7 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         **kwargs,
     ) -> dict[str, Any]:
         """Convert HF checkpoint to native format.
-        - Apply key mappings from HF to internal format        
+        - Apply key mappings from HF to internal format
         - Add quantization block and scale tensors
         """
         # Detect model prefix usage
@@ -228,7 +231,7 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
                 break
 
         native_state_dict = dict(hf_state_dict)
-        # native_state_dict = self._dequantize_block_scale_tensors(native_state_dict)
+        native_state_dict = self._dequantize_block_scale_tensors(native_state_dict)
         native_state_dict = self._apply_key_mapping(native_state_dict, self.hf_to_internal_map)
 
         return native_state_dict
