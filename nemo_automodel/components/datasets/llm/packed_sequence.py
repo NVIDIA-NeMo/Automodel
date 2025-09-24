@@ -169,7 +169,7 @@ def _split_and_add_pack(current_pack: PACK_TYPE, packs: list[PACK_TYPE], split_a
     return output_dict
 
 
-def pack_dataset(dataset, split, packed_sequence_size, split_across_pack=False, max_packs=None, padding_idx=0):
+def pack_dataset(dataset, split=None, packed_sequence_size, split_across_pack=False, max_packs=None, padding_idx=0):
     """
     Pack the dataset to defined length.
 
@@ -187,7 +187,8 @@ def pack_dataset(dataset, split, packed_sequence_size, split_across_pack=False, 
         max_packs (int): Maximum number of packs. Default: None
     """
     packs: list[PACK_TYPE] = []
-
+    if split is not None:
+        dataset = dataset[split]
 
     # Buffer to hold samples until they are long enough to be added to packs
     current_pack = {
