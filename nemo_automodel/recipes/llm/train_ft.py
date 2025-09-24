@@ -411,6 +411,8 @@ def build_dataloader(
         # Apply packing if configured
         if packed_sequence_size > 0:
             logger.info(f"Packing dataset with size: {packed_sequence_size}")
+            if hasattr(ds, "shuffle"):
+                ds = ds.shuffle(seed)
             ds = pack_dataset(
                 ds,
                 split=cfg_ds.split,  # Assumes split is defined in dataset config
