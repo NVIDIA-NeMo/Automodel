@@ -35,9 +35,9 @@ rng:
   seed: 1111
   ranked: true
 
-parallelize_fn:
-  _target_: nemo_automodel.components.models.deepseek_v3.parallelizer.parallelize_model
-  activation_checkpointing: false
+parallelizer:
+  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
+  enable_ac: false
 
 model:
   _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_config

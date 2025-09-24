@@ -209,7 +209,7 @@ def build_model_and_optimizer(
     else:
         load_weights = False
         if parallelize_fn is not None and get_world_size_safe() > 1:
-            parallelize_fn.instantiate(
+            parallelize_fn(
                 model,
                 world_mesh=model_wrapper.device_mesh,
                 moe_mesh=getattr(model_wrapper, "moe_mesh", None),

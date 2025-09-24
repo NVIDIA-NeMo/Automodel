@@ -182,7 +182,7 @@ def parallelize_model(
     tp_axis_name: str | None = None,
     ep_axis_name: str | None = None,
     ep_shard_axis_names: tuple[str, ...] | None = None,
-    enable_ac: bool = False,
+    activation_checkpointing: bool = False,
 ):
     assert tp_axis_name is None or world_mesh[tp_axis_name].size() == 1, (
         "Tensor parallelism not supported for DeepSeek v3 model"
@@ -204,7 +204,7 @@ def parallelize_model(
 
         apply_ep(model, moe_mesh[ep_axis_name])
 
-    if enable_ac:
+    if activation_checkpointing:
         apply_ac(model)
 
     if ep_shard_axis_names is not None:
