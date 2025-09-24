@@ -14,17 +14,14 @@ dist_env:
 
 # Option 2 – explicit HF config (uncomment to use)
 model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
-  config:
-    _target_: transformers.GPT2Config
-    vocab_size: 50258
-    n_positions: 2048
-    n_ctx: 2048
-    n_embd: 768
-    n_layer: 2
-    n_head: 12
-    bos_token_id: 50256
-    eos_token_id: 50256
+  _target_: nemo_automodel.components.models.gpt2.build_gpt2_model
+  vocab_size: 50258   # default 50257
+  n_positions: 2048   # context length
+  n_embd: 768         # hidden size
+  n_layer: 2         # number of transformer blocks
+  n_head: 12          # attention heads
+  bos_token_id: 50256
+  eos_token_id: 50256
 
 # Dataset
 # Point this to the location where your *.bin shards live.

@@ -41,10 +41,14 @@ Here’s a glimpse of what the data looks like:
 For the purposes of this guide, we will be using the FineWeb-Edu 10BT subset which is a subset randomly sampled from FineWeb-Edu of around 10B tokens. In order to prepare the dataset, follow the following commands:
 
 ```bash
+# run this inside the Automodel directory
+
 git clone https://github.com/facebookresearch/lingua.git
 cd lingua
 pip install -r requirements.txt
 python setup/download_prepare_hf_data.py fineweb_edu_10bt <MEMORY> --data_dir <DATA_DIR> --seed 42 --nchunks 1
+cd ..
+mv lingua/fineweb_edu .
 ```
 `<MEMORY>` can be replaced with how much system memory `terashuf` (the tool used to shuffle samples) will be allocated, and `<DATA_DIR>` is the root directory where the data will be stored. An example command you can run is:
 ```bash
@@ -109,7 +113,7 @@ fineweb_edu/
 NeMo AutoModel provides tooling to perform the task of tokenizing and saving in the Megatron-Core dataset format. This can be used as follows:
 
 ```
-uv run tools/preprocess_megatron_dataset.py --input fineweb_edu/fineweb_edu_10bt/fineweb_edu_10bt.chunk.*.jsonl --json-keys text --output-prefix processed_data --output-path fineweb_edu/megatron_gpt2/ --workers 8 --pretrained-model-name-or-path openai-community/gpt2 --append-eod
+uv run tools/preprocess_megatron_dataset.py --input "fineweb_edu/fineweb_edu_10bt/fineweb_edu_10bt.chunk.*.jsonl" --json-keys text --output-prefix processed_data --output-path fineweb_edu/megatron_gpt2/ --workers 8 --pretrained-model-name-or-path openai-community/gpt2 --append-eod
 ```
 
 The directory should look like this:

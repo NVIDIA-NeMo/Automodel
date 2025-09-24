@@ -73,8 +73,8 @@ class TestPreprocessArgsAndKwargsForAttn:
 
         expected_keys = {"attn_mask_type", "window_size", "attention_mask"}
         assert set(attn_kwargs.keys()) == expected_keys
-        assert attn_kwargs["attn_mask_type"] == "padding"
-        assert attn_kwargs["window_size"] == (-1, -1)
+        assert attn_kwargs["attn_mask_type"] == "padding_causal"
+        assert attn_kwargs["window_size"] == (-1, 0)
 
         # Check padding mask shape and values
         padding_mask = attn_kwargs["attention_mask"]

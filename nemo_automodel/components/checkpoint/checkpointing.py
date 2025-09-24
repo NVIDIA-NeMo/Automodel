@@ -61,6 +61,7 @@ class CheckpointingConfig:
     save_consolidated: bool
     is_peft: bool
     model_state_dict_keys: list[str]  # copy of the model state dict keys before any parallelization
+    dequantize_base_checkpoint: bool = False
 
     def __post_init__(self):
         """
@@ -197,6 +198,7 @@ def load_model_from_base_checkpoint(
     peft_init_method: str,
     device_mesh: Optional[DeviceMesh] = None,
     moe_mesh: Optional[DeviceMesh] = None,
+    quantization: bool = False,
 ):
     """
     Load a model from the base Hugging Face checkpoint in parallel.
@@ -246,6 +248,7 @@ def load_model_from_base_checkpoint(
         key_mapping=getattr(model, "_checkpoint_conversion_mapping", None),
         load_peft_adapters=False,
         moe_mesh=moe_mesh,
+        quantization=quantization,
     )
 
     is_tied_lm_head = getattr(getattr(model, "config", {}), "tie_word_embeddings", False)
@@ -264,6 +267,7 @@ def load_model(
     key_mapping: Optional[dict[str, str]] = None,
     load_peft_adapters: bool = True,
     moe_mesh: Optional[DeviceMesh] = None,
+    quantization: bool = False,
 ):
     """
     Load a model state dictionary from a weights path.
@@ -302,7 +306,7 @@ def load_model(
         state_dict_adapter = getattr((model[0] if isinstance(model, list) else model), "state_dict_adapter", None)
         if state_dict_adapter:
             reinstated_state_dict = state_dict_adapter.to_hf(
-                reinstated_state_dict, exclude_key_regex=r".*_extra_state.*"
+                reinstated_state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization
             )
 
         dcp.load(

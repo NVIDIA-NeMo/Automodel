@@ -51,6 +51,8 @@ class Block(nn.Module):
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        **attn_kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Forward pass for the Transformer block.
@@ -71,24 +73,25 @@ class Block(nn.Module):
             x=self.input_layernorm(x),
             freqs_cis=freqs_cis,
             attention_mask=attention_mask,
+            **attn_kwargs,
         )
         x = x + attn_out
 
-        mlp_out, aux_loss = self._mlp(
+        mlp_out = self._mlp(
             x=self.post_attention_layernorm(x),
             padding_mask=padding_mask,
         )
         x = x + mlp_out
 
-        return x, aux_loss
+        return x
 
     def _mlp(
         self,
         x: torch.Tensor,
         padding_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> torch.Tensor:
         if isinstance(self.mlp, MLP):
-            return self.mlp(x), None
+            return self.mlp(x)
         else:
             assert isinstance(self.mlp, MoE)
             return self.mlp(x, padding_mask)
@@ -152,6 +155,7 @@ class DeepseekV3Model(nn.Module):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if position_ids is None:
@@ -165,19 +169,15 @@ class DeepseekV3Model(nn.Module):
         h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
 
         # Apply the transformer layers.
-        aux_losses = []
         for layer in self.layers.values():
-            h, aux_loss = layer(
+            h = layer(
                 x=h,
                 freqs_cis=freqs_cis,
+                attention_mask=attention_mask,
                 padding_mask=padding_mask,
+                seq_lens=seq_lens,
+                **attn_kwargs,
             )
-            if aux_loss is not None:
-                aux_losses.append(aux_loss)
-
-        # Aux loss is currently not supported for DeepseekV3.
-        # TODO: add support for aux loss
-        # final_aux_loss = torch.stack(aux_losses).mean() if aux_losses else None
 
         h = self.norm(h) if self.norm else h
         return h
@@ -248,6 +248,7 @@ class DeepseekV3ForCausalLM(nn.Module):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
         logits = self.model(
@@ -255,6 +256,7 @@ class DeepseekV3ForCausalLM(nn.Module):
             position_ids=position_ids,
             attention_mask=attention_mask,
             padding_mask=padding_mask,
+            seq_lens=seq_lens,
             **attn_kwargs,
         )
         logits = self.lm_head(logits) if self.lm_head else logits
