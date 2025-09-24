@@ -19,7 +19,7 @@ import re
 
 skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")
 
-from nemo_automodel.components.moe.state_dict_mixin import MoEStateDictMixin
+from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
 
 
 class MockMoEConfig:
@@ -38,7 +38,7 @@ class MockBackend:
         pass
 
 
-class MockMoEStateDictMixin(MoEStateDictMixin):
+class MockMoEStateDictMixin(MoESplitExpertsStateDictMixin):
     def __init__(self, n_experts=8, inter_dim=512, dtype=torch.float32, uses_model_prefix=True):
         self.moe_config = MockMoEConfig(n_experts, inter_dim)
         self.config = MockConfig()
@@ -224,30 +224,27 @@ class TestConcatenateExpertWeights:
         assert result.shape == (2, 512, 1024)
 
 
-class TestToHfGroupedExperts:
+class TestToHfWSplitExperts:
     @patch("nemo_automodel.components.moe.state_dict_mixin.is_dtensor")
     def test_gate_projs_conversion(self, mock_is_dtensor):
         mock_is_dtensor.return_value = False
 
         mixin = MockMoEStateDictMixin(n_experts=4)
 
-        # Mock the _split_experts_weights method
-        gate_weights = [torch.randn(512, 1024) for _ in range(4)]
-        mixin._split_experts_weights = Mock(return_value=gate_weights)
-        mixin._last_expert_ids = [0, 1, 2, 3]
-
+        # DeepEP input: gate_and_up_projs [n_experts, dim, 2*inter_dim]
         state_dict = {
-            "model.layers.0.mlp.experts.gate_projs": torch.randn(4, 512, 1024),
-            "other_weight": torch.randn(10, 10)
+            "model.layers.0.mlp.experts.gate_and_up_projs": torch.randn(4, 1024, 1024),
+            "other_weight": torch.randn(10, 10),
         }
 
-        result = mixin._to_hf_grouped_experts(state_dict)
+        result = mixin._to_hf_w_split_experts(state_dict)
 
-        # Check that gate_proj weights were split correctly
+        # Check that gate_proj and up_proj weights were created
         for expert_id in range(4):
-            expected_key = f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"
-            assert expected_key in result
-            assert torch.equal(result[expected_key], gate_weights[expert_id])
+            gate_key = f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"
+            up_key = f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight"
+            assert gate_key in result
+            assert up_key in result
 
         # Check that other weights are preserved
         assert "other_weight" in result
@@ -258,19 +255,16 @@ class TestToHfGroupedExperts:
 
         mixin = MockMoEStateDictMixin(n_experts=4)
 
-        up_weights = [torch.randn(512, 1024) for _ in range(4)]
-        mixin._split_experts_weights = Mock(return_value=up_weights)
-        mixin._last_expert_ids = [0, 1, 2, 3]
-
+        # DeepEP input for layer 1
         state_dict = {
-            "model.layers.1.mlp.experts.up_projs": torch.randn(4, 512, 1024),
+            "model.layers.1.mlp.experts.gate_and_up_projs": torch.randn(4, 1024, 1024),
         }
 
-        result = mixin._to_hf_grouped_experts(state_dict)
+        result = mixin._to_hf_w_split_experts(state_dict)
 
         for expert_id in range(4):
-            expected_key = f"model.layers.1.mlp.experts.{expert_id}.up_proj.weight"
-            assert expected_key in result
+            up_key = f"model.layers.1.mlp.experts.{expert_id}.up_proj.weight"
+            assert up_key in result
 
     @patch("nemo_automodel.components.moe.state_dict_mixin.is_dtensor")
     def test_down_projs_conversion(self, mock_is_dtensor):
@@ -278,19 +272,16 @@ class TestToHfGroupedExperts:
 
         mixin = MockMoEStateDictMixin(n_experts=4)
 
-        down_weights = [torch.randn(1024, 512) for _ in range(4)]
-        mixin._split_experts_weights = Mock(return_value=down_weights)
-        mixin._last_expert_ids = [0, 1, 2, 3]
-
+        # DeepEP down_projs: [n_experts, inter_dim, dim]
         state_dict = {
-            "model.layers.2.mlp.experts.down_projs": torch.randn(4, 1024, 512),
+            "model.layers.2.mlp.experts.down_projs": torch.randn(4, 512, 1024),
         }
 
-        result = mixin._to_hf_grouped_experts(state_dict)
+        result = mixin._to_hf_w_split_experts(state_dict)
 
         for expert_id in range(4):
-            expected_key = f"model.layers.2.mlp.experts.{expert_id}.down_proj.weight"
-            assert expected_key in result
+            down_key = f"model.layers.2.mlp.experts.{expert_id}.down_proj.weight"
+            assert down_key in result
 
     @patch("nemo_automodel.components.moe.state_dict_mixin.validate_dtensor_expert_sharding")
     @patch("nemo_automodel.components.moe.state_dict_mixin.is_dtensor")
@@ -299,41 +290,40 @@ class TestToHfGroupedExperts:
 
         mixin = MockMoEStateDictMixin(n_experts=4)
 
-        gate_weights = [torch.randn(512, 1024) for _ in range(4)]
-        mixin._split_experts_weights = Mock(return_value=gate_weights)
+        # Mock split to avoid depending on dtensor internals
+        combined_weights = [torch.randn(1024, 1024) for _ in range(4)]
+        mixin._split_experts_weights = Mock(return_value=combined_weights)
         mixin._last_expert_ids = [0, 1, 2, 3]
 
         mock_dtensor = Mock()
         state_dict = {
-            "model.layers.0.mlp.experts.gate_projs": mock_dtensor,
+            "model.layers.0.mlp.experts.gate_and_up_projs": mock_dtensor,
         }
 
-        result = mixin._to_hf_grouped_experts(state_dict)
+        result = mixin._to_hf_w_split_experts(state_dict)
 
-        mock_validate.assert_called_once_with(mock_dtensor, 4, "gate_projs layer 0")
+        mock_validate.assert_called_once_with(mock_dtensor, 4, "gate_and_up_projs layer 0")
 
     def test_without_model_prefix(self):
         mixin = MockMoEStateDictMixin(n_experts=4, uses_model_prefix=False)
 
         with patch.object(mixin, '_split_experts_weights') as mock_split:
-            gate_weights = [torch.randn(512, 1024) for _ in range(4)]
-            mock_split.return_value = gate_weights
+            gate_and_up_weights = [torch.randn(1024, 1024) for _ in range(4)]
+            mock_split.return_value = gate_and_up_weights
             mixin._last_expert_ids = [0, 1, 2, 3]
 
             state_dict = {
-                "model.layers.0.mlp.experts.gate_projs": torch.randn(4, 512, 1024),
+                "model.layers.0.mlp.experts.gate_and_up_projs": torch.randn(4, 1024, 1024),
             }
 
-            with patch("nemo_automodel.components.moe.state_dict_mixin.is_dtensor", return_value=False):
-                result = mixin._to_hf_grouped_experts(state_dict)
+        with patch("nemo_automodel.components.moe.state_dict_mixin.is_dtensor", return_value=False):
+            result = mixin._to_hf_w_split_experts(state_dict)
 
             # Without model prefix, keys should not have "model."
             for expert_id in range(4):
                 expected_key = f"layers.0.mlp.experts.{expert_id}.gate_proj.weight"
                 assert expected_key in result
 
-
-class TestToHfDeepEP:
     @patch("nemo_automodel.components.moe.state_dict_mixin.is_dtensor")
     def test_gate_and_up_projs_conversion(self, mock_is_dtensor):
         mock_is_dtensor.return_value = False
@@ -349,7 +339,7 @@ class TestToHfDeepEP:
             "model.layers.0.mlp.experts.gate_and_up_projs": torch.randn(2, 1024, 1024),
         }
 
-        result = mixin._to_hf_deepep(state_dict)
+        result = mixin._to_hf_w_split_experts(state_dict)
 
         # Check that gate_proj and up_proj weights were created
         for expert_id in range(2):
@@ -361,7 +351,7 @@ class TestToHfDeepEP:
             assert result[up_key].shape == (512, 1024)    # [inter_dim, dim]
 
     @patch("nemo_automodel.components.moe.state_dict_mixin.is_dtensor")
-    def test_down_projs_conversion(self, mock_is_dtensor):
+    def test_down_projs_conversion_n2(self, mock_is_dtensor):
         mock_is_dtensor.return_value = False
 
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
@@ -375,7 +365,7 @@ class TestToHfDeepEP:
             "model.layers.0.mlp.experts.down_projs": torch.randn(2, 512, 1024),
         }
 
-        result = mixin._to_hf_deepep(state_dict)
+        result = mixin._to_hf_w_split_experts(state_dict)
 
         # Check that down_proj weights were transposed correctly
         for expert_id in range(2):
@@ -385,7 +375,7 @@ class TestToHfDeepEP:
 
     @patch("nemo_automodel.components.moe.state_dict_mixin.validate_dtensor_expert_sharding")
     @patch("nemo_automodel.components.moe.state_dict_mixin.is_dtensor")
-    def test_dtensor_validation(self, mock_is_dtensor, mock_validate):
+    def test_dtensor_validation_n2(self, mock_is_dtensor, mock_validate):
         mock_is_dtensor.return_value = True
 
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
@@ -399,12 +389,15 @@ class TestToHfDeepEP:
             "model.layers.0.mlp.experts.gate_and_up_projs": mock_dtensor,
         }
 
-        result = mixin._to_hf_deepep(state_dict)
+        result = mixin._to_hf_w_split_experts(state_dict)
 
         mock_validate.assert_called_once_with(mock_dtensor, 2, "gate_and_up_projs layer 0")
 
 
-class TestFromHfGroupedExperts:
+    # Tests merged into TestToHfWSplitExperts
+
+
+class TestFromHfWMergedExperts:
     @patch("nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local")
     @patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank")
     def test_basic_conversion(self, mock_should_load, mock_create_dtensor):
@@ -414,18 +407,20 @@ class TestFromHfGroupedExperts:
         mixin = MockMoEStateDictMixin(n_experts=2, dtype=torch.float32)
 
         hf_state_dict = {}
-        # Add gate_proj weights for 2 experts in layer 0
+        # Add gate_proj and up_proj weights for 2 experts in layer 0
         for expert_id in range(2):
             key = f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"
             hf_state_dict[key] = torch.randn(512, 1024)
+            key_up = f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight"
+            hf_state_dict[key_up] = torch.randn(512, 1024)
 
         with patch.object(mixin, '_validate_expert_availability'):
-            result = mixin._from_hf_grouped_experts(hf_state_dict)
+            result = mixin._from_hf_w_merged_experts(hf_state_dict)
 
-        # Check that gate_projs tensor was created
-        expected_key = "model.layers.0.mlp.experts.gate_projs"
+        # Check that gate_and_up_projs tensor was created
+        expected_key = "model.layers.0.mlp.experts.gate_and_up_projs"
         assert expected_key in result
-        assert result[expected_key].shape == (2, 512, 1024)
+        assert result[expected_key].shape == (2, 1024, 1024)
 
     def test_partial_expert_loading(self):
         # Test that the method respects should_load_expert_for_rank filtering
@@ -435,16 +430,18 @@ class TestFromHfGroupedExperts:
         for expert_id in range(2):
             key = f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"
             hf_state_dict[key] = torch.randn(512, 1024)
+            key_up = f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight"
+            hf_state_dict[key_up] = torch.randn(512, 1024)
 
         with patch.object(mixin, '_validate_expert_availability'):
             with patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank") as mock_should_load:
                 mock_should_load.side_effect = lambda expert_id, *args: expert_id == 1  # Only load expert 1
                 with patch("nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local", side_effect=lambda x, *args: x):
-                    result = mixin._from_hf_grouped_experts(hf_state_dict)
+                    result = mixin._from_hf_w_merged_experts(hf_state_dict)
 
         # When only partial experts are loaded, no tensor should be created until all are available
         # This is the expected behavior based on the code logic
-        expected_key = "model.layers.0.mlp.experts.gate_projs"
+        expected_key = "model.layers.0.mlp.experts.gate_and_up_projs"
         assert expected_key not in result  # No tensor created because we don't have all expected experts
 
     def test_without_model_prefix(self):
@@ -455,13 +452,15 @@ class TestFromHfGroupedExperts:
         for expert_id in range(2):
             key = f"layers.0.mlp.experts.{expert_id}.gate_proj.weight"
             hf_state_dict[key] = torch.randn(512, 1024)
+            key_up = f"layers.0.mlp.experts.{expert_id}.up_proj.weight"
+            hf_state_dict[key_up] = torch.randn(512, 1024)
 
         with patch.object(mixin, '_validate_expert_availability'):
             with patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank", return_value=True):
                 with patch("nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local", side_effect=lambda x, *args: x):
-                    result = mixin._from_hf_grouped_experts(hf_state_dict)
+                    result = mixin._from_hf_w_merged_experts(hf_state_dict)
 
-        expected_key = "model.layers.0.mlp.experts.gate_projs"
+        expected_key = "model.layers.0.mlp.experts.gate_and_up_projs"
         assert expected_key in result
 
     @skip_if_no_gpu
@@ -480,20 +479,19 @@ class TestFromHfGroupedExperts:
         mixin = MockMoEStateDictMixin(n_experts=2, dtype=torch.float32)
 
         hf_state_dict = {
-            "model.layers.0.mlp.experts.0.gate_proj.weight": torch.randn(512, 1024)
+            "model.layers.0.mlp.experts.0.gate_proj.weight": torch.randn(512, 1024),
+            "model.layers.0.mlp.experts.0.up_proj.weight": torch.randn(512, 1024),
         }
 
         with patch.object(mixin, '_validate_expert_availability'):
             with patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank", return_value=True):
                 with patch("nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local", side_effect=lambda x, *args: x):
-                    result = mixin._from_hf_grouped_experts(hf_state_dict, mock_device_mesh)
+                    result = mixin._from_hf_w_merged_experts(hf_state_dict, mock_device_mesh)
 
-        expected_key = "model.layers.0.mlp.experts.gate_projs"
+        expected_key = "model.layers.0.mlp.experts.gate_and_up_projs"
         assert expected_key in result
-        assert result[expected_key].shape == (1, 512, 1024)
+        assert result[expected_key].shape == (1, 1024, 1024)
 
-
-class TestFromHfDeepEP:
     @patch("nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local")
     @patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank")
     def test_gate_and_up_combination(self, mock_should_load, mock_create_dtensor):
@@ -508,7 +506,7 @@ class TestFromHfDeepEP:
         }
 
         with patch.object(mixin, '_validate_expert_availability'):
-            result = mixin._from_hf_deepep(hf_state_dict)
+            result = mixin._from_hf_w_merged_experts(hf_state_dict)
 
         # Should create gate_and_up_projs tensor
         expected_key = "model.layers.0.mlp.experts.gate_and_up_projs"
@@ -528,7 +526,7 @@ class TestFromHfDeepEP:
         }
 
         with patch.object(mixin, '_validate_expert_availability'):
-            result = mixin._from_hf_deepep(hf_state_dict)
+            result = mixin._from_hf_w_merged_experts(hf_state_dict)
 
         # Should create transposed down_projs tensor
         expected_key = "model.layers.0.mlp.experts.down_projs"
@@ -556,7 +554,7 @@ class TestFromHfDeepEP:
         with patch.object(mixin, '_validate_expert_availability'):
             with patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank", return_value=True):
                 with patch("nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local", side_effect=lambda x, *args: x):
-                    result = mixin._from_hf_deepep(hf_state_dict)
+                    result = mixin._from_hf_w_merged_experts(hf_state_dict)
 
         # Verify to_local was called on DTensor inputs
         mock_gate_dtensor.to_local.assert_called_once()
@@ -571,7 +569,10 @@ class TestFromHfDeepEP:
         }
 
         with patch.object(mixin, '_validate_expert_availability'):
-            result = mixin._from_hf_deepep(hf_state_dict)
+            result = mixin._from_hf_w_merged_experts(hf_state_dict)
 
         assert "some_weight" in result
         assert "some_weight_scale_inv" not in result
+
+
+    # Tests merged into TestFromHfWMergedExperts

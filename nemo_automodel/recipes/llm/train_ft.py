@@ -100,6 +100,7 @@ def build_model_and_optimizer(
     autopipeline: AutoPipeline | None = None,
     loss_fn=None,
     parallelize_fn=None,
+    dequantize_base_checkpoint=False,
 ) -> tuple[nn.Module | AutoPipeline, list[str], list["Optimizer"], nn.Module]:  # noqa: F821
     """
     Build and initialize a model and optimizer.
@@ -192,6 +193,7 @@ def build_model_and_optimizer(
                     getattr(cfg_peft, "lora_A_init", None),
                     device_mesh=autopipeline.world_mesh,
                     moe_mesh=autopipeline.moe_mesh,
+                    quantization=dequantize_base_checkpoint,
                 )
 
             # Create optimizer for all model parts
@@ -230,21 +232,13 @@ def build_model_and_optimizer(
                     cfg_opt.foreach = False
                 optimizer = cfg_opt.instantiate(params=trainable_params)
 
-                if get_world_size_safe() == 1:
-                    logger.info("World size is 1, skipping parallelization.")
-                    model = model.to(device).to(torch.bfloat16)
-                else:
-                    model, optimizer = model_wrapper.parallelize(model, optimizer)
+                model, optimizer = model_wrapper.parallelize(model, optimizer)
 
                 return model, state_dict_keys, [optimizer], loss_fn
 
             else:
                 load_weights = True
-                if get_world_size_safe() == 1:
-                    logger.info("World size is 1, skipping parallelization.")
-                    model = model.to(device).to(torch.bfloat16)
-                else:
-                    model = model_wrapper.parallelize(model)
+                model = model_wrapper.parallelize(model)
 
         # Load the weights into the model in parallel.
         if is_meta_device and load_weights:
@@ -726,6 +720,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
         autopipeline_cfg = self.cfg.get("autopipeline", None)
         if self.pp_enabled:
+            pp_batch_size = self.cfg.step_scheduler.local_batch_size
+            assert pp_batch_size // self.cfg.autopipeline.pp_microbatch_size >= self.model_wrapper.pp_size, (
+                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {self.cfg.autopipeline.pp_microbatch_size} must be greater than or equal to pp_size {self.model_wrapper.pp_size}"
+            )
             assert autopipeline_cfg is not None, (
                 "AutoPipeline configuration is required when pipeline parallelism is enabled"
             )
@@ -749,7 +747,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 ep_shard_axis_names=(
                     ("ep_shard",) if self.moe_mesh is not None and "ep_shard" in self.moe_mesh.mesh_dim_names else None
                 ),
-                pp_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+                pp_batch_size=pp_batch_size,
                 device=torch.cuda.current_device(),
             )
             assert isinstance(autopipeline, AutoPipeline), (
@@ -763,7 +761,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
         self.loss_fn = build_loss_fn(self.cfg.loss_fn)
-        parallelize_fn = self.cfg.get("parallelize_fn", None)
+        parallelize_fn = getattr(self.cfg.get("parallelizer", None), "instantiate", None)
         if parallelize_fn is None and self.pp_enabled:
             parallelize_fn = partial(parallelize_for_pp, model_wrapper=self.model_wrapper)
 
@@ -783,6 +781,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             autopipeline=autopipeline,
             loss_fn=self.loss_fn,
             parallelize_fn=parallelize_fn,
+            dequantize_base_checkpoint=self.cfg.get("checkpoint.dequantize_base_checkpoint", False),
         )
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
