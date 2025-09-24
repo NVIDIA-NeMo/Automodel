@@ -248,3 +248,255 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
         tmp, wgrad = weighted_swiglu_back(grad_output, input, weights)
         return tmp, wgrad, None
+
+
+def weighted_bias_swiglu_impl(input, weights, fp8_input_store=False):
+    """
+    Token-wise-weighted bias swiglu fusion.
+    """
+    ori_shape = input.shape
+    assert len(ori_shape) in [2, 3]
+    input = input.view(-1, ori_shape[-1])
+    output = WeightedSwiGLUFunction.apply(input, weights, fp8_input_store)
+
+    return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
+
+
+@torch.compile
+def quick_gelu(y: torch.Tensor, alpha: float = 1.702) -> torch.Tensor:
+    """Sigmoid approximation of gelu"""
+    return y * torch.sigmoid(alpha * y)
+
+
+@torch.compile
+def quick_geglu(y: torch.Tensor, linear_offset: float = 0.0) -> torch.Tensor:
+    """Performs Quick-GELU-based GEGLU activation : quick_gelu(y1) * (y2 + offset).
+
+    Args:
+        y: Input tensor split into two halves on the last dimension.
+        linear_offset: Optional linear offset added to the second half before gating.
+
+    Returns:
+        Tensor after applying the GEGLU activation.
+    """
+    y_1, y_2 = torch.chunk(y, 2, dim=-1)
+    return quick_gelu(y_1) * (y_2 + linear_offset)
+
+
+@torch.compile
+def weighted_quick_geglu(y: torch.Tensor, weights: torch.Tensor, linear_offset: float = 0.0) -> torch.Tensor:
+    """Token-wise-weighted Quick-GEGLU activation.
+
+    The weights tensor is expected to have the same first-dimension length as ``y`` and a trailing
+    singleton dimension so that it broadcasts over the feature dimension.
+    """
+    dtype = y.dtype
+    res = quick_geglu(y, linear_offset) * weights
+    return res.to(dtype)
+
+
+# gradient of sigmoid approximation of gelu
+@torch.compile
+def quick_geglu_back(g, y, linear_offset: float = 0.0) -> torch.Tensor:
+    y_1, y_2 = torch.chunk(y, 2, -1)
+    sigmoid_out = torch.sigmoid(1.702 * y_1)
+    dy_1 = g * sigmoid_out * (1 + 1.702 * y_1 * (1 - sigmoid_out)) * (y_2 + linear_offset)
+    dy_2 = g * y_1 * sigmoid_out
+    return torch.cat((dy_1, dy_2), -1)
+
+
+@torch.compile
+def weighted_quick_geglu_back(g, y, weights, linear_offset: float = 0.0):
+    """Backward helper for weighted Quick-GEGLU.
+    Returns gradient w.r.t input `y` and `weights`.
+    """
+    input_dtype = y.dtype
+    w_dtype = weights.dtype
+    # Gradient w.r.t input uses the chain rule with weighting.
+    input_grad = quick_geglu_back(g * weights, y, linear_offset)
+    # Gradient w.r.t weights is the activation times upstream grad (cast to weight dtype).
+    weights_grad = quick_geglu(y, linear_offset) * g.to(w_dtype)
+    # Sum across the feature dimension to keep weights shape `[tokens, 1]`.
+    weights_grad = torch.sum(weights_grad, dim=-1, keepdim=True)
+    return input_grad.to(input_dtype), weights_grad.to(w_dtype)
+
+
+# ---------------- Weighted Bias Quick-GEGLU helpers -----------------
+
+
+@torch.compile
+def weighted_bias_quick_geglu(
+    y: torch.Tensor, bias: torch.Tensor, weights: torch.Tensor, linear_offset: float = 0.0
+) -> torch.Tensor:
+    """Token-wise weighted Quick-GEGLU activation with bias.
+
+    Args:
+        y: Input tensor before bias addition.
+        bias: Bias tensor broadcastable to `y`.
+        weights: Weight tensor with shape `[tokens, 1]` broadcasting over feature dim.
+        linear_offset: Optional linear offset for the second half before gating.
+
+    Returns:
+        Activated tensor with same dtype as `y`.
+    """
+    dtype = y.dtype
+    res = quick_geglu(y + bias, linear_offset) * weights
+    return res.to(dtype)
+
+
+@torch.compile
+def weighted_bias_quick_geglu_back(g, y, bias, weights, linear_offset: float = 0.0):
+    """Backward helper for weighted Quick-GEGLU with bias.
+
+    Returns gradients w.r.t input `y`, `bias`, and `weights`.
+    """
+    input_dtype = y.dtype
+    w_dtype = weights.dtype
+
+    # Forward input with bias
+    x = y + bias
+
+    # Gradient w.r.t input (and thus bias) via chain rule
+    input_grad = quick_geglu_back(g * weights, x, linear_offset)
+
+    # Gradient w.r.t weights
+    weights_grad = quick_geglu(x, linear_offset) * g.to(w_dtype)
+    weights_grad = torch.sum(weights_grad, dim=-1, keepdim=True)
+
+    # bias gradient identical to input gradient
+    bias_grad = input_grad
+
+    return input_grad.to(input_dtype), bias_grad.to(input_dtype), weights_grad.to(w_dtype)
+
+
+class WeightedQuickGeGLUFunction(torch.autograd.Function):
+    """Autograd function for token-wise weighted Quick-GEGLU (no bias)."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        fp8_input_store: bool,
+        linear_offset: torch.Tensor,
+    ):
+        input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
+        ctx.save_for_backward(input_for_backward, weights, linear_offset)
+        ctx.ori_input_dtype = input.dtype
+        ctx.fp8_input_store = fp8_input_store
+        return weighted_quick_geglu(input, weights, linear_offset)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, weights, linear_offset = ctx.saved_tensors
+        input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
+        input_grad, wgrad = weighted_quick_geglu_back(grad_output, input, weights, linear_offset)
+        return input_grad, wgrad, None, None
+
+
+class WeightedBiasQuickGeGLUFunction(torch.autograd.Function):
+    """Autograd function for token-wise weighted Quick-GEGLU with bias support."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        input: torch.Tensor,
+        bias: torch.Tensor,
+        weights: torch.Tensor,
+        fp8_input_store: bool,
+        linear_offset: torch.Tensor,
+    ):
+        # Optionally store the input in FP8 for memory savings.
+        input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
+
+        # Save tensors for backward.
+        ctx.save_for_backward(input_for_backward, bias, weights, linear_offset)
+        ctx.ori_input_dtype = input.dtype
+        ctx.fp8_input_store = fp8_input_store
+
+        # Compute activation using fused helper that includes bias and weighting.
+        return weighted_bias_quick_geglu(input, bias, weights, linear_offset)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, bias, weights, linear_offset = ctx.saved_tensors
+
+        # Restore original input dtype if it was stored in FP8.
+        input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
+
+        input_grad, bias_grad, weights_grad = weighted_bias_quick_geglu_back(
+            grad_output, input, bias, weights, linear_offset
+        )
+
+        return input_grad, bias_grad, weights_grad, None, None
+
+
+def weighted_bias_quick_geglu_impl(
+    input, bias, weights, fp8_input_store=False, linear_offset=0.0, clamp_value=None, alpha=1.702
+):
+    """
+    Token-wise-weighted bias quick_geglu fusion.
+        input: [num_selected_experts * seq_len, hidden_size * 2]
+        bias: None
+        weights: [num_selected_experts * seq_len, 1]
+        fp8_input_store: bool
+        linear_offset: float
+        output: [num_selected_experts * seq_len, hidden_size]
+    """
+    ori_shape = input.shape
+    assert len(ori_shape) in [2, 3], f"Input shape must be of length 2 or 3, but got {ori_shape=}"
+    if clamp_value is not None:
+        x_glu, x_linear = input.chunk(2, -1)
+        input = torch.cat(
+            (
+                x_glu.clamp(min=None, max=clamp_value),
+                x_linear.clamp(min=-clamp_value, max=clamp_value),
+            ),
+            -1,
+        )
+    input = input.view(-1, ori_shape[-1])
+    linear_offset = torch.tensor(linear_offset, dtype=input.dtype, device=input.device)
+    if bias is not None:
+        output = WeightedBiasQuickGeGLUFunction.apply(input, bias, weights, fp8_input_store, linear_offset)
+    else:
+        output = WeightedQuickGeGLUFunction.apply(input, weights, fp8_input_store, linear_offset)
+
+    return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
+
+
+class MoEAuxLossAutoScaler(torch.autograd.Function):
+    """An AutoScaler that triggers the backward pass and scales the grad for auxiliary loss."""
+
+    main_loss_backward_scale: torch.Tensor = None
+
+    @staticmethod
+    def forward(ctx, output: torch.Tensor, aux_loss: torch.Tensor):
+        """Preserve the aux_loss by storing it in the context to avoid garbage collection.
+
+        Args:
+            output (torch.Tensor): The output tensor.
+            aux_loss (torch.Tensor): The auxiliary loss tensor.
+
+        Returns:
+            torch.Tensor: The output tensor.
+        """
+        ctx.save_for_backward(aux_loss)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """Compute and scale the gradient for auxiliary loss..
+
+        Args:
+            grad_output (torch.Tensor): The gradient of the output.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: The gradient of the output, scaled auxiliary loss
+                                               gradient.
+        """
+        (aux_loss,) = ctx.saved_tensors
+        if MoEAuxLossAutoScaler.main_loss_backward_scale is None:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(1.0, device=aux_loss.device)
+        aux_loss_backward_scale = MoEAuxLossAutoScaler.main_loss_backward_scale
+        scaled_aux_loss_grad = torch.ones_like(aux_loss) * aux_loss_backward_scale
+        return grad_output, scaled_aux_loss_grad

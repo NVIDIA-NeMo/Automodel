@@ -761,7 +761,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
         self.loss_fn = build_loss_fn(self.cfg.loss_fn)
-        parallelize_fn = self.cfg.get("parallelize_fn", None)
+        parallelize_fn = getattr(self.cfg.get("parallelizer", None), "instantiate", None)
         if parallelize_fn is None and self.pp_enabled:
             parallelize_fn = partial(parallelize_for_pp, model_wrapper=self.model_wrapper)
 
