@@ -523,7 +523,7 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
         tp_axis_name=None,
         ep_axis_name="ep",
         ep_shard_axis_names=("es1", "es2"),
-        enable_ac=True,
+        activation_checkpointing=True,
     )
 
     apply_ep_mock.assert_called_once()
@@ -574,7 +574,7 @@ def test_parallelize_model_asserts_on_invalid_tp_cp_and_ep_divisibility(monkeypa
             tp_axis_name="tp",
             ep_axis_name=None,
             ep_shard_axis_names=None,
-            enable_ac=False,
+            activation_checkpointing=False,
         )
 
     # CP size != 1 -> assertion
@@ -590,7 +590,7 @@ def test_parallelize_model_asserts_on_invalid_tp_cp_and_ep_divisibility(monkeypa
             tp_axis_name=None,
             ep_axis_name=None,
             ep_shard_axis_names=None,
-            enable_ac=False,
+            activation_checkpointing=False,
         )
 
     # EP enabled but divisibility violated -> assertion
@@ -607,5 +607,5 @@ def test_parallelize_model_asserts_on_invalid_tp_cp_and_ep_divisibility(monkeypa
             tp_axis_name=None,
             ep_axis_name="ep",
             ep_shard_axis_names=None,
-            enable_ac=False,
+            activation_checkpointing=False,
         )
