@@ -73,9 +73,10 @@ def test_loss_mask_handling():
     packed_ds = pack_dataset(
         ds_with_mask, split="train", packed_sequence_size=5, split_across_pack=False, max_packs=None
     )
-
-    assert packed_ds[0]["loss_mask"] == [1, 1, 0, 0, 0]
-    assert packed_ds[1]["loss_mask"] == [1, 1, 1, 0, 0]
+    assert packed_ds[0]["labels"][-3:] == [-100] * 3
+    assert packed_ds[0]["labels"][:2] != [-100] * 2
+    assert packed_ds[1]["labels"][:3] != [-100] * 3
+    assert packed_ds[1]["labels"][-2:] == [-100] * 2
 
 
 def test_position_id_wrapping(base_dataset):
