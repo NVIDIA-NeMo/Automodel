@@ -41,6 +41,8 @@ def initialize_attn_module_and_func(
     softmax_scale: float,
     attn_mask_type: str = "causal",
     qkv_format: str = "bshd",
+    num_gqa_groups: int | None = None,
+    **kwargs,
 ) -> tuple[nn.Module | None, Callable]:
     if attn_impl == "te":
         from transformer_engine.pytorch.attention import DotProductAttention
@@ -51,12 +53,18 @@ def initialize_attn_module_and_func(
             attn_mask_type=attn_mask_type,
             qkv_format=qkv_format,
             softmax_scale=softmax_scale,
+            num_gqa_groups=num_gqa_groups,
+            **kwargs,
         )
         attn_func = attn_module.__call__
         return attn_module, attn_func
     elif attn_impl == "sdpa":
         attn_func = functools.partial(
-            F.scaled_dot_product_attention, scale=softmax_scale, is_causal=attn_mask_type == "causal"
+            F.scaled_dot_product_attention,
+            scale=softmax_scale,
+            is_causal=attn_mask_type == "causal",
+            enable_gqa=num_gqa_groups is not None,
+            **kwargs,
         )
         return None, attn_func
     elif attn_impl == "flex":
