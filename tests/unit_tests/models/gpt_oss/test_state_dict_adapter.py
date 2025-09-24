@@ -13,6 +13,11 @@
 # limitations under the License.
 
 import torch
+from unittest.mock import Mock, patch
+from transformers import GptOssConfig
+
+from nemo_automodel.components.moe.layers import MoEConfig
+from nemo_automodel.components.moe.utils import BackendConfig
 
 from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSStateDictAdapter
 
@@ -38,6 +43,7 @@ class TestApplyKeyMapping:
             "some.other.weight": torch.randn(2),
         }
 
+        original_state_dict = dict(state_dict)
         out = adapter._apply_key_mapping(state_dict, mapping)
 
         # Positive cases: replaced keys exist, originals do not
@@ -64,11 +70,11 @@ class TestApplyKeyMapping:
 
         # Value identity preserved for replaced entries
         torch.testing.assert_close(
-            out["model.layers.0.mlp.gate.weight"], state_dict["model.layers.0.mlp.router.weight"]
+            out["model.layers.0.mlp.gate.weight"], original_state_dict["model.layers.0.mlp.router.weight"]
         )
         torch.testing.assert_close(
             out["model.layers.2.mlp.experts.gate_and_up_projs"],
-            state_dict["model.layers.2.mlp.experts.gate_up_proj"],
+            original_state_dict["model.layers.2.mlp.experts.gate_up_proj"],
         )
 
     def test_multiple_keys_across_layers(self):
@@ -123,3 +129,223 @@ class TestApplyKeyMapping:
         # This one endswith mapping key and should be replaced, preserving prefix
         assert "Xmlp.gate.weight" in out
         assert "Xmlp.router.weight" not in out
+
+class TestGPTOSSStateDictAdapter:
+    def create_mock_config(self, **overrides):
+        config = Mock(spec=GptOssConfig)
+        for key, value in overrides.items():
+            setattr(config, key, value)
+        return config
+
+    def create_mock_moe_config(self, **overrides):
+        moe_config = Mock(spec=MoEConfig)
+        for key, value in overrides.items():
+            setattr(moe_config, key, value)
+        return moe_config
+
+    def create_mock_backend_config(self, **overrides):
+        backend = Mock(spec=BackendConfig)
+        for key, value in overrides.items():
+            setattr(backend, key, value)
+        return backend
+
+    def test_initialization(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+
+        adapter = GPTOSSStateDictAdapter(config=config, moe_config=moe_config, backend=backend, dtype=torch.float16)
+
+        assert adapter.config is config
+        assert adapter.moe_config is moe_config
+        assert adapter.backend is backend
+        assert adapter.dtype == torch.float16
+        assert adapter._uses_model_prefix is True
+
+        # Mapping structures
+        assert isinstance(adapter.hf_to_internal_map, dict)
+        assert isinstance(adapter.internal_to_hf_map, dict)
+        # Expected four mappings
+        assert len(adapter.hf_to_internal_map) == 4
+        assert len(adapter.internal_to_hf_map) == 4
+
+    def test_to_hf_applies_mapping_and_exclude(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+        adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
+
+        state_dict = {
+            "model.layers.0.mlp.gate.weight": torch.randn(3, 3),
+            "model.layers.0.mlp.gate.bias": torch.randn(3),
+            "model.layers.0.mlp.experts.gate_and_up_projs": torch.randn(2, 5),
+            "model.layers.0.mlp.experts.down_projs": torch.randn(2, 5),
+            "exclude_this": torch.randn(1),
+        }
+
+        out = adapter.to_hf(state_dict, exclude_key_regex=r"^exclude.*", quantization=False)
+
+        # Mapped keys must exist
+        assert "model.layers.0.mlp.router.weight" in out
+        assert "model.layers.0.mlp.router.bias" in out
+        assert "model.layers.0.mlp.experts.gate_up_proj" in out
+        assert "model.layers.0.mlp.experts.down_proj" in out
+
+        # Excluded key removed
+        assert "exclude_this" not in out
+
+        # No quantization artifacts when quantization=False
+        assert not any(k.endswith("_blocks") or k.endswith("_scales") for k in out)
+
+    def test_to_hf_quantization_true_calls_helper(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+        adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
+
+        state_dict = {
+            "model.layers.0.mlp.gate.weight": torch.randn(3, 3),
+        }
+
+        with patch.object(adapter, "_add_quantization_block_scale_tensors") as mock_add:
+            mock_add.return_value = {"quantized": torch.randn(1)}
+            out = adapter.to_hf(state_dict, quantization=True)
+
+        mock_add.assert_called_once()
+        assert "quantized" in out
+
+    def test_add_quantization_block_scale_tensors_creates_expected_keys(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+        adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
+
+        class FakeDTensor:
+            def __init__(self, shape, placements="P", device_mesh="M"):
+                self.shape = shape
+                self.placements = placements
+                self.device_mesh = device_mesh
+                self.is_cuda = False
+
+        # HF-style keys expected by _add_quantization_block_scale_tensors
+        state_dict = {
+            "model.layers.0.mlp.experts.gate_up_proj": FakeDTensor((2, 64, 128)),
+            "model.layers.0.mlp.experts.down_proj": FakeDTensor((2, 32, 256)),
+            # non-matching suffix should be ignored
+            "model.layers.0.mlp.experts.up_proj": torch.randn(2, 2),
+        }
+
+        def fake_ones(shape, placements=None, device_mesh=None, dtype=None):
+            return FakeDTensor(shape, placements=placements, device_mesh=device_mesh)
+
+        with patch("torch.distributed.tensor.ones", create=True, side_effect=fake_ones):
+            out = adapter._add_quantization_block_scale_tensors(state_dict)
+
+        # Original keys removed
+        assert "model.layers.0.mlp.experts.gate_up_proj" not in out
+        assert "model.layers.0.mlp.experts.down_proj" not in out
+
+        # New quantization keys exist with expected shapes
+        g_blocks = out["model.layers.0.mlp.experts.gate_up_proj_blocks"]
+        g_scales = out["model.layers.0.mlp.experts.gate_up_proj_scales"]
+        d_blocks = out["model.layers.0.mlp.experts.down_proj_blocks"]
+        d_scales = out["model.layers.0.mlp.experts.down_proj_scales"]
+
+        assert g_blocks.shape == (2, 128, 90, 16)
+        assert g_scales.shape == (2, 128, 90)
+        assert d_blocks.shape == (2, 256, 90, 16)
+        assert d_scales.shape == (2, 256, 90)
+
+        # Irrelevant key preserved
+        assert "model.layers.0.mlp.experts.up_proj" in out
+
+    def test_dequantize_block_scale_tensors_merges_pairs(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+        adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
+
+        # Two different layers worth of blocks/scales
+        state_dict = {
+            "model.layers.0.mlp.experts.gate_up_proj_blocks": torch.ones(1),
+            "model.layers.0.mlp.experts.gate_up_proj_scales": torch.ones(1),
+            "model.layers.0.mlp.experts.down_proj_blocks": torch.ones(1),
+            "model.layers.0.mlp.experts.down_proj_scales": torch.ones(1),
+            # unrelated
+            "some.other": torch.randn(2, 2),
+        }
+
+        with patch.object(adapter, "_convert_moe_packed_tensors") as mock_convert:
+            mock_convert.side_effect = [torch.randn(4, 4), torch.randn(3, 3)]
+            out = adapter._dequantize_block_scale_tensors(state_dict)
+
+        # New merged keys created
+        assert "model.layers.0.mlp.experts.gate_up_proj" in out
+        assert "model.layers.0.mlp.experts.down_proj" in out
+
+        # Old block/scale keys removed
+        assert not any(k.endswith("_blocks") or k.endswith("_scales") for k in out)
+
+        # Irrelevant entries preserved
+        assert "some.other" in out
+
+    def test_from_hf_detects_model_prefix(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+        adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
+
+        hf_state = {
+            "model.layers.0.mlp.experts.gate_up_proj_blocks": torch.ones(1),
+            "model.layers.0.mlp.experts.gate_up_proj_scales": torch.ones(1),
+        }
+
+        with patch.object(adapter, "_convert_moe_packed_tensors", return_value=torch.randn(2, 2)):
+            adapter.from_hf(hf_state)
+
+        assert adapter._uses_model_prefix is True
+
+    def test_from_hf_end_to_end_mapping_and_dequantize(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+        adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
+
+        hf_state = {
+            # Will dequantize into gate_up_proj and then map to gate_and_up_projs
+            "model.layers.0.mlp.experts.gate_up_proj_blocks": torch.ones(1),
+            "model.layers.0.mlp.experts.gate_up_proj_scales": torch.ones(1),
+            # Direct mapping without dequantization
+            "model.layers.0.mlp.router.weight": torch.randn(2, 2),
+        }
+
+        with patch.object(adapter, "_convert_moe_packed_tensors", return_value=torch.randn(2, 2)):
+            out = adapter.from_hf(hf_state)
+
+        # Dequantized and mapped
+        assert "model.layers.0.mlp.experts.gate_and_up_projs" in out
+
+        # Router mapping applied
+        assert "model.layers.0.mlp.gate.weight" in out
+
+        # No block/scale artifacts remain
+        assert not any(k.endswith("_blocks") or k.endswith("_scales") for k in out)
+
+    def test_from_hf_only_mapping_without_quant(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+        adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
+
+        hf_state = {
+            "layers.0.mlp.router.weight": torch.randn(2, 2),
+            "layers.0.mlp.router.bias": torch.randn(2),
+        }
+
+        # No 'model.' prefix present; behavior is simply mapping
+        out = adapter.from_hf(hf_state)
+
+        assert "layers.0.mlp.gate.weight" in out
+        assert "layers.0.mlp.gate.bias" in out
+        assert "layers.0.mlp.router.weight" not in out
+        assert "layers.0.mlp.router.bias" not in out
