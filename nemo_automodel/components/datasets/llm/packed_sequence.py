@@ -169,7 +169,7 @@ def _split_and_add_pack(current_pack: PACK_TYPE, packs: list[PACK_TYPE], split_a
     return output_dict
 
 
-def pack_dataset(dataset, split=None, packed_sequence_size, split_across_pack=False, max_packs=None, padding_idx=0):
+def pack_dataset(dataset, split=None, packed_sequence_size, split_across_pack=False, max_packs=None, padding_idx=0, drop_long_samples=False):
     """
     Pack the dataset to defined length.
 
@@ -185,6 +185,7 @@ def pack_dataset(dataset, split=None, packed_sequence_size, split_across_pack=Fa
             ``packed_sequence_size``, split the sample into the next pack, or move it entirely
             to the beginning of the next pack. Default: False
         max_packs (int): Maximum number of packs. Default: None
+        drop_long_samples (bool): If True, drop samples that are longer than packed_sequence_size.
     """
     packs: list[PACK_TYPE] = []
     if split is not None:
@@ -207,6 +208,8 @@ def pack_dataset(dataset, split=None, packed_sequence_size, split_across_pack=Fa
         # packed_sequence_size and we're unable to split it, user needs to modify
         # one of the two parameters
         seq_len = len(input_ids)
+        if drop_long_samples and seq_len > packed_sequence_size:
+            continue
         if seq_len > packed_sequence_size and not split_across_pack:
             raise ValueError(
                 f"Dataset sample is too long ({seq_len} > {packed_sequence_size}). "
