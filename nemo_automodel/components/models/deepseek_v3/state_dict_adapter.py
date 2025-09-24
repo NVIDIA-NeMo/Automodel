@@ -22,7 +22,7 @@ from transformers import DeepseekV3Config
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.moe.layers import MoEConfig
-from nemo_automodel.components.moe.state_dict_mixin import MoEStateDictMixin
+from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
 from nemo_automodel.components.moe.utils import BackendConfig
 
 logger = logging.getLogger(__name__)
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 BLOCK_SIZE = 128
 
 
-class DeepSeekV3StateDictAdapter(MoEStateDictMixin, StateDictAdapter):
+class DeepSeekV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     def __init__(
         self,
         config: DeepseekV3Config,
@@ -96,10 +96,7 @@ class DeepSeekV3StateDictAdapter(MoEStateDictMixin, StateDictAdapter):
         """Convert from native model state dict to HuggingFace format.
         Automatically detects format based on backend.enable_deepep configuration.
         """
-        if self.backend.enable_deepep:
-            hf_state_dict = self._to_hf_deepep(state_dict)
-        else:
-            hf_state_dict = self._to_hf_grouped_experts(state_dict)
+        hf_state_dict = self._to_hf_w_split_experts(state_dict)
 
         if exclude_key_regex:
             hf_state_dict = {k: v for k, v in hf_state_dict.items() if not re.match(exclude_key_regex, k)}
@@ -113,7 +110,6 @@ class DeepSeekV3StateDictAdapter(MoEStateDictMixin, StateDictAdapter):
         self,
         hf_state_dict: dict[str, Any],
         device_mesh: Optional["DeviceMesh"] = None,
-        target_format: str = "auto",
         **kwargs,
     ) -> dict[str, Any]:
         """Convert HF checkpoint to native format.
@@ -126,18 +122,7 @@ class DeepSeekV3StateDictAdapter(MoEStateDictMixin, StateDictAdapter):
                 self._uses_model_prefix = key.startswith("model.")
 
         hf_state_dict = self._dequantize(hf_state_dict)
-
-        if target_format == "auto":
-            actual_target_format = "deepep" if self.backend.enable_deepep else "grouped_experts"
-        else:
-            if target_format not in ["grouped_experts", "deepep"]:
-                raise ValueError(f"target_format must be 'auto', 'grouped_experts' or 'deepep', got '{target_format}'")
-            actual_target_format = target_format
-
-        if actual_target_format == "deepep":
-            return self._from_hf_deepep(hf_state_dict, device_mesh)
-        else:
-            return self._from_hf_grouped_experts(hf_state_dict, device_mesh)
+        return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
 
 
 def calculate_scale_shape(weight: torch.Tensor, BLOCK_SIZE: int = BLOCK_SIZE) -> torch.Size:

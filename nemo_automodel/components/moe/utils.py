@@ -20,10 +20,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from nemo_automodel.components.attention.flex_attention import FlexAttention
+
 
 @dataclass(kw_only=True)
 class BackendConfig:
-    attn: Literal["te", "sdpa"] = "te"
+    attn: Literal["te", "sdpa", "flex"] = "te"
     linear: Literal["torch", "te"] = "torch"
     rms_norm: Literal["torch", "te"] = "te"
     enable_deepep: bool = False
@@ -57,6 +59,11 @@ def initialize_attn_module_and_func(
             F.scaled_dot_product_attention, scale=softmax_scale, is_causal=attn_mask_type == "causal"
         )
         return None, attn_func
+    elif attn_impl == "flex":
+        attn_module = FlexAttention()
+        # We still return the module and a reference to its call for parity with other backends
+        attn_func = attn_module.__call__
+        return attn_module, attn_func
     else:
         raise ValueError(f"Unsupported attention implementation: {attn_impl}")
 
