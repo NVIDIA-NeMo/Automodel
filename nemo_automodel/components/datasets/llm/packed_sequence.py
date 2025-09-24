@@ -28,17 +28,16 @@ PACK_TYPE = dict[str, torch.Tensor | list[int]]
 # based on https://github.com/pytorch/torchtune/blob/v0.6.1/torchtune/datasets/_packed.py#L17
 
 def _convert_to_tensors(pack: PACK_TYPE) -> PACK_TYPE:
+    print(pack)
     tensor_pack = {
         "input_ids": torch.tensor(pack["input_ids"], dtype=torch.long),
         "labels": torch.tensor(pack["labels"], dtype=torch.long),
         "position_ids": torch.tensor(pack["position_ids"], dtype=torch.long),
         "seq_lens": torch.tensor(pack["seq_lens"], dtype=torch.long),
     }
-    if contains_loss_mask:
-        tensor_pack["loss_mask"] = torch.tensor(pack["loss_mask"], dtype=torch.long)
     return tensor_pack
 
-def _pad_pack(pack: PACK_TYPE, padding_idx: int) -> PACK_TYPE:
+def _pad_pack(pack: PACK_TYPE, padding_idx: int, cross_entropy_ignore_idx: int = CROSS_ENTROPY_IGNORE_IDX) -> PACK_TYPE:
     # Pad tokens
     num_padding_tokens = packed_sequence_size - len(pack["input_ids"])
     padded_tokens = F.pad(
@@ -51,16 +50,8 @@ def _pad_pack(pack: PACK_TYPE, padding_idx: int) -> PACK_TYPE:
     padded_labels = F.pad(
         pack["labels"],
         (0, packed_sequence_size - len(pack["labels"])),
-        value=CROSS_ENTROPY_IGNORE_IDX,
+        value=cross_entropy_ignore_idx,
     )
-
-    # Pad loss_mask
-    if contains_loss_mask:
-        padded_loss_mask = F.pad(
-            pack["loss_mask"],
-            (0, packed_sequence_size - len(pack["loss_mask"])),
-            value=0,
-        )
 
     # Add padding tokens as a last seq len to ensure sum is packed_sequence_size
     padded_seq_lens = (
@@ -86,22 +77,19 @@ def _pad_pack(pack: PACK_TYPE, padding_idx: int) -> PACK_TYPE:
         "position_ids": padded_position_ids,
         "seq_lens": padded_seq_lens,
     }
-    if contains_loss_mask:
-        padded_pack["loss_mask"] = padded_loss_mask
     return padded_pack
 
-def _add_pack(pack: PACK_TYPE) -> None:
+def _tensorize_and_pad_pack(packs, pack: PACK_TYPE, padding_idx: int, cross_entropy_ignore_idx: int = CROSS_ENTROPY_IGNORE_IDX) -> None:
     pack = _convert_to_tensors(pack)
-    pack = _pad_pack(pack, padding_idx=padding_idx)
-    packs.append(pack)
+    pack = _pad_pack(pack, padding_idx=padding_idx, cross_entropy_ignore_idx=cross_entropy_ignore_idx)
+    return pack
 
-def _should_stop_packing() -> bool:
+def _should_stop_packing(max_packs: int | None, packs: list[PACK_TYPE]) -> bool:
     if max_packs is not None and len(packs) == max_packs:
         return True
     return False
 
-def _split_and_add_pack(current_pack: PACK_TYPE) -> PACK_TYPE:
-    nonlocal previous_sample_boundary
+def _split_and_add_pack(current_pack: PACK_TYPE, split_across_pack: bool, packed_sequence_size: int, packs: list[PACK_TYPE], previous_sample_boundary: int, padding_idx: int, cross_entropy_ignore_idx: int = CROSS_ENTROPY_IGNORE_IDX) -> PACK_TYPE:
     if split_across_pack:
         boundary = packed_sequence_size
         # The last elem in ``seq_lens`` ensures that ``sum(seq_lens) == packed_sequence_size``
@@ -119,11 +107,9 @@ def _split_and_add_pack(current_pack: PACK_TYPE) -> PACK_TYPE:
         "position_ids": current_pack["position_ids"][:boundary],
         "seq_lens": current_pack["seq_lens"][:-1] + seq_len_padding,
     }
-    if contains_loss_mask:
-        pack["loss_mask"] = current_pack["loss_mask"][:boundary]
 
     # Process and add the pack
-    _add_pack(pack)
+    packs.append(_tensorize_and_pad_pack(pack, padding_idx, cross_entropy_ignore_idx))
 
     # Return the length of the first sample in next pack if we are splitting across packs,
     # otherwise return the length of the last sample in the current pack
@@ -137,10 +123,13 @@ def _split_and_add_pack(current_pack: PACK_TYPE) -> PACK_TYPE:
         "position_ids": current_pack["position_ids"][boundary:],
         "seq_lens": [next_seq_len],
     }
-    if contains_loss_mask:
-        output_dict["loss_mask"] = current_pack["loss_mask"][boundary:]
     return output_dict
 
+def _fill_labels_with_cross_entropy_ignore_idx(labels: list[int], loss_mask: list[int]) -> list[int]:
+    for i, mask in enumerate(loss_mask):
+        if mask == 0:
+            labels[i] = CROSS_ENTROPY_IGNORE_IDX
+    return labels
 
 def pack_dataset(
     dataset,
@@ -149,6 +138,7 @@ def pack_dataset(
     packed_sequence_size: int,
     split_across_pack: bool = False,
     max_packs: int | None = None,
+    cross_entropy_ignore_idx: int = CROSS_ENTROPY_IGNORE_IDX,
 ):
     """
     Implements Packed Sequence for input dataset and returns a new packed dataset.
@@ -166,19 +156,8 @@ def pack_dataset(
         datasets.Dataset: Packed dataset.
     """
     padding_idx = 0
-    contains_loss_mask = False
     packs: list[PACK_TYPE] = []
     previous_sample_boundary: int = 0
-
-    # Only show progress bar on rank 0
-    rank = (
-        torch.distributed.get_rank()
-        if torch.distributed.is_available() and torch.distributed.is_initialized()
-        else 0
-    )
-
-    if "loss_mask" in dataset[0]:
-        contains_loss_mask = True
 
     # Buffer to hold samples until they are long enough to be added to packs
     current_pack = {
@@ -187,16 +166,14 @@ def pack_dataset(
         "position_ids": [],
         "seq_lens": [],
     }
-    if contains_loss_mask:
-        current_pack["loss_mask"] = []
     previous_sample_boundary = 0
 
-    if rank == 0:
-        pbar = tqdm(total=len(dataset), desc=f"Packing {split} dataset", dynamic_ncols=True)
     for sample in dataset:
         input_ids, labels = sample["input_ids"], sample["labels"]
-        if contains_loss_mask:
-            loss_mask = sample["loss_mask"]
+        if "loss_mask" in sample:
+            loss_mask = sample.pop("loss_mask")
+            labels = _fill_labels_with_cross_entropy_ignore_idx(labels, loss_mask)
+
         # If the dataset outputs samples that are larger than the specified
         # packed_sequence_size and we're unable to split it, user needs to modify
         # one of the two parameters
@@ -212,30 +189,36 @@ def pack_dataset(
         current_pack["labels"] += labels
         current_pack["position_ids"] += [x % packed_sequence_size for x in range(seq_len)]
         current_pack["seq_lens"] += [seq_len]
-        if contains_loss_mask:
-            current_pack["loss_mask"] += loss_mask
 
         # If the current pack is over the packed_sequence_size, add it to packs and
         # retain any truncated or bumped samples for next pack
-        while len(current_pack["input_ids"]) > packed_sequence_size and not _should_stop_packing():
-            current_pack = _split_and_add_pack(current_pack)
-
-        if rank == 0:
-            pbar.update()
+        while len(current_pack["input_ids"]) > packed_sequence_size and not _should_stop_packing(max_packs, packs):
+            current_pack = _split_and_add_pack(
+                current_pack=current_pack,
+                split_across_pack=split_across_pack,
+                packed_sequence_size=packed_sequence_size,
+                packs=packs,
+                previous_sample_boundary=previous_sample_boundary,
+                padding_idx=padding_idx,
+                cross_entropy_ignore_idx=cross_entropy_ignore_idx,
+            )
 
         # Keep track of previous sample boundary
         previous_sample_boundary = len(current_pack["input_ids"])
 
-        if _should_stop_packing():
+        if _should_stop_packing(max_packs, packs):
             break
 
     # Handle the last pack if there's leftover and we haven't filled up the max packs
     if len(current_pack["input_ids"]) > 0 and (max_packs is None or len(packs) < max_packs):
         # No need to handle splitting at this point so we can just add the current pack
-        _add_pack(current_pack)
+        packs.append(_tensorize_and_pad_pack(current_pack, padding_idx, cross_entropy_ignore_idx))
 
     # After packing all samples, convert packs to a Dataset object
-    packed_dataset = Dataset.from_dict({key: [pack[key] for pack in packs] for key in packs[0].keys()})
+    packed_dataset = Dataset.from_dict({
+        key: [pack[key] for pack in packs]
+        for key in packs[0].keys()
+    })
     logger.info("Total number of packs created: {}".format(len(packs)))
     return packed_dataset
 
