@@ -100,6 +100,7 @@ def build_model_and_optimizer(
     autopipeline: AutoPipeline | None = None,
     loss_fn=None,
     parallelize_fn=None,
+    load_base_model=True,
     dequantize_base_checkpoint=False,
 ) -> tuple[nn.Module | AutoPipeline, list[str], list["Optimizer"], nn.Module]:  # noqa: F821
     """
@@ -193,6 +194,7 @@ def build_model_and_optimizer(
                     getattr(cfg_peft, "lora_A_init", None),
                     device_mesh=autopipeline.world_mesh,
                     moe_mesh=autopipeline.moe_mesh,
+                    load_base_model=load_base_model,
                     quantization=dequantize_base_checkpoint,
                 )
 
@@ -251,6 +253,7 @@ def build_model_and_optimizer(
                 getattr(cfg_peft, "lora_A_init", None),
                 device_mesh=model_wrapper.device_mesh,
                 moe_mesh=getattr(model_wrapper, "moe_mesh", None),
+                load_base_model=load_base_model,
                 quantization=dequantize_base_checkpoint,
             )
 
@@ -307,6 +310,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft, state_d
     if cfg_ckpt is not None:
         cfg_ckpt = cfg_ckpt.to_dict()
         cfg_ckpt.pop("restore_from", None)
+        cfg_ckpt.pop("load_base_model", None)
         ckpt_kwargs |= cfg_ckpt
     if ckpt_kwargs.get("is_peft", False) and ckpt_kwargs.get("model_save_format") == "torch_save":
         raise ValueError(
@@ -782,6 +786,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             autopipeline=autopipeline,
             loss_fn=self.loss_fn,
             parallelize_fn=parallelize_fn,
+            load_base_model=self.cfg.get("checkpoint.load_base_model", True),
             dequantize_base_checkpoint=self.cfg.get("checkpoint.dequantize_base_checkpoint", False),
         )
         if isinstance(model, AutoPipeline):
