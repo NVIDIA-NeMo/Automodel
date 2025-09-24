@@ -349,3 +349,168 @@ class TestGPTOSSStateDictAdapter:
         assert "layers.0.mlp.gate.bias" in out
         assert "layers.0.mlp.router.weight" not in out
         assert "layers.0.mlp.router.bias" not in out
+
+
+class TestConvertMoePackedTensors:
+    def _make_adapter(self):
+        return GPTOSSStateDictAdapter(config=object(), moe_config=object(), backend=object(), dtype=torch.float32)
+
+    def test_convert_basic_nibble_decode_and_shape(self):
+        adapter = self._make_adapter()
+
+        class FakeDTensor:
+            def __init__(self, tensor, placements="P", device_mesh="M"):
+                self.tensor = tensor
+                self.placements = placements
+                self.device_mesh = device_mesh
+
+            @property
+            def shape(self):
+                return self.tensor.shape
+
+            @property
+            def device(self):
+                return self.tensor.device
+
+            @property
+            def is_cuda(self):
+                return self.tensor.is_cuda
+
+            def to(self, dtype):
+                return FakeDTensor(self.tensor.to(dtype), self.placements, self.device_mesh)
+
+            def cuda(self):
+                return FakeDTensor(self.tensor.cuda(), self.placements, self.device_mesh)
+
+            def reshape(self, *shape):
+                return FakeDTensor(self.tensor.reshape(*shape), self.placements, self.device_mesh)
+
+            def view(self, *shape):
+                return FakeDTensor(self.tensor.view(*shape), self.placements, self.device_mesh)
+
+            def transpose(self, dim0, dim1):
+                return FakeDTensor(self.tensor.transpose(dim0, dim1), self.placements, self.device_mesh)
+
+            def contiguous(self):
+                return FakeDTensor(self.tensor.contiguous(), self.placements, self.device_mesh)
+
+            def to_local(self):
+                return self.tensor
+
+            def __getitem__(self, item):
+                return FakeDTensor(self.tensor.__getitem__(item), self.placements, self.device_mesh)
+
+            def __sub__(self, other):
+                if isinstance(other, FakeDTensor):
+                    return FakeDTensor(self.tensor - other.tensor, self.placements, self.device_mesh)
+                return FakeDTensor(self.tensor - other, self.placements, self.device_mesh)
+
+            def __rsub__(self, other):
+                if isinstance(other, FakeDTensor):
+                    return FakeDTensor(other.tensor - self.tensor, self.placements, self.device_mesh)
+                return FakeDTensor(other - self.tensor, self.placements, self.device_mesh)
+
+        # blocks shape: (*prefix=1,1, G=1, B=1) containing byte 0x12 -> low=2 (1.0), high=1 (0.5)
+        blocks = FakeDTensor(torch.tensor([[[[18]]]], dtype=torch.uint8))
+        # scales shape: (*prefix=1,1, G=1), value 127 -> exponent 0 (no scaling)
+        scales = FakeDTensor(torch.tensor([[[127]]], dtype=torch.uint8))
+
+        def fake_empty(shape, placements=None, device_mesh=None, dtype=None):
+            return FakeDTensor(torch.empty(shape, dtype=dtype), placements=placements, device_mesh=device_mesh)
+
+        with patch("torch.cuda.is_available", return_value=False), \
+             patch("torch.distributed.tensor.empty", create=True, side_effect=fake_empty):
+            out = adapter._convert_moe_packed_tensors(blocks, scales, dtype=torch.float32, rows_per_chunk=4)
+
+        # Unwrap local tensor for validation
+        out_local = out.to_local() if hasattr(out, "to_local") else out
+
+        # Expect shape: (*prefix, G*B*2) = (1, 2) then transposed dims (1,2) -> (1, 2, 1)
+        assert out_local.shape == (1, 2, 1)
+        torch.testing.assert_close(out_local[0, 0, 0], torch.tensor(1.0, dtype=torch.float32))
+        torch.testing.assert_close(out_local[0, 1, 0], torch.tensor(0.5, dtype=torch.float32))
+
+    def test_convert_chunking_and_exponent_scaling(self):
+        adapter = self._make_adapter()
+
+        class FakeDTensor:
+            def __init__(self, tensor, placements="P", device_mesh="M"):
+                self.tensor = tensor
+                self.placements = placements
+                self.device_mesh = device_mesh
+
+            @property
+            def shape(self):
+                return self.tensor.shape
+
+            @property
+            def device(self):
+                return self.tensor.device
+
+            @property
+            def is_cuda(self):
+                return self.tensor.is_cuda
+
+            def to(self, dtype):
+                return FakeDTensor(self.tensor.to(dtype), self.placements, self.device_mesh)
+
+            def cuda(self):
+                return FakeDTensor(self.tensor.cuda(), self.placements, self.device_mesh)
+
+            def reshape(self, *shape):
+                return FakeDTensor(self.tensor.reshape(*shape), self.placements, self.device_mesh)
+
+            def view(self, *shape):
+                return FakeDTensor(self.tensor.view(*shape), self.placements, self.device_mesh)
+
+            def transpose(self, dim0, dim1):
+                return FakeDTensor(self.tensor.transpose(dim0, dim1), self.placements, self.device_mesh)
+
+            def contiguous(self):
+                return FakeDTensor(self.tensor.contiguous(), self.placements, self.device_mesh)
+
+            def to_local(self):
+                return self.tensor
+
+            def __getitem__(self, item):
+                return FakeDTensor(self.tensor.__getitem__(item), self.placements, self.device_mesh)
+
+            def __sub__(self, other):
+                if isinstance(other, FakeDTensor):
+                    return FakeDTensor(self.tensor - other.tensor, self.placements, self.device_mesh)
+                return FakeDTensor(self.tensor - other, self.placements, self.device_mesh)
+
+            def __rsub__(self, other):
+                if isinstance(other, FakeDTensor):
+                    return FakeDTensor(other.tensor - self.tensor, self.placements, self.device_mesh)
+                return FakeDTensor(other - self.tensor, self.placements, self.device_mesh)
+
+        # Design 3 rows (G=3), B=1, prefix=(1,1)
+        # Bytes: 0x12 -> [1.0, 0.5], 0xF1 -> [0.5, -6.0], 0x80 -> [0.0, -0.0]
+        blocks = FakeDTensor(torch.tensor([[[[0x12], [0xF1], [0x80]]]], dtype=torch.uint8))
+        # Exponents: 127->0, 128->+1, 126->-1
+        scales = FakeDTensor(torch.tensor([[[127, 128, 126]]], dtype=torch.uint8))
+
+        def fake_empty(shape, placements=None, device_mesh=None, dtype=None):
+            return FakeDTensor(torch.empty(shape, dtype=dtype), placements=placements, device_mesh=device_mesh)
+
+        with patch("torch.cuda.is_available", return_value=False), \
+             patch("torch.distributed.tensor.empty", create=True, side_effect=fake_empty):
+            out = adapter._convert_moe_packed_tensors(blocks, scales, dtype=torch.float32, rows_per_chunk=1)
+
+        out_local = out.to_local() if hasattr(out, "to_local") else out
+
+        # Shape: (*prefix, G*B*2) -> (1, 6) then transpose -> (1, 6, 1)
+        assert out_local.shape == (1, 6, 1)
+
+        # Row 0, exponent 0 -> [1.0, 0.5]
+        torch.testing.assert_close(out_local[0, 0, 0], torch.tensor(1.0))
+        torch.testing.assert_close(out_local[0, 1, 0], torch.tensor(0.5))
+
+        # Row 1, exponent +1 -> [1.0, -12.0]
+        torch.testing.assert_close(out_local[0, 2, 0], torch.tensor(1.0))
+        torch.testing.assert_close(out_local[0, 3, 0], torch.tensor(-12.0))
+
+        # Row 2, exponent -1 -> [0.0, 0.0] (signed zeros tolerated)
+        torch.testing.assert_close(out_local[0, 4, 0], torch.tensor(0.0))
+        torch.testing.assert_close(out_local[0, 5, 0], torch.tensor(0.0))
