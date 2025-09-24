@@ -12,16 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 step_scheduler:
   global_batch_size: 512
   local_batch_size: 64
   ckpt_every_steps: 500
   val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 2
-<<<<<<< HEAD
-=======
-  # max_steps: 5
->>>>>>> origin/main
 
 dist_env:
   backend: nccl
@@ -38,12 +35,7 @@ parallelizer:
 
 model:
   _target_: nemo_automodel.components.models.gpt_oss.model.GptOssForCausalLM.from_config
-<<<<<<< HEAD
   pretrained_model_name_or_path: openai/gpt-oss-20b
-=======
-  # _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained_config
-  pretrained_model_name_or_path: unsloth/gpt-oss-20b-BF16
->>>>>>> origin/main
   trust_remote_code: true
   is_meta_device: true
   backend:
@@ -56,7 +48,6 @@ model:
     enable_hf_state_dict_adapter: true
 
 checkpoint:
-<<<<<<< HEAD
   enabled: false
   checkpoint_dir: /tmp/checkpoints/
   model_save_format: safetensors # torch_save or safetensors
@@ -66,15 +57,6 @@ checkpoint:
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: 8
-=======
-  enabled: true
-  checkpoint_dir: /tmp/checkpoints/
-  model_save_format: safetensors # torch_save or safetensors
-  save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
-
-distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
->>>>>>> origin/main
   tp_size: 1
   cp_size: 1
   pp_size: 1
