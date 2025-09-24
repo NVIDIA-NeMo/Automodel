@@ -566,7 +566,6 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
         ep_shard_axis_names=("es1", "es2"),
         activation_checkpointing=True,
     )
-
     apply_ep_mock.assert_called_once()
     # AC enabled
     apply_ac_mock.assert_called_once_with(model)
