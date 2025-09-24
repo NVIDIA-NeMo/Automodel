@@ -16,7 +16,7 @@ import gc
 import math
 import re
 from collections import defaultdict
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 from transformers import GptOssConfig
@@ -24,6 +24,9 @@ from transformers import GptOssConfig
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.components.moe.utils import BackendConfig
+
+if TYPE_CHECKING:
+    from torch.distributed.device_mesh import DeviceMesh
 
 FP4_VALUES = [
     +0.0,
@@ -195,7 +198,7 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         return out.transpose(1, 2).contiguous()
 
 
-    def to_hf(self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False) -> dict[str, Any]:
+    def to_hf(self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs) -> dict[str, Any]:
         """Convert from native model state dict to HuggingFace format."""
         hf_state_dict = dict(state_dict)
         hf_state_dict = self._apply_key_mapping(hf_state_dict, self.internal_to_hf_map)
@@ -211,6 +214,7 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
     def from_hf(
         self,
         hf_state_dict: dict[str, Any],
+        device_mesh: Optional["DeviceMesh"] = None,
         **kwargs,
     ) -> dict[str, Any]:
         """Convert HF checkpoint to native format.
