@@ -18,7 +18,6 @@ step_scheduler:
   ckpt_every_steps: 500
   val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 2
-  # max_steps: 5
 
 dist_env:
   backend: nccl
@@ -35,8 +34,7 @@ parallelizer:
 
 model:
   _target_: nemo_automodel.components.models.gpt_oss.model.GptOssForCausalLM.from_config
-  # _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained_config
-  pretrained_model_name_or_path: unsloth/gpt-oss-20b-BF16
+  pretrained_model_name_or_path: openai/gpt-oss-20b
   trust_remote_code: true
   is_meta_device: true
   backend:
@@ -49,10 +47,11 @@ model:
     enable_hf_state_dict_adapter: true
 
 checkpoint:
-  enabled: true
+  enabled: false
   checkpoint_dir: /tmp/checkpoints/
   model_save_format: safetensors # torch_save or safetensors
   save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  dequantize_base_checkpoint: true
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager

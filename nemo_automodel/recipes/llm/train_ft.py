@@ -251,6 +251,7 @@ def build_model_and_optimizer(
                 getattr(cfg_peft, "lora_A_init", None),
                 device_mesh=model_wrapper.device_mesh,
                 moe_mesh=getattr(model_wrapper, "moe_mesh", None),
+                quantization=dequantize_base_checkpoint,
             )
 
         # ensure the model is on device
