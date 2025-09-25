@@ -230,7 +230,8 @@ uv run examples/llm_finetune/finetune.py \
 # section `step_scheduler` of the yaml file.
 ```
 
-Launching a multi-node PEFT example requires only adding a `slurm` section to your config, similarly to the SFT case.
+> [!NOTE]
+> Launching a multi-node PEFT example requires only adding a `slurm` section to your config, similarly to the SFT case.
 
 
 ## VLM Supervised Fine-Tuning (SFT)
