@@ -19,8 +19,8 @@
 
 </div>
 
-📣 News
----
+<!-- 📣 News
+--- -->
 
 Overview
 ---
@@ -29,22 +29,23 @@ Nemo AutoModel is an open-source training library developed by NVIDIA, designed 
 
 What you can expect:
 
-- **Flexibility** with a modular design that allows easy integration and customization.
-- **Efficient resource management** using k8s and Slurm, enabling scalable and flexible deployment across different hardware configurations.
-- **Hackable** with PyTorch-native paths for quick research prototypes.
-- **High performance and flexible** with custom kernels and DTensor support.
-- **Seamless integration** with Hugging Face for day-0 model support, ease of use, allowing users to leverage a wide range of pre-trained models and tools.
-- Comprehensive documentation that is both detailed and user-friendly, with practical examples.
+- **Hackable** with a modular design that allows easy integration, customization and quick research prototypes.
+- **Minimal ceremony**: YAML‑driven recipes; override any field via CLI.
+- **High performance and flexibility** with custom kernels and DTensor support.
+- **Seamless integration** with Hugging Face for day-0 model support, ease of use, and wide range of supported models.
+- **Efficient resource management** using k8s and Slurm, enabling scalable and flexible deployment across configurations.
+- **Comprehensive documentation** that is both detailed and user-friendly, with practical examples.
 
-Please refer to our design documents for more details on the architecture and design philosophy.
+<!-- Please refer to our design documents for more details on the architecture and design philosophy. -->
 
 <!-- NeMo Framework is NVIDIA's GPU accelerated, end-to-end training framework for large language models (LLMs), multi-modal models and speech models. It enables seamless scaling of training (both pretraining and post-training) workloads from single GPU to thousand-node clusters for both 🤗Hugging Face/PyTorch and Megatron models. It includes a suite of libraries and recipe collections to help users train models from end to end. The **AutoModel library ("NeMo AutoModel")** provides GPU-accelerated PyTorch training for 🤗Hugging Face models on **Day-0**. Users can start training and fine-tuning models instantly without conversion delays, scale effortlessly with PyTorch-native parallelisms, optimized custom kernels, and memory-efficient recipes-all while preserving the original checkpoint format for seamless use across the Hugging Face ecosystem. -->
 
 > ⚠️ Note: NeMo AutoModel is under active development. New features, improvements, and documentation updates are released regularly. We are working toward a stable release, so expect the interface to solidify over time. Your feedback and contributions are welcome, and we encourage you to follow along as new updates roll out.
 
+
 ## Table of Contents
 - [Feature Roadmap](#feature-roadmap)
-- [Design Principles](#design-principles)
+- [Design Principles](#why-dtensor-and-spmd-instead-of-framework-specific-parallel)
 - [Key Features](#key-features)
 - [Getting Started](#getting-started)
 - [LLM](#llm-pre-training)
@@ -59,6 +60,8 @@ Please refer to our design documents for more details on the architecture and de
 - [Interoperability](#-interoperability)
 - [Contributing](#-contributing)
 - [License](#license)
+
+## Feature Roadmap
 
 ✅ _Available now_ | 🔜 _Coming in 25.11_
 
@@ -77,20 +80,15 @@ Please refer to our design documents for more details on the architecture and de
 
 - 🔜 **Extended MoE support** - GPT-OSS, Qwen3 (Coder-480B-A35B, etc), Qwen-next.
 
-## Design Principles
-
-- **DTensor‑native**: Partition model/optimizer states with `DeviceMesh` + placements (`Shard`, `Replicate`).
-- **SPMD first**: Parallelism is configuration. No model rewrites when scaling up or changing strategy.
-- **HF integration**: Operate on native 🤗 checkpoints/configs for frictionless fine‑tuning and pretraining.
-- **Minimal ceremony**: YAML‑driven recipes; override any field via CLI.
-
-## Why SPMD instead of framework‑specific parallel?
+## Why DTensor and SPMD instead of framework‑specific parallel?
 
 - **One program, any scale**: The same training script runs on 1 GPU or 100+ by changing the mesh.
+- **DTensor‑native**: Partition model/optimizer states with `DeviceMesh` + placements (`Shard`, `Replicate`).
+- **SPMD first**: Parallelism is configuration. No model rewrites when scaling up or changing strategy.
 - **Decoupled concerns**: Model code stays pure PyTorch; parallel strategy lives in config.
 - **Composability**: Mix **tensor**, **sequence**, and **data** parallel by editing placements.
 - **Portability**: Fewer bespoke abstractions; easier to reason about failure modes and restarts.
-- **Interoperability**: HF models/tokenizers/optimizers plug in directly; no format round‑trips.
+<!-- - **Interoperability**: HF models/tokenizers/optimizers plug in directly; no format round‑trips. -->
 
 > TL;DR: SPMD turns “how to parallelize” into a *runtime layout choice*, not a code fork.
 
@@ -99,19 +97,20 @@ Please refer to our design documents for more details on the architecture and de
 - **Mesh‑defined parallelism**: Compose tensor/sequence/data parallel by changing placements and sizes.
 - **FSDP2 on DTensor**: Memory‑efficient sharding (HSDP included) for large models.
 - **Pretraining & fine‑tuning**: Day‑0 support for both regimes with shared configs/utilities.
-- **HF‑native I/O**: Train from 🤗 configs/weights; export consolidated HF checkpoints.
+- **HF‑native I/O**: Train from 🤗 checkpoints on day-0; export consolidated HF checkpoints.
 - **Mixed precision**: BF16/FP16/FP8; sequence packing; optimized CUDA kernels.
 - **PEFT built‑in**: LoRA and hooks for custom adapters.
 - **Mesh‑aware DCP**: Sharded SafeTensors with merge/reshard utilities.
 - **Flexible Configuration**: YAML-based configuration system for reproducible experiments.
 - **FP8 Precision**: Native FP8 training & inference for higher throughput and lower memory use.
-- **Day-0 Hugging Face Support**: Instantly fine-tune any model from the Hugging Face Hub.
 - **Large-Scale Distributed Training**: Built-in FSDP2 and Megatron-FSDP for seamless multi-node scaling.
 - **Vision-Language Model Ready**: Native support for VLMs (Qwen2-VL, Gemma-3-VL, etc).
+<!-- - **Day-0 Hugging Face Support**: Instantly fine-tune any model from the Hugging Face Hub. -->
+
 
 ## Getting Started
 
-We recommend **uv** for reproducible environments.
+We recommend using **uv** for reproducible Python environments.
 
 ```bash
 uv venv
@@ -119,8 +118,6 @@ uv pip install nemo_automodel # latest release
 # or: uv pip install git+https://github.com/NVIDIA-NeMo/Automodel.git
 uv run python -c "import nemo_automodel; print('AutoModel ready')"
 ```
-
-> Ensure recent CUDA/PyTorch. Some kernels (e.g., FlashAttention‑style) may JIT on first run.
 
 
 ### Run a Recipe
@@ -142,14 +139,16 @@ uv run examples/vlm_finetune/finetune.py --config examples/vlm_finetune/gemma3/g
 We provide an example SFT experiment using the [Fineweb dataset](https://huggingface.co/datasets/HuggingFaceFW/fineweb/) with a nano-GPT model, ideal for quick experimentation on a single node.
 ```sh
 uv run torchrun --nproc-per-node=8 \
-    examples/llm_pretrain/pretrain.py \
-    -c examples/llm_pretrain/nanogpt_pretrain.yaml
+  examples/llm_pretrain/pretrain.py \
+  -c examples/llm_pretrain/nanogpt_pretrain.yaml
 ```
 
-### LLM Pre-training Multi Node
+<!-- ### LLM Pre-training Multi Node -->
 
 ## LLM Supervised Fine-Tuning (SFT)
 We provide an example SFT experiment using the [SQuAD dataset](https://rajpurkar.github.io/SQuAD-explorer/).
+
+<!-- Refer to `examples/llm_finetune/annotated.yaml` for a full list of parameters that can be overridden. -->
 
 ### LLM SFT Single Node
 
@@ -157,8 +156,8 @@ The default SFT configuration is set to run on a single GPU. To start the experi
 
 ```sh
 uv run python3 \
-    examples/llm_finetune/finetune.py \
-    -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+  examples/llm_finetune/finetune.py \
+  -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
 This fine-tunes the `Llama3.2-1B` model on the SQuAD dataset using a 1 GPU.
@@ -168,33 +167,53 @@ using torchrun and adjust the `--proc-per-node` argument to the number of needed
 
 ```sh
 uv run torchrun --nproc-per-node=8 \
-    examples/llm_finetune/finetune.py \
-    -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+  examples/llm_finetune/finetune.py \
+  -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
-Refer to `examples/configs/sft.yaml` for a full list of parameters that can be overridden.
-
+Alternatively, you can use the `automodel` CLI application to launch the same job, for example:
+```sh
+uv run automodel finetune llm \
+  --nproc-per-node=8 \
+  -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+```
 
 ### LLM SFT Multi Node
-
+You can use the `automodel` CLI application to launch a job on a SLURM cluster, for example:
 ```sh
-# Run from the root of NeMo RL repo
-NUM_ACTOR_NODES=2
+# First you need to specify the SLURM section in your YAML config, for example:
 
-COMMAND="uv run ./examples/run_sft.py --config examples/configs/sft.yaml cluster.num_nodes=2 cluster.gpus_per_node=8 checkpointing.checkpoint_dir='results/sft_llama8b_2nodes' logger.wandb_enabled=True logger.wandb.name='sft-llama8b'" \
-CONTAINER=YOUR_CONTAINER \
-MOUNTS="$PWD:$PWD" \
-sbatch \
-    --nodes=${NUM_ACTOR_NODES} \
-    --account=YOUR_ACCOUNT \
-    --job-name=YOUR_JOBNAME \
-    --partition=YOUR_PARTITION \
-    --time=4:0:0 \
-    --gres=gpu:8 \
-    ray.sub
+cat << EOF > examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+slurm:
+  job_name: llm-finetune # set to the job name you want to use
+  nodes: 2 # set to the needed number of nodes
+  ntasks_per_node: 8
+  time: 00:30:00
+  account: your_account
+  partition: gpu
+  container_image: nvcr.io/nvidia/nemo:25.07
+  gpus_per_node: 8 # This adds "#SBATCH --gpus-per-node=8" to the script
+  # Optional: Add extra mount points if needed
+  extra_mounts:
+    - /lustre:/lustre
+  # Optional: Specify custom HF_HOME location (will auto-create if not specified)
+  hf_home: /path/to/your/HF_HOME
+  # Optional : Specify custom env vars
+  # env_vars:
+  #   ENV_VAR: value
+  # Optional: Specify custom job directory (defaults to cwd/slurm_jobs)
+  # job_dir: /path/to/slurm/jobs
+EOF
+
+# using the updated YAML you can launch the job.
+uv run automodel finetune llm \
+  -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
 ## LLM Parameter-Efficient Fine-Tuning (PEFT)
+
+We provide a PEFT example using the [HellaSwag dataset](https://rowanzellers.com/hellaswag/).
+
 ### LLM PEFT Single Node
 ```bash
 # Memory‑efficient SFT with LoRA
@@ -204,36 +223,43 @@ uv run examples/llm_finetune/finetune.py \
 # You can always overwrite parameters by appending them to the command, for example,
 # if you want to increase the micro-batch size you can do
 uv run examples/llm_finetune/finetune.py \
---config examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml \
---step_scheduler.local_batch_size 16
+  --config examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml \
+  --step_scheduler.local_batch_size 16
 
 # The above command will modify the `local_batch_size` variable to have value 16 in the
 # section `step_scheduler` of the yaml file.
 ```
-### LLM PEFT Multi Node
+
+Launching a multi-node PEFT example requires only adding a `slurm` section to your config, similarly to the SFT case.
 
 
 ## VLM Supervised Fine-Tuning (SFT)
+
+We provide a VLM SFT example using Qwen2.5‑VL for end‑to‑end fine‑tuning on image‑text data.
+
 ### VLM SFT Single Node
 ```bash
-# Qwen2.5‑VL on a single GPU
-uv run examples/vlm_finetune/finetune.py \
---config examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml
+# Qwen2.5‑VL on a 8 GPUs
+uv run torchrun --nproc-per-node=8 \
+  examples/vlm_finetune/finetune.py \
+  --config examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml
 ```
 
 ## VLM Parameter-Efficient Fine-Tuning (PEFT)
+
+We provide a VLM PEFT (LoRA) example for memory‑efficient adaptation with Gemma3 VLM.
+
 ### VLM PEFT Single Node
 ```bash
-# Qwen2.5‑VL on a single GPU
-uv run examples/vlm_finetune/finetune.py \
---config examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix_peft.yaml
+# Qwen2.5‑VL on a 8 GPUs
+uv run torchrun --nproc-per-node=8 \
+  examples/vlm_finetune/finetune.py \
+  --config examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix_peft.yaml
 ```
 
 
-
-
 ## Supported Models
-NeMo AutoModel provides native support for a wide range of models available on the Hugging Face Hub, enabling efficient fine-tuning for various domains. Below is a small sample of ready‑to‑use families (train as‑is or swap any compatible 🤗 causal LM):
+NeMo AutoModel provides native support for a wide range of models available on the Hugging Face Hub, enabling efficient fine-tuning for various domains. Below is a small sample of ready‑to‑use families (train as‑is or swap any compatible 🤗 causal LM), you can specify nearly any LLM/VLM model available on 🤗 hub:
 
 | Domain | Model Family | Model ID | Recipes |
 |--------|--------------|----------|---------|
@@ -264,7 +290,7 @@ NeMo AutoModel provides native support for a wide range of models available on t
 ## Performance
 
 Coming soon..
-
+<!--
 ## Mesh‑Aware Checkpointing
 
 AutoModel writes **Distributed Checkpoints (DCP)** with SafeTensors
@@ -280,7 +306,7 @@ enabled: true
 checkpoint_dir: ./checkpoints
 save_consolidated: true
 model_save_format: safetensors
-```
+``` -->
 
 ## 🔌 Interoperability
 
@@ -328,21 +354,23 @@ NeMo-Automodel/
 └── tests/                      # Comprehensive test suite
 ```
 
----
 
-## 🤝 Contributing
+## Citation
+If you use NeMo AutoModel in your research, please cite it using the following BibTeX entry:
+```
+@misc{nemo-automodel,
+title = {NeMo AutoModel: A Scalable and Efficient Training Library},
+howpublished = {\url{https://github.com/NVIDIA-NeMo/Automodel}},
+year = {2025},
+note = {GitHub repository},
+}
+```
+
+## Contributing
 
 We welcome contributions! Please see our [Contributing Guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/CONTRIBUTING.md) for details.
 
----
 
-## 🔗 Links
-
-- **Documentation**: https://docs.nvidia.com/nemo-framework/user-guide/latest/automodel/index.html
-- **Hugging Face Hub**: https://huggingface.co/models
-- **Issues**: https://github.com/NVIDIA-NeMo/Automodel/issues
-- **Discussions**: https://github.com/NVIDIA-NeMo/Automodel/discussions
-
-## 📄 License
+## License
 
 NVIDIA NeMo AutoModel is licensed under the [Apache License 2.0](https://github.com/NVIDIA-NeMo/Automodel/blob/main/LICENSE).
