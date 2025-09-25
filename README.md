@@ -45,7 +45,7 @@ What you can expect:
 
 ## Table of Contents
 - [Feature Roadmap](#feature-roadmap)
-- [Design Principles](#why-dtensor-and-spmd-instead-of-framework-specific-parallel)
+- [Design Principles](#why-dtensor-and-spmd-instead-of-framework‑specific-parallel)
 - [Key Features](#key-features)
 - [Getting Started](#getting-started)
 - [LLM](#llm-pre-training)
@@ -58,7 +58,7 @@ What you can expect:
 - [Supported Models](#supported-models)
 - [Performance](#performance)
 - [Interoperability](#-interoperability)
-- [Contributing](#-contributing)
+- [Contributing](#contributing)
 - [License](#license)
 
 ## Feature Roadmap
@@ -80,7 +80,7 @@ What you can expect:
 
 - 🔜 **Extended MoE support** - GPT-OSS, Qwen3 (Coder-480B-A35B, etc), Qwen-next.
 
-## Why DTensor and SPMD instead of framework‑specific parallel?
+## Why DTensor and SPMD instead of framework‑specific parallel
 
 - **One program, any scale**: The same training script runs on 1 GPU or 100+ by changing the mesh.
 - **DTensor‑native**: Partition model/optimizer states with `DeviceMesh` + placements (`Shard`, `Replicate`).
