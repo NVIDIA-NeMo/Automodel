@@ -58,8 +58,8 @@ What you can expect:
 - [Supported Models](#supported-models)
 - [Performance](#performance)
 - [Interoperability](#-interoperability)
-- [Contributing](#contributing)
-- [License](#license)
+- [Contributing](#-contributing)
+- [License](#-license)
 
 ## Feature Roadmap
 
@@ -368,11 +368,11 @@ note = {GitHub repository},
 }
 ```
 
-## Contributing
+## 🤝 Contributing
 
 We welcome contributions! Please see our [Contributing Guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/CONTRIBUTING.md) for details.
 
 
-## License
+## 📄 License
 
 NVIDIA NeMo AutoModel is licensed under the [Apache License 2.0](https://github.com/NVIDIA-NeMo/Automodel/blob/main/LICENSE).
