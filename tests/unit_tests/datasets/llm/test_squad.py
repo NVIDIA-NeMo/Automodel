@@ -117,7 +117,7 @@ def test_plain_tokenizer_basic():
       • produce loss_mask = [0]*len(context_ids) + [1]*len(answer_ids)
     """
     tok = DummyTokenizer()
-    ds = make_squad_dataset(tok, split="train", seq_length=None)
+    ds = make_squad_dataset(tok, split="train", max_seq_length=None)
     # The dataset should have 2 examples (mocked dataset length)
     assert len(ds) == 2
     sample = ds[0]
@@ -136,25 +136,23 @@ def test_plain_tokenizer_basic():
         assert all(v == 1 for v in sample["loss_mask"][first_one:])
 
 
-def test_sequence_padding():
+def test_sequence_max_len_enforced():
     """
-    When `seq_length` is supplied, every field must be padded to that exact
-    length; `loss_mask` should be padded with zeros; `input_ids` & `labels`
-    with eos.
+    When `seq_length` is supplied, total tokenized length must not exceed it
+    after space-aware context truncation; no padding should be added.
     """
     tok = DummyTokenizer()
     pad_len = 32
-    ds = make_squad_dataset(tok, seq_length=pad_len)
+    ds = make_squad_dataset(tok, max_seq_length=pad_len)
     for row in ds:
         for key, val in row.items():
             if key == "___PAD_TOKEN_IDS___":
                 continue
-            assert len(val) == pad_len
-        # last id in labels must equal eos
-        assert list(filter(lambda x: x != -100, row["labels"])) == [0]
-        if 'loss_mask' in row:
-            # loss mask padding must be zeros
-            assert row["loss_mask"][-1] == 0
+            assert len(val) <= pad_len
+        # labels should still end with eos (filtered of -100)
+        assert list(filter(lambda x: x != -100, row["labels"]))[-1] == tok.eos_token_id
+        # attention masks should be ones (no padding zeros)
+        assert all(v == 1 for v in row["attention_mask"])  # type: ignore[index]
 
 
 def test_limit_dataset_samples(monkeypatch):
@@ -183,7 +181,7 @@ def test_chat_template_path():
     ds = make_squad_dataset(
         tok,
         start_of_turn_token=start_token,
-        seq_length=None,  # no padding
+        max_seq_length=None,  # no padding
     )
     row = ds[0]
     n = len(row['input_ids'])
@@ -202,15 +200,3 @@ def test_chat_template_path():
     if 'loss_mask' in row:
         assert sum(row["loss_mask"][:response_start]) == 0
         assert sum(row["loss_mask"][response_start:]) == len(row["loss_mask"][response_start:])
-
-
-def test_fp8_flag_is_noop():
-    """
-    The `fp8` flag exists for future use. Setting it should not alter
-    functional behaviour nor raise.
-    """
-    tok = DummyTokenizer()
-    ds = make_squad_dataset(tok, fp8=True)
-    # still returns a dataset
-    assert isinstance(ds, Dataset)
-    assert len(ds) == 2

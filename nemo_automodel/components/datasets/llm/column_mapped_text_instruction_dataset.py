@@ -16,12 +16,14 @@ import logging
 import re
 from enum import Enum
 from pathlib import Path
+from random import randint
 from typing import Dict, Iterator, List, Optional, Union
 
 from datasets import VerificationMode, load_dataset
 from torch.utils.data import Dataset
 
 from nemo_automodel.components.datasets.llm.formatting_utils import (
+    NoContextLeftError,
     _add_pad_token,
     _has_chat_template,
     format_chat_template,
@@ -152,20 +154,21 @@ class ColumnMappedTextInstructionDataset(Dataset):
         *,
         split: Optional[str] = None,
         answer_only_loss_mask: bool = True,
-        seq_length: Optional[int] = None,
+        max_seq_length: Optional[int] = None,
         start_of_turn_token: Optional[str] = None,
     ) -> None:
         """
         Initialize the dataset.
 
         Args:
-            path_or_dataset_id: The path or dataset id of the dataset.
-            column_mapping: The mapping of the columns.
-            tokenizer: The tokenizer to use.
-            split: The split of the dataset to load.
-            answer_only_loss_mask: Whether to compute the loss mask only on the answer tokens.
-            seq_length: The sequence length to use for padding.
-            start_of_turn_token: The token to use to indicate the start of a turn.
+            path_or_dataset_id (str, list[str]): The path or dataset id of the dataset.
+            column_mapping (dict): The mapping of the columns.
+            tokenizer (Tokenizer): The tokenizer to use.
+            split (str, optional): The split of the dataset to load.
+            answer_only_loss_mask (bool, optional): Whether to compute the loss mask only on the answer tokens.
+            max_seq_length (int, optional): If set, will truncate each example to this
+                length. If smaller than max_seq_length, the sequence is left as is.
+            start_of_turn_token (str, optional): The token to use to indicate the start of a turn.
         """
 
         if _has_chat_template(tokenizer):
@@ -207,7 +210,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
 
         self.answer_only_loss_mask = answer_only_loss_mask
         self.start_of_turn_token = start_of_turn_token
-        self.seq_length = seq_length
+        self.max_seq_length = max_seq_length
 
     def __len__(self) -> int:  # noqa: D401
         """
@@ -234,11 +237,26 @@ class ColumnMappedTextInstructionDataset(Dataset):
         Raises:
             RuntimeError: If streaming is enabled.
         """
-        row = self.dataset[idx]
-        mapped = {dest: row[src] for dest, src in self.column_mapping.items() if src in row}
-        mapped = self._apply_tokenizer(mapped)
-        assert _check_all_values_equal_length(mapped), "All values must be of the same length"
-        return mapped
+        # Try current idx, then successive ones, to find a sample that fits max_seq_length
+        total = len(self.dataset)
+        cur_idx = idx
+        last_error: Optional[Exception] = None
+        max_attempts = min(64, total)
+        for _ in range(max_attempts):
+            row = self.dataset[cur_idx]
+            mapped = {dest: row[src] for dest, src in self.column_mapping.items() if src in row}
+            try:
+                mapped = self._apply_tokenizer(mapped)
+                assert _check_all_values_equal_length(mapped), "All values must be of the same length"
+                return mapped
+            except NoContextLeftError as e:
+                last_error = e
+                cur_idx = randint(0, total - 1)  # randint [start, end] (inclusive)
+                continue
+        # If we exhausted attempts, re-raise the last error for visibility
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Failed to retrieve a valid sample")
 
     def _apply_tokenizer(self, sample: Dict[str, str]) -> Dict[str, List[int]]:
         """
@@ -274,7 +292,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
                 formatted_text,
                 eos_token_id,
                 pad_token_id,
-                seq_length=self.seq_length,
+                max_seq_length=self.max_seq_length,
                 start_of_turn_token=self.start_of_turn_token,
             )
         else:
@@ -286,6 +304,6 @@ class ColumnMappedTextInstructionDataset(Dataset):
                 answer,
                 eos_token_id,
                 pad_token_id,
-                seq_length=self.seq_length,
+                max_seq_length=self.max_seq_length,
                 answer_only_loss_mask=self.answer_only_loss_mask,
             )
