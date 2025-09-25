@@ -286,7 +286,7 @@ NeMo AutoModel provides native support for a wide range of models available on t
 |  |  | [`google/gemma-3n-e4b-it`](https://huggingface.co/google/gemma-3n-e4b-it) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix_peft.yaml) |
 
 > [!NOTE]
-> Check out more [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune) and [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune) examples. Any causal LM on Hugging Face Hub can be used with the base recipe template, just overwrite pass `--model.pretrained_model_name_or_path <model-id>` to the CLI.
+> Check out more [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune) and [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune) examples. Any causal LM on Hugging Face Hub can be used with the base recipe template, just overwrite `--model.pretrained_model_name_or_path <model-id>` to the CLI.
 
 ---
 ## Performance
