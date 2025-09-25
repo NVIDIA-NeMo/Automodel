@@ -37,7 +37,7 @@ rng:
 
 parallelizer:
   _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
-  enable_ac: false
+  activation_checkpointing: false
 
 model:
   _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_config
@@ -124,4 +124,4 @@ lr_scheduler:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir> 
+#   save_dir: <your_wandb_save_dir>
