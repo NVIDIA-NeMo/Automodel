@@ -136,7 +136,7 @@ uv run examples/vlm_finetune/finetune.py --config examples/vlm_finetune/gemma3/g
 
 ## LLM Pre-training
 ### LLM Pre-training Single Node
-We provide an example SFT experiment using the [Fineweb dataset](https://huggingface.co/datasets/HuggingFaceFW/fineweb/) with a nano-GPT model, ideal for quick experimentation on a single node.
+We provide an example SFT experiment using the [Fineweb dataset](https://arxiv.org/abs/2406.17557/) with a nano-GPT model, ideal for quick experimentation on a single node.
 ```sh
 uv run torchrun --nproc-per-node=8 \
   examples/llm_pretrain/pretrain.py \
