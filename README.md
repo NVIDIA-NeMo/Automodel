@@ -25,7 +25,7 @@
 Overview
 ---
 
-Nemo AutoModel is an open-source training library developed by NVIDIA, designed to streamline and scale training and finetuning for multimodal models (LLMs, VLMs, etc). Designed for flexibility, reproducibility, and scale, NeMo AutoModel enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
+Nemo AutoModel is an open-source training library developed by NVIDIA, designed to streamline and scale training and finetuning for LLMs and VLMs. Designed for flexibility, reproducibility, and scale, NeMo AutoModel enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
 
 What you can expect:
 
