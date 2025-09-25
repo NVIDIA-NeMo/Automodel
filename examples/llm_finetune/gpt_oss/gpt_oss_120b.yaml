@@ -30,7 +30,7 @@ rng:
 
 parallelizer:
   _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
-  enable_ac: false
+  activation_checkpointing: false
 
 model:
   _target_: nemo_automodel.components.models.gpt_oss.model.GptOssForCausalLM.from_config
