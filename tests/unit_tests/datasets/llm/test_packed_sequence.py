@@ -15,7 +15,7 @@
 import pytest
 from datasets import Dataset
 
-from nemo_automodel.components.datasets.llm.packed_sequence import PackedSequence
+from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
 
 
 @pytest.fixture
@@ -31,9 +31,9 @@ def base_dataset():
 
 def test_basic_packing(base_dataset):
     """Test basic packing without splitting across packs"""
-    packed_ds = PackedSequence(
-        base_dataset, "train", packed_sequence_size=10, split_across_pack=False, max_packs=None
-    ).pack()
+    packed_ds = pack_dataset(
+        base_dataset, split="train", packed_sequence_size=10, split_across_pack=False, max_packs=None
+    )
 
     assert len(packed_ds) == 2
     # Check packed_ds[0] is [1,2,3,4,5,6,7,8,9] plus [0] for padding
@@ -58,9 +58,9 @@ def test_basic_packing(base_dataset):
 )
 def test_split_across_pack(base_dataset, split_across_pack, max_packs, expected):
     """Test splitting sequences across packs with different configurations"""
-    packed_ds = PackedSequence(
-        base_dataset, "train", packed_sequence_size=5, split_across_pack=split_across_pack, max_packs=max_packs
-    ).pack()
+    packed_ds = pack_dataset(
+        base_dataset, split="train", packed_sequence_size=5, split_across_pack=split_across_pack, max_packs=max_packs
+    )
     assert len(packed_ds) == expected
 
 
@@ -70,19 +70,20 @@ def test_loss_mask_handling():
         {"input_ids": [[1, 2, 3], [4, 5, 6]], "labels": [[1, 2, 3], [4, 5, 6]], "loss_mask": [[1, 1, 0], [1, 1, 1]]}
     )
 
-    packed_ds = PackedSequence(
-        ds_with_mask, "train", packed_sequence_size=5, split_across_pack=False, max_packs=None
-    ).pack()
-
-    assert packed_ds[0]["loss_mask"] == [1, 1, 0, 0, 0]
-    assert packed_ds[1]["loss_mask"] == [1, 1, 1, 0, 0]
+    packed_ds = pack_dataset(
+        ds_with_mask, split="train", packed_sequence_size=5, split_across_pack=False, max_packs=None
+    )
+    assert packed_ds[0]["labels"][-3:] == [-100] * 3
+    assert packed_ds[0]["labels"][:2] != [-100] * 2
+    assert packed_ds[1]["labels"][:3] != [-100] * 3
+    assert packed_ds[1]["labels"][-2:] == [-100] * 2
 
 
 def test_position_id_wrapping(base_dataset):
     """Test position ID generation with wrapping"""
-    packed_ds = PackedSequence(
-        base_dataset, "train", packed_sequence_size=5, split_across_pack=False, max_packs=None
-    ).pack()
+    packed_ds = pack_dataset(
+        base_dataset, split="train", packed_sequence_size=5, split_across_pack=False, max_packs=None
+    )
     assert packed_ds[0]["position_ids"] == [0, 1, 2, 3, 4]
 
 
@@ -90,9 +91,9 @@ def test_exact_fit():
     """Test sequence that exactly fills pack size"""
     exact_fit_ds = Dataset.from_dict({"input_ids": [[1, 2, 3, 4, 5]], "labels": [[1, 2, 3, 4, 5]]})
 
-    packed_ds = PackedSequence(
-        exact_fit_ds, "train", packed_sequence_size=5, split_across_pack=False, max_packs=None
-    ).pack()
+    packed_ds = pack_dataset(
+        exact_fit_ds, split="train", packed_sequence_size=5, split_across_pack=False, max_packs=None
+    )
     assert len(packed_ds) == 1
     assert packed_ds[0]["input_ids"] == [1, 2, 3, 4, 5]
 
@@ -102,4 +103,4 @@ def test_error_on_oversized_sequence():
     oversized_ds = Dataset.from_dict({"input_ids": [[1, 2, 3, 4, 5, 6]], "labels": [[1, 2, 3, 4, 5, 6]]})
 
     with pytest.raises(ValueError):
-        PackedSequence(oversized_ds, "train", packed_sequence_size=5, split_across_pack=False, max_packs=None).pack()
+        pack_dataset(oversized_ds, split="train", packed_sequence_size=5, split_across_pack=False, max_packs=None)
