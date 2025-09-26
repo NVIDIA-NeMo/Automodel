@@ -4,6 +4,7 @@ This page summarizes the datasets already supported in NeMo Automodel for LLM an
 
 - See also: [LLM datasets](llm/dataset.md) and [VLM datasets](vlm/dataset.md) for deeper, task-specific guides.
 
+- If a dataset you need is missing, please open a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues) with a short description and example schema so we can prioritize support.
 ---
 
 ## LLM Datasets
