@@ -67,7 +67,7 @@ class TimerBase(ABC):
         Args:
             barrier (bool, optional): Synchronizes ranks before starting. Defaults to False.
         """
-        pass
+        pass  # pragma: no cover
 
     @abstractmethod
     def stop(self, barrier=False):
@@ -77,14 +77,14 @@ class TimerBase(ABC):
         Args:
             barrier (bool, optional): Synchronizes ranks before stopping. Defaults to False.
         """
-        pass
+        pass  # pragma: no cover
 
     @abstractmethod
     def reset(self):
         """
         Reset timer.
         """
-        pass
+        pass  # pragma: no cover
 
     @abstractmethod
     def elapsed(self, reset=True, barrier=False):
@@ -98,7 +98,7 @@ class TimerBase(ABC):
         Returns:
             float: Elapsed time.
         """
-        pass
+        pass  # pragma: no cover
 
 
 class DummyTimer(TimerBase):
@@ -467,7 +467,7 @@ class Timers:
         elif self._log_option == "all":
             output_string = self._get_all_ranks_time_string(names, reset, barrier, normalizer / 1000.0)
         else:
-            raise Exception("unknown timing log option {}".format(self._log_option))
+            raise Exception("unknown timing log option {}".format(self._log_option))  # pragma: no cover
         return output_string
 
     def log(
