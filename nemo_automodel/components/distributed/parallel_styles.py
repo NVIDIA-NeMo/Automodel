@@ -14,12 +14,16 @@
 
 import torch.nn as nn
 from torch.distributed.tensor import (
+    DTensor,
+    Replicate,
+    DeviceMesh,
     Shard,
     distribute_tensor,
 )
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     RowwiseParallel,
+    SequenceParallel,
 )
 
 def _distribute_param(_module, name, device_mesh, src_data_rank, placements):
@@ -74,9 +78,24 @@ class RowwiseParallelLora(RowwiseParallel):
         for name, param in module.named_parameters():
             _distribute_param(module, name, device_mesh, self.src_data_rank, [Shard(0)])
 
+class SequenceParallelLora(SequenceParallel):
+    def _replicate_module_fn(
+        self, name: str, module: nn.Module, device_mesh: DeviceMesh
+    ):
+        for p_name, param in module.named_parameters():
+            # simple replication with fixed ones_ init from LayerNorm/RMSNorm, which allow
+            # us to simply just use from_local
+            replicated_param = torch.nn.Parameter(
+                DTensor.from_local(param, device_mesh, [Replicate()], run_check=False),
+                requires_grad=param.requires_grad,
+            )
+            module.register_parameter(p_name, replicated_param)
+
 def translate_to_lora(plan):
-    if isinstance(plan, ColwiseParallel):
-        plan.__class__ = ColwiseParallelLora
-    elif isinstance(plan, RowwiseParallel):
-        plan.__class__ = RowwiseParallelLora
+    CLS_MAP = {
+        ColwiseParallel: ColwiseParallelLora,
+        RowwiseParallel: RowwiseParallelLora,
+        SequenceParallel: SequenceParallelLora,
+    }
+    plan.__class__ = CLS_MAP.get(type(plan), plan.__class__)
     return plan
