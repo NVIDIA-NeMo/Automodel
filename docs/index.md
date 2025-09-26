@@ -39,25 +39,23 @@ model-coverage/llm.md
 model-coverage/vlm.md
 ```
 
-
-<!--
 ```{toctree}
 :caption: Datasets
 :hidden:
+
+guides/dataset_overview.md
 guides/llm/dataset.md
+guides/llm/column-mapped-text-instruction-dataset.md
 guides/vlm/dataset.md
-``` -->
+```
 
 ```{toctree}
 :caption: Development
 :hidden:
 guides/checkpointing.md
 guides/gradient_checkpointing.md
-guides/llm/knowledge_distillation.md
 guides/pipelining.md
-guides/llm/dataset.md
-guides/vlm/dataset.md
-guides/llm/column-mapped-text-instruction-dataset.md
+guides/llm/knowledge_distillation.md
 guides/fp8_training.md
 
 apidocs/index.rst
