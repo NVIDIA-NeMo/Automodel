@@ -96,13 +96,18 @@ class MegatronPretraining:
             splits_to_build (Optional[Union[str, List[str]]]): Splits to build. If None, builds all splits.
         """
         if find_spec("nemo_automodel.components.datasets.llm.megatron.helpers_cpp") is None:
-            if dist.is_available() and dist.is_initialized():
-                if get_local_rank_preinit() == 0:
+            try:
+                if dist.is_available() and dist.is_initialized():
+                    if get_local_rank_preinit() == 0:
+                        compile_helper()
+                    dist.barrier()
+                else:
                     compile_helper()
-                dist.barrier()
-            else:
-                compile_helper()
-            assert find_spec("nemo_automodel.components.datasets.llm.megatron.helpers_cpp") is not None
+                assert find_spec("nemo_automodel.components.datasets.llm.megatron.helpers_cpp") is not None
+            except AssertionError:
+                raise ImportError(
+                    "Could not compile megatron dataset C++ helper functions and therefore cannot import helpers python file."
+                )
 
         if not isinstance(paths, (list, tuple, dict)):
             paths = get_list_of_files(paths)
