@@ -22,26 +22,33 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
 )
 
+def _distribute_param(_module, name, device_mesh, src_data_rank, placements):
+    param = getattr(_module, name)
+    dist_param = nn.Parameter(
+        distribute_tensor(param, device_mesh, placements, src_data_rank=src_data_rank),
+        requires_grad=param.requires_grad,
+    )
+    assert dist_param.requires_grad == param.requires_grad
+    _module.register_parameter(name, dist_param)
+
+
 
 class ColwiseParallelLora(ColwiseParallel):
     def _partition_linear_fn(self, name, module, device_mesh):
         # colwise shard weight/bias to Shard(0), weight be Shard(0)
         # means Colwise as Linear is input * weight^T + bias, where
         # weight would become Shard(1)
-        def _distribute_param(_module, name):
-            param = getattr(_module, name)
-            dist_param = nn.Parameter(
-                distribute_tensor(param, device_mesh, [Shard(0)], src_data_rank=self.src_data_rank)
-            )
-            _module.register_parameter(name, dist_param)
+        def _get_module_and_name(module, name):
+            if name.endswith("lora_A.weight"):
+                return module.lora_A, "weight"
+            elif name.endswith("lora_B.weight") and hasattr(module, "lora_B"):
+                return module.lora_B, "weight"
+            else:
+                return module, name
 
         for name, param in module.named_parameters():
-            if name.endswith("lora_A.weight"):
-                _distribute_param(module.lora_A, "weight")
-            elif name.endswith("lora_B.weight"):
-                _distribute_param(module.lora_B, "weight")
-            else:
-                _distribute_param(module, name)
+            _module, _name = _get_module_and_name(module, name)
+            _distribute_param(_module, _name, device_mesh, self.src_data_rank, [Shard(0)])
 
 
 class RowwiseParallelLora(RowwiseParallel):
@@ -49,10 +56,12 @@ class RowwiseParallelLora(RowwiseParallel):
         # Rowwise shard weight to Shard(1), bias to Replicate(), weight be Shard(1)
         # means Rowwise as nn.Linear is input * weight^T + bias, where
         # weight would become Shard(0)
-        super()._partition_linear_fn(name, module, device_mesh)
+        _distribute_param(module, "weight", device_mesh, self.src_data_rank, [Shard(1)])
+        if getattr(module, "bias", None) is not None:
+            _distribute_param(module, "bias", device_mesh, self.src_data_rank, [Replicate()])
         if hasattr(module, "lora_A"):
-            super()._partition_linear_fn(name, module.lora_A, device_mesh)
-            super()._partition_linear_fn(name, module.lora_B, device_mesh)
+            _distribute_param(module.lora_A, "weight", device_mesh, self.src_data_rank, [Shard(1)])
+            _distribute_param(module.lora_B, "weight", device_mesh, self.src_data_rank, [Shard(1)])
 
 
 def translate_to_lora(plan):
