@@ -20,7 +20,7 @@ export CUDA_VISIBLE_DEVICES="0,1"
 
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
 examples/llm_finetune/finetune.py \
-    --config examples/llm_finetune/qwen/qwen3_moe_2l_torch_sdpa.yaml \
+    --config examples/llm_finetune/qwen/qwen3_moe_2layer_proxy_torch_sdpa.yaml \
     --step_scheduler.max_steps 2 \
     --step_scheduler.global_batch_size 8 \
     --step_scheduler.local_batch_size 4 \
