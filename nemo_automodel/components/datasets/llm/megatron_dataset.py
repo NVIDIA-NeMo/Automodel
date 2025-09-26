@@ -19,9 +19,9 @@ from importlib.util import find_spec
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
+import torch.distributed as dist
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-import torch.distributed as dist
 from nemo_automodel.components.datasets.llm.megatron.builder import BlendedMegatronDatasetBuilder
 from nemo_automodel.components.datasets.llm.megatron.gpt_dataset import GPTDatasetConfig
 from nemo_automodel.components.datasets.llm.megatron.megatron_utils import compile_helper, get_blend_from_list
