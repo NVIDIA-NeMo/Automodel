@@ -282,7 +282,7 @@ NeMo AutoModel provides native support for a wide range of models available on t
 > [!NOTE]
 > Check out more [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune) and [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune) examples. Any causal LM on Hugging Face Hub can be used with the base recipe template, just overwrite `--model.pretrained_model_name_or_path <model-id>` in the CLI or in the YAML config.
 
----
+
 ## Performance
 
 Coming soon..
@@ -310,9 +310,6 @@ model_save_format: safetensors
 - **[Hugging Face](https://github.com/huggingface/transformers)**: Train any LLM/VLM from 🤗 without format conversion.
 - **[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)**: Optional conversions to/from Megatron formats for specific workflows.
 
-
-
----
 
 ## 🗂️ Project Structure
 
