@@ -1,0 +1,62 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+distributed:
+  pp_size: 1
+  ep_size: 8
+  dp_replicate_size: 1
+
+model:
+  _target_: nemo_automodel.components.models.gpt_oss.model.GptOssForCausalLM.from_config
+  pretrained_model_name_or_path: openai/gpt-oss-20b
+  num_layers: null  # Optionally override the number of hidden layers (null = use model default)
+  backend:
+    _target_: nemo_automodel.components.moe.utils.BackendConfig
+    attn: flex
+    linear: torch
+    rms_norm: torch
+    enable_deepep: false
+    fake_balanced_gate: true
+    enable_hf_state_dict_adapter: false
+
+parallelizer:
+  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
+  enable_ac: false
+
+training:
+  seq_len: 4096
+  global_batch_size: 256
+  local_batch_size: 2
+  steps: 30
+  warmup_steps: 10
+  seed: 1234
+
+profiling:
+  nsys_start: -1
+  nsys_end: -1
+
+optimizer:
+  _target_: torch.optim.Adam
+  lr: 1.0e-4
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  weight_decay: 0
+
+pipelining:
+  pp_microbatch_size: 2
+  layers_per_stage: 2
+  pipeline_parallel_schedule: interleaved1f1b
+  patch_inner_model: false
+  patch_causal_lm_model: false
+  round_to_pp_multiple: down
