@@ -368,6 +368,47 @@ def test_apply_ac_wraps_blocks_with_and_without_context(monkeypatch):
     assert len(model.layers.registered) == 2
 
 
+def test_apply_ac_custom_policy_respects_hidden_and_expert_dims(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    captured_policy = None
+
+    def fake_create_selective_checkpoint_contexts(policy_cb):
+        nonlocal captured_policy
+        captured_policy = policy_cb
+        return "CTX"
+
+    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+        assert preserve_rng_state is True
+        assert callable(context_fn)
+        assert context_fn() == "CTX"
+        return block
+
+    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
+
+    hidden_size = 17
+    num_experts = 31
+    model = DummyModel([DummyBlock(), DummyBlock()])
+
+    P.apply_ac(model, ignore_router=True, hidden_size=hidden_size, num_experts=num_experts)
+
+    assert captured_policy is not None
+
+    torch_stub = sys.modules["torch"]
+    rhs_match = type("Mat", (), {"shape": (hidden_size, num_experts)})()
+    rhs_mismatch = type("Mat", (), {"shape": (hidden_size, num_experts + 1)})()
+
+    policy = captured_policy
+    must_save = policy(None, torch_stub.ops.aten.mm.default, object(), rhs_match)
+    prefer_recompute_shape = policy(None, torch_stub.ops.aten.mm.default, object(), rhs_mismatch)
+    prefer_recompute_func = policy(None, object(), object(), rhs_match)
+
+    assert must_save == P.CheckpointPolicy.MUST_SAVE
+    assert prefer_recompute_shape == P.CheckpointPolicy.PREFER_RECOMPUTE
+    assert prefer_recompute_func == P.CheckpointPolicy.PREFER_RECOMPUTE
+
+
 def _find_call_by_first_arg(mock_obj, target_first_arg):
     for args, kwargs in mock_obj.call_args_list:
         if args and args[0] is target_first_arg:
@@ -523,9 +564,8 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
         tp_axis_name=None,
         ep_axis_name="ep",
         ep_shard_axis_names=("es1", "es2"),
-        enable_ac=True,
+        activation_checkpointing=True,
     )
-
     apply_ep_mock.assert_called_once()
     # AC enabled
     apply_ac_mock.assert_called_once_with(model)
@@ -574,7 +614,7 @@ def test_parallelize_model_asserts_on_invalid_tp_cp_and_ep_divisibility(monkeypa
             tp_axis_name="tp",
             ep_axis_name=None,
             ep_shard_axis_names=None,
-            enable_ac=False,
+            activation_checkpointing=False,
         )
 
     # CP size != 1 -> assertion
@@ -590,7 +630,7 @@ def test_parallelize_model_asserts_on_invalid_tp_cp_and_ep_divisibility(monkeypa
             tp_axis_name=None,
             ep_axis_name=None,
             ep_shard_axis_names=None,
-            enable_ac=False,
+            activation_checkpointing=False,
         )
 
     # EP enabled but divisibility violated -> assertion
@@ -607,5 +647,5 @@ def test_parallelize_model_asserts_on_invalid_tp_cp_and_ep_divisibility(monkeypa
             tp_axis_name=None,
             ep_axis_name="ep",
             ep_shard_axis_names=None,
-            enable_ac=False,
+            activation_checkpointing=False,
         )

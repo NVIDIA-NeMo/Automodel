@@ -81,12 +81,12 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh):
             )
 
 
-def apply_ac(model: nn.Module, ignore_router: bool = False):
+def apply_ac(model: nn.Module, ignore_router: bool = False, hidden_size: int = 7168, num_experts: int = 256):
     """Apply activation checkpointing to the model."""
 
     def _custom_policy(ctx, func, *args, **kwargs):
         if func == torch.ops.aten.mm.default:
-            if len(args) == 2 and (args[1].shape == (7168, 256) or args[1].shape == (2048, 64)):
+            if len(args) == 2 and (args[1].shape == (hidden_size, num_experts)):
                 return CheckpointPolicy.MUST_SAVE
             else:
                 return CheckpointPolicy.PREFER_RECOMPUTE
@@ -182,7 +182,7 @@ def parallelize_model(
     tp_axis_name: str | None = None,
     ep_axis_name: str | None = None,
     ep_shard_axis_names: tuple[str, ...] | None = None,
-    enable_ac: bool = False,
+    activation_checkpointing: bool = False,
 ):
     assert tp_axis_name is None or world_mesh[tp_axis_name].size() == 1, (
         "Tensor parallelism not supported for DeepSeek v3 model"
@@ -204,7 +204,7 @@ def parallelize_model(
 
         apply_ep(model, moe_mesh[ep_axis_name])
 
-    if enable_ac:
+    if activation_checkpointing:
         apply_ac(model)
 
     if ep_shard_axis_names is not None:

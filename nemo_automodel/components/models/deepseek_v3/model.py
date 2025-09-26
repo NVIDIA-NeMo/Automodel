@@ -218,6 +218,7 @@ class DeepseekV3ForCausalLM(nn.Module):
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
         trust_remote_code: bool = False,
+        **kwargs,
     ):
         if isinstance(pretrained_model_name_or_path, str):
             config = DeepseekV3Config.from_pretrained(pretrained_model_name_or_path)
