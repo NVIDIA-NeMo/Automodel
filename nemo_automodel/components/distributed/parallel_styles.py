@@ -40,8 +40,10 @@ class ColwiseParallelLora(ColwiseParallel):
         # weight would become Shard(1)
         def _get_module_and_name(module, name):
             if name.endswith("lora_A.weight"):
+                assert hasattr(module, "lora_A"), f"lora_A not found in {module}"
                 return module.lora_A, "weight"
-            elif name.endswith("lora_B.weight") and hasattr(module, "lora_B"):
+            elif name.endswith("lora_B.weight"):
+                assert hasattr(module, "lora_B"), f"lora_B not found in {module}"
                 return module.lora_B, "weight"
             else:
                 return module, name
