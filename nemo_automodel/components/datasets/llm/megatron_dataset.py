@@ -25,7 +25,6 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from nemo_automodel.components.datasets.llm.megatron.builder import BlendedMegatronDatasetBuilder
 from nemo_automodel.components.datasets.llm.megatron.gpt_dataset import GPTDatasetConfig
 from nemo_automodel.components.datasets.llm.megatron.megatron_utils import compile_helper, get_blend_from_list
-from nemo_automodel.components.distributed.init_utils import get_local_rank_preinit
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +97,7 @@ class MegatronPretraining:
         if find_spec("nemo_automodel.components.datasets.llm.megatron.helpers_cpp") is None:
             try:
                 if dist.is_available() and dist.is_initialized():
-                    if get_local_rank_preinit() == 0:
+                    if int(os.environ.get("LOCAL_RANK", "0")) == 0:
                         compile_helper()
                     dist.barrier()
                 else:
