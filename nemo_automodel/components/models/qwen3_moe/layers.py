@@ -45,12 +45,7 @@ def _preprocess_for_attn(
                 "attention_mask": padding_mask.unsqueeze(1).unsqueeze(2),
             }
     else:  # sdpa / flex
-        if attention_mask is None:
-            attn_kwargs = {}
-        else:
-            attn_kwargs = {
-                "attention_mask": attention_mask.bool(),
-            }
+        attn_kwargs = {}
         # SDPA expects (B, H, S, D)
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
