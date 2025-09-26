@@ -42,6 +42,27 @@ What you can expect:
 
 > ⚠️ Note: NeMo AutoModel is under active development. New features, improvements, and documentation updates are released regularly. We are working toward a stable release, so expect the interface to solidify over time. Your feedback and contributions are welcome, and we encourage you to follow along as new updates roll out.
 
+### Why DTensor and SPMD
+
+- **One program, any scale**: The same training script runs on 1 GPU or 100+ by changing the mesh.
+- **DTensor‑native**: Partition model/optimizer states with `DeviceMesh` + placements (`Shard`, `Replicate`).
+- **SPMD first**: Parallelism is configuration. No model rewrites when scaling up or changing strategy.
+- **Decoupled concerns**: Model code stays pure PyTorch; parallel strategy lives in config.
+- **Composability**: Mix **tensor**, **sequence**, and **data** parallel by editing placements.
+- **Portability**: Fewer bespoke abstractions; easier to reason about failure modes and restarts.
+<!-- - **Interoperability**: HF models/tokenizers/optimizers plug in directly; no format round‑trips. -->
+
+### Key Features
+
+- **Mesh‑defined parallelism**: Compose tensor/sequence/pipeline/data parallel by changing placements and sizes.
+- **FSDP2 on DTensor**: Memory‑efficient sharding (HSDP included) for large scale training.
+- **Pretraining, SFT & PEFT**: Day‑0 support for LLMs both regimes with shared configs/utilities.
+- **Mixed precision**: BF16/FP16/FP8; sequence packing; optimized CUDA kernels.
+- **Mesh‑aware DCP**: Sharded SafeTensors with merge/reshard utilities; interoperable with HF.
+- **Large-Scale Distributed Training**: Built-in FSDP2 and Megatron-FSDP for seamless multi-node scaling.
+- **Vision-Language Model Ready**: Native support for VLMs (Qwen2-VL, Gemma-3-VL, etc).
+<!-- - **Day-0 Hugging Face Support**: Instantly fine-tune any model from the Hugging Face Hub. -->
+
 
 ## Table of Contents
 - [Why DTensor and SPMD](#why-dtensor-and-spmd)
@@ -60,16 +81,6 @@ What you can expect:
 - [Interoperability](#-interoperability)
 - [Contributing](#-contributing)
 - [License](#-license)
-
-## Why DTensor and SPMD
-
-- **One program, any scale**: The same training script runs on 1 GPU or 100+ by changing the mesh.
-- **DTensor‑native**: Partition model/optimizer states with `DeviceMesh` + placements (`Shard`, `Replicate`).
-- **SPMD first**: Parallelism is configuration. No model rewrites when scaling up or changing strategy.
-- **Decoupled concerns**: Model code stays pure PyTorch; parallel strategy lives in config.
-- **Composability**: Mix **tensor**, **sequence**, and **data** parallel by editing placements.
-- **Portability**: Fewer bespoke abstractions; easier to reason about failure modes and restarts.
-<!-- - **Interoperability**: HF models/tokenizers/optimizers plug in directly; no format round‑trips. -->
 
 > TL;DR: SPMD turns “how to parallelize” into a *runtime layout choice*, not a code fork.
 
@@ -91,21 +102,6 @@ What you can expect:
 - ✅ **Knowledge Distillation** - Support for knowledge distillation with LLMs; VLM support will be added post 25.09.
 
 - 🔜 **Extended MoE support** - GPT-OSS, Qwen3 (Coder-480B-A35B, etc), Qwen-next.
-
-## Key Features
-
-- **Mesh‑defined parallelism**: Compose tensor/sequence/data parallel by changing placements and sizes.
-- **FSDP2 on DTensor**: Memory‑efficient sharding (HSDP included) for large models.
-- **Pretraining & fine‑tuning**: Day‑0 support for both regimes with shared configs/utilities.
-- **HF‑native I/O**: Train from 🤗 checkpoints on day-0; export consolidated HF checkpoints.
-- **Mixed precision**: BF16/FP16/FP8; sequence packing; optimized CUDA kernels.
-- **PEFT built‑in**: LoRA and hooks for custom adapters.
-- **Mesh‑aware DCP**: Sharded SafeTensors with merge/reshard utilities.
-- **Flexible Configuration**: YAML-based configuration system for reproducible experiments.
-- **FP8 Precision**: Native FP8 training & inference for higher throughput and lower memory use.
-- **Large-Scale Distributed Training**: Built-in FSDP2 and Megatron-FSDP for seamless multi-node scaling.
-- **Vision-Language Model Ready**: Native support for VLMs (Qwen2-VL, Gemma-3-VL, etc).
-<!-- - **Day-0 Hugging Face Support**: Instantly fine-tune any model from the Hugging Face Hub. -->
 
 
 ## Getting Started
