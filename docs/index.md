@@ -43,9 +43,10 @@ model-coverage/vlm.md
 :caption: Datasets
 :hidden:
 
+guides/dataset_overview.md
 guides/llm/dataset.md
-guides/vlm/dataset.md
 guides/llm/column-mapped-text-instruction-dataset.md
+guides/vlm/dataset.md
 ```
 
 ```{toctree}
