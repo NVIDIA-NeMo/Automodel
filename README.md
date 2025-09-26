@@ -52,15 +52,15 @@ What you can expect:
 - **Portability**: Fewer bespoke abstractions; easier to reason about failure modes and restarts.
 <!-- - **Interoperability**: HF models/tokenizers/optimizers plug in directly; no format round‑trips. -->
 
-### Key Features
+<!-- ### Key Features -->
 
-- **Mesh‑defined parallelism**: Compose tensor/sequence/pipeline/data parallel by changing placements and sizes.
-- **FSDP2 on DTensor**: Memory‑efficient sharding (HSDP included) for large scale training.
-- **Pretraining, SFT & PEFT**: Day‑0 support for LLMs both regimes with shared configs/utilities.
-- **Mixed precision**: BF16/FP16/FP8; sequence packing; optimized CUDA kernels.
-- **Mesh‑aware DCP**: Sharded SafeTensors with merge/reshard utilities; interoperable with HF.
-- **Large-Scale Distributed Training**: Built-in FSDP2 and Megatron-FSDP for seamless multi-node scaling.
-- **Vision-Language Model Ready**: Native support for VLMs (Qwen2-VL, Gemma-3-VL, etc).
+<!-- - **Mesh‑defined parallelism**: Compose tensor/sequence/pipeline/data parallel by changing placements and sizes. -->
+<!-- - **FSDP2 on DTensor**: Memory‑efficient sharding (HSDP included) for large scale training. -->
+<!-- - **Pretraining, SFT & PEFT**: Day‑0 support for LLMs both regimes with shared configs/utilities.
+- **Mixed precision**: BF16/FP16/FP8; sequence packing; optimized CUDA kernels. -->
+<!-- - **Mesh‑aware DCP**: Sharded SafeTensors with merge/reshard utilities; interoperable with HF. -->
+<!-- - **Large-Scale Distributed Training**: Built-in FSDP2 and Megatron-FSDP for seamless multi-node scaling. -->
+<!-- - **Vision-Language Model Ready**: Native support for VLMs (Qwen2-VL, Gemma-3-VL, etc). -->
 <!-- - **Day-0 Hugging Face Support**: Instantly fine-tune any model from the Hugging Face Hub. -->
 
 
@@ -88,17 +88,19 @@ What you can expect:
 
 - ✅ **Advanced Parallelism** - PyTorch native FSDP2, TP, CP, and SP for efficient training.
 - ✅ **Distributed Training** - Fully Sharded Data Parallel (FSDP2) support.
-- ✅ **HSDP** - Hybrid Sharding Data Parallelism based on FSDP2.
+- ✅ **HSDP** - Multi-node Hybrid Sharding Data Parallelism based on FSDP2.
 - ✅ **Pipeline Support** - Torch-native support for pipelining composable with FSDP2 and DTensor (3D Parallelism).
 - ✅ **Environment Support** - Support for SLURM and interactive training.
 - ✅ **Learning Algorithms** - SFT (Supervised Fine-Tuning), and PEFT (Parameter Efficient Fine-Tuning).
 - ✅ **Pre-training** - Support for model pre-training, including DeepSeekV3.
 - ✅ **Knowledge Distillation** - Support for knowledge distillation with LLMs; VLM support will be added post 25.09.
 - ✅ **Large Model Support** - Native PyTorch support for models up to 70B parameters.
-- ✅ **HuggingFace Integration** - Works with 1-70B models (Qwen, Llama).
+- ✅ **HuggingFace Integration** - Works with 1-70B models (Qwen, Llama) and larger MoEs.
 - ✅ **Sequence Packing** - Sequence packing for huge training perf gains.
-- ✅ **FP8** - With torchao, requires torch.compile-supported models.
+- ✅ **FP8 and mixed precision** - FP8 support with torchao, requires torch.compile-supported models.
 - ✅ **DCP** - Distributed Checkpoint support with SafeTensors output.
+- ✅ **VLM**: Support for finetuning VLMs (Qwen2-VL, Gemma-3-VL). More families to be included in the future.
+
 
 - 🔜 **Extended MoE support** - GPT-OSS, Qwen3 (Coder-480B-A35B, etc), Qwen-next.
 
