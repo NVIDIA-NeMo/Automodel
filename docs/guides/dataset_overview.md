@@ -2,7 +2,7 @@
 
 This page summarizes the datasets already supported in NeMo Automodel for LLM and VLM, and shows how to plug in your own datasets via simple Python functions or purely through YAML using the `_target_` mechanism.
 
-- See also: `docs/guides/llm/dataset.md`, `docs/guides/llm/column-mapped-text-instruction-dataset.md`, and `docs/guides/vlm/dataset.md` for deeper, task-specific guides.
+- See also: [LLM datasets](docs/guides/llm/dataset.md) and [VLM datasets](docs/guides/vlm/dataset.md) for deeper, task-specific guides.
 
 ---
 
@@ -56,7 +56,7 @@ dataset:
   answer_only_loss_mask: true
   start_of_turn_token: "<|assistant|>"
 ```
-  - See detailed guide: `docs/guides/llm/column-mapped-text-instruction-dataset.md`.
+  - See detailed guide: (here)[docs/guides/llm/column-mapped-text-instruction-dataset.md].
 
 - **NanoGPT Binary Shards (pretraining)**
   - Class: `nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset`
@@ -83,6 +83,7 @@ dataset:
   split: "0.99, 0.01, 0.00"  # train, validation, test
   splits_to_build: "train"
 ```
+ - See detailed pretrained guide (here)[docs/guides/llm/mcore_pretraining.md] using MegatronPretraining data.
 
 > ⚠️ Note: Multi-turn conversational and tool-calling/function-calling dataset support is coming soon.
 
@@ -147,7 +148,7 @@ dataloader:
 ```
 If you want answer-only loss masking, provide a model-appropriate `start_of_response_token` to the collate function.
 
-See `docs/guides/omni/gemma3-3n.md` and `docs/guides/vlm/dataset.md` for end-to-end examples.
+See [Gemma-3n](docs/guides/omni/gemma3-3n.md) and [VLM dataset](docs/guides/vlm/dataset.md) for end-to-end examples.
 
 ---
 
@@ -225,4 +226,4 @@ Then reference your class via `_target_` in YAML.
 - **Packed sequences**: Prefer packed sequences for throughput when fine-tuning LLMs on variable-length corpora.
 - **Validation**: You can define a separate `validation_dataset` and `validation_dataloader` block mirroring your training config.
 
-For detailed, end-to-end recipes, browse the example configs under `examples/llm_finetune/`, `examples/llm_pretrain/`, and `examples/vlm_finetune/`.
+For detailed, end-to-end recipes, browse the example configs under [examples/llm_finetune/](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune), [examples/llm_pretrain/](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_pretrain), and [examples/vlm_finetune/](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/vlm_finetune).
