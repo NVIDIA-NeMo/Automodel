@@ -65,9 +65,7 @@ What you can expect:
 
 
 ## Table of Contents
-- [Why DTensor and SPMD](#why-dtensor-and-spmd)
 - [Feature Roadmap](#feature-roadmap)
-- [Key Features](#key-features)
 - [Getting Started](#getting-started)
 - [LLM](#llm-pre-training)
   - [Pre-training](#llm-pre-training)
