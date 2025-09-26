@@ -65,6 +65,10 @@ class RowwiseParallelLora(RowwiseParallel):
             _distribute_param(module.lora_A, "weight", device_mesh, self.src_data_rank, [Shard(1)])
             _distribute_param(module.lora_B, "weight", device_mesh, self.src_data_rank, [Shard(1)])
 
+    def _partition_embedding_fn(self, name, module, device_mesh):
+        # colwise shard embedding.weight is straight forward as Shard(1)
+        for name, param in module.named_parameters():
+            _distribute_param(module, name, device_mesh, self.src_data_rank, [Shard(1)])
 
 def translate_to_lora(plan):
     if isinstance(plan, ColwiseParallel):
