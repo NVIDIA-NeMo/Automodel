@@ -21,7 +21,7 @@ export CUDA_VISIBLE_DEVICES="0,1"
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
 examples/llm_finetune/finetune.py \
     --config examples/llm_finetune/qwen/qwen3_moe_2layer_proxy_torch_sdpa.yaml \
-    --step_scheduler.max_steps 2 \
+    --step_scheduler.max_steps 4 \
     --step_scheduler.global_batch_size 8 \
     --step_scheduler.local_batch_size 4 \
     --step_scheduler.val_every_steps 1 \
@@ -34,7 +34,7 @@ examples/llm_finetune/finetune.py \
     --validation_dataset.seq_length 512 \
     --dataset.limit_dataset_samples 8 \
     --validation_dataset.limit_dataset_samples 8 \
-    --model.is_meta_device false \
+    --model.is_meta_device true \
     --checkpoint.enabled false \
     --distributed._target_ nemo_automodel.components.distributed.fsdp2.FSDP2Manager \
     --distributed.tp_size 1 \
