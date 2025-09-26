@@ -186,7 +186,7 @@ class TestDeepSeekV3StateDictAdapter:
         assert scale_inv.device.type == device.type
         assert scale_inv.dtype == torch.float32
 
-    def test_to_hf_deepep_backend(self):
+    def test_to_hf(self):
         config = self.create_mock_config()
         moe_config = self.create_mock_moe_config()
         backend = self.create_mock_backend_config(enable_deepep=True)
@@ -195,29 +195,12 @@ class TestDeepSeekV3StateDictAdapter:
 
         state_dict = {"test_key": torch.randn(10, 10)}
 
-        with patch.object(adapter, '_to_hf_deepep') as mock_deepep:
-            mock_deepep.return_value = {"converted_key": torch.randn(10, 10)}
+        with patch.object(adapter, '_to_hf_w_split_experts') as mock_to_hf:
+            mock_to_hf.return_value = {"converted_key": torch.randn(10, 10)}
 
             result = adapter.to_hf(state_dict)
 
-            mock_deepep.assert_called_once_with(state_dict)
-            assert "converted_key" in result
-
-    def test_to_hf_grouped_experts_backend(self):
-        config = self.create_mock_config()
-        moe_config = self.create_mock_moe_config()
-        backend = self.create_mock_backend_config(enable_deepep=False)
-
-        adapter = DeepSeekV3StateDictAdapter(config, moe_config, backend)
-
-        state_dict = {"test_key": torch.randn(10, 10)}
-
-        with patch.object(adapter, '_to_hf_grouped_experts') as mock_grouped:
-            mock_grouped.return_value = {"converted_key": torch.randn(10, 10)}
-
-            result = adapter.to_hf(state_dict)
-
-            mock_grouped.assert_called_once_with(state_dict)
+            mock_to_hf.assert_called_once_with(state_dict)
             assert "converted_key" in result
 
     def test_to_hf_with_exclude_regex(self):
@@ -229,8 +212,8 @@ class TestDeepSeekV3StateDictAdapter:
 
         state_dict = {"test_key": torch.randn(10, 10)}
 
-        with patch.object(adapter, '_to_hf_grouped_experts') as mock_grouped:
-            mock_grouped.return_value = {
+        with patch.object(adapter, '_to_hf_w_split_experts') as mock_to_hf:
+            mock_to_hf.return_value = {
                 "keep_this": torch.randn(5, 5),
                 "exclude_this": torch.randn(5, 5),
                 "also_keep": torch.randn(5, 5)
@@ -251,10 +234,10 @@ class TestDeepSeekV3StateDictAdapter:
 
         state_dict = {"test_key": torch.randn(10, 10)}
 
-        with patch.object(adapter, '_to_hf_grouped_experts') as mock_grouped, \
+        with patch.object(adapter, '_to_hf_w_split_experts') as mock_to_hf, \
              patch.object(adapter, '_add_quantization_scale_inv_tensors') as mock_add_quant:
 
-            mock_grouped.return_value = {"converted_key": torch.randn(10, 10)}
+            mock_to_hf.return_value = {"converted_key": torch.randn(10, 10)}
             mock_add_quant.return_value = {"quantized_key": torch.randn(10, 10)}
 
             result = adapter.to_hf(state_dict, quantization=True)
@@ -271,11 +254,11 @@ class TestDeepSeekV3StateDictAdapter:
 
         state_dict = {"test_key": torch.randn(10, 10)}
 
-        with patch.object(adapter, '_to_hf_grouped_experts') as mock_grouped, \
+        with patch.object(adapter, '_to_hf_w_split_experts') as mock_to_hf, \
              patch.object(adapter, '_add_quantization_scale_inv_tensors') as mock_add_quant:
 
             weight = torch.randn(8, 8)
-            mock_grouped.return_value = {"keep_key.weight": weight.clone()}
+            mock_to_hf.return_value = {"keep_key.weight": weight.clone()}
 
             result = adapter.to_hf(state_dict, quantization=False)
 
@@ -293,8 +276,8 @@ class TestDeepSeekV3StateDictAdapter:
 
         state_dict = {"test_key": torch.randn(10, 10)}
 
-        with patch.object(adapter, '_to_hf_grouped_experts') as mock_grouped:
-            mock_grouped.return_value = {
+        with patch.object(adapter, '_to_hf_w_split_experts') as mock_to_hf:
+            mock_to_hf.return_value = {
                 "keep_key.weight": torch.randn(16, 16),
                 "exclude_key.weight": torch.randn(16, 16),
             }
@@ -320,10 +303,10 @@ class TestDeepSeekV3StateDictAdapter:
         }
 
         with patch.object(adapter, '_dequantize') as mock_dequant, \
-             patch.object(adapter, '_from_hf_grouped_experts') as mock_from_grouped:
+             patch.object(adapter, '_from_hf_w_merged_experts') as mock_from_hf:
 
             mock_dequant.return_value = hf_state_dict
-            mock_from_grouped.return_value = {"converted": torch.randn(10, 10)}
+            mock_from_hf.return_value = {"converted": torch.randn(10, 10)}
 
             adapter.from_hf(hf_state_dict)
 
@@ -342,16 +325,16 @@ class TestDeepSeekV3StateDictAdapter:
         }
 
         with patch.object(adapter, '_dequantize') as mock_dequant, \
-             patch.object(adapter, '_from_hf_grouped_experts') as mock_from_grouped:
+             patch.object(adapter, '_from_hf_w_merged_experts') as mock_from_hf:
 
             mock_dequant.return_value = hf_state_dict
-            mock_from_grouped.return_value = {"converted": torch.randn(10, 10)}
+            mock_from_hf.return_value = {"converted": torch.randn(10, 10)}
 
             adapter.from_hf(hf_state_dict)
 
             assert adapter._uses_model_prefix is False
 
-    def test_from_hf_auto_deepep_backend(self):
+    def test_from_hf(self):
         config = self.create_mock_config()
         moe_config = self.create_mock_moe_config()
         backend = self.create_mock_backend_config(enable_deepep=True)
@@ -361,90 +344,15 @@ class TestDeepSeekV3StateDictAdapter:
         hf_state_dict = {"test_key": torch.randn(10, 10)}
 
         with patch.object(adapter, '_dequantize') as mock_dequant, \
-             patch.object(adapter, '_from_hf_deepep') as mock_from_deepep:
+             patch.object(adapter, '_from_hf_w_merged_experts') as mock_from_hf:
 
             mock_dequant.return_value = hf_state_dict
-            mock_from_deepep.return_value = {"converted": torch.randn(10, 10)}
+            mock_from_hf.return_value = {"converted": torch.randn(10, 10)}
 
-            result = adapter.from_hf(hf_state_dict, target_format="auto")
+            result = adapter.from_hf(hf_state_dict)
 
-            mock_from_deepep.assert_called_once()
+            mock_from_hf.assert_called_once()
             assert "converted" in result
-
-    def test_from_hf_auto_grouped_experts_backend(self):
-        config = self.create_mock_config()
-        moe_config = self.create_mock_moe_config()
-        backend = self.create_mock_backend_config(enable_deepep=False)
-
-        adapter = DeepSeekV3StateDictAdapter(config, moe_config, backend)
-
-        hf_state_dict = {"test_key": torch.randn(10, 10)}
-
-        with patch.object(adapter, '_dequantize') as mock_dequant, \
-             patch.object(adapter, '_from_hf_grouped_experts') as mock_from_grouped:
-
-            mock_dequant.return_value = hf_state_dict
-            mock_from_grouped.return_value = {"converted": torch.randn(10, 10)}
-
-            result = adapter.from_hf(hf_state_dict, target_format="auto")
-
-            mock_from_grouped.assert_called_once()
-            assert "converted" in result
-
-    def test_from_hf_explicit_target_format_deepep(self):
-        config = self.create_mock_config()
-        moe_config = self.create_mock_moe_config()
-        backend = self.create_mock_backend_config(enable_deepep=False)  # Backend is grouped but override
-
-        adapter = DeepSeekV3StateDictAdapter(config, moe_config, backend)
-
-        hf_state_dict = {"test_key": torch.randn(10, 10)}
-
-        with patch.object(adapter, '_dequantize') as mock_dequant, \
-             patch.object(adapter, '_from_hf_deepep') as mock_from_deepep:
-
-            mock_dequant.return_value = hf_state_dict
-            mock_from_deepep.return_value = {"converted": torch.randn(10, 10)}
-
-            result = adapter.from_hf(hf_state_dict, target_format="deepep")
-
-            mock_from_deepep.assert_called_once()
-            assert "converted" in result
-
-    def test_from_hf_explicit_target_format_grouped_experts(self):
-        config = self.create_mock_config()
-        moe_config = self.create_mock_moe_config()
-        backend = self.create_mock_backend_config(enable_deepep=True)  # Backend is deepep but override
-
-        adapter = DeepSeekV3StateDictAdapter(config, moe_config, backend)
-
-        hf_state_dict = {"test_key": torch.randn(10, 10)}
-
-        with patch.object(adapter, '_dequantize') as mock_dequant, \
-             patch.object(adapter, '_from_hf_grouped_experts') as mock_from_grouped:
-
-            mock_dequant.return_value = hf_state_dict
-            mock_from_grouped.return_value = {"converted": torch.randn(10, 10)}
-
-            result = adapter.from_hf(hf_state_dict, target_format="grouped_experts")
-
-            mock_from_grouped.assert_called_once()
-            assert "converted" in result
-
-    def test_from_hf_invalid_target_format(self):
-        config = self.create_mock_config()
-        moe_config = self.create_mock_moe_config()
-        backend = self.create_mock_backend_config()
-
-        adapter = DeepSeekV3StateDictAdapter(config, moe_config, backend)
-
-        hf_state_dict = {"test_key": torch.randn(10, 10)}
-
-        with patch.object(adapter, '_dequantize') as mock_dequant:
-            mock_dequant.return_value = hf_state_dict
-
-            with pytest.raises(ValueError, match="target_format must be"):
-                adapter.from_hf(hf_state_dict, target_format="invalid_format")
 
 
 class TestCalculateScaleShape:
