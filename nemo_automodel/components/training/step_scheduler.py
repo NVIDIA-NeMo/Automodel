@@ -55,7 +55,7 @@ class StepScheduler(Stateful):
         )
         self.grad_acc_steps = global_batch_size // (local_batch_size * dp_size)
         assert self.grad_acc_steps >= 1, (
-            "grad_acc_steps must be greater than or equal to 1. Please ensure that global_batch_size >= (local_batch_size * dp_size)"
+            f"grad_acc_steps ({self.grad_acc_steps}) must be greater than or equal to 1. Please ensure that global_batch_size >= (local_batch_size * dp_size)"
         )
         self.ckpt_every_steps = ckpt_every_steps
         assert ckpt_every_steps > 0, "ckpt_every_steps must be greater than 0"
