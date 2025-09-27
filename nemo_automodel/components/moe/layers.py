@@ -64,6 +64,7 @@ class MoEConfig:
     expert_activation: Literal["swiglu", "quick_geglu"] = "swiglu"
     activation_alpha: float = 1.702
     activation_limit: float = 7.0
+    softmax_before_topk: bool = False
 
 
 class MLP(nn.Module):
@@ -490,6 +491,8 @@ class GroupedExpertsDeepEP(nn.Module):
                 output2 = self._apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
         else:
             output2 = torch.zeros((1, x.size(-1)), dtype=x.dtype, device=x.device)
+            output2 = output2 * permuted_probs
+            output2 = output2.to(x.dtype)
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
@@ -572,6 +575,7 @@ class Gate(nn.Module):
         self.dim = config.dim
         self.n_experts = config.n_routed_experts
         self.topk = config.n_activated_experts
+        self.softmax_before_topk = config.softmax_before_topk
         self.n_groups = config.n_expert_groups
         self.topk_groups = config.n_limited_groups
         self.score_func = config.score_func
@@ -624,9 +628,15 @@ class Gate(nn.Module):
         scores = F.linear(x, self.weight, bias=self.bias)
 
         if self.score_func == "softmax":
-            values, indices = torch.topk(scores, k=self.topk, dim=-1)
-            weights = torch.nn.functional.softmax(values, dim=1)
-            original_scores = scores
+            if self.softmax_before_topk:
+                scores = scores.softmax(dim=-1, dtype=torch.float32)
+                original_scores = scores
+                indices = torch.topk(scores, k=self.topk, dim=-1)[1]
+                weights = scores.gather(1, indices)
+            else:
+                values, indices = torch.topk(scores, k=self.topk, dim=-1)
+                weights = values.softmax(dim=1, dtype=torch.float32)
+                original_scores = scores
         else:
             scores = scores.sigmoid()
             original_scores = scores
@@ -649,12 +659,12 @@ class Gate(nn.Module):
             indices = torch.topk(scores, self.topk, dim=-1)[1]
             weights = original_scores.gather(1, indices)
 
-            if self.score_func == "sigmoid" and self.norm_topk_prob and self.topk > 1:
-                # Use out-of-place division to keep autograd versions intact.
-                denom_w = weights.sum(dim=-1, keepdim=True) + 1e-20
-                denom_s = original_scores.sum(dim=-1, keepdim=True) + 1e-20
-                weights = weights / denom_w
-                original_scores = original_scores / denom_s
+        if self.norm_topk_prob and self.topk > 1:
+            # Use out-of-place division to keep autograd versions intact.
+            denom_w = weights.sum(dim=-1, keepdim=True) + 1e-20
+            denom_s = original_scores.sum(dim=-1, keepdim=True) + 1e-20
+            weights = weights / denom_w
+            original_scores = original_scores / denom_s
 
         weights = weights * self.route_scale
 
