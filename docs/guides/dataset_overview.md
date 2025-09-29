@@ -88,7 +88,7 @@ dataset:
 
 > ⚠️ Note: Multi-turn conversational and tool-calling/function-calling dataset support is coming soon.
 
-### Packed Sequence Support
+## Packed Sequence Support
 To reduce padding and improve throughput with variable-length sequences:
 ```yaml
 packed_sequence:
