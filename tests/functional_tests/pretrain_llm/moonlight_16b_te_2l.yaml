@@ -94,7 +94,7 @@ model:
   is_meta_device: true
   backend:
     _target_: nemo_automodel.components.moe.utils.BackendConfig
-    attn: torch
+    attn: sdpa
     linear: torch
     rms_norm: torch
     enable_deepep: false
