@@ -57,7 +57,7 @@ dataset:
   answer_only_loss_mask: true
   start_of_turn_token: "<|assistant|>"
 ```
-  - See detailed guide: (here)[llm/column-mapped-text-instruction-dataset.md].
+  - See the detailed guide, [Column-Mapped Text Instruction Dataset](llm/column-mapped-text-instruction-dataset.md), for more information.
 
 - **NanoGPT Binary Shards (pretraining)**
   - Class: `nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset`
