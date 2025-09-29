@@ -27,8 +27,8 @@ guides/omni/gemma3-3n.md
 
 guides/llm/sft.md
 guides/llm/peft.md
-guides/llm/mcore_pretraining.md
-guides/llm/nanogpt_pretraining.md
+guides/llm/mcore-pretraining.md
+guides/llm/nanogpt-pretraining.md
 ```
 
 ```{toctree}
@@ -43,7 +43,7 @@ model-coverage/vlm.md
 :caption: Datasets
 :hidden:
 
-guides/dataset_overview.md
+guides/dataset-overview.md
 guides/llm/dataset.md
 guides/llm/column-mapped-text-instruction-dataset.md
 guides/vlm/dataset.md
@@ -53,10 +53,10 @@ guides/vlm/dataset.md
 :caption: Development
 :hidden:
 guides/checkpointing.md
-guides/gradient_checkpointing.md
+guides/gradient-checkpointing.md
 guides/pipelining.md
-guides/llm/knowledge_distillation.md
-guides/fp8_training.md
+guides/llm/knowledge-distillation.md
+guides/fp8-training.md
 
 apidocs/index.rst
 ```
