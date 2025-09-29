@@ -221,7 +221,7 @@ class MyCompletionDataset:
 ```
 Then reference your class via `_target_` in YAML.
 
-### Tips and gotchas
+### Important Considerations
 - **Chat templates**: If your tokenizer has a chat template and you want answer-only loss, provide the correct `start_of_turn_token` (LLM) or `start_of_response_token` (VLM collate functions).
 - **Padding for FP8**: If training with FP8, set `pad_seq_len_divisible: 16` in your collate function to align sequence lengths.
 - **Packed sequences**: Prefer packed sequences for throughput when fine-tuning LLMs on variable-length corpora.
