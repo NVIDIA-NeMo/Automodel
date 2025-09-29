@@ -154,7 +154,7 @@ See [Gemma-3n](omni/gemma3-3n.md) and [VLM dataset](vlm/dataset.md) for end-to-e
 ---
 
 ## Bring Your Own Dataset
-You can integrate custom datasets with zero code changes to NeMo Automodel by using `_target_` in YAML. Two main approaches:
+You can integrate custom datasets with zero code changes to NeMo Automodel by using `_target_` in YAML. There are three approaches:
 
 ### 1) Point to an existing class or function (dotted path)
 - LLM example (class):
