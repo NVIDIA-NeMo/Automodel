@@ -27,6 +27,7 @@ from torch.distributed.tensor.parallel import (
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
+from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.distributed.parallelizer import (
     fsdp2_strategy_parallelize,
     get_hf_tp_shard_plan,
@@ -279,9 +280,8 @@ class FSDP2Manager:
         Raises:
             NotImplemented: If the required TP sharding plan is not supported.
         """
-        if dist.get_world_size() == 1:
+        if get_world_size_safe() == 1:
             logger.info("World size is 1, skipping parallelization.")
-            model.to("cuda").to(torch.bfloat16)
             if self.activation_checkpointing:
                 if hasattr(model, "gradient_checkpointing_enable"):
                     model.gradient_checkpointing_enable()
