@@ -134,7 +134,7 @@ Each example follows the conversation schema expected by `apply_chat_template`, 
 }
 ```
 
-### Collate functions
+### Collate Functions
 - `nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn`
 - `nemo_automodel.components.datasets.vlm.collate_fns.qwen2_5_collate_fn` (Qwen2.5 VL)
 - `nemo_automodel.components.datasets.vlm.collate_fns.phi4_mm_collate_fn` (audio)
