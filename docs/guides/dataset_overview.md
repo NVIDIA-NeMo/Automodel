@@ -202,7 +202,7 @@ dataset:
   start_of_turn_token: "<|assistant|>"
 ```
 
-### Minimal custom class pattern (LLM completion)
+### Minimal Custom Class Pattern (LLM Completion)
 If you prefer Python, implement `get_context` and `get_target` and reuse the built-in preprocessor:
 ```python
 from datasets import load_dataset
