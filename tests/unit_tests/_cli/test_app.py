@@ -162,6 +162,36 @@ def test_launch_with_slurm(monkeypatch, tmp_path):
         job_dir = '/tmp/a/123456789/'
         module.launch_with_slurm(dummy_args, job_dir +'y.conf', job_dir, slurm_config=slurm_config_dict)
 
+
+    dummy_cfg = tmp_path / "dummy.yaml"
+    dummy_cfg.write_text("foo: bar\n")
+    fake_config = {"slurm": {"job_dir": str(tmp_path / "slurm_jobs")}, "foo": "bar"}
+    monkeypatch.setattr(module, "load_yaml", lambda x: dict(fake_config))
+    monkeypatch.setattr(module.time, "time", lambda: 1234567890)
+
+    captured = {}
+    def fake_launch_with_slurm_main(args, job_conf_path, job_dir, slurm_config, extra_args=None):
+        captured["job_conf_path"] = job_conf_path
+        captured["job_dir"] = job_dir
+        captured["slurm_config"] = slurm_config
+        captured["extra_args"] = extra_args
+        # ensure job_config.yaml contains only non-slurm keys
+        with open(job_conf_path, "r") as fp:
+            data = yaml.safe_load(fp)
+        assert data == {"foo": "bar"}
+        assert os.path.basename(job_dir) == "1234567890"
+        return 0
+
+    monkeypatch.setattr(module, "launch_with_slurm", fake_launch_with_slurm_main)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["automodel", "finetune", "llm", "-c", str(dummy_cfg), "--some-unknown-flag", "abc"],
+    )
+    result = module.main()
+    assert result == 0
+    assert captured["extra_args"] == ["--some-unknown-flag", "abc"]
+
+
 def test_main_single_node(monkeypatch, tmp_yaml_file):
     config_path = tmp_yaml_file
 
@@ -303,3 +333,5 @@ def test_repo_structure():
     assert (repo_root / "nemo_automodel" / "shared").exists()
     assert (repo_root / "docs").exists()
     assert (repo_root / "examples").exists()
+
+
