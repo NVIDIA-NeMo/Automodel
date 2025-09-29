@@ -31,7 +31,9 @@ except ImportError:
 try:
     from grouped_gemm import ops
 except ImportError:
-    print("grouped_gemm is not available. Please run:pip install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4")
+    print(
+        "grouped_gemm is not available. Please run:pip install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4"
+    )
 
 from nemo_automodel.components.moe.megatron.moe_utils import (
     MoEAuxLossAutoScaler,
@@ -495,9 +497,9 @@ class GroupedExpertsDeepEP(nn.Module):
                 down_bias = self.down_proj_bias.to_local()
                 output2 = self._apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
         else:
-            output2 = torch.zeros((1, x.size(-1)), dtype=x.dtype, device=x.device)
-            output2 = output2 * permuted_probs
-            output2 = output2.to(x.dtype)
+            output1 = torch.matmul(x[0] * 0, self.gate_and_up_projs.to_local()[0])
+            output1_ = self.expert_activation(output1, permuted_probs)
+            output2 = torch.matmul(output1_, self.down_projs.to_local()[0])
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
@@ -817,7 +819,9 @@ class Gate(nn.Module):
                 context_length, device_mesh=cp_mesh, placements=[Partial()]
             ).full_tensor()
             expert_load = DTensor.from_local(expert_load, device_mesh=cp_mesh, placements=[Partial()]).full_tensor()
-            expert_scores = DTensor.from_local(expert_scores, device_mesh=cp_mesh, placements=[Partial()]).full_tensor()
+            expert_scores = DTensor.from_local(
+                expert_scores, device_mesh=cp_mesh, placements=[Partial()]
+            ).full_tensor()
 
         # Compute f_i (fraction of tokens dispatched to each expert).
         # If uniform distribution, expert_load will be topk * num_location / n_experts, and f_i will be 1
