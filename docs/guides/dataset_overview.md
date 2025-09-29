@@ -84,7 +84,7 @@ dataset:
   split: "0.99, 0.01, 0.00"  # train, validation, test
   splits_to_build: "train"
 ```
- - See detailed pretrained guide (here)[llm/mcore_pretraining.md] using MegatronPretraining data.
+ - See the detailed pretraining guide, [Megatron MCore Pretraining](llm/mcore-pretraining.md), which uses MegatronPretraining data.
 
 > ⚠️ Note: Multi-turn conversational and tool-calling/function-calling dataset support is coming soon.
 
