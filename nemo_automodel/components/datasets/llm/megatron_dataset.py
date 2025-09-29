@@ -19,6 +19,7 @@ from importlib.util import find_spec
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
+import torch.distributed as dist
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_automodel.components.datasets.llm.megatron.builder import BlendedMegatronDatasetBuilder
@@ -95,7 +96,12 @@ class MegatronPretraining:
         """
         if find_spec("nemo_automodel.components.datasets.llm.megatron.helpers_cpp") is None:
             try:
-                compile_helper()
+                if dist.is_available() and dist.is_initialized():
+                    if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+                        compile_helper()
+                    dist.barrier()
+                else:
+                    compile_helper()
                 assert find_spec("nemo_automodel.components.datasets.llm.megatron.helpers_cpp") is not None
             except AssertionError:
                 raise ImportError(
