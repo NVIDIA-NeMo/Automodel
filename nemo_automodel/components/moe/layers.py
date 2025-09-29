@@ -489,7 +489,9 @@ class GroupedExpertsDeepEP(nn.Module):
                 down_bias = self.down_proj_bias.to_local()
                 output2 = self._apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
         else:
-            output2 = torch.zeros((1, x.size(-1)), dtype=x.dtype, device=x.device)
+            output1 = torch.matmul(x[0] * 0, self.gate_and_up_projs.to_local()[0])
+            output1_ = self.expert_activation(output1, permuted_probs)
+            output2 = torch.matmul(output1_, self.down_projs.to_local()[0])
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y

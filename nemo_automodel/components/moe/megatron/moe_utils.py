@@ -255,11 +255,12 @@ def weighted_bias_swiglu_impl(input, weights, fp8_input_store=False):
     Token-wise-weighted bias swiglu fusion.
     """
     ori_shape = input.shape
-    assert len(ori_shape) in [2, 3]
-    input = input.view(-1, ori_shape[-1])
+    assert len(ori_shape) in [1, 2, 3]
+    if len(ori_shape) != 1:
+        input = input.view(-1, ori_shape[-1])
     output = WeightedSwiGLUFunction.apply(input, weights, fp8_input_store)
 
-    return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
+    return output if len(ori_shape) in [1, 2] else output.view(ori_shape[0], ori_shape[1], -1)
 
 
 @torch.compile
