@@ -22,7 +22,7 @@ from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention, Rot
 from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSStateDictAdapter
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
 from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
-from nemo_automodel.shared.utils import get_dtype
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 class Block(nn.Module):
