@@ -17,6 +17,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
+from transformers.utils import ModelOutput
 
 from nemo_automodel.components.models.deepseek_v3.layers import MLA
 from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
@@ -163,7 +164,7 @@ class DeepseekV3Model(nn.Module):
                 torch.arange(0, input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand(input_ids.shape[0], -1)
             )
 
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast(device_type="cuda", enabled=False):
             freqs_cis = freqs_cis_from_position_ids(position_ids, self.freqs_cis)
 
         h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
@@ -261,7 +262,8 @@ class DeepseekV3ForCausalLM(nn.Module):
             **attn_kwargs,
         )
         logits = self.lm_head(logits) if self.lm_head else logits
-        return logits
+        
+        return ModelOutput(logits=logits)
 
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
