@@ -46,7 +46,9 @@ parallelize_fn:
 
 model:
   _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_config
-  pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
+  config:
+    _target_: transformers.AutoConfig.from_pretrained
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
   trust_remote_code: true
   is_meta_device: true
   backend:

@@ -64,6 +64,7 @@ class MoEConfig:
     expert_activation: Literal["swiglu", "quick_geglu"] = "swiglu"
     activation_alpha: float = 1.702
     activation_limit: float = 7.0
+    dtype: torch.dtype = torch.bfloat16
 
 
 class MLP(nn.Module):
@@ -76,7 +77,7 @@ class MLP(nn.Module):
         up_proj (nn.Module): Additional linear layer for feature transformation.
     """
 
-    def __init__(self, dim: int, inter_dim: int, backend: str):
+    def __init__(self, dim: int, inter_dim: int, backend: str, dtype: torch.dtype = torch.bfloat16):
         """
         Initializes the MLP layer.
 
@@ -86,13 +87,13 @@ class MLP(nn.Module):
         """
         super().__init__()
         self.gate_proj = initialize_linear_module(
-            linear_impl=backend, in_features=dim, out_features=inter_dim, bias=False
+            linear_impl=backend, in_features=dim, out_features=inter_dim, bias=False, dtype=dtype
         )
         self.down_proj = initialize_linear_module(
-            linear_impl=backend, in_features=inter_dim, out_features=dim, bias=False
+            linear_impl=backend, in_features=inter_dim, out_features=dim, bias=False, dtype=dtype
         )
         self.up_proj = initialize_linear_module(
-            linear_impl=backend, in_features=dim, out_features=inter_dim, bias=False
+            linear_impl=backend, in_features=dim, out_features=inter_dim, bias=False, dtype=dtype
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -188,13 +189,17 @@ class GroupedExperts(nn.Module):
         self.n_routed_experts = config.n_routed_experts
         self.expert_bias = config.expert_bias
         self.gate_and_up_projs = nn.Parameter(
-            torch.empty(config.n_routed_experts, config.dim, config.moe_inter_dim * 2)
+            torch.empty(config.n_routed_experts, config.dim, config.moe_inter_dim * 2, dtype=config.dtype)
         )
-        self.down_projs = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim, config.dim))
+        self.down_projs = nn.Parameter(
+            torch.empty(config.n_routed_experts, config.moe_inter_dim, config.dim, dtype=config.dtype)
+        )
 
         if self.expert_bias:
-            self.gate_up_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim * 2))
-            self.down_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.dim))
+            self.gate_up_proj_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, config.moe_inter_dim * 2, dtype=config.dtype)
+            )
+            self.down_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.dim, dtype=config.dtype))
         else:
             self.gate_up_proj_bias = None
             self.down_proj_bias = None
@@ -584,14 +589,20 @@ class Gate(nn.Module):
         if self.bias_update_factor > 0:
             assert self.train_gate, "Require train_gate to be set to True to apply the bias update"
 
-        self.weight = nn.Parameter(torch.empty(config.n_routed_experts, config.dim), requires_grad=self.train_gate)
+        self.weight = nn.Parameter(
+            torch.empty(config.n_routed_experts, config.dim, dtype=config.dtype), requires_grad=self.train_gate
+        )
         if config.router_bias:
-            self.bias = nn.Parameter(torch.empty(config.n_routed_experts), requires_grad=self.train_gate)
+            self.bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=config.dtype), requires_grad=self.train_gate
+            )
         else:
             self.bias = None
 
         if self.bias_update_factor > 0:
-            self.e_score_correction_bias = nn.Parameter(torch.empty(config.n_routed_experts), requires_grad=False)
+            self.e_score_correction_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=config.dtype), requires_grad=False
+            )
         else:
             self.e_score_correction_bias = None
 
