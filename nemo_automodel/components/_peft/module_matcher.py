@@ -44,7 +44,7 @@ def _get_model_embedding_ptrs(model: nn.Module) -> list[str]:
         ptrs.append(module.weight.data_ptr())
     return ptrs
 
-def _get_tied_target_modules(self, model: nn.Module) -> list[str]:
+def _get_tied_target_modules(model: nn.Module) -> list[str]:
     if model is None:
         return []
     tied_target_modules = []
@@ -110,11 +110,6 @@ class ModuleMatcher:
             return False
 
         full_name = f"{prefix}.{name}" if prefix else name
-
-        if self.is_causal_lm or m in self.tied_target_modules:
-            if "lm_head" in full_name:
-                return False
-
         # 1. matching by layer type takes absolute precedence
         if self.match_all_linear and isinstance(m, nn.Linear):
             return True
