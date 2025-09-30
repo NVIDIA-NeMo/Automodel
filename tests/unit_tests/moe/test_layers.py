@@ -64,6 +64,7 @@ def moe_config():
         expert_activation="swiglu",
         activation_alpha=1.702,
         activation_limit=7.0,
+        dtype=torch.bfloat16,
     )
 
 
@@ -87,9 +88,9 @@ class TestActivationFunctions:
         batch_size, seq_len, dim = 4, 8, 64
         inter_dim = 128
 
-        x = torch.randn(batch_size, seq_len, dim, device=device)
-        gate_and_up_proj = torch.randn(dim, inter_dim * 2, device=device)
-        down_proj = torch.randn(inter_dim, dim, device=device)
+        x = torch.randn(batch_size, seq_len, dim, dtype=torch.bfloat16, device=device)
+        gate_and_up_proj = torch.randn(dim, inter_dim * 2, dtype=torch.bfloat16, device=device)
+        down_proj = torch.randn(inter_dim, dim, dtype=torch.bfloat16, device=device)
 
         result = swiglu(x, gate_and_up_proj=gate_and_up_proj, down_proj=down_proj)
 
@@ -101,11 +102,11 @@ class TestActivationFunctions:
         batch_size, seq_len, dim = 2, 4, 32
         inter_dim = 64
 
-        x = torch.randn(batch_size, seq_len, dim, device=device)
-        gate_and_up_proj = torch.randn(dim, inter_dim * 2, device=device)
-        down_proj = torch.randn(inter_dim, dim, device=device)
-        gate_up_proj_bias = torch.randn(inter_dim * 2, device=device)
-        down_proj_bias = torch.randn(dim, device=device)
+        x = torch.randn(batch_size, seq_len, dim, dtype=torch.bfloat16, device=device)
+        gate_and_up_proj = torch.randn(dim, inter_dim * 2, dtype=torch.bfloat16, device=device)
+        down_proj = torch.randn(inter_dim, dim, dtype=torch.bfloat16, device=device)
+        gate_up_proj_bias = torch.randn(inter_dim * 2, dtype=torch.bfloat16, device=device)
+        down_proj_bias = torch.randn(dim, dtype=torch.bfloat16, device=device)
 
         result = swiglu(
             x,
@@ -171,7 +172,7 @@ class TestMLP:
         mlp = mlp.to(device)
 
         batch_size, seq_len = 2, 4
-        x = torch.randn(batch_size, seq_len, dim, device=device)
+        x = torch.randn(batch_size, seq_len, dim, dtype=torch.bfloat16, device=device)
 
         output = mlp(x)
 
@@ -184,7 +185,7 @@ class TestMLP:
         mlp = MLP(dim, inter_dim, backend="torch")
         mlp = mlp.to(device)
 
-        x = torch.randn(1, 1, dim, device=device)
+        x = torch.randn(1, 1, dim, dtype=torch.bfloat16, device=device)
 
         # Manual computation for verification
         gate_out = mlp.gate_proj(x)
@@ -224,7 +225,7 @@ class TestFakeBalancedGate:
         gate = gate.to(device)
 
         batch_size, seq_len = 4, 8
-        x = torch.randn(batch_size * seq_len, moe_config.dim, device=device)
+        x = torch.randn(batch_size * seq_len, moe_config.dim, dtype=torch.bfloat16, device=device)
         token_mask = torch.ones(batch_size * seq_len, dtype=torch.bool, device=device)
 
         weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
@@ -240,7 +241,7 @@ class TestFakeBalancedGate:
         gate = gate.to(device)
 
         num_tokens = 16
-        x = torch.randn(num_tokens, moe_config.dim, device=device)
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
         token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
 
         weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
@@ -255,7 +256,7 @@ class TestFakeBalancedGate:
         gate = gate.to(device)
 
         num_tokens = moe_config.n_routed_experts * 2  # Two full cycles
-        x = torch.randn(num_tokens, moe_config.dim, device=device)
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
         token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
 
         weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
@@ -308,7 +309,7 @@ class TestGate:
                 gate.bias.zero_()
 
         num_tokens = 16
-        x = torch.randn(num_tokens, moe_config.dim, device=device)
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
         token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
 
         weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
@@ -318,7 +319,7 @@ class TestGate:
         # In softmax mode, weights should sum to 1 along last dim
         # Use detach() to avoid gradient warnings
         weights_detached = weights.detach()
-        expected = torch.ones(num_tokens, device=device)
+        expected = torch.ones(num_tokens, dtype=torch.bfloat16, device=device)
         torch.testing.assert_close(weights_detached.sum(dim=-1), expected, rtol=1e-4, atol=1e-4)
 
     def test_gate_forward_sigmoid_mode(self, moe_config, device):
@@ -334,7 +335,7 @@ class TestGate:
                 gate.bias.zero_()
 
         num_tokens = 16
-        x = torch.randn(num_tokens, moe_config.dim, device=device)
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
         token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
 
         weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
@@ -353,7 +354,7 @@ class TestGate:
         gate.train()  # Enable training mode for aux loss
 
         num_tokens = 16
-        x = torch.randn(num_tokens, moe_config.dim, device=device)
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
         token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
 
         weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
@@ -370,7 +371,7 @@ class TestGate:
         gate.train()
 
         # Simulate some expert load
-        expert_load = torch.rand(moe_config.n_routed_experts, device=device) * 10
+        expert_load = torch.rand(moe_config.n_routed_experts, dtype=torch.bfloat16, device=device) * 10
         gate._cumulative_expert_load = expert_load
 
         original_bias = gate.e_score_correction_bias.clone()
@@ -426,9 +427,9 @@ class TestGroupedExperts:
         experts = experts.to(device)
 
         num_tokens = 16
-        x = torch.randn(num_tokens, moe_config.dim, device=device)
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
         token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
-        weights = torch.rand(num_tokens, moe_config.n_activated_experts, device=device)
+        weights = torch.rand(num_tokens, moe_config.n_activated_experts, dtype=torch.bfloat16, device=device)
         indices = torch.randint(0, moe_config.n_routed_experts, (num_tokens, moe_config.n_activated_experts), device=device)
 
         output = experts(x, token_mask, weights, indices)
@@ -444,9 +445,9 @@ class TestGroupedExperts:
         experts = experts.to(device)
 
         num_tokens = 8
-        x = torch.randn(num_tokens, moe_config.dim, device=device)
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
         token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
-        weights = torch.rand(num_tokens, moe_config.n_activated_experts, device=device)
+        weights = torch.rand(num_tokens, moe_config.n_activated_experts, dtype=torch.bfloat16, device=device)
         indices = torch.randint(0, moe_config.n_routed_experts, (num_tokens, moe_config.n_activated_experts), device=device)
 
         try:

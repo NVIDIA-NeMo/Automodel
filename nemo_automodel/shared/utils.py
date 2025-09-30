@@ -11,9 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import torch
 
 
-def dtype_from_str(val):
+def dtype_from_str(val, default=torch.bfloat16):
     """
     Translate a str val of a dtype into the corresponding torch.dtype
     Args:
@@ -22,7 +23,9 @@ def dtype_from_str(val):
     Returns:
         torch.dtype: the actual dtype (e.g., torch.bfloat16)
     """
-    import torch
+    if val is None:
+        assert isinstance(default, torch.dtype), default
+        return default
 
     if isinstance(val, torch.dtype):
         return val

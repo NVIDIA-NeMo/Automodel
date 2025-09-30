@@ -19,11 +19,12 @@
 
 
 step_scheduler:
-  global_batch_size: 128
-  local_batch_size: 4
+  global_batch_size: 2
+  local_batch_size: 1
   ckpt_every_steps: 100
   val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 1
+  max_steps: 4
 
 dist_env:
   backend: nccl
@@ -41,24 +42,71 @@ parallelizer:
 model:
   _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_config
   config:
-    _target_: transformers.AutoConfig.from_pretrained
-     pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
+    _target_: transformers.models.deepseek_v3.configuration_deepseek_v3.DeepseekV3Config
+    attention_bias: false
+    attention_dropout: 0.0
+    aux_loss_alpha: 0.001
+    bos_token_id: 163584
+    eos_token_id: 163585
+    ep_size: 1
+    first_k_dense_replace: 1
+    head_dim: 64
+    hidden_act: "silu"
+    hidden_size: 2048
+    initializer_range: 0.02
+    intermediate_size: 11264
+    kv_lora_rank: 512
+    max_position_embeddings: 8192
+    model_type: "deepseek_v3"
+    moe_intermediate_size: 1408
+    moe_layer_freq: 1
+    n_group: 1
+    n_routed_experts: 8
+    n_shared_experts: 1
+    norm_topk_prob: true
+    num_attention_heads: 16
+    num_experts_per_tok: 6
+    num_hidden_layers: 2
+    num_key_value_heads: 16
+    num_nextn_predict_layers: 0
+    pretraining_tp: 1
+    q_lora_rank: null
+    qk_head_dim: 192
+    qk_nope_head_dim: 128
+    qk_rope_head_dim: 64
+    rms_norm_eps: 1e-05
+    rope_interleave: true
+    rope_scaling: null
+    rope_theta: 50000.0
+    routed_scaling_factor: 2.446
+    scoring_func: "sigmoid"
+    seq_aux: true
+    tie_word_embeddings: false
+    topk_group: 1
+    topk_method: "noaux_tc"
+    torch_dtype: "bfloat16"
+    transformers_version: "4.55.4"
+    use_cache: true
+    v_head_dim: 128
+    vocab_size: 163840
+
   trust_remote_code: true
-  is_meta_device: true
   backend:
     _target_: nemo_automodel.components.moe.utils.BackendConfig
-    attn: te
-    linear: te
-    rms_norm: te
-    enable_deepep: true
+    attn: sdpa
+    linear: torch
+    rms_norm: torch
+    enable_deepep: false
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
+  torch_dtype: bfloat16
 
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: torch_save # torch_save or safetensors
   save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  load_base_model: false
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
@@ -66,37 +114,24 @@ distributed:
   cp_size: 1
   pp_size: 1
   dp_replicate_size: 1
-  dp_size: 8
-  ep_size: 8
-
+  dp_size: 2
+  ep_size: 2
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
-  split: train
-
-packed_sequence:
-  # Set packed_sequence_size > 0 to run with packed sequences
-  packed_sequence_size: 2048
-  split_across_pack: False
+  _target_: nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset
+  file_pattern: "/home/TestData/akoumparouli/fineweb10B/fineweb_train_*.bin"
+  seq_len: 1024
+  shuffle_files: true
+  align_to_bos: false
+  bos_token: 50256 # optional, only needed if align_to_bos is true
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  shuffle: true
-
-validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
-  split: validation
-  num_samples_limit: 64
-
-validation_dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
 
 optimizer:
   _target_: torch.optim.Adam
