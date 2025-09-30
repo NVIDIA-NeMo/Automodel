@@ -130,7 +130,7 @@ class DeepseekV3Model(nn.Module):
             aux_loss_coeff=0,
             norm_topk_prob=config.norm_topk_prob,
         )
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=self.config.torch_dtype)
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, backend)
@@ -214,16 +214,12 @@ class DeepseekV3ForCausalLM(nn.Module):
     @classmethod
     def from_config(
         cls,
-        pretrained_model_name_or_path: str | DeepseekV3Config,
+        config: DeepseekV3Config,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
         trust_remote_code: bool = False,
         **kwargs,
     ):
-        if isinstance(pretrained_model_name_or_path, str):
-            config = DeepseekV3Config.from_pretrained(pretrained_model_name_or_path)
-        else:
-            config = pretrained_model_name_or_path
         return cls(config, moe_config, backend)
 
     def __init__(
