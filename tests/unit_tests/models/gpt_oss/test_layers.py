@@ -270,14 +270,14 @@ class TestGptOssAttention:
         attention = attention.to(device)
 
         batch_size, seq_len = 2, 8
-        x = torch.randn(batch_size, seq_len, gpt_config.hidden_size, device=device)
-        freqs_cis = torch.randn(batch_size, seq_len, gpt_config.head_dim, device=device)
+        x = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
+        freqs_cis = torch.randn(batch_size, seq_len, gpt_config.head_dim, dtype=torch.bfloat16, device=device)
 
         # Mock the attn_module call method instead of replacing the module
         with patch.object(attention.attn_module, "__call__") as mock_attn:
             # Mock attention module to return expected shape
             mock_attn.return_value = torch.randn(
-                batch_size, gpt_config.num_attention_heads, seq_len, gpt_config.head_dim, device=device
+                batch_size, gpt_config.num_attention_heads, seq_len, gpt_config.head_dim, dtype=torch.bfloat16, device=device
             )
 
             output = attention(x, freqs_cis)
@@ -293,8 +293,8 @@ class TestGptOssAttention:
         attention = attention.to(device)
 
         batch_size, seq_len = 2, 8
-        x = torch.randn(batch_size, seq_len, gpt_config.hidden_size, device=device)
-        freqs_cis = torch.randn(batch_size, seq_len, gpt_config.head_dim, device=device)
+        x = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
+        freqs_cis = torch.randn(batch_size, seq_len, gpt_config.head_dim, dtype=torch.bfloat16, device=device)
 
         # Test that the forward pass completes successfully on GPU
         try:
@@ -327,11 +327,11 @@ class TestGptOssAttention:
         attention = attention.to(device)
 
         batch_size, seq_len = 1, 4
-        x = torch.randn(batch_size, seq_len, gpt_config.hidden_size, device=device)
+        x = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
 
         # Create simple freqs_cis for testing
-        cos = torch.ones(batch_size, seq_len, gpt_config.head_dim // 2, device=device)
-        sin = torch.zeros(batch_size, seq_len, gpt_config.head_dim // 2, device=device)
+        cos = torch.ones(batch_size, seq_len, gpt_config.head_dim // 2, dtype=torch.bfloat16, device=device)
+        sin = torch.zeros(batch_size, seq_len, gpt_config.head_dim // 2, dtype=torch.bfloat16, device=device)
         freqs_cis = torch.cat([cos, sin], dim=-1)
 
         # Test that the forward pass completes successfully with valid inputs

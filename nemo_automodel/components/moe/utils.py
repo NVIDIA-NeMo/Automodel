@@ -62,7 +62,7 @@ def initialize_attn_module_and_func(
         )
         return None, attn_func
     elif attn_impl == "flex":
-        attn_module = FlexAttention(dtype=dtype)
+        attn_module = FlexAttention()
         # We still return the module and a reference to its call for parity with other backends
         attn_func = attn_module.__call__
         return attn_module, attn_func
