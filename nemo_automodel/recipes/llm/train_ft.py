@@ -1011,6 +1011,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             opt.step()
             opt.zero_grad()
 
+        if hasattr(self.model_parts[0], "update_moe_gate_bias"):
+            for mp in self.model_parts:
+                mp.update_moe_gate_bias()
+
         if self.lr_scheduler is not None:
             for scheduler in self.lr_scheduler:
                 scheduler.step(1)
