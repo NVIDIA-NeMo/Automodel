@@ -821,24 +821,25 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
 
         # Build validation dataloader if the config provides it
-        self.val_dataloader = None
+        self.val_dataloader = {}
         if "validation_dataset" in self.cfg:
             # For validation, do not use packed sequences for fair comparison with baseline
 
-            self.val_dataloader, _ = build_dataloader(
-                self.cfg.validation_dataset,
-                self.cfg.validation_dataloader,
-                self.cfg.model,
-                cfg_ps=None,  # Use unpacked config for validation
-                seed=self.cfg.get("seed", 42),
-                local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-                global_batch_size=self.cfg.get("step_scheduler.global_batch_size", 1),
-                max_steps=self.cfg.get("step_scheduler.max_steps", None),
-                val_check_interval=self.cfg.get("step_scheduler.val_every_steps", None),
-                dp_rank=self._get_dp_rank(),
-                dp_world_size=self._get_dp_group_size(),
-                pp_enabled=self.pp_enabled,
-            )
+            for val_ds_name, val_ds_cfg in self.cfg.validation_dataset.items():
+                self.val_dataloader[val_ds_name] = build_dataloader(
+                    val_ds_cfg,
+                    self.cfg.validation_dataloader,
+                    self.cfg.model,
+                    cfg_ps=None,  # Use unpacked config for validation
+                    seed=self.cfg.get("seed", 42),
+                    local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+                    global_batch_size=self.cfg.get("step_scheduler.global_batch_size", 1),
+                    max_steps=self.cfg.get("step_scheduler.max_steps", None),
+                    val_check_interval=self.cfg.get("step_scheduler.val_every_steps", None),
+                    dp_rank=self._get_dp_rank(),
+                    dp_world_size=self._get_dp_group_size(),
+                    pp_enabled=self.pp_enabled,
+                )[0]
 
         # Scheduler
         self.step_scheduler = build_step_scheduler(
@@ -899,8 +900,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     self.save_checkpoint(epoch, self.step_scheduler.step)
 
                 # Run validation every val_every_steps
-                if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                    self._run_validation_epoch()
+                if self.step_scheduler.is_val_step and len(self.val_dataloader) > 0:
+                    self._run_validation_epochs()
                     for mp in self.model_parts:
                         mp.train()
 
@@ -1058,12 +1059,23 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         return reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens
 
     @torch.no_grad()
-    def _run_validation_epoch(self):
-        """Run one pass over `self.val_dataloader`."""
+    def _run_validation_epochs(self):
+        """Run one pass over all validation dataloaders in `self.val_dataloader`."""
         if self.pp_enabled:
             logger.warning("Validation is not supported for pipeline parallelism")
             return
 
+        for val_name, val_dataloader in self.val_dataloader.items():
+            self._run_validation_epoch(val_name, val_dataloader)
+
+    @torch.no_grad()
+    def _run_validation_epoch(self, val_name, val_dataloader):
+        """Run one pass over a single validation dataloader.
+        
+        Args:
+            val_name: Name of the validation dataset.
+            val_dataloader: DataLoader for the validation dataset.
+        """
         with ScopedRNG(seed=1, ranked=True):
             for mp in self.model_parts:
                 mp.eval()
@@ -1071,7 +1083,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
             total_num_label_tokens = 0
 
-            for batch in self.val_dataloader:
+            for batch in val_dataloader:
                 loss_buffer = []
                 num_label_tokens = (batch["labels"] != -100).sum().item()
                 self._forward_backward_step(
@@ -1092,12 +1104,17 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         val_loss = total_loss / max(total_num_label_tokens, 1e-8)
         if self.dist_env.is_main:
             if wandb.run is not None:
-                wandb.log({"val_loss": val_loss, "step": self.step_scheduler.step, "epoch": self.step_scheduler.epoch})
+                wandb.log({
+                    f"val_loss/{val_name}": val_loss, 
+                    "step": self.step_scheduler.step, 
+                    "epoch": self.step_scheduler.epoch
+                })
 
         # assumes all model parts' optimizers have the same learning rate
         current_lr = self.optimizer[0].param_groups[0]["lr"]
         logging.info(
-            "[val] step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
+            "[val:{}] step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
+                val_name,
                 self.step_scheduler.step,
                 self.step_scheduler.epoch,
                 val_loss,
