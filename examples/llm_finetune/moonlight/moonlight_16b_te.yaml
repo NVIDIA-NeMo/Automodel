@@ -40,7 +40,9 @@ parallelizer:
 
 model:
   _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_config
-  pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
+  config:
+    _target_: transformers.AutoConfig.from_pretrained
+     pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
   trust_remote_code: true
   is_meta_device: true
   backend:
