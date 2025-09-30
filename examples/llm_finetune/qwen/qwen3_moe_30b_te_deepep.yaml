@@ -35,8 +35,9 @@ parallelizer:
 
 model:
   _target_: nemo_automodel.components.models.qwen3_moe.model.Qwen3MoeForCausalLM.from_config
-  # _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained_config
-  pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
+  config:
+    _target_: transformers.AutoConfig.from_pretrained
+    pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
   trust_remote_code: true
   is_meta_device: true
   backend:
