@@ -130,7 +130,7 @@ class DeepseekV3Model(nn.Module):
             aux_loss_coeff=0,
             norm_topk_prob=config.norm_topk_prob,
         )
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=self.config.torch_dtype)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=getattr(self.config, "torch_dtype", torch.bfloat16))
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, backend)

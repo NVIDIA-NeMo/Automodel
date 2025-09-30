@@ -98,7 +98,7 @@ class GptOssModel(nn.Module):
             activation_limit=getattr(config, "swiglu_limit", 7.0),
         )
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=self.config.torch_dtype)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=getattr(self.config, "torch_dtype", torch.bfloat16))
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, backend)
