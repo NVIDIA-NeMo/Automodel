@@ -191,10 +191,14 @@ class GroupedExperts(nn.Module):
         self.gate_and_up_projs = nn.Parameter(
             torch.empty(config.n_routed_experts, config.dim, config.moe_inter_dim * 2, dtype=config.dtype)
         )
-        self.down_projs = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim, config.dim, dtype=config.dtype))
+        self.down_projs = nn.Parameter(
+            torch.empty(config.n_routed_experts, config.moe_inter_dim, config.dim, dtype=config.dtype)
+        )
 
         if self.expert_bias:
-            self.gate_up_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim * 2, dtype=config.dtype))
+            self.gate_up_proj_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, config.moe_inter_dim * 2, dtype=config.dtype)
+            )
             self.down_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.dim, dtype=config.dtype))
         else:
             self.gate_up_proj_bias = None
@@ -585,14 +589,20 @@ class Gate(nn.Module):
         if self.bias_update_factor > 0:
             assert self.train_gate, "Require train_gate to be set to True to apply the bias update"
 
-        self.weight = nn.Parameter(torch.empty(config.n_routed_experts, config.dim, dtype=config.dtype), requires_grad=self.train_gate)
+        self.weight = nn.Parameter(
+            torch.empty(config.n_routed_experts, config.dim, dtype=config.dtype), requires_grad=self.train_gate
+        )
         if config.router_bias:
-            self.bias = nn.Parameter(torch.empty(config.n_routed_experts, dtype=config.dtype), requires_grad=self.train_gate)
+            self.bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=config.dtype), requires_grad=self.train_gate
+            )
         else:
             self.bias = None
 
         if self.bias_update_factor > 0:
-            self.e_score_correction_bias = nn.Parameter(torch.empty(config.n_routed_experts, dtype=config.dtype), requires_grad=False)
+            self.e_score_correction_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=config.dtype), requires_grad=False
+            )
         else:
             self.e_score_correction_bias = None
 
