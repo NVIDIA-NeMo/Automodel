@@ -41,7 +41,7 @@ parallelizer:
 
 model:
   _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_config
-  pretrained_model_name_or_path:
+  config:
     _target_: transformers.models.deepseek_v3.configuration_deepseek_v3.DeepseekV3Config
     attention_bias: false
     attention_dropout: 0.0
@@ -91,7 +91,6 @@ model:
     vocab_size: 163840
 
   trust_remote_code: true
-  is_meta_device: true
   backend:
     _target_: nemo_automodel.components.moe.utils.BackendConfig
     attn: sdpa
@@ -100,6 +99,7 @@ model:
     enable_deepep: false
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
+  torch_dtype: bfloat16
 
 checkpoint:
   enabled: true
@@ -117,7 +117,6 @@ distributed:
   dp_size: 2
   ep_size: 2
 
-
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
@@ -129,11 +128,11 @@ dataset:
   align_to_bos: false
   bos_token: 50256 # optional, only needed if align_to_bos is true
 
-
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  shuffle: true
+  shuffle: false
+
 optimizer:
   _target_: torch.optim.Adam
   betas: [0.9, 0.999]
