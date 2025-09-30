@@ -14,7 +14,7 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/nemotron_nano_9b_v2_squad_peft.yaml
 # Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
 
