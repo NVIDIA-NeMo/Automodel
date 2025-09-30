@@ -25,6 +25,7 @@ from nemo_automodel.components.moe.rope_utils import freqs_cis_from_position_ids
 from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.shared.utils import get_dtype
 
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -130,7 +131,9 @@ class DeepseekV3Model(nn.Module):
             aux_loss_coeff=0,
             norm_topk_prob=config.norm_topk_prob,
         )
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16))
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
+        )
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, backend)
