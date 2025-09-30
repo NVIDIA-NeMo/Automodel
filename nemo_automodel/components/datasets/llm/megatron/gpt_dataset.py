@@ -349,9 +349,12 @@ class GPTDataset(torch.utils.data.Dataset):
         """Abstract method implementation
 
         Returns:
-            int: The length of the dataset
+            int: The effective length of the dataset, capped by num_samples when provided
         """
-        return self.sample_index.shape[0] - 1
+        total = self.sample_index.shape[0] - 1
+        if self.num_samples is None:
+            return total
+        return min(self.num_samples, total)
 
     def __getitem__(self, idx: Optional[int]) -> dict[str, torch.Tensor]:
         """Abstract method implementation
