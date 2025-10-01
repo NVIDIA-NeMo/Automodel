@@ -251,3 +251,5 @@ class GptOssForCausalLM(nn.Module):
         with buffer_device:
             # Ensure rotary embedding uses correct device after dtype move
             self.model.rotary_emb.device = buffer_device
+
+ModelClass = GptOssForCausalLM

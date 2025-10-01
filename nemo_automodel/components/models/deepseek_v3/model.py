@@ -294,3 +294,5 @@ class DeepseekV3ForCausalLM(nn.Module):
                 self.config.rope_theta,
                 self.config.rope_scaling,
             )
+
+ModelClass = DeepseekV3ForCausalLM

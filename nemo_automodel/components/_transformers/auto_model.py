@@ -33,6 +33,7 @@ from transformers.models.auto.auto_factory import _BaseAutoModelClass
 from nemo_automodel import __version__
 from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
+from nemo_automodel.components._transformers.registry import ModelRegistry
 
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 logger = logging.getLogger(__name__)
@@ -368,6 +369,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             name = cls.__name__
             if name.startswith("NeMo"):
                 cls.__name__ = name[4:]
+            # if we have a custom model implementation available, we prioritize that over HF
+            if config.architectures[0] in ModelRegistry.model_arch_name_to_cls:
+                model = ModelRegistry.model_arch_name_to_cls[config.architectures[0]](config, *model_args, **kwargs)
+                return model
+
             if quantization_config is not None:
                 kwargs["quantization_config"] = quantization_config
             model = super().from_config(
