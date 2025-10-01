@@ -138,6 +138,7 @@ def _gpt_oss_cfg() -> SimpleNamespace:
         hidden_size=2048,
         num_attention_heads=16,
         num_key_value_heads=16,
+        num_experts_per_tok=1,
         moe_ffn_hidden_size=8192,
         moe_router_topk=1,
         vocab_size=50257,
