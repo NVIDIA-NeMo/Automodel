@@ -84,12 +84,12 @@ logger = logging.getLogger(__name__)
 #  Stateless helper functions
 # ---------------------------
 def _get_model_name(cfg_model):
-    if hasattr(cfg_model, "pretrained_model_name_or_path"):
+    if cfg_model.get("pretrained_model_name_or_path", None) is not None:
         return cfg_model.pretrained_model_name_or_path
-    elif hasattr(cfg_model, "config"):
-        return cfg_model.config.pretrained_model_name_or_path
+    elif cfg_model.get("config", None) is not None:
+        return cfg_model.config.get("pretrained_model_name_or_path", None)
     else:
-        raise ValueError("pretrained_model_name_or_path not found in model config")
+        return None
 
 
 def build_model_and_optimizer(

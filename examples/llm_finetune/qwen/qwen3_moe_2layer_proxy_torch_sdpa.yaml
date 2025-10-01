@@ -34,7 +34,7 @@ parallelizer:
 
 model:
   _target_: nemo_automodel.components.models.qwen3_moe.model.Qwen3MoeForCausalLM.from_config
-  pretrained_model_name_or_path:
+  config:
     _target_: transformers.models.qwen3_moe.configuration_qwen3_moe.Qwen3MoeConfig
     vocab_size: 151936
     hidden_size: 2048
