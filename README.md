@@ -110,7 +110,10 @@ What you can expect:
 We recommend using **uv** for reproducible Python environments.
 
 ```bash
+# Setup environment before running any commands
 uv venv
+uv sync --frozen --all-extras
+
 uv pip install nemo_automodel # latest release
 # or: uv pip install git+https://github.com/NVIDIA-NeMo/Automodel.git
 uv run python -c "import nemo_automodel; print('AutoModel ready')"
