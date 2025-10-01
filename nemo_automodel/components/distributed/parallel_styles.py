@@ -11,12 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import torch
 import torch.nn as nn
 from torch.distributed.tensor import (
+    DeviceMesh,
     DTensor,
     Replicate,
-    DeviceMesh,
     Shard,
     distribute_tensor,
 )
@@ -26,6 +26,7 @@ from torch.distributed.tensor.parallel import (
     SequenceParallel,
 )
 
+
 def _distribute_param(_module, name, device_mesh, src_data_rank, placements):
     param = getattr(_module, name)
     dist_param = nn.Parameter(
@@ -34,7 +35,6 @@ def _distribute_param(_module, name, device_mesh, src_data_rank, placements):
     )
     assert dist_param.requires_grad == param.requires_grad
     _module.register_parameter(name, dist_param)
-
 
 
 class ColwiseParallelLora(ColwiseParallel):
@@ -61,6 +61,7 @@ class ColwiseParallelLora(ColwiseParallel):
         for name, param in module.named_parameters():
             _distribute_param(module, name, device_mesh, self.src_data_rank, [Shard(1)])
 
+
 class RowwiseParallelLora(RowwiseParallel):
     def _partition_linear_fn(self, name, module, device_mesh):
         # Rowwise shard weight to Shard(1), bias to Replicate(), weight be Shard(1)
@@ -78,10 +79,9 @@ class RowwiseParallelLora(RowwiseParallel):
         for name, param in module.named_parameters():
             _distribute_param(module, name, device_mesh, self.src_data_rank, [Shard(0)])
 
+
 class SequenceParallelLora(SequenceParallel):
-    def _replicate_module_fn(
-        self, name: str, module: nn.Module, device_mesh: DeviceMesh
-    ):
+    def _replicate_module_fn(self, name: str, module: nn.Module, device_mesh: DeviceMesh):
         for p_name, param in module.named_parameters():
             # simple replication with fixed ones_ init from LayerNorm/RMSNorm, which allow
             # us to simply just use from_local
@@ -90,6 +90,7 @@ class SequenceParallelLora(SequenceParallel):
                 requires_grad=param.requires_grad,
             )
             module.register_parameter(p_name, replicated_param)
+
 
 def translate_to_lora(plan):
     CLS_MAP = {
