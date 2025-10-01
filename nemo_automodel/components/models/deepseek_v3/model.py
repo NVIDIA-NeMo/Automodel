@@ -23,6 +23,7 @@ from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import Deep
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
 from nemo_automodel.components.moe.rope_utils import freqs_cis_from_position_ids, precompute_freqs_cis
 from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 class Block(nn.Module):
@@ -51,6 +52,8 @@ class Block(nn.Module):
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        **attn_kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Forward pass for the Transformer block.
@@ -71,24 +74,25 @@ class Block(nn.Module):
             x=self.input_layernorm(x),
             freqs_cis=freqs_cis,
             attention_mask=attention_mask,
+            **attn_kwargs,
         )
         x = x + attn_out
 
-        mlp_out, aux_loss = self._mlp(
+        mlp_out = self._mlp(
             x=self.post_attention_layernorm(x),
             padding_mask=padding_mask,
         )
         x = x + mlp_out
 
-        return x, aux_loss
+        return x
 
     def _mlp(
         self,
         x: torch.Tensor,
         padding_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> torch.Tensor:
         if isinstance(self.mlp, MLP):
-            return self.mlp(x), None
+            return self.mlp(x)
         else:
             assert isinstance(self.mlp, MoE)
             return self.mlp(x, padding_mask)
@@ -127,7 +131,9 @@ class DeepseekV3Model(nn.Module):
             aux_loss_coeff=0,
             norm_topk_prob=config.norm_topk_prob,
         )
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
+        )
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, backend)
@@ -152,6 +158,7 @@ class DeepseekV3Model(nn.Module):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if position_ids is None:
@@ -165,19 +172,15 @@ class DeepseekV3Model(nn.Module):
         h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
 
         # Apply the transformer layers.
-        aux_losses = []
         for layer in self.layers.values():
-            h, aux_loss = layer(
+            h = layer(
                 x=h,
                 freqs_cis=freqs_cis,
+                attention_mask=attention_mask,
                 padding_mask=padding_mask,
+                seq_lens=seq_lens,
+                **attn_kwargs,
             )
-            if aux_loss is not None:
-                aux_losses.append(aux_loss)
-
-        # Aux loss is currently not supported for DeepseekV3.
-        # TODO: add support for aux loss
-        # final_aux_loss = torch.stack(aux_losses).mean() if aux_losses else None
 
         h = self.norm(h) if self.norm else h
         return h
@@ -214,15 +217,12 @@ class DeepseekV3ForCausalLM(nn.Module):
     @classmethod
     def from_config(
         cls,
-        pretrained_model_name_or_path: str | DeepseekV3Config,
+        config: DeepseekV3Config,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
         trust_remote_code: bool = False,
+        **kwargs,
     ):
-        if isinstance(pretrained_model_name_or_path, str):
-            config = DeepseekV3Config.from_pretrained(pretrained_model_name_or_path)
-        else:
-            config = pretrained_model_name_or_path
         return cls(config, moe_config, backend)
 
     def __init__(
@@ -238,7 +238,7 @@ class DeepseekV3ForCausalLM(nn.Module):
         self.lm_head = initialize_linear_module(backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = DeepSeekV3StateDictAdapter(
-                self.config, self.model.moe_config, self.backend, dtype=torch.bfloat16
+                self.config, self.model.moe_config, self.backend, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
             )
 
     def forward(
@@ -248,6 +248,7 @@ class DeepseekV3ForCausalLM(nn.Module):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
         logits = self.model(
@@ -255,6 +256,7 @@ class DeepseekV3ForCausalLM(nn.Module):
             position_ids=position_ids,
             attention_mask=attention_mask,
             padding_mask=padding_mask,
+            seq_lens=seq_lens,
             **attn_kwargs,
         )
         logits = self.lm_head(logits) if self.lm_head else logits

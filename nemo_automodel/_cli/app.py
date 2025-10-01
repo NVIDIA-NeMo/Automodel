@@ -104,7 +104,7 @@ def get_automodel_repo_root():
     return None
 
 
-def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
+def launch_with_slurm(args, job_conf_path, job_dir, slurm_config, extra_args=None):
     from nemo_automodel.components.launcher.slurm.config import SlurmConfig, VolumeMapping
     from nemo_automodel.components.launcher.slurm.utils import submit_slurm_job
 
@@ -136,20 +136,22 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
         slurm_config["job_name"] = f"{args.domain}_{args.command}"
 
     # create the command
-    command = " ".join(
-        (
-            f"PYTHONPATH={repo_root}:$PYTHONPATH",
-            # Use torchrun to launch multiple processes instead
-            f"uv run --frozen --all-extras torchrun "
-            f"--nproc_per_node={slurm_config['ntasks_per_node']} "
-            f"--nnodes={slurm_config['nodes']} "
-            f"--rdzv_backend=c10d "
-            f"--rdzv_endpoint=${{MASTER_ADDR}}:${{MASTER_PORT}}",
-            f"{repo_root}/examples/{args.domain}_{args.command}/{args.command}.py",
-            "-c",
-            f"{job_conf_path}",
-        )
-    )
+    command_parts = [
+        f"PYTHONPATH={repo_root}:$PYTHONPATH",
+        # Use torchrun to launch multiple processes instead
+        "uv sync --inexact --frozen $(cat /opt/uv_args.txt) && uv run --no-sync torchrun ",
+        f"--nproc_per_node={slurm_config['ntasks_per_node']} ",
+        f"--nnodes={slurm_config['nodes']} ",
+        "--rdzv_backend=c10d ",
+        f"--rdzv_endpoint=${{MASTER_ADDR}}:${{MASTER_PORT}}",  # noqa: F541
+        f"{repo_root}/examples/{args.domain}_{args.command}/{args.command}.py",
+        "-c",
+        f"{job_conf_path}",
+    ]
+    # Append CLI overrides if provided (e.g., --model.pretrained_name_or_path=...)
+    if extra_args:
+        command_parts.extend(extra_args)
+    command = " ".join(command_parts)
     # Add extra mounts
     if not "extra_mounts" in slurm_config:
         slurm_config["extra_mounts"] = []
@@ -227,9 +229,12 @@ def run_interactive(args):
     from torch.distributed.run import determine_local_world_size, get_args_parser
     from torch.distributed.run import run as thrun
 
+    COMMAND_ALIASES = {"finetune": "train_ft", "pretrain": "train_ft"}
+    # remap commands: finetune -> train_ft
+    command = COMMAND_ALIASES.get(args.command, args.command)
     config_path = args.config.resolve()
     repo_root = get_repo_root()
-    script_path = repo_root / "nemo_automodel" / "recipes" / args.domain / f"{args.command}.py"
+    script_path = repo_root / "nemo_automodel" / "recipes" / args.domain / f"{command}.py"
 
     # launch job on this node
     num_devices = determine_local_world_size(nproc_per_node="gpu")
@@ -289,7 +294,7 @@ def main():
         with open(job_conf_path, "w") as fp:
             yaml.dump(config, fp, default_flow_style=False, sort_keys=False)
         logging.info(f"Logging Slurm job in: {job_dir}")
-        return launch_with_slurm(args, job_conf_path, job_dir, slurm_config)
+        return launch_with_slurm(args, job_conf_path, job_dir, slurm_config, extra_args=extra)
     elif "k8s" in config or "kubernetes" in config:
         # launch job on kubernetes.
         raise NotImplementedError("kubernetes support is pending")

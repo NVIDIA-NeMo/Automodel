@@ -5,11 +5,19 @@ on:
     branches:
       - main
       - "pull-request/[0-9]+"
+      - "deploy-release/*"
 
 jobs:
+  pre-flight:
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.64.1
+
   pip-test:
     runs-on: ${{ matrix.arch }}
     name: Pip - Python${{ matrix.python-version }} - ${{ matrix.arch == 'ubuntu-latest' && 'AMD64/Linux' || (matrix.arch == 'ubuntu-24.04-arm' && 'ARM64/Linux' || 'ARM64/Darwin') }} - No CUDA
+    needs: [pre-flight]
+    if: |
+      !(needs.pre-flight.outputs.docs_only == 'true'
+      || needs.pre-flight.outputs.is_deployment_workflow == 'true')
     strategy:
       fail-fast: false
       matrix:
@@ -48,6 +56,10 @@ jobs:
   ngc-cuda-test-uv:
     runs-on: linux-amd64-cpu16
     name: UV - Python${{ matrix.python-version }} - AMD64/Linux - NGC CUDA
+    needs: [pre-flight]
+    if: |
+      !(needs.pre-flight.outputs.docs_only == 'true'
+      || needs.pre-flight.outputs.is_deployment_workflow == 'true')
     container:
       image: nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
     environment: nemo-ci
@@ -124,6 +136,10 @@ jobs:
     container:
       image: nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
     environment: nemo-ci
+    needs: [pre-flight]
+    if: |
+      !(needs.pre-flight.outputs.docs_only == 'true'
+      || needs.pre-flight.outputs.is_deployment_workflow == 'true')
     strategy:
       fail-fast: false
       matrix:
@@ -172,6 +188,10 @@ jobs:
   uv-test:
     runs-on: ${{ matrix.arch }}
     name: UV - Python ${{ matrix.python-version }} - ${{ matrix.arch == 'ubuntu-latest' && 'AMD64/Linux' || 'ARM64/Darwin' }} - No CUDA
+    needs: [pre-flight]
+    if: |
+      !(needs.pre-flight.outputs.docs_only == 'true'
+      || needs.pre-flight.outputs.is_deployment_workflow == 'true')
     environment: nemo-ci
     strategy:
       fail-fast: false
@@ -219,9 +239,33 @@ jobs:
           python-binary: ./venv/bin/python
 
   install-test-summary:
-    needs: [pip-test, uv-test, ngc-cuda-test-uv, ngc-cuda-test-pip]
+    needs: [pip-test, uv-test, ngc-cuda-test-uv, ngc-cuda-test-pip, pre-flight]
     runs-on: ubuntu-latest
     name: Install test summary
+    if: |
+      (
+        needs.pre-flight.outputs.docs_only == 'true'
+        || needs.pre-flight.outputs.is_deployment_workflow == 'true'
+        || always()
+      )
+      && !cancelled()
     steps:
-      - name: Result
-        run: echo Install check successful
+      - name: Get workflow result
+        id: result
+        shell: bash -x -e -u -o pipefail {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' }}
+        run: |
+          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
+
+          if [ "${FAILED_JOBS:-0}" -eq 0 ] || [ "$SKIPPING_IS_ALLOWED" == "true" ]; then
+              echo "✅ All previous jobs completed successfully"
+              exit 0
+          else
+              echo "❌ Found $FAILED_JOBS failed job(s)"
+              # Show which jobs failed
+              gh run view $GITHUB_RUN_ID --json jobs --jq '.jobs[] | select(.status == "completed" and .conclusion != "success") | .name'
+              exit 1
+          fi

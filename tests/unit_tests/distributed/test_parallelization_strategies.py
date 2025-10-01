@@ -33,6 +33,7 @@ from nemo_automodel.components.distributed.parallelizer import (
     get_parallelization_strategy,
     fsdp2_strategy_parallelize,
 )
+from nemo_automodel.components.distributed import parallelizer as parallelizer_mod
 
 
 class MockModel(nn.Module):
@@ -386,13 +387,15 @@ class TestNemotronHParallelizationStrategy:
                 tp_shard_plan={"test": ColwiseParallel()},
             )
 
+    @pytest.mark.parametrize("tp_size", [1, 2])
     @patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     def test_nemotron_specific_parallelization(self, mock_fully_shard, mock_parallelize_module,
-                                             strategy, mock_device_mesh, nemotron_model):
-        """Test NemotronH-specific parallelization logic."""
+                                             strategy, mock_device_mesh, nemotron_model, tp_size):
+        """Test NemotronH-specific parallelization logic for tp_size 1 and 2."""
         mesh, _, dp_shard_mesh, tp_mesh = mock_device_mesh
         mock_fully_shard.side_effect = lambda model, **kwargs: model
+        tp_mesh.size.return_value = tp_size
 
         result = strategy.parallelize(
             model=nemotron_model,
@@ -400,14 +403,15 @@ class TestNemotronHParallelizationStrategy:
             activation_checkpointing=False,
         )
 
-        # Should call parallelize_module for model-level TP plan
-        assert mock_parallelize_module.call_count >= 1
+        if tp_size == 1:
+            # No TP parallelization when tp_size == 1
+            assert mock_parallelize_module.call_count == 0
+        else:
+            # Should call parallelize_module for model-level TP plan
+            expected_calls = len([layer for layer in nemotron_model.backbone.layers if layer.block_type == "mlp"]) + 1  # +1 for model level
+            assert mock_parallelize_module.call_count == expected_calls
 
-        # Should call parallelize_module for each MLP layer
-        expected_calls = len([layer for layer in nemotron_model.backbone.layers if layer.block_type == "mlp"])
-        assert mock_parallelize_module.call_count == expected_calls + 1  # +1 for model level
-
-        # Should call fully_shard for each layer and the root model
+        # Should call fully_shard for each layer and the root model regardless of TP size
         expected_fully_shard_calls = len(nemotron_model.backbone.layers) + 1  # +1 for root
         assert mock_fully_shard.call_count == expected_fully_shard_calls
 
@@ -602,3 +606,69 @@ class TestStrategyExtensibility:
         # Both should be proper strategy objects
         assert isinstance(regular_strategy, ParallelizationStrategy)
         assert isinstance(nemotron_strategy, ParallelizationStrategy)
+
+
+class TestDeciLMNemotronNASValidation:
+    """Tests for DeciLM nemotron-nas special validation path in validate_tp_mesh."""
+
+    def _make_decilm_nas_model(self, *, num_attention_heads=8, num_hidden_layers=3,
+                               block_kinds=("linear", "group", "noop"),
+                               n_heads_in_group=2, num_key_value_heads=3):
+        """Create a minimal mock model/config for DeciLM nemotron-nas branch.
+
+        num_key_value_heads is intentionally allowed to be incompatible with TP so
+        that the generic path would fail if reached; the DeciLM branch should bypass it.
+        """
+        # Build block_configs with attention attributes
+        blocks = []
+        for kind in block_kinds[:num_hidden_layers]:
+            if kind == "linear":
+                attn = SimpleNamespace(replace_with_linear=True, n_heads_in_group=None, no_op=False)
+            elif kind == "group":
+                attn = SimpleNamespace(replace_with_linear=False, n_heads_in_group=n_heads_in_group, no_op=False)
+            elif kind == "noop":
+                attn = SimpleNamespace(replace_with_linear=False, n_heads_in_group=None, no_op=True)
+            else:
+                attn = SimpleNamespace(replace_with_linear=False, n_heads_in_group=None, no_op=True)
+            blocks.append(SimpleNamespace(attention=attn))
+
+        config = SimpleNamespace(
+            architectures=["DeciLMForCausalLM"],
+            model_type="nemotron-nas",
+            num_attention_heads=num_attention_heads,
+            num_hidden_layers=num_hidden_layers,
+            block_configs=blocks,
+            num_key_value_heads=num_key_value_heads,
+        )
+
+        class _M(nn.Module):
+            def __init__(self, cfg):
+                super().__init__()
+                self.config = cfg
+
+        return _M(config)
+
+    def test_validate_tp_mesh_decilm_nas_calls_specialized_and_returns_early(self):
+        model = self._make_decilm_nas_model()
+        tp_mesh = MagicMock()
+        tp_mesh.size.return_value = 2
+
+        with patch("nemo_automodel.components.distributed.parallelizer.validate_tp_mesh_for_nemotron_nas") as mock_spec:
+            mock_spec.return_value = None
+
+            # should not raise despite incompatible num_key_value_heads
+            parallelizer_mod.validate_tp_mesh(model, tp_mesh)
+
+            # specialized validator was called with (model, tp_size)
+            mock_spec.assert_called_once_with(model, 2)
+
+    def test_validate_tp_mesh_for_nemotron_nas_valid_config_passes(self):
+        # a valid config covering linear, grouped, and noop attention cases
+        model = self._make_decilm_nas_model(
+            num_attention_heads=8,
+            num_hidden_layers=3,
+            block_kinds=("linear", "group", "noop"),
+            n_heads_in_group=2,
+        )
+
+        parallelizer_mod.validate_tp_mesh_for_nemotron_nas(model, tp_size=2)

@@ -61,6 +61,7 @@ class CheckpointingConfig:
     save_consolidated: bool
     is_peft: bool
     model_state_dict_keys: list[str]  # copy of the model state dict keys before any parallelization
+    dequantize_base_checkpoint: bool = False
 
     def __post_init__(self):
         """
@@ -193,10 +194,12 @@ def load_model_from_base_checkpoint(
     device: torch.device,
     is_peft: bool,
     root_dir: str,
-    model_name: str,
+    model_name: str | None,
     peft_init_method: str,
     device_mesh: Optional[DeviceMesh] = None,
     moe_mesh: Optional[DeviceMesh] = None,
+    load_base_model: bool = True,
+    quantization: bool = False,
 ):
     """
     Load a model from the base Hugging Face checkpoint in parallel.
@@ -236,17 +239,20 @@ def load_model_from_base_checkpoint(
     # init peft adapters with the scaled weights
     _init_peft_adapters(model, peft_init_method)
 
-    load_model(
-        model,
-        model_path=model_name if os.path.exists(model_name) else get_safetensors_index_path(root_dir, model_name),
-        model_save_format=SerializationFormat.SAFETENSORS,
-        is_peft=is_peft,
-        is_init_step=True,
-        use_checkpoint_id=False,
-        key_mapping=getattr(model, "_checkpoint_conversion_mapping", None),
-        load_peft_adapters=False,
-        moe_mesh=moe_mesh,
-    )
+    if load_base_model:
+        assert model_name is not None, "model_name is required when loading base model"
+        load_model(
+            model,
+            model_path=model_name if os.path.exists(model_name) else get_safetensors_index_path(root_dir, model_name),
+            model_save_format=SerializationFormat.SAFETENSORS,
+            is_peft=is_peft,
+            is_init_step=True,
+            use_checkpoint_id=False,
+            key_mapping=getattr(model, "_checkpoint_conversion_mapping", None),
+            load_peft_adapters=False,
+            moe_mesh=moe_mesh,
+            quantization=quantization,
+        )
 
     is_tied_lm_head = getattr(getattr(model, "config", {}), "tie_word_embeddings", False)
     if hasattr(model, "tie_weights") and is_tied_lm_head:
@@ -264,6 +270,7 @@ def load_model(
     key_mapping: Optional[dict[str, str]] = None,
     load_peft_adapters: bool = True,
     moe_mesh: Optional[DeviceMesh] = None,
+    quantization: bool = False,
 ):
     """
     Load a model state dictionary from a weights path.
@@ -302,7 +309,7 @@ def load_model(
         state_dict_adapter = getattr((model[0] if isinstance(model, list) else model), "state_dict_adapter", None)
         if state_dict_adapter:
             reinstated_state_dict = state_dict_adapter.to_hf(
-                reinstated_state_dict, exclude_key_regex=r".*_extra_state.*"
+                reinstated_state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization
             )
 
         dcp.load(

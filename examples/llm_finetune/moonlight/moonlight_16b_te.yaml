@@ -14,17 +14,16 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/qwen_3_0p6b_hellaswag.yaml
+# torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/moonlight/moonlight_16b_te.yaml
 # Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
 
 step_scheduler:
-  global_batch_size: 128
+  global_batch_size: 512
   local_batch_size: 32
-  ckpt_every_steps: 5
+  ckpt_every_steps: 500
   val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 2
-  max_steps: 6
 
 dist_env:
   backend: nccl
@@ -35,10 +34,17 @@ rng:
   seed: 1111
   ranked: true
 
+parallelizer:
+  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
+  activation_checkpointing: false
+
 model:
   _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_config
-  # _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained_config
-  pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
+  config:
+    _target_: transformers.AutoConfig.from_pretrained
+    pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
+  trust_remote_code: true
+  is_meta_device: true
   backend:
     _target_: nemo_automodel.components.moe.utils.BackendConfig
     attn: te
@@ -51,8 +57,8 @@ model:
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
-  model_save_format: safetensors # torch_save or safetensors
-  save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  model_save_format: torch_save # torch_save or safetensors
+  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
@@ -60,17 +66,8 @@ distributed:
   cp_size: 1
   pp_size: 1
   dp_replicate_size: 1
-  dp_size: 2
-  ep_size: 2
-
-autopipeline:
-  _target_: nemo_automodel.components.distributed.pipelining.autopipeline.AutoPipeline
-  pp_schedule: interleaved1f1b
-  pp_microbatch_size: 8
-  round_virtual_stages_to_pp_multiple: up
-  scale_grads_in_schedule: false
-  patch_inner_model: false
-  patch_causal_lm_model: false
+  dp_size: 8
+  ep_size: 8
 
 
 loss_fn:
@@ -104,7 +101,7 @@ validation_dataloader:
 optimizer:
   _target_: torch.optim.Adam
   betas: [0.9, 0.999]
-  eps: 1e-8
+  eps: 1e-6
   lr: 1.0e-4
   weight_decay: 0
   # min_lr: 1.0e-5
@@ -114,4 +111,4 @@ optimizer:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir> 
+#   save_dir: <your_wandb_save_dir>

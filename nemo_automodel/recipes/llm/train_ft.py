@@ -43,7 +43,7 @@ from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConf
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
-from nemo_automodel.components.datasets.llm.packed_sequence import PackedSequence
+from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import (
     get_rank_safe,
@@ -79,9 +79,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
 # ---------------------------
 #  Stateless helper functions
 # ---------------------------
+def _get_model_name(cfg_model):
+    if cfg_model.get("pretrained_model_name_or_path", None) is not None:
+        return cfg_model.pretrained_model_name_or_path
+    elif cfg_model.get("config", None) is not None:
+        return cfg_model.config.get("pretrained_model_name_or_path", None)
+    else:
+        return None
 
 
 def build_model_and_optimizer(
@@ -100,6 +108,8 @@ def build_model_and_optimizer(
     autopipeline: AutoPipeline | None = None,
     loss_fn=None,
     parallelize_fn=None,
+    load_base_model=True,
+    dequantize_base_checkpoint=False,
 ) -> tuple[nn.Module | AutoPipeline, list[str], list["Optimizer"], nn.Module]:  # noqa: F821
     """
     Build and initialize a model and optimizer.
@@ -188,10 +198,12 @@ def build_model_and_optimizer(
                     device,
                     cfg_peft is not None,
                     cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
-                    cfg_model.pretrained_model_name_or_path,
+                    _get_model_name(cfg_model),
                     getattr(cfg_peft, "lora_A_init", None),
                     device_mesh=autopipeline.world_mesh,
                     moe_mesh=autopipeline.moe_mesh,
+                    load_base_model=load_base_model,
+                    quantization=dequantize_base_checkpoint,
                 )
 
             # Create optimizer for all model parts
@@ -230,21 +242,13 @@ def build_model_and_optimizer(
                     cfg_opt.foreach = False
                 optimizer = cfg_opt.instantiate(params=trainable_params)
 
-                if get_world_size_safe() == 1:
-                    logger.info("World size is 1, skipping parallelization.")
-                    model = model.to(device).to(torch.bfloat16)
-                else:
-                    model, optimizer = model_wrapper.parallelize(model, optimizer)
+                model, optimizer = model_wrapper.parallelize(model, optimizer)
 
                 return model, state_dict_keys, [optimizer], loss_fn
 
             else:
                 load_weights = True
-                if get_world_size_safe() == 1:
-                    logger.info("World size is 1, skipping parallelization.")
-                    model = model.to(device).to(torch.bfloat16)
-                else:
-                    model = model_wrapper.parallelize(model)
+                model = model_wrapper.parallelize(model)
 
         # Load the weights into the model in parallel.
         if is_meta_device and load_weights:
@@ -253,10 +257,12 @@ def build_model_and_optimizer(
                 device,
                 cfg_peft is not None,
                 cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
-                cfg_model.pretrained_model_name_or_path,
+                _get_model_name(cfg_model),
                 getattr(cfg_peft, "lora_A_init", None),
                 device_mesh=model_wrapper.device_mesh,
                 moe_mesh=getattr(model_wrapper, "moe_mesh", None),
+                load_base_model=load_base_model,
+                quantization=dequantize_base_checkpoint,
             )
 
         # ensure the model is on device
@@ -312,6 +318,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft, state_d
     if cfg_ckpt is not None:
         cfg_ckpt = cfg_ckpt.to_dict()
         cfg_ckpt.pop("restore_from", None)
+        cfg_ckpt.pop("load_base_model", None)
         ckpt_kwargs |= cfg_ckpt
     if ckpt_kwargs.get("is_peft", False) and ckpt_kwargs.get("model_save_format") == "torch_save":
         raise ValueError(
@@ -335,12 +342,10 @@ def build_loss_fn(cfg_loss):
 
 def _build_tokenizer(cfg_model, cfg_ds):
     # if tokenizer is not provided, use the model config to instantiate it
-    if "tokenizer" not in cfg_ds and cfg_model.get("pretrained_model_name_or_path", None) is not None:
+    if "tokenizer" not in cfg_ds and _get_model_name(cfg_model) is not None:
         logging.info("Using model config to instantiate tokenizer")
         trust_remote_code = getattr(cfg_model, "trust_remote_code", False)
-        tokenizer = AutoTokenizer.from_pretrained(
-            cfg_model.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
-        )
+        tokenizer = AutoTokenizer.from_pretrained(_get_model_name(cfg_model), trust_remote_code=trust_remote_code)
     elif cfg_ds.get("tokenizer", None) is None:
         tokenizer = None
     elif "_target_" not in cfg_ds.tokenizer:
@@ -417,13 +422,15 @@ def build_dataloader(
         # Apply packing if configured
         if packed_sequence_size > 0:
             logger.info(f"Packing dataset with size: {packed_sequence_size}")
-            ds = PackedSequence(
+            if hasattr(ds, "shuffle"):
+                ds = ds.shuffle(seed)
+            ds = pack_dataset(
                 ds,
                 split=cfg_ds.split,  # Assumes split is defined in dataset config
                 packed_sequence_size=packed_sequence_size,
                 split_across_pack=getattr(cfg_ps, "split_across_pack", False),
                 max_packs=getattr(cfg_ps, "max_packs", None),
-            ).pack()
+            )
 
         if isinstance(ds, MegatronPretraining):
             ds = ds.get_dataset(split=cfg_ds.splits_to_build)
@@ -589,7 +596,7 @@ def build_wandb(cfg) -> wandb.Run:
     assert cfg.get("wandb", None) is not None
     kwargs = cfg.wandb.to_dict()
     if kwargs.get("name", "") == "":
-        kwargs["name"] = "_".join(cfg.get("model.pretrained_model_name_or_path").split("/")[-2:])
+        kwargs["name"] = "_".join(_get_model_name(cfg.model).split("/")[-2:])
     run = wandb.init(
         **kwargs,
         config=cfg.to_dict(),
@@ -726,6 +733,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
         autopipeline_cfg = self.cfg.get("autopipeline", None)
         if self.pp_enabled:
+            pp_batch_size = self.cfg.step_scheduler.local_batch_size
+            assert pp_batch_size // self.cfg.autopipeline.pp_microbatch_size >= self.model_wrapper.pp_size, (
+                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {self.cfg.autopipeline.pp_microbatch_size} must be greater than or equal to pp_size {self.model_wrapper.pp_size}"
+            )
             assert autopipeline_cfg is not None, (
                 "AutoPipeline configuration is required when pipeline parallelism is enabled"
             )
@@ -749,7 +760,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 ep_shard_axis_names=(
                     ("ep_shard",) if self.moe_mesh is not None and "ep_shard" in self.moe_mesh.mesh_dim_names else None
                 ),
-                pp_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+                pp_batch_size=pp_batch_size,
                 device=torch.cuda.current_device(),
             )
             assert isinstance(autopipeline, AutoPipeline), (
@@ -763,7 +774,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
         self.loss_fn = build_loss_fn(self.cfg.loss_fn)
-        parallelize_fn = self.cfg.get("parallelize_fn", None)
+        parallelize_fn = getattr(self.cfg.get("parallelizer", None), "instantiate", None)
         if parallelize_fn is None and self.pp_enabled:
             parallelize_fn = partial(parallelize_for_pp, model_wrapper=self.model_wrapper)
 
@@ -783,6 +794,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             autopipeline=autopipeline,
             loss_fn=self.loss_fn,
             parallelize_fn=parallelize_fn,
+            load_base_model=self.cfg.get("checkpoint.load_base_model", True),
+            dequantize_base_checkpoint=self.cfg.get("checkpoint.dequantize_base_checkpoint", False),
         )
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
@@ -846,7 +859,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.checkpoint_config = build_checkpoint_config(
             self.cfg.get("checkpoint", None),
             self.cfg.get("model.cache_dir", None),
-            self.cfg.model.get("pretrained_model_name_or_path", None),
+            _get_model_name(self.cfg.model),
             True if self.cfg.get("peft", None) else False,
             model_state_dict_keys,
         )
