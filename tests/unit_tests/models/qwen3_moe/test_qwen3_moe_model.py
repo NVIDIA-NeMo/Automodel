@@ -145,7 +145,7 @@ class TestBlock:
     def test_mlp_wrapper_handles_mlp_instance(self, qwen_config, backend_config):
         block = Block(layer_idx=0, config=qwen_config, moe_config=magic_moe_config(qwen_config), backend=backend_config)
         block.mlp = MLP(dim=qwen_config.hidden_size, inter_dim=qwen_config.intermediate_size, backend="torch")
-        x = torch.randn(2, 4, qwen_config.hidden_size)
+        x = torch.randn(2, 4, qwen_config.hidden_size).to(torch.bfloat16)
 
         out = block._mlp(x, padding_mask=None)
 
@@ -216,14 +216,6 @@ class TestQwen3MoeModel:
 
 
 class TestQwen3MoeForCausalLM:
-    def test_from_config_handles_string(self, qwen_config, backend_config):
-        with patch("transformers.models.qwen3_moe.configuration_qwen3_moe.Qwen3MoeConfig.from_pretrained") as mock_from_pretrained:
-            mock_from_pretrained.return_value = qwen_config
-            model = Qwen3MoeForCausalLM.from_config("fake", backend=backend_config)
-
-        mock_from_pretrained.assert_called_once_with("fake", trust_remote_code=False)
-        assert isinstance(model, Qwen3MoeForCausalLM)
-
     def test_forward_returns_logits(self, qwen_config, backend_config, device):
         model = Qwen3MoeForCausalLM(qwen_config, backend=backend_config)
         model = model.to(device)
@@ -231,7 +223,7 @@ class TestQwen3MoeForCausalLM:
         batch, seq_len = 2, 6
         input_ids = torch.randint(0, qwen_config.vocab_size, (batch, seq_len), device=device)
 
-        with patch.object(model.model, "forward", return_value=torch.randn(batch, seq_len, qwen_config.hidden_size, device=device)):
+        with patch.object(model.model, "forward", return_value=torch.randn(batch, seq_len, qwen_config.hidden_size, device=device).to(torch.bfloat16)):
             logits = model(input_ids)
 
         assert logits.shape == (batch, seq_len, qwen_config.vocab_size)

@@ -31,9 +31,7 @@ except ImportError:
 try:
     from grouped_gemm import ops
 except ImportError:
-    print(
-        "grouped_gemm is not available. Please run:pip install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4"
-    )
+    print("grouped_gemm is not available. Please run:pip install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4")
 
 from nemo_automodel.components.moe.megatron.moe_utils import (
     MoEAuxLossAutoScaler,
@@ -819,9 +817,7 @@ class Gate(nn.Module):
                 context_length, device_mesh=cp_mesh, placements=[Partial()]
             ).full_tensor()
             expert_load = DTensor.from_local(expert_load, device_mesh=cp_mesh, placements=[Partial()]).full_tensor()
-            expert_scores = DTensor.from_local(
-                expert_scores, device_mesh=cp_mesh, placements=[Partial()]
-            ).full_tensor()
+            expert_scores = DTensor.from_local(expert_scores, device_mesh=cp_mesh, placements=[Partial()]).full_tensor()
 
         # Compute f_i (fraction of tokens dispatched to each expert).
         # If uniform distribution, expert_load will be topk * num_location / n_experts, and f_i will be 1
