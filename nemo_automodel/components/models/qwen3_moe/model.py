@@ -23,6 +23,7 @@ from nemo_automodel.components.models.qwen3_moe.layers import Qwen3MoeAttention
 from nemo_automodel.components.models.qwen3_moe.state_dict_adapter import Qwen3MoeStateDictAdapter
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
 from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 class Block(nn.Module):
@@ -115,7 +116,9 @@ class Qwen3MoeModel(nn.Module):
             softmax_before_topk=True,
         )
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
+        )
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, backend)
@@ -215,7 +218,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Qwen3MoeStateDictAdapter(
-                self.config, self.model.moe_config, self.backend, dtype=torch.bfloat16
+                self.config, self.model.moe_config, self.backend, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
             )
 
     def forward(

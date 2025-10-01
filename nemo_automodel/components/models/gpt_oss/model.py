@@ -207,7 +207,7 @@ class GptOssForCausalLM(nn.Module):
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = GPTOSSStateDictAdapter(
-                self.config, self.model.moe_config, self.backend, dtype=torch.bfloat16
+                self.config, self.model.moe_config, self.backend, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
             )
 
     def forward(
