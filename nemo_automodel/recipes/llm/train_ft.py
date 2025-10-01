@@ -79,9 +79,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
 # ---------------------------
 #  Stateless helper functions
 # ---------------------------
+def _get_model_name(cfg_model):
+    if hasattr(cfg_model, "pretrained_model_name_or_path"):
+        return cfg_model.pretrained_model_name_or_path
+    elif hasattr(cfg_model, "config"):
+        return cfg_model.config.pretrained_model_name_or_path
+    else:
+        raise ValueError("pretrained_model_name_or_path not found in model config")
 
 
 def build_model_and_optimizer(
@@ -190,7 +198,7 @@ def build_model_and_optimizer(
                     device,
                     cfg_peft is not None,
                     cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
-                    cfg_model.pretrained_model_name_or_path,
+                    _get_model_name(cfg_model),
                     getattr(cfg_peft, "lora_A_init", None),
                     device_mesh=autopipeline.world_mesh,
                     moe_mesh=autopipeline.moe_mesh,
@@ -249,7 +257,7 @@ def build_model_and_optimizer(
                 device,
                 cfg_peft is not None,
                 cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
-                cfg_model.pretrained_model_name_or_path,
+                _get_model_name(cfg_model),
                 getattr(cfg_peft, "lora_A_init", None),
                 device_mesh=model_wrapper.device_mesh,
                 moe_mesh=getattr(model_wrapper, "moe_mesh", None),
@@ -334,12 +342,10 @@ def build_loss_fn(cfg_loss):
 
 def _build_tokenizer(cfg_model, cfg_ds):
     # if tokenizer is not provided, use the model config to instantiate it
-    if "tokenizer" not in cfg_ds and cfg_model.get("pretrained_model_name_or_path", None) is not None:
+    if "tokenizer" not in cfg_ds and _get_model_name(cfg_model) is not None:
         logging.info("Using model config to instantiate tokenizer")
         trust_remote_code = getattr(cfg_model, "trust_remote_code", False)
-        tokenizer = AutoTokenizer.from_pretrained(
-            cfg_model.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
-        )
+        tokenizer = AutoTokenizer.from_pretrained(_get_model_name(cfg_model), trust_remote_code=trust_remote_code)
     elif cfg_ds.get("tokenizer", None) is None:
         tokenizer = None
     elif "_target_" not in cfg_ds.tokenizer:
@@ -590,7 +596,7 @@ def build_wandb(cfg) -> wandb.Run:
     assert cfg.get("wandb", None) is not None
     kwargs = cfg.wandb.to_dict()
     if kwargs.get("name", "") == "":
-        kwargs["name"] = "_".join(cfg.get("model.pretrained_model_name_or_path").split("/")[-2:])
+        kwargs["name"] = "_".join(_get_model_name(cfg.model).split("/")[-2:])
     run = wandb.init(
         **kwargs,
         config=cfg.to_dict(),
@@ -853,7 +859,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.checkpoint_config = build_checkpoint_config(
             self.cfg.get("checkpoint", None),
             self.cfg.get("model.cache_dir", None),
-            self.cfg.model.get("pretrained_model_name_or_path", None),
+            _get_model_name(self.cfg.model),
             True if self.cfg.get("peft", None) else False,
             model_state_dict_keys,
         )

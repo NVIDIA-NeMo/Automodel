@@ -194,15 +194,12 @@ class Qwen3MoeForCausalLM(nn.Module):
     @classmethod
     def from_config(
         cls,
-        pretrained_model_name_or_path: str | Qwen3MoeConfig,
+        config: Qwen3MoeConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
         trust_remote_code: bool = False,
+        **kwargs,
     ):
-        if isinstance(pretrained_model_name_or_path, str):
-            config = Qwen3MoeConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=trust_remote_code)
-        else:
-            config = pretrained_model_name_or_path
         return cls(config, moe_config, backend)
 
     def __init__(

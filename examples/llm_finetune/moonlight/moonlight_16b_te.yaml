@@ -19,11 +19,11 @@
 
 
 step_scheduler:
-  global_batch_size: 128
-  local_batch_size: 4
-  ckpt_every_steps: 100
+  global_batch_size: 512
+  local_batch_size: 32
+  ckpt_every_steps: 500
   val_every_steps: 100  # will run every x number of gradient steps
-  num_epochs: 1
+  num_epochs: 2
 
 dist_env:
   backend: nccl
@@ -42,7 +42,7 @@ model:
   _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_config
   config:
     _target_: transformers.AutoConfig.from_pretrained
-     pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
+    pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
   trust_remote_code: true
   is_meta_device: true
   backend:
@@ -80,7 +80,7 @@ dataset:
 
 packed_sequence:
   # Set packed_sequence_size > 0 to run with packed sequences
-  packed_sequence_size: 2048
+  packed_sequence_size: 0
   split_across_pack: False
 
 dataloader:
@@ -101,7 +101,7 @@ validation_dataloader:
 optimizer:
   _target_: torch.optim.Adam
   betas: [0.9, 0.999]
-  eps: 1e-8
+  eps: 1e-6
   lr: 1.0e-4
   weight_decay: 0
   # min_lr: 1.0e-5
@@ -111,4 +111,4 @@ optimizer:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir> 
+#   save_dir: <your_wandb_save_dir>

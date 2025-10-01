@@ -42,7 +42,6 @@ def initialize_attn_module_and_func(
     attn_mask_type: str = "causal",
     qkv_format: str = "bshd",
     num_gqa_groups: int | None = None,
-    dtype: torch.dtype = torch.bfloat16,
     **kwargs,
 ) -> tuple[nn.Module | None, Callable]:
     if attn_impl == "te":
@@ -54,7 +53,6 @@ def initialize_attn_module_and_func(
             attn_mask_type=attn_mask_type,
             qkv_format=qkv_format,
             softmax_scale=softmax_scale,
-            params_dtype=dtype,
             num_gqa_groups=num_gqa_groups,
             **kwargs,
         )
