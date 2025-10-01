@@ -43,12 +43,7 @@ def preprocess_args_and_kwargs_for_attn(
                 "attention_mask": padding_mask.unsqueeze(1).unsqueeze(2),
             }
     else:  # sdpa
-        if attention_mask is None:
-            attn_kwargs = {}
-        else:
-            attn_kwargs = {
-                "attention_mask": attention_mask.bool(),
-            }
+        attn_kwargs = {}
         # Transpose for SDPA
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
