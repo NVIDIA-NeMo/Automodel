@@ -59,21 +59,35 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         # Store and remove benchmarking-specific parameters
         if "step_scheduler" in cfg:
             step_cfg = cfg.step_scheduler
-            self._bench_seq_len = step_cfg.get("seq_len", 2048)
-            self._bench_steps = step_cfg.get("steps", 30)
+            self._bench_steps = step_cfg.get("max_steps", 30)
             self._bench_warmup_steps = step_cfg.get("warmup_steps", 10)
 
-            # Set max_steps from steps if needed
-            if "max_steps" not in step_cfg and "steps" in step_cfg:
-                step_cfg.max_steps = step_cfg.steps
-
             # Remove benchmarking-specific parameters that StepScheduler doesn't accept
-            if "seq_len" in step_cfg:
-                del step_cfg.__dict__["seq_len"]
-            if "steps" in step_cfg:
-                del step_cfg.__dict__["steps"]
             if "warmup_steps" in step_cfg:
                 del step_cfg.__dict__["warmup_steps"]
+
+        # Get seq_len from dataset config
+        self._bench_seq_len = cfg.dataset.get("seq_len", 2048) if "dataset" in cfg else 2048
+
+        # Infer vocab_size from model config and inject it into dataset config
+        if "dataset" in cfg and "model" in cfg:
+            # Get vocab_size from model config
+            if hasattr(cfg.model, "config") and hasattr(cfg.model.config, "pretrained_model_name_or_path"):
+                from transformers import AutoConfig
+
+                model_config = AutoConfig.from_pretrained(cfg.model.config.pretrained_model_name_or_path)
+                vocab_size = model_config.vocab_size
+                # Inject vocab_size into dataset config
+                cfg.dataset.vocab_size = vocab_size
+                if logger.isEnabledFor(logging.INFO):
+                    logger.info(f"Inferred vocab_size={vocab_size} from model config")
+
+        # Inject batch_size from step_scheduler into dataset config
+        if "dataset" in cfg and "step_scheduler" in cfg:
+            local_batch_size = cfg.step_scheduler.get("local_batch_size", 1)
+            cfg.dataset.batch_size = local_batch_size
+            if logger.isEnabledFor(logging.INFO):
+                logger.info(f"Using batch_size={local_batch_size} from step_scheduler.local_batch_size")
 
         super().__init__(cfg)
         self.timers = Timers(log_level=2, log_option="minmax")
@@ -84,8 +98,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         This method calls the parent's setup() but adapts it for benchmarking purposes.
         It skips validation dataloader, checkpointing, and other training-specific features.
         """
-        # Call parent setup
-        super().setup()
+        with self.timers("setup", log_level=1):
+            # Call parent setup
+            super().setup()
 
         # Clear validation dataloader (not needed for benchmarking)
         self.val_dataloader = None
@@ -108,6 +123,13 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             return torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
 
         self.loss_fn = ce_loss_fn
+        self.timers.log(
+            names=["setup"],
+            rank=0,
+            normalizer=1000.0,  # Convert to seconds
+            reset=True,
+            barrier=True,
+        )
 
     def run_benchmark(self):
         """Run the benchmarking loop.
@@ -147,10 +169,6 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 f"GA steps: {ga_steps}, DP size: {dp_size}, Local batch size: {local_batch_size}, Global batch size: {global_batch_size}"
             )
 
-        # Setup phase timer
-        with self.timers("setup", log_level=1):
-            torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
-
         # Create dataloader iterator
         dataloader_iter = iter(self.dataloader)
 
@@ -173,16 +191,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             iter_timer = "iteration_warmup" if i < warmup_steps else "iteration"
             with self.timers(iter_timer, log_level=1):
                 # Gradient accumulation loop
-                for mp in self.model_parts:
-                    if hasattr(mp, "run_pre_forward"):
-                        mp.run_pre_forward()
-
                 for ga_step_idx in range(ga_steps):
-                    if ga_step_idx == ga_steps - 1:
-                        for mp in self.model_parts:
-                            if hasattr(mp, "run_post_backward"):
-                                mp.run_post_backward()
-
                     # Get batch from dataloader
                     batch = next(dataloader_iter)
 

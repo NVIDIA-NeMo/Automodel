@@ -29,8 +29,6 @@ step_scheduler:
   val_every_steps: 1000
   num_epochs: 1
   max_steps: 30
-  seq_len: 4096
-  steps: 30
   warmup_steps: 10
 
 dist_env:
@@ -43,7 +41,9 @@ parallelizer:
 
 model:
   _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_config
-  pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
+  config:
+    _target_: transformers.AutoConfig.from_pretrained
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
   trust_remote_code: true
   is_meta_device: true
   backend:
@@ -81,11 +81,9 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: examples.benchmarking_v3.mock_dataset.MockBenchmarkDataset
-  vocab_size: 102400
+  _target_: examples.benchmark.mock_dataset.MockBenchmarkDataset
   seq_len: 4096
   num_samples: 100000
-  batch_size: 8
 
 dataloader:
   batch_size: null  # Dataset already yields batches
