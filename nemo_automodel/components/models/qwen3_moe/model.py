@@ -16,26 +16,37 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
+from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention, RotaryEmbedding
-from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSStateDictAdapter
+from nemo_automodel.components.models.gpt_oss.layers import RotaryEmbedding
+from nemo_automodel.components.models.qwen3_moe.layers import Qwen3MoeAttention
+from nemo_automodel.components.models.qwen3_moe.state_dict_adapter import Qwen3MoeStateDictAdapter
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
 from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 class Block(nn.Module):
-    def __init__(self, layer_idx: int, config: GptOssConfig, moe_config: MoEConfig, backend: BackendConfig):
+    def __init__(self, layer_idx: int, config: Qwen3MoeConfig, moe_config: MoEConfig, backend: BackendConfig):
         super().__init__()
-        self.self_attn = GptOssAttention(
-            config, backend, use_sliding_attention=config.layer_types[layer_idx] == "sliding_attention"
+        self.self_attn = Qwen3MoeAttention(config, backend)
+
+        # Qwen3-MoE sparsifies every decoder_sparse_step layer, unless in mlp_only_layers
+        is_moe_layer = (
+            (layer_idx not in getattr(config, "mlp_only_layers", []))
+            and (getattr(config, "num_experts", 0) > 0)
+            and ((layer_idx + 1) % getattr(config, "decoder_sparse_step", 1) == 0)
         )
-        self.mlp = MoE(moe_config, backend)
+        if is_moe_layer:
+            self.mlp = MoE(moe_config, backend)
+        else:
+            self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear)
+
         self.input_layernorm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps
         )
+        self.layer_idx = layer_idx
 
     def forward(
         self,
@@ -44,16 +55,20 @@ class Block(nn.Module):
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        **attn_kwargs: Any,
+    ) -> torch.Tensor:
         if attention_mask is not None and padding_mask is None:
             padding_mask = attention_mask.bool().logical_not()
 
-        # TODO: Support arbitrary attention masks
-        attn_out = self.self_attn(self.input_layernorm(x), freqs_cis=freqs_cis)
+        attn_out = self.self_attn(
+            x=self.input_layernorm(x),
+            freqs_cis=freqs_cis,
+            attention_mask=attention_mask,
+            **attn_kwargs,
+        )
         x = x + attn_out
 
-        mlp_in = self.post_attention_layernorm(x)
-        mlp_out = self._mlp(mlp_in, padding_mask)
+        mlp_out = self._mlp(x=self.post_attention_layernorm(x), padding_mask=padding_mask)
         x = x + mlp_out
         return x
 
@@ -71,32 +86,34 @@ class Block(nn.Module):
         self.mlp.init_weights(buffer_device)
 
 
-class GptOssModel(nn.Module):
-    def __init__(self, config: GptOssConfig, backend: BackendConfig, *, moe_config: MoEConfig | None = None):
+class Qwen3MoeModel(nn.Module):
+    def __init__(self, config: Qwen3MoeConfig, backend: BackendConfig, *, moe_config: MoEConfig | None = None):
         super().__init__()
         self.backend = backend
         self.config = config
-        # GPT-OSS is MoE everywhere; set shared experts to 0 to disable shared path in our MoE wrapper.
+
+        # Map HF Qwen3 MoE config -> our MoE wrapper
+        # Qwen config fields from example config:
+        # - hidden_size, intermediate_size, moe_intermediate_size, num_experts, num_experts_per_tok, norm_topk_prob
         self.moe_config = moe_config or MoEConfig(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
-            moe_inter_dim=config.intermediate_size,
-            n_routed_experts=config.num_local_experts,
+            moe_inter_dim=getattr(config, "moe_intermediate_size", config.intermediate_size),
+            n_routed_experts=getattr(config, "num_experts", 0),
             n_shared_experts=0,
-            n_activated_experts=config.num_experts_per_tok,
-            n_expert_groups=getattr(config, "n_group", 1),
-            n_limited_groups=getattr(config, "topk_group", 1),
+            n_activated_experts=getattr(config, "num_experts_per_tok", 1),
+            n_expert_groups=1,
+            n_limited_groups=1,
             train_gate=True,
-            gate_bias_update_factor=0,
-            score_func="softmax",
+            gate_bias_update_factor=0.0,
+            score_func="softmax",  # Qwen3 uses softmax topk routing
             route_scale=1.0,
-            aux_loss_coeff=config.router_aux_loss_coef,
+            aux_loss_coeff=getattr(config, "router_aux_loss_coef", 0.0),
             norm_topk_prob=getattr(config, "norm_topk_prob", False),
-            expert_bias=True,
-            router_bias=True,
-            expert_activation="quick_geglu",
-            activation_alpha=1.702,
-            activation_limit=getattr(config, "swiglu_limit", 7.0),
+            expert_bias=False,
+            router_bias=False,
+            expert_activation="swiglu",
+            softmax_before_topk=True,
         )
 
         self.embed_tokens = nn.Embedding(
@@ -107,25 +124,17 @@ class GptOssModel(nn.Module):
             self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, backend)
         self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
 
-        # Rotary embedding cached at model-level (inv_freq + concentration via YaRN/NTK-by-parts)
+        # Rotary embedding cache compatible with our rope_utils functions
         self.max_seq_len = config.max_position_embeddings
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        if rope_scaling is None:
-            rope_scaling = {
-                "factor": 1.0,
-                "beta_fast": 32.0,
-                "beta_slow": 1.0,
-                "original_max_position_embeddings": 4096,
-            }
         self.rotary_emb = RotaryEmbedding(
             head_dim=self.head_dim,
-            base=getattr(config, "rope_theta", 10000.0),
+            base=config.rope_theta,
             dtype=torch.float32,
-            initial_context_length=rope_scaling["original_max_position_embeddings"],
-            scaling_factor=rope_scaling["factor"],
-            ntk_alpha=rope_scaling["beta_slow"],
-            ntk_beta=rope_scaling["beta_fast"],
+            initial_context_length=4096,
+            scaling_factor=1.0,
+            ntk_alpha=1.0,
+            ntk_beta=32.0,
             device=torch.device(f"cuda:{torch.cuda.current_device()}"),
         )
 
@@ -157,10 +166,11 @@ class GptOssModel(nn.Module):
 
         for layer in self.layers.values():
             h = layer(
-                h,
+                x=h,
                 freqs_cis=freqs_cis,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
+                **attn_kwargs,
             )
 
         h = self.norm(h) if self.norm else h
@@ -175,7 +185,7 @@ class GptOssModel(nn.Module):
                 nn.init.normal_(self.embed_tokens.weight)
             if self.norm is not None:
                 self.norm.reset_parameters()
-            # Ensure rotary embedding uses correct device
+            # Ensure rotary embedding uses correct device after dtype move
             self.rotary_emb.device = buffer_device
 
         for layer in self.layers.values():
@@ -183,30 +193,31 @@ class GptOssModel(nn.Module):
                 layer.init_weights(buffer_device=buffer_device)
 
 
-class GptOssForCausalLM(nn.Module):
+class Qwen3MoeForCausalLM(nn.Module):
     @classmethod
     def from_config(
         cls,
-        config: GptOssConfig,
+        config: Qwen3MoeConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
         trust_remote_code: bool = False,
+        **kwargs,
     ):
         return cls(config, moe_config, backend)
 
     def __init__(
         self,
-        config: GptOssConfig,
+        config: Qwen3MoeConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
     ):
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig()
-        self.model = GptOssModel(config, backend=self.backend, moe_config=moe_config)
+        self.model = Qwen3MoeModel(config, backend=self.backend, moe_config=moe_config)
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
-            self.state_dict_adapter = GPTOSSStateDictAdapter(
+            self.state_dict_adapter = Qwen3MoeStateDictAdapter(
                 self.config, self.model.moe_config, self.backend, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
             )
 

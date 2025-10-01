@@ -194,7 +194,7 @@ def load_model_from_base_checkpoint(
     device: torch.device,
     is_peft: bool,
     root_dir: str,
-    model_name: str,
+    model_name: str | None,
     peft_init_method: str,
     device_mesh: Optional[DeviceMesh] = None,
     moe_mesh: Optional[DeviceMesh] = None,
@@ -240,6 +240,7 @@ def load_model_from_base_checkpoint(
     _init_peft_adapters(model, peft_init_method)
 
     if load_base_model:
+        assert model_name is not None, "model_name is required when loading base model"
         load_model(
             model,
             model_path=model_name if os.path.exists(model_name) else get_safetensors_index_path(root_dir, model_name),
