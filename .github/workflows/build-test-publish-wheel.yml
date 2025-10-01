@@ -27,7 +27,7 @@ defaults:
     shell: bash -x -e -u -o pipefail {0}
 
 jobs:
-  re-flight:
+  pre-flight:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.64.0
 
   build-test-publish-wheel:
