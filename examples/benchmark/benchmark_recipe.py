@@ -118,11 +118,6 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         if self.dist_env.is_main:
             logger.info(f"TFLOPs/GPU: {self.tflops:.6f}")
 
-        # Simple CE loss
-        def ce_loss_fn(logits, labels, **kwargs):
-            return torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
-
-        self.loss_fn = ce_loss_fn
         self.timers.log(
             names=["setup"],
             rank=0,
@@ -191,51 +186,44 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             iter_timer = "iteration_warmup" if i < warmup_steps else "iteration"
             with self.timers(iter_timer, log_level=1):
                 # Gradient accumulation loop
+                num_label_tokens = 0
+                loss_buffer = []
                 for ga_step_idx in range(ga_steps):
                     # Get batch from dataloader
                     batch = next(dataloader_iter)
-
                     torch.cuda.nvtx.range_push(f"iteration_{i}_ga_step_{ga_step_idx}")
 
-                    # Forward and backward pass using parent's method
-                    loss_buffer = []
-                    num_label_tokens = (batch["labels"] != -100).sum().item()
+                    num_label_tokens += (batch["labels"] != -100).sum().item()
 
                     with self.timers(f"forward_backward_{ga_step_idx}", log_level=2):
                         self._forward_backward_step(
                             ga_step_idx,
                             batch,
                             loss_buffer=loss_buffer,
-                            num_label_tokens=num_label_tokens,
+                            num_label_tokens=None,
                             num_batches=ga_steps,
                             is_train=True,
                         )
 
-                    # Log loss for last stage on first DP rank
-                    if self.pp_enabled:
-                        if self.pp.info.has_last_stage and self._get_dp_rank() == 0:
-                            loss = (
-                                torch.mean(torch.stack(loss_buffer)).to(device)
-                                if loss_buffer
-                                else torch.tensor([-1.0], device=device)
-                            )
-                            logger.info(
-                                f"Rank {rank} | Iteration {i} | GA step {ga_step_idx} | "
-                                f"Max Memory Allocated: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB | "
-                                f"loss={loss.detach().item():.4f}"
-                            )
-                    else:
-                        if rank == 0:
-                            loss = (
-                                torch.mean(torch.stack(loss_buffer)).to(device)
-                                if loss_buffer
-                                else torch.tensor([-1.0], device=device)
-                            )
-                            logger.info(
-                                f"Rank {rank} | Iteration {i} | GA step {ga_step_idx} | "
-                                f"Max Memory Allocated: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB | "
-                                f"loss={loss.detach().item():.4f}"
-                            )
+                loss = (
+                    torch.sum(torch.stack(loss_buffer)).to(device)
+                    if loss_buffer
+                    else torch.tensor([-1.0], device=device)
+                )
+                if self.pp_enabled:
+                    src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
+                    if self.dist_env.rank == src_rank:
+                        torch.distributed.send(loss, dst=0)
+                    elif self.dist_env.is_main:
+                        torch.distributed.recv(loss, src=src_rank)
+
+                if rank == 0:
+                    loss = loss / num_label_tokens
+                    logger.info(
+                        f"Rank {rank} | Iteration {i} | num_label_tokens={num_label_tokens} | "
+                        f"Max Memory Allocated: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB | "
+                        f"loss={loss.detach().item():.4f}"
+                    )
 
                     torch.cuda.nvtx.range_pop()
 
