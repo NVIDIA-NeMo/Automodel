@@ -45,20 +45,11 @@ parallelize_fn:
   activation_checkpointing: false
 
 model:
-  _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_config
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
-  trust_remote_code: true
   is_meta_device: true
-  backend:
-    _target_: nemo_automodel.components.moe.utils.BackendConfig
-    attn: te
-    linear: te
-    rms_norm: te
-    enable_deepep: true
-    fake_balanced_gate: true
-    enable_hf_state_dict_adapter: true
 
 checkpoint:
   enabled: true
@@ -84,7 +75,7 @@ dataset:
   index_mapping_dir: /path/to/fineweb_edu/mapping_dir  # REPLACE THIS
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
     trust_remote_code: true
   seq_length: 1024
   split: "0.99, 0.01, 0.00"  # train, validation, test

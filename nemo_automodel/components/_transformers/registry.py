@@ -17,15 +17,13 @@
 # and https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/models/registry.py
 
 import importlib
+import logging
 import pkgutil
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Dict, List, Type, Union
-import logging
 
 import torch.nn as nn
-
-
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +54,6 @@ class _ModelRegistry:
             self._mapping_model_arch_name_to_cls(path)
 
     def _mapping_model_arch_name_to_cls(self, modeling_path: str):
-        breakpoint()
         package = importlib.import_module(modeling_path)
         for _, name, ispkg in pkgutil.walk_packages(package.__path__, modeling_path + "."):
             if not ispkg:
