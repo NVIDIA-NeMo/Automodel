@@ -200,10 +200,18 @@ class Qwen3MoeForCausalLM(nn.Module):
         config: Qwen3MoeConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
-        trust_remote_code: bool = False,
-        **kwargs,
     ):
         return cls(config, moe_config, backend)
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        *model_args,
+        **kwargs,
+    ):
+        config = Qwen3MoeConfig.from_pretrained(pretrained_model_name_or_path)
+        return cls.from_config(config, *model_args, **kwargs)
 
     def __init__(
         self,
@@ -262,3 +270,6 @@ class Qwen3MoeForCausalLM(nn.Module):
         with buffer_device:
             # Ensure rotary embedding uses correct device after dtype move
             self.model.rotary_emb.device = buffer_device
+
+
+ModelClass = Qwen3MoeForCausalLM
