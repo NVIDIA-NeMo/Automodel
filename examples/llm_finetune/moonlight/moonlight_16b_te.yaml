@@ -57,8 +57,8 @@ distributed:
   cp_size: 1
   pp_size: 1
   dp_replicate_size: 1
-  dp_size: 1
-  ep_size: 1
+  dp_size: 8
+  ep_size: 8
 
 
 loss_fn:
