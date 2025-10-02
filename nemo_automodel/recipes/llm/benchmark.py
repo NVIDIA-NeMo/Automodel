@@ -91,7 +91,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
         # Get step_scheduler config
         seq_len = self._bench_seq_len
-        global_batch_size = getattr(self.cfg.step_scheduler, "global_batch_size", 256)
+        global_batch_size = self.cfg.step_scheduler.global_batch_size
 
         # Calculate FLOPs
         flops_formula = get_flops_formula_for_hf_config(self.model_parts[0].config)
