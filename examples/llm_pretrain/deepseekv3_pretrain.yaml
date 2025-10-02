@@ -44,6 +44,7 @@ parallelize_fn:
   _target_: nemo_automodel.components.models.deepseek_v3.parallelizer.parallelize_model
   activation_checkpointing: false
 
+# Option 1 - shorthand builder w/ automatic optimized path
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
@@ -51,11 +52,32 @@ model:
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
   is_meta_device: true
 
+# Option 2 - more fine-grained builder
+# model:
+#   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+#   config:
+#     _target_: transformers.AutoConfig.from_pretrained
+#     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
+#   is_meta_device: true
+#   backend:
+#     _target_: nemo_automodel.components.moe.utils.BackendConfig
+#     attn: te
+#     linear: te
+#     rms_norm: te
+#     enable_deepep: true
+#     fake_balanced_gate: false
+#     enable_hf_state_dict_adapter: true
+#   moe_config:
+#     _target_: nemo_automodel.components.moe.layers.MoEConfig
+#     dim: 7168
+#     ...
+
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: torch_save # torch_save or safetensors
   save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  load_base_model: false
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
