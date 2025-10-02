@@ -44,7 +44,7 @@ What you can expect:
 
 ### Why DTensor and SPMD
 
-- **One program, any scale**: The same training script runs on 1 GPU or 100+ by changing the mesh.
+- **One program, any scale**: The same training script runs on 1 GPU or 1000+ by changing the mesh.
 - **DTensor‑native**: Partition model/optimizer states with `DeviceMesh` + placements (`Shard`, `Replicate`).
 - **SPMD first**: Parallelism is configuration. No model rewrites when scaling up or changing strategy.
 - **Decoupled concerns**: Model code stays pure PyTorch; parallel strategy lives in config.
