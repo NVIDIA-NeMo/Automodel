@@ -40,20 +40,11 @@ parallelizer:
   activation_checkpointing: false
 
 model:
-  _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_config
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: transformers.AutoConfig.from_pretrained
-     pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
-  trust_remote_code: true
+    pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
   is_meta_device: true
-  backend:
-    _target_: nemo_automodel.components.moe.utils.BackendConfig
-    attn: te
-    linear: te
-    rms_norm: te
-    enable_deepep: true
-    fake_balanced_gate: false
-    enable_hf_state_dict_adapter: true
 
 checkpoint:
   enabled: true

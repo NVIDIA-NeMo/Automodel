@@ -81,6 +81,56 @@ class TestNeMoAutoModelForCausalLM:
             assert model is mock_model
             assert mock_from_config.call_count == 1
 
+    def test_from_pretrained_uses_registry_when_available(self):
+        """If AutoConfig.architectures[0] maps to a custom class in ModelRegistry,
+        ensure that the registry path is taken and HF loader is not called."""
+        with (
+            patch("nemo_automodel.components._transformers.auto_model.AutoConfig.from_pretrained") as mock_cfg_from_pretrained,
+            patch("nemo_automodel.components._transformers.auto_model.ModelRegistry") as mock_registry,
+            patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_hf_loader,
+        ):
+            # Prepare a fake config with architectures
+            cfg = Mock()
+            cfg.architectures = ["CustomArch"]
+            mock_cfg_from_pretrained.return_value = cfg
+
+            # Prepare a fake custom model class and return value
+            custom_model_instance = Mock()
+            custom_cls = Mock(return_value=custom_model_instance)
+            mock_registry.model_arch_name_to_cls = {"CustomArch": custom_cls}
+
+            returned = NeMoAutoModelForCausalLM.from_pretrained("dummy/path")
+
+            # Should have returned the custom model instance directly
+            assert returned is custom_model_instance
+            # HF path should not be invoked
+            mock_hf_loader.assert_not_called()
+            # Custom cls should be invoked with config first arg
+            custom_cls.assert_called()
+
+    def test_from_config_uses_registry_when_available(self):
+        """If config.architectures[0] maps to a custom class in ModelRegistry,
+        ensure that the registry path is taken and HF loader is not called."""
+        with (
+            patch("nemo_automodel.components._transformers.auto_model.ModelRegistry") as mock_registry,
+            patch.object(transformers.AutoModelForCausalLM, "from_config") as mock_hf_loader,
+        ):
+            # Fake config with architectures attribute
+            cfg = Mock()
+            cfg.architectures = ["CustomArch"]
+
+            # Registry provides a custom class
+            custom_model_instance = Mock()
+            custom_cls = Mock(return_value=custom_model_instance)
+            mock_registry.model_arch_name_to_cls = {"CustomArch": custom_cls}
+
+            returned = NeMoAutoModelForCausalLM.from_config(cfg)
+
+            # Should return custom model instance
+            assert returned is custom_model_instance
+            mock_hf_loader.assert_not_called()
+            custom_cls.assert_called_with(cfg)
+
     def test_from_config_happy_path(self):
         """Test the basic from_config functionality works."""
         config = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")

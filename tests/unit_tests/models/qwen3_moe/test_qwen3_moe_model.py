@@ -269,3 +269,35 @@ def magic_moe_config(config: Qwen3MoeConfig) -> MoEConfig:
         activation_limit=7.0,
         softmax_before_topk=True,
     )
+
+
+class TestQwen3MoeModelFromPretrainedAndExport:
+    def test_from_pretrained_classmethod(self):
+        """Ensure classmethod from_pretrained builds config then delegates to from_config."""
+        cfg = Qwen3MoeConfig(
+            vocab_size=128,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            head_dim=16,
+            num_experts=2,
+            num_experts_per_tok=1,
+        )
+
+        with patch("transformers.models.qwen3_moe.configuration_qwen3_moe.Qwen3MoeConfig.from_pretrained") as mock_from_pretrained:
+            mock_from_pretrained.return_value = cfg
+
+            with patch.object(Qwen3MoeForCausalLM, "from_config", wraps=Qwen3MoeForCausalLM.from_config) as mock_from_config:
+                model = Qwen3MoeForCausalLM.from_pretrained("qwen3/model")
+                assert isinstance(model, Qwen3MoeForCausalLM)
+                mock_from_pretrained.assert_called_once_with("qwen3/model")
+                called_cfg = mock_from_config.call_args[0][0]
+                assert called_cfg is cfg
+
+    def test_modelclass_export_exists(self):
+        """Ensure ModelClass pointer is defined and points to class."""
+        from nemo_automodel.components.models.qwen3_moe import model as qwen_mod
+
+        assert hasattr(qwen_mod, "ModelClass")
+        assert qwen_mod.ModelClass is Qwen3MoeForCausalLM
