@@ -261,8 +261,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     model = ModelRegistry.model_arch_name_to_cls[config.architectures[0]](config, *model_args, **kwargs)
                     logger.info(f"Using custom model implementation for {config.architectures[0]}")
                     return model
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Failed to use custom model implementation for {config.architectures[0]} with error: {e}")
 
             if quantization_config is not None:
                 kwargs["quantization_config"] = quantization_config
@@ -386,8 +386,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     model = ModelRegistry.model_arch_name_to_cls[config.architectures[0]](config, *model_args, **kwargs)
                     logger.info(f"Using custom model implementation for {config.architectures[0]}")
                     return model
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Failed to use custom model implementation for {config.architectures[0]} with error: {e}")
 
             if quantization_config is not None:
                 kwargs["quantization_config"] = quantization_config
