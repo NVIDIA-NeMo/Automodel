@@ -31,6 +31,25 @@ step_scheduler:
   max_steps: 30
   warmup_steps: 10
 
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  dp_replicate_size: 1
+  ep_size: 8
+  sequence_parallel: false
+
+autopipeline:
+  _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
+  pp_schedule: interleaved1f1b
+  pp_microbatch_size: 2
+  round_virtual_stages_to_pp_multiple: down
+  scale_grads_in_schedule: false
+  patch_inner_model: false
+  patch_causal_lm_model: false
+  layers_per_stage: 2
+
 dist_env:
   backend: nccl
   timeout_minutes: 10
@@ -38,6 +57,7 @@ dist_env:
 parallelizer:
   _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
   activation_checkpointing: false
+  fp32_upcast: false
 
 model:
   _target_: nemo_automodel.components.models.gpt_oss.model.GptOssForCausalLM.from_config
@@ -59,29 +79,11 @@ checkpoint:
   enabled: false
   load_base_model: false
 
-distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
-  tp_size: 1
-  cp_size: 1
-  pp_size: 1
-  dp_replicate_size: 1
-  ep_size: 8
-  sequence_parallel: false
-
-autopipeline:
-  _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
-  pp_schedule: interleaved1f1b
-  pp_microbatch_size: 2
-  round_virtual_stages_to_pp_multiple: down
-  scale_grads_in_schedule: false
-  patch_inner_model: false
-  patch_causal_lm_model: false
-
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: examples.benchmark.mock_dataset.MockBenchmarkDataset
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
   seq_len: 4096
   num_samples: 100000
 
