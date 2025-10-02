@@ -220,8 +220,9 @@ class DeepseekV3ForCausalLM(nn.Module):
         config: DeepseekV3Config,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        **kwargs,
     ):
-        return cls(config, moe_config, backend)
+        return cls(config, moe_config, backend, **kwargs)
 
     @classmethod
     def from_pretrained(
@@ -238,6 +239,7 @@ class DeepseekV3ForCausalLM(nn.Module):
         config: DeepseekV3Config,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        **kwargs,
     ):
         super().__init__()
         self.config = config
