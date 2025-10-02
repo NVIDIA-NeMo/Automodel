@@ -14,7 +14,6 @@
 
 
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/registry.py
-# and https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/models/registry.py
 
 import importlib
 import logging
