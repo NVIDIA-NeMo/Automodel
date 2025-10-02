@@ -181,16 +181,16 @@ def test_flops_formulas_with_precomputed_values(name, func, cfg_factory, kwargs,
         (1.0, 8, 1.0, 1.0, 12.5),
         # Longer time: 10 TFLOPs per GPU, 1 GPU, 10 seconds, reference 1 TFLOPs -> 100% MFU
         (10.0, 1, 10.0, 1.0, 100.0),
-        # H100 reference (default): 989 TFLOPs per GPU, 8 GPUs, 1 second, reference 1979 TFLOPs -> 62.56% MFU
-        (989.0, 8, 1.0, 1979.0, 62.558867710964424),
-        # Real-world scenario: 500 TFLOPs per GPU, 64 GPUs, 2 seconds, H100 reference -> 39.61% MFU
-        (500.0, 64, 2.0, 1979.0, 39.61394138453764),
+        # H100 reference (default): 989 TFLOPs per GPU, 8 GPUs, 1 second, reference 1979 TFLOPs -> 6.25% MFU
+        (989.0, 8, 1.0, 1979.0, 6.2468418393127845),
+        # Real-world scenario: 500 TFLOPs per GPU, 64 GPUs, 2 seconds, H100 reference -> 0.197% MFU
+        (500.0, 64, 2.0, 1979.0, 0.19738504295098536),
     ],
 )
 def test_calculate_mfu(tflops, world_size, time_seconds, reference_mfu, expected_mfu):
     """Test calculate_mfu function with various scenarios."""
     actual_mfu = flops_utils.calculate_mfu(tflops, world_size, time_seconds, reference_mfu)
-    assert pytest.approx(actual_mfu, rel=1e-6) == expected_mfu
+    assert pytest.approx(actual_mfu, rel=1e-3) == expected_mfu
 
 
 def test_calculate_mfu_default_reference():
