@@ -449,3 +449,24 @@ class TestGptOssForCausalLM:
             assert "attention_mask" in kwargs
             assert "custom_kwarg" in kwargs
             assert kwargs["custom_kwarg"] == "test"
+
+    def test_from_pretrained_classmethod(self, gpt_config, backend_config):
+        """Ensure classmethod from_pretrained builds config then delegates to from_config."""
+        with patch("transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig.from_pretrained") as mock_from_pretrained:
+            mock_from_pretrained.return_value = gpt_config
+
+            with patch.object(GptOssForCausalLM, "from_config", wraps=GptOssForCausalLM.from_config) as mock_from_config:
+                model = GptOssForCausalLM.from_pretrained("some/model")
+                assert isinstance(model, GptOssForCausalLM)
+                mock_from_pretrained.assert_called_once_with("some/model")
+                # from_config should have been called with the returned config
+                called_cfg = mock_from_config.call_args[0][0]
+                assert called_cfg is gpt_config
+
+    def test_backend_attn_forced_to_flex_and_error_logged(self, gpt_config, backend_config, caplog):
+        """If backend.attn is not flex, implementation should log error and set to flex."""
+        backend_config.attn = "sdpa"
+        with caplog.at_level("ERROR"):
+            model = GptOssForCausalLM(gpt_config, backend=backend_config)
+        assert model.backend.attn == "flex"
+        assert any("Unsupported attention implementation for GPT-OSS" in rec.message for rec in caplog.records)
