@@ -168,3 +168,33 @@ def test_flops_formulas_with_precomputed_values(name, func, cfg_factory, kwargs,
     cfg = cfg_factory()
     actual = int(func(cfg, **kwargs))
     assert actual == expected, f"{name}: expected {expected}, got {actual}"
+
+
+@pytest.mark.parametrize(
+    "tflops, world_size, time_seconds, reference_mfu, expected_mfu",
+    [
+        # Basic test: 1 TFLOPs per GPU, 1 GPU, 1 second, reference 1 TFLOPs -> 100% MFU
+        (1.0, 1, 1.0, 1.0, 100.0),
+        # Half efficiency: 0.5 TFLOPs per GPU, 1 GPU, 1 second, reference 1 TFLOPs -> 50% MFU
+        (0.5, 1, 1.0, 1.0, 50.0),
+        # Multiple GPUs: 1 TFLOPs per GPU, 8 GPUs, 1 second, reference 1 TFLOPs -> 12.5% MFU
+        (1.0, 8, 1.0, 1.0, 12.5),
+        # Longer time: 10 TFLOPs per GPU, 1 GPU, 10 seconds, reference 1 TFLOPs -> 100% MFU
+        (10.0, 1, 10.0, 1.0, 100.0),
+        # H100 reference (default): 989 TFLOPs per GPU, 8 GPUs, 1 second, reference 1979 TFLOPs -> 62.56% MFU
+        (989.0, 8, 1.0, 1979.0, 62.558867710964424),
+        # Real-world scenario: 500 TFLOPs per GPU, 64 GPUs, 2 seconds, H100 reference -> 39.61% MFU
+        (500.0, 64, 2.0, 1979.0, 39.61394138453764),
+    ],
+)
+def test_calculate_mfu(tflops, world_size, time_seconds, reference_mfu, expected_mfu):
+    """Test calculate_mfu function with various scenarios."""
+    actual_mfu = flops_utils.calculate_mfu(tflops, world_size, time_seconds, reference_mfu)
+    assert pytest.approx(actual_mfu, rel=1e-6) == expected_mfu
+
+
+def test_calculate_mfu_default_reference():
+    """Test calculate_mfu with default H100 reference."""
+    # Using default reference_mfu (1979.0 for H100)
+    actual_mfu = flops_utils.calculate_mfu(tflops=1979.0, world_size=1, time_seconds=1.0)
+    assert pytest.approx(actual_mfu, rel=1e-6) == 100.0

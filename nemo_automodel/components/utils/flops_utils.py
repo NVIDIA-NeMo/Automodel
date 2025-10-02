@@ -15,6 +15,23 @@
 from typing import Any, Callable, Optional
 
 
+def calculate_mfu(tflops, world_size, time_seconds, reference_mfu=1979.0):
+    """Calculate Model FLOPs Utilization (MFU).
+
+    Args:
+        tflops: TFLOPs per GPU
+        world_size: Total number of GPUs
+        time_seconds: Time taken for computation
+        reference_mfu: Peak TFLOPs of the hardware (default: H100)
+
+    Returns:
+        MFU as a percentage
+    """
+    mfu = tflops / (world_size * time_seconds)
+    mfu = mfu / reference_mfu
+    return mfu * 100
+
+
 def gpt3_flops(config, gbs=1, seq_len=None):
     """Model FLOPs for GPT3 family - accepts either AutoConfig or normalized config"""
 

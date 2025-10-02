@@ -16,11 +16,12 @@
 
 seed: 1234
 
-profiling:
+benchmark:
+  warmup_steps: 10
+  peak_tflops: 989  # H100 peak TFLOPs
   nsys_start: -1
   nsys_end: -1
-
-peak_tflops: 989  # H100 peak TFLOPs
+  nsys_ranks: []
 
 step_scheduler:
   global_batch_size: 256
@@ -29,7 +30,6 @@ step_scheduler:
   val_every_steps: 1000
   num_epochs: 1
   max_steps: 30
-  warmup_steps: 10
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
@@ -57,7 +57,6 @@ dist_env:
 parallelizer:
   _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
   activation_checkpointing: true
-  fp32_upcast: false
 
 model:
   _target_: nemo_automodel.components.models.qwen3_moe.model.Qwen3MoeForCausalLM.from_config
@@ -81,6 +80,7 @@ checkpoint:
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: false
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset

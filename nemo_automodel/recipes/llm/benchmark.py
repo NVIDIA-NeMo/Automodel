@@ -19,27 +19,10 @@ import torch
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.training.timers import Timers
-from nemo_automodel.components.utils.flops_utils import get_flops_formula_for_hf_config
+from nemo_automodel.components.utils.flops_utils import calculate_mfu, get_flops_formula_for_hf_config
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 logger = logging.getLogger(__name__)
-
-
-def calculate_mfu(tflops, world_size, time_seconds, reference_mfu=1979.0):
-    """Calculate Model FLOPs Utilization (MFU).
-
-    Args:
-        tflops: TFLOPs per GPU
-        world_size: Total number of GPUs
-        time_seconds: Time taken for computation
-        reference_mfu: Peak TFLOPs of the hardware (default: H100)
-
-    Returns:
-        MFU as a percentage
-    """
-    mfu = tflops / (world_size * time_seconds)
-    mfu = mfu / reference_mfu
-    return mfu * 100
 
 
 class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPrediction):
@@ -56,21 +39,22 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         Args:
             cfg: Configuration dictionary/object for benchmarking.
         """
-        # Store and remove benchmarking-specific parameters
-        if "step_scheduler" in cfg:
-            step_cfg = cfg.step_scheduler
-            self._bench_steps = step_cfg.get("max_steps", 30)
-            self._bench_warmup_steps = step_cfg.get("warmup_steps", 10)
+        # Store benchmarking-specific parameters from benchmark section
+        bench_cfg = cfg.benchmark
+        self._bench_warmup_steps = bench_cfg.warmup_steps
+        self._bench_peak_tflops = bench_cfg.peak_tflops
+        self._bench_nsys_start = bench_cfg.nsys_start
+        self._bench_nsys_end = bench_cfg.nsys_end
+        self._bench_nsys_ranks = bench_cfg.nsys_ranks
 
-            # Remove benchmarking-specific parameters that StepScheduler doesn't accept
-            if "warmup_steps" in step_cfg:
-                del step_cfg.__dict__["warmup_steps"]
+        # Infer max_steps from step_scheduler
+        self._bench_steps = cfg.step_scheduler.max_steps
 
         # Get seq_len from dataset config
-        self._bench_seq_len = cfg.dataset.get("seq_len", 2048) if "dataset" in cfg else 2048
+        self._bench_seq_len = cfg.dataset.seq_len
 
         # Infer vocab_size from model config and inject it into dataset config
-        if "dataset" in cfg and "model" in cfg:
+        if hasattr(cfg, "dataset") and hasattr(cfg, "model"):
             # Get vocab_size from model config
             if hasattr(cfg.model, "config") and hasattr(cfg.model.config, "pretrained_model_name_or_path"):
                 from transformers import AutoConfig
@@ -83,8 +67,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     logger.info(f"Inferred vocab_size={vocab_size} from model config")
 
         # Inject batch_size from step_scheduler into dataset config
-        if "dataset" in cfg and "step_scheduler" in cfg:
-            local_batch_size = cfg.step_scheduler.get("local_batch_size", 1)
+        if hasattr(cfg, "dataset") and hasattr(cfg, "step_scheduler"):
+            local_batch_size = getattr(cfg.step_scheduler, "local_batch_size", 1)
             cfg.dataset.batch_size = local_batch_size
             if logger.isEnabledFor(logging.INFO):
                 logger.info(f"Using batch_size={local_batch_size} from step_scheduler.local_batch_size")
@@ -106,9 +90,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         self.val_dataloader = None
 
         # Get step_scheduler config
-        step_cfg = self.cfg.get("step_scheduler", {})
         seq_len = self._bench_seq_len
-        global_batch_size = step_cfg.get("global_batch_size", 256)
+        global_batch_size = getattr(self.cfg.step_scheduler, "global_batch_size", 256)
 
         # Calculate FLOPs
         flops_formula = get_flops_formula_for_hf_config(self.model_parts[0].config)
@@ -136,18 +119,16 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         device = self.dist_env.device
 
         # Get benchmarking config
-        step_cfg = self.cfg.get("step_scheduler", {})
         steps = self._bench_steps
         warmup_steps = self._bench_warmup_steps
-        local_batch_size = step_cfg.get("local_batch_size", 4)
-        global_batch_size = step_cfg.get("global_batch_size", 256)
+        local_batch_size = self.cfg.step_scheduler.local_batch_size
+        global_batch_size = self.cfg.step_scheduler.global_batch_size
 
-        profiling_cfg = self.cfg.get("profiling", {})
-        nsys_start = profiling_cfg.get("nsys_start", -1)
-        nsys_end = profiling_cfg.get("nsys_end", -1)
-        nsys_ranks = profiling_cfg.get("nsys_ranks", [])
+        nsys_start = self._bench_nsys_start
+        nsys_end = self._bench_nsys_end
+        nsys_ranks = self._bench_nsys_ranks
 
-        peak_tflops = self.cfg.get("peak_tflops", 989)
+        peak_tflops = self._bench_peak_tflops
 
         # Set models to training mode
         for mp in self.model_parts:
@@ -315,7 +296,14 @@ def main(config_path=None):
     Loads the configuration, sets up the recipe, and runs the benchmark.
     """
     if config_path is None:
-        config_path = pathlib.Path(__file__).parent.resolve() / "configs" / "moonlight_16b_torch.yaml"
+        # Default to moonlight_16b_torch.yaml in examples/benchmark/configs
+        config_path = (
+            pathlib.Path(__file__).parent.parent.parent.resolve()
+            / "examples"
+            / "benchmark"
+            / "configs"
+            / "moonlight_16b_torch.yaml"
+        )
 
     cfg = parse_args_and_load_config(config_path)
     recipe = BenchmarkingRecipeForNextTokenPrediction(cfg)
