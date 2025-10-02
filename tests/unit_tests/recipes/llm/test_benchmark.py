@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -19,6 +20,45 @@ import pytest
 import torch
 
 from nemo_automodel.recipes.llm.benchmark import BenchmarkingRecipeForNextTokenPrediction
+
+
+@pytest.fixture
+def patch_torch_distributed_for_benchmark():
+    """
+    Patch torch.distributed for benchmark tests.
+
+    This fixture provides stubs for torch.distributed methods that are commonly used
+    in the benchmarking code but require a multi-GPU/multi-process environment.
+    """
+    # Save original torch.distributed
+    original_distributed = torch.distributed
+
+    # Distributed stubs
+    dist_stub = types.ModuleType("torch.distributed")
+
+    # Minimal API surface
+    dist_stub.get_world_size = lambda: 1
+    dist_stub.get_rank = lambda: 0
+    dist_stub.barrier = lambda group=None: None
+    dist_stub.is_initialized = lambda: False
+    dist_stub.send = lambda tensor, dst: None
+    dist_stub.recv = lambda tensor, src: None
+
+    def _all_gather(dest: torch.Tensor, src: torch.Tensor, group=None, async_op=False):
+        """Dummy all_gather for single process."""
+        dest.copy_(src)
+        return None
+
+    dist_stub.all_gather_into_tensor = _all_gather
+    dist_stub._all_gather_base = _all_gather
+
+    # Patch torch.distributed
+    torch.distributed = dist_stub
+
+    yield
+
+    # Restore original
+    torch.distributed = original_distributed
 
 
 @pytest.fixture
@@ -90,6 +130,7 @@ def mock_recipe(mock_config):
         return recipe
 
 
+@pytest.mark.usefixtures("patch_torch_distributed_for_benchmark")
 class TestBenchmarkingRecipeInitialization:
     """Test initialization of BenchmarkingRecipeForNextTokenPrediction."""
 
@@ -132,6 +173,7 @@ class TestBenchmarkingRecipeInitialization:
             assert mock_config.dataset.batch_size == 4
 
 
+@pytest.mark.usefixtures("patch_torch_distributed_for_benchmark")
 class TestBenchmarkingRecipeSetup:
     """Test setup method of BenchmarkingRecipeForNextTokenPrediction."""
 
@@ -161,6 +203,7 @@ class TestBenchmarkingRecipeSetup:
             mock_flops_formula.assert_called_once()
 
 
+@pytest.mark.usefixtures("patch_torch_distributed_for_benchmark")
 class TestBenchmarkingRecipeRunBenchmark:
     """Test run_benchmark method of BenchmarkingRecipeForNextTokenPrediction."""
 
@@ -312,6 +355,7 @@ class TestBenchmarkingRecipeRunBenchmark:
             assert mock_recipe.optimizer[0].step.call_count == 30
 
 
+@pytest.mark.usefixtures("patch_torch_distributed_for_benchmark")
 class TestBenchmarkingRecipeHelpers:
     """Test helper methods and edge cases."""
 
