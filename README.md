@@ -12,8 +12,8 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/release/python-3100/)
 [![GitHub Stars](https://img.shields.io/github/stars/NVIDIA-NeMo/Automodel.svg?style=social&label=Star)](https://github.com/NVIDIA-NeMo/Automodel/stargazers/)
 
-<!-- **Day-0 integration with Hugging Face models automating fine-tuning and pretraining with pytorch-native parallelism, custom-kernels and optimized recipes** -->
-**Pytorch DTensor‑native SPMD library for large‑scale training**
+<!-- **Day-0 integration with Hugging Face models automating fine-tuning and pretraining with pytorch-native parallelism, custom-kernels and optimized recipes** 
+**Pytorch DTensor‑native SPMD library for large‑scale training**-->
 
 [📖 Documentation](https://docs.nvidia.com/nemo/automodel/latest/index.html) • [🔥 Ready-to-Use Recipes](https://github.com/NVIDIA-NeMo/Automodel/#supported-models) • [💡 Examples](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples) • [🤝 Contributing](https://github.com/NVIDIA-NeMo/Automodel/blob/main/CONTRIBUTING.md)
 
@@ -25,7 +25,7 @@
 Overview
 ---
 
-Nemo AutoModel is an open-source training library developed by NVIDIA, designed to streamline and scale training and finetuning for LLMs and VLMs. Designed for flexibility, reproducibility, and scale, NeMo AutoModel enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
+Nemo AutoModel is a Pytorch DTensor‑native SPMD open-source training library developed by NVIDIA, designed to streamline and scale training and finetuning for LLMs and VLMs. Designed for flexibility, reproducibility, and scale, NeMo AutoModel enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
 
 What you can expect:
 
@@ -44,7 +44,7 @@ What you can expect:
 
 ### Why DTensor and SPMD
 
-- **One program, any scale**: The same training script runs on 1 GPU or 100+ by changing the mesh.
+- **One program, any scale**: The same training script runs on 1 GPU or 1000+ by changing the mesh.
 - **DTensor‑native**: Partition model/optimizer states with `DeviceMesh` + placements (`Shard`, `Replicate`).
 - **SPMD first**: Parallelism is configuration. No model rewrites when scaling up or changing strategy.
 - **Decoupled concerns**: Model code stays pure PyTorch; parallel strategy lives in config.
@@ -86,23 +86,22 @@ What you can expect:
 
 ✅ _Available now_ | 🔜 _Coming in 25.11_
 
-- ✅ **Advanced Parallelism** - PyTorch native FSDP2, TP, CP, and SP for efficient training.
-- ✅ **Distributed Training** - Fully Sharded Data Parallel (FSDP2) support.
+- ✅ **Advanced Parallelism** - PyTorch native FSDP2, TP, CP, and SP for distributed training.
 - ✅ **HSDP** - Multi-node Hybrid Sharding Data Parallelism based on FSDP2.
 - ✅ **Pipeline Support** - Torch-native support for pipelining composable with FSDP2 and DTensor (3D Parallelism).
 - ✅ **Environment Support** - Support for SLURM and interactive training.
 - ✅ **Learning Algorithms** - SFT (Supervised Fine-Tuning), and PEFT (Parameter Efficient Fine-Tuning).
 - ✅ **Pre-training** - Support for model pre-training, including DeepSeekV3.
 - ✅ **Knowledge Distillation** - Support for knowledge distillation with LLMs; VLM support will be added post 25.09.
-- ✅ **Large Model Support** - Native PyTorch support for models up to 70B parameters.
-- ✅ **HuggingFace Integration** - Works with 1-70B models (Qwen, Llama) and larger MoEs.
+- ✅ **HuggingFace Integration** - Works with dense models (e.g., Qwen, Llama3, etc) and large MoEs (e.g., DSv3).
 - ✅ **Sequence Packing** - Sequence packing for huge training perf gains.
 - ✅ **FP8 and mixed precision** - FP8 support with torchao, requires torch.compile-supported models.
 - ✅ **DCP** - Distributed Checkpoint support with SafeTensors output.
-- ✅ **VLM**: Support for finetuning VLMs (Qwen2-VL, Gemma-3-VL). More families to be included in the future.
+- ✅ **VLM**: Support for finetuning VLMs (e.g., Qwen2-VL, Gemma-3-VL). More families to be included in the future.
 
 
 - 🔜 **Extended MoE support** - GPT-OSS, Qwen3 (Coder-480B-A35B, etc), Qwen-next.
+- 🔜 **Kubernetes** - MUlti-node job launch with k8s.
 
 
 ## Getting Started
@@ -358,7 +357,7 @@ NeMo-Automodel/
 If you use NeMo AutoModel in your research, please cite it using the following BibTeX entry:
 ```
 @misc{nemo-automodel,
-title = {NeMo AutoModel: A Scalable and Efficient Training Library},
+title = {NeMo AutoModel: DTensor‑native SPMD library for scalable and efficient training},
 howpublished = {\url{https://github.com/NVIDIA-NeMo/Automodel}},
 year = {2025},
 note = {GitHub repository},
