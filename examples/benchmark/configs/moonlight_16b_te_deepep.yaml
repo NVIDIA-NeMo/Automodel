@@ -73,6 +73,16 @@ model:
     enable_deepep: true
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
+    fsdp_optimization_config:
+      _target_: nemo_automodel.components.moe.utils.FsdpOptimizationConfig
+      disable_gradient_sync_for_model: true
+      disable_reshard_after_backward_for_model: true
+      disable_gradient_sync_for_embed_tokens: true
+      disable_reshard_after_backward_for_embed_tokens: true
+      disable_gradient_sync_for_lm_head: true
+      disable_reshard_after_backward_for_lm_head: true
+      disable_gradient_sync_for_experts: true
+      disable_reshard_after_backward_for_experts: true
 
 checkpoint:
   enabled: false
