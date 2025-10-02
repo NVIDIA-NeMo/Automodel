@@ -357,7 +357,7 @@ NeMo-Automodel/
 If you use NeMo AutoModel in your research, please cite it using the following BibTeX entry:
 ```
 @misc{nemo-automodel,
-title = {NeMo AutoModel: A Scalable and Efficient Training Library},
+title = {NeMo AutoModel: DTensor‑native SPMD library for scalable and efficient training},
 howpublished = {\url{https://github.com/NVIDIA-NeMo/Automodel}},
 year = {2025},
 note = {GitHub repository},
