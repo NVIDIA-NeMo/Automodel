@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import importlib.util
 from dataclasses import dataclass
 from typing import Callable, Literal
 
@@ -22,15 +23,18 @@ from torch import nn
 
 from nemo_automodel.components.attention.flex_attention import FlexAttention
 
+HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
+HAVE_DEEP_EP = importlib.util.find_spec("deep_ep") is not None
+
 
 @dataclass(kw_only=True)
 class BackendConfig:
-    attn: Literal["te", "sdpa", "flex"] = "te"
-    linear: Literal["torch", "te"] = "torch"
-    rms_norm: Literal["torch", "te"] = "te"
-    enable_deepep: bool = False
+    attn: Literal["te", "sdpa", "flex"] = "te" if HAVE_TE else "sdpa"
+    linear: Literal["torch", "te"] = "te" if HAVE_TE else "torch"
+    rms_norm: Literal["torch", "te"] = "te" if HAVE_TE else "torch"
+    enable_deepep: bool = HAVE_DEEP_EP
     fake_balanced_gate: bool = False
-    enable_hf_state_dict_adapter: bool = False
+    enable_hf_state_dict_adapter: bool = True
 
 
 def initialize_attn_module_and_func(

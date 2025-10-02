@@ -220,22 +220,32 @@ class DeepseekV3ForCausalLM(nn.Module):
         config: DeepseekV3Config,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
-        trust_remote_code: bool = False,
         **kwargs,
     ):
-        return cls(config, moe_config, backend)
+        return cls(config, moe_config, backend, **kwargs)
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        *model_args,
+        **kwargs,
+    ):
+        config = DeepseekV3Config.from_pretrained(pretrained_model_name_or_path)
+        return cls.from_config(config, *model_args, **kwargs)
 
     def __init__(
         self,
         config: DeepseekV3Config,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        **kwargs,
     ):
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig()
-        self.model = DeepseekV3Model(config, backend=backend, moe_config=moe_config)
-        self.lm_head = initialize_linear_module(backend.linear, config.hidden_size, config.vocab_size, bias=False)
+        self.model = DeepseekV3Model(config, backend=self.backend, moe_config=moe_config)
+        self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = DeepSeekV3StateDictAdapter(
                 self.config, self.model.moe_config, self.backend, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
@@ -294,3 +304,6 @@ class DeepseekV3ForCausalLM(nn.Module):
                 self.config.rope_theta,
                 self.config.rope_scaling,
             )
+
+
+ModelClass = DeepseekV3ForCausalLM
