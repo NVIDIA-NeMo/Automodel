@@ -101,6 +101,7 @@ What you can expect:
 
 
 - 🔜 **Extended MoE support** - GPT-OSS, Qwen3 (Coder-480B-A35B, etc), Qwen-next.
+- 🔜 **Kubernetes** - MUlti-node job launch with k8s.
 
 
 ## Getting Started
