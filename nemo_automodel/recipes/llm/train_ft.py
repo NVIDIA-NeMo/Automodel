@@ -183,7 +183,7 @@ def build_model_and_optimizer(
     # hold a copy of the model state dict keys before any parallelization
     state_dict_keys = model.state_dict().keys()
 
-    if not _supports_logits_to_keep(model):
+    if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
         loss_fn = MaskedCrossEntropy()
 
@@ -991,7 +991,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
         num_batches = len(batches)
+        for mp in self.model_parts:
+            if hasattr(mp, "set_fsdp_states_for_first_forward"):
+                mp.set_fsdp_states_for_first_forward()
+
         for i, batch in enumerate(batches):
+            if i == num_batches - 1:
+                for mp in self.model_parts:
+                    if hasattr(mp, "set_fsdp_states_for_last_backward"):
+                        mp.set_fsdp_states_for_last_backward()
+
             self._forward_backward_step(
                 i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
             )

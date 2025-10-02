@@ -169,7 +169,16 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 # Gradient accumulation loop
                 num_label_tokens = 0
                 loss_buffer = []
+                for mp in self.model_parts:
+                    if hasattr(mp, "set_fsdp_states_for_first_forward"):
+                        mp.set_fsdp_states_for_first_forward()
+
                 for ga_step_idx in range(ga_steps):
+                    if ga_step_idx == ga_steps - 1:
+                        for mp in self.model_parts:
+                            if hasattr(mp, "set_fsdp_states_for_last_backward"):
+                                mp.set_fsdp_states_for_last_backward()
+
                     # Get batch from dataloader
                     batch = next(dataloader_iter)
                     torch.cuda.nvtx.range_push(f"iteration_{i}_ga_step_{ga_step_idx}")
@@ -215,29 +224,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     logger.debug("Optimizer step")
 
             # Calculate and log MFU
-            max_iter_time = self.timers._get_global_min_max_time(
-                [iter_timer], reset=False, barrier=False, normalizer=1.0
-            )[iter_timer][1]
-
-            if rank == 0:
-                mfu = calculate_mfu(
-                    self.tflops,
-                    self.dist_env.world_size,
-                    max_iter_time,
-                    reference_mfu=peak_tflops,
-                )
-                logger.info(f"Max iter time: {max_iter_time:.6f} seconds")
-                logger.info(f"MFU: {mfu:.6f}%")
-
-            # Log detailed timers
-            self.timers.log(
-                names=[iter_timer, "optimizer"]
-                + [f"forward_backward_{ga_step_idx}" for ga_step_idx in range(ga_steps)],
-                rank=0,
-                normalizer=1000.0,  # Convert to seconds
-                reset=True,
-                barrier=True,
-            )
+            self._log_iteration_metrics(iter_timer, ga_steps, peak_tflops, rank)
 
             # Stop nsys profiling if configured
             if i == nsys_end and rank in nsys_ranks:
@@ -245,6 +232,33 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 torch.cuda.cudart().cudaProfilerStop()
 
         # Final summary
+        self._log_benchmark_summary(steps, warmup_steps, peak_tflops, rank)
+
+    def _log_iteration_metrics(self, iter_timer, ga_steps, peak_tflops, rank):
+        max_iter_time = self.timers._get_global_min_max_time([iter_timer], reset=False, barrier=False, normalizer=1.0)[
+            iter_timer
+        ][1]
+
+        if rank == 0:
+            mfu = calculate_mfu(
+                self.tflops,
+                self.dist_env.world_size,
+                max_iter_time,
+                reference_mfu=peak_tflops,
+            )
+            logger.info(f"Max iter time: {max_iter_time:.6f} seconds")
+            logger.info(f"MFU: {mfu:.6f}%")
+
+        # Log detailed timers
+        self.timers.log(
+            names=[iter_timer, "optimizer"] + [f"forward_backward_{ga_step_idx}" for ga_step_idx in range(ga_steps)],
+            rank=0,
+            normalizer=1000.0,  # Convert to seconds
+            reset=True,
+            barrier=True,
+        )
+
+    def _log_benchmark_summary(self, steps, warmup_steps, peak_tflops, rank):
         torch.distributed.barrier()
         if rank == 0:
             logger.info(f"{'=' * 60}")

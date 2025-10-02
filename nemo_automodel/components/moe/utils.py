@@ -28,6 +28,18 @@ HAVE_DEEP_EP = importlib.util.find_spec("deep_ep") is not None
 
 
 @dataclass(kw_only=True)
+class FsdpOptimizationConfig:
+    disable_gradient_sync_for_model: bool = False
+    disable_reshard_after_backward_for_model: bool = False
+    disable_gradient_sync_for_embed_tokens: bool = False
+    disable_reshard_after_backward_for_embed_tokens: bool = False
+    disable_gradient_sync_for_lm_head: bool = False
+    disable_reshard_after_backward_for_lm_head: bool = False
+    disable_gradient_sync_for_experts: bool = True
+    disable_reshard_after_backward_for_experts: bool = True
+
+
+@dataclass(kw_only=True)
 class BackendConfig:
     attn: Literal["te", "sdpa", "flex"] = "te" if HAVE_TE else "sdpa"
     linear: Literal["torch", "te"] = "te" if HAVE_TE else "torch"
@@ -35,6 +47,7 @@ class BackendConfig:
     enable_deepep: bool = HAVE_DEEP_EP
     fake_balanced_gate: bool = False
     enable_hf_state_dict_adapter: bool = True
+    fsdp_optimization_config: FsdpOptimizationConfig | None = None
 
 
 def initialize_attn_module_and_func(
