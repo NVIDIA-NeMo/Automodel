@@ -996,7 +996,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 mp.set_fsdp_states_for_first_forward()
 
         for i, batch in enumerate(batches):
-            if i == num_batches - 1:
+            if i == num_batches - 1 and not self.pp_enabled:
                 for mp in self.model_parts:
                     if hasattr(mp, "set_fsdp_states_for_last_backward"):
                         mp.set_fsdp_states_for_last_backward()
@@ -1004,6 +1004,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self._forward_backward_step(
                 i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
             )
+
+        if self.pp_enabled:
+            for mp in self.model_parts:
+                if hasattr(mp, "finalize_fsdp_states_post_backward"):
+                    mp.finalize_fsdp_states_post_backward()
 
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
