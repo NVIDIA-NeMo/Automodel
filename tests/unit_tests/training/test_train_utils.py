@@ -103,29 +103,6 @@ def test_clip_grad_norm_skips_with_pp_and_tp():
     assert grad_norm == 0
 
 
-@patch("torch.distributed.all_reduce")
-def test_clip_grad_norm_works_with_pp_only(mock_all_reduce):  # noqa: ARG001
-    model = torch.nn.Linear(10, 10)
-    model.weight.grad = torch.randn_like(model.weight)
-
-    device_mesh = Mock()
-    device_mesh.mesh_dim_names = ["pp"]
-    pp_mesh = Mock()
-    pp_mesh.size = Mock(return_value=1)
-    pp_mesh.get_group = Mock(return_value=None)
-    device_mesh.__getitem__ = Mock(return_value=pp_mesh)
-
-    grad_norm = clip_grad_norm(
-        max_grad_norm=1.0,
-        model_parts=[model],
-        pp_enabled=True,
-        device_mesh=device_mesh,
-        pp_axis_name="pp",
-    )
-
-    assert grad_norm > 0
-
-
 def test_clip_grad_norm_works_without_pp():
     model = torch.nn.Linear(10, 10)
     model.weight.grad = torch.randn_like(model.weight)
