@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import Mock, patch
+
 import pytest
 import torch
 
-from nemo_automodel.components.training.utils import count_tail_padding
+from nemo_automodel.components.training.utils import clip_grad_norm, count_tail_padding
 
 
 def test_docstring_example():
@@ -80,3 +82,48 @@ def test_random_shapes():
                 ref += (row[idx[-1] + 1 :] == -100).sum().item()
 
         assert count_tail_padding(batch) == ref
+
+
+def test_clip_grad_norm_skips_with_pp_and_tp():
+    model = torch.nn.Linear(10, 10)
+    model.weight.grad = torch.randn_like(model.weight)
+
+    device_mesh = Mock()
+    device_mesh.mesh_dim_names = ["pp", "tp"]
+    device_mesh.__getitem__ = Mock(side_effect=lambda key: Mock(size=Mock(return_value=2)))
+
+    grad_norm = clip_grad_norm(
+        max_grad_norm=1.0,
+        model_parts=[model],
+        pp_enabled=True,
+        device_mesh=device_mesh,
+        pp_axis_name="pp",
+    )
+
+    assert grad_norm == 0
+
+
+def test_clip_grad_norm_works_without_pp():
+    model = torch.nn.Linear(10, 10)
+    model.weight.grad = torch.randn_like(model.weight)
+
+    grad_norm = clip_grad_norm(
+        max_grad_norm=1.0,
+        model_parts=[model],
+        pp_enabled=False,
+    )
+
+    assert grad_norm > 0
+
+
+def test_clip_grad_norm_returns_zero_when_max_grad_norm_is_none():
+    model = torch.nn.Linear(10, 10)
+    model.weight.grad = torch.randn_like(model.weight)
+
+    grad_norm = clip_grad_norm(
+        max_grad_norm=None,
+        model_parts=[model],
+        pp_enabled=False,
+    )
+
+    assert grad_norm == 0

@@ -159,6 +159,9 @@ def clip_grad_norm(
     if max_grad_norm is None:
         return grad_norm
 
+    if pp_enabled and device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
+        return grad_norm
+
     if pp_enabled:
         assert pp_axis_name is not None, "pp_axis_name must be provided when pp_enabled is True"
         pp_mesh = device_mesh[pp_axis_name]
