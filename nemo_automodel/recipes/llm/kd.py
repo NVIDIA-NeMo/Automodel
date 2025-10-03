@@ -289,7 +289,6 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         # fix reporting_loss, tps across ranks
         return reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens
 
-
     @torch.no_grad()
     def _run_validation_epoch(self):
         """Run one pass over `self.val_dataloader`."""
