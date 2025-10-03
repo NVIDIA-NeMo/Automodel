@@ -147,7 +147,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         self.kd_loss_fn = _build_kd_loss_fn(self.cfg.get("kd_loss_fn", None))
         self.kd_ratio: float = float(self.cfg.get("kd_ratio", 0.5))
         logger.info("KD Loss config: " + str(self.cfg.get("kd_loss_fn", None)))
-        logger.info(f"Knowledge-distillation enabled: ratio={self.kd_ratio}, T={self.kd_loss_fn.temperature}")
+        temperature = getattr(self.kd_loss_fn, "temperature", "N/A")
+        logger.info(f"Knowledge-distillation enabled: ratio={self.kd_ratio}, T={temperature}")
 
         # Buffers for logging
         self._kd_loss_buffer = []
@@ -208,7 +209,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             if is_train:
                 (local_loss * self._get_dp_group_size()).backward()
             # return the losses for logging
-            return local_loss.clone().detach(), kd_loss.clone().detach(), ce_loss.clone().detach()
+            detached_local = local_loss.detach().clone()
+            return detached_local, kd_loss.detach().clone(), ce_loss.detach().clone()
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
@@ -287,6 +289,61 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         # fix reporting_loss, tps across ranks
         return reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens
 
+
+    @torch.no_grad()
+    def _run_validation_epoch(self):
+        """Run one pass over `self.val_dataloader`."""
+        if self.pp_enabled:
+            logger.warning("Validation is not supported for pipeline parallelism")
+            return
+
+        with ScopedRNG(seed=1, ranked=True):
+            for mp in self.model_parts:
+                mp.eval()
+
+            total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
+            ce_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
+            kd_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
+            total_num_label_tokens = 0
+
+            for batch in self.val_dataloader:
+                num_label_tokens = (batch["labels"] != -100).sum().item()
+                local_loss, _kd_loss, _ce_loss = self._forward_backward_step(
+                    0,
+                    batch,
+                    num_label_tokens=num_label_tokens,
+                    num_batches=1,
+                    is_train=False,
+                )
+                total_num_label_tokens += num_label_tokens
+                ce_loss += _ce_loss
+                kd_loss += _kd_loss
+                total_loss += local_loss
+
+        total_loss = self._dp_allreduce(total_loss).item()
+        ce_loss = self._dp_allreduce(ce_loss).item()
+        kd_loss = self._dp_allreduce(kd_loss).item()
+        total_num_label_tokens = self._dp_allreduce(torch.tensor(total_num_label_tokens, dtype=torch.long)).item()
+
+        val_loss = total_loss / max(total_num_label_tokens, 1e-8)
+        if self.dist_env.is_main:
+            if wandb.run is not None:
+                wandb.log({"val_loss": val_loss, "step": self.step_scheduler.step, "epoch": self.step_scheduler.epoch})
+
+        # assumes all model parts' optimizers have the same learning rate
+        current_lr = self.optimizer[0].param_groups[0]["lr"]
+        logging.info(
+            "[val] step {} | epoch {} | loss {:.4f} | ce_loss {:.4f} | kd_loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
+                self.step_scheduler.step,
+                self.step_scheduler.epoch,
+                val_loss,
+                current_lr,
+                total_num_label_tokens,
+                ce_loss,
+                kd_loss,
+            )
+        )
+
     def log_train_metrics(
         self, train_loss, grad_norm, num_tokens_in_batch, tps, num_label_tokens, kd_loss=None
     ) -> float:
@@ -332,7 +389,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 current_lr,
                 tps,
                 self.kd_ratio,
-                self.kd_loss_fn.temperature,
+                getattr(self.kd_loss_fn, "temperature", float("nan")),
             )
         )
         torch.cuda.reset_peak_memory_stats()
