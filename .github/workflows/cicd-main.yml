@@ -203,6 +203,10 @@ jobs:
             test-folder: hf_transformer_vlm
             runner: self-hosted-nemo
             timeout: 60
+          - test-name: L2_LLM_KD
+            test-folder: llm_kd
+            runner: self-hosted-nemo
+            timeout: 60
           - test-name: L2_Datasets
             test-folder: data
             runner: self-hosted-nemo
