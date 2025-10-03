@@ -67,8 +67,12 @@ def patch_torch_distributed(monkeypatch):
     sys.modules["torch.distributed"] = dist_stub
 
     # Import the module *after* stubs are in place so it picks them up.
+    # Force reload in case it was imported by another test module
     global timers_mod
-    timers_mod = importlib.import_module("nemo_automodel.components.training.timers")
+    if "nemo_automodel.components.training.timers" in sys.modules:
+        timers_mod = importlib.reload(sys.modules["nemo_automodel.components.training.timers"])
+    else:
+        timers_mod = importlib.import_module("nemo_automodel.components.training.timers")
     # Re-export so tests can use a short alias.
     globals().update(
         {
