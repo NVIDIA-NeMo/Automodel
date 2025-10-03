@@ -174,7 +174,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                         mp.set_fsdp_states_for_first_forward()
 
                 for ga_step_idx in range(ga_steps):
-                    if ga_step_idx == ga_steps - 1:
+                    if ga_step_idx == ga_steps - 1 and not self.pp_enabled:
                         for mp in self.model_parts:
                             if hasattr(mp, "set_fsdp_states_for_last_backward"):
                                 mp.set_fsdp_states_for_last_backward()
@@ -194,6 +194,11 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                             num_batches=ga_steps,
                             is_train=True,
                         )
+
+                if self.pp_enabled:
+                    for mp in self.model_parts:
+                        if hasattr(mp, "finalize_fsdp_states_post_backward"):
+                            mp.finalize_fsdp_states_post_backward()
 
                 loss = (
                     torch.sum(torch.stack(loss_buffer)).to(device)

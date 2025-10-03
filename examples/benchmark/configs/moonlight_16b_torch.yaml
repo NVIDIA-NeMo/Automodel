@@ -50,25 +50,6 @@ autopipeline:
   patch_causal_lm_model: false
   layers_per_stage: 2
 
-distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
-  tp_size: 1
-  cp_size: 1
-  pp_size: 1
-  dp_replicate_size: 1
-  ep_size: 8
-  sequence_parallel: false
-
-autopipeline:
-  _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
-  pp_schedule: interleaved1f1b
-  pp_microbatch_size: 4
-  layers_per_stage: 2
-  round_virtual_stages_to_pp_multiple: up
-  scale_grads_in_schedule: false
-  patch_inner_model: false
-  patch_causal_lm_model: false
-
 dist_env:
   backend: nccl
   timeout_minutes: 10

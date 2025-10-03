@@ -37,16 +37,33 @@ rng:
 parallelizer:
   _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
   activation_checkpointing: false
+  reshard_after_forward: false
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
+  backend:
+    _target_: nemo_automodel.components.moe.utils.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: te
+    enable_deepep: true
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    fsdp_optimization_config:
+      _target_: nemo_automodel.components.moe.utils.FsdpOptimizationConfig
+      defer_grad_sync_for_model: true
+      defer_reshard_after_backward_for_model: true
+      defer_grad_sync_for_lm_head: true
+      defer_reshard_after_backward_for_lm_head: true
+      defer_grad_sync_for_experts: true
+      defer_reshard_after_backward_for_experts: true
   is_meta_device: true
 
 checkpoint:
-  enabled: true
+  enabled: false
   checkpoint_dir: checkpoints/
   model_save_format: torch_save # torch_save or safetensors
   save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.

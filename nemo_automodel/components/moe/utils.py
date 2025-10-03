@@ -29,14 +29,17 @@ HAVE_DEEP_EP = importlib.util.find_spec("deep_ep") is not None
 
 @dataclass(kw_only=True)
 class FsdpOptimizationConfig:
-    disable_gradient_sync_for_model: bool = False
-    disable_reshard_after_backward_for_model: bool = False
-    disable_gradient_sync_for_embed_tokens: bool = False
-    disable_reshard_after_backward_for_embed_tokens: bool = False
-    disable_gradient_sync_for_lm_head: bool = False
-    disable_reshard_after_backward_for_lm_head: bool = False
-    disable_gradient_sync_for_experts: bool = True
-    disable_reshard_after_backward_for_experts: bool = True
+    """
+    Configuration for FSDP gradient sync and resharding optimizations during gradient accumulation.
+    Deferring gradient sync and resharding until the last microbatch reduces communication overhead.
+    """
+
+    defer_grad_sync_for_model: bool = False
+    defer_reshard_after_backward_for_model: bool = False
+    defer_grad_sync_for_lm_head: bool = False
+    defer_reshard_after_backward_for_lm_head: bool = False
+    defer_grad_sync_for_experts: bool = False
+    defer_reshard_after_backward_for_experts: bool = False
 
 
 @dataclass(kw_only=True)
