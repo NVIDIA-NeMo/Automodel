@@ -261,6 +261,7 @@ class SFTSingleTurnPreprocessor:
         self.block_size = None
         self.preprocessing_num_workers = 1
         self.overwrite_cache = False
+        self.pad_to_max_length = True
 
     def _tokenize_function(self, examples, dataset):
         ctx = dataset.get_context(examples)
@@ -331,7 +332,7 @@ class SFTSingleTurnPreprocessor:
             ds (dataset): the dataset with get_target method.
 
         Returns:
-            datasets.DatasetDict: tokenized + padded datasets (all splits preserved).
+            datasets.DatasetDict: tokenized + optionally padded datasets (all splits preserved).
         """
         if not hasattr(self.tokenizer, "pad_token") and hasattr(self.tokenizer, "bos_token"):
             self.tokenizer.pad_token = self.tokenizer.bos_token
@@ -346,17 +347,19 @@ class SFTSingleTurnPreprocessor:
             desc="Running tokenizer on dataset",
         )
 
-        # 2. global max len -----------------------------------------------------------
-        max_len = self._compute_dataset_max_len(tokenized)
+        # 2. pad (optional) ----------------------------------------------------------
+        if self.pad_to_max_length:
+            # 2a. compute global max len
+            max_len = self._compute_dataset_max_len(tokenized)
 
-        # 3. pad ----------------------------------------------------------------------
-        pad_fn = self._pad_function(max_len)
-        tokenized = tokenized.map(
-            pad_fn,
-            batched=True,
-            num_proc=self.preprocessing_num_workers,
-            load_from_cache_file=not self.overwrite_cache,
-            desc=f"Padding dataset to max length {max_len}",
-        )
+            # 2b. pad to max len
+            pad_fn = self._pad_function(max_len)
+            tokenized = tokenized.map(
+                pad_fn,
+                batched=True,
+                num_proc=self.preprocessing_num_workers,
+                load_from_cache_file=not self.overwrite_cache,
+                desc=f"Padding dataset to max length {max_len}",
+            )
 
         return tokenized
