@@ -256,8 +256,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 cls.__name__ = name[4:]
             try:
                 config = AutoConfig.from_pretrained(
-                    pretrained_model_name_or_path,
-                    trust_remote_code=bool(kwargs.get("trust_remote_code", False))
+                    pretrained_model_name_or_path, trust_remote_code=bool(kwargs.get("trust_remote_code", False))
                 )
                 # if we have a custom model implementation available, we prioritize that over HF
                 if config.architectures[0] in ModelRegistry.model_arch_name_to_cls:
