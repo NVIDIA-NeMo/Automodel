@@ -18,8 +18,9 @@ import logging
 import os
 import time
 from pathlib import Path
-
 import yaml
+import json, subprocess, tempfile, wandb
+from pathlib import Path
 
 logging.getLogger().setLevel(logging.INFO)
 
@@ -160,6 +161,25 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config, extra_args=Non
         slurm_config["extra_mounts"].append(VolumeMapping(Path(repo_root), Path(repo_root)))
     return submit_slurm_job(SlurmConfig(**slurm_config, command=command, chdir=repo_root), job_dir)
 
+def _download_env_artifact(run_url: str) -> Path:
+    api = wandb.Api()
+    run = api.from_path(run_url)
+    arts = [a for a in run.logged_artifacts() if a.type == "environment"]
+    art = arts[-1]
+    return Path(art.download())
+
+def suggest_docker_cmd(env_dir: Path, extra_mount: str | None = None) -> str | None:
+    docker_json = env_dir / "docker.json"
+    if not docker_json.exists(): return None
+    dj = json.loads(docker_json.read_text())
+    ref = dj.get("digest_ref") or dj.get("ref_env")
+    if not ref: return None
+    mounts = [
+        "-v \"$(pwd)\":\"/workspace\"",
+        f"-v {extra_mount}:/extra:ro" if extra_mount else "",
+        "--gpus all" if shutil.which("nvidia-smi") else "",
+    ]
+    return f"docker run --rm -it {' '.join(m for m in mounts if m)} {ref} bash"
 
 def build_parser() -> argparse.ArgumentParser:
     """
@@ -177,7 +197,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["finetune", "pretrain", "kd"],
         help="Command within the domain (e.g., finetune, pretrain, kd, etc)",
     )
-    parser.add_argument(
+    subparser = parser.add_subparsers(help='Job launch from YAML config')
+    subparser.add_argument(
         "domain",
         metavar="<domain>",
         choices=["llm", "vlm"],
@@ -185,7 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # Optional/required flag
-    parser.add_argument(
+    subparser.add_argument(
         "-c",
         "--config",
         metavar="PATH",
@@ -193,6 +214,13 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Path to YAML configuration file",
     )
+    subparser = parser.add_subparsers(help='Job launch from W&B run')
+    subparser.add_argument(
+        "run_url",
+        metavar="RUN_URL",
+        help="W&B run URL",
+    )
+
     # This is defined in torch.distributed.run's parser, but we also define it here.
     # We want to determine if the user passes `--nproc-per-node` via CLI. In particular, we
     # want to use this information to determine whether they want to utilize a subset of the
@@ -263,7 +291,6 @@ def run_interactive(args):
             torchrun_args.nproc_per_node = num_devices
         return thrun(torchrun_args)
 
-
 def main():
     """CLI for running finetune jobs with NeMo-Automodel, supporting torchrun, Slurm & Kubernetes.
 
@@ -274,6 +301,11 @@ def main():
         int: Job's status code
     """
     args, extra = build_parser().parse_known_args()
+    if args.run_url:
+        env_dir = _download_env_artifact(args.run_url)
+        cmd = suggest_docker_cmd(env_dir)
+        raise NotImplementedError("Launching job from W&B run is not implemented yet")
+
     logging.info(f"Domain:  {args.domain}")
     logging.info(f"Command: {args.command}")
     logging.info(f"Config:  {args.config.resolve()}")

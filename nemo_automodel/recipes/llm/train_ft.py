@@ -55,6 +55,7 @@ from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.loggers.wandb_env import log_environment_bundle
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
@@ -593,6 +594,7 @@ def build_wandb(cfg) -> wandb.Run:
     Returns:
         The wandb instance.
     """
+    import wandb_workspaces.reports.v2 as wr
     assert cfg.get("wandb", None) is not None
     kwargs = cfg.wandb.to_dict()
     if kwargs.get("name", "") == "":
@@ -602,6 +604,24 @@ def build_wandb(cfg) -> wandb.Run:
         config=cfg.to_dict(),
         settings=Settings(silent=True),
     )
+    log_environment_bundle(run)
+
+    cmd = f"automodel reproduce --run-url {run.url}"  # whatever you want users to copy
+
+    report = wr.Report(
+        project=run.project,            # same project as the run
+        title=f"Reproduce: {run.name}",
+        description="One-click copy command to reproduce this run"
+    )
+    report.blocks = [
+        wr.H3(text="Copy & run this:"),
+        wr.CodeBlock(code=[cmd], language="bash"),   # renders with a copy button in the UI
+    ]
+    report.save()
+
+    # surface it from the run page too
+    run.summary["reproduce_cmd"] = cmd
+    run.summary["reproduce_report_url"] = report.url
     return run
 
 
