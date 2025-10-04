@@ -49,6 +49,7 @@ from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import count_tail_padding
+from nemo_automodel.components.loggers.metrics_tracker import WandBMetricsTracker
 from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
     compile_model,
@@ -619,6 +620,22 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
 
+        # ------------------ metrics tracking init ------------------
+        peak_tflops = None
+        try:
+            if hasattr(self.cfg, "metrics") and hasattr(self.cfg.metrics, "peak_tflops_per_gpu"):
+                peak_tflops = float(self.cfg.metrics.peak_tflops_per_gpu)
+        except Exception:
+            pass
+        self.metrics = WandBMetricsTracker(
+            dp_world_size=self._get_dp_group_size(),
+            step_scheduler=self.step_scheduler,
+            micro_batch_size=int(self.step_scheduler.local_batch_size),
+            model_parts=[self.model],
+            peak_tflops_per_gpu=peak_tflops,
+            count_trainable_params=sum(p.numel() for p in self.model.parameters() if p.requires_grad),
+        )
+
     # ------------------ main loop ------------------
     def run_train_validation_loop(self):
         """Run the training loop over all epochs and batches.
@@ -733,6 +750,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         tps = num_tokens_in_batch / time_delta
         reporting_loss = torch.sum(torch.stack(loss_buffer)).item()
         # fix reporting_loss, tps across ranks
+
+        # Update metrics tracker
+        self.metrics.update_after_step(time_delta=float(time_delta), num_tokens_in_batch=int(num_tokens_in_batch))
         return reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens
 
     @torch.no_grad()
@@ -808,10 +828,19 @@ class FinetuneRecipeForVLM(BaseRecipe):
             "tps": tps,
         }
         current_lr = self.optimizer.param_groups[0]["lr"]
-        log_data["learning_rate"] = current_lr
+        # Delegate logging to tracker
+        self.metrics.log(
+            step=self.step_scheduler.step,
+            epoch=self.step_scheduler.epoch,
+            base_log=log_data,
+            learning_rate=current_lr,
+            tps=tps,
+            grad_norm=grad_norm,
+            model_parts=[self.model],
+        )
 
         if wandb.run is not None:
-            wandb.log(log_data, step=self.step_scheduler.step)
+            pass
 
         logging.info(
             "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f} | num_label_tokens {}".format(
