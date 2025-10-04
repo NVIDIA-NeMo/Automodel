@@ -90,8 +90,8 @@ def _build_teacher_model(cfg_teacher, seed, has_packed_sequence, device, model_w
                 logger.warning(f"Failed to parallelize teacher model with FSDP2: {e}")
                 logger.info("Falling back to simple device placement for teacher model")
                 teacher_model = teacher_model.to(device)
-        else:
-            teacher_model = teacher_model.to(device)
+        # ensure on device
+        teacher_model = teacher_model.to(device)
 
         # Set teacher to eval mode and freeze parameters
         teacher_model.eval()
