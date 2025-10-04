@@ -78,12 +78,6 @@ class NeMoAutoDiffusionPipeline(DiffusionPipeline):
         move_to_device: bool = True,
         **kwargs,
     ) -> DiffusionPipeline:
-        # IMPORTANT: call DiffusionPipeline.from_pretrained directly so that
-        # diffusers loads the actual pipeline class defined by the checkpoint
-        # (from model_index.json). If we call super().from_pretrained here,
-        # diffusers will introspect this wrapper class' __init__ (which is
-        # variadic) and think expected components are ['args', 'kwargs'],
-        # causing user-provided components like 'vae' to be rejected.
         pipe: DiffusionPipeline = DiffusionPipeline.from_pretrained(
             pretrained_model_name_or_path,
             *model_args,
