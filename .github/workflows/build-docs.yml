@@ -15,10 +15,48 @@
 name: Build docs
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+  push:
+    branches:
+      - main
+      - "pull-request/[0-9]+"
+      - "deploy-release/*"
   workflow_call:
 
 jobs:
+  pre-flight:
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.64.1
+
   build-docs:
+    needs: [pre-flight]
+    if: needs.pre-flight.outputs.is_deployment_workflow != 'true'
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.57.0
+
+  build-docs-summary:
+    needs: [pre-flight, build-docs]
+    if: |
+      (
+        needs.pre-flight.outputs.is_deployment_workflow == 'true'
+        || always()
+      )
+      && !cancelled()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get workflow result
+        id: result
+        shell: bash -x -e -u -o pipefail {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' }}
+        run: |
+          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
+
+          if [ "${FAILED_JOBS:-0}" -eq 0 ] || [ "$SKIPPING_IS_ALLOWED" == "true" ]; then
+              echo "✅ All previous jobs completed successfully"
+              exit 0
+          else
+              echo "❌ Found $FAILED_JOBS failed job(s)"
+              # Show which jobs failed
+              gh run view $GITHUB_RUN_ID --json jobs --jq '.jobs[] | select(.status == "completed" and .conclusion != "success") | .name'
+              exit 1
+          fi

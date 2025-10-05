@@ -33,18 +33,11 @@ parallelizer:
   activation_checkpointing: false
 
 model:
-  _target_: nemo_automodel.components.models.gpt_oss.model.GptOssForCausalLM.from_config
-  pretrained_model_name_or_path: openai/gpt-oss-120b
-  trust_remote_code: true
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: transformers.AutoConfig.from_pretrained
+    pretrained_model_name_or_path: openai/gpt-oss-120b
   is_meta_device: true
-  backend:
-    _target_: nemo_automodel.components.moe.utils.BackendConfig
-    attn: flex
-    linear: te
-    rms_norm: te
-    enable_deepep: true
-    fake_balanced_gate: false
-    enable_hf_state_dict_adapter: true
 
 checkpoint:
   enabled: false
