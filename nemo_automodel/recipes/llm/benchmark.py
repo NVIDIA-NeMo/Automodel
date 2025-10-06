@@ -19,6 +19,10 @@ import torch
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.training.timers import Timers
+from nemo_automodel.components.training.utils import (
+    prepare_for_final_backward,
+    prepare_for_grad_accumulation,
+)
 from nemo_automodel.components.utils.flops_utils import calculate_mfu, get_flops_formula_for_hf_config
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
@@ -169,15 +173,11 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 # Gradient accumulation loop
                 num_label_tokens = 0
                 loss_buffer = []
-                for mp in self.model_parts:
-                    if hasattr(mp, "set_fsdp_states_for_first_forward"):
-                        mp.set_fsdp_states_for_first_forward()
+                prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
                 for ga_step_idx in range(ga_steps):
-                    if ga_step_idx == ga_steps - 1 and not self.pp_enabled:
-                        for mp in self.model_parts:
-                            if hasattr(mp, "set_fsdp_states_for_last_backward"):
-                                mp.set_fsdp_states_for_last_backward()
+                    if ga_step_idx == ga_steps - 1:
+                        prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
                     # Get batch from dataloader
                     batch = next(dataloader_iter)
@@ -195,11 +195,6 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                             is_train=True,
                         )
 
-                if self.pp_enabled:
-                    for mp in self.model_parts:
-                        if hasattr(mp, "finalize_fsdp_states_post_backward"):
-                            mp.finalize_fsdp_states_post_backward()
-
                 loss = (
                     torch.sum(torch.stack(loss_buffer)).to(device)
                     if loss_buffer
@@ -213,6 +208,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                         torch.distributed.recv(loss, src=src_rank)
 
                 if rank == 0:
+                    print(f"num_label_tokens={num_label_tokens} | loss={loss.detach().item():.4f}")
                     loss = loss / num_label_tokens
                     logger.info(
                         f"Rank {rank} | Iteration {i} | num_label_tokens={num_label_tokens} | "
