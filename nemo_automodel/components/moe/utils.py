@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import importlib.util
 from dataclasses import dataclass
 from typing import Callable, Literal
 
@@ -22,15 +23,18 @@ from torch import nn
 
 from nemo_automodel.components.attention.flex_attention import FlexAttention
 
+HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
+HAVE_DEEP_EP = importlib.util.find_spec("deep_ep") is not None
+
 
 @dataclass(kw_only=True)
 class BackendConfig:
-    attn: Literal["te", "sdpa", "flex"] = "te"
-    linear: Literal["torch", "te"] = "torch"
-    rms_norm: Literal["torch", "te"] = "te"
-    enable_deepep: bool = False
+    attn: Literal["te", "sdpa", "flex"] = "te" if HAVE_TE else "sdpa"
+    linear: Literal["torch", "te"] = "te" if HAVE_TE else "torch"
+    rms_norm: Literal["torch", "te"] = "te" if HAVE_TE else "torch"
+    enable_deepep: bool = HAVE_DEEP_EP
     fake_balanced_gate: bool = False
-    enable_hf_state_dict_adapter: bool = False
+    enable_hf_state_dict_adapter: bool = True
 
 
 def initialize_attn_module_and_func(
@@ -41,6 +45,8 @@ def initialize_attn_module_and_func(
     softmax_scale: float,
     attn_mask_type: str = "causal",
     qkv_format: str = "bshd",
+    num_gqa_groups: int | None = None,
+    **kwargs,
 ) -> tuple[nn.Module | None, Callable]:
     if attn_impl == "te":
         from transformer_engine.pytorch.attention import DotProductAttention
@@ -51,12 +57,18 @@ def initialize_attn_module_and_func(
             attn_mask_type=attn_mask_type,
             qkv_format=qkv_format,
             softmax_scale=softmax_scale,
+            num_gqa_groups=num_gqa_groups,
+            **kwargs,
         )
         attn_func = attn_module.__call__
         return attn_module, attn_func
     elif attn_impl == "sdpa":
         attn_func = functools.partial(
-            F.scaled_dot_product_attention, scale=softmax_scale, is_causal=attn_mask_type == "causal"
+            F.scaled_dot_product_attention,
+            scale=softmax_scale,
+            is_causal=attn_mask_type == "causal",
+            enable_gqa=num_gqa_groups is not None,
+            **kwargs,
         )
         return None, attn_func
     elif attn_impl == "flex":
@@ -73,13 +85,14 @@ def initialize_rms_norm_module(
     dim: int,
     eps: float = 1e-5,
     device: torch.device | str = "meta",
+    dtype: torch.dtype = torch.bfloat16,
 ) -> nn.Module:
     if rms_norm_impl == "te":
         from transformer_engine.pytorch.module.rmsnorm import RMSNorm as TransformerEngineRMSNorm
 
-        rms_norm_module = TransformerEngineRMSNorm(normalized_shape=dim, eps=eps, device=device)
+        rms_norm_module = TransformerEngineRMSNorm(normalized_shape=dim, eps=eps, device=device, params_dtype=dtype)
     elif rms_norm_impl == "torch":
-        rms_norm_module = nn.RMSNorm(dim, eps=eps)
+        rms_norm_module = nn.RMSNorm(dim, eps=eps, dtype=dtype)
     else:
         raise ValueError(f"Unsupported RMSNorm implementation: {rms_norm_impl}")
     return rms_norm_module
@@ -91,12 +104,13 @@ def initialize_linear_module(
     out_features: int,
     bias: bool = False,
     device: torch.device | str = "meta",
+    dtype: torch.dtype = torch.bfloat16,
 ) -> nn.Module:
     if linear_impl == "torch":
-        return nn.Linear(in_features, out_features, bias=bias)
+        return nn.Linear(in_features, out_features, bias=bias, dtype=dtype)
     elif linear_impl == "te":
         from transformer_engine.pytorch.module.linear import Linear as TransformerEngineLinear
 
-        return TransformerEngineLinear(in_features, out_features, bias=bias, device=device)
+        return TransformerEngineLinear(in_features, out_features, bias=bias, device=device, params_dtype=dtype)
     else:
         raise ValueError(f"Unsupported Linear implementation: {linear_impl}")

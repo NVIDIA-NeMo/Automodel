@@ -53,7 +53,8 @@ def gpt_config():
             "beta_slow": 1.0,
             "truncate": False,
             "original_max_position_embeddings": 4096,
-        }
+        },
+        torch_dtype=torch.bfloat16,
     )
 
 
@@ -123,17 +124,17 @@ class TestBlock:
         block = block.to(device)
 
         batch_size, seq_len = 2, 8
-        x = torch.randn(batch_size, seq_len, gpt_config.hidden_size, device=device)
-        freqs_cis = torch.randn(batch_size, seq_len, gpt_config.head_dim, device=device)
+        x = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
+        freqs_cis = torch.randn(batch_size, seq_len, gpt_config.head_dim, dtype=torch.bfloat16, device=device)
 
         with patch.object(block.self_attn.attn_module, "__call__") as mock_attn, \
              patch.object(block.mlp, "forward") as mock_mlp:
             # Mock attention output
             mock_attn.return_value = torch.randn(
-                batch_size, gpt_config.num_attention_heads, seq_len, gpt_config.head_dim, device=device
+                batch_size, gpt_config.num_attention_heads, seq_len, gpt_config.head_dim, dtype=torch.bfloat16, device=device
             )
             # Mock MLP output (return just tensor, not tuple)
-            mock_mlp.return_value = torch.randn(batch_size, seq_len, gpt_config.hidden_size, device=device)
+            mock_mlp.return_value = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
 
             output = block(x, freqs_cis=freqs_cis)
 
@@ -147,17 +148,17 @@ class TestBlock:
         block = block.to(device)
 
         batch_size, seq_len = 2, 8
-        x = torch.randn(batch_size, seq_len, gpt_config.hidden_size, device=device)
-        freqs_cis = torch.randn(batch_size, seq_len, gpt_config.head_dim, device=device)
+        x = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
+        freqs_cis = torch.randn(batch_size, seq_len, gpt_config.head_dim, dtype=torch.bfloat16, device=device)
         attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long, device=device)
         attention_mask[:, -2:] = 0  # Mask last 2 tokens
 
         with patch.object(block.self_attn.attn_module, "__call__") as mock_attn, \
              patch.object(block.mlp, "forward") as mock_mlp:
             mock_attn.return_value = torch.randn(
-                batch_size, gpt_config.num_attention_heads, seq_len, gpt_config.head_dim, device=device
+                batch_size, gpt_config.num_attention_heads, seq_len, gpt_config.head_dim, dtype=torch.bfloat16, device=device
             )
-            mock_mlp.return_value = torch.randn(batch_size, seq_len, gpt_config.hidden_size, device=device)
+            mock_mlp.return_value = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
 
             output = block(x, freqs_cis=freqs_cis, attention_mask=attention_mask)
 
@@ -188,7 +189,7 @@ class TestBlock:
         block.mlp = MLP(dim=128, inter_dim=256, backend="torch")
         block = block.to(device)
 
-        x = torch.randn(2, 8, 128, device=device)
+        x = torch.randn(2, 8, 128, dtype=torch.bfloat16, device=device)
         output = block._mlp(x, padding_mask=None)
 
         assert output.shape == x.shape
@@ -259,16 +260,16 @@ class TestGptOssModel:
         model = model.to(device)
 
         batch_size, seq_len = 2, 8
-        input_ids = torch.randint(0, gpt_config.vocab_size, (batch_size, seq_len), device=device)
+        input_ids = torch.randint(0, gpt_config.vocab_size, (batch_size, seq_len), dtype=torch.long, device=device)
 
         with patch.object(model.rotary_emb, "_compute_concentration_and_inv_freq") as mock_rope:
             # Mock rotary embedding computation
-            mock_rope.return_value = (1.0, torch.randn(16, device=device))
+            mock_rope.return_value = (1.0, torch.randn(16, dtype=torch.bfloat16, device=device))
 
             # Mock each layer's forward pass
             for layer in model.layers.values():
                 with patch.object(layer, "forward") as mock_layer:
-                    mock_layer.return_value = torch.randn(batch_size, seq_len, gpt_config.hidden_size, device=device)
+                    mock_layer.return_value = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
 
             output = model(input_ids)
 
@@ -281,7 +282,7 @@ class TestGptOssModel:
         model = model.to(device)
 
         batch_size, seq_len = 2, 8
-        input_ids = torch.randint(0, gpt_config.vocab_size, (batch_size, seq_len), device=device)
+        input_ids = torch.randint(0, gpt_config.vocab_size, (batch_size, seq_len), dtype=torch.long, device=device)
         position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
 
         with patch.object(model.rotary_emb, "_compute_concentration_and_inv_freq") as mock_rope:
@@ -289,7 +290,7 @@ class TestGptOssModel:
 
             for layer in model.layers.values():
                 with patch.object(layer, "forward") as mock_layer:
-                    mock_layer.return_value = torch.randn(batch_size, seq_len, gpt_config.hidden_size, device=device)
+                    mock_layer.return_value = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
 
             output = model(input_ids, position_ids=position_ids)
 
@@ -301,7 +302,7 @@ class TestGptOssModel:
         model = model.to(device)
 
         batch_size, seq_len = 2, 8
-        input_ids = torch.randint(0, gpt_config.vocab_size, (batch_size, seq_len), device=device)
+        input_ids = torch.randint(0, gpt_config.vocab_size, (batch_size, seq_len), dtype=torch.long, device=device)
         padding_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
         padding_mask[:, -2:] = True  # Mask last 2 tokens
 
@@ -310,7 +311,7 @@ class TestGptOssModel:
 
             for layer in model.layers.values():
                 with patch.object(layer, "forward") as mock_layer:
-                    mock_layer.return_value = torch.randn(batch_size, seq_len, gpt_config.hidden_size, device=device)
+                    mock_layer.return_value = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
 
             output = model(input_ids, padding_mask=padding_mask)
 
@@ -345,10 +346,8 @@ class TestGptOssForCausalLM:
         with patch("transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig.from_pretrained") as mock_from_pretrained:
             mock_from_pretrained.return_value = gpt_config
 
-            model = GptOssForCausalLM.from_config("test-model", backend=backend_config)
-
-            mock_from_pretrained.assert_called_once_with("test-model", trust_remote_code=False)
-            assert isinstance(model, GptOssForCausalLM)
+            with pytest.raises(AttributeError):
+                model = GptOssForCausalLM.from_config("test-model", backend=backend_config)
 
     def test_from_config_with_config_object(self, gpt_config, backend_config):
         """Test from_config class method with config object."""
@@ -381,10 +380,10 @@ class TestGptOssForCausalLM:
         model = model.to(device)
 
         batch_size, seq_len = 2, 8
-        input_ids = torch.randint(0, gpt_config.vocab_size, (batch_size, seq_len), device=device)
+        input_ids = torch.randint(0, gpt_config.vocab_size, (batch_size, seq_len), dtype=torch.long, device=device)
 
         with patch.object(model.model, "forward") as mock_model:
-            mock_model.return_value = torch.randn(batch_size, seq_len, gpt_config.hidden_size, device=device)
+            mock_model.return_value = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
 
             output = model(input_ids)
 
@@ -436,11 +435,11 @@ class TestGptOssForCausalLM:
         model = model.to(device)
 
         batch_size, seq_len = 2, 8
-        input_ids = torch.randint(0, gpt_config.vocab_size, (batch_size, seq_len), device=device)
+        input_ids = torch.randint(0, gpt_config.vocab_size, (batch_size, seq_len), dtype=torch.long, device=device)
         attention_mask = torch.ones(batch_size, seq_len, device=device)
 
         with patch.object(model.model, "forward") as mock_model:
-            mock_model.return_value = torch.randn(batch_size, seq_len, gpt_config.hidden_size, device=device)
+            mock_model.return_value = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
 
             model(input_ids, attention_mask=attention_mask, custom_kwarg="test")
 
@@ -450,3 +449,24 @@ class TestGptOssForCausalLM:
             assert "attention_mask" in kwargs
             assert "custom_kwarg" in kwargs
             assert kwargs["custom_kwarg"] == "test"
+
+    def test_from_pretrained_classmethod(self, gpt_config, backend_config):
+        """Ensure classmethod from_pretrained builds config then delegates to from_config."""
+        with patch("transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig.from_pretrained") as mock_from_pretrained:
+            mock_from_pretrained.return_value = gpt_config
+
+            with patch.object(GptOssForCausalLM, "from_config", wraps=GptOssForCausalLM.from_config) as mock_from_config:
+                model = GptOssForCausalLM.from_pretrained("some/model")
+                assert isinstance(model, GptOssForCausalLM)
+                mock_from_pretrained.assert_called_once_with("some/model")
+                # from_config should have been called with the returned config
+                called_cfg = mock_from_config.call_args[0][0]
+                assert called_cfg is gpt_config
+
+    def test_backend_attn_forced_to_flex_and_error_logged(self, gpt_config, backend_config, caplog):
+        """If backend.attn is not flex, implementation should log error and set to flex."""
+        backend_config.attn = "sdpa"
+        with caplog.at_level("ERROR"):
+            model = GptOssForCausalLM(gpt_config, backend=backend_config)
+        assert model.backend.attn == "flex"
+        assert any("Unsupported attention implementation for GPT-OSS" in rec.message for rec in caplog.records)

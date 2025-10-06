@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from typing import Any
 
 import torch
@@ -22,6 +23,9 @@ from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention, Rot
 from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSStateDictAdapter
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
 from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+logger = logging.getLogger(__name__)
 
 
 class Block(nn.Module):
@@ -98,7 +102,9 @@ class GptOssModel(nn.Module):
             activation_limit=getattr(config, "swiglu_limit", 7.0),
         )
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
+        )
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, backend)
@@ -184,31 +190,42 @@ class GptOssForCausalLM(nn.Module):
     @classmethod
     def from_config(
         cls,
-        pretrained_model_name_or_path: str | GptOssConfig,
+        config: GptOssConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
-        trust_remote_code: bool = False,
+        **kwargs,
     ):
-        if isinstance(pretrained_model_name_or_path, str):
-            config = GptOssConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=trust_remote_code)
-        else:
-            config = pretrained_model_name_or_path
-        return cls(config, moe_config, backend)
+        return cls(config, moe_config, backend, **kwargs)
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        *model_args,
+        **kwargs,
+    ):
+        config = GptOssConfig.from_pretrained(pretrained_model_name_or_path)
+        return cls.from_config(config, *model_args, **kwargs)
 
     def __init__(
         self,
         config: GptOssConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        **kwargs,
     ):
         super().__init__()
         self.config = config
-        self.backend = backend or BackendConfig()
+        self.backend = backend or BackendConfig(attn="flex")
+        if self.backend.attn != "flex":
+            # if the user passes a non-flex attention implementation, we switch to flex
+            logger.error(f"Unsupported attention implementation for GPT-OSS: {self.backend.attn}, switching to flex")
+            self.backend.attn = "flex"
         self.model = GptOssModel(config, backend=self.backend, moe_config=moe_config)
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = GPTOSSStateDictAdapter(
-                self.config, self.model.moe_config, self.backend, dtype=torch.bfloat16
+                self.config, self.model.moe_config, self.backend, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
             )
 
     def forward(
@@ -252,3 +269,6 @@ class GptOssForCausalLM(nn.Module):
         with buffer_device:
             # Ensure rotary embedding uses correct device after dtype move
             self.model.rotary_emb.device = buffer_device
+
+
+ModelClass = GptOssForCausalLM

@@ -64,6 +64,8 @@ class MoEConfig:
     expert_activation: Literal["swiglu", "quick_geglu"] = "swiglu"
     activation_alpha: float = 1.702
     activation_limit: float = 7.0
+    softmax_before_topk: bool = False
+    dtype: torch.dtype = torch.bfloat16
 
 
 class MLP(nn.Module):
@@ -76,7 +78,7 @@ class MLP(nn.Module):
         up_proj (nn.Module): Additional linear layer for feature transformation.
     """
 
-    def __init__(self, dim: int, inter_dim: int, backend: str):
+    def __init__(self, dim: int, inter_dim: int, backend: str, dtype: torch.dtype = torch.bfloat16):
         """
         Initializes the MLP layer.
 
@@ -86,13 +88,13 @@ class MLP(nn.Module):
         """
         super().__init__()
         self.gate_proj = initialize_linear_module(
-            linear_impl=backend, in_features=dim, out_features=inter_dim, bias=False
+            linear_impl=backend, in_features=dim, out_features=inter_dim, bias=False, dtype=dtype
         )
         self.down_proj = initialize_linear_module(
-            linear_impl=backend, in_features=inter_dim, out_features=dim, bias=False
+            linear_impl=backend, in_features=inter_dim, out_features=dim, bias=False, dtype=dtype
         )
         self.up_proj = initialize_linear_module(
-            linear_impl=backend, in_features=dim, out_features=inter_dim, bias=False
+            linear_impl=backend, in_features=dim, out_features=inter_dim, bias=False, dtype=dtype
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -188,13 +190,17 @@ class GroupedExperts(nn.Module):
         self.n_routed_experts = config.n_routed_experts
         self.expert_bias = config.expert_bias
         self.gate_and_up_projs = nn.Parameter(
-            torch.empty(config.n_routed_experts, config.dim, config.moe_inter_dim * 2)
+            torch.empty(config.n_routed_experts, config.dim, config.moe_inter_dim * 2, dtype=config.dtype)
         )
-        self.down_projs = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim, config.dim))
+        self.down_projs = nn.Parameter(
+            torch.empty(config.n_routed_experts, config.moe_inter_dim, config.dim, dtype=config.dtype)
+        )
 
         if self.expert_bias:
-            self.gate_up_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim * 2))
-            self.down_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.dim))
+            self.gate_up_proj_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, config.moe_inter_dim * 2, dtype=config.dtype)
+            )
+            self.down_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.dim, dtype=config.dtype))
         else:
             self.gate_up_proj_bias = None
             self.down_proj_bias = None
@@ -490,6 +496,8 @@ class GroupedExpertsDeepEP(nn.Module):
                 output2 = self._apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
         else:
             output2 = torch.zeros((1, x.size(-1)), dtype=x.dtype, device=x.device)
+            output2 = output2 * permuted_probs
+            output2 = output2.to(x.dtype)
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
@@ -572,6 +580,7 @@ class Gate(nn.Module):
         self.dim = config.dim
         self.n_experts = config.n_routed_experts
         self.topk = config.n_activated_experts
+        self.softmax_before_topk = config.softmax_before_topk
         self.n_groups = config.n_expert_groups
         self.topk_groups = config.n_limited_groups
         self.score_func = config.score_func
@@ -584,14 +593,20 @@ class Gate(nn.Module):
         if self.bias_update_factor > 0:
             assert self.train_gate, "Require train_gate to be set to True to apply the bias update"
 
-        self.weight = nn.Parameter(torch.empty(config.n_routed_experts, config.dim), requires_grad=self.train_gate)
+        self.weight = nn.Parameter(
+            torch.empty(config.n_routed_experts, config.dim, dtype=config.dtype), requires_grad=self.train_gate
+        )
         if config.router_bias:
-            self.bias = nn.Parameter(torch.empty(config.n_routed_experts), requires_grad=self.train_gate)
+            self.bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=config.dtype), requires_grad=self.train_gate
+            )
         else:
             self.bias = None
 
         if self.bias_update_factor > 0:
-            self.e_score_correction_bias = nn.Parameter(torch.empty(config.n_routed_experts), requires_grad=False)
+            self.e_score_correction_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=config.dtype), requires_grad=False
+            )
         else:
             self.e_score_correction_bias = None
 
@@ -624,9 +639,15 @@ class Gate(nn.Module):
         scores = F.linear(x, self.weight, bias=self.bias)
 
         if self.score_func == "softmax":
-            values, indices = torch.topk(scores, k=self.topk, dim=-1)
-            weights = torch.nn.functional.softmax(values, dim=1)
-            original_scores = scores
+            if self.softmax_before_topk:
+                scores = scores.softmax(dim=-1, dtype=torch.float32)
+                original_scores = scores
+                indices = torch.topk(scores, k=self.topk, dim=-1)[1]
+                weights = scores.gather(1, indices)
+            else:
+                values, indices = torch.topk(scores, k=self.topk, dim=-1)
+                weights = values.softmax(dim=1, dtype=torch.float32)
+                original_scores = scores
         else:
             scores = scores.sigmoid()
             original_scores = scores
@@ -649,12 +670,12 @@ class Gate(nn.Module):
             indices = torch.topk(scores, self.topk, dim=-1)[1]
             weights = original_scores.gather(1, indices)
 
-            if self.score_func == "sigmoid" and self.norm_topk_prob and self.topk > 1:
-                # Use out-of-place division to keep autograd versions intact.
-                denom_w = weights.sum(dim=-1, keepdim=True) + 1e-20
-                denom_s = original_scores.sum(dim=-1, keepdim=True) + 1e-20
-                weights = weights / denom_w
-                original_scores = original_scores / denom_s
+        if self.norm_topk_prob and self.topk > 1:
+            # Use out-of-place division to keep autograd versions intact.
+            denom_w = weights.sum(dim=-1, keepdim=True) + 1e-20
+            denom_s = original_scores.sum(dim=-1, keepdim=True) + 1e-20
+            weights = weights / denom_w
+            original_scores = original_scores / denom_s
 
         weights = weights * self.route_scale
 

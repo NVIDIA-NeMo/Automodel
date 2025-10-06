@@ -22,6 +22,7 @@ from typing import List, Optional, Union
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import (
+    AutoConfig,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForSequenceClassification,
@@ -31,6 +32,7 @@ from transformers import (
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
 from nemo_automodel import __version__
+from nemo_automodel.components._transformers.registry import ModelRegistry
 from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -252,6 +254,18 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             name = cls.__name__
             if name.startswith("NeMo"):
                 cls.__name__ = name[4:]
+            try:
+                config = AutoConfig.from_pretrained(
+                    pretrained_model_name_or_path, trust_remote_code=bool(kwargs.get("trust_remote_code", False))
+                )
+                # if we have a custom model implementation available, we prioritize that over HF
+                if config.architectures[0] in ModelRegistry.model_arch_name_to_cls:
+                    model = ModelRegistry.model_arch_name_to_cls[config.architectures[0]](config, *model_args, **kwargs)
+                    logger.info(f"Using custom model implementation for {config.architectures[0]}")
+                    return model
+            except Exception as e:
+                logger.error(f"Failed to use custom model implementation with error: {e}")
+
             if quantization_config is not None:
                 kwargs["quantization_config"] = quantization_config
             model = super().from_pretrained(
@@ -368,6 +382,15 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             name = cls.__name__
             if name.startswith("NeMo"):
                 cls.__name__ = name[4:]
+            try:
+                # if we have a custom model implementation available, we prioritize that over HF
+                if config.architectures[0] in ModelRegistry.model_arch_name_to_cls:
+                    model = ModelRegistry.model_arch_name_to_cls[config.architectures[0]](config, *model_args, **kwargs)
+                    logger.info(f"Using custom model implementation for {config.architectures[0]}")
+                    return model
+            except Exception as e:
+                logger.error(f"Failed to use custom model implementation with error: {e}")
+
             if quantization_config is not None:
                 kwargs["quantization_config"] = quantization_config
             model = super().from_config(
