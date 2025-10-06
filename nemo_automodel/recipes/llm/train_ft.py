@@ -1139,12 +1139,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             "tps": tps,
             "tps_per_gpu": tps / max(self._get_dp_group_size(), 1),
         }
-        if isinstance(grad_norm, tuple):
-            grad_norm, non_ep_grads_total_norm, ep_grads_total_norm = grad_norm
-            log_data["grad_norm"] = grad_norm
-            log_data["non_ep_grads_total_norm"] = non_ep_grads_total_norm
-            log_data["ep_grads_total_norm"] = ep_grads_total_norm
-
         # assumes all model parts' optimizers have the same learning rate
         current_lr = self.optimizer[0].param_groups[0]["lr"]
         log_data["learning_rate"] = current_lr

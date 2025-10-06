@@ -99,7 +99,7 @@ def clip_grad_norm_with_ep(
     torch.nn.utils.clip_grads_with_norm_(ep_params, max_norm, total_norm, foreach)
     torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_norm, total_norm, foreach)
 
-    return total_norm, non_ep_grads_total_norm, ep_grads_total_norm
+    return total_norm
 
 
 @torch.no_grad()
@@ -200,10 +200,6 @@ def clip_grad_norm(
 
     if isinstance(grad_norm, torch.Tensor):
         grad_norm = grad_norm.item()
-
-    if isinstance(grad_norm, tuple):
-        grad_norm, non_ep_grads_total_norm, ep_grads_total_norm = grad_norm
-        return grad_norm.item(), non_ep_grads_total_norm.item(), ep_grads_total_norm.item()
 
     return grad_norm
 
