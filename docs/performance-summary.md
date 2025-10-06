@@ -39,13 +39,13 @@ The table below shows training performance for full sequences with no padding ac
 
 ## Configuration Files
 
-All benchmark configurations are available in [`examples/benchmark/configs/`](../examples/benchmark/configs/):
+All benchmark configurations are available in [`examples/benchmark/configs/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples):
 
-- [`deepseek_v3_te_deepep.yaml`](../examples/benchmark/configs/deepseek_v3_te_deepep.yaml) - DeepSeek V3 with TE + DeepEP
-- [`kimi_k2_te_deepep.yaml`](../examples/benchmark/configs/kimi_k2_te_deepep.yaml) - Kimi K2 optimized configuration
-- [`qwen3_moe_30b_te_deepep.yaml`](../examples/benchmark/configs/qwen3_moe_30b_te_deepep.yaml) - Qwen3 MoE with TE + DeepEP
-- [`gptoss_20b_te_deepep.yaml`](../examples/benchmark/configs/gptoss_20b_te_deepep.yaml) - GPT-OSS 20B with optimizations
-- [`gptoss_120b_te_deepep.yaml`](../examples/benchmark/configs/gptoss_120b_te_deepep.yaml) - GPT-OSS 120B optimized
+- [`deepseek_v3_te_deepep.yaml`](examples/benchmark/configs/deepseek_v3_te_deepep.yaml) - DeepSeek V3 with TE + DeepEP
+- [`kimi_k2_te_deepep.yaml`](examples/benchmark/configs/kimi_k2_te_deepep.yaml) - Kimi K2 optimized configuration
+- [`qwen3_moe_30b_te_deepep.yaml`](examples/benchmark/configs/qwen3_moe_30b_te_deepep.yaml) - Qwen3 MoE with TE + DeepEP
+- [`gptoss_20b_te_deepep.yaml`](examples/benchmark/configs/gptoss_20b_te_deepep.yaml) - GPT-OSS 20B with optimizations
+- [`gptoss_120b_te_deepep.yaml`](examples/benchmark/configs/gptoss_120b_te_deepep.yaml) - GPT-OSS 120B optimized
 
 ---
 
