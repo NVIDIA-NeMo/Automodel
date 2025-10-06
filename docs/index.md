@@ -60,3 +60,10 @@ guides/fp8-training.md
 
 apidocs/index.rst
 ```
+
+```{toctree}
+:caption: Performance
+:hidden:
+
+performance-summary.md
+```
