@@ -15,10 +15,9 @@ environment/cluster.md
 -->
 
 ```{toctree}
-:caption: Guides
+:caption: Announcements
 :hidden:
 
-guides/omni/gemma3-3n.md
 ```
 
 ```{toctree}
@@ -29,6 +28,7 @@ guides/llm/sft.md
 guides/llm/peft.md
 guides/llm/mcore-pretraining.md
 guides/llm/nanogpt-pretraining.md
+guides/omni/gemma3-3n.md
 ```
 
 ```{toctree}
