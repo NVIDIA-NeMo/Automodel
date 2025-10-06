@@ -2,16 +2,25 @@
 
 ## NVIDIA NeMo-Automodel 0.1.0
 
-* User-defined models / pretraining
-* DeepSeek v3
-* Knowledge distillation
-* ColumnMapped Dataset for single-turn SFT
-* FP8 with torchao
-* HF PP Support
-* Checkpoint PP
-* DCP Parallel loading
-* Pretrain Data (MCore and nanogpt compatible data)
-* HSDP with FSDP2
+- Pretraining support for
+  - Models under 40B with PyT FSDP2
+  - Larger models by applying PyT PP
+  - TP can also be used for models with a TP plan
+  - Large MOE via custom implementations
+- Knowledge distillation for LLMs (requires same tokenizer)
+- FP8 with torchao (requires torch.compile)
+- Parallelism
+  - HSDP with FSDP2
+  - Auto Pipelining Support
+- Checkpointing
+  - Pipeline support (load and save)
+  - Parallel load with meta device
+- Data
+  - ColumnMapped Dataset for single-turn SFT
+  - Pretrain Data: Megatron-Core and Nano-gpt compatible data
+- Performance [ tmp link ]
+- Pretraining benchmark for Large MoE user-defined models
+- Fast DeepSeek v3 implementation with DeepEP
 
 ## NVIDIA NeMo-Automodel 0.1.0.a0
 
