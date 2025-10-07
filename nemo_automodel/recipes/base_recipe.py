@@ -208,7 +208,12 @@ class BaseRecipe:
                 tokenizer = getattr(self, key)
             elif is_dataloader(getattr(self, key)) or isinstance(getattr(self, key), StatefulRNG):
                 save_dp_aware_helper(
-                    getattr(self, key), key, path, self._get_dp_rank(), self._get_tp_rank(), self._get_pp_rank()
+                    getattr(self, key),
+                    key,
+                    path,
+                    self._get_dp_rank(include_cp=True),
+                    self._get_tp_rank(),
+                    self._get_pp_rank(),
                 )
             else:
                 if is_rank_0:
@@ -255,7 +260,7 @@ class BaseRecipe:
             elif is_lr_scheduler(getattr(self, key)):
                 scheduler = getattr(self, key)
             elif is_dataloader(getattr(self, key)) or isinstance(getattr(self, key), StatefulRNG):
-                load_dp_aware_helper(getattr(self, key), key, ckpt_dir, self._get_dp_rank())
+                load_dp_aware_helper(getattr(self, key), key, ckpt_dir, self._get_dp_rank(include_cp=True))
             elif is_tokenizer(getattr(self, key)) or isinstance(getattr(self, key), ConfigNode):
                 # we don't need to load the tokenizer or config from the checkpoint
                 # we only save the tokenizer for consolidated checkpoints for downstream use
@@ -402,47 +407,23 @@ class BaseRecipe:
         for k, v in attrs.items():
             logging.info(f"- {k}: {v}")
 
-    def _get_dp_group(self, exclude_cp: bool = True):
-        """
-        Return the data-parallel group.
-
-        Args:
-            exclude_cp: If True (default), return the DP group that EXCLUDES the CP dimension.
-                       Use True for dataset sharding, scheduler math, and metrics.
-                       Set to False only for gradient operations that need CP included.
-        """
+    def _get_dp_group(self, include_cp: bool = False):
         if not self.device_mesh:
             return None
-        elif exclude_cp or self.device_mesh["cp"].size() == 1:
-            return self.device_mesh["dp"].get_group()
-        else:
+        if include_cp and self.device_mesh["cp"].size() > 1:
             return self.device_mesh["dp_cp"].get_group()
+        return self.device_mesh["dp"].get_group()
 
-    def _get_dp_group_size(self, exclude_cp: bool = True):
-        """
-        Return the size of the data-parallel group.
-
-        Args:
-            exclude_cp: If True (default), return the size excluding CP dimension.
-                       Set to False only for gradient operations.
-        """
-        dp_group = self._get_dp_group(exclude_cp=exclude_cp)
+    def _get_dp_group_size(self, include_cp: bool = False):
+        dp_group = self._get_dp_group(include_cp=include_cp)
         return 1 if dp_group is None else dp_group.size()
 
-    def _get_dp_rank(self, exclude_cp: bool = True):
-        """
-        Return the rank within the data-parallel group.
-
-        Args:
-            exclude_cp: If True (default), return the rank within the DP-only group.
-                       Set to False only when CP group should be included.
-        """
+    def _get_dp_rank(self, include_cp: bool = False):
         if not self.device_mesh:
             return 0
-        elif exclude_cp or self.device_mesh["cp"].size() == 1:
-            return self.device_mesh.get_local_rank("dp")
-        else:
+        if include_cp and self.device_mesh["cp"].size() > 1:
             return self.device_mesh.get_local_rank("dp_cp")
+        return self.device_mesh.get_local_rank("dp")
 
     def _get_tp_rank(self):
         if not self.device_mesh or self.device_mesh["tp"].size() == 1:
@@ -454,18 +435,8 @@ class BaseRecipe:
             return 0
         return self.device_mesh.get_local_rank("pp")
 
-    def _dp_allreduce(self, tensor, op=dist.ReduceOp.SUM, exclude_cp: bool = True):
-        """
-        Perform an all-reduce operation across the data-parallel group.
-
-        Args:
-            tensor: The tensor to reduce.
-            op: The reduction operation (default: SUM).
-            exclude_cp: If True (default), reduce only across DP dimension (excluding CP).
-                       Use True for dataset sharding, metrics, and loss reporting.
-                       Set to False only for gradient operations.
-        """
-        dp_group = self._get_dp_group(exclude_cp=exclude_cp)
+    def _dp_allreduce(self, tensor, op=dist.ReduceOp.SUM, include_cp: bool = False):
+        dp_group = self._get_dp_group(include_cp=include_cp)
         if dp_group is not None:
             tensor = tensor.cuda()
             dist.all_reduce(tensor, op=op, group=dp_group)

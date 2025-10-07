@@ -207,7 +207,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             )
             local_loss = (1.0 - self.kd_ratio) * ce_loss + self.kd_ratio * kd_loss
             if is_train:
-                (local_loss * self._get_dp_group_size()).backward()
+                (local_loss * self._get_dp_group_size(include_cp=True)).backward()
             # return the losses for logging
             detached_local = local_loss.detach().clone()
             return detached_local, kd_loss.detach().clone(), ce_loss.detach().clone()
@@ -284,7 +284,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         self.timestamp = t
         tps = num_tokens_in_batch / time_delta
         reporting_loss = torch.sum(torch.stack(loss_buffer))
-        reporting_loss = self._dp_allreduce(reporting_loss)
+        reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
         reporting_loss = reporting_loss.cpu().item()
         # fix reporting_loss, tps across ranks
         return reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens
@@ -319,9 +319,9 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 kd_loss += _kd_loss
                 total_loss += local_loss
 
-        total_loss = self._dp_allreduce(total_loss).item()
-        ce_loss = self._dp_allreduce(ce_loss).item()
-        kd_loss = self._dp_allreduce(kd_loss).item()
+        total_loss = self._dp_allreduce(total_loss, include_cp=True).item()
+        ce_loss = self._dp_allreduce(ce_loss, include_cp=True).item()
+        kd_loss = self._dp_allreduce(kd_loss, include_cp=True).item()
         total_num_label_tokens = self._dp_allreduce(torch.tensor(total_num_label_tokens, dtype=torch.long)).item()
 
         val_loss = total_loss / max(total_num_label_tokens, 1e-8)
@@ -349,8 +349,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         """Override to log KD-specific metrics."""
         # Calculate average CE and KD losses from the buffers
         if len(getattr(self, "_ce_loss_buffer", [])) > 0:
-            ce_loss = self._dp_allreduce(torch.stack(self._ce_loss_buffer).sum()).item()
-            kd_loss = self._dp_allreduce(torch.stack(self._kd_loss_buffer).sum()).item()
+            ce_loss = self._dp_allreduce(torch.stack(self._ce_loss_buffer).sum(), include_cp=True).item()
+            kd_loss = self._dp_allreduce(torch.stack(self._kd_loss_buffer).sum(), include_cp=True).item()
             # Clear buffers for next step
             self._ce_loss_buffer.clear()
             self._kd_loss_buffer.clear()
