@@ -120,11 +120,12 @@ automodel = "nemo_automodel._cli.app:main"
 build = ["setuptools", "torch<=2.8.0"]
 docs = [
     "sphinx",
-    "sphinx-autobuild",    # For live doc serving while editing docs
-    "sphinx-autodoc2",     # For documenting Python API
-    "sphinx-copybutton",   # Adds a copy button for code blocks
-    "myst_parser",         # For our markdown docs
+    "sphinx-autobuild", # For live doc serving while editing docs
+    "sphinx-autodoc2", # For documenting Python API
+    "sphinx-copybutton", # Adds a copy button for code blocks
+    "myst_parser", # For our markdown docs
     "nvidia-sphinx-theme", # Our NVIDIA theme
+    "sphinx-new-tab-link>=0.8.0",
 ]
 linting = [
     "pre-commit>=4.2.0",
