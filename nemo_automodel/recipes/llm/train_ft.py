@@ -967,7 +967,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
-                    (local_loss * self._get_dp_group_size()).backward()
+                    (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
@@ -1007,7 +1007,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             pp_axis_name="pp" if self.pp_enabled else None,
             foreach=True,
             num_label_tokens=num_label_tokens,
-            dp_group_size=self._get_dp_group_size(),
+            dp_group_size=self._get_dp_group_size(include_cp=True),
         )
 
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
@@ -1042,7 +1042,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.timestamp = t
         tps = num_tokens_in_batch / time_delta
         reporting_loss = torch.sum(torch.stack(loss_buffer))
-        reporting_loss = self._dp_allreduce(reporting_loss)
+        reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
         if self.pp_enabled:
             reporting_loss = reporting_loss / num_label_tokens
             reporting_loss = reporting_loss.to(self.dist_env.device)
@@ -1086,7 +1086,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 total_loss += torch.sum(torch.stack(loss_buffer)).item()
                 total_num_label_tokens += num_label_tokens
 
-        total_loss = self._dp_allreduce(total_loss).item()
+        total_loss = self._dp_allreduce(total_loss, include_cp=True).item()
         total_num_label_tokens = self._dp_allreduce(torch.tensor(total_num_label_tokens, dtype=torch.long)).item()
 
         val_loss = total_loss / max(total_num_label_tokens, 1e-8)
@@ -1122,7 +1122,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             "grad_norm": grad_norm,
             "num_tokens_per_step": num_tokens_in_batch,
             "tps": tps,
-            "tps_per_gpu": tps / self._get_dp_group_size(),
+            "tps_per_gpu": tps / max(self._get_dp_group_size(), 1),
         }
         # assumes all model parts' optimizers have the same learning rate
         current_lr = self.optimizer[0].param_groups[0]["lr"]
@@ -1141,7 +1141,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     current_lr,
                     torch.cuda.max_memory_allocated() / 1024**3,
                     tps,
-                    tps / self._get_dp_group_size(),
+                    tps / max(self._get_dp_group_size(), 1),
                     num_label_tokens,
                 )
             )
