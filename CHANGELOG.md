@@ -18,9 +18,9 @@
 - Data
   - ColumnMapped Dataset for single-turn SFT
   - Pretrain Data: Megatron-Core and Nano-gpt compatible data
-- Performance [ tmp link ]
-- Pretraining benchmark for Large MoE user-defined models
-- Fast DeepSeek v3 implementation with DeepEP
+- Performance <https://docs.nvidia.com/nemo/automodel/latest/performance-summary.html>
+  - Pretraining benchmark for Large MoE user-defined models
+  - Fast DeepSeek v3 implementation with DeepEP
 
 ## NVIDIA NeMo-Automodel 0.1.0.a0
 
