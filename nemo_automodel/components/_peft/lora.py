@@ -340,16 +340,8 @@ def apply_lora_to_linear_modules(
     for w in model.parameters():
         w.requires_grad_(False)
 
-    is_causal_lm = False
-    try:
-        if hasattr(model, "config") and "CausalLM" in model.config.architectures[0]:
-            # for example, LlamaForCausalLM
-            is_causal_lm = True
-    except AttributeError:
-        is_causal_lm = False
-
     matcher = ModuleMatcher(
-        peft_config.target_modules, peft_config.exclude_modules, peft_config.match_all_linear, is_causal_lm
+        peft_config.target_modules, peft_config.exclude_modules, peft_config.match_all_linear, model,
     )
     num_modules_matched = 0
     for name, module in list(model.named_modules()):
