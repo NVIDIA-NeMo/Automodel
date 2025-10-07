@@ -107,6 +107,11 @@ moe = [
     # "flash-attn==2.7.4.post1",
     # "grouped_gemm",
 ]
+all = [
+    "nemo_curator[vlm]",
+    "nemo_curator[fa]",
+    "nemo_curator[moe]",
+]
 
 [project.urls]
 Homepage = "https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/stable/"
