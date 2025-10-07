@@ -208,7 +208,12 @@ class BaseRecipe:
                 tokenizer = getattr(self, key)
             elif is_dataloader(getattr(self, key)) or isinstance(getattr(self, key), StatefulRNG):
                 save_dp_aware_helper(
-                    getattr(self, key), key, path, self._get_dp_rank(), self._get_tp_rank(), self._get_pp_rank()
+                    getattr(self, key),
+                    key,
+                    path,
+                    self._get_dp_rank(include_cp=True),
+                    self._get_tp_rank(),
+                    self._get_pp_rank(),
                 )
             else:
                 if is_rank_0:
@@ -255,7 +260,7 @@ class BaseRecipe:
             elif is_lr_scheduler(getattr(self, key)):
                 scheduler = getattr(self, key)
             elif is_dataloader(getattr(self, key)) or isinstance(getattr(self, key), StatefulRNG):
-                load_dp_aware_helper(getattr(self, key), key, ckpt_dir, self._get_dp_rank())
+                load_dp_aware_helper(getattr(self, key), key, ckpt_dir, self._get_dp_rank(include_cp=True))
             elif is_tokenizer(getattr(self, key)) or isinstance(getattr(self, key), ConfigNode):
                 # we don't need to load the tokenizer or config from the checkpoint
                 # we only save the tokenizer for consolidated checkpoints for downstream use
@@ -402,25 +407,23 @@ class BaseRecipe:
         for k, v in attrs.items():
             logging.info(f"- {k}: {v}")
 
-    def _get_dp_group(self):
+    def _get_dp_group(self, include_cp: bool = False):
         if not self.device_mesh:
             return None
-        elif self.device_mesh["cp"].size() > 1:
+        if include_cp and self.device_mesh["cp"].size() > 1:
             return self.device_mesh["dp_cp"].get_group()
-        else:
-            return self.device_mesh["dp"].get_group()
+        return self.device_mesh["dp"].get_group()
 
-    def _get_dp_group_size(self):
-        dp_group = self._get_dp_group()
+    def _get_dp_group_size(self, include_cp: bool = False):
+        dp_group = self._get_dp_group(include_cp=include_cp)
         return 1 if dp_group is None else dp_group.size()
 
-    def _get_dp_rank(self):
+    def _get_dp_rank(self, include_cp: bool = False):
         if not self.device_mesh:
             return 0
-        elif self.device_mesh["cp"].size() > 1:
+        if include_cp and self.device_mesh["cp"].size() > 1:
             return self.device_mesh.get_local_rank("dp_cp")
-        else:
-            return self.device_mesh.get_local_rank("dp")
+        return self.device_mesh.get_local_rank("dp")
 
     def _get_tp_rank(self):
         if not self.device_mesh or self.device_mesh["tp"].size() == 1:
@@ -432,8 +435,8 @@ class BaseRecipe:
             return 0
         return self.device_mesh.get_local_rank("pp")
 
-    def _dp_allreduce(self, tensor, op=dist.ReduceOp.SUM):
-        dp_group = self._get_dp_group()
+    def _dp_allreduce(self, tensor, op=dist.ReduceOp.SUM, include_cp: bool = False):
+        dp_group = self._get_dp_group(include_cp=include_cp)
         if dp_group is not None:
             tensor = tensor.cuda()
             dist.all_reduce(tensor, op=op, group=dp_group)
