@@ -13,7 +13,7 @@
 # limitations under the License.
 
 ARG CUDA_BASE_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
-ARG PYTORCH_BASE_IMAGE=nvcr.io/nvidian/pytorch:25.09-py3
+ARG PYTORCH_BASE_IMAGE=nvcr.io/nvidia/pytorch:25.09-py3
 ARG AUTOMODEL_BASE_IMAGE=cuda
 
 FROM ${CUDA_BASE_IMAGE} AS cuda
