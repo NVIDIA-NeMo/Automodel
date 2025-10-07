@@ -137,7 +137,7 @@ runs:
       run: |
         echo "::group::Build test container"
         docker system prune -af
-        docker build -f docker/Dockerfile.ci  --secret id=GH_TOKEN -t automodel .
+        docker build -f docker/Dockerfile.ci --secret id=GH_TOKEN --target automodel_base -t automodel .
         echo "::endgroup::"
 
     - name: Start container

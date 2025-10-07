@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG BUILD_BASE_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
-ARG AUTOMODEL_BASE_IMAGE=cuda_base
+ARG CUDA_BASE_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+ARG PYTORCH_BASE_IMAGE=nvcr.io/nvidian/pytorch:25.09-py3
+ARG AUTOMODEL_BASE_IMAGE=cuda
 
 FROM ${BUILD_BASE_IMAGE} AS base
 WORKDIR /opt
 
-FROM base AS cuda_base
+FROM ${CUDA_BASE_IMAGE} AS cuda
 # Install dependencies
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -31,6 +32,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     libopenmpi-dev && \
     rm -rf /var/lib/apt/lists/*
+
+FROM {PYTORCH_BASE_IMAGE} AS pytorch
 
 FROM ${AUTOMODEL_BASE_IMAGE} AS automodel_base
 
@@ -47,7 +50,11 @@ RUN uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
 # Install Automodel
 COPY . /opt/Automodel
 RUN cd /opt/Automodel && \
-    uv sync --link-mode copy --locked --extra all --all-groups
+    if [ $AUTOMODEL_BASE_IMAGE = "pytorch" ]; then \
+        uv sync --link-mode copy --locked --extra all --all-groups $(cat /opt/Automodel/docker/common/pytorch_uv_args.txt) \
+    else \
+        uv sync --link-mode copy --locked --extra all --all-groups \
+    fi
 
 COPY <<EOF /opt/venv/env.sh
 export UV_PROJECT_ENVIRONMENT=/opt/venv
