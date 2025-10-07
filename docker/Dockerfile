@@ -49,9 +49,9 @@ RUN uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
 COPY . /opt/Automodel
 RUN cd /opt/Automodel && \
     if [ $AUTOMODEL_BASE_IMAGE = "pytorch" ]; then \
-        uv sync --link-mode copy --locked --extra all --all-groups $(cat /opt/Automodel/docker/common/pytorch_uv_args.txt) \
+        uv sync --link-mode copy --locked --extra all --all-groups $(cat /opt/Automodel/docker/common/pytorch_uv_args.txt); \
     else \
-        uv sync --link-mode copy --locked --extra all --all-groups \
+        uv sync --link-mode copy --locked --extra all --all-groups; \
     fi
 
 COPY <<EOF /opt/venv/env.sh
