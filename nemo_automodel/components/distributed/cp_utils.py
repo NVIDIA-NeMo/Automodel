@@ -132,6 +132,9 @@ def make_cp_batch_and_ctx(device_mesh, batch, labels, loss_mask=None):
     if _get_mesh_size(cp_mesh) <= 1:
         return nullcontext, batch
 
+    # CP doesn't support packed sequence currently. Let torch SDPA handle attention mask.
+    batch.pop("attention_mask", None)
+
     if "position_ids" not in batch and (_get_mesh_size(cp_mesh) > 1 or _get_mesh_size(tp_mesh) > 1):
         batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(batch["input_ids"].device)
 
