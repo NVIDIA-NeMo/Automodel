@@ -12,7 +12,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/release/python-3100/)
 [![GitHub Stars](https://img.shields.io/github/stars/NVIDIA-NeMo/Automodel.svg?style=social&label=Star)](https://github.com/NVIDIA-NeMo/Automodel/stargazers/)
 
-<!-- **Day-0 integration with Hugging Face models automating fine-tuning and pretraining with pytorch-native parallelism, custom-kernels and optimized recipes** 
+<!-- **Day-0 integration with Hugging Face models automating fine-tuning and pretraining with pytorch-native parallelism, custom-kernels and optimized recipes**
 **Pytorch DTensor‑native SPMD library for large‑scale training**-->
 
 [📖 Documentation](https://docs.nvidia.com/nemo/automodel/latest/index.html) • [🔥 Ready-to-Use Recipes](https://github.com/NVIDIA-NeMo/Automodel/#supported-models) • [💡 Examples](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples) • [🤝 Contributing](https://github.com/NVIDIA-NeMo/Automodel/blob/main/CONTRIBUTING.md)
@@ -295,7 +295,16 @@ NeMo AutoModel provides native support for a wide range of models available on t
 
 ## Performance
 
-Coming soon..
+NeMo AutoModel achieves great training performance on NVIDIA GPUs. Below are highlights from our benchmark results:
+
+| Model | #GPUs | Seq Length | Model TFLOPs/sec/GPU | Tokens/sec/GPU | Kernel Optimizations |
+|-------|------:|-----------:|---------------------:|---------------:|----------------------|
+| DeepSeek V3 671B | 256 | 4096 | 250 | 1,002 | TE + DeepEP |
+| GPT-OSS 20B | 8 | 4096 | 279 | 13,058 | TE + DeepEP + FlexAttn |
+| Qwen3 MoE 30B | 8 | 4096 | 212 | 11,842 | TE + DeepEP |
+
+For complete benchmark results including configuration details, see the [Performance Summary](docs/performance-summary.md).
+
 <!--
 ## Mesh‑Aware Checkpointing
 
