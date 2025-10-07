@@ -30,7 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libopenmpi-dev && \
     rm -rf /var/lib/apt/lists/*
 
-FROM {PYTORCH_BASE_IMAGE} AS pytorch
+FROM ${PYTORCH_BASE_IMAGE} AS pytorch
 
 FROM ${AUTOMODEL_BASE_IMAGE} AS automodel_base
 
