@@ -13,6 +13,7 @@
 # limitations under the License.
 
 ARG BUILD_BASE_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+ARG AUTOMODEL_BASE_IMAGE=cuda_base
 
 FROM ${BUILD_BASE_IMAGE} AS base
 WORKDIR /opt
@@ -31,7 +32,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libopenmpi-dev && \
     rm -rf /var/lib/apt/lists/*
 
-ARG AUTOMODEL_BASE_IMAGE=base
 FROM ${AUTOMODEL_BASE_IMAGE} AS automodel_base
 
 # Install uv
