@@ -402,25 +402,47 @@ class BaseRecipe:
         for k, v in attrs.items():
             logging.info(f"- {k}: {v}")
 
-    def _get_dp_group(self):
+    def _get_dp_group(self, exclude_cp: bool = True):
+        """
+        Return the data-parallel group.
+
+        Args:
+            exclude_cp: If True (default), return the DP group that EXCLUDES the CP dimension.
+                       Use True for dataset sharding, scheduler math, and metrics.
+                       Set to False only for gradient operations that need CP included.
+        """
         if not self.device_mesh:
             return None
-        elif self.device_mesh["cp"].size() > 1:
-            return self.device_mesh["dp_cp"].get_group()
-        else:
+        elif exclude_cp or self.device_mesh["cp"].size() == 1:
             return self.device_mesh["dp"].get_group()
+        else:
+            return self.device_mesh["dp_cp"].get_group()
 
-    def _get_dp_group_size(self):
-        dp_group = self._get_dp_group()
+    def _get_dp_group_size(self, exclude_cp: bool = True):
+        """
+        Return the size of the data-parallel group.
+
+        Args:
+            exclude_cp: If True (default), return the size excluding CP dimension.
+                       Set to False only for gradient operations.
+        """
+        dp_group = self._get_dp_group(exclude_cp=exclude_cp)
         return 1 if dp_group is None else dp_group.size()
 
-    def _get_dp_rank(self):
+    def _get_dp_rank(self, exclude_cp: bool = True):
+        """
+        Return the rank within the data-parallel group.
+
+        Args:
+            exclude_cp: If True (default), return the rank within the DP-only group.
+                       Set to False only when CP group should be included.
+        """
         if not self.device_mesh:
             return 0
-        elif self.device_mesh["cp"].size() > 1:
-            return self.device_mesh.get_local_rank("dp_cp")
-        else:
+        elif exclude_cp or self.device_mesh["cp"].size() == 1:
             return self.device_mesh.get_local_rank("dp")
+        else:
+            return self.device_mesh.get_local_rank("dp_cp")
 
     def _get_tp_rank(self):
         if not self.device_mesh or self.device_mesh["tp"].size() == 1:
@@ -432,8 +454,18 @@ class BaseRecipe:
             return 0
         return self.device_mesh.get_local_rank("pp")
 
-    def _dp_allreduce(self, tensor, op=dist.ReduceOp.SUM):
-        dp_group = self._get_dp_group()
+    def _dp_allreduce(self, tensor, op=dist.ReduceOp.SUM, exclude_cp: bool = True):
+        """
+        Perform an all-reduce operation across the data-parallel group.
+
+        Args:
+            tensor: The tensor to reduce.
+            op: The reduction operation (default: SUM).
+            exclude_cp: If True (default), reduce only across DP dimension (excluding CP).
+                       Use True for dataset sharding, metrics, and loss reporting.
+                       Set to False only for gradient operations.
+        """
+        dp_group = self._get_dp_group(exclude_cp=exclude_cp)
         if dp_group is not None:
             tensor = tensor.cuda()
             dist.all_reduce(tensor, op=op, group=dp_group)

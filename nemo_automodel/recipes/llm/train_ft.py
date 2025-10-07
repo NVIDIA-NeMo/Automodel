@@ -967,7 +967,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
-                    (local_loss * self._get_dp_group_size()).backward()
+                    # Include CP in gradient scaling
+                    (local_loss * self._get_dp_group_size(exclude_cp=False)).backward()
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
@@ -1007,7 +1008,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             pp_axis_name="pp" if self.pp_enabled else None,
             foreach=True,
             num_label_tokens=num_label_tokens,
-            dp_group_size=self._get_dp_group_size(),
+            dp_group_size=self._get_dp_group_size(exclude_cp=False),  # Include CP for gradient operations
         )
 
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
@@ -1122,7 +1123,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             "grad_norm": grad_norm,
             "num_tokens_per_step": num_tokens_in_batch,
             "tps": tps,
-            "tps_per_gpu": tps / self._get_dp_group_size(),
+            # Per-DP-rank throughput (exclude CP)
+            "tps_per_gpu": tps / max(self._get_dp_group_size(), 1),
         }
         # assumes all model parts' optimizers have the same learning rate
         current_lr = self.optimizer[0].param_groups[0]["lr"]
@@ -1141,7 +1143,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     current_lr,
                     torch.cuda.max_memory_allocated() / 1024**3,
                     tps,
-                    tps / self._get_dp_group_size(),
+                    tps / max(self._get_dp_group_size(), 1),
                     num_label_tokens,
                 )
             )
