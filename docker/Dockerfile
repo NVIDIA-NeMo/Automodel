@@ -16,9 +16,6 @@ ARG CUDA_BASE_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
 ARG PYTORCH_BASE_IMAGE=nvcr.io/nvidian/pytorch:25.09-py3
 ARG AUTOMODEL_BASE_IMAGE=cuda
 
-FROM ${BUILD_BASE_IMAGE} AS base
-WORKDIR /opt
-
 FROM ${CUDA_BASE_IMAGE} AS cuda
 # Install dependencies
 ENV DEBIAN_FRONTEND=noninteractive
@@ -37,6 +34,7 @@ FROM {PYTORCH_BASE_IMAGE} AS pytorch
 
 FROM ${AUTOMODEL_BASE_IMAGE} AS automodel_base
 
+WORKDIR /opt
 # Install uv
 ENV UV_VERSION="0.8.22"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
