@@ -1123,7 +1123,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             "grad_norm": grad_norm,
             "num_tokens_per_step": num_tokens_in_batch,
             "tps": tps,
-            # Per-DP-rank throughput (exclude CP)
             "tps_per_gpu": tps / max(self._get_dp_group_size(), 1),
         }
         # assumes all model parts' optimizers have the same learning rate
