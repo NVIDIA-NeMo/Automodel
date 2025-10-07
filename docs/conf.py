@@ -109,6 +109,9 @@ html_theme_options = {
     <script type="text/javascript">if (typeof _satellite !== "undefined") {_satellite.pageBottom();}</script>
     """
     },
+  "external_links": [
+      {"name": "NeMo Framework Documentation Hub", "url": "https://docs.nvidia.com/nemo/#framework"}
+  ]
 }
 html_extra_path = ["project.json", "versions1.json"]
 
