@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
-WORKDIR /workspace
+ARG BUILD_BASE_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
 
+FROM ${BUILD_BASE_IMAGE} AS base
+WORKDIR /opt
+
+FROM base AS cuda_base
 # Install dependencies
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -28,8 +31,35 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libopenmpi-dev && \
     rm -rf /var/lib/apt/lists/*
 
-COPY . .
-RUN --mount=type=secret,id=GH_TOKEN bash -ex <<"EOF"
-    export PAT=$(cat /run/secrets/GH_TOKEN)
-    bash docker/common/install.sh --base-image cuda
+ARG AUTOMODEL_BASE_IMAGE=base
+FROM ${AUTOMODEL_BASE_IMAGE} AS automodel_base
+
+# Install uv
+ENV UV_VERSION="0.8.22"
+RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
+ENV UV_CACHE_DIR=/opt/uv_cache
+ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
+ENV UV_LINK_MODE=copy
+RUN uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+
+# Install Automodel
+COPY . /opt/Automodel
+RUN cd /opt/Automodel && \
+    uv sync --link-mode copy --locked --extra all --all-groups
+
+COPY <<EOF /opt/venv/env.sh
+export UV_PROJECT_ENVIRONMENT=/opt/venv
+export PATH="/opt/venv/bin:$PATH"
+export UV_LINK_MODE=copy
+export PATH="/root/.local/bin:$PATH"
 EOF
+
+RUN chmod +x /opt/venv/env.sh
+
+ARG NVIDIA_BUILD_ID
+ENV NVIDIA_BUILD_ID=${NVIDIA_BUILD_ID:-<unknown>}
+LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
+ARG NVIDIA_BUILD_REF
+LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
