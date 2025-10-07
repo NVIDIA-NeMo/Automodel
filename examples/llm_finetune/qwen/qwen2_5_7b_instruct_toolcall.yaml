@@ -14,7 +14,7 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/qwen/qwen2_5_7b_instruct_toolcall.yaml
 # Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
 
@@ -36,7 +36,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B-Instruct
+  pretrained_model_name_or_path: Qwen/Qwen2.5-7B-Instruct
 
 # torch.compile configuration
 compile:
@@ -65,7 +65,10 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.make_xlam_dataset.make_xlam_dataset
+  _target_: nemo_automodel.components.datasets.llm.tool_calling_chat_dataset.ToolCallingChatDataset
+  path_or_dataset_id: your/path/to/train.jsonl
+  seq_length: 4096
+  # chat_template: null  # Optional: override tokenizer.chat_template
 
 packed_sequence:
   packed_sequence_size: 0
@@ -76,7 +79,10 @@ dataloader:
   shuffle: false
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.make_xlam_dataset.make_xlam_dataset
+  _target_: nemo_automodel.components.datasets.llm.tool_calling_chat_dataset.ToolCallingChatDataset
+  path_or_dataset_id: your/path/to/validation.jsonl
+  seq_length: 4096
+  # chat_template: null  # Optional: override tokenizer.chat_template
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -100,4 +106,5 @@ lr_scheduler:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
+
 
