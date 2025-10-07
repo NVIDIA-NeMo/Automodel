@@ -497,7 +497,9 @@ class GroupedExpertsDeepEP(nn.Module):
                 down_bias = self.down_proj_bias.to_local()
                 output2 = self._apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
         else:
-            output2 = torch.zeros((0, x.size(-1)), dtype=x.dtype, device=x.device)
+            output1 = torch.matmul(x[0] * 0, self.gate_and_up_projs.to_local()[0])
+            output1_ = self.expert_activation(output1, permuted_probs)
+            output2 = torch.matmul(output1_, self.down_projs.to_local()[0])
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
@@ -513,10 +515,11 @@ class FakeBalancedGate(nn.Module):
     how the load imbalance with real data is impacting end-to-end performance.
     """
 
-    def __init__(self, config: MoEConfig):
+    def __init__(self, config: MoEConfig, skip_first_n_experts: int = 0):
         super().__init__()
         self.n_routed_experts = config.n_routed_experts
         self.n_activated_experts = config.n_activated_experts
+        self.skip_first_n_experts = skip_first_n_experts
 
     def forward(
         self,
@@ -543,7 +546,10 @@ class FakeBalancedGate(nn.Module):
         n_exp = self.n_routed_experts
         a_exp = self.n_activated_experts
         weights = torch.ones(x.size(0), a_exp, device=x.device) / a_exp
-        indices = torch.arange(x.size(0) * a_exp, device=x.device).view(-1, a_exp) % n_exp
+        available_experts = n_exp - self.skip_first_n_experts
+        indices = (
+            torch.arange(x.size(0) * a_exp, device=x.device).view(-1, a_exp) % available_experts
+        ) + self.skip_first_n_experts
 
         return weights.type_as(x), indices, None
 
