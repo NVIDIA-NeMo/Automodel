@@ -75,13 +75,6 @@ model:
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
-      # _target_: nemo_automodel.components.moe.utils.FsdpOptimizationConfig
-      # defer_grad_sync_for_model: true
-      # defer_reshard_after_backward_for_model: true
-      # defer_grad_sync_for_lm_head: true
-      # defer_reshard_after_backward_for_lm_head: true
-      # defer_grad_sync_for_experts: true
-      # defer_reshard_after_backward_for_experts: true
 
 checkpoint:
   enabled: false
