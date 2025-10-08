@@ -109,82 +109,95 @@ def test_error_on_oversized_sequence():
 
 def test_seq_lens_padded():
     """
-    Test seq_lens_padded handling for identifier tokens that don't participate in attention.
+    Test seq_lens_padded is automatically generated from seq_lens.
 
-    Example: [a a a 1 b b 2 2 c c c c 3]
-    - seq_lens: [3, 2, 4] (actual attention tokens)
-    - seq_lens_padded: [4, 4, 5] (includes identifier tokens 1, 2 2, 3)
+    When packing sequences, seq_lens contains the actual sequence lengths,
+    and seq_lens_padded adds pack-level padding to the last sequence.
 
-    Uses identifier_token_id=99 to identify non-attention tokens.
+    Example: sequences [3, 2, 4] tokens that pack to size 13
+    - seq_lens: [3, 2, 4] (actual sequence lengths, sum = 9)
+    - seq_lens_padded: [3, 2, 8] (last sequence includes 4 padding tokens to reach size 13)
     """
-    # Dataset with sequences and identifier tokens
-    ds_with_identifiers = Dataset.from_dict(
+    # Dataset with sequences of varying lengths
+    ds = Dataset.from_dict(
         {
             "input_ids": [
-                [1, 2, 3, 99],  # [a a a 1] - 3 tokens + 1 identifier (99)
-                [4, 5, 99, 99],  # [b b 2 2] - 2 tokens + 2 identifiers (99)
-                [6, 7, 8, 9, 99],  # [c c c c 3] - 4 tokens + 1 identifier (99)
+                [1, 2, 3],  # 3 tokens
+                [4, 5],  # 2 tokens
+                [6, 7, 8, 9],  # 4 tokens
             ],
-            "labels": [[1, 2, 3, -100], [4, 5, -100, -100], [6, 7, 8, 9, -100]],
-            "seq_len_padded": [4, 4, 5],  # Includes identifier tokens
+            "labels": [[1, 2, 3], [4, 5], [6, 7, 8, 9]],
         }
     )
 
     packed_ds = pack_dataset(
-        ds_with_identifiers,
+        ds,
         split="train",
         packed_sequence_size=13,
         split_across_pack=False,
         max_packs=None,
-        padding_idx=99,
+        padding_idx=0,
     )
 
     assert len(packed_ds) == 1
-    # Verify seq_lens (attention tokens only: 3 + 2 + 4 = 9 tokens)
-    # Note: packed_ds is a HF Dataset, so items are already lists/arrays not tensors
+    # Verify seq_lens (actual sequence lengths: 3 + 2 + 4 = 9 tokens)
     import torch
     seq_lens = packed_ds[0]["seq_lens"]
     if isinstance(seq_lens, torch.Tensor):
         seq_lens = seq_lens.tolist()
     assert seq_lens == [3, 2, 4]
 
-    # Verify seq_lens_padded (includes identifiers: 4 + 4 + 5 = 13 tokens)
+    # Verify seq_lens_padded (last sequence includes padding: 3 + 2 + 8 = 13 tokens)
     assert "seq_lens_padded" in packed_ds[0]
     seq_lens_padded = packed_ds[0]["seq_lens_padded"]
     if isinstance(seq_lens_padded, torch.Tensor):
         seq_lens_padded = seq_lens_padded.tolist()
-    assert seq_lens_padded == [4, 4, 5]
+    assert seq_lens_padded == [3, 2, 8]  # Last element is 4 + 4 padding
 
-    # Verify all tokens are packed correctly
+    # Verify all tokens are packed correctly with padding
     input_ids = packed_ds[0]["input_ids"]
     if isinstance(input_ids, torch.Tensor):
         input_ids = input_ids.tolist()
-    assert input_ids == [1, 2, 3, 99, 4, 5, 99, 99, 6, 7, 8, 9, 99]
+    assert input_ids == [1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 0, 0, 0]
 
 
 def test_seq_lens_padded_with_split():
     """Test seq_lens_padded when splitting across packs"""
-    ds_with_identifiers = Dataset.from_dict(
+    ds = Dataset.from_dict(
         {
-            "input_ids": [[1, 2, 3, 99], [4, 5, 6, 7, 8, 99]],
-            "labels": [[1, 2, 3, -100], [4, 5, 6, 7, 8, -100]],
-            "seq_len_padded": [4, 6],
+            "input_ids": [[1, 2, 3], [4, 5, 6, 7, 8]],
+            "labels": [[1, 2, 3], [4, 5, 6, 7, 8]],
         }
     )
 
     packed_ds = pack_dataset(
-        ds_with_identifiers,
+        ds,
         split="train",
         packed_sequence_size=7,
         split_across_pack=True,
         max_packs=None,
-        padding_idx=99,
+        padding_idx=0,
     )
 
     # First pack should have seq_lens and seq_lens_padded
     assert "seq_lens_padded" in packed_ds[0]
     # Second pack should also have seq_lens_padded
     assert "seq_lens_padded" in packed_ds[1]
+
+    import torch
+    # Check that seq_lens_padded is correct for both packs
+    seq_lens_padded_0 = packed_ds[0]["seq_lens_padded"]
+    if isinstance(seq_lens_padded_0, torch.Tensor):
+        seq_lens_padded_0 = seq_lens_padded_0.tolist()
+
+    seq_lens_padded_1 = packed_ds[1]["seq_lens_padded"]
+    if isinstance(seq_lens_padded_1, torch.Tensor):
+        seq_lens_padded_1 = seq_lens_padded_1.tolist()
+
+    # First pack should have sequences with padding
+    # Second pack should have sequences with padding
+    assert len(seq_lens_padded_0) > 0
+    assert len(seq_lens_padded_1) > 0
 
 
 def test_seq_lens_padded_always_present(base_dataset):
@@ -199,3 +212,130 @@ def test_seq_lens_padded_always_present(base_dataset):
 
     # Verify seq_lens_padded is in output
     assert "seq_lens_padded" in packed_ds[0]
+    assert "seq_lens_padded" in packed_ds[1]
+
+    import torch
+    # Verify seq_lens vs seq_lens_padded for each pack
+    for i in range(len(packed_ds)):
+        seq_lens = packed_ds[i]["seq_lens"]
+        seq_lens_padded = packed_ds[i]["seq_lens_padded"]
+
+        if isinstance(seq_lens, torch.Tensor):
+            seq_lens = seq_lens.tolist()
+        if isinstance(seq_lens_padded, torch.Tensor):
+            seq_lens_padded = seq_lens_padded.tolist()
+
+        # seq_lens and seq_lens_padded should have the same length
+        assert len(seq_lens) == len(seq_lens_padded)
+
+        # The last element of seq_lens_padded should be >= the last element of seq_lens
+        # (includes padding)
+        assert seq_lens_padded[-1] >= seq_lens[-1]
+
+        # All non-last elements should be the same
+        assert seq_lens[:-1] == seq_lens_padded[:-1]
+
+
+def test_seq_lens_padded_exact_fit():
+    """Test seq_lens_padded when sequences exactly fit the pack size (no padding needed)"""
+    exact_fit_ds = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3], [4, 5]],  # Total = 5 tokens
+            "labels": [[1, 2, 3], [4, 5]],
+        }
+    )
+
+    packed_ds = pack_dataset(
+        exact_fit_ds,
+        split="train",
+        packed_sequence_size=5,
+        split_across_pack=False,
+        max_packs=None,
+    )
+
+    assert len(packed_ds) == 1
+    import torch
+    seq_lens = packed_ds[0]["seq_lens"]
+    seq_lens_padded = packed_ds[0]["seq_lens_padded"]
+
+    if isinstance(seq_lens, torch.Tensor):
+        seq_lens = seq_lens.tolist()
+    if isinstance(seq_lens_padded, torch.Tensor):
+        seq_lens_padded = seq_lens_padded.tolist()
+
+    # When no padding is needed, seq_lens and seq_lens_padded should be identical
+    assert seq_lens == [3, 2]
+    assert seq_lens_padded == [3, 2]
+
+
+def test_seq_lens_padded_multiple_packs():
+    """Test seq_lens_padded across multiple packs"""
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2], [3, 4], [5, 6], [7, 8]],
+            "labels": [[1, 2], [3, 4], [5, 6], [7, 8]],
+        }
+    )
+
+    packed_ds = pack_dataset(
+        ds,
+        split="train",
+        packed_sequence_size=5,
+        split_across_pack=False,
+        max_packs=None,
+    )
+
+    # Should create 2 packs: [1,2,3,4,0] and [5,6,7,8,0]
+    assert len(packed_ds) == 2
+
+    import torch
+    # Check first pack
+    seq_lens_0 = packed_ds[0]["seq_lens"]
+    seq_lens_padded_0 = packed_ds[0]["seq_lens_padded"]
+    if isinstance(seq_lens_0, torch.Tensor):
+        seq_lens_0 = seq_lens_0.tolist()
+    if isinstance(seq_lens_padded_0, torch.Tensor):
+        seq_lens_padded_0 = seq_lens_padded_0.tolist()
+
+    assert seq_lens_0 == [2, 2]
+    assert seq_lens_padded_0 == [2, 3]  # Last sequence includes 1 padding token
+
+    # Check second pack
+    seq_lens_1 = packed_ds[1]["seq_lens"]
+    seq_lens_padded_1 = packed_ds[1]["seq_lens_padded"]
+    if isinstance(seq_lens_1, torch.Tensor):
+        seq_lens_1 = seq_lens_1.tolist()
+    if isinstance(seq_lens_padded_1, torch.Tensor):
+        seq_lens_padded_1 = seq_lens_padded_1.tolist()
+
+    assert seq_lens_1 == [2, 2]
+    assert seq_lens_padded_1 == [2, 3]  # Last sequence includes 1 padding token
+
+
+def test_seq_lens_padded_sum():
+    """Test that sum of seq_lens_padded equals packed_sequence_size"""
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3], [4, 5], [6]],
+            "labels": [[1, 2, 3], [4, 5], [6]],
+        }
+    )
+
+    packed_sequence_size = 10
+    packed_ds = pack_dataset(
+        ds,
+        split="train",
+        packed_sequence_size=packed_sequence_size,
+        split_across_pack=False,
+        max_packs=None,
+    )
+
+    assert len(packed_ds) == 1
+    import torch
+    seq_lens_padded = packed_ds[0]["seq_lens_padded"]
+    if isinstance(seq_lens_padded, torch.Tensor):
+        seq_lens_padded = seq_lens_padded.tolist()
+
+    # Sum of seq_lens_padded should equal packed_sequence_size
+    assert sum(seq_lens_padded) == packed_sequence_size
+    assert seq_lens_padded == [3, 2, 5]  # 1 token + 4 padding = 5
