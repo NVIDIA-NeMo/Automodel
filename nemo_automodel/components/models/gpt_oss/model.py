@@ -21,6 +21,7 @@ from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
 from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention, RotaryEmbedding
 from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSStateDictAdapter
+from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
 from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -186,7 +187,7 @@ class GptOssModel(nn.Module):
                 layer.init_weights(buffer_device=buffer_device)
 
 
-class GptOssForCausalLM(nn.Module):
+class GptOssForCausalLM(nn.Module, MoEFSDPSyncMixin):
     @classmethod
     def from_config(
         cls,
