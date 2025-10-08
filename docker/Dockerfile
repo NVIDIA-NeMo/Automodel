@@ -48,7 +48,8 @@ RUN uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
 # Install Automodel
 COPY . /opt/Automodel
 RUN cd /opt/Automodel && \
-    uv sync --link-mode copy --locked --extra all --all-groups --no-install-package torch
+    NO_INSTALL_UV_ARGS=$(cat /opt/Automodel/docker/common/pytorch_uv_args.txt) \
+    uv sync --link-mode copy --locked --extra all --all-groups $NO_INSTALL_UV_ARGS
     # if [ "$AUTOMODEL_BASE_IMAGE" = "pytorch" ]; then \
     #     uv sync --link-mode copy --locked --extra all --all-groups $(cat /opt/Automodel/docker/common/pytorch_uv_args.txt); \
     # else \
