@@ -57,6 +57,7 @@ dist_env:
 parallelizer:
   _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
   activation_checkpointing: true
+  reshard_after_forward: false
 
 model:
   _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_config
@@ -73,6 +74,7 @@ model:
     enable_deepep: true
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: false
+    enable_fsdp_optimization: true
 
 checkpoint:
   enabled: false
