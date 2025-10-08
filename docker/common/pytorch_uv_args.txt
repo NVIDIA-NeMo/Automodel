@@ -1,6 +1,4 @@
---no-install-package torch
---no-install-package torchvision
---no-install-package triton
+--no-install-package flash-attn
 --no-install-package nvidia-cublas-cu12
 --no-install-package nvidia-cuda-cupti-cu12
 --no-install-package nvidia-cuda-nvrtc-cu12
@@ -13,3 +11,6 @@
 --no-install-package nvidia-cusparse-cu12
 --no-install-package nvidia-cusparselt-cu12
 --no-install-package nvidia-nccl-cu12
+--no-install-package torch
+--no-install-package torchvision
+--no-install-package triton
