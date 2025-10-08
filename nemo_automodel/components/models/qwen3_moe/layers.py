@@ -18,47 +18,17 @@ import torch
 from torch import nn
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
+from nemo_automodel.components.attention.utils import (
+    initialize_attn_module_and_func,
+    postprocess_output_for_attn,
+    preprocess_args_and_kwargs_for_attn,
+)
 from nemo_automodel.components.models.gpt_oss.layers import _apply_rotary_emb
 from nemo_automodel.components.moe.utils import (
     BackendConfig,
-    initialize_attn_module_and_func,
     initialize_linear_module,
     initialize_rms_norm_module,
 )
-
-
-def _preprocess_for_attn(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attention_mask: torch.Tensor | None, backend: BackendConfig
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-    """Preprocess attention inputs based on backend requirements.
-
-    Mirrors deepseek_v3.layers.preprocess_args_and_kwargs_for_attn but inlined to avoid import cycles.
-    """
-    if backend.attn == "te":
-        if attention_mask is None:
-            attn_kwargs = {}
-        else:
-            padding_mask = attention_mask.logical_not()
-            attn_kwargs = {
-                "attn_mask_type": "padding_causal",
-                "window_size": (-1, 0),
-                "attention_mask": padding_mask.unsqueeze(1).unsqueeze(2),
-            }
-    else:  # sdpa / flex
-        attn_kwargs = {}
-        # SDPA expects (B, H, S, D)
-        q = q.transpose(1, 2).contiguous()
-        k = k.transpose(1, 2).contiguous()
-        v = v.transpose(1, 2).contiguous()
-        attn_kwargs["is_causal"] = True
-
-    return q, k, v, attn_kwargs
-
-
-def _postprocess_from_attn(x: torch.Tensor, backend: BackendConfig) -> torch.Tensor:
-    if backend.attn == "sdpa":
-        x = x.transpose(1, 2).contiguous()
-    return x
 
 
 class Qwen3MoeAttention(nn.Module):
@@ -133,9 +103,11 @@ class Qwen3MoeAttention(nn.Module):
         k = _apply_rotary_emb(k, cos, sin)
 
         # Backend-specific attention
-        q, k, v, _attn_kwargs = _preprocess_for_attn(q, k, v, attention_mask, self.backend)
+        q, k, v, _attn_kwargs = preprocess_args_and_kwargs_for_attn(
+            q, k, v, attention_mask, self.backend.attn, **attn_kwargs
+        )
         out = self.attn_func(q, k, v, **_attn_kwargs)
-        out = _postprocess_from_attn(out, self.backend)
+        out = postprocess_output_for_attn(out, self.backend.attn)
 
         out = self.o_proj(out.flatten(2))
         return out

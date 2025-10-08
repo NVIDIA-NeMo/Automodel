@@ -12,16 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
 import importlib.util
 from dataclasses import dataclass
-from typing import Callable, Literal
+from typing import Literal
 
 import torch
-import torch.nn.functional as F
 from torch import nn
-
-from nemo_automodel.components.attention.flex_attention import FlexAttention
 
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
 HAVE_DEEP_EP = importlib.util.find_spec("deep_ep") is not None
@@ -36,49 +32,6 @@ class BackendConfig:
     fake_balanced_gate: bool = False
     enable_hf_state_dict_adapter: bool = True
     enable_fsdp_optimizations: bool = False
-
-
-def initialize_attn_module_and_func(
-    attn_impl: str,
-    num_attention_heads: int,
-    num_qk_channels: int,
-    num_v_channels: int,
-    softmax_scale: float,
-    attn_mask_type: str = "causal",
-    qkv_format: str = "bshd",
-    num_gqa_groups: int | None = None,
-    **kwargs,
-) -> tuple[nn.Module | None, Callable]:
-    if attn_impl == "te":
-        from transformer_engine.pytorch.attention import DotProductAttention
-
-        attn_module = DotProductAttention(
-            num_attention_heads=num_attention_heads,
-            kv_channels=(num_qk_channels, num_v_channels),
-            attn_mask_type=attn_mask_type,
-            qkv_format=qkv_format,
-            softmax_scale=softmax_scale,
-            num_gqa_groups=num_gqa_groups,
-            **kwargs,
-        )
-        attn_func = attn_module.__call__
-        return attn_module, attn_func
-    elif attn_impl == "sdpa":
-        attn_func = functools.partial(
-            F.scaled_dot_product_attention,
-            scale=softmax_scale,
-            is_causal=attn_mask_type == "causal",
-            enable_gqa=num_gqa_groups is not None,
-            **kwargs,
-        )
-        return None, attn_func
-    elif attn_impl == "flex":
-        attn_module = FlexAttention()
-        # We still return the module and a reference to its call for parity with other backends
-        attn_func = attn_module.__call__
-        return attn_module, attn_func
-    else:
-        raise ValueError(f"Unsupported attention implementation: {attn_impl}")
 
 
 def initialize_rms_norm_module(

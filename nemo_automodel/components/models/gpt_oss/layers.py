@@ -23,9 +23,9 @@ from torch.distributed.tensor import DTensor
 if TYPE_CHECKING:
     from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
+from nemo_automodel.components.attention.utils import initialize_attn_module_and_func
 from nemo_automodel.components.moe.utils import (
     BackendConfig,
-    initialize_attn_module_and_func,
     initialize_linear_module,
 )
 
