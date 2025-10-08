@@ -108,9 +108,9 @@ moe = [
     # "grouped_gemm",
 ]
 all = [
-    "nemo_curator[vlm]",
-    "nemo_curator[fa]",
-    "nemo_curator[moe]",
+    "nemo_automodel[vlm]",
+    "nemo_automodel[fa]",
+    "nemo_automodel[moe]",
 ]
 
 [project.urls]
