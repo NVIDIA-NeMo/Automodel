@@ -1311,12 +1311,16 @@ all = [
     { name = "mistral-common", extra = ["opencv"] },
     { name = "numba" },
     { name = "numpy" },
+    { name = "nvidia-nvshmem-cu13" },
     { name = "pillow" },
     { name = "qwen-vl-utils", extra = ["decord"], marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "timm" },
     { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "transformer-engine", extra = ["pytorch"] },
     { name = "transformers" },
+]
+deepep = [
+    { name = "nvidia-nvshmem-cu13" },
 ]
 fa = [
     { name = "flash-attn" },
@@ -1373,11 +1377,13 @@ requires-dist = [
     { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", specifier = ">=0.5.9" },
     { name = "megatron-fsdp" },
     { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'" },
+    { name = "nemo-automodel", extras = ["deepep"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["fa"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["moe"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["vlm"], marker = "extra == 'all'" },
     { name = "numba", marker = "extra == 'vlm'" },
     { name = "numpy", marker = "extra == 'vlm'" },
+    { name = "nvidia-nvshmem-cu13", marker = "extra == 'deepep'" },
     { name = "pillow", marker = "extra == 'vlm'" },
     { name = "pybind11" },
     { name = "pyyaml" },
@@ -1393,7 +1399,7 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'vlm'", specifier = "<=4.55.4" },
     { name = "wandb" },
 ]
-provides-extras = ["vlm", "fa", "moe", "all"]
+provides-extras = ["vlm", "fa", "moe", "deepep", "all"]
 
 [package.metadata.requires-dev]
 build = [
@@ -1645,6 +1651,15 @@ version = "12.8.93"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f6/74/86a07f1d0f42998ca31312f998bd3b9a7eff7f52378f4f270c8679c77fb9/nvidia_nvjitlink_cu12-12.8.93-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl", hash = "sha256:81ff63371a7ebd6e6451970684f916be2eab07321b73c9d244dc2b4da7f73b88", size = 39254836, upload-time = "2025-03-07T01:49:55.661Z" },
+]
+
+[[package]]
+name = "nvidia-nvshmem-cu13"
+version = "3.4.5"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/dc/0f/05cc9c720236dcd2db9c1ab97fff629e96821be2e63103569da0c9b72f19/nvidia_nvshmem_cu13-3.4.5-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:6dc2a197f38e5d0376ad52cd1a2a3617d3cdc150fd5966f4aee9bcebb1d68fe9", size = 60215947, upload-time = "2025-09-06T00:32:20.022Z" },
+    { url = "https://files.pythonhosted.org/packages/3c/35/a9bf80a609e74e3b000fef598933235c908fcefcef9026042b8e6dfde2a9/nvidia_nvshmem_cu13-3.4.5-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:290f0a2ee94c9f3687a02502f3b9299a9f9fe826e6d0287ee18482e78d495b80", size = 60412546, upload-time = "2025-09-06T00:32:41.564Z" },
 ]
 
 [[package]]

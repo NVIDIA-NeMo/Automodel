@@ -107,10 +107,14 @@ moe = [
     # "flash-attn==2.7.4.post1",
     # "grouped_gemm",
 ]
+deepep = [
+    "nvidia-nvshmem-cu13",
+]
 all = [
-    "nemo_automodel[vlm]",
+    "nemo_automodel[deepep]",
     "nemo_automodel[fa]",
     "nemo_automodel[moe]",
+    "nemo_automodel[vlm]",
 ]
 
 [project.urls]
