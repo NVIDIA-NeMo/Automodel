@@ -58,13 +58,14 @@ RUN cd /opt/Automodel && \
 # Install Deepep
 ARG INSTALL_DEEPEP=False
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
-RUN if [ "INSTALL_DEEPEP" = "True" ]; then \
+RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     git clone https://github.com/deepseek-ai/DeepEP.git && \
     cd DeepEP && \
     git pull && \
     git fetch origin $DEEPEP_COMMIT && \
-    git checkout FETCH_HEAD; fi && \
-    patch -p1 < /opt/Automodel/docker/common/deepep.patch
+    git checkout FETCH_HEAD && \
+    patch -p1 < /opt/Automodel/docker/common/deepep.patch && \
+    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --no-build-isolation -v .; fi
 
 COPY <<EOF /opt/venv/env.sh
 export UV_PROJECT_ENVIRONMENT=/opt/venv
