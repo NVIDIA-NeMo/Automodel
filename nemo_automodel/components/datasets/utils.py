@@ -244,7 +244,7 @@ def default_collater(batch, pad_seq_len_divisible=None):
 
 def packed_sequence_thd_collater(batch):
     """
-    Collater for packed sequences in THD (total, hidden, depth) format without padding.
+    Collater for packed sequences in THD (total, hidden, depth) format.
 
     This collater is designed for THD format, where multiple variable-length
     sequences are concatenated with/without padding tokens between them. The THD format represents
@@ -252,38 +252,57 @@ def packed_sequence_thd_collater(batch):
     lengths in the batch.
 
     Unlike traditional padding-based approaches (BSHD/SBHD formats), this THD format:
-    - Concatenates sequences directly without padding: [a a a b b c c c c]
-    - Uses seq_lens to identify sequence boundaries
+    - Concatenates sequences directly: [a a a b b c c c c]
+    - Uses seq_lens to identify sequence boundaries for attention computation
     - Supports optional identifier or padding tokens between sequences via seq_lens_padded
 
-    Args:
-        batch (List[dict]): A list of dictionaries, where each dictionary represents one example
-            with concatenated sequences. Each dictionary should contain:
-            - 'input_ids': List of token IDs for all packed sequences
-            - 'labels': List of labels for all packed sequences
-            - 'position_ids': List of position IDs for all packed sequences
-            - 'seq_lens': List of actual sequence lengths (used to compute cu_seqlens)
-            - 'seq_lens_padded': List of sequence lengths including identifier tokens
+    This collater supports both pipeline parallelism (PP) and non-PP use cases by:
+    - Stacking token-level tensors (input_ids, labels, position_ids) along batch dimension
+    - Padding and stacking seq_lens and seq_lens_padded with sentinel value -1000
+    - Including 'qkv_format': 'thd' in the output to indicate THD format
 
-            Example:
+    IMPORTANT: All examples in the batch must have the same token sequence length for input_ids,
+    labels, and position_ids. This is typically ensured by the dataset/packing logic that creates
+    fixed-length packed sequences.
+
+    Args:
+        batch (List[dict]): A list of dictionaries, where each dictionary represents one packed example.
+            Each dictionary should contain:
+            - 'input_ids': List[int] - Token IDs for all packed sequences (must be same length across batch)
+            - 'labels': List[int] - Labels for all packed sequences (must be same length across batch)
+            - 'position_ids': List[int] - Position IDs for all tokens (must be same length across batch)
+            - 'seq_lens': List[int] - Actual sequence lengths for each packed sequence
+            - 'seq_lens_padded': List[int] - Sequence lengths including identifier/padding tokens
+
+            Example batch with 2 examples, both with 6 total tokens:
             [
-                {'input_ids': [1,2,3,4,5,...], 'seq_lens': [3, 2, ...], 'seq_lens_padded': [4, 3, ...]},
-                {'input_ids': [6,7,8,9,...], 'seq_lens': [2, 2, ...], 'seq_lens_padded': [3, 3, ...]},
+                {
+                    'input_ids': [1, 2, 3, 99, 4, 5],  # Two sequences: [1,2,3] and [4,5] with sep token 99
+                    'labels': [1, 2, 3, -100, 4, 5],
+                    'position_ids': [0, 1, 2, 0, 0, 1],
+                    'seq_lens': [3, 2],  # Actual sequence lengths (excluding separator)
+                    'seq_lens_padded': [4, 2]  # Including separator token
+                },
+                {
+                    'input_ids': [6, 7, 99, 8, 9, 10],  # Two sequences with separator
+                    'labels': [6, 7, -100, 8, 9, 10],
+                    'position_ids': [0, 1, 0, 0, 1, 2],
+                    'seq_lens': [2, 3],
+                    'seq_lens_padded': [3, 3]
+                }
             ]
 
-            In this example, if seq_lens = [3, 2] and seq_lens_padded = [4, 3], it means:
-            - First sequence has 3 real tokens followed by 1 identifier token
-            - Second sequence has 2 real tokens followed by 1 identifier token
-            - cumulative seq_lens would be [0, 3, 5]
-            - cumulative seq_lens_padded would be [0, 4, 7] (for sequence boundaries)
-
     Returns:
-        dict: A dictionary with concatenated tensors:
-            - 'input_ids': tensor of shape [total_tokens] - all sequences concatenated
-            - 'labels': tensor of shape [total_tokens] - all labels concatenated
-            - 'position_ids': tensor of shape [total_tokens] - position IDs for each token
-            - 'seq_lens': tensor of shape [total_sequences] - cumulative sequence lengths for attention
-            - 'seq_lens_padded': tensor of shape [total_sequences] - cumulative lengths including identifiers
+        dict: A dictionary with batched tensors:
+            - 'input_ids': tensor of shape [batch_size, seq_len] - stacked token sequences
+            - 'labels': tensor of shape [batch_size, seq_len] - stacked labels
+            - 'position_ids': tensor of shape [batch_size, seq_len] - stacked position IDs
+            - 'seq_lens': tensor of shape [batch_size, max_num_packs] - padded sequence lengths
+            - 'seq_lens_padded': tensor of shape [batch_size, max_num_packs] - padded lengths with separators
+            - 'qkv_format': str - Always 'thd' to indicate THD format
+
+        Note: seq_lens and seq_lens_padded are padded with -1000 to handle variable number of
+        packed sequences per example. These sentinel values should be filtered out before use.
     """
     # Remove padding token IDs if present (not used in passthrough)
     if len(batch) > 0 and "___PAD_TOKEN_IDS___" in batch[0]:
@@ -294,11 +313,12 @@ def packed_sequence_thd_collater(batch):
     if len(batch) == 0:
         return {}
 
-    tokens = torch.cat([torch.tensor(x["input_ids"]) for x in batch])
-    labels = torch.cat([torch.tensor(x["labels"]) for x in batch])
-    position_ids = torch.cat([torch.tensor(x["position_ids"]) for x in batch])
-    seq_lens = torch.cat([torch.tensor(x["seq_lens"]) for x in batch])
-    seq_lens_padded = torch.cat([torch.tensor(x["seq_lens_padded"]) for x in batch])
+    tokens = batchify(torch.stack([torch.tensor(x["input_ids"]) for x in batch]))
+    labels = batchify(torch.stack([torch.tensor(x["labels"]) for x in batch]))
+    position_ids = batchify(torch.stack([torch.tensor(x["position_ids"]) for x in batch]))
+
+    seq_lens = batchify(torch.LongTensor(pad_within_micro([x["seq_lens"] for x in batch], -1000)))
+    seq_lens_padded = batchify(torch.LongTensor(pad_within_micro([x["seq_lens_padded"] for x in batch], -1000)))
 
     return {
         "input_ids": tokens,
@@ -306,6 +326,7 @@ def packed_sequence_thd_collater(batch):
         "position_ids": position_ids,
         "seq_lens": seq_lens,
         "seq_lens_padded": seq_lens_padded,
+        "qkv_format": "thd",
     }
 
 

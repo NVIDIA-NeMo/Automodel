@@ -954,11 +954,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
         batch = {
             k: (
-                {dk: dv.to(self.dist_env.device, non_blocking=True) if dv is not None else None for dk, dv in v.items()}
+                {
+                    dk: dv.to(self.dist_env.device, non_blocking=True) if dv is not None else None
+                    for dk, dv in v.items()
+                }
                 if isinstance(v, dict)
-                else v.to(self.dist_env.device, non_blocking=True)
-                if v is not None
-                else None
+                else (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
             )
             for k, v in batch.items()
         }

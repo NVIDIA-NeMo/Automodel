@@ -20,6 +20,7 @@ from nemo_automodel.components.attention.utils import (
     initialize_attn_module_and_func,
     preprocess_args_and_kwargs_for_attn,
     postprocess_output_for_attn,
+    process_input_for_thd,
 )
 
 
@@ -369,3 +370,182 @@ class TestEndToEndWorkflow:
 
         # Should remain the same shape
         assert final_output.shape == original_shape
+
+
+class TestProcessInputForTHD:
+    """Tests for process_input_for_thd function."""
+
+    def test_basic_conversion(self):
+        """Test basic conversion from BSHD to THD format with 2D token IDs."""
+        batch_size, seq_len = 2, 6
+        input_ids = torch.tensor([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]])
+        position_ids = torch.tensor([[0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5]])
+        seq_lens = torch.tensor([[6], [6]])
+        seq_lens_padded = torch.tensor([[6], [6]])
+
+        input_ids_thd, position_ids_thd, attn_kwargs = process_input_for_thd(
+            input_ids, position_ids, seq_lens, seq_lens_padded
+        )
+
+        # Check shapes - for 2D input [batch, seq], output is [batch*seq] (squeezed)
+        assert input_ids_thd.shape == (12,)
+        assert position_ids_thd.shape == (12,)
+
+        # Check values are preserved
+        assert torch.equal(input_ids_thd, torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]))
+
+        # Check cu_seqlens
+        assert "cu_seqlens_q" in attn_kwargs
+        assert "cu_seqlens_kv" in attn_kwargs
+        assert torch.equal(attn_kwargs["cu_seqlens_q"], torch.tensor([0, 6, 12], dtype=torch.int32))
+
+    def test_with_multiple_packed_sequences(self):
+        """Test with multiple packed sequences per example."""
+        input_ids = torch.tensor([[1, 2, 3, 99, 4, 5], [6, 7, 99, 8, 9, 10]])
+        position_ids = torch.tensor([[0, 1, 2, 0, 0, 1], [0, 1, 0, 0, 1, 2]])
+        seq_lens = torch.tensor([[3, 2], [2, 3]])
+        seq_lens_padded = torch.tensor([[4, 2], [3, 3]])
+
+        input_ids_thd, position_ids_thd, attn_kwargs = process_input_for_thd(
+            input_ids, position_ids, seq_lens, seq_lens_padded
+        )
+
+        # Check shapes - 2D input [batch, seq] becomes [batch*seq] (squeezed)
+        assert input_ids_thd.shape == (12,)
+        assert position_ids_thd.shape == (12,)
+
+        # Check cu_seqlens: [0, 3, 5, 7, 10]
+        # First batch: seq 1 (len 3), seq 2 (len 2) -> cumsum [0, 3, 5]
+        # Second batch: seq 1 (len 2), seq 2 (len 3) -> cumsum [5, 7, 10]
+        expected_cu_seqlens = torch.tensor([0, 3, 5, 7, 10], dtype=torch.int32)
+        assert torch.equal(attn_kwargs["cu_seqlens_q"], expected_cu_seqlens)
+
+        # Check cu_seqlens_padded: [0, 4, 6, 9, 12]
+        expected_cu_seqlens_padded = torch.tensor([0, 4, 6, 9, 12], dtype=torch.int32)
+        assert torch.equal(attn_kwargs["cu_seqlens_q_padded"], expected_cu_seqlens_padded)
+
+    def test_with_variable_num_sequences_and_padding(self):
+        """Test with variable number of sequences per example (seq_lens padding with -1000)."""
+        input_ids = torch.tensor([[1, 2, 3, 99, 4, 5], [6, 7, 8, 9, 10, 11]])
+        position_ids = torch.tensor([[0, 1, 2, 0, 0, 1], [0, 1, 2, 3, 4, 5]])
+        seq_lens = torch.tensor([[3, 2], [6, -1000]])  # -1000 is padding
+        seq_lens_padded = torch.tensor([[4, 2], [6, -1000]])
+
+        input_ids_thd, position_ids_thd, attn_kwargs = process_input_for_thd(
+            input_ids, position_ids, seq_lens, seq_lens_padded
+        )
+
+        # Check shapes - 2D input [batch, seq] becomes [batch*seq] (squeezed)
+        assert input_ids_thd.shape == (12,)
+        assert position_ids_thd.shape == (12,)
+
+        # Check cu_seqlens: [0, 3, 5, 11] (filters out -1000)
+        expected_cu_seqlens = torch.tensor([0, 3, 5, 11], dtype=torch.int32)
+        assert torch.equal(attn_kwargs["cu_seqlens_q"], expected_cu_seqlens)
+
+        # Check cu_seqlens_padded: [0, 4, 6, 12]
+        expected_cu_seqlens_padded = torch.tensor([0, 4, 6, 12], dtype=torch.int32)
+        assert torch.equal(attn_kwargs["cu_seqlens_q_padded"], expected_cu_seqlens_padded)
+
+    def test_without_position_ids(self):
+        """Test that position_ids can be None - should raise error since reshape depends on it."""
+        input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
+        seq_lens = torch.tensor([[4], [4]])
+        seq_lens_padded = torch.tensor([[4], [4]])
+
+        # Current implementation requires position_ids to determine reshape size
+        with pytest.raises(AttributeError):
+            input_ids_thd, position_ids_thd, attn_kwargs = process_input_for_thd(
+                input_ids, None, seq_lens, seq_lens_padded
+            )
+
+    def test_without_seq_lens(self):
+        """Test that seq_lens can be None (returns empty attn_kwargs)."""
+        input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        position_ids = torch.tensor([[0, 1, 2], [0, 1, 2]])
+
+        input_ids_thd, position_ids_thd, attn_kwargs = process_input_for_thd(input_ids, position_ids, None, None)
+
+        # 2D input [batch, seq] becomes [batch*seq] (squeezed)
+        assert input_ids_thd.shape == (6,)
+        assert position_ids_thd.shape == (6,)
+        assert attn_kwargs == {}
+
+    def test_complex_batch(self):
+        """Integration test with complex batch."""
+        input_ids = torch.tensor(
+            [[1, 2, 99, 3, 4, 5, 99, 6, 7], [10, 11, 12, 13, 14, 15, 16, 17, 18], [20, 21, 99, 22, 23, 99, 24, 25, 26]]
+        )
+        position_ids = torch.tensor(
+            [[0, 1, 0, 0, 1, 2, 0, 0, 1], [0, 1, 2, 3, 4, 5, 6, 7, 8], [0, 1, 0, 0, 1, 0, 0, 1, 2]]
+        )
+        seq_lens = torch.tensor([[2, 3, 2], [9, -1000, -1000], [2, 2, 3]])
+        seq_lens_padded = torch.tensor([[3, 4, 2], [9, -1000, -1000], [3, 3, 3]])
+
+        input_ids_thd, position_ids_thd, attn_kwargs = process_input_for_thd(
+            input_ids, position_ids, seq_lens, seq_lens_padded
+        )
+
+        # Check shapes - 2D input [batch, seq] becomes [batch*seq] (squeezed)
+        assert input_ids_thd.shape == (27,)
+        assert position_ids_thd.shape == (27,)
+
+        # seq_lens: [2, 3, 2, 9, 2, 2, 3] (filters out -1000)
+        # cu_seqlens: [0, 2, 5, 7, 16, 18, 20, 23]
+        expected_cu_seqlens = torch.tensor([0, 2, 5, 7, 16, 18, 20, 23], dtype=torch.int32)
+        assert torch.equal(attn_kwargs["cu_seqlens_q"], expected_cu_seqlens)
+
+        # Check that both q and kv have the same cu_seqlens
+        assert torch.equal(attn_kwargs["cu_seqlens_q"], attn_kwargs["cu_seqlens_kv"])
+
+    def test_dtype_preservation(self):
+        """Test that dtypes are preserved correctly."""
+        input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.long)
+        position_ids = torch.tensor([[0, 1, 2], [0, 1, 2]], dtype=torch.long)
+        seq_lens = torch.tensor([[3], [3]], dtype=torch.long)
+        seq_lens_padded = torch.tensor([[3], [3]], dtype=torch.long)
+
+        input_ids_thd, position_ids_thd, attn_kwargs = process_input_for_thd(
+            input_ids, position_ids, seq_lens, seq_lens_padded
+        )
+
+        assert input_ids_thd.dtype == torch.long
+        assert position_ids_thd.dtype == torch.long
+        assert attn_kwargs["cu_seqlens_q"].dtype == torch.int32
+        assert attn_kwargs["cu_seqlens_q_padded"].dtype == torch.int32
+
+    def test_with_embeddings_3d_input(self):
+        """Test with 3D embeddings input (pipeline parallelism scenario)."""
+        batch_size, seq_len, hidden_dim = 2, 6, 128
+        # Simulating embeddings instead of token IDs
+        embeddings = torch.randn(batch_size, seq_len, hidden_dim)
+        position_ids = torch.tensor([[0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5]])
+        seq_lens = torch.tensor([[6], [6]])
+        seq_lens_padded = torch.tensor([[6], [6]])
+
+        embeddings_thd, position_ids_thd, attn_kwargs = process_input_for_thd(
+            embeddings, position_ids, seq_lens, seq_lens_padded
+        )
+
+        # Check shapes - 3D input [batch, seq, hidden] becomes [batch*seq, hidden]
+        assert embeddings_thd.shape == (12, hidden_dim)  # [batch*seq, hidden_dim]
+        assert position_ids_thd.shape == (12,)
+
+        # Check cu_seqlens
+        assert torch.equal(attn_kwargs["cu_seqlens_q"], torch.tensor([0, 6, 12], dtype=torch.int32))
+
+    def test_2d_vs_3d_input_shapes(self):
+        """Test that 2D token IDs and 3D embeddings are handled correctly."""
+        batch_size, seq_len, hidden_dim = 2, 4, 64
+        position_ids = torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]])
+        seq_lens = torch.tensor([[4], [4]])
+
+        # Test with 2D token IDs
+        input_ids_2d = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
+        ids_thd, pos_thd, _ = process_input_for_thd(input_ids_2d, position_ids, seq_lens, None)
+        assert ids_thd.shape == (8,)  # [batch*seq] (squeezed)
+
+        # Test with 3D embeddings
+        embeddings_3d = torch.randn(batch_size, seq_len, hidden_dim)
+        emb_thd, pos_thd, _ = process_input_for_thd(embeddings_3d, position_ids, seq_lens, None)
+        assert emb_thd.shape == (8, hidden_dim)  # [batch*seq, hidden_dim]
