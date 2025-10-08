@@ -12,43 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Benchmarking config for Gptoss 120B Te Deepep
+# Benchmarking config for Deepseek V3 Te Deepep
 
 seed: 1234
 
-benchmark:
-  warmup_steps: 10
-  peak_tflops: 989  # H100 peak TFLOPs
+profiling:
   nsys_start: -1
   nsys_end: -1
-  nsys_ranks: []
+
+peak_tflops: 989  # H100 peak TFLOPs
 
 step_scheduler:
-  global_batch_size: 512
-  local_batch_size: 2
+  global_batch_size: 8192
+  local_batch_size: 8
   ckpt_every_steps: 1000
   val_every_steps: 1000
   num_epochs: 1
   max_steps: 30
-
-distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
-  tp_size: 1
-  cp_size: 1
-  pp_size: 1
-  dp_replicate_size: 1
-  ep_size: 64
-  sequence_parallel: false
-
-autopipeline:
-  _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
-  pp_schedule: interleaved1f1b
-  pp_microbatch_size: 2
-  round_virtual_stages_to_pp_multiple: down
-  scale_grads_in_schedule: false
-  patch_inner_model: false
-  patch_causal_lm_model: false
-  layers_per_stage: 2
+  warmup_steps: 10
 
 dist_env:
   backend: nccl
@@ -56,29 +37,48 @@ dist_env:
 
 parallelizer:
   _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
-  activation_checkpointing: false
-  reshard_after_forward: true
+  activation_checkpointing: true
+  reshard_after_forward: false
 
 model:
-  _target_: nemo_automodel.components.models.gpt_oss.model.GptOssForCausalLM.from_config
+  _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_config
   config:
     _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: openai/gpt-oss-120b
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
   trust_remote_code: true
   is_meta_device: true
   backend:
     _target_: nemo_automodel.components.moe.utils.BackendConfig
-    attn: flex
+    attn: te
     linear: te
     rms_norm: te
     enable_deepep: true
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: false
-    fsdp_optimization_config: null
+    enable_fsdp_optimization: true
 
 checkpoint:
   enabled: false
   load_base_model: false
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  tp_size: 1
+  cp_size: 1
+  pp_size: 4
+  dp_replicate_size: 1
+  ep_size: 64
+  sequence_parallel: false
+
+autopipeline:
+  _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
+  pp_schedule: interleaved1f1b
+  pp_microbatch_size: 1
+  round_virtual_stages_to_pp_multiple: down
+  scale_grads_in_schedule: false
+  patch_inner_model: false
+  patch_causal_lm_model: false
+  layers_per_stage: 4
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
