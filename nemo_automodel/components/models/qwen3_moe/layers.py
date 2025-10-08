@@ -23,7 +23,7 @@ from nemo_automodel.components.attention.utils import (
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
 )
-from nemo_automodel.components.models.gpt_oss.layers import _apply_rotary_emb
+from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb
 from nemo_automodel.components.moe.utils import (
     BackendConfig,
     initialize_linear_module,
@@ -86,12 +86,25 @@ class Qwen3MoeAttention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
-        bsz, seqlen, _ = x.size()
+        if len(x.shape) == 2:
+            qkv_format = "thd"
+            num_tokens = x.shape[0]
+        else:
+            qkv_format = "bshd"
+            bsz, seqlen, _ = x.size()
 
-        # Projections
-        q = self.q_proj(x).view(bsz, seqlen, self.num_heads, self.head_dim)
-        k = self.k_proj(x).view(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(x).view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        if qkv_format == "thd":
+            q = q.view(num_tokens, self.num_heads, self.head_dim)
+            k = k.view(num_tokens, self.num_kv_heads, self.head_dim)
+            v = v.view(num_tokens, self.num_kv_heads, self.head_dim)
+        else:
+            q = q.view(bsz, seqlen, self.num_heads, self.head_dim)
+            k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+            v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
         # Per-head RMSNorm
         q = self.q_norm(q)
@@ -99,8 +112,8 @@ class Qwen3MoeAttention(nn.Module):
 
         # RoPE (complex rotation)
         cos, sin = freqs_cis.split(self.head_dim // 2, dim=-1)
-        q = _apply_rotary_emb(q, cos, sin)
-        k = _apply_rotary_emb(k, cos, sin)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
 
         # Backend-specific attention
         q, k, v, _attn_kwargs = preprocess_args_and_kwargs_for_attn(
@@ -109,7 +122,8 @@ class Qwen3MoeAttention(nn.Module):
         out = self.attn_func(q, k, v, **_attn_kwargs)
         out = postprocess_output_for_attn(out, self.backend.attn)
 
-        out = self.o_proj(out.flatten(2))
+        flatten_dim = 2 if qkv_format == "bshd" else 1
+        out = self.o_proj(out.flatten(flatten_dim))
         return out
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02):
