@@ -435,6 +435,7 @@ def build_dataloader(
                 packed_sequence_size=packed_sequence_size,
                 split_across_pack=getattr(cfg_ps, "split_across_pack", False),
                 max_packs=getattr(cfg_ps, "max_packs", None),
+                padding_idx=getattr(tokenizer, "pad_token_id", 0),
             )
 
         if isinstance(ds, MegatronPretraining):

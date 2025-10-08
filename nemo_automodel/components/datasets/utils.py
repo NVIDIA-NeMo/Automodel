@@ -147,6 +147,73 @@ def default_collater(batch, pad_seq_len_divisible=None):
     return {k: batchify(torch.LongTensor(v)) for k, v in ans.items()}
 
 
+def packed_sequence_thd_collater(batch):
+    """
+    Collater for packed sequences in THD (total, hidden, depth) format without padding.
+
+    This collater is designed for THD format, where multiple variable-length
+    sequences are concatenated with/without padding tokens between them. The THD format represents
+    sequences as (total_tokens, hidden_dim, depth) where total_tokens is the sum of all sequence
+    lengths in the batch.
+
+    Unlike traditional padding-based approaches (BSHD/SBHD formats), this THD format:
+    - Concatenates sequences directly without padding: [a a a b b c c c c]
+    - Uses seq_lens to identify sequence boundaries
+    - Supports optional identifier or padding tokens between sequences via seq_lens_padded
+
+    Args:
+        batch (List[dict]): A list of dictionaries, where each dictionary represents one example
+            with concatenated sequences. Each dictionary should contain:
+            - 'input_ids': List of token IDs for all packed sequences
+            - 'labels': List of labels for all packed sequences
+            - 'position_ids': List of position IDs for all packed sequences
+            - 'seq_lens': List of actual sequence lengths (used to compute cu_seqlens)
+            - 'seq_lens_padded': List of sequence lengths including identifier tokens
+
+            Example:
+            [
+                {'input_ids': [1,2,3,4,5,...], 'seq_lens': [3, 2, ...], 'seq_lens_padded': [4, 3, ...]},
+                {'input_ids': [6,7,8,9,...], 'seq_lens': [2, 2, ...], 'seq_lens_padded': [3, 3, ...]},
+            ]
+
+            In this example, if seq_lens = [3, 2] and seq_lens_padded = [4, 3], it means:
+            - First sequence has 3 real tokens followed by 1 identifier token
+            - Second sequence has 2 real tokens followed by 1 identifier token
+            - cumulative seq_lens would be [0, 3, 5]
+            - cumulative seq_lens_padded would be [0, 4, 7] (for sequence boundaries)
+
+    Returns:
+        dict: A dictionary with concatenated tensors:
+            - 'input_ids': tensor of shape [total_tokens] - all sequences concatenated
+            - 'labels': tensor of shape [total_tokens] - all labels concatenated
+            - 'position_ids': tensor of shape [total_tokens] - position IDs for each token
+            - 'seq_lens': tensor of shape [total_sequences] - cumulative sequence lengths for attention
+            - 'seq_lens_padded': tensor of shape [total_sequences] - cumulative lengths including identifiers
+    """
+    # Remove padding token IDs if present (not used in passthrough)
+    if len(batch) > 0 and "___PAD_TOKEN_IDS___" in batch[0]:
+        for item in batch:
+            item.pop("___PAD_TOKEN_IDS___", None)
+
+    # Extract all keys from the first batch item
+    if len(batch) == 0:
+        return {}
+
+    tokens = torch.cat([torch.tensor(x["input_ids"]) for x in batch])
+    labels = torch.cat([torch.tensor(x["labels"]) for x in batch])
+    position_ids = torch.cat([torch.tensor(x["position_ids"]) for x in batch])
+    seq_lens = torch.cat([torch.tensor(x["seq_lens"]) for x in batch])
+    seq_lens_padded = torch.cat([torch.tensor(x["seq_lens_padded"]) for x in batch])
+
+    return {
+        "input_ids": tokens,
+        "labels": labels,
+        "position_ids": position_ids,
+        "seq_lens": seq_lens,
+        "seq_lens_padded": seq_lens_padded,
+    }
+
+
 class SFTSingleTurnPreprocessor:
     """
     Generic single-turn text-to-text SFT (supervised-fine-tuning) pre-processor.
