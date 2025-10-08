@@ -266,6 +266,126 @@ class TestFakeBalancedGate:
         for i in range(moe_config.n_routed_experts):
             assert i in flat_indices
 
+    def test_routing_with_skip_first_expert(self, moe_config, device):
+        """Test routing when skipping the first expert."""
+        skip_n = 1
+        gate = FakeBalancedGate(moe_config, skip_first_n_experts=skip_n)
+        gate = gate.to(device)
+
+        batch_size = 16
+        x = torch.randn(batch_size, moe_config.dim, device=device)
+        token_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+
+        weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
+
+        # Check indices skip the first expert (expert 0)
+        assert indices.min() >= skip_n
+        assert indices.max() < moe_config.n_routed_experts
+
+        # Check that expert 0 is never selected
+        assert (indices == 0).sum() == 0
+
+    def test_routing_with_skip_multiple_experts(self, moe_config, device):
+        """Test routing when skipping multiple experts."""
+        skip_n = 3
+        gate = FakeBalancedGate(moe_config, skip_first_n_experts=skip_n)
+        gate = gate.to(device)
+
+        batch_size = 32
+        x = torch.randn(batch_size, moe_config.dim, device=device)
+        token_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+
+        weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
+
+        # Check indices skip the first 3 experts (experts 0, 1, 2)
+        assert indices.min() >= skip_n
+        assert indices.max() < moe_config.n_routed_experts
+
+        # Check that experts 0, 1, 2 are never selected
+        for i in range(skip_n):
+            assert (indices == i).sum() == 0
+
+    def test_load_balancing_with_skip(self, moe_config, device):
+        """Test that load is balanced across available experts when skipping."""
+        skip_n = 2
+        gate = FakeBalancedGate(moe_config, skip_first_n_experts=skip_n)
+        gate = gate.to(device)
+
+        # Use a large batch to ensure good distribution
+        batch_size = 1000
+        x = torch.randn(batch_size, moe_config.dim, device=device)
+        token_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+
+        weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
+
+        # Count how many times each expert is selected
+        available_experts = moe_config.n_routed_experts - skip_n
+        expert_counts = torch.zeros(moe_config.n_routed_experts, dtype=torch.int64, device=device)
+        for i in range(moe_config.n_routed_experts):
+            expert_counts[i] = (indices == i).sum()
+
+        # First skip_n experts should have 0 assignments
+        assert expert_counts[:skip_n].sum() == 0
+
+        # Remaining experts should have roughly equal assignments
+        remaining_counts = expert_counts[skip_n:]
+        expected_count = (batch_size * moe_config.n_activated_experts) // available_experts
+
+        # Allow some tolerance for distribution
+        assert torch.all(remaining_counts > 0), "All available experts should be used"
+        assert torch.all(
+            torch.abs(remaining_counts - expected_count) < expected_count * 0.2
+        ), "Load should be roughly balanced"
+
+    def test_weights_are_uniform_with_skip(self, moe_config, device):
+        """Test that weights are always uniform regardless of skip parameter."""
+        for skip_n in [0, 1, 3]:
+            gate = FakeBalancedGate(moe_config, skip_first_n_experts=skip_n)
+            gate = gate.to(device)
+
+            batch_size = 8
+            x = torch.randn(batch_size, moe_config.dim, device=device)
+            token_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+
+            weights, _, _ = gate(x, token_mask, cp_mesh=None)
+
+            # All weights should be 1 / n_activated_experts
+            expected_weight = 1.0 / moe_config.n_activated_experts
+            assert torch.allclose(weights, torch.ones_like(weights) * expected_weight)
+
+    def test_skip_almost_all_experts(self, moe_config, device):
+        """Test edge case where we skip all but one expert."""
+        skip_n = moe_config.n_routed_experts - 1
+        gate = FakeBalancedGate(moe_config, skip_first_n_experts=skip_n)
+        gate = gate.to(device)
+
+        batch_size = 8
+        x = torch.randn(batch_size, moe_config.dim, device=device)
+        token_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+
+        weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
+
+        # All tokens should route to the last expert
+        assert torch.all(indices == moe_config.n_routed_experts - 1)
+
+    def test_output_dtype_matches_input(self, moe_config, device):
+        """Test that output weights match input dtype."""
+        gate = FakeBalancedGate(moe_config, skip_first_n_experts=0)
+        gate = gate.to(device)
+
+        batch_size = 8
+
+        # Test with float32
+        x_fp32 = torch.randn(batch_size, moe_config.dim, dtype=torch.float32, device=device)
+        token_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+        weights_fp32, _, _ = gate(x_fp32, token_mask, cp_mesh=None)
+        assert weights_fp32.dtype == torch.float32
+
+        # Test with float16
+        x_fp16 = torch.randn(batch_size, moe_config.dim, dtype=torch.float16, device=device)
+        weights_fp16, _, _ = gate(x_fp16, token_mask, cp_mesh=None)
+        assert weights_fp16.dtype == torch.float16
+
 
 class TestGate:
     """Test Gate (router) module."""
