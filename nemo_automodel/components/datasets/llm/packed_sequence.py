@@ -58,24 +58,15 @@ def _pad_pack(
         value=cross_entropy_ignore_idx,
     )
 
-    # Add padding tokens as a last seq len to ensure sum is packed_sequence_size
-    # - seq_lens: padding tokens don't participate in attention (count as 0)
-    # - seq_lens_padded: padding tokens are included in the total span
-    if "seq_lens_padded" in pack:
-        # seq_lens: keep as-is (no extra padding-only sequence)
-        padded_seq_lens = pack["seq_lens"]
-        # seq_lens_padded: add trailing pack padding to the last sequence's span
-        if num_padding_tokens > 0 and pack["seq_lens_padded"].numel() > 0:
-            last_augmented = pack["seq_lens_padded"][-1:] + num_padding_tokens
-            padded_seq_lens_padded = torch.cat([pack["seq_lens_padded"][:-1], last_augmented])
-        else:
-            padded_seq_lens_padded = pack["seq_lens_padded"]
+    # Store original seq_lens (actual sequence lengths without padding)
+    original_seq_lens = pack["seq_lens"].clone()
+
+    # seq_lens_padded: add padding tokens to the last sequence length
+    if num_padding_tokens > 0 and len(pack["seq_lens"]) > 0:
+        padded_seq_lens = pack["seq_lens"].clone()
+        padded_seq_lens[-1] = padded_seq_lens[-1] + num_padding_tokens
     else:
-        # Fallback when seq_lens_padded is missing (shouldn't happen with pack_dataset)
-        padded_seq_lens = (
-            torch.cat([pack["seq_lens"], torch.tensor([0])]) if num_padding_tokens > 0 else pack["seq_lens"]
-        )
-        padded_seq_lens_padded = None
+        padded_seq_lens = pack["seq_lens"].clone()
 
     # Pad position_ids continuing the sequence from last value
     # in position_ids
@@ -92,11 +83,9 @@ def _pad_pack(
         "input_ids": padded_tokens,
         "labels": padded_labels,
         "position_ids": padded_position_ids,
-        "seq_lens": padded_seq_lens,
+        "seq_lens": original_seq_lens,
+        "seq_lens_padded": padded_seq_lens,
     }
-    if padded_seq_lens_padded is not None:
-        padded_pack["seq_lens_padded"] = padded_seq_lens_padded
-
     return padded_pack
 
 
@@ -110,8 +99,6 @@ def _convert_to_tensors(pack: PACK_TYPE) -> PACK_TYPE:
         "position_ids": torch.tensor(pack["position_ids"], dtype=torch.long),
         "seq_lens": torch.tensor(pack["seq_lens"], dtype=torch.long),
     }
-    if "seq_lens_padded" in pack:
-        tensor_pack["seq_lens_padded"] = torch.tensor(pack["seq_lens_padded"], dtype=torch.long)
     return tensor_pack
 
 
@@ -145,26 +132,18 @@ def _should_stop_packing(max_packs: int, packs: list[PACK_TYPE]) -> bool:
 
 def _calculate_leftover_seq_len(
     current_pack: PACK_TYPE, split_across_pack, previous_sample_boundary, packed_sequence_size
-) -> tuple[int, list[int], list[int]]:
+) -> int:
     if split_across_pack:
         boundary = packed_sequence_size
         # The last elem in ``seq_lens`` ensures that ``sum(seq_lens) == packed_sequence_size``
         leftover_seq_len = packed_sequence_size - sum(current_pack["seq_lens"][:-1])
         seq_len_padding = [leftover_seq_len] if leftover_seq_len > 0 else []
-
-        # Calculate leftover for seq_lens_padded if present
-        if "seq_lens_padded" in current_pack:
-            leftover_seq_len_padded = packed_sequence_size - sum(current_pack["seq_lens_padded"][:-1])
-            seq_len_padded_padding = [leftover_seq_len_padded] if leftover_seq_len_padded > 0 else []
-        else:
-            seq_len_padded_padding = []
     else:
         boundary = previous_sample_boundary
         # If we aren't splitting across packs, we leave out the last sample b/c
         # it will go into the next pack
         seq_len_padding = []
-        seq_len_padded_padding = []
-    return boundary, seq_len_padding, seq_len_padded_padding
+    return boundary, seq_len_padding
 
 
 def _split_and_add_pack(
@@ -183,7 +162,7 @@ def _split_and_add_pack(
 
     TODO(@akoumparouli): refactor.
     """
-    boundary, seq_len_padding, seq_len_padded_padding = _calculate_leftover_seq_len(
+    boundary, seq_len_padding = _calculate_leftover_seq_len(
         current_pack,
         split_across_pack,
         previous_sample_boundary,
@@ -196,10 +175,6 @@ def _split_and_add_pack(
         "position_ids": current_pack["position_ids"][:boundary],
         "seq_lens": current_pack["seq_lens"][:-1] + seq_len_padding,
     }
-
-    # Handle seq_lens_padded if present
-    if "seq_lens_padded" in current_pack:
-        pack["seq_lens_padded"] = current_pack["seq_lens_padded"][:-1] + seq_len_padded_padding
 
     # Process and add the pack
     packs.append(
@@ -221,14 +196,6 @@ def _split_and_add_pack(
         "position_ids": current_pack["position_ids"][boundary:],
         "seq_lens": [next_seq_len],
     }
-
-    # Handle seq_lens_padded for next pack
-    if "seq_lens_padded" in current_pack:
-        next_seq_len_padded = (
-            len(current_pack["input_ids"][boundary:]) if split_across_pack else current_pack["seq_lens_padded"][-1]
-        )
-        output_dict["seq_lens_padded"] = [next_seq_len_padded]
-
     return output_dict
 
 
@@ -256,7 +223,6 @@ def pack_dataset(
             ``packed_sequence_size``, split the sample into the next pack, or move it entirely
             to the beginning of the next pack. Default: False
         max_packs (int): Maximum number of packs. Default: None
-        padding_idx (int): Token ID used for padding packs to packed_sequence_size. Default: 0
         drop_long_samples (bool): If True, drop samples that are longer than packed_sequence_size.
     """
     packs: list[PACK_TYPE] = []
@@ -272,9 +238,7 @@ def pack_dataset(
         "labels": [],
         "position_ids": [],
         "seq_lens": [],
-        "seq_lens_padded": [],
     }
-
     previous_sample_boundary: int = 0
 
     for sample in dataset:
@@ -284,34 +248,21 @@ def pack_dataset(
         # If the dataset outputs samples that are larger than the specified
         # packed_sequence_size and we're unable to split it, user needs to modify
         # one of the two parameters
-        total_len = len(input_ids)
-
-        # Compute lengths:
-        # - seq_len: only non-padding tokens (input_ids != padding_idx)
-        # - seq_len_padded: total span including identifier/padding tokens
-        if "seq_len_padded" in sample:
-            seq_len_padded = sample["seq_len_padded"]
-        else:
-            seq_len_padded = total_len
-        seq_len = sum(1 for token_id in input_ids if token_id != padding_idx)
-
-        if drop_long_samples and total_len > packed_sequence_size:
+        seq_len = len(input_ids)
+        if drop_long_samples and seq_len > packed_sequence_size:
             continue
 
-        if total_len > packed_sequence_size and not split_across_pack:
+        if seq_len > packed_sequence_size and not split_across_pack:
             raise ValueError(
-                f"Dataset sample is too long ({total_len} > {packed_sequence_size}). "
+                f"Dataset sample is too long ({seq_len} > {packed_sequence_size}). "
                 "Please set `split_across_pack=True` or increase `packed_sequence_size`.",
             )
-
         # Update the current pack
         # "position_ids" is the pos ids, "seq_lens" is the len of each seq within the pack
         current_pack["input_ids"] += input_ids
         current_pack["labels"] += labels
-        # Position IDs should cover all tokens (including identifiers)
-        current_pack["position_ids"] += [x % packed_sequence_size for x in range(total_len)]
+        current_pack["position_ids"] += [x % packed_sequence_size for x in range(seq_len)]
         current_pack["seq_lens"] += [seq_len]
-        current_pack["seq_lens_padded"] += [seq_len_padded]
 
         # If the current pack is over the packed_sequence_size, add it to packs and
         # retain any truncated or bumped samples for next pack
@@ -384,7 +335,7 @@ def create_block_causal_mask(seq_lens: list[torch.Tensor]) -> torch.Tensor:
                     dtype=torch.bool,
                 ),
             )
-            for seq_len in seq_lens[sample_idx]
+            for i, seq_len in enumerate(seq_lens[sample_idx])
         ]
 
         batch_block_attn_masks.append(torch.block_diag(*block_attn_masks))
