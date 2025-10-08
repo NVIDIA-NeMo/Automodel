@@ -39,10 +39,10 @@ parallelizer:
   activation_checkpointing: false
 
 model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  _target_: nemo_automodel.components.models.qwen3_moe.model.Qwen3MoeForCausalLM.from_config
   config:
     _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
+    pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
   backend:
     _target_: nemo_automodel.components.moe.utils.BackendConfig
     attn: te
@@ -82,10 +82,6 @@ loss_fn:
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
-    trust_remote_code: true
   path_or_dataset: rowan/hellaswag
   split: train
   pad_to_max_length: false
@@ -102,10 +98,6 @@ dataloader:
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
-    trust_remote_code: true
   path_or_dataset: rowan/hellaswag
   split: validation
   num_samples_limit: 64
@@ -117,7 +109,7 @@ validation_dataloader:
 optimizer:
   _target_: torch.optim.Adam
   betas: [0.9, 0.999]
-  eps: 1e-5
+  eps: 1e-7
   lr: 1.0e-4
   weight_decay: 0
   # min_lr: 1.0e-5
