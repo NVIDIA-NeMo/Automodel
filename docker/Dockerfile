@@ -46,6 +46,7 @@ ENV UV_LINK_MODE=copy
 RUN uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
 
 # Install Automodel
+ARG AUTOMODEL_BASE_IMAGE=cuda
 COPY . /opt/Automodel
 RUN cd /opt/Automodel && \
     NO_INSTALL_UV_ARGS=$(cat /opt/Automodel/docker/common/pytorch_uv_args.txt) && \
@@ -65,7 +66,8 @@ RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     git fetch origin $DEEPEP_COMMIT && \
     git checkout FETCH_HEAD && \
     patch -p1 < /opt/Automodel/docker/common/deepep.patch && \
-    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --no-build-isolation -v .; fi
+    NO_INSTALL_UV_ARGS=$(cat /opt/Automodel/docker/common/pytorch_uv_args.txt) && \
+    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --no-build-isolation -v . $NO_INSTALL_UV_ARGS; fi
 
 COPY <<EOF /opt/venv/env.sh
 export UV_PROJECT_ENVIRONMENT=/opt/venv
