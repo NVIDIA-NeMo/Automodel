@@ -67,7 +67,7 @@ RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     git checkout FETCH_HEAD && \
     patch -p1 < /opt/Automodel/docker/common/deepep.patch && \
     NO_INSTALL_UV_ARGS=$(cat /opt/Automodel/docker/common/pytorch_uv_args.txt) && \
-    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --no-build-isolation -v . $NO_INSTALL_UV_ARGS; fi
+    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv add --no-build-isolation -v . $NO_INSTALL_UV_ARGS; fi
 
 COPY <<EOF /opt/venv/env.sh
 export UV_PROJECT_ENVIRONMENT=/opt/venv
