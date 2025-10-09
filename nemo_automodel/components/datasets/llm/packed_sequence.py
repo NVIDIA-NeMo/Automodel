@@ -58,12 +58,15 @@ def _pad_pack(
         value=cross_entropy_ignore_idx,
     )
 
-    # Add padding tokens as a last seq len to ensure sum is packed_sequence_size
-    padded_seq_lens = (
-        torch.cat([pack["seq_lens"], torch.tensor([num_padding_tokens])])
-        if num_padding_tokens > 0
-        else pack["seq_lens"]
-    )
+    # Store original seq_lens (actual sequence lengths without padding)
+    original_seq_lens = pack["seq_lens"].clone()
+
+    # seq_lens_padded: add padding tokens to the last sequence length
+    if num_padding_tokens > 0 and len(pack["seq_lens"]) > 0:
+        padded_seq_lens = pack["seq_lens"].clone()
+        padded_seq_lens[-1] = padded_seq_lens[-1] + num_padding_tokens
+    else:
+        padded_seq_lens = pack["seq_lens"].clone()
 
     # Pad position_ids continuing the sequence from last value
     # in position_ids
@@ -80,7 +83,8 @@ def _pad_pack(
         "input_ids": padded_tokens,
         "labels": padded_labels,
         "position_ids": padded_position_ids,
-        "seq_lens": padded_seq_lens,
+        "seq_lens": original_seq_lens,
+        "seq_lens_padded": padded_seq_lens,
     }
     return padded_pack
 

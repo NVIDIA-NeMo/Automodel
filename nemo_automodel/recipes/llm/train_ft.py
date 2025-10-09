@@ -435,6 +435,7 @@ def build_dataloader(
                 packed_sequence_size=packed_sequence_size,
                 split_across_pack=getattr(cfg_ps, "split_across_pack", False),
                 max_packs=getattr(cfg_ps, "max_packs", None),
+                padding_idx=getattr(tokenizer, "pad_token_id", 0),
             )
 
         if isinstance(ds, MegatronPretraining):
@@ -921,7 +922,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_batches,
         is_train: bool = True,
     ):
-        batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
+        batch = {
+            k: v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+            for k, v in batch.items()
+        }
         labels = batch.pop("labels")
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
         if self.pp_enabled:

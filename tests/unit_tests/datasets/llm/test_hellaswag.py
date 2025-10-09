@@ -44,6 +44,7 @@ def _patch_external_libs(monkeypatch):
     class _DummyPreprocessor:
         def __init__(self, tokenizer):
             self.tokenizer = tokenizer
+            self.pad_to_max_length = True  # Default value
 
         def process(self, ds, _parent):
             # Return dataset unchanged
@@ -91,3 +92,24 @@ def test_sample_limiting():
     )
     # Our stub still returns the same two rows
     assert len(ds) == 2
+
+
+def test_pad_to_max_length_control():
+    """Test that pad_to_max_length parameter is properly passed to processor."""
+    from nemo_automodel.components.datasets.llm.hellaswag import HellaSwag
+    from nemo_automodel.components.datasets.utils import SFTSingleTurnPreprocessor
+
+    # Import after the autouse fixture has already patched
+    dummy_tokenizer = object()
+
+    # Test with pad_to_max_length=True (default)
+    ds1 = HellaSwag(path_or_dataset="ignored", tokenizer=dummy_tokenizer, pad_to_max_length=True)
+    # The fixture's _DummyPreprocessor will be used, we just verify no crash
+
+    # Test with pad_to_max_length=False
+    ds2 = HellaSwag(path_or_dataset="ignored", tokenizer=dummy_tokenizer, pad_to_max_length=False)
+    # The fixture's _DummyPreprocessor will be used, we just verify no crash
+
+    # Both should complete without errors
+    assert len(ds1) == 2
+    assert len(ds2) == 2

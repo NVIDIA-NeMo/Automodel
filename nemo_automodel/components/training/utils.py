@@ -40,7 +40,6 @@ def count_tail_padding(labels, ignore_label=-100):
     Returns:
         int: total number of ignored tokens in the `labels` input.
     """
-
     # Flip along the last dimension (seq_len)
     flipped = labels.flip(dims=[1])
     tail_mask = flipped == ignore_label

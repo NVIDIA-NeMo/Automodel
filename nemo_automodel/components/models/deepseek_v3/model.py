@@ -18,11 +18,12 @@ import torch
 import torch.nn as nn
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
+from nemo_automodel.components.attention.utils import process_input_for_thd
 from nemo_automodel.components.models.deepseek_v3.layers import MLA
+from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids, precompute_freqs_cis
 from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
-from nemo_automodel.components.moe.rope_utils import freqs_cis_from_position_ids, precompute_freqs_cis
 from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -53,7 +54,6 @@ class Block(nn.Module):
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
-        seq_lens: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
@@ -159,9 +159,15 @@ class DeepseekV3Model(nn.Module):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
-        seq_lens: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        bsz, seq_len = input_ids.shape[0], input_ids.shape[1]
+        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+            input_ids, position_ids, attn_kwargs = process_input_for_thd(
+                input_ids, position_ids, attn_kwargs["seq_lens"], attn_kwargs["seq_lens_padded"]
+            )
+            attention_mask = None
+
         if position_ids is None:
             position_ids = (
                 torch.arange(0, input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand(input_ids.shape[0], -1)
@@ -179,11 +185,11 @@ class DeepseekV3Model(nn.Module):
                 freqs_cis=freqs_cis,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
-                seq_lens=seq_lens,
                 **attn_kwargs,
             )
 
         h = self.norm(h) if self.norm else h
+        h = h.view(bsz, seq_len, -1)
         return h
 
     def update_moe_gate_bias(self) -> None:
@@ -259,7 +265,6 @@ class DeepseekV3ForCausalLM(nn.Module, MoEFSDPSyncMixin):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
-        seq_lens: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
         logits = self.model(
@@ -267,7 +272,6 @@ class DeepseekV3ForCausalLM(nn.Module, MoEFSDPSyncMixin):
             position_ids=position_ids,
             attention_mask=attention_mask,
             padding_mask=padding_mask,
-            seq_lens=seq_lens,
             **attn_kwargs,
         )
         logits = self.lm_head(logits) if self.lm_head else logits
