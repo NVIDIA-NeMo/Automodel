@@ -61,7 +61,12 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
-from nemo_automodel.components.training.utils import count_tail_padding, scale_grads_and_clip_grad_norm
+from nemo_automodel.components.training.utils import (
+    count_tail_padding,
+    prepare_for_final_backward,
+    prepare_for_grad_accumulation,
+    scale_grads_and_clip_grad_norm,
+)
 from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
     compile_model,
@@ -183,7 +188,7 @@ def build_model_and_optimizer(
     # hold a copy of the model state dict keys before any parallelization
     state_dict_keys = model.state_dict().keys()
 
-    if not _supports_logits_to_keep(model):
+    if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
         loss_fn = MaskedCrossEntropy()
 
@@ -761,6 +766,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     ("ep_shard",) if self.moe_mesh is not None and "ep_shard" in self.moe_mesh.mesh_dim_names else None
                 ),
                 pp_batch_size=pp_batch_size,
+                patch_stage_backward_maybe_with_nosync=self.cfg.get("model.backend.enable_fsdp_optimizations", False),
                 device=torch.cuda.current_device(),
             )
             assert isinstance(autopipeline, AutoPipeline), (
@@ -991,7 +997,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
         num_batches = len(batches)
+        prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
+
         for i, batch in enumerate(batches):
+            if i == num_batches - 1:
+                prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
+
             self._forward_backward_step(
                 i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
             )
@@ -1016,6 +1027,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         for opt in self.optimizer:
             opt.step()
             opt.zero_grad()
+
+        if hasattr(self.model_parts[0], "update_moe_gate_bias"):
+            for mp in self.model_parts:
+                mp.update_moe_gate_bias()
 
         if self.lr_scheduler is not None:
             for scheduler in self.lr_scheduler:
