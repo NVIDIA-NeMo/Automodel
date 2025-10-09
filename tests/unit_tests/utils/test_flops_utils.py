@@ -115,6 +115,7 @@ def _qwen3_cfg() -> SimpleNamespace:
         intermediate_size=14336,
         vocab_size=32000,
         moe_topk=1,
+        head_dim=256,
     )
 
 
@@ -156,7 +157,7 @@ def _gpt_oss_cfg() -> SimpleNamespace:
         ("llama3", flops_utils.llama3_flops, _llama3_cfg, dict(gbs=1, seq_len=2048), 90671054585856),
         ("nemotron", flops_utils.nemotron_flops, _nemotron_cfg, dict(gbs=1, seq_len=2048), 50470160695296),
         ("mixtral", flops_utils.mixtral_flops, _mixtral_cfg, dict(gbs=1, seq_len=2048), 169835891785728),
-        ("qwen3", flops_utils.qwen3_flops, _qwen3_cfg, dict(gbs=1, seq_len=2048), 90671054585856),
+        ("qwen3", flops_utils.qwen3_flops, _qwen3_cfg, dict(gbs=1, seq_len=2048), 110462263885824),
         ("bert", flops_utils.bert_flops, _bert_cfg, dict(gbs=1, seq_len=512), 361920724992),
         ("transformer", flops_utils.transformer_flops, _transformer_cfg, dict(gbs=1, seq_len=1024), 8363320541184),
         ("gpt_oss", flops_utils.gpt_oss_flops, _gpt_oss_cfg, dict(gbs=1, seq_len=1024), 7356800827392),
