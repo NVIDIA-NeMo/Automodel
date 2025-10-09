@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Union
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
 
 from datasets import VerificationMode, load_dataset
 from torch.utils.data import Dataset
@@ -46,9 +46,7 @@ def _as_iter(val: Union[str, Sequence[str]]) -> Iterator[str]:
             yield x
 
 
-def _load_openai_messages(
-    path_or_dataset_id: Union[str, Sequence[str]], split: Optional[str] = None
-):
+def _load_openai_messages(path_or_dataset_id: Union[str, Sequence[str]], split: Optional[str] = None):
     """Load OpenAI chat messages datasets from HF or local JSON/JSONL files.
 
     For HF repo IDs, we delegate to datasets.load_dataset.
@@ -115,7 +113,7 @@ class ToolCallingChatDataset(Dataset):
     """Dataset for OpenAI-format tool-calling chat transcripts.
 
     This class expects each row to contain a `messages` list in OpenAI chat format,
-    potentially including tool calls and tool responses. The datasetformats the 
+    potentially including tool calls and tool responses. The datasetformats the
     conversation via the tokenizer's chat template to produce `input_ids`, `labels`,
     and `attention_mask` suitable for SFT.
     """
@@ -139,9 +137,7 @@ class ToolCallingChatDataset(Dataset):
             tokenizer.chat_template = chat_template
 
         if not _has_chat_template(tokenizer):
-            raise ValueError(
-                "ToolCallingChatDataset requires a tokenizer with chat template support."
-            )
+            raise ValueError("ToolCallingChatDataset requires a tokenizer with chat template support.")
 
         self.tokenizer = tokenizer
         self.seq_length = seq_length
@@ -178,5 +174,3 @@ class ToolCallingChatDataset(Dataset):
             tools=tools,
         )
         return sample
-
-

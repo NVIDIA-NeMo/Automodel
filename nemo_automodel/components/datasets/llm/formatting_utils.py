@@ -174,7 +174,6 @@ def format_chat_template(
     else:
         input_ids = tokenizer.apply_chat_template(formatted_text)
 
-
     if isinstance(start_of_turn_token, str):
         start_of_turn_token_id = tokenizer(start_of_turn_token, add_special_tokens=False)["input_ids"][0]
         first_start_of_turn_token_id = input_ids.index(start_of_turn_token_id)
