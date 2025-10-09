@@ -24,7 +24,7 @@ benchmark:
   nsys_ranks: []
 
 step_scheduler:
-  global_batch_size: 256
+  global_batch_size: 512
   local_batch_size: 4
   ckpt_every_steps: 1000
   val_every_steps: 1000
