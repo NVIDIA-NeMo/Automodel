@@ -1,13 +1,18 @@
-import os, torch, wandb, torch.distributed as dist
-from typing import Optional, Dict
+import os
+from typing import Dict, Optional
+
+import torch
+import torch.distributed as dist
+import wandb
 from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
 
-from .dist_utils import setup_distributed, is_main_process, print0, cast_model_to_dtype
-from .fsdp_hybrid import setup_hybrid_for_pipe
-from .lora_utils import broadcast_params, allreduce_grads
+from .checkpoint_io import load_lora_checkpoint, save_lora_checkpoint
 from .data_utils import create_dataloader
+from .dist_utils import cast_model_to_dtype, is_main_process, print0, setup_distributed
+from .fsdp_hybrid import setup_hybrid_for_pipe
+from .lora_utils import allreduce_grads, broadcast_params
 from .training_step import step_dual_transformer
-from .checkpoint_io import save_lora_checkpoint, load_lora_checkpoint
+
 
 class WanI2VLoRATrainer:
     def __init__(
@@ -44,7 +49,9 @@ class WanI2VLoRATrainer:
     def setup_pipeline(self):
         print0("[INFO] Loading pipeline ...")
         vae = AutoencoderKLWan.from_pretrained(self.model_id, subfolder="vae", torch_dtype=torch.float32)
-        self.pipe = WanImageToVideoPipeline.from_pretrained(self.model_id, vae=vae, torch_dtype=torch.float32, boundary_ratio=self.boundary_ratio)
+        self.pipe = WanImageToVideoPipeline.from_pretrained(
+            self.model_id, vae=vae, torch_dtype=torch.float32, boundary_ratio=self.boundary_ratio
+        )
 
         cast_model_to_dtype(self.pipe.vae, self.bf16)
         self.pipe.vae.to(self.device, dtype=self.bf16).requires_grad_(False)
@@ -61,8 +68,12 @@ class WanI2VLoRATrainer:
 
     def setup_hybrid(self):
         self.model_map, self.transformer_names = setup_hybrid_for_pipe(
-            self.pipe, device=self.device, bf16=self.bf16,
-            local_rank=self.local_rank, lora_rank=self.lora_rank, lora_alpha=self.lora_alpha
+            self.pipe,
+            device=self.device,
+            bf16=self.bf16,
+            local_rank=self.local_rank,
+            lora_rank=self.lora_rank,
+            lora_alpha=self.lora_alpha,
         )
         # Broadcast LoRA params so all ranks start the same
         all_params = []
@@ -105,7 +116,9 @@ class WanI2VLoRATrainer:
         start_epoch = 0
 
         if resume_checkpoint:
-            global_step = load_lora_checkpoint(self.pipe, self.model_map, self.transformer_names, self.optimizer, self.lr_scheduler, resume_checkpoint)
+            global_step = load_lora_checkpoint(
+                self.pipe, self.model_map, self.transformer_names, self.optimizer, self.lr_scheduler, resume_checkpoint
+            )
             start_epoch = global_step // steps_per_epoch
 
         if is_main_process():
@@ -133,7 +146,8 @@ class WanI2VLoRATrainer:
             iterable = dataloader
             if is_main_process():
                 from tqdm import tqdm
-                iterable = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
+
+                iterable = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}")
 
             epoch_loss = 0.0
             num_steps = 0
@@ -184,20 +198,36 @@ class WanI2VLoRATrainer:
                     if hasattr(iterable, "set_postfix"):
                         iterable.set_postfix(
                             loss=f"{loss.item():.4f}",
-                            avg=f"{(epoch_loss/num_steps):.4f}",
+                            avg=f"{(epoch_loss / num_steps):.4f}",
                             lr=f"{self.optimizer.param_groups[0]['lr']:.2e}",
                             gn=f"{grad_norm:.2f}",
                         )
 
                 if save_every and (global_step % save_every == 0):
-                    save_lora_checkpoint(self.pipe, self.model_map, self.transformer_names, self.optimizer, self.lr_scheduler, output_dir, global_step)
+                    save_lora_checkpoint(
+                        self.pipe,
+                        self.model_map,
+                        self.transformer_names,
+                        self.optimizer,
+                        self.lr_scheduler,
+                        output_dir,
+                        global_step,
+                    )
 
-            print0(f"[INFO] Epoch {epoch+1} done. avg_loss={epoch_loss/max(num_steps,1):.6f}")
+            print0(f"[INFO] Epoch {epoch + 1} done. avg_loss={epoch_loss / max(num_steps, 1):.6f}")
             if is_main_process():
                 wandb.log({"epoch/avg_loss": epoch_loss / max(num_steps, 1), "epoch/num": epoch + 1}, step=global_step)
 
         if is_main_process():
-            save_lora_checkpoint(self.pipe, self.model_map, self.transformer_names, self.optimizer, self.lr_scheduler, output_dir, global_step)
+            save_lora_checkpoint(
+                self.pipe,
+                self.model_map,
+                self.transformer_names,
+                self.optimizer,
+                self.lr_scheduler,
+                output_dir,
+                global_step,
+            )
             final_dir = os.path.join(output_dir, "final")
             os.makedirs(final_dir, exist_ok=True)
             old = {}

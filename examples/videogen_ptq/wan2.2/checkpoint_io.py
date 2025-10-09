@@ -1,6 +1,9 @@
-import os, torch
-from typing import Dict, List
+import os
+
+import torch
+
 from .dist_utils import is_main_process, print0
+
 
 def _swap_to_base(pipe, transformer_names, model_map):
     old = {}
@@ -9,9 +12,11 @@ def _swap_to_base(pipe, transformer_names, model_map):
         setattr(pipe, name, model_map[name]["base_transformer"])
     return old
 
+
 def _restore_fsdp(pipe, transformer_names, old):
     for name in transformer_names:
         setattr(pipe, name, old[name])
+
 
 def save_lora_checkpoint(pipe, model_map, transformer_names, optimizer, scheduler, output_dir: str, step: int):
     if not is_main_process():
@@ -35,6 +40,7 @@ def save_lora_checkpoint(pipe, model_map, transformer_names, optimizer, schedule
     }
     torch.save(state, os.path.join(ckpt, "training_state.pt"))
     print0(f"[INFO] Checkpoint saved at step {step}")
+
 
 def load_lora_checkpoint(pipe, model_map, transformer_names, optimizer, scheduler, ckpt_path: str) -> int:
     if not os.path.exists(ckpt_path):

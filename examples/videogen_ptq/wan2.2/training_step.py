@@ -1,6 +1,9 @@
-import torch
 from typing import Dict
+
+import torch
+
 from .conditioning import prepare_i2v_conditioning
+
 
 def boundary_from_ratio(pipe, ratio: float):
     sch = pipe.scheduler
@@ -10,6 +13,7 @@ def boundary_from_ratio(pipe, ratio: float):
     if num_train is None:
         num_train = 1000
     return max(0, int(ratio * num_train)), num_train
+
 
 def step_dual_transformer(
     pipe,
@@ -44,9 +48,14 @@ def step_dual_transformer(
         if use_t1.any():
             idx = use_t1.nonzero(as_tuple=True)[0]
             m = model_map["transformer"]["fsdp"]
-            out = m(hidden_states=cond[idx], timestep=timesteps[idx], encoder_hidden_states=text_embeddings[idx], return_dict=False)
+            out = m(
+                hidden_states=cond[idx],
+                timestep=timesteps[idx],
+                encoder_hidden_states=text_embeddings[idx],
+                return_dict=False,
+            )
             pred = out[0] if isinstance(out, tuple) else out
-            mask = (1 - cond_mask[idx])
+            mask = 1 - cond_mask[idx]
             l = torch.nn.functional.mse_loss(pred * mask, noise[idx] * mask)
             s = l * len(idx)
             total_loss = s if total_loss is None else total_loss + s
@@ -55,9 +64,14 @@ def step_dual_transformer(
         if use_t2.any() and "transformer_2" in model_map:
             idx = use_t2.nonzero(as_tuple=True)[0]
             m = model_map["transformer_2"]["fsdp"]
-            out = m(hidden_states=cond[idx], timestep=timesteps[idx], encoder_hidden_states=text_embeddings[idx], return_dict=False)
+            out = m(
+                hidden_states=cond[idx],
+                timestep=timesteps[idx],
+                encoder_hidden_states=text_embeddings[idx],
+                return_dict=False,
+            )
             pred = out[0] if isinstance(out, tuple) else out
-            mask = (1 - cond_mask[idx])
+            mask = 1 - cond_mask[idx]
             l = torch.nn.functional.mse_loss(pred * mask, noise[idx] * mask)
             s = l * len(idx)
             total_loss = s if total_loss is None else total_loss + s

@@ -1,17 +1,26 @@
-import logging, os, warnings, torch, torch.distributed as dist
+import logging
+import os
+import warnings
+
+import torch
+import torch.distributed as dist
+
 
 def is_main_process() -> bool:
     return not dist.is_initialized() or dist.get_rank() == 0
 
+
 def print0(*a, **k):
     if is_main_process():
         print(*a, **k)
+
 
 def configure_logging():
     level = logging.INFO if is_main_process() else logging.ERROR
     logging.basicConfig(level=level)
     if dist.is_initialized() and dist.get_rank() != 0:
         warnings.filterwarnings("ignore")
+
 
 def setup_distributed():
     if not dist.is_initialized():
@@ -29,6 +38,7 @@ def setup_distributed():
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     return local_rank
+
 
 def cast_model_to_dtype(module, dtype):
     for p in module.parameters(recurse=True):

@@ -1,6 +1,7 @@
 import torch
 
-def prepare_i2v_conditioning(pipe, video_latents: torch.Tensor, timesteps: torch.Tensor, bf16) :
+
+def prepare_i2v_conditioning(pipe, video_latents: torch.Tensor, timesteps: torch.Tensor, bf16):
     """
     Keep the first frame clean (condition), noise the rest; returns
     (conditioned_latents[bf16], noise[bf16], condition_mask[bf16])

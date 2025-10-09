@@ -1,13 +1,14 @@
 from typing import Dict, List
-import torch
+
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.fully_sharded_data_parallel import (
-    BackwardPrefetch, MixedPrecision, ShardingStrategy
-)
+from torch.distributed.fsdp.fully_sharded_data_parallel import BackwardPrefetch, MixedPrecision, ShardingStrategy
+
 from .dist_utils import cast_model_to_dtype, print0
 from .lora_utils import (
-    wan_install_and_materialize_lora, collect_wan_lora_parameters,
+    collect_wan_lora_parameters,
+    wan_install_and_materialize_lora,
 )
+
 
 def setup_hybrid_for_pipe(pipe, device, bf16, local_rank: int, lora_rank: int, lora_alpha: int):
     """

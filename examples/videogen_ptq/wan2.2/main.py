@@ -1,5 +1,7 @@
 import argparse
+
 from wan_i2v_lora.trainer import WanI2VLoRATrainer
+
 
 def parse_args():
     p = argparse.ArgumentParser("WAN 2.2 I2V LoRA (FSDP hybrid)")
@@ -17,6 +19,7 @@ def parse_args():
     p.add_argument("--output_dir", type=str, default="./wan_i2v_outputs")
     p.add_argument("--resume_checkpoint", type=str, default=None)
     return p.parse_args()
+
 
 def main():
     a = parse_args()
@@ -38,7 +41,8 @@ def main():
         resume_checkpoint=a.resume_checkpoint,
     )
 
+
 if __name__ == "__main__":
     main()
 
-#torchrun --nproc-per-node=8 main.py --meta_folder /path/to/data --batch_size 1
+# torchrun --nproc-per-node=8 main.py --meta_folder /path/to/data --batch_size 1

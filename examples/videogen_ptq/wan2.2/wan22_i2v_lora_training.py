@@ -23,8 +23,8 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import (
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 
-
 # --------------------------- Utility Functions ---------------------------
+
 
 def is_main_process() -> bool:
     return not dist.is_initialized() or dist.get_rank() == 0
@@ -68,6 +68,7 @@ def cast_model_to_dtype(module: nn.Module, dtype: torch.dtype):
 
 
 # --------------------------- LoRA Helpers (WAN) ---------------------------
+
 
 def _install_wan_lora_processors(transformer: nn.Module):
     """
@@ -136,14 +137,15 @@ def _move_params(params: List[nn.Parameter], device: torch.device, dtype: torch.
 
 # --------------------------- Trainer ---------------------------
 
+
 class WanI2VDiffusersLoRATrainer:
     """WAN 2.2 I2V trainer using Diffusers-native LoRA with FSDP hybrid approach."""
 
     def __init__(
         self,
         model_id: str = "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-        lora_rank: int = 16,    # not used by WAN’s zero-arg proc – kept for CLI parity
-        lora_alpha: int = 32,   # not used by WAN’s zero-arg proc – kept for CLI parity
+        lora_rank: int = 16,  # not used by WAN’s zero-arg proc – kept for CLI parity
+        lora_alpha: int = 32,  # not used by WAN’s zero-arg proc – kept for CLI parity
         learning_rate: float = 1e-4,
         num_frames: int = 81,
         height: int = 480,
@@ -247,9 +249,7 @@ class WanI2VDiffusersLoRATrainer:
             raise RuntimeError("No transformers found in pipeline")
         print0(f"[INFO] Found transformers: {self.transformer_names}")
 
-        fsdp_mixed_precision = MixedPrecision(
-            param_dtype=self.bf16, reduce_dtype=self.bf16, buffer_dtype=self.bf16
-        )
+        fsdp_mixed_precision = MixedPrecision(param_dtype=self.bf16, reduce_dtype=self.bf16, buffer_dtype=self.bf16)
 
         self.model_map = {}
         for name in self.transformer_names:
@@ -306,9 +306,7 @@ class WanI2VDiffusersLoRATrainer:
             all_lora_params, lr=self.learning_rate, weight_decay=0.01, betas=(0.9, 0.999)
         )
         # Temp scheduler; reset after dataloader is built
-        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=1000, eta_min=1e-6
-        )
+        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=1000, eta_min=1e-6)
 
     # -------- Data --------
 
@@ -372,7 +370,7 @@ class WanI2VDiffusersLoRATrainer:
                     return_dict=False,
                 )
                 noise_pred = out[0] if isinstance(out, tuple) else out
-                non_cond = (1 - condition_mask[idx])
+                non_cond = 1 - condition_mask[idx]
                 loss = torch.nn.functional.mse_loss(noise_pred * non_cond, noise[idx] * non_cond)
                 total_loss = loss * len(idx) if total_loss is None else total_loss + loss * len(idx)
                 num_samples += len(idx)
@@ -387,7 +385,7 @@ class WanI2VDiffusersLoRATrainer:
                     return_dict=False,
                 )
                 noise_pred = out[0] if isinstance(out, tuple) else out
-                non_cond = (1 - condition_mask[idx])
+                non_cond = 1 - condition_mask[idx]
                 loss = torch.nn.functional.mse_loss(noise_pred * non_cond, noise[idx] * non_cond)
                 total_loss = loss * len(idx) if total_loss is None else total_loss + loss * len(idx)
                 num_samples += len(idx)
@@ -513,9 +511,7 @@ class WanI2VDiffusersLoRATrainer:
 
         steps_per_epoch = len(dataloader)
         total_steps = num_epochs * steps_per_epoch
-        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=total_steps, eta_min=1e-6
-        )
+        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=total_steps, eta_min=1e-6)
         print0(f"[INFO] Scheduler set for {total_steps} steps")
 
         # Resume
@@ -562,7 +558,12 @@ class WanI2VDiffusersLoRATrainer:
                     self._allreduce_lora_grads()
 
                     # clip
-                    grads = [p for name in self.transformer_names for p in self.model_map[name]["lora_params"] if p.grad is not None]
+                    grads = [
+                        p
+                        for name in self.transformer_names
+                        for p in self.model_map[name]["lora_params"]
+                        if p.grad is not None
+                    ]
                     grad_norm = 0.0
                     if grads:
                         grad_norm = torch.nn.utils.clip_grad_norm_(grads, max_norm=1.0)
@@ -629,11 +630,12 @@ class WanI2VDiffusersLoRATrainer:
 
 def main():
     import argparse
+
     parser = argparse.ArgumentParser(description="WAN 2.2 I2V Diffusers-native LoRA Training")
 
     # Model
     parser.add_argument("--model_id", type=str, default="Wan-AI/Wan2.2-I2V-A14B-Diffusers")
-    parser.add_argument("--lora_rank", type=int, default=16)   # kept for CLI parity; WAN ignores
+    parser.add_argument("--lora_rank", type=int, default=16)  # kept for CLI parity; WAN ignores
     parser.add_argument("--lora_alpha", type=int, default=32)  # kept for CLI parity; WAN ignores
     parser.add_argument("--boundary_ratio", type=float, default=0.5)
 
