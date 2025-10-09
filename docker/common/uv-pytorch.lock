@@ -33,6 +33,7 @@ overrides = [
     { name = "nvidia-cusparselt-cu12", marker = "sys_platform == 'never'" },
     { name = "nvidia-nccl-cu12", marker = "sys_platform == 'never'" },
     { name = "torch", marker = "sys_platform == 'never'", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "torchao", marker = "sys_platform == 'never'" },
     { name = "torchvision", marker = "sys_platform == 'never'" },
     { name = "triton", marker = "sys_platform == 'never'" },
 ]
@@ -1313,7 +1314,7 @@ dependencies = [
     { name = "pybind11" },
     { name = "pyyaml" },
     { name = "torch", marker = "sys_platform == 'never'" },
-    { name = "torchao" },
+    { name = "torchao", marker = "sys_platform == 'never'" },
     { name = "torchdata" },
     { name = "transformers" },
     { name = "wandb" },
@@ -3019,7 +3020,6 @@ name = "torchao"
 version = "0.12.0"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/72/5e/f5df5e0bbc7d84e5da3b4599b5bad58f4a6657b22bcae64dd741faee80ab/torchao-0.12.0-cp39-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:326ea2800cc7d9d50f0d17742ad923e5c6d4c4dd5942558f4ed13db00bdebc7c", size = 6777967, upload-time = "2025-07-17T17:50:13.567Z" },
     { url = "https://files.pythonhosted.org/packages/6c/5f/6bf9b5bed6d31e286516d23e1db7320d2ccfbf1b2234749833ad1e3d25a5/torchao-0.12.0-py3-none-any.whl", hash = "sha256:103f2a9164d2e4f705332af1aafbb8473eadd14d9164e45857ca187cde1f13d2", size = 962232, upload-time = "2025-07-17T17:50:15.119Z" },
 ]
 

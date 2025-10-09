@@ -13,6 +13,7 @@ override-dependencies = [
     "nvidia-cusparselt-cu12; sys_platform == 'never'",
     "nvidia-nccl-cu12; sys_platform == 'never'",
     "torch; sys_platform == 'never'",
+    "torchao; sys_platform == 'never'",
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
 ]
