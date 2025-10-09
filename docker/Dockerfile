@@ -69,7 +69,7 @@ RUN cd /opt/Automodel && \
     NO_INSTALL_UV_ARGS=$(cat /opt/Automodel/docker/common/pytorch_uv_args.txt) && \
     if [ "$INSTALL_DEEPEP" = "True" ]; then \
         TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" \
-        uv add --no-build-isolation -v deep_ep --path /opt/DeepEP --no-sync; \
+        uv add --no-build-isolation -v /opt/DeepEP --no-sync; \
     fi && \
     if [ "$AUTOMODEL_BASE_IMAGE" = "pytorch" ]; then \
         uv sync --locked --extra all --all-groups $NO_INSTALL_UV_ARGS; \
