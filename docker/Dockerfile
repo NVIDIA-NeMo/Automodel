@@ -60,7 +60,6 @@ RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     git fetch origin $DEEPEP_COMMIT && \
     git checkout FETCH_HEAD && \
     patch -p1 < /opt/deepep.patch && \
-    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv add --no-build-isolation -v . --no-sync && \
     rm -rf /opt/deepep.patch; fi
 
 # Install Automodel
@@ -68,6 +67,10 @@ ARG AUTOMODEL_BASE_IMAGE=cuda
 COPY . /opt/Automodel
 RUN cd /opt/Automodel && \
     NO_INSTALL_UV_ARGS=$(cat /opt/Automodel/docker/common/pytorch_uv_args.txt) && \
+    if [ "$INSTALL_DEEPEP" = "True" ]; then \
+        TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" \
+        uv add --no-build-isolation -v deep_ep --path /opt/DeepEP --no-sync; \
+    fi && \
     if [ "$AUTOMODEL_BASE_IMAGE" = "pytorch" ]; then \
         uv sync --locked --extra all --all-groups $NO_INSTALL_UV_ARGS; \
     else \
