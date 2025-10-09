@@ -79,6 +79,8 @@ try:
 except:
     pass
 
+from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
+
 logger = logging.getLogger(__name__)
 
 
@@ -253,7 +255,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         dp_mesh = device_mesh[dp_mesh_dim_names]
 
         for layer in layers:
-            fully_shard(layer, mesh=dp_mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+            fully_shard_by_dtype(layer, mesh=dp_mesh, mp_policy=mp_policy, offload_policy=offload_policy)
 
         # do not reshard after forward for root model
         # because its parameters will be used in backward immediately
