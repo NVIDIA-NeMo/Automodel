@@ -50,6 +50,7 @@ RUN mkdir /opt/Automodel
 COPY pyproject.toml uv.lock /opt/Automodel
 
 # Install Deepep
+COPY docker/common/deepep.patch /opt/deepep.patch
 ARG INSTALL_DEEPEP=False
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
@@ -58,9 +59,10 @@ RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     git pull && \
     git fetch origin $DEEPEP_COMMIT && \
     git checkout FETCH_HEAD && \
-    patch -p1 < /opt/Automodel/docker/common/deepep.patch && \
+    patch -p1 < /opt/deepep.patch && \
     NO_INSTALL_UV_ARGS=$(cat /opt/Automodel/docker/common/pytorch_uv_args.txt) && \
-    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv add --no-build-isolation -v . --no-sync; fi
+    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv add --no-build-isolation -v . --no-sync && \
+    rm -rf /opt/deepep.patch; fi
 
 # Install Automodel
 ARG AUTOMODEL_BASE_IMAGE=cuda
