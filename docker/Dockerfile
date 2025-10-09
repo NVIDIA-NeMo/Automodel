@@ -45,10 +45,6 @@ ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
 ENV UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1
 RUN uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
 
-# Copy Automodel dependency files
-RUN mkdir /opt/Automodel
-COPY pyproject.toml uv.lock /opt/Automodel
-
 # Install Deepep
 COPY docker/common/deepep.patch /opt/deepep.patch
 ARG INSTALL_DEEPEP=False
@@ -66,15 +62,14 @@ RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
 ARG AUTOMODEL_BASE_IMAGE=cuda
 COPY . /opt/Automodel
 RUN cd /opt/Automodel && \
-    NO_INSTALL_UV_ARGS=$(cat /opt/Automodel/docker/common/pytorch_uv_args.txt) && \
+    if [ "$AUTOMODEL_BASE_IMAGE" = "pytorch" ]; then \
+        sed -i '/\[tool\.uv\]/r /opt/Automodel/docker/common/uv-pytorch.toml' pyproject.toml && \
+        mv /opt/Automodel/docker/common/uv-pytorch.lock /opt/Automodel/uv.lock; \
+    fi && \
+    uv sync --locked --extra all --all-groups && \
     if [ "$INSTALL_DEEPEP" = "True" ]; then \
         TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" \
-        uv add --no-build-isolation -v /opt/DeepEP --no-sync; \
-    fi && \
-    if [ "$AUTOMODEL_BASE_IMAGE" = "pytorch" ]; then \
-        uv sync --locked --extra all --all-groups $NO_INSTALL_UV_ARGS; \
-    else \
-        uv sync --locked --extra all --all-groups; \
+        uv add --no-build-isolation -v /opt/DeepEP; \
     fi
 
 COPY <<EOF /opt/venv/env.sh
