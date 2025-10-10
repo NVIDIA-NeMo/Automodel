@@ -6,9 +6,15 @@
 
 ```bash
 # Set build arguments
-export BASE_IMAGE=cuda #options [cuda, pytorch]
-export INSTALL_DEEPEP=False
-docker build -f docker/Dockerfile --build-arg AUTOMODEL_BASE_IMAGE=$BASE_IMAGE --build-arg INSTALL_DEEPEP=$INSTALL_DEEPEP -t automodel --target=automodel_base .
+export AUTOMODEL_INSTALL=dev #[all, dev, deepep, fa, moe, vlm]
+export BASE_IMAGE=cuda #[cuda, pytorch]
+export INSTALL_DEEPEP=False #[True, False]
+
+docker build -f docker/Dockerfile \
+--build-arg AUTOMODEL_INSTALL=$AUTOMODEL_INSTALL \
+--build-arg BASE_IMAGE=$BASE_IMAGE \
+--build-arg INSTALL_DEEPEP=$INSTALL_DEEPEP \
+-t automodel --target=automodel_final .
 ```
 
 * Run the following command to start your container:
