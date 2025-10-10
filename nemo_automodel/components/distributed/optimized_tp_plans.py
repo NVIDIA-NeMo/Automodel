@@ -39,6 +39,7 @@ from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
+from transformers.models.qwen3.modeling_qwen3 import Qwen3ForSequenceClassification
 
 
 class RotaryEmbedParallel(SequenceParallel):
@@ -265,6 +266,7 @@ def _parallelize_phi3(
 PARALLELIZE_FUNCTIONS: Dict[type, Callable[..., Dict[str, ParallelStyle]]] = {
     Qwen2ForCausalLM: _parallelize_qwen,
     Qwen3ForCausalLM: _parallelize_qwen,
+    Qwen3ForSequenceClassification: _parallelize_qwen,
     LlamaForCausalLM: _parallelize_llama,
     # gemma-3-1b-it uses Gemma3ForCausalLM since it is a text-only model
     Gemma3ForCausalLM: _parallelize_gemma3,
