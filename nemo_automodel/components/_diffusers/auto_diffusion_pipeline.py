@@ -95,6 +95,7 @@ class NeMoAutoDiffusionPipeline(DiffusionPipeline):
 
         # Use per-component FSDP2Manager mappings to parallelize components
         if parallel_scheme is not None:
+            assert torch.distributed.is_initialized(), "Expect distributed environment to be initialized"
             for comp_name, comp_module in _iter_pipeline_modules(pipe):
                 manager = parallel_scheme.get(comp_name)
                 if manager is None:

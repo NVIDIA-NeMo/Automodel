@@ -11,26 +11,14 @@ from diffusers.utils import export_to_video
 
 from nemo_automodel.components._diffusers import NeMoAutoDiffusionPipeline
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
+from nemo_automodel.distributed.init_utils import initialize_distributed
+from nemo_automodel.utils.logging import setup_logging
 
-def is_main_process() -> bool:
-    return not dist.is_initialized() or dist.get_rank() == 0
-
-def print0(*args, **kwargs):
-    if is_main_process():
-        print(*args, **kwargs)
-
-def configure_logging_quiet_others():
-    level = logging.INFO if is_main_process() else logging.ERROR
-    logging.basicConfig(level=level)
-    if dist.is_initialized() and dist.get_rank() != 0:
-        warnings.filterwarnings("ignore")
-        sys.stdout = open(os.devnull, "w")
 
 def setup_dist() -> int:
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
-    configure_logging_quiet_others()
 
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -85,7 +73,10 @@ def parse_args():
 
 def main():
     args = parse_args()
-    local_rank = setup_dist()
+    initialize_distributed(backend="nccl", timeout_minutes=10)
+    setup_logging()
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
     world_size = dist.get_world_size()
     device = torch.device("cuda", local_rank)
     bf16 = torch.bfloat16
@@ -98,7 +89,7 @@ def main():
     dp_rank = local_rank // (tp_size * cp_size * pp_size)
     
     # -------- Load pipeline --------
-    print0("[Loading] Loading VAE and pipeline...")
+    logging.info("[Loading] Loading VAE and pipeline...")
     vae = AutoencoderKLWan.from_pretrained(
         "Wan-AI/Wan2.2-T2V-A14B-Diffusers", subfolder="vae", torch_dtype=torch.bfloat16
     )
@@ -127,11 +118,11 @@ def main():
         device=device,
         parallel_scheme=parallel_scheme,
     )
-    print0("[Setup] Pipeline loaded and parallelized via NeMoAutoDiffusionPipeline")
+    logging.info("[Setup] Pipeline loaded and parallelized via NeMoAutoDiffusionPipeline")
     dist.barrier()
 
     # -------- Inference --------
-    print0("[Inference] Starting distributed inference...")
+    logging.info("[Inference] Starting distributed inference...")
     torch.manual_seed(args.seed+dp_rank)
 
     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=bf16):
@@ -145,15 +136,14 @@ def main():
             num_inference_steps=args.num_inference_steps,
         ).frames[0]
 
-    if is_main_process():
+    if dist.get_rank() == 0:
         export_to_video(out, args.output, fps=args.fps)
-        print0(f"[Inference] Saved {args.output}")
+        logging.info(f"[Inference] Saved {args.output}")
 
     dist.barrier()
-    print0(
+    logging.info(
         f"[Complete] Automodel FSDP2 inference completed! TP={tp_size}, CP={cp_size}, PP={pp_size}, DP={dp_size}"
     )
-
     dist.destroy_process_group()
 
 
