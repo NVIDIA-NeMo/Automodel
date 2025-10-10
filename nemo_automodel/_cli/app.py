@@ -103,6 +103,69 @@ def get_automodel_repo_root():
         return cwd
     return None
 
+def launch_with_lepton(args, job_conf_path, job_dir, lepton_config, extra_args=None):
+    import nemo_run as run
+    from nemo_automodel.components.launcher.lepton.utils import create_lepton_executor
+
+    # Determine a repo root only for logging purposes. Code will be packaged by nemo_run.
+    if repo_root := get_automodel_repo_root():
+        repo_root = str(repo_root)
+        logging.info(f"Running job using source from: {repo_root}")
+    else:
+        repo_root = "/opt/Automodel"
+    logging.info(f"Using {repo_root} as code repo")
+
+    # Make default name
+    if lepton_config.get("job_name", "") == "":
+        lepton_config["job_name"] = f"{args.domain}_{args.command}"
+
+    job_name = lepton_config["job_name"]
+
+    # nproc per node
+    nproc_per_node = lepton_config.get("nprocs_per_node") or lepton_config.get("gpus_per_node") or args.nproc_per_node
+    if nproc_per_node is None:
+        nproc_per_node = 8
+
+    # Build inline command executed inside Lepton container. LeptonExecutor will cd into /nemo_run/code.
+    command_parts = [
+        "uv sync --inexact --frozen $(cat /opt/uv_args.txt) && uv run --no-sync torchrun ",
+        f"--nproc_per_node {nproc_per_node} ",
+        "--nnodes $NNODES ",
+        "--master_addr $MASTER_ADDR ",
+        "--master_port 29400 ",
+        "--node_rank $NODE_RANK ",
+        f"examples/{args.domain}_{args.command}/{args.command}.py ",
+        "-c ",
+        "/nemo_run/configs/job_config.yaml",
+    ]
+    if extra_args:
+        command_parts.extend([" ", " ".join(extra_args)])
+    inline_cmd = "".join(command_parts)
+
+    recipe = run.Script(
+        inline=inline_cmd,
+        entrypoint="bash",
+    )
+
+    # Create executor from config
+    executor = create_lepton_executor(config=lepton_config)
+
+    # Launch via nemo_run Experiment
+    with run.Experiment(f"{job_name}") as exp:
+        job_id = exp.add(recipe, name=job_name, executor=executor)
+        # Ensure job_config.yaml is packaged and available remotely under /nemo_run/configs/
+        try:
+            with open(job_conf_path, "r") as fp:
+                cfg_text = fp.read()
+        except Exception:
+            cfg_text = ""
+        # Access the assigned executor to package the config before run
+        try:
+            job = next(j for j in exp.jobs if getattr(j, "id", None) == job_id)
+            job.executor.package_configs(("job_config.yaml", cfg_text))
+        except Exception as e:
+            logging.warning(f"Failed to package job config for Lepton: {e}")
+        return exp.run(detach=True)
 
 def launch_with_slurm(args, job_conf_path, job_dir, slurm_config, extra_args=None):
     from nemo_automodel.components.launcher.slurm.config import SlurmConfig, VolumeMapping
@@ -295,6 +358,18 @@ def main():
             yaml.dump(config, fp, default_flow_style=False, sort_keys=False)
         logging.info(f"Logging Slurm job in: {job_dir}")
         return launch_with_slurm(args, job_conf_path, job_dir, slurm_config, extra_args=extra)
+    elif lepton_config := config.pop("lepton", None):
+        logging.info("Launching job via Lepton")
+        job_dir = os.path.join(
+            lepton_config.pop("job_dir", os.path.join(os.getcwd(), "lepton_jobs")), str(int(time.time()))
+        )
+        os.makedirs(job_dir, exist_ok=True)
+
+        job_conf_path = os.path.join(job_dir, "job_config.yaml")
+        with open(job_conf_path, "w") as fp:
+            yaml.dump(config, fp, default_flow_style=False, sort_keys=False)
+        logging.info(f"Logging Lepton job in: {job_dir}")
+        return launch_with_lepton(args, job_conf_path, job_dir, lepton_config, extra_args=extra)
     elif "k8s" in config or "kubernetes" in config:
         # launch job on kubernetes.
         raise NotImplementedError("kubernetes support is pending")
