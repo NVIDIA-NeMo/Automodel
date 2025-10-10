@@ -1335,7 +1335,10 @@ all = [
     { name = "transformer-engine", extra = ["pytorch"] },
     { name = "transformers" },
 ]
-ci = [
+deepep = [
+    { name = "nvidia-nvshmem-cu13" },
+]
+dev = [
     { name = "backoff" },
     { name = "flash-attn", marker = "sys_platform == 'never'" },
     { name = "mistral-common", extra = ["opencv"] },
@@ -1346,9 +1349,6 @@ ci = [
     { name = "timm" },
     { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "transformers" },
-]
-deepep = [
-    { name = "nvidia-nvshmem-cu13" },
 ]
 fa = [
     { name = "flash-attn", marker = "sys_platform == 'never'" },
@@ -1406,10 +1406,10 @@ requires-dist = [
     { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'" },
     { name = "nemo-automodel", extras = ["deepep"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["fa"], marker = "extra == 'all'" },
-    { name = "nemo-automodel", extras = ["fa"], marker = "extra == 'ci'" },
+    { name = "nemo-automodel", extras = ["fa"], marker = "extra == 'dev'" },
     { name = "nemo-automodel", extras = ["moe"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["vlm"], marker = "extra == 'all'" },
-    { name = "nemo-automodel", extras = ["vlm"], marker = "extra == 'ci'" },
+    { name = "nemo-automodel", extras = ["vlm"], marker = "extra == 'dev'" },
     { name = "numba", marker = "extra == 'vlm'" },
     { name = "numpy", marker = "extra == 'vlm'" },
     { name = "nvidia-nvshmem-cu13", marker = "extra == 'deepep'" },
@@ -1428,7 +1428,7 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'vlm'", specifier = "<=4.55.4" },
     { name = "wandb" },
 ]
-provides-extras = ["vlm", "fa", "moe", "deepep", "ci", "all"]
+provides-extras = ["vlm", "fa", "moe", "deepep", "dev", "all"]
 
 [package.metadata.requires-dev]
 build = [

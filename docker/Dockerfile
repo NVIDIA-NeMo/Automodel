@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG CUDA_BASE_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
-ARG PYTORCH_BASE_IMAGE=nvcr.io/nvidia/pytorch:25.09-py3
-ARG AUTOMODEL_BASE_IMAGE=cuda
+ARG CUDA_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:25.09-py3
+ARG BASE_IMAGE=cuda
 
-FROM ${CUDA_BASE_IMAGE} AS cuda
+FROM ${CUDA_IMAGE} AS cuda
 # Install dependencies
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -30,9 +30,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libopenmpi-dev && \
     rm -rf /var/lib/apt/lists/*
 
-FROM ${PYTORCH_BASE_IMAGE} AS pytorch
+FROM ${PYTORCH_IMAGE} AS pytorch
 
-FROM ${AUTOMODEL_BASE_IMAGE} AS automodel_base
+FROM ${BASE_IMAGE} AS automodel_final
 
 WORKDIR /opt
 # Install uv
@@ -59,14 +59,15 @@ RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     rm -rf /opt/deepep.patch; fi
 
 # Install Automodel
-ARG AUTOMODEL_BASE_IMAGE=cuda
+ARG BASE_IMAGE=cuda
+ARG AUTOMODEL_INSTALL=dev
 COPY . /opt/Automodel
 RUN cd /opt/Automodel && \
-    if [ "$AUTOMODEL_BASE_IMAGE" = "pytorch" ]; then \
+    if [ "$BASE_IMAGE" = "pytorch" ]; then \
         sed -i '/\[tool\.uv\]/r /opt/Automodel/docker/common/uv-pytorch.toml' pyproject.toml && \
         mv /opt/Automodel/docker/common/uv-pytorch.lock /opt/Automodel/uv.lock; \
     fi && \
-    uv sync --locked --extra ci --all-groups && \
+    uv sync --locked --extra $AUTOMODEL_INSTALL --all-groups && \
     if [ "$INSTALL_DEEPEP" = "True" ]; then \
         TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" \
         uv add --no-build-isolation -v /opt/DeepEP; \
