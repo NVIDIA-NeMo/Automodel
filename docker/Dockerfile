@@ -66,7 +66,7 @@ RUN cd /opt/Automodel && \
         sed -i '/\[tool\.uv\]/r /opt/Automodel/docker/common/uv-pytorch.toml' pyproject.toml && \
         mv /opt/Automodel/docker/common/uv-pytorch.lock /opt/Automodel/uv.lock; \
     fi && \
-    uv sync --locked --extra all --all-groups && \
+    uv sync --locked --extra ci --all-groups && \
     if [ "$INSTALL_DEEPEP" = "True" ]; then \
         TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" \
         uv add --no-build-isolation -v /opt/DeepEP; \
