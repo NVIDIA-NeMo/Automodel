@@ -19,7 +19,7 @@ class VideoPreprocessor:
     def __init__(
         self,
         video_folder: str = "clipped_video",
-        wan22_model_id: str = "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+        wan21_model_id: str = "Wan-AI/Wan2.1-T2V-14B-Diffusers",
         output_folder: str = "processed_meta",
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         deterministic_latents: bool = True,
@@ -30,11 +30,11 @@ class VideoPreprocessor:
         center_crop: bool = False,
     ):
         """
-        Initialize the video preprocessor for Wan2.2 fine-tuning.
+        Initialize the video preprocessor for Wan2.1 fine-tuning.
 
         Args:
             video_folder: Path to folder containing videos and meta.json
-            wan22_model_id: Hugging Face model ID for Wan2.2
+            wan21_model_id: Hugging Face model ID for Wan2.1 (e.g., "Wan-AI/Wan2.1-T2V-14B-Diffusers")
             output_folder: Path to folder where .meta files will be saved
             device: Device to run inference on
             deterministic_latents: If True, use posterior mean instead of sampling (recommended for clean reconstructions)
@@ -47,7 +47,7 @@ class VideoPreprocessor:
         self.video_folder = Path(video_folder)
         self.output_folder = Path(output_folder)
         self.device = device
-        self.wan22_model_id = wan22_model_id
+        self.wan21_model_id = wan21_model_id
         self.deterministic_latents = deterministic_latents
         self.enable_memory_optimization = enable_memory_optimization
 
@@ -99,8 +99,8 @@ class VideoPreprocessor:
         self.output_folder.mkdir(parents=True, exist_ok=True)
         logger.info(f"Output folder created/verified: {self.output_folder}")
 
-        # Load Wan2.2 components
-        logger.info(f"Loading Wan2.2 components from {wan22_model_id}...")
+        # Load Wan2.1 components
+        logger.info(f"Loading Wan2.1 components from {wan21_model_id}...")
         self.text_encoder = self._load_text_encoder()
         self.vae = self._load_vae()
         self.tokenizer = self._load_tokenizer()
@@ -109,10 +109,10 @@ class VideoPreprocessor:
         self.metadata = self._load_metadata()
 
     def _load_text_encoder(self):
-        """Load Wan2.2 UMT5 text encoder from Hugging Face."""
+        """Load Wan2.1 UMT5 text encoder from Hugging Face."""
         logger.info("Loading UMT5 text encoder...")
         text_encoder = UMT5EncoderModel.from_pretrained(
-            self.wan22_model_id,
+            self.wan21_model_id,
             subfolder="text_encoder",
             torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
         )
@@ -122,23 +122,22 @@ class VideoPreprocessor:
         return text_encoder
 
     def _load_vae(self):
-        """Load Wan2.2 VAE from Hugging Face with memory optimization."""
-        logger.info("Loading Wan VAE...")
+        """Load Wan2.1 VAE from Hugging Face with memory optimization."""
+        logger.info("Loading Wan2.1 VAE...")
 
-        # CRITICAL: Use the correct VAE subfolder for your model
-        # For Wan2.2-TI2V-5B, make sure you're using the 5B-compatible VAE
+        # Load Wan2.1 VAE with correct subfolder
         try:
             vae = AutoencoderKLWan.from_pretrained(
-                self.wan22_model_id,
+                self.wan21_model_id,
                 subfolder="vae",
                 torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
             )
         except Exception as e:
-            logger.error(f"Failed to load VAE from {self.wan22_model_id}/vae")
+            logger.error(f"Failed to load VAE from {self.wan21_model_id}/vae")
             logger.error(f"Error: {e}")
-            logger.info("Make sure you're using the correct VAE for your model:")
-            logger.info("- For Wan2.2-TI2V-5B: use the Wan2.2 VAE (not Wan2.1)")
-            logger.info("- For Wan2.1 models: use the Wan2.1 VAE")
+            logger.info("Make sure you're using a valid Wan2.1 model:")
+            logger.info("- Wan-AI/Wan2.1-T2V-14B-Diffusers")
+            logger.info("- Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
             raise
 
         vae.to(self.device)
@@ -153,8 +152,8 @@ class VideoPreprocessor:
         else:
             logger.info("Memory optimization disabled - using full tensors")
 
-        # Debug: Print VAE config to understand available attributes
-        logger.info("Wan VAE loaded successfully")
+        # Log VAE configuration
+        logger.info("Wan2.1 VAE loaded successfully")
         logger.info(f"VAE config type: {type(vae.config)}")
 
         # Log the input/output channels to verify correctness
@@ -162,21 +161,27 @@ class VideoPreprocessor:
             logger.info(f"VAE in_channels: {vae.config.in_channels}")
         if hasattr(vae.config, "out_channels"):
             logger.info(f"VAE out_channels: {vae.config.out_channels}")
+        if hasattr(vae.config, "z_dim"):
+            logger.info(f"VAE z_dim (latent channels): {vae.config.z_dim}")
 
-        # Check for scaling factor in different places
-        if hasattr(vae.config, "scaling_factor"):
-            logger.info(f"Found scaling_factor in config: {vae.config.scaling_factor}")
-        elif hasattr(vae, "scaling_factor"):
-            logger.info(f"Found scaling_factor as VAE attribute: {vae.scaling_factor}")
-        else:
-            logger.warning("No scaling_factor found - will use default")
+        # Wan2.1 uses per-channel normalization with latents_mean and latents_std
+        if hasattr(vae.config, "latents_mean"):
+            logger.info(f"VAE latents_mean: {vae.config.latents_mean}")
+        if hasattr(vae.config, "latents_std"):
+            logger.info(f"VAE latents_std: {vae.config.latents_std}")
+
+        # Log scale factors (Wan2.1 typically uses 4x temporal, 8x spatial)
+        scale_factor_temporal = getattr(vae.config, "scale_factor_temporal", 4)
+        scale_factor_spatial = getattr(vae.config, "scale_factor_spatial", 8)
+        logger.info(f"VAE scale_factor_temporal: {scale_factor_temporal}")
+        logger.info(f"VAE scale_factor_spatial: {scale_factor_spatial}")
 
         return vae
 
     def _load_tokenizer(self):
         """Load UMT5 tokenizer from Hugging Face."""
-        logger.info("Loading tokenizer...")
-        tokenizer = AutoTokenizer.from_pretrained(self.wan22_model_id, subfolder="tokenizer")
+        logger.info("Loading UMT5 tokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained(self.wan21_model_id, subfolder="tokenizer")
         logger.info("Tokenizer loaded successfully")
         return tokenizer
 
@@ -374,7 +379,7 @@ class VideoPreprocessor:
 
     def encode_text(self, caption: str) -> torch.Tensor:
         """
-        Encode text caption using Wan2.2 UMT5 text encoder.
+        Encode text caption using Wan2.1 UMT5 text encoder.
 
         Args:
             caption: Text description of the video
@@ -382,28 +387,42 @@ class VideoPreprocessor:
         Returns:
             Text embedding tensor
         """
-        # Tokenize text with UMT5 settings
-        inputs = self.tokenizer(caption, max_length=256, padding="max_length", truncation=True, return_tensors="pt")
+        # Clean the prompt (as done in Wan2.1 pipeline)
+        caption = caption.strip()
+
+        # Tokenize text with UMT5 settings (max_length=512 for Wan2.1)
+        inputs = self.tokenizer(
+            caption, 
+            max_length=512, 
+            padding="max_length", 
+            truncation=True, 
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
 
         # Move to device
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         # Encode text using UMT5 encoder
         with torch.no_grad():
-            text_embeddings = self.text_encoder(**inputs).last_hidden_state
+            text_embeddings = self.text_encoder(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"]
+            ).last_hidden_state
 
+        logger.info(f"Text embeddings shape: {text_embeddings.shape}")
         return text_embeddings
 
     def encode_video(self, video_tensor: torch.Tensor) -> torch.Tensor:
         """
-        Encode video using Wan2.2 VAE with built-in memory optimization.
+        Encode video using Wan2.1 VAE with built-in memory optimization.
         Uses deterministic posterior mean instead of random sampling to prevent flares.
 
         Args:
             video_tensor: Video tensor of shape (batch, channels, num_frames, height, width)
 
         Returns:
-            Video latent tensor (normalized)
+            Video latent tensor (normalized using Wan2.1 per-channel normalization)
         """
         logger.info(f"Input video tensor shape: {video_tensor.shape}, dtype: {video_tensor.dtype}")
 
@@ -415,25 +434,23 @@ class VideoPreprocessor:
         # Convert to [-1, 1] range for VAE
         video_tensor = video_tensor * 2.0 - 1.0
 
-        # Get normalization parameters for Wan VAE
-        use_wan_normalization = False
-        if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
-            # Wan VAE uses per-channel normalization
-            latents_mean = torch.tensor(self.vae.config.latents_mean, device=self.device, dtype=self.vae.dtype)
-            latents_std = torch.tensor(self.vae.config.latents_std, device=self.device, dtype=self.vae.dtype)
+        # Wan2.1 uses per-channel normalization with latents_mean and latents_std
+        if not hasattr(self.vae.config, "latents_mean") or not hasattr(self.vae.config, "latents_std"):
+            raise ValueError("Wan2.1 VAE requires latents_mean and latents_std in config")
 
-            # Reshape for broadcasting: (1, C, 1, 1, 1) for 5D tensors
-            latents_mean = latents_mean.view(1, -1, 1, 1, 1)
-            latents_std = latents_std.view(1, -1, 1, 1, 1)
+        latents_mean = torch.tensor(self.vae.config.latents_mean, device=self.device, dtype=self.vae.dtype)
+        latents_std = torch.tensor(self.vae.config.latents_std, device=self.device, dtype=self.vae.dtype)
 
-            logger.info("Using Wan VAE per-channel normalization")
-            logger.info(f"latents_mean shape: {latents_mean.shape}, latents_std shape: {latents_std.shape}")
-            use_wan_normalization = True
+        # Reshape for broadcasting: (1, C, 1, 1, 1) for 5D tensors
+        latents_mean = latents_mean.view(1, -1, 1, 1, 1)
+        latents_std = latents_std.view(1, -1, 1, 1, 1)
 
-        # 🔥 SIMPLIFIED: Use Wan's built-in memory optimization
-        # No manual chunking needed - VAE handles it internally with slicing/tiling
+        logger.info("Using Wan2.1 VAE per-channel normalization")
+        logger.info(f"latents_mean shape: {latents_mean.shape}, latents_std shape: {latents_std.shape}")
+
+        # Use Wan's built-in memory optimization
         with torch.no_grad():
-            logger.info("Encoding with Wan VAE (using built-in memory optimization)")
+            logger.info("Encoding with Wan2.1 VAE (using built-in memory optimization)")
             latent_dist = self.vae.encode(video_tensor)
 
             if self.deterministic_latents:
@@ -445,18 +462,9 @@ class VideoPreprocessor:
                 video_latents = latent_dist.latent_dist.sample()
                 logger.info("Using stochastic sampling (may cause flares)")
 
-            # Apply normalization (Wan style or standard)
-            if use_wan_normalization:
-                # Wan VAE: normalize per channel (z - mean) / std
-                video_latents = (video_latents - latents_mean) / latents_std
-                logger.info("Applied Wan VAE per-channel normalization")
-            else:
-                # Standard VAE: apply scaling factor
-                scaling_factor = getattr(
-                    self.vae.config, "scaling_factor", getattr(self.vae, "scaling_factor", 0.18215)
-                )
-                video_latents = video_latents * scaling_factor
-                logger.info(f"Applied standard scaling factor: {scaling_factor}")
+            # Apply Wan2.1 per-channel normalization: (z - mean) / std
+            video_latents = (video_latents - latents_mean) / latents_std
+            logger.info("Applied Wan2.1 VAE per-channel normalization")
 
         logger.info(f"Output video latents shape: {video_latents.shape}, dtype: {video_latents.dtype}")
         logger.info(f"Encoding mode: {'deterministic' if self.deterministic_latents else 'stochastic'}")
@@ -497,6 +505,7 @@ class VideoPreprocessor:
             "original_video_path": str(self.video_folder / video_name),
             "deterministic_latents": self.deterministic_latents,  # Save encoding mode
             "memory_optimization": self.enable_memory_optimization,  # Save memory setting
+            "model_version": "wan2.1",  # Mark as Wan2.1 format
             "resize_settings": {  # Save resize settings
                 "target_size": self.target_size,
                 "resize_mode": self.resize_mode,
@@ -513,6 +522,7 @@ class VideoPreprocessor:
         logger.info(f"First frame shape: {first_frame.shape}, dtype: {first_frame.dtype}")
         logger.info(f"Encoding mode saved: {'deterministic' if self.deterministic_latents else 'stochastic'}")
         logger.info(f"Memory optimization: {'enabled' if self.enable_memory_optimization else 'disabled'}")
+        logger.info(f"Model version: Wan2.1")
         if self.target_size is not None:
             logger.info(f"Resize settings saved: {self.target_size} ({self.resize_mode})")
 
@@ -573,6 +583,7 @@ class VideoPreprocessor:
     def process_all_videos(self):
         """Process all videos in the folder."""
         logger.info(f"Starting to process {len(self.metadata)} videos...")
+        logger.info(f"Model: Wan2.1 ({self.wan21_model_id})")
         logger.info(
             f"Encoding mode: {'deterministic (flare-free)' if self.deterministic_latents else 'stochastic (may have flares)'}"
         )
@@ -610,9 +621,11 @@ class VideoPreprocessor:
         # Check encoding mode and memory optimization of loaded data
         encoding_mode = data.get("deterministic_latents", "unknown")
         memory_opt = data.get("memory_optimization", "unknown")
+        model_version = data.get("model_version", "unknown")
         resize_settings = data.get("resize_settings", {})
 
-        logger.info(f"Loaded .meta file with encoding mode: {encoding_mode}, memory optimization: {memory_opt}")
+        logger.info(f"Loaded .meta file with model version: {model_version}")
+        logger.info(f"Encoding mode: {encoding_mode}, memory optimization: {memory_opt}")
         if resize_settings.get("target_size"):
             logger.info(f"Resize settings: {resize_settings}")
         if "first_frame" in data:
@@ -635,14 +648,18 @@ def main():
     """Main function to run the preprocessing."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Preprocess videos for Wan2.2 fine-tuning")
+    parser = argparse.ArgumentParser(description="Preprocess videos for Wan2.1 fine-tuning")
     parser.add_argument(
         "--video_folder", default="clipped_video", help="Path to folder containing videos and meta.json"
     )
     parser.add_argument(
         "--output_folder", default="processed_meta", help="Path to folder where .meta files will be saved"
     )
-    parser.add_argument("--model", default="Wan-AI/Wan2.2-TI2V-5B-Diffusers", help="Wan2.2 model ID")
+    parser.add_argument(
+        "--model", 
+        default="Wan-AI/Wan2.1-T2V-14B-Diffusers", 
+        help="Wan2.1 model ID (e.g., Wan-AI/Wan2.1-T2V-14B-Diffusers or Wan-AI/Wan2.1-T2V-1.3B-Diffusers)"
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use")
     parser.add_argument(
         "--stochastic",
@@ -683,7 +700,7 @@ def main():
     # Initialize preprocessor
     preprocessor = VideoPreprocessor(
         video_folder=args.video_folder,
-        wan22_model_id=args.model,
+        wan21_model_id=args.model,
         output_folder=args.output_folder,
         device=args.device,
         deterministic_latents=not args.stochastic,  # Default to deterministic
@@ -704,20 +721,23 @@ if __name__ == "__main__":
 
 # Example usage:
 """
-# Process with deterministic encoding and memory optimization (recommended)
-python preprocess_resize.py
+# Process with Wan2.1 14B model (deterministic encoding and memory optimization)
+python preprocess_wan21.py --model Wan-AI/Wan2.1-T2V-14B-Diffusers
 
-# Resize videos to 512x512 with aspect ratio preservation
-python preprocess_resize.py --height 512 --width 512
+# Process with Wan2.1 1.3B model
+python preprocess_wan21.py --model Wan-AI/Wan2.1-T2V-1.3B-Diffusers
 
-# Resize videos to 720x1280 with center cropping to exact size
-python preprocess_resize.py --height 720 --width 1280 --center-crop
+# Resize videos to 480x832 (default Wan2.1 resolution)
+python preprocess_wan21.py --height 480 --width 832
+
+# Resize videos to 720x1280 with center cropping
+python preprocess_wan21.py --height 720 --width 1280 --center-crop
 
 # Resize videos to 480x640 without aspect ratio preservation (stretch)
-python preprocess_resize.py --height 480 --width 640 --no-aspect-ratio
+python preprocess_wan21.py --height 480 --width 640 --no-aspect-ratio
 
 # Load and inspect a processed .meta file (including first frame)
-from preprocess_resize import VideoPreprocessor
+from preprocess_wan21 import VideoPreprocessor
 import matplotlib.pyplot as plt
 
 preprocessor = VideoPreprocessor()
@@ -736,4 +756,9 @@ plt.show()
 text_embeddings = data['text_embeddings']
 video_latents = data['video_latents']
 metadata = data['metadata']
+model_version = data['model_version']  # Should be 'wan2.1'
+
+print(f"Model version: {model_version}")
+print(f"Text embeddings shape: {text_embeddings.shape}")
+print(f"Video latents shape: {video_latents.shape}")
 """

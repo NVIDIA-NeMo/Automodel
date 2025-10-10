@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 class VideoDecoder:
     def __init__(
         self,
-        wan22_model_id: str = "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+        wan21_model_id: str = "Wan-AI/Wan2.1-T2V-14B-Diffusers",
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         enable_memory_optimization: bool = True,
     ):
@@ -25,23 +25,25 @@ class VideoDecoder:
         Initialize the video decoder for converting .meta files back to videos.
 
         Args:
-            wan22_model_id: Hugging Face model ID for Wan2.2 VAE
+            wan21_model_id: Hugging Face model ID for Wan2.1 VAE
             device: Device to run inference on
             enable_memory_optimization: Enable Wan's built-in slicing and tiling
         """
         self.device = device
-        self.wan22_model_id = wan22_model_id
+        self.wan21_model_id = wan21_model_id
         self.enable_memory_optimization = enable_memory_optimization
 
-        # Load Wan2.2 VAE for decoding
-        logger.info(f"Loading Wan2.2 VAE from {wan22_model_id}...")
+        # Load Wan2.1 VAE for decoding
+        logger.info(f"Loading Wan2.1 VAE from {wan21_model_id}...")
         self.vae = self._load_vae()
 
     def _load_vae(self):
-        """Load Wan2.2 VAE from Hugging Face with memory optimization."""
-        logger.info("Loading Wan VAE for decoding...")
+        """Load Wan2.1 VAE from Hugging Face with memory optimization."""
+        logger.info("Loading Wan2.1 VAE for decoding...")
         vae = AutoencoderKLWan.from_pretrained(
-            self.wan22_model_id, subfolder="vae", torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
+            self.wan21_model_id, 
+            subfolder="vae", 
+            torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
         )
         vae.to(self.device)
         vae.eval()
@@ -50,17 +52,22 @@ class VideoDecoder:
         if self.enable_memory_optimization:
             logger.info("Enabling Wan VAE memory optimization...")
             vae.enable_slicing()  # Reduce peak memory by slicing batch
-            vae.disable_tiling()  # Tile H/W during encode+decode
+            vae.enable_tiling()  # Tile H/W during encode+decode
             logger.info("✅ Enabled slicing and tiling for memory efficiency")
         else:
             logger.info("Memory optimization disabled - using full tensors")
 
         # Log VAE config for debugging
-        logger.info("Wan VAE loaded successfully")
+        logger.info("Wan2.1 VAE loaded successfully")
+        
+        # Verify this is a Wan2.1 VAE
         if hasattr(vae.config, "latents_mean") and hasattr(vae.config, "latents_std"):
-            logger.info("Found latents_mean and latents_std in VAE config")
+            logger.info("✅ Found latents_mean and latents_std in VAE config (Wan2.1 format)")
+            logger.info(f"   z_dim: {vae.config.z_dim if hasattr(vae.config, 'z_dim') else 'unknown'}")
         else:
-            logger.warning("No latents_mean/latents_std found in VAE config")
+            logger.error("❌ No latents_mean/latents_std found in VAE config")
+            logger.error("This doesn't appear to be a Wan2.1 VAE!")
+            raise ValueError("VAE config missing latents_mean and latents_std (required for Wan2.1)")
 
         return vae
 
@@ -84,6 +91,13 @@ class VideoDecoder:
         logger.info(f"Video latents shape: {data['video_latents'].shape}")
         logger.info(f"Text embeddings shape: {data['text_embeddings'].shape}")
         logger.info(f"Original filename: {data.get('original_filename', 'N/A')}")
+
+        # Check model version
+        model_version = data.get("model_version", "unknown")
+        logger.info(f"Model version: {model_version}")
+        if model_version != "wan2.1":
+            logger.warning(f"⚠️  This .meta file was created with {model_version}, but you're using a Wan2.1 decoder!")
+            logger.warning("   Decoding may not work correctly if versions don't match.")
 
         # Check if first frame exists
         if "first_frame" in data:
@@ -125,7 +139,7 @@ class VideoDecoder:
 
     def decode_video_latents(self, video_latents: torch.Tensor) -> torch.Tensor:
         """
-        Decode video latents back to video frames using Wan VAE.
+        Decode video latents back to video frames using Wan2.1 VAE.
         Uses Wan's built-in memory optimization instead of manual chunking.
 
         Args:
@@ -140,35 +154,35 @@ class VideoDecoder:
         # Move to device and ensure correct dtype
         video_latents = video_latents.to(device=self.device, dtype=self.vae.dtype)
 
-        # De-normalize latents (reverse the encoding normalization)
-        if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
-            # Wan VAE: de-normalize per channel (z * std + mean)
-            latents_mean = torch.tensor(self.vae.config.latents_mean, device=self.device, dtype=self.vae.dtype)
-            latents_std = torch.tensor(self.vae.config.latents_std, device=self.device, dtype=self.vae.dtype)
+        # De-normalize latents (reverse the Wan2.1 encoding normalization)
+        # Wan2.1 uses per-channel normalization: (z - mean) / std
+        # So we reverse it: z * std + mean
+        if not (hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std")):
+            raise ValueError("Wan2.1 VAE requires latents_mean and latents_std in config")
 
-            logger.info(f"latents_mean: {latents_mean}")
-            logger.info(f"latents_std: {latents_std}")
+        latents_mean = torch.tensor(self.vae.config.latents_mean, device=self.device, dtype=self.vae.dtype)
+        latents_std = torch.tensor(self.vae.config.latents_std, device=self.device, dtype=self.vae.dtype)
 
-            # Reshape for broadcasting: (1, C, 1, 1, 1) for 5D tensors
-            latents_mean = latents_mean.view(1, -1, 1, 1, 1)
-            latents_std = latents_std.view(1, -1, 1, 1, 1)
+        logger.info("Using Wan2.1 per-channel de-normalization")
+        logger.info(f"latents_mean: {latents_mean.tolist()}")
+        logger.info(f"latents_std: {latents_std.tolist()}")
 
-            # De-normalize: z * std + mean (reverse of (z - mean) / std)
-            video_latents = video_latents * latents_std + latents_mean
-            logger.info("Applied Wan VAE de-normalization")
-            logger.info(f"De-normalized latents range: [{video_latents.min():.3f}, {video_latents.max():.3f}]")
-        else:
-            # Fallback: reverse standard scaling factor
-            video_latents = video_latents
-            logger.info(f"De-normalized latents range: [{video_latents.min():.3f}, {video_latents.max():.3f}]")
+        # Reshape for broadcasting: (1, C, 1, 1, 1) for 5D tensors
+        latents_mean = latents_mean.view(1, -1, 1, 1, 1)
+        latents_std = latents_std.view(1, -1, 1, 1, 1)
+
+        # De-normalize: z * std + mean (reverse of (z - mean) / std)
+        video_latents = video_latents * latents_std + latents_mean
+        logger.info("Applied Wan2.1 VAE de-normalization")
+        logger.info(f"De-normalized latents range: [{video_latents.min():.3f}, {video_latents.max():.3f}]")
 
         B, C, T, H, W = video_latents.shape
         logger.info(f"De-normalized latents shape: {video_latents.shape}")
 
-        # 🔥 SIMPLIFIED: Use Wan's built-in memory optimization
+        # Use Wan's built-in memory optimization
         # No manual chunking needed - VAE handles it internally with slicing/tiling
         with torch.no_grad():
-            logger.info("Decoding with Wan VAE (using built-in memory optimization)")
+            logger.info("Decoding with Wan2.1 VAE (using built-in memory optimization)")
             decoded_video = self.vae.decode(video_latents).sample
             logger.info(f"Decoded video range: [{decoded_video.min():.3f}, {decoded_video.max():.3f}]")
 
@@ -233,8 +247,8 @@ class VideoDecoder:
         # Release video writer
         out.release()
 
-        logger.info(f"Successfully saved video: {output_path}")
-        logger.info(f"Video info: {num_frames} frames, {height}x{width}, {fps} FPS")
+        logger.info(f"✅ Successfully saved video: {output_path}")
+        logger.info(f"   Video info: {num_frames} frames, {height}x{width}, {fps} FPS")
 
     def decode_meta_to_video(self, meta_path: str, output_path: str, fps: int = 24, jpeg_quality: int = 95):
         """
@@ -270,10 +284,10 @@ class VideoDecoder:
             # Save as MP4
             self.save_video_as_mp4(decoded_video, output_path, fps)
 
-            logger.info(f"Successfully converted {meta_path} to {output_path}")
+            logger.info(f"✅ Successfully converted {meta_path} to {output_path}")
 
         except Exception as e:
-            logger.error(f"Error converting {meta_path}: {e}")
+            logger.error(f"❌ Error converting {meta_path}: {e}")
             raise
 
     def decode_folder(self, meta_folder: str, output_folder: str, fps: int = 24, jpeg_quality: int = 95):
@@ -313,21 +327,21 @@ class VideoDecoder:
                 logger.error(f"Failed to decode {meta_file}: {e}")
                 continue
 
-        logger.info(f"Finished decoding {len(meta_files)} videos to {output_folder}")
+        logger.info(f"✅ Finished decoding {len(meta_files)} videos to {output_folder}")
 
 
 def main():
     """Main function to run the video decoding."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Decode .meta files to MP4 videos")
+    parser = argparse.ArgumentParser(description="Decode Wan2.1 .meta files to MP4 videos")
     parser.add_argument("--input", "-i", required=True, help="Input .meta file or folder containing .meta files")
     parser.add_argument("--output", "-o", required=True, help="Output MP4 file or folder for MP4 files")
     parser.add_argument("--fps", type=int, default=24, help="Frames per second for output video (default: 24)")
     parser.add_argument(
         "--model",
-        default="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-        help="Wan2.2 model ID (default: Wan-AI/Wan2.2-I2V-A14B-Diffusers)",
+        default="Wan-AI/Wan2.1-T2V-14B-Diffusers",
+        help="Wan2.1 model ID (default: Wan-AI/Wan2.1-T2V-14B-Diffusers, also supports Wan-AI/Wan2.1-T2V-1.3B-Diffusers)",
     )
     parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use (default: auto-detect)"
@@ -343,7 +357,9 @@ def main():
 
     # Initialize decoder
     decoder = VideoDecoder(
-        wan22_model_id=args.model, device=args.device, enable_memory_optimization=not args.no_memory_optimization
+        wan21_model_id=args.model, 
+        device=args.device, 
+        enable_memory_optimization=not args.no_memory_optimization
     )
 
     input_path = Path(args.input)
@@ -371,19 +387,24 @@ if __name__ == "__main__":
 # Example usage:
 """
 # Decode single .meta file (creates both .mp4 and .jpg)
-python decode.py --input processed_meta/video1.meta --output decoded_videos/video1.mp4
+python decode_wan21.py --input processed_meta/video1.meta --output decoded_videos/video1.mp4
 
 # Decode all .meta files in a folder
-python decode.py --input processed_meta/ --output decoded_videos/
+python decode_wan21.py --input processed_meta/ --output decoded_videos/
 
-# Custom JPEG quality
-python decode.py --input processed_meta/ --output decoded_videos/ --jpeg-quality 90
+# Use Wan2.1 1.3B model
+python decode_wan21.py --input processed_meta/ --output decoded_videos/ --model Wan-AI/Wan2.1-T2V-1.3B-Diffusers
+
+# Custom JPEG quality and FPS
+python decode_wan21.py --input processed_meta/ --output decoded_videos/ --fps 16 --jpeg-quality 90
 
 # Disable memory optimization if you have enough VRAM
-python decode.py --input processed_meta/ --output decoded_videos/ --no-memory-optimization
+python decode_wan21.py --input processed_meta/ --output decoded_videos/ --no-memory-optimization
 
 # Programmatic usage
-decoder = VideoDecoder("Wan-AI/Wan2.2-TI2V-5B-Diffusers")
+from decode_wan21 import VideoDecoder
+
+decoder = VideoDecoder("Wan-AI/Wan2.1-T2V-14B-Diffusers")
 
 # Single file (creates video1.mp4 and video1.jpg)
 decoder.decode_meta_to_video("processed_meta/video1.meta", "output/video1.mp4")
