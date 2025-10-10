@@ -39,6 +39,7 @@ from wandb import Settings
 
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components._transformers.utils import apply_cache_compatibility_patches
+from nemo_automodel.components.attention.utils import process_input_for_thd
 from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig, load_model_from_base_checkpoint
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
@@ -229,7 +230,12 @@ def build_model_and_optimizer(
                 world_mesh=model_wrapper.device_mesh,
                 moe_mesh=getattr(model_wrapper, "moe_mesh", None),
                 pp_enabled=False,
-                dp_axis_names=("dp_shard",),
+                dp_axis_names=(
+                    ("dp_replicate", "dp_shard_cp")
+                    if "dp_replicate" in model_wrapper.device_mesh.mesh_dim_names
+                    and "dp_shard_cp" in model_wrapper.device_mesh.mesh_dim_names
+                    else ("dp_shard_cp",)
+                ),
                 cp_axis_name="cp",
                 tp_axis_name="tp",
                 ep_axis_name="ep",
@@ -784,10 +790,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 moe_mesh=self.moe_mesh,
                 pp_axis_name="pp",
                 dp_axis_names=(
-                    ("dp_replicate", "dp_shard")
+                    ("dp_replicate", "dp_shard_cp")
                     if "dp_replicate" in self.device_mesh.mesh_dim_names
-                    and "dp_shard" in self.device_mesh.mesh_dim_names
-                    else ("dp_shard",)
+                    and "dp_shard_cp" in self.device_mesh.mesh_dim_names
+                    else ("dp_shard_cp",)
                 ),
                 cp_axis_name="cp" if "cp" in self.device_mesh.mesh_dim_names else None,
                 tp_axis_name="tp" if "tp" in self.device_mesh.mesh_dim_names else None,
@@ -963,8 +969,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             for k, v in batch.items()
         }
+        batch = process_input_for_thd(batch)
+        train_ctx, batch = make_cp_batch_and_ctx(
+            self.device_mesh, batch, use_te=True, padding_token_id=self.tokenizer.pad_token_id
+        )
         labels = batch.pop("labels")
-        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
+
         if self.pp_enabled:
             if not is_train:
                 logging.info("Skipping forward pass for validation because pipeline parallelism is enabled")

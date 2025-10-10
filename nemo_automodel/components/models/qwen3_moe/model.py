@@ -18,7 +18,6 @@ import torch
 import torch.nn as nn
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from nemo_automodel.components.attention.utils import process_input_for_thd
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.qwen3_moe.layers import Qwen3MoeAttention
 from nemo_automodel.components.models.qwen3_moe.state_dict_adapter import Qwen3MoeStateDictAdapter
@@ -149,13 +148,13 @@ class Qwen3MoeModel(nn.Module):
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
-        bsz, seq_len = input_ids.shape[0], input_ids.shape[1]
+        # bsz, seq_len = input_ids.shape[0], input_ids.shape[1]
         original_kwargs = attn_kwargs
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
-            input_ids, position_ids, attn_kwargs = process_input_for_thd(
-                input_ids, position_ids, attn_kwargs["seq_lens"], attn_kwargs["seq_lens_padded"]
-            )
-            attention_mask = None
+        # if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+        #     input_ids, position_ids, attn_kwargs = process_input_for_thd(
+        #         input_ids, position_ids, attn_kwargs["seq_lens"], attn_kwargs["seq_lens_padded"]
+        #     )
+        #     attention_mask = None
 
         if position_ids is None:
             position_ids = (
@@ -179,7 +178,7 @@ class Qwen3MoeModel(nn.Module):
             )
 
         h = self.norm(h) if self.norm else h
-        h = h.view(bsz, seq_len, -1)
+        # h = h.view(bsz, seq_len, -1)
         return h
 
     @torch.no_grad()

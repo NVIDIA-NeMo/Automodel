@@ -18,7 +18,6 @@ import torch
 import torch.nn as nn
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
-from nemo_automodel.components.attention.utils import process_input_for_thd
 from nemo_automodel.components.models.deepseek_v3.layers import MLA
 from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids, precompute_freqs_cis
 from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
@@ -78,6 +77,8 @@ class Block(nn.Module):
             **attn_kwargs,
         )
         x = x + attn_out
+        if torch.distributed.get_rank() in [0, 1, 6, 7]:
+            print(f"{torch.distributed.get_rank()=} {self.layer_idx=} {x.shape=} {attn_out.shape=}")
 
         mlp_out = self._mlp(
             x=self.post_attention_layernorm(x),
@@ -161,12 +162,13 @@ class DeepseekV3Model(nn.Module):
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        bsz, seq_len = input_ids.shape[0], input_ids.shape[1]
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
-            input_ids, position_ids, attn_kwargs = process_input_for_thd(
-                input_ids, position_ids, attn_kwargs["seq_lens"], attn_kwargs["seq_lens_padded"]
-            )
-            attention_mask = None
+        # torch.distributed.breakpoint()
+        # bsz, seq_len = input_ids.shape[0], input_ids.shape[1]
+        # if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+        #     input_ids, position_ids, attn_kwargs = process_input_for_thd(
+        #         input_ids, position_ids, attn_kwargs["seq_lens"], attn_kwargs["seq_lens_padded"]
+        #     )
+        #     attention_mask = None
 
         if position_ids is None:
             position_ids = (
@@ -189,7 +191,7 @@ class DeepseekV3Model(nn.Module):
             )
 
         h = self.norm(h) if self.norm else h
-        h = h.view(bsz, seq_len, -1)
+        # h = h.view(bsz, seq_len, -1)
         return h
 
     def update_moe_gate_bias(self) -> None:
