@@ -55,6 +55,7 @@ from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.loggers.metrics_tracker import WandBMetricsTracker
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
@@ -875,6 +876,21 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
+        # ------------------ metrics tracking init ------------------
+        peak_tflops = None
+        try:
+            if hasattr(self.cfg, "metrics") and hasattr(self.cfg.metrics, "peak_tflops_per_gpu"):
+                peak_tflops = float(self.cfg.metrics.peak_tflops_per_gpu)
+        except Exception:
+            pass
+        # initialize tracker
+        self.metrics = WandBMetricsTracker(
+            dp_world_size=self._get_dp_group_size(),
+            step_scheduler=self.step_scheduler,
+            micro_batch_size=int(self.step_scheduler.local_batch_size),
+            model_parts=self.model_parts,
+            peak_tflops_per_gpu=peak_tflops,
+        )
 
     # ------------------ main loop ------------------
     def run_train_validation_loop(self):
@@ -1070,6 +1086,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         reporting_loss = reporting_loss.cpu().item()
         # fix reporting_loss, tps across ranks
+        # Update metrics tracker counters
+        self.metrics.update_after_step(time_delta=float(time_delta), num_tokens_in_batch=int(num_tokens_in_batch))
         return reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens
 
     @torch.no_grad()
@@ -1141,10 +1159,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         }
         # assumes all model parts' optimizers have the same learning rate
         current_lr = self.optimizer[0].param_groups[0]["lr"]
-        log_data["learning_rate"] = current_lr
-
-        if wandb.run is not None:
-            wandb.log(log_data, step=self.step_scheduler.step)
+        # Delegate logging to tracker
+        self.metrics.log(
+            step=self.step_scheduler.step,
+            epoch=self.step_scheduler.epoch,
+            base_log=log_data,
+            learning_rate=current_lr,
+            tps=tps,
+            grad_norm=grad_norm,
+            model_parts=self.model_parts,
+        )
 
         if self.dist_env.is_main:
             logging.info(

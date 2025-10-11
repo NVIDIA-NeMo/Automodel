@@ -51,6 +51,7 @@ from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.utils import count_tail_padding
+from nemo_automodel.components.loggers.metrics_tracker import WandBMetricsTracker
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     calculate_loss,
@@ -153,6 +154,21 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         # Buffers for logging
         self._kd_loss_buffer = []
         self._ce_loss_buffer = []
+
+        # ------------------ metrics tracking init ------------------
+        peak_tflops = None
+        try:
+            if hasattr(self.cfg, "metrics") and hasattr(self.cfg.metrics, "peak_tflops_per_gpu"):
+                peak_tflops = float(self.cfg.metrics.peak_tflops_per_gpu)
+        except Exception:
+            pass
+        self.metrics = WandBMetricsTracker(
+            dp_world_size=self._get_dp_group_size(),
+            step_scheduler=self.step_scheduler,
+            micro_batch_size=int(self.step_scheduler.local_batch_size),
+            model_parts=self.model_parts,
+            peak_tflops_per_gpu=peak_tflops,
+        )
 
     #  Override the forward backward step to inject KD loss
     def _forward_backward_step(
@@ -287,6 +303,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
         reporting_loss = reporting_loss.cpu().item()
         # fix reporting_loss, tps across ranks
+        # Update tracker counters
+        self.metrics.update_after_step(time_delta=float(time_delta), num_tokens_in_batch=int(num_tokens_in_batch))
         return reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens
 
     @torch.no_grad()
@@ -360,21 +378,27 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
 
         # assumes all model parts' optimizers have the same learning rate
         current_lr = self.optimizer[0].param_groups[0]["lr"]
-        # log_data
-        if wandb.run is not None:
-            log_data = {
-                "step": self.step_scheduler.step,
-                "epoch": self.step_scheduler.epoch,
-                "train_loss": train_loss,
-                "ce_loss": ce_loss,
-                "kd_loss": kd_loss,
-                "grad_norm": grad_norm,
-                "num_tokens_per_step": num_tokens_in_batch,
-                "tps": tps,
-                "tps_per_gpu": tps / self._get_dp_group_size(),
-                "learning_rate": current_lr,
-            }
-            wandb.log(log_data, step=self.step_scheduler.step)
+        # Compose base log and delegate to tracker
+        log_data = {
+            "step": self.step_scheduler.step,
+            "epoch": self.step_scheduler.epoch,
+            "train_loss": train_loss,
+            "ce_loss": ce_loss,
+            "kd_loss": kd_loss,
+            "grad_norm": grad_norm,
+            "num_tokens_per_step": num_tokens_in_batch,
+            "tps": tps,
+            "tps_per_gpu": tps / self._get_dp_group_size(),
+        }
+        self.metrics.log(
+            step=self.step_scheduler.step,
+            epoch=self.step_scheduler.epoch,
+            base_log=log_data,
+            learning_rate=current_lr,
+            tps=tps,
+            grad_norm=grad_norm,
+            model_parts=self.model_parts,
+        )
 
         logging.info(
             "step {} | epoch {} | "
