@@ -932,12 +932,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # 1. len(batches) == grad_acc_steps
             # 2. len(batches[0]) == batch_size
             for i, batches in enumerate(self.step_scheduler):
-                reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens = self._run_train_optim_step(
-                    batches, 1.0
-                )
-
+                train_log_data = self._run_train_optim_step(batches, 1.0)
                 # log
-                self.log_train_metrics(reporting_loss, grad_norm, num_tokens_in_batch, tps, num_label_tokens)
+                self.log_train_metrics(train_log_data)
 
                 # Save the checkpoint every ckpt_every_steps
                 if self.step_scheduler.is_ckpt_step:
@@ -945,7 +942,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
                 # Run validation every val_every_steps
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                    self._run_validation_epoch()
+                    val_log_data = self._run_validation_epoch(self.val_dataloader)
+                    self.log_val_metrics(val_log_data)
                     for mp in self.model_parts:
                         mp.train()
         # Close JSONL loggers after training loop completes
@@ -1125,10 +1123,24 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         reporting_loss = reporting_loss.cpu().item()
         # fix reporting_loss, tps across ranks
-        return reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens
+
+        return MetricsSample(
+            step=self.step_scheduler.step,
+            epoch=self.step_scheduler.epoch,
+            metrics={
+                "loss": reporting_loss,
+                "grad_norm": grad_norm,
+                "lr": self.optimizer[0].param_groups[0]["lr"],
+                "mem": torch.cuda.max_memory_allocated() / 1024**3,
+                "tps": tps,
+                "tps_per_gpu": tps / max(self._get_dp_group_size(), 1),
+                "num_tokens_per_step": num_tokens_in_batch,
+                "num_label_tokens": num_label_tokens,
+            },
+        )
 
     @torch.no_grad()
-    def _run_validation_epoch(self):
+    def _run_validation_epoch(self, val_dataloader):
         """Run one pass over `self.val_dataloader`."""
         if self.pp_enabled:
             logger.warning("Validation is not supported for pipeline parallelism")
@@ -1141,7 +1153,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
             total_num_label_tokens = 0
 
-            for batch in self.val_dataloader:
+            for batch in val_dataloader:
                 loss_buffer = []
                 num_label_tokens = (batch["labels"] != -100).sum().item()
                 self._forward_backward_step(
@@ -1160,10 +1172,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         total_num_label_tokens = self._dp_allreduce(torch.tensor(total_num_label_tokens, dtype=torch.long)).item()
         val_loss = total_loss / max(total_num_label_tokens, 1e-8)
 
-        if not self.dist_env.is_main:
-            return
-
-        log_data = MetricsSample(
+        return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
             metrics={
@@ -1174,6 +1183,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             },
         )
 
+    def log_val_metrics(self, log_data):
+        if not self.dist_env.is_main:
+            return
 
         if wandb.run is not None:
             wandb.log(log_data.to_dict(), step=log_data.step)
@@ -1191,32 +1203,25 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
         )
 
-    def log_train_metrics(self, train_loss, grad_norm, num_tokens_in_batch, tps, num_label_tokens) -> float:
+    def log_train_metrics(self, log_data):
         """Log metrics to wandb.
 
         Args:
-            train_loss: Training loss.
-            grad_norm: Grad norm from the training step.
-            num_tokens_in_batch: Total number of loss tokens.
-            tps: Tokens per second.
+            log_data: MetricsSample object, containing:
+                step: int, the current step.
+                epoch: int, the current epoch.
+                metrics: Dict[str, float], containing:
+                    "loss": Training loss.
+                    "grad_norm": Grad norm from the training step.
+                    "lr": Learning rate.
+                    "mem": Memory allocated.
+                    "tps": Tokens per second.
+                    "tps_per_gpu": Tokens per second per GPU.
+                    "num_label_tokens": Number of label tokens.
         """
         if not self.dist_env.is_main:
             return
 
-        log_data = MetricsSample(
-            step=self.step_scheduler.step,
-            epoch=self.step_scheduler.epoch,
-            metrics={
-                "loss": train_loss,
-                "grad_norm": grad_norm,
-                "lr": self.optimizer[0].param_groups[0]["lr"],
-                "mem": torch.cuda.max_memory_allocated() / 1024**3,
-                "tps": tps,
-                "tps_per_gpu": tps / max(self._get_dp_group_size(), 1),
-                "num_tokens_per_step": num_tokens_in_batch,
-                "num_label_tokens": num_label_tokens,
-            },
-        )
 
         if wandb.run is not None:
             wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
