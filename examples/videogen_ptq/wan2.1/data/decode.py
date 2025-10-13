@@ -387,7 +387,7 @@ if __name__ == "__main__":
 # Example usage:
 """
 # Decode single .meta file (creates both .mp4 and .jpg)
-python decode_wan21.py --input processed_meta/video1.meta --output decoded_videos/video1.mp4
+python decode_wan21.py --input processed_meta/video1.meta --output decoded_videos/video1.mp4 --model Wan-AI/Wan2.1-T2V-1.3B-Diffusers
 
 # Decode all .meta files in a folder
 python decode_wan21.py --input processed_meta/ --output decoded_videos/

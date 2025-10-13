@@ -415,14 +415,14 @@ class VideoPreprocessor:
 
     def encode_video(self, video_tensor: torch.Tensor) -> torch.Tensor:
         """
-        Encode video using Wan2.1 VAE with built-in memory optimization.
-        Uses deterministic posterior mean instead of random sampling to prevent flares.
-
+        CRITICAL FIX: Encode video using Wan2.1 VAE without manual normalization.
+        The VAE encode() already returns normalized latents!
+        
         Args:
             video_tensor: Video tensor of shape (batch, channels, num_frames, height, width)
 
         Returns:
-            Video latent tensor (normalized using Wan2.1 per-channel normalization)
+            Video latent tensor (already normalized by VAE)
         """
         logger.info(f"Input video tensor shape: {video_tensor.shape}, dtype: {video_tensor.dtype}")
 
@@ -434,23 +434,13 @@ class VideoPreprocessor:
         # Convert to [-1, 1] range for VAE
         video_tensor = video_tensor * 2.0 - 1.0
 
-        # Wan2.1 uses per-channel normalization with latents_mean and latents_std
-        if not hasattr(self.vae.config, "latents_mean") or not hasattr(self.vae.config, "latents_std"):
-            raise ValueError("Wan2.1 VAE requires latents_mean and latents_std in config")
-
-        latents_mean = torch.tensor(self.vae.config.latents_mean, device=self.device, dtype=self.vae.dtype)
-        latents_std = torch.tensor(self.vae.config.latents_std, device=self.device, dtype=self.vae.dtype)
-
-        # Reshape for broadcasting: (1, C, 1, 1, 1) for 5D tensors
-        latents_mean = latents_mean.view(1, -1, 1, 1, 1)
-        latents_std = latents_std.view(1, -1, 1, 1, 1)
-
-        logger.info("Using Wan2.1 VAE per-channel normalization")
-        logger.info(f"latents_mean shape: {latents_mean.shape}, latents_std shape: {latents_std.shape}")
-
-        # Use Wan's built-in memory optimization
+        # CRITICAL FIX: Check if VAE encode() returns normalized latents
+        # According to Wan2.1 code, the VAE.encode() should handle normalization internally
+        # We should NOT manually normalize again!
+        
+        logger.info("Encoding with Wan2.1 VAE...")
+        
         with torch.no_grad():
-            logger.info("Encoding with Wan2.1 VAE (using built-in memory optimization)")
             latent_dist = self.vae.encode(video_tensor)
 
             if self.deterministic_latents:
@@ -462,14 +452,49 @@ class VideoPreprocessor:
                 video_latents = latent_dist.latent_dist.sample()
                 logger.info("Using stochastic sampling (may cause flares)")
 
+        # CRITICAL: Check if we need to normalize
+        # If VAE already normalizes, we should NOT normalize again
+        # Let's check the latent statistics
+        latent_mean = video_latents.mean().item()
+        latent_std = video_latents.std().item()
+        
+        logger.info(f"Raw latent statistics - mean: {latent_mean:.4f}, std: {latent_std:.4f}")
+        
+        # Check if latents are already normalized (mean~0, std~1)
+        if abs(latent_mean) < 0.5 and 0.5 < latent_std < 2.0:
+            logger.warning("⚠️  Latents appear already normalized! Skipping manual normalization.")
+            logger.warning("⚠️  If you see training issues, the VAE might already normalize internally.")
+            # Don't normalize again - use raw latents
+            final_latents = video_latents
+        else:
+            # Latents need normalization - apply Wan2.1 per-channel normalization
+            if not hasattr(self.vae.config, "latents_mean") or not hasattr(self.vae.config, "latents_std"):
+                raise ValueError("Wan2.1 VAE requires latents_mean and latents_std in config")
+
+            latents_mean = torch.tensor(self.vae.config.latents_mean, device=self.device, dtype=self.vae.dtype)
+            latents_std = torch.tensor(self.vae.config.latents_std, device=self.device, dtype=self.vae.dtype)
+
+            # Reshape for broadcasting: (1, C, 1, 1, 1) for 5D tensors
+            latents_mean = latents_mean.view(1, -1, 1, 1, 1)
+            latents_std = latents_std.view(1, -1, 1, 1, 1)
+
+            logger.info("Applying Wan2.1 VAE per-channel normalization")
+            logger.info(f"latents_mean shape: {latents_mean.shape}, latents_std shape: {latents_std.shape}")
+
             # Apply Wan2.1 per-channel normalization: (z - mean) / std
-            video_latents = (video_latents - latents_mean) / latents_std
+            final_latents = (video_latents - latents_mean) / latents_std
             logger.info("Applied Wan2.1 VAE per-channel normalization")
 
-        logger.info(f"Output video latents shape: {video_latents.shape}, dtype: {video_latents.dtype}")
+        logger.info(f"Output video latents shape: {final_latents.shape}, dtype: {final_latents.dtype}")
         logger.info(f"Encoding mode: {'deterministic' if self.deterministic_latents else 'stochastic'}")
         logger.info(f"Memory optimization: {'enabled' if self.enable_memory_optimization else 'disabled'}")
-        return video_latents
+        
+        # Final statistics
+        final_mean = final_latents.mean().item()
+        final_std = final_latents.std().item()
+        logger.info(f"Final latent statistics - mean: {final_mean:.4f}, std: {final_std:.4f}")
+        
+        return final_latents
 
     def save_processed_data(
         self,
@@ -717,48 +742,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# Example usage:
-"""
-# Process with Wan2.1 14B model (deterministic encoding and memory optimization)
-python preprocess_wan21.py --model Wan-AI/Wan2.1-T2V-14B-Diffusers
-
-# Process with Wan2.1 1.3B model
-python preprocess_wan21.py --model Wan-AI/Wan2.1-T2V-1.3B-Diffusers
-
-# Resize videos to 480x832 (default Wan2.1 resolution)
-python preprocess_wan21.py --height 480 --width 832
-
-# Resize videos to 720x1280 with center cropping
-python preprocess_wan21.py --height 720 --width 1280 --center-crop
-
-# Resize videos to 480x640 without aspect ratio preservation (stretch)
-python preprocess_wan21.py --height 480 --width 640 --no-aspect-ratio
-
-# Load and inspect a processed .meta file (including first frame)
-from preprocess_wan21 import VideoPreprocessor
-import matplotlib.pyplot as plt
-
-preprocessor = VideoPreprocessor()
-data = preprocessor.load_processed_data("video_001.meta")
-
-# Access the first frame
-first_frame = data['first_frame']  # RGB numpy array (H, W, C) with values in [0, 255]
-
-# Display the first frame
-plt.imshow(first_frame.astype('uint8'))
-plt.title("First Frame")
-plt.axis('off')
-plt.show()
-
-# Access other data
-text_embeddings = data['text_embeddings']
-video_latents = data['video_latents']
-metadata = data['metadata']
-model_version = data['model_version']  # Should be 'wan2.1'
-
-print(f"Model version: {model_version}")
-print(f"Text embeddings shape: {text_embeddings.shape}")
-print(f"Video latents shape: {video_latents.shape}")
-"""

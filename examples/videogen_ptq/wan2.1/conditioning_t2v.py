@@ -2,35 +2,40 @@ import os
 import torch
 from dist_utils import print0
 
-
 def prepare_t2v_conditioning(pipe, video_latents: torch.Tensor, timesteps: torch.Tensor, bf16):
     """
-    T2V conditioning for WAN 2.1 - simpler than I2V, just noisy latents.
-    WAN 2.1 T2V uses 16-channel input (no conditioning concatenation).
+    WAN 2.1 T2V: 16-channel latents only (no concat conditioning).
+    Compute noise/noising in fp32, return bf16 latents for model input,
+    BUT keep noise in fp32 for loss stability.
     """
-    # Only print debug info if DEBUG_TRAINING env var is set
     debug_mode = os.environ.get("DEBUG_TRAINING", "0") == "1"
-    
+
     if debug_mode:
         print0("[DEBUG] === T2V CONDITIONING (16-channel) ===")
-        print0(f"[DEBUG] Input video_latents: {video_latents.shape}")
-        print0(f"[DEBUG] Input timesteps: {timesteps.shape}")
+        print0(f"[DEBUG] Input video_latents: {tuple(video_latents.shape)}  dtype={video_latents.dtype}")
+        print0(f"[DEBUG] Input timesteps: {tuple(timesteps.shape)}  dtype={timesteps.dtype}")
 
-    batch_size, channels, frames, height, width = video_latents.shape
+    # Ensure fp32 math for the noising step
+    latents_f32 = video_latents.float()
 
-    # Generate noise matching input latents (16 channels)
-    noise = torch.randn_like(video_latents)
+    # fp32 noise (do NOT bf16 this)
+    noise = torch.randn(
+        latents_f32.shape,
+        device=latents_f32.device,
+        dtype=torch.float32,
+    )
 
-    # Apply scheduler noise based on timesteps
-    noisy_latents = pipe.scheduler.add_noise(video_latents, noise, timesteps)
-    
+    # Scheduler expects fp32 tensors for stable math
+    noisy_latents = pipe.scheduler.add_noise(latents_f32, noise, timesteps)
+
     if debug_mode:
-        print0(f"[DEBUG] Noisy latents shape: {noisy_latents.shape}")
-        print0(f"[DEBUG] Final T2V input shape: {noisy_latents.shape}")
-        print0(f"[DEBUG] Input range: [{noisy_latents.min():.3f}, {noisy_latents.max():.3f}]")
+        nl = noisy_latents
+        print0(f"[DEBUG] Noisy latents shape: {tuple(nl.shape)}  dtype={nl.dtype}")
+        print0(f"[DEBUG] Noisy range: [{nl.min().item():.3f}, {nl.max().item():.3f}]")
 
-    # Verify we have exactly 16 channels
+    # WAN 2.1 T2V: enforce 16 channels
     if noisy_latents.shape[1] != 16:
         raise RuntimeError(f"Expected 16 channels for T2V, got {noisy_latents.shape[1]}")
 
-    return noisy_latents.to(bf16), noise.to(bf16)
+    # Return: bf16 inputs for the transformer, fp32 noise for the loss/target
+    return noisy_latents.to(bf16), noise  # keep noise fp32

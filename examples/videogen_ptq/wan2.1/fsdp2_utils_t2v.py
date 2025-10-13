@@ -246,60 +246,138 @@ def get_fsdp_all_parameters(model_map: Dict):
     
     return all_params
 
-
-def save_fsdp_checkpoint(model_map: Dict, optimizer, scheduler, output_dir: str, step: int):
-    """Save FSDP checkpoint with sharded optimizer states - FULL MODEL."""
+def save_fsdp_checkpoint(
+    model_map: Dict, 
+    optimizer, 
+    scheduler, 
+    output_dir: str, 
+    step: int,
+    consolidate: bool = None,
+):
+    """
+    Save FSDP checkpoint with optional consolidation.
+    
+    Args:
+        consolidate: If True, save consolidated model. If False, skip.
+                    If None, auto-decide based on step
+    """
     from torch.distributed.checkpoint import save as dist_save
     from torch.distributed.checkpoint import FileSystemWriter
+    from torch.distributed.fsdp import FullStateDictConfig, StateDictType
 
+    # FIXED: Better auto-consolidation logic
+    if consolidate is None:
+        # Consolidate every 1000 steps to ensure regular consolidated checkpoints
+        # This is more frequent but ensures you always have inference-ready models
+        consolidate = (step % 1000 == 0)
+    
     ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
-    os.makedirs(ckpt_dir, exist_ok=True)
+    
+    if is_main_process():
+        os.makedirs(ckpt_dir, exist_ok=True)
+    
+    if dist.is_initialized():
+        dist.barrier()
 
-    print0(f"[FSDP] Saving sharded checkpoint to {ckpt_dir}")
+    print0(f"[FSDP] Saving checkpoint to {ckpt_dir}")
+    if consolidate:
+        print0("[FSDP] Will save consolidated model (inference-ready)")
+    else:
+        print0("[FSDP] Skipping consolidation (sharded only, faster)")
 
-    # Save model state dict (sharded)
     fsdp_model = model_map["transformer"]["fsdp_transformer"]
+
+    # ========================================
+    # 1. Save FSDP sharded checkpoint (ALWAYS)
+    # ========================================
+    print0("[FSDP] Saving sharded FSDP checkpoint...")
+    
     model_state_dict = {"model": fsdp_model.state_dict()}
     model_path = os.path.join(ckpt_dir, "transformer_model")
-    os.makedirs(model_path, exist_ok=True)
+    
+    if is_main_process():
+        os.makedirs(model_path, exist_ok=True)
+    
+    if dist.is_initialized():
+        dist.barrier()
 
     dist_save(
         state_dict=model_state_dict,
         storage_writer=FileSystemWriter(model_path),
     )
+    
+    if dist.is_initialized():
+        dist.barrier()
+    
+    print0("[FSDP] ✓ Saved sharded transformer model")
 
-    print0("[FSDP] Saved transformer model state")
-
-    # Save optimizer state dict (sharded)
-    optimizer_state = FSDP.optim_state_dict(
-        model=fsdp_model,
-        optim=optimizer,
-    )
-
+    # Save optimizer
+    optimizer_state = FSDP.optim_state_dict(model=fsdp_model, optim=optimizer)
     optim_path = os.path.join(ckpt_dir, "optimizer")
-    os.makedirs(optim_path, exist_ok=True)
+    
+    if is_main_process():
+        os.makedirs(optim_path, exist_ok=True)
+    
+    if dist.is_initialized():
+        dist.barrier()
 
     dist_save(
         state_dict={"optimizer": optimizer_state},
         storage_writer=FileSystemWriter(optim_path),
     )
+    
+    if dist.is_initialized():
+        dist.barrier()
+    
+    print0("[FSDP] ✓ Saved sharded optimizer state")
 
-    print0("[FSDP] Saved sharded optimizer state")
+    # ========================================
+    # 2. Save consolidated model if requested
+    # ========================================
+    if consolidate:
+        print0("[FSDP] Consolidating full model (this may take 1-2 minutes)...")
+        
+        import time
+        start_time = time.time()
+        
+        with FSDP.state_dict_type(
+            fsdp_model,
+            StateDictType.FULL_STATE_DICT,
+            FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+        ):
+            consolidated_state_dict = fsdp_model.state_dict()
+        
+        if is_main_process():
+            consolidation_time = time.time() - start_time
+            
+            if len(consolidated_state_dict) > 0:
+                consolidated_path = os.path.join(ckpt_dir, "consolidated_model.bin")
+                torch.save(consolidated_state_dict, consolidated_path)
+                file_size_gb = os.path.getsize(consolidated_path) / 1024**3
+                print0(f"[FSDP] ✓ Saved consolidated model ({consolidation_time:.1f}s)")
+                print0(f"[FSDP]   Path: {consolidated_path}")
+                print0(f"[FSDP]   Size: {file_size_gb:.2f} GB")
+            else:
+                print0("[FSDP] ⚠ Consolidated state dict is empty!")
+        
+        if dist.is_initialized():
+            dist.barrier()
+    else:
+        print0("[FSDP] ⏭ Skipped consolidation (faster save)")
 
-    # Save scheduler and step (rank 0 only)
+    # Save training state
     if is_main_process():
         training_state = {
             "step": step,
             "scheduler": scheduler.state_dict(),
         }
         torch.save(training_state, os.path.join(ckpt_dir, "training_state.pt"))
-        print0("[FSDP] Saved training state")
+        print0("[FSDP] ✓ Saved training state")
 
     if dist.is_initialized():
         dist.barrier()
 
-    print0(f"[FSDP] Checkpoint saved at step {step}")
-
+    print0(f"[FSDP] ✓ Checkpoint saved at step {step}")
 
 def load_fsdp_checkpoint(model_map: Dict, optimizer, scheduler, ckpt_path: str) -> int:
     """Load FSDP checkpoint with sharded optimizer states - FULL MODEL."""

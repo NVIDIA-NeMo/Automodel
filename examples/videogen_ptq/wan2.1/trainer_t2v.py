@@ -1,4 +1,5 @@
-# trainer_t2v.py - WAN 2.1 T2V FULL fine-tuning Trainer with FSDP + Data Parallel
+# trainer_t2v.py - WAN 2.1 T2V Trainer with Flow Matching
+
 import os
 from typing import Optional
 
@@ -21,13 +22,14 @@ from training_step_t2v import step_fsdp_transformer_t2v
 
 class WanT2VTrainerFSDP:
     """
-    WAN 2.1 T2V FULL fine-tuning trainer using FSDP for intra-node parallelism 
-    and data parallelism across nodes.
+    WAN 2.1 T2V FULL fine-tuning trainer with flow matching.
     
-    Architecture:
-    - Within each node: FSDP shards the model across GPUs
-    - Across nodes: Each node processes a different batch (data parallel)
-    - Total effective batch size = batch_size_per_node * num_nodes
+    Features:
+    - FSDP for intra-node parallelism
+    - Data parallelism across nodes
+    - Flow matching training (independent of inference scheduler)
+    - Density-based timestep sampling
+    - Loss weighting
     """
 
     def __init__(
@@ -35,11 +37,26 @@ class WanT2VTrainerFSDP:
         model_id: str = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
         learning_rate: float = 1e-5,
         cpu_offload: bool = True,
+        # Flow matching training parameters
+        use_sigma_noise: bool = True,
+        timestep_sampling: str = "uniform",
+        logit_mean: float = 0.0,
+        logit_std: float = 1.0,
+        flow_shift: float = 3.0,
+        mix_uniform_ratio: float = 0.1,
     ):
         self.model_id = model_id
         self.learning_rate = learning_rate
         self.cpu_offload = cpu_offload
         self.bf16 = torch.bfloat16
+
+        # Flow matching config
+        self.use_sigma_noise = use_sigma_noise
+        self.timestep_sampling = timestep_sampling
+        self.logit_mean = logit_mean
+        self.logit_std = logit_std
+        self.flow_shift = flow_shift
+        self.mix_uniform_ratio = mix_uniform_ratio
 
         self.local_rank = setup_distributed()
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -50,11 +67,16 @@ class WanT2VTrainerFSDP:
         self.num_nodes = self.world_size // self.local_world_size if self.local_world_size > 0 else 1
         self.node_rank = dist.get_rank() // self.local_world_size if dist.is_initialized() else 0
 
-        print0("[INFO] WAN 2.1 T2V FULL fine-tuning trainer with FSDP + Data Parallel")
+        print0("[INFO] WAN 2.1 T2V Trainer with Flow Matching")
         print0(f"[INFO] Total GPUs: {self.world_size}, GPUs per node: {self.local_world_size}, Num nodes: {self.num_nodes}")
         print0(f"[INFO] Node rank: {self.node_rank}, Local rank: {self.local_rank}")
         print0(f"[INFO] Learning rate: {learning_rate}")
         print0(f"[INFO] CPU offload: {'ENABLED' if cpu_offload else 'DISABLED'}")
+        print0(f"[INFO] Flow matching: {'ENABLED' if use_sigma_noise else 'DISABLED'}")
+        if use_sigma_noise:
+            print0(f"[INFO]   - Timestep sampling: {timestep_sampling}")
+            print0(f"[INFO]   - Flow shift: {flow_shift}")
+            print0(f"[INFO]   - Mix uniform ratio: {mix_uniform_ratio}")
 
         self.pipe = None
         self.model_map = {}
@@ -116,10 +138,19 @@ class WanT2VTrainerFSDP:
 
         print0(f"[INFO] Optimizing {len(all_params)} parameters")
 
-        self.optimizer = torch.optim.AdamW(all_params, lr=self.learning_rate, weight_decay=0.01, betas=(0.9, 0.999))
+        self.optimizer = torch.optim.AdamW(
+            all_params, 
+            lr=self.learning_rate, 
+            weight_decay=0.01, 
+            betas=(0.9, 0.999)
+        )
 
         # Temporary scheduler - will be reconfigured after dataloader is created
-        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=1000, eta_min=1e-6)
+        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, 
+            T_max=1000, 
+            eta_min=1e-6
+        )
 
     def validate_setup(self):
         """Validate FSDP setup with a test forward pass."""
@@ -144,13 +175,12 @@ class WanT2VTrainerFSDP:
         resume_checkpoint: Optional[str] = None,
     ):
         """
-        Train the model with FSDP (intra-node) + Data Parallel (inter-node).
+        Train the model with flow matching.
         
         Args:
             batch_size_per_node: Batch size for each node (NOT per GPU)
-                                Each node gets 1 batch, distributed across its GPUs via FSDP
         """
-        print0("[INFO] Starting T2V training with FSDP + Data Parallel")
+        print0("[INFO] Starting T2V training with Flow Matching")
         print0(f"[INFO] Batch size per node: {batch_size_per_node}")
         print0(f"[INFO] Total effective batch size: {batch_size_per_node * self.num_nodes}")
 
@@ -159,14 +189,18 @@ class WanT2VTrainerFSDP:
         self.setup_optim()
         self.validate_setup()
 
-        # Create dataloader - FIXED: use num_nodes instead of world_size
+        # Create dataloader
         dataloader, sampler = create_dataloader(meta_folder, batch_size_per_node, self.num_nodes)
 
         steps_per_epoch = len(dataloader)
         total_steps = num_epochs * steps_per_epoch
 
         # Reconfigure scheduler with actual total steps
-        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=total_steps, eta_min=1e-6)
+        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, 
+            T_max=total_steps, 
+            eta_min=1e-6
+        )
         print0(f"[INFO] Scheduler configured for {total_steps} total steps")
 
         global_step = 0
@@ -190,12 +224,19 @@ class WanT2VTrainerFSDP:
                 "num_nodes": self.num_nodes,
                 "gpus_per_node": self.local_world_size,
                 "total_gpus": self.world_size,
-                "approach": "wan_t2v_fsdp_full_finetune",
+                "approach": "wan_t2v_flow_matching",
                 "cpu_offload": self.cpu_offload,
+                # Flow matching config
+                "use_sigma_noise": self.use_sigma_noise,
+                "timestep_sampling": self.timestep_sampling,
+                "logit_mean": self.logit_mean,
+                "logit_std": self.logit_std,
+                "flow_shift": self.flow_shift,
+                "mix_uniform_ratio": self.mix_uniform_ratio,
             }
 
             wandb.init(
-                project="wan-t2v-fsdp-full-finetune",
+                project="wan-t2v-flow-matching",
                 config=config,
                 resume=resume_checkpoint is not None,
             )
@@ -210,7 +251,6 @@ class WanT2VTrainerFSDP:
             iterable = dataloader
             if is_main_process():
                 from tqdm import tqdm
-
                 iterable = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}")
 
             epoch_loss = 0.0
@@ -220,12 +260,20 @@ class WanT2VTrainerFSDP:
                 self.optimizer.zero_grad(set_to_none=True)
 
                 try:
-                    loss = step_fsdp_transformer_t2v(
+                    loss, metrics = step_fsdp_transformer_t2v(
                         pipe=self.pipe,
                         model_map=self.model_map,
                         batch=batch,
                         device=self.device,
                         bf16=self.bf16,
+                        # Flow matching parameters
+                        use_sigma_noise=self.use_sigma_noise,
+                        timestep_sampling=self.timestep_sampling,
+                        logit_mean=self.logit_mean,
+                        logit_std=self.logit_std,
+                        flow_shift=self.flow_shift,
+                        mix_uniform_ratio=self.mix_uniform_ratio,
+                        global_step=global_step,
                     )
 
                 except Exception as e:
@@ -237,8 +285,11 @@ class WanT2VTrainerFSDP:
 
                 loss.backward()
 
-                # Gradient clipping - get all trainable params
-                trainable_params = [p for p in self.model_map["transformer"]["fsdp_transformer"].parameters() if p.requires_grad and p.grad is not None]
+                # Gradient clipping
+                trainable_params = [
+                    p for p in self.model_map["transformer"]["fsdp_transformer"].parameters() 
+                    if p.requires_grad and p.grad is not None
+                ]
 
                 grad_norm = 0.0
                 if trainable_params:
@@ -275,14 +326,19 @@ class WanT2VTrainerFSDP:
                             }
                         )
 
+                # Checkpointing
                 if save_every and (global_step % save_every == 0):
+                    # FIXED: Better consolidation strategy
+                    # - Consolidate every 1000 steps (or use save_every if it's >= 1000)
+                    # - This ensures regular inference-ready checkpoints
                     save_fsdp_checkpoint(
                         self.model_map,
                         self.optimizer,
                         self.lr_scheduler,
                         output_dir,
                         global_step,
-                    )
+                        consolidate=True,  # Always save consolidated model
+                    )                    
 
             # Epoch summary
             avg_loss = epoch_loss / max(num_steps, 1)
@@ -301,6 +357,7 @@ class WanT2VTrainerFSDP:
                 self.lr_scheduler,
                 output_dir,
                 global_step,
+                consolidate=True,  # Always consolidate final checkpoint
             )
 
             print0(f"[INFO] Saved final checkpoint at step {global_step}")
