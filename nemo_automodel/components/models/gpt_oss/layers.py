@@ -18,7 +18,9 @@ import math
 import torch
 from torch import nn
 from torch.distributed.tensor import DTensor
-from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
 from nemo_automodel.components.moe.utils import (
     BackendConfig,
@@ -112,7 +114,7 @@ class RotaryEmbedding(torch.nn.Module):
 
 
 class GptOssAttention(nn.Module):
-    def __init__(self, config: GptOssConfig, backend: BackendConfig, use_sliding_attention: bool = False):
+    def __init__(self, config: "GptOssConfig", backend: BackendConfig, use_sliding_attention: bool = False):
         super().__init__()
 
         self.sliding_window = config.sliding_window if use_sliding_attention else None
