@@ -76,7 +76,7 @@ from nemo_automodel.components.utils.model_utils import (
     print_trainable_parameters,
 )
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.components.loggers.metric_logger import MetricLoggerDist
+from nemo_automodel.components.loggers.metric_logger import MetricsSample, MetricLoggerDist
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -949,11 +949,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     for mp in self.model_parts:
                         mp.train()
         # Close JSONL loggers after training loop completes
-        if self.dist_env.is_main:
-            if getattr(self, "jsonl_train_logger", None) is not None:
-                self.jsonl_train_logger.close()
-            if getattr(self, "jsonl_val_logger", None) is not None:
-                self.jsonl_val_logger.close()
+        self.jsonl_train_logger.close()
+        self.jsonl_val_logger.close()
 
         self.checkpointer.close()
 
@@ -1161,33 +1158,36 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         total_loss = self._dp_allreduce(total_loss, include_cp=True).item()
         total_num_label_tokens = self._dp_allreduce(torch.tensor(total_num_label_tokens, dtype=torch.long)).item()
-
         val_loss = total_loss / max(total_num_label_tokens, 1e-8)
-        if self.dist_env.is_main:
-            if wandb.run is not None:
-                wandb.log({"val_loss": val_loss, "step": self.step_scheduler.step, "epoch": self.step_scheduler.epoch})
-            # JSONL validation log
-            if getattr(self, "jsonl_val_logger", None) is not None:
-                try:
-                    self.jsonl_val_logger.log({
-                        "step": self.step_scheduler.step,
-                        "epoch": self.step_scheduler.epoch,
-                        "val_loss": val_loss,
-                        "learning_rate": current_lr,
-                        "num_label_tokens": total_num_label_tokens,
-                    })
-                except Exception:
-                    pass
 
-        # assumes all model parts' optimizers have the same learning rate
-        current_lr = self.optimizer[0].param_groups[0]["lr"]
+        if not self.dist_env.is_main:
+            return
+
+        log_data = MetricsSample(
+            step=self.step_scheduler.step,
+            epoch=self.step_scheduler.epoch,
+            metrics={
+                "val_loss": val_loss,
+                "lr": self.optimizer[0].param_groups[0]["lr"],
+                "num_label_tokens": total_num_label_tokens,
+                "mem": torch.cuda.max_memory_allocated() / 1024**3,
+            },
+        )
+
+
+        if wandb.run is not None:
+            wandb.log(log_data.to_dict(), step=log_data.step)
+
+        # JSONL validation log
+        self.jsonl_val_logger.log(log_data)
+
         logging.info(
             "[val] step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
-                self.step_scheduler.step,
-                self.step_scheduler.epoch,
-                val_loss,
-                current_lr,
-                total_num_label_tokens,
+                log_data.step,
+                log_data.epoch,
+                log_data.metrics["val_loss"],
+                log_data.metrics["lr"],
+                log_data.metrics["num_label_tokens"],
             )
         )
 
@@ -1200,42 +1200,41 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             num_tokens_in_batch: Total number of loss tokens.
             tps: Tokens per second.
         """
-        log_data = {
-            "step": self.step_scheduler.step,
-            "epoch": self.step_scheduler.epoch,
-            "train_loss": train_loss,
-            "grad_norm": grad_norm,
-            "num_tokens_per_step": num_tokens_in_batch,
-            "tps": tps,
-            "tps_per_gpu": tps / max(self._get_dp_group_size(), 1),
-        }
-        # assumes all model parts' optimizers have the same learning rate
-        current_lr = self.optimizer[0].param_groups[0]["lr"]
-        log_data["learning_rate"] = current_lr
+        if not self.dist_env.is_main:
+            return
+
+        log_data = MetricsSample(
+            step=self.step_scheduler.step,
+            epoch=self.step_scheduler.epoch,
+            metrics={
+                "loss": train_loss,
+                "grad_norm": grad_norm,
+                "lr": self.optimizer[0].param_groups[0]["lr"],
+                "mem": torch.cuda.max_memory_allocated() / 1024**3,
+                "tps": tps,
+                "tps_per_gpu": tps / max(self._get_dp_group_size(), 1),
+                "num_tokens_per_step": num_tokens_in_batch,
+                "num_label_tokens": num_label_tokens,
+            },
+        )
 
         if wandb.run is not None:
-            wandb.log(log_data, step=self.step_scheduler.step)
+            wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
         # JSONL training log
-        if getattr(self, "jsonl_train_logger", None) is not None:
-            try:
-                self.jsonl_train_logger.log(log_data)
-            except Exception:
-                pass
-
-        if self.dist_env.is_main:
-            logging.info(
-                "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
-                    self.step_scheduler.step,
-                    self.step_scheduler.epoch,
-                    train_loss,
-                    grad_norm,
-                    current_lr,
-                    torch.cuda.max_memory_allocated() / 1024**3,
-                    tps,
-                    tps / max(self._get_dp_group_size(), 1),
-                    num_label_tokens,
-                )
+        self.jsonl_train_logger.log(log_data)
+        logging.info(
+            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
+                log_data.step,
+                log_data.epoch,
+                log_data.metrics["loss"],
+                log_data.metrics["grad_norm"],
+                log_data.metrics["lr"],
+                log_data.metrics["mem"],
+                log_data.metrics["tps"],
+                log_data.metrics["tps_per_gpu"],
+                log_data.metrics["num_label_tokens"],
             )
+        )
         torch.cuda.reset_peak_memory_stats()
 
 

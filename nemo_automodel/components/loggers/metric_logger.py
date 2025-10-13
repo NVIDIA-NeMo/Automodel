@@ -19,6 +19,20 @@ import threading
 from datetime import datetime
 from typing import Any, Dict, Optional
 from torch.distributed import dist
+from dataclasses import dataclass
+
+
+@dataclass
+class MetricsSample:
+    step: int
+    epoch: int
+    metrics: Dict[str, float]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "step": self.step,
+            "epoch": self.epoch,
+        } | self.metrics
 
 class MetricLogger:
     """
