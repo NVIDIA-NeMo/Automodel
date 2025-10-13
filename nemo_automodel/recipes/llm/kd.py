@@ -51,6 +51,7 @@ from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.utils import count_tail_padding
+from nemo_automodel.components.loggers.metric_logger import MetricLoggerDist, MetricsSample
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     calculate_loss,
@@ -288,10 +289,35 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
         reporting_loss = reporting_loss.cpu().item()
         # fix reporting_loss, tps across ranks
-        return reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens
+
+        ce_loss = self._dp_allreduce(torch.stack(self._ce_loss_buffer).sum(), include_cp=True).item()
+        kd_loss = self._dp_allreduce(torch.stack(self._kd_loss_buffer).sum(), include_cp=True).item()
+        # Clear buffers for next step
+        self._ce_loss_buffer.clear()
+        self._kd_loss_buffer.clear()
+
+        # return reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens
+        return MetricsSample(
+            step=self.step_scheduler.step,
+            epoch=self.step_scheduler.epoch,
+            metrics={
+                "loss": reporting_loss,
+                "ce_loss": ce_loss,
+                "kd_loss": kd_loss,
+                "grad_norm": grad_norm,
+                "lr": self.optimizer[0].param_groups[0]["lr"],
+                "mem": torch.cuda.max_memory_allocated() / 1024**3,
+                "tps": tps,
+                "tps_per_gpu": tps / max(self._get_dp_group_size(), 1),
+                "num_tokens_per_step": num_tokens_in_batch,
+                "num_label_tokens": num_label_tokens,
+                "kd_ratio": self.kd_ratio,
+                "temperature": getattr(self.kd_loss_fn, "temperature", float("nan")),
+            },
+        )
 
     @torch.no_grad()
-    def _run_validation_epoch(self):
+    def _run_validation_epoch(self, val_dataloader):
         """Run one pass over `self.val_dataloader`."""
         if self.pp_enabled:
             logger.warning("Validation is not supported for pipeline parallelism")
@@ -306,7 +332,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             kd_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
             total_num_label_tokens = 0
 
-            for batch in self.val_dataloader:
+            for batch in val_dataloader:
                 num_label_tokens = (batch["labels"] != -100).sum().item()
                 local_loss, _kd_loss, _ce_loss = self._forward_backward_step(
                     0,
@@ -326,70 +352,75 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         total_num_label_tokens = self._dp_allreduce(torch.tensor(total_num_label_tokens, dtype=torch.long)).item()
 
         val_loss = total_loss / max(total_num_label_tokens, 1e-8)
-        if self.dist_env.is_main:
-            if wandb.run is not None:
-                wandb.log({"val_loss": val_loss, "step": self.step_scheduler.step, "epoch": self.step_scheduler.epoch})
-
-        # assumes all model parts' optimizers have the same learning rate
-        current_lr = self.optimizer[0].param_groups[0]["lr"]
-        logging.info(
-            "[val] step {} | epoch {} | loss {:.4f} | ce_loss {:.4f} | kd_loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
-                self.step_scheduler.step,
-                self.step_scheduler.epoch,
-                val_loss,
-                current_lr,
-                total_num_label_tokens,
-                ce_loss,
-                kd_loss,
-            )
-        )
-
-    def log_train_metrics(
-        self, train_loss, grad_norm, num_tokens_in_batch, tps, num_label_tokens, kd_loss=None
-    ) -> float:
-        """Override to log KD-specific metrics."""
-        # Calculate average CE and KD losses from the buffers
-        if len(getattr(self, "_ce_loss_buffer", [])) > 0:
-            ce_loss = self._dp_allreduce(torch.stack(self._ce_loss_buffer).sum(), include_cp=True).item()
-            kd_loss = self._dp_allreduce(torch.stack(self._kd_loss_buffer).sum(), include_cp=True).item()
-            # Clear buffers for next step
-            self._ce_loss_buffer.clear()
-            self._kd_loss_buffer.clear()
-        else:
-            ce_loss = 0.0
-            kd_loss = 0.0
-
-        # assumes all model parts' optimizers have the same learning rate
-        current_lr = self.optimizer[0].param_groups[0]["lr"]
-        # log_data
-        if wandb.run is not None:
-            log_data = {
-                "step": self.step_scheduler.step,
-                "epoch": self.step_scheduler.epoch,
-                "train_loss": train_loss,
+        return MetricsSample(
+            step=self.step_scheduler.step,
+            epoch=self.step_scheduler.epoch,
+            metrics={
+                "val_loss": val_loss,
                 "ce_loss": ce_loss,
                 "kd_loss": kd_loss,
-                "grad_norm": grad_norm,
-                "num_tokens_per_step": num_tokens_in_batch,
-                "tps": tps,
-                "tps_per_gpu": tps / self._get_dp_group_size(),
-                "learning_rate": current_lr,
-            }
-            wandb.log(log_data, step=self.step_scheduler.step)
+                "lr": self.optimizer[0].param_groups[0]["lr"],
+                "num_label_tokens": total_num_label_tokens,
+                "mem": torch.cuda.max_memory_allocated() / 1024**3,
+            },
+        )
+
+    def log_val_metrics(self, log_data):
+        if not self.dist_env.is_main or log_data is None:
+            return
+
+        if wandb.run is not None:
+            wandb.log(log_data.to_dict(), step=log_data.step)
+
+        # assumes all model parts' optimizers have the same learning rate
+        logging.info(
+            "[val] step {} | epoch {} | loss {:.4f} | ce_loss {:.4f} | kd_loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
+                log_data.step,
+                log_data.epoch,
+                log_data.metrics["val_loss"],
+                log_data.metrics["ce_loss"],
+                log_data.metrics["kd_loss"],
+                log_data.metrics["lr"],
+                log_data.metrics["num_label_tokens"],
+           )
+        )
+
+
+    def log_train_metrics(self, log_data) -> float:
+        """Log metrics to wandb and other loggers.
+
+        Args:
+            log_data: MetricsSample object, containing:
+                step: int, the current step.
+                epoch: int, the current epoch.
+                metrics: Dict[str, float], containing:
+                    "loss": Training loss.
+                    "grad_norm": Grad norm from the training step.
+                    "lr": Learning rate.
+                    "mem": Memory allocated.
+                    "tps": Tokens per second.
+                    "tps_per_gpu": Tokens per second per GPU.
+                    "num_label_tokens": Number of label tokens.
+        """
+        if not self.dist_env.is_main:
+            return
+        # log_data
+        if wandb.run is not None:
+            wandb.log(log_data.to_dict(), step=log_data.step)
 
         logging.info(
             "step {} | epoch {} | "
             "loss {:.4f} | ce_loss {:.4f} | kd_loss {:.4f} | "
             "lr {:.2e} | tps {:.2f} | kd_ratio {:.2f} | temperature {:.2f}".format(
-                self.step_scheduler.step,
-                self.step_scheduler.epoch,
-                train_loss,
-                ce_loss,
-                kd_loss,
-                current_lr,
-                tps,
-                self.kd_ratio,
-                getattr(self.kd_loss_fn, "temperature", float("nan")),
+                log_data.step,
+                log_data.epoch,
+                log_data.metrics["loss"],
+                log_data.metrics["ce_loss"],
+                log_data.metrics["kd_loss"],
+                log_data.metrics["lr"],
+                log_data.metrics["tps"],
+                log_data.metrics["kd_ratio"],
+                log_data.metrics["temperature"],
             )
         )
         torch.cuda.reset_peak_memory_stats()
