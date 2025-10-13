@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from math import ceil
 from typing import Optional
 
 from torch.distributed.checkpoint.stateful import Stateful
@@ -68,7 +69,7 @@ class StepScheduler(Stateful):
         assert num_epochs > 0, "num_epochs must be greater than 0"
         # Throws with IterableDataset.
         try:
-            self.epoch_len = len(dataloader)
+            self.epoch_len = ceil(len(dataloader) / self.grad_acc_steps)
         except:
             self.epoch_len = None
         self.val_every_steps = val_every_steps
