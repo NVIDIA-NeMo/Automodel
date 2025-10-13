@@ -150,6 +150,7 @@ def format_chat_template(
     pad_token_id: int,
     seq_length: Optional[int] = None,
     start_of_turn_token: Optional[str] = None,
+    tools: Optional[List[Dict]] = None,
 ) -> Dict[str, List[int]]:
     """
     Format a chat template style example.
@@ -165,7 +166,14 @@ def format_chat_template(
     Returns:
         A dictionary with the formatted example.
     """
-    input_ids = tokenizer.apply_chat_template(formatted_text)
+    # Ensure we have a usable chat template
+    if not _has_chat_template(tokenizer):
+        raise ValueError("Tokenizer lacks a usable chat template (chat_template/apply_chat_template)")
+    if tools is not None:
+        input_ids = tokenizer.apply_chat_template(formatted_text, tools=tools)
+    else:
+        input_ids = tokenizer.apply_chat_template(formatted_text)
+
     if isinstance(start_of_turn_token, str):
         start_of_turn_token_id = tokenizer(start_of_turn_token, add_special_tokens=False)["input_ids"][0]
         first_start_of_turn_token_id = input_ids.index(start_of_turn_token_id)
