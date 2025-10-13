@@ -14,11 +14,12 @@
 
 import functools
 import math
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 from torch.distributed.tensor import DTensor
-from typing import TYPE_CHECKING
+
 if TYPE_CHECKING:
     from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
