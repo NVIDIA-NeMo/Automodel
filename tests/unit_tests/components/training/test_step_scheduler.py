@@ -18,15 +18,19 @@ from nemo_automodel.components.training.step_scheduler import StepScheduler
 
 
 class SizedDataLoader:
-    def __init__(self, num_batches: int):
+    def __init__(self, num_batches: int, global_batch_size: int = 1, local_batch_size: int = 1):
         self.num_batches = num_batches
+        self.global_batch_size = global_batch_size
+        self.local_batch_size = local_batch_size
 
     def __iter__(self):
         for i in range(self.num_batches):
-            yield {"batch": i}
+            ans = []
+            for j in range(self.global_batch_size):
+                yield {"batch": (i, j)}
 
     def __len__(self):
-        return self.num_batches
+        return self.num_batches * (self.global_batch_size // self.local_batch_size)
 
 
 class IterableDataLoader:
@@ -116,22 +120,26 @@ def test_resume(max_steps, ckpt_every_steps):
     assert len(ref_outputs) == 0
 
 @pytest.mark.parametrize(
-    "max_steps, ckpt_every_steps, is_ckpt_step",
+    "max_steps, ckpt_every_steps, global_batch_size, local_batch_size, is_ckpt_step",
     [
-        (1, 1, [True]),
-        (3, 1, [True, True, True]),
-        (3, 2, [False, True, True]),
-        (3, 3, [False, False, True]),
-        (5, 3, [False, False, True, False, True]),
-        (6, 2, [False, True, False, True, False, True]),
-        (10, 4, [False, False, False, True, False, False, False, True, False, True]),
+        (1, 1, 1, 1, [True]),
+        (3, 1, 2, 2, [True, True, True]),
+        (3, 2, 2, 1, [False, True, True]),
+        (3, 3, 2, 2, [False, False, True]),
+        (5, 3, 1, 1, [False, False, True, False, True]),
+        (6, 2, 2, 1, [False, True, False, True, False, True]),
+        (10, 4, 4, 2, [False, False, False, True, False, False, False, True, False, True]),
     ],
 )
-def test_is_ckpt_step_parametrized_iterable(max_steps, ckpt_every_steps, is_ckpt_step):
-    dataloader = SizedDataLoader(num_batches=max_steps)
+def test_is_ckpt_step_parametrized_iterable(max_steps, ckpt_every_steps, global_batch_size, local_batch_size, is_ckpt_step):
+    dataloader = SizedDataLoader(
+        num_batches=max_steps,
+        global_batch_size=global_batch_size,
+        local_batch_size=local_batch_size,
+    )
     scheduler = StepScheduler(
-        global_batch_size=1,  # grad_acc_steps = 1
-        local_batch_size=1,
+        global_batch_size=global_batch_size,
+        local_batch_size=local_batch_size,
         dp_size=1,
         ckpt_every_steps=ckpt_every_steps,
         dataloader=dataloader,
@@ -141,7 +149,8 @@ def test_is_ckpt_step_parametrized_iterable(max_steps, ckpt_every_steps, is_ckpt
 
     periodic_ckpt_steps = []
     assert len(is_ckpt_step) == max_steps
-    for i, _  in enumerate(scheduler):
+    for i, batches in enumerate(scheduler):
+        assert len(batches) == global_batch_size // local_batch_size
         # After each yielded group, scheduler.step has been incremented
         # Record steps where the periodic checkpoint condition fires
         assert is_ckpt_step.pop(0) == scheduler.is_ckpt_step, i
