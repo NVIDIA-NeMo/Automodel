@@ -37,13 +37,12 @@ from typing import Optional
 
 import requests
 import torch
-from PIL import Image
-from transformers import AutoProcessor
-
 from nemo_automodel._peft.lora import PeftConfig, apply_lora_to_linear_modules
 from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig, load_model
 from nemo_automodel.loggers.log_utils import setup_logging
+from PIL import Image
+from transformers import AutoProcessor
 
 # TODO: Parse config from YAML and run generate with FSDP2/distributed in general
 

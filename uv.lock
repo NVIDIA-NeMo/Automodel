@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
@@ -516,6 +516,25 @@ dependencies = [
 wheels = [
     { url = "https://files.pythonhosted.org/packages/11/79/936af42edf90a7bd4e41a6cac89c913d4b47fa48a26b042d5129a9242ee3/decord-0.6.0-py3-none-manylinux2010_x86_64.whl", hash = "sha256:51997f20be8958e23b7c4061ba45d0efcd86bffd5fe81c695d0befee0d442976", size = 13602299, upload-time = "2021-06-14T21:30:55.486Z" },
     { url = "https://files.pythonhosted.org/packages/6c/be/e15b5b866da452e62635a7b27513f31cb581fa2ea9cc9b768b535d62a955/decord-0.6.0-py3-none-win_amd64.whl", hash = "sha256:02665d7c4f1193a330205a791bc128f7e108eb6ae5b67144437a02f700943bad", size = 24733380, upload-time = "2021-06-14T21:30:57.766Z" },
+]
+
+[[package]]
+name = "diffusers"
+version = "0.35.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "filelock" },
+    { name = "huggingface-hub" },
+    { name = "importlib-metadata" },
+    { name = "numpy" },
+    { name = "pillow" },
+    { name = "regex" },
+    { name = "requests" },
+    { name = "safetensors" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/49/05/c4c8736c14e0efe9a835fb91c6ff5e1abddf9894a2f2a28fffe6429378a6/diffusers-0.35.1.tar.gz", hash = "sha256:6f4dc0c9d309a4c4914a2179646f2bc801b5e395a43295fff3b5f9dbd3e28fd3", size = 3369127, upload-time = "2025-08-20T04:16:10.668Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/06/a7/c53f294f34d9e1584388721b3d7aa024ea1ac46e86d0c302fc3db40ed960/diffusers-0.35.1-py3-none-any.whl", hash = "sha256:fe29ff10200970c7c5934c6488c213e2a77a03dad5e6fa00bbd8e1d04234cb0e", size = 4121424, upload-time = "2025-08-20T04:16:08.359Z" },
 ]
 
 [[package]]
@@ -1304,6 +1323,7 @@ source = { editable = "." }
 dependencies = [
     { name = "bitsandbytes", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "datasets" },
+    { name = "diffusers" },
     { name = "ftfy" },
     { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "megatron-fsdp" },
@@ -1399,6 +1419,7 @@ requires-dist = [
     { name = "backoff", marker = "extra == 'vlm'" },
     { name = "bitsandbytes", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", specifier = "==0.45.5" },
     { name = "datasets", specifier = ">=4.0.0" },
+    { name = "diffusers" },
     { name = "flash-attn", marker = "extra == 'fa'", specifier = "<=2.8.3" },
     { name = "ftfy" },
     { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", specifier = ">=0.5.9" },
@@ -1412,8 +1433,8 @@ requires-dist = [
     { name = "nemo-automodel", extras = ["vlm"], marker = "extra == 'dev'" },
     { name = "numba", marker = "extra == 'vlm'" },
     { name = "numpy", marker = "extra == 'vlm'" },
-    { name = "opencv-python-headless", specifier = "==4.10.0.84" },
     { name = "nvidia-nvshmem-cu13", marker = "extra == 'deepep'" },
+    { name = "opencv-python-headless", specifier = "==4.10.0.84" },
     { name = "pillow", marker = "extra == 'vlm'" },
     { name = "pybind11" },
     { name = "pyyaml" },
