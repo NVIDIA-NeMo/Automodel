@@ -1204,7 +1204,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
 
     def log_train_metrics(self, log_data):
-        """Log metrics to wandb.
+        """Log metrics to wandb and other loggers.
 
         Args:
             log_data: MetricsSample object, containing:
