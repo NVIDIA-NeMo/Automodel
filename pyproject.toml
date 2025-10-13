@@ -110,9 +110,7 @@ moe = [
 deepep = [
     "nvidia-nvshmem-cu13",
 ]
-dev = [
-    "nemo_automodel[vlm]",
-]
+dev = []
 all = [
     "nemo_automodel[deepep]",
     "nemo_automodel[fa]",
