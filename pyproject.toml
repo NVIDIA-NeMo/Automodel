@@ -71,8 +71,10 @@ classifiers = [
 dependencies = [
     "bitsandbytes==0.45.5; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "datasets>=4.0.0",
+    "ftfy",
     "liger-kernel>=0.5.9; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "megatron-fsdp",
+    "opencv-python-headless==4.10.0.84",
     "pybind11",
     "pyyaml",
     "torch<=2.8.0",
