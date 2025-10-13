@@ -26,7 +26,7 @@ import torch.distributed as dist
 class MetricsSample:
     step: int
     epoch: int
-    metrics: Dict[str, float]
+    metrics: Dict[str, float] = {}
     timestamp: str = None
 
     def to_dict(self) -> Dict[str, Any]:
