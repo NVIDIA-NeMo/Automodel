@@ -21,9 +21,9 @@ name: Generate Uv lock
 #     types: [ opened, synchronize, reopened, labeled, unlabeled ]
 
 on:
-  push:
-    branches:
-      - "pull-request/[0-9]+"
+  pull_request:
+    paths:
+      - 'pyproject.toml'
 
 jobs:
   check_uv_lock_and_update:
@@ -43,4 +43,3 @@ jobs:
       - name: Check Uv lock
         run: |
           uv lock --check
-
