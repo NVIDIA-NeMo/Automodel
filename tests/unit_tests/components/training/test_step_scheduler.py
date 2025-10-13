@@ -38,7 +38,7 @@ class IterableDataLoader:
             yield {"batch": i}
 
     def __len__(self):
-        return self.num_batches
+        raise NotImplementedError("IterableDataLoader does not support __len__")
 
 
 def test_iteration_groups_and_epoch_increment_sized():
@@ -63,7 +63,57 @@ def test_iteration_groups_and_epoch_increment_sized():
     # One epoch completed and 3 steps performed
     assert scheduler.step == 3
     assert scheduler.epoch == 1
+@pytest.mark.parametrize(
+    "max_steps, ckpt_every_steps",
+    [
+        (1, 1),
+        (3, 1),
+        (3, 2),
+        (3, 3),
+        (5, 3),
+        (6, 2),
+        (10, 4),
+    ],
+)
+def test_resume(max_steps, ckpt_every_steps):
+    from copy import deepcopy
+    max_steps = 10
+    ckpt_every_steps = 2
+    dataloader = SizedDataLoader(num_batches=max_steps)
+    scheduler = StepScheduler(
+        global_batch_size=1,  # grad_acc_steps = 1
+        local_batch_size=1,
+        dp_size=1,
+        ckpt_every_steps=ckpt_every_steps,
+        dataloader=dataloader,
+        num_epochs=1,
+        max_steps=max_steps,
+    )
 
+    ref_outputs = []
+    ref_state = None
+    for i, _  in enumerate(scheduler):
+        if i == 2:
+            ref_state = deepcopy(scheduler.state_dict())
+            ref_outputs = [] # reset ref_outputs
+        ref_outputs.append((scheduler.step, scheduler.is_val_step, scheduler.is_ckpt_step))
+
+    del scheduler
+    scheduler = StepScheduler(
+        global_batch_size=1,  # grad_acc_steps = 1
+        local_batch_size=1,
+        dp_size=1,
+        ckpt_every_steps=ckpt_every_steps,
+        dataloader=dataloader,
+        num_epochs=1,
+        max_steps=max_steps,
+    )
+
+    scheduler.load_state_dict(ref_state)
+    for i, _  in enumerate(scheduler):
+        assert ref_outputs.pop(0) == (scheduler.step, scheduler.is_val_step, scheduler.is_ckpt_step)
+        assert scheduler.step == i + 2
+    assert len(ref_outputs) == 0
 
 @pytest.mark.parametrize(
     "max_steps, ckpt_every_steps, is_ckpt_step",
@@ -78,8 +128,7 @@ def test_iteration_groups_and_epoch_increment_sized():
     ],
 )
 def test_is_ckpt_step_parametrized_iterable(max_steps, ckpt_every_steps, is_ckpt_step):
-    # Use iterable dataloader (no __len__) so last_batch condition is not involved
-    dataloader = IterableDataLoader(num_batches=max_steps)
+    dataloader = SizedDataLoader(num_batches=max_steps)
     scheduler = StepScheduler(
         global_batch_size=1,  # grad_acc_steps = 1
         local_batch_size=1,
