@@ -91,12 +91,14 @@ def test_is_ckpt_step_parametrized_iterable(max_steps, ckpt_every_steps, is_ckpt
     )
 
     periodic_ckpt_steps = []
+    assert len(is_ckpt_step) == max_steps
     for i, _  in enumerate(scheduler):
         # After each yielded group, scheduler.step has been incremented
         # Record steps where the periodic checkpoint condition fires
-        assert is_ckpt_step[i] == scheduler.is_ckpt_step, i
+        assert is_ckpt_step.pop(0) == scheduler.is_ckpt_step, i
         if scheduler.is_ckpt_step:
             periodic_ckpt_steps.append(scheduler.step)
+    assert len(is_ckpt_step) == 0
 
     # Finished should trigger a checkpoint at the end regardless of periodicity
     assert scheduler.step == max_steps
