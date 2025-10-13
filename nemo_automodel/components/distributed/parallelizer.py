@@ -16,7 +16,7 @@ import importlib
 import logging
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from functools import lru_cache
+from functools import lru_cache, reduce
 from types import FunctionType
 from typing import Any, Dict, Generator, List, Optional, Union
 
@@ -65,7 +65,6 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
     Qwen2VLForConditionalGeneration,
 )
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
-from functools import reduce
 
 # Import model-specific tensor parallel plans from the dedicated module
 from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE_FUNCTIONS
