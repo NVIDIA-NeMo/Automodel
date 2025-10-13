@@ -749,9 +749,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             suppress_wandb_log_messages()
             run = build_wandb(self.cfg)
             logging.info("🚀 View run at {}".format(run.url))
-        # Initialize JSONL loggers on main rank
-        self.jsonl_train_logger = MetricLoggerDist("training.jsonl", flush=True)
-        self.jsonl_val_logger = MetricLoggerDist("validation.jsonl", flush=True)
 
         # Log experiment details on main rank
         self._log_experiment_details()
@@ -908,6 +905,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
 
         restore_from = self.cfg.get("checkpoint.restore_from", None)
+        self.checkpoint_config = build_checkpoint_config(
+            self.cfg.get("checkpoint", None),
+            self.cfg.get("model.cache_dir", None),
+            _get_model_name(self.cfg.model),
+            True if self.cfg.get("peft", None) else False,
+            model_state_dict_keys,
+        )
+        # Initialize JSONL loggers on main rank
+        self.metric_logger_train = MetricLoggerDist(pathlib.Path(self.checkpoint_config.checkpoint_dir) / "training.jsonl")
+        self.metric_logger_valid = MetricLoggerDist(pathlib.Path(self.checkpoint_config.checkpoint_dir) / "validation.jsonl")
 
         # Optionally resume
         self.load_checkpoint(restore_from)
@@ -947,8 +954,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     for mp in self.model_parts:
                         mp.train()
         # Close JSONL loggers after training loop completes
-        self.jsonl_train_logger.close()
-        self.jsonl_val_logger.close()
+        self.metric_logger_train.close()
+        self.metric_logger_valid.close()
 
         self.checkpointer.close()
 
@@ -1203,7 +1210,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             wandb.log(log_data.to_dict(), step=log_data.step)
 
         # JSONL validation log
-        self.jsonl_val_logger.log(log_data)
+        self.metric_logger_valid.log(log_data)
 
         logging.info(
             "[val] step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
@@ -1238,7 +1245,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if wandb.run is not None:
             wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
         # JSONL training log
-        self.jsonl_train_logger.log(log_data)
+        self.metric_logger_train.log(log_data)
         logging.info(
             "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
                 log_data.step,
