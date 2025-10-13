@@ -677,6 +677,7 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         layers.extend(largest_module_list)
         logger.info(f"Successfully extracted {len(largest_module_list)} layers using heuristic")
 
+    assert all(isinstance(m, nn.Module) for m in layers), "layers shoudl be nn.Module instances"
     return layers
 
 
