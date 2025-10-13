@@ -66,7 +66,7 @@ def test_iteration_groups_and_epoch_increment_sized():
 @pytest.mark.parametrize(
     "max_steps, ckpt_every_steps",
     [
-        (1, 1),
+        (11, 1),
         (3, 1),
         (3, 2),
         (3, 3),
