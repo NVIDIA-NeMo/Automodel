@@ -92,8 +92,8 @@ class StepScheduler(Stateful):
         for batch in self.dataloader:
             batch_buffer.append(batch)
             if len(batch_buffer) == self.grad_acc_steps:
-                self.step += 1
                 yield batch_buffer
+                self.step += 1
                 batch_buffer = []
                 if self.step >= self.max_steps:
                     return
