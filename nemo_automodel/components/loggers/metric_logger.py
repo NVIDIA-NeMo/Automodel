@@ -39,6 +39,7 @@ class MetricsSample:
     def __post_init__(self):
         self.timestamp = datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
 
+
 class MetricLogger:
     """
     Simple JSON Lines logger.
