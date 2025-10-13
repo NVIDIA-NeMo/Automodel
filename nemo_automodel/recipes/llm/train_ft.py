@@ -1207,7 +1207,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     "mem": Memory allocated.
         """
 
-        if not self.dist_env.is_main:
+        # Pipeline parallelism does not support validation -> log_data is None
+        if not self.dist_env.is_main or log_data is None:
             return
 
         if wandb.run is not None:
