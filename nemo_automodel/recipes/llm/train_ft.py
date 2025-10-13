@@ -594,19 +594,17 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamSch
 
     for opt in optimizer:
         base_lr = opt.param_groups[0]["lr"]
-        (
-            default_kwargs.update(
-                dict(
-                    optimizer=opt,
-                    init_lr=base_lr * 0.1,  # Start warmup at 10% of base LR
-                    max_lr=base_lr,
-                    min_lr=base_lr * 0.01,  # End at 1% of base LR
-                    start_wd=opt.param_groups[0].get("weight_decay", 0.0),
-                    end_wd=opt.param_groups[0].get("weight_decay", 0.0),
-                )
+        default_kwargs.update(
+            dict(
+                optimizer=opt,
+                init_lr=base_lr * 0.1,  # Start warmup at 10% of base LR
+                max_lr=base_lr,
+                min_lr=base_lr * 0.01,  # End at 1% of base LR
+                start_wd=opt.param_groups[0].get("weight_decay", 0.0),
+                end_wd=opt.param_groups[0].get("weight_decay", 0.0),
             )
-            | user_kwargs
         )
+        default_kwargs.update(user_kwargs)
         optimizer_param_schedulers.append(OptimizerParamScheduler(**default_kwargs))
 
     logger.info(
