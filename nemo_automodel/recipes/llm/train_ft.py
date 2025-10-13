@@ -912,7 +912,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             True if self.cfg.get("peft", None) else False,
             model_state_dict_keys,
         )
-        # Initialize JSONL loggers on main rank
+        # Initialize JSONL loggers
         self.metric_logger_train = MetricLoggerDist(
             pathlib.Path(self.checkpoint_config.checkpoint_dir) / "training.jsonl"
         )
@@ -942,7 +942,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # The step scheduler yields a list of batches with the following properties:
             # 1. len(batches) == grad_acc_steps
             # 2. len(batches[0]) == batch_size
-            for i, batches in enumerate(self.step_scheduler):
+            for batches in self.step_scheduler:
                 train_log_data = self._run_train_optim_step(batches, 1.0)
                 # log
                 self.log_train_metrics(train_log_data)
