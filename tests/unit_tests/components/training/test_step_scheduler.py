@@ -37,6 +37,9 @@ class IterableDataLoader:
         for i in range(self.num_batches):
             yield {"batch": i}
 
+    def __len__(self):
+        return self.num_batches
+
 
 def test_iteration_groups_and_epoch_increment_sized():
     # grad_acc_steps = global // (local * dp) = 8 // (2 * 2) = 2
@@ -63,18 +66,20 @@ def test_iteration_groups_and_epoch_increment_sized():
 
 
 @pytest.mark.parametrize(
-    "max_steps, ckpt_every_steps",
+    "max_steps, ckpt_every_steps, is_ckpt_step",
     [
-        (1, 1),
-        (3, 2),
-        (5, 3),
-        (6, 2),
-        (10, 4),
+        (1, 1, [True]),
+        (3, 1, [True, True, True]),
+        (3, 2, [False, True, True]),
+        (3, 3, [False, False, True]),
+        (5, 3, [False, False, True, False, True]),
+        (6, 2, [False, True, False, True, False, True]),
+        (10, 4, [False, False, False, True, False, False, False, True, False, True]),
     ],
 )
-def test_is_ckpt_step_parametrized_iterable(max_steps, ckpt_every_steps):
+def test_is_ckpt_step_parametrized_iterable(max_steps, ckpt_every_steps, is_ckpt_step):
     # Use iterable dataloader (no __len__) so last_batch condition is not involved
-    dataloader = IterableDataLoader(num_batches=max_steps * 3)
+    dataloader = IterableDataLoader(num_batches=max_steps)
     scheduler = StepScheduler(
         global_batch_size=1,  # grad_acc_steps = 1
         local_batch_size=1,
@@ -86,22 +91,16 @@ def test_is_ckpt_step_parametrized_iterable(max_steps, ckpt_every_steps):
     )
 
     periodic_ckpt_steps = []
-    for _ in scheduler:
+    for i, _  in enumerate(scheduler):
         # After each yielded group, scheduler.step has been incremented
         # Record steps where the periodic checkpoint condition fires
+        assert is_ckpt_step[i] == scheduler.is_ckpt_step, i
         if scheduler.is_ckpt_step:
             periodic_ckpt_steps.append(scheduler.step)
 
     # Finished should trigger a checkpoint at the end regardless of periodicity
     assert scheduler.step == max_steps
     assert scheduler.is_ckpt_step is True
-
-    # Expected periodic checkpoints at steps s in [1 .. max_steps-1]
-    expected_periodic = [
-        s for s in range(1, max_steps) if ((s + 1) % ckpt_every_steps) == 0 and s != 0
-    ]
-    assert periodic_ckpt_steps == expected_periodic
-
 
 def test_is_ckpt_step_triggers_on_last_batch_with_sized_dataloader():
     epoch_len = 4  # number of micro-batches per epoch

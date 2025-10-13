@@ -118,7 +118,7 @@ class StepScheduler(Stateful):
         """
         is_val = False
         if self.val_every_steps and self.val_every_steps > 0:
-            is_val = ((self.step + 1) % self.val_every_steps) == 0
+            is_val = self.step % self.val_every_steps == self.val_every_steps - 1
         return is_val
 
     @property
@@ -131,7 +131,7 @@ class StepScheduler(Stateful):
         """
         last_batch = self.epoch_len is not None and (self.step % self.epoch_len) == self.epoch_len - 1
         finished = self.step >= self.max_steps
-        return (((self.step + 1) % self.ckpt_every_steps) == 0 and self.step != 0) or last_batch or finished
+        return ((self.step % self.ckpt_every_steps) == self.ckpt_every_steps - 1) or last_batch or finished
 
     @property
     def epochs(self):
