@@ -32,7 +32,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 FROM ${PYTORCH_IMAGE} AS pytorch
 
-FROM ${BASE_IMAGE} AS automodel_final
+FROM ${BASE_IMAGE} AS automodel_dep
 
 WORKDIR /opt
 # Install uv
@@ -44,6 +44,15 @@ ENV UV_CACHE_DIR=/opt/uv_cache
 ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
 ENV UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1
 RUN uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+
+# Configure project files
+RUN mkdir /opt/Automodel
+COPY pyproject.toml uv.lock docker/common /opt/Automodel
+RUN cd /opt/Automodel && \
+    if [ "$BASE_IMAGE" = "pytorch" ]; then \
+        sed -i '/\[tool\.uv\]/r /opt/Automodel/docker/common/uv-pytorch.toml' pyproject.toml && \
+        mv /opt/Automodel/docker/common/uv-pytorch.lock /opt/Automodel/uv.lock; \
+    fi && \
 
 # Install Deepep
 COPY docker/common/deepep.patch /opt/deepep.patch
@@ -61,17 +70,22 @@ RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
 # Install Automodel
 ARG BASE_IMAGE=cuda
 ARG AUTOMODEL_INSTALL=dev
-COPY . /opt/Automodel
 RUN cd /opt/Automodel && \
-    if [ "$BASE_IMAGE" = "pytorch" ]; then \
-        sed -i '/\[tool\.uv\]/r /opt/Automodel/docker/common/uv-pytorch.toml' pyproject.toml && \
-        mv /opt/Automodel/docker/common/uv-pytorch.lock /opt/Automodel/uv.lock; \
-    fi && \
     uv sync --locked --extra $AUTOMODEL_INSTALL --all-groups && \
     if [ "$INSTALL_DEEPEP" = "True" ]; then \
         TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" \
         uv add --no-build-isolation -v /opt/DeepEP; \
-    fi
+    fi && \
+    cp pyproject.toml /opt/docker_pyproject.toml && \
+    cp uv.lock /opt/docker_uv.lock
+
+FROM automodel_dep AS automodel_final
+
+# Copy Automodel
+COPY . /opt/Automodel
+RUN cp /opt/docker_pyproject.toml /opt/Automodel/pyproject.toml && \
+    cp /opt/docker_uv.lock /opt/Automodel/uv.lock && \
+    rm /opt/docker_pyproject.toml /opt/docker_uv.lock
 
 COPY <<EOF /opt/venv/env.sh
 export UV_PROJECT_ENVIRONMENT=/opt/venv
