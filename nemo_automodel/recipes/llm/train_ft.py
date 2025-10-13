@@ -580,13 +580,14 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamSch
 
     # Set defaults for scheduler parameters
     optimizer_param_schedulers = []
+    user_kwargs = cfg.to_dict()
     default_kwargs = dict(
         lr_warmup_steps=min(1000, total_steps // 10),  # 10% warmup or max 1000 steps
         lr_decay_steps=total_steps,
         lr_decay_style="cosine",
         wd_incr_steps=total_steps,
         wd_incr_style="constant",
-    ) | cfg.to_dict()
+    )
 
     if not isinstance(optimizer, list):
         optimizer = [optimizer]
@@ -600,7 +601,7 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamSch
             min_lr=base_lr * 0.01,  # End at 1% of base LR
             start_wd=opt.param_groups[0].get("weight_decay", 0.0),
             end_wd=opt.param_groups[0].get("weight_decay", 0.0),
-        ))
+        )) | user_kwargs
         optimizer_param_schedulers.append(OptimizerParamScheduler(**default_kwargs))
 
     logger.info(
