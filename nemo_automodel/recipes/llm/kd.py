@@ -48,10 +48,10 @@ from transformers import AutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.utils import get_sync_ctx
+from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.utils import count_tail_padding
-from nemo_automodel.components.loggers.metric_logger import MetricLoggerDist, MetricsSample
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     calculate_loss,
@@ -382,9 +382,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 log_data.metrics["kd_loss"],
                 log_data.metrics["lr"],
                 log_data.metrics["num_label_tokens"],
-           )
+            )
         )
-
 
     def log_train_metrics(self, log_data) -> float:
         """Log metrics to wandb and other loggers.
