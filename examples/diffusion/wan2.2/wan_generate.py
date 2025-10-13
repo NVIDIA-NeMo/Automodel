@@ -6,11 +6,11 @@ import torch
 import torch.distributed as dist
 from diffusers import AutoencoderKLWan
 from diffusers.utils import export_to_video
-from nemo_automodel.distributed.init_utils import initialize_distributed
-from nemo_automodel.utils.logging import setup_logging
 
 from nemo_automodel.components._diffusers import NeMoAutoDiffusionPipeline
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
+from nemo_automodel.distributed.init_utils import initialize_distributed
+from nemo_automodel.utils.logging import setup_logging
 
 
 def setup_dist() -> int:
