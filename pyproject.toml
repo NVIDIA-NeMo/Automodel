@@ -111,7 +111,6 @@ deepep = [
     "nvidia-nvshmem-cu13",
 ]
 dev = [
-    "nemo_automodel[fa]",
     "nemo_automodel[vlm]",
 ]
 all = [
