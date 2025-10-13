@@ -15,7 +15,7 @@ import io
 import json
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict
 
@@ -26,7 +26,7 @@ import torch.distributed as dist
 class MetricsSample:
     step: int
     epoch: int
-    metrics: Dict[str, float] = {}
+    metrics: Dict[str, float] = field(default_factory=dict)
     timestamp: str = None
 
     def to_dict(self) -> Dict[str, Any]:
