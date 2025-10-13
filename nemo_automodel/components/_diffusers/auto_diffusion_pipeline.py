@@ -9,7 +9,6 @@ from diffusers import DiffusionPipeline
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 from nemo_automodel.shared.utils import dtype_from_str
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -40,6 +39,7 @@ def _iter_pipeline_modules(pipe: DiffusionPipeline) -> Iterable[Tuple[str, nn.Mo
             continue
         if isinstance(value, nn.Module):
             yield name, value
+
 
 def _move_module_to_device(module: nn.Module, device: torch.device, torch_dtype: Any) -> None:
     # torch_dtype can be "auto", torch.dtype, or string
@@ -107,5 +107,3 @@ class NeMoAutoDiffusionPipeline(DiffusionPipeline):
                 except Exception as e:
                     logger.warning("FSDP2Manager.parallelize failed for %s: %s", comp_name, e)
         return pipe
-
-

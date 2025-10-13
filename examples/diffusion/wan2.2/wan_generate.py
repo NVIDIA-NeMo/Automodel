@@ -1,18 +1,16 @@
-import logging
 import argparse
+import logging
 import os
-import sys
-import warnings
 
 import torch
 import torch.distributed as dist
 from diffusers import AutoencoderKLWan
 from diffusers.utils import export_to_video
+from nemo_automodel.distributed.init_utils import initialize_distributed
+from nemo_automodel.utils.logging import setup_logging
 
 from nemo_automodel.components._diffusers import NeMoAutoDiffusionPipeline
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
-from nemo_automodel.distributed.init_utils import initialize_distributed
-from nemo_automodel.utils.logging import setup_logging
 
 
 def setup_dist() -> int:
@@ -23,6 +21,7 @@ def setup_dist() -> int:
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     return local_rank
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Wan2.2 T2V FSDP2 generation")
@@ -71,6 +70,7 @@ def parse_args():
     )
     return parser.parse_args()
 
+
 def main():
     args = parse_args()
     initialize_distributed(backend="nccl", timeout_minutes=10)
@@ -87,7 +87,7 @@ def main():
     pp_size = args.pp_size
     dp_size = args.dp_size
     dp_rank = local_rank // (tp_size * cp_size * pp_size)
-    
+
     # -------- Load pipeline --------
     logging.info("[Loading] Loading VAE and pipeline...")
     vae = AutoencoderKLWan.from_pretrained(
@@ -123,7 +123,7 @@ def main():
 
     # -------- Inference --------
     logging.info("[Inference] Starting distributed inference...")
-    torch.manual_seed(args.seed+dp_rank)
+    torch.manual_seed(args.seed + dp_rank)
 
     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=bf16):
         out = pipe(
@@ -149,4 +149,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

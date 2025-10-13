@@ -348,7 +348,7 @@ class WanParallelizationStrategy(ParallelizationStrategy):
 # Strategy registry mapping model class names to parallelization strategies
 PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
     "NemotronHForCausalLM": NemotronHParallelizationStrategy(),
-    "WanTransformer3DModel": WanParallelizationStrategy()
+    "WanTransformer3DModel": WanParallelizationStrategy(),
 }
 
 # Default strategy instance
