@@ -41,9 +41,7 @@ class VideoDecoder:
         """Load Wan2.1 VAE from Hugging Face with memory optimization."""
         logger.info("Loading Wan2.1 VAE for decoding...")
         vae = AutoencoderKLWan.from_pretrained(
-            self.wan21_model_id, 
-            subfolder="vae", 
-            torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
+            self.wan21_model_id, subfolder="vae", torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
         )
         vae.to(self.device)
         vae.eval()
@@ -59,7 +57,7 @@ class VideoDecoder:
 
         # Log VAE config for debugging
         logger.info("Wan2.1 VAE loaded successfully")
-        
+
         # Verify this is a Wan2.1 VAE
         if hasattr(vae.config, "latents_mean") and hasattr(vae.config, "latents_std"):
             logger.info("✅ Found latents_mean and latents_std in VAE config (Wan2.1 format)")
@@ -357,9 +355,7 @@ def main():
 
     # Initialize decoder
     decoder = VideoDecoder(
-        wan21_model_id=args.model, 
-        device=args.device, 
-        enable_memory_optimization=not args.no_memory_optimization
+        wan21_model_id=args.model, device=args.device, enable_memory_optimization=not args.no_memory_optimization
     )
 
     input_path = Path(args.input)

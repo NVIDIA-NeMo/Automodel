@@ -1,6 +1,8 @@
 import os
+
 import torch
 from dist_utils import print0
+
 
 def prepare_t2v_conditioning(pipe, video_latents: torch.Tensor, timesteps: torch.Tensor, bf16):
     """

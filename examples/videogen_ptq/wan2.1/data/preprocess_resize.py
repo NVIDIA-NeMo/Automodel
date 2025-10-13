@@ -392,10 +392,10 @@ class VideoPreprocessor:
 
         # Tokenize text with UMT5 settings (max_length=512 for Wan2.1)
         inputs = self.tokenizer(
-            caption, 
-            max_length=512, 
-            padding="max_length", 
-            truncation=True, 
+            caption,
+            max_length=512,
+            padding="max_length",
+            truncation=True,
             return_tensors="pt",
             return_attention_mask=True,
         )
@@ -406,8 +406,7 @@ class VideoPreprocessor:
         # Encode text using UMT5 encoder
         with torch.no_grad():
             text_embeddings = self.text_encoder(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"]
+                input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"]
             ).last_hidden_state
 
         logger.info(f"Text embeddings shape: {text_embeddings.shape}")
@@ -417,7 +416,7 @@ class VideoPreprocessor:
         """
         CRITICAL FIX: Encode video using Wan2.1 VAE without manual normalization.
         The VAE encode() already returns normalized latents!
-        
+
         Args:
             video_tensor: Video tensor of shape (batch, channels, num_frames, height, width)
 
@@ -437,9 +436,9 @@ class VideoPreprocessor:
         # CRITICAL FIX: Check if VAE encode() returns normalized latents
         # According to Wan2.1 code, the VAE.encode() should handle normalization internally
         # We should NOT manually normalize again!
-        
+
         logger.info("Encoding with Wan2.1 VAE...")
-        
+
         with torch.no_grad():
             latent_dist = self.vae.encode(video_tensor)
 
@@ -457,9 +456,9 @@ class VideoPreprocessor:
         # Let's check the latent statistics
         latent_mean = video_latents.mean().item()
         latent_std = video_latents.std().item()
-        
+
         logger.info(f"Raw latent statistics - mean: {latent_mean:.4f}, std: {latent_std:.4f}")
-        
+
         # Check if latents are already normalized (mean~0, std~1)
         if abs(latent_mean) < 0.5 and 0.5 < latent_std < 2.0:
             logger.warning("⚠️  Latents appear already normalized! Skipping manual normalization.")
@@ -488,12 +487,12 @@ class VideoPreprocessor:
         logger.info(f"Output video latents shape: {final_latents.shape}, dtype: {final_latents.dtype}")
         logger.info(f"Encoding mode: {'deterministic' if self.deterministic_latents else 'stochastic'}")
         logger.info(f"Memory optimization: {'enabled' if self.enable_memory_optimization else 'disabled'}")
-        
+
         # Final statistics
         final_mean = final_latents.mean().item()
         final_std = final_latents.std().item()
         logger.info(f"Final latent statistics - mean: {final_mean:.4f}, std: {final_std:.4f}")
-        
+
         return final_latents
 
     def save_processed_data(
@@ -547,7 +546,7 @@ class VideoPreprocessor:
         logger.info(f"First frame shape: {first_frame.shape}, dtype: {first_frame.dtype}")
         logger.info(f"Encoding mode saved: {'deterministic' if self.deterministic_latents else 'stochastic'}")
         logger.info(f"Memory optimization: {'enabled' if self.enable_memory_optimization else 'disabled'}")
-        logger.info(f"Model version: Wan2.1")
+        logger.info("Model version: Wan2.1")
         if self.target_size is not None:
             logger.info(f"Resize settings saved: {self.target_size} ({self.resize_mode})")
 
@@ -681,9 +680,9 @@ def main():
         "--output_folder", default="processed_meta", help="Path to folder where .meta files will be saved"
     )
     parser.add_argument(
-        "--model", 
-        default="Wan-AI/Wan2.1-T2V-14B-Diffusers", 
-        help="Wan2.1 model ID (e.g., Wan-AI/Wan2.1-T2V-14B-Diffusers or Wan-AI/Wan2.1-T2V-1.3B-Diffusers)"
+        "--model",
+        default="Wan-AI/Wan2.1-T2V-14B-Diffusers",
+        help="Wan2.1 model ID (e.g., Wan-AI/Wan2.1-T2V-14B-Diffusers or Wan-AI/Wan2.1-T2V-1.3B-Diffusers)",
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use")
     parser.add_argument(
