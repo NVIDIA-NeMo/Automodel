@@ -120,6 +120,7 @@ def apply_fsdp(
     ep_shard_mesh: DeviceMesh | None = None,
     mp_policy: MixedPrecisionPolicy | None = None,
     offload_policy: OffloadPolicy | None = None,
+    reshard_after_forward: bool = False,
 ):
     if mp_policy is None:
         mp_policy = MixedPrecisionPolicy(
@@ -129,7 +130,7 @@ def apply_fsdp(
     fully_shard_default = functools.partial(
         fully_shard,
         mesh=fsdp_mesh,
-        reshard_after_forward=not pp_enabled,
+        reshard_after_forward=reshard_after_forward,
         mp_policy=mp_policy,
         offload_policy=offload_policy,
     )
@@ -147,7 +148,7 @@ def apply_fsdp(
                 block.mlp.experts,
                 mesh=ep_shard_mesh,
                 shard_placement_fn=lambda _: Shard(1),
-                reshard_after_forward=not pp_enabled,
+                reshard_after_forward=reshard_after_forward,
             )
         # If FSDP is disabled for grouped experts because the parameters are already
         # fully sharded by PP and EP, then we need to explicitly remove the parameters
@@ -183,6 +184,7 @@ def parallelize_model(
     ep_axis_name: str | None = None,
     ep_shard_axis_names: tuple[str, ...] | None = None,
     activation_checkpointing: bool = False,
+    reshard_after_forward: bool = False,
 ):
     assert tp_axis_name is None or world_mesh[tp_axis_name].size() == 1, (
         "Tensor parallelism not supported for DeepSeek v3 model"
@@ -226,4 +228,5 @@ def parallelize_model(
             ep_enabled=ep_enabled,
             ep_shard_enabled=ep_shard_mesh is not None and ep_shard_mesh.size() > 1,
             ep_shard_mesh=ep_shard_mesh,
+            reshard_after_forward=reshard_after_forward,
         )

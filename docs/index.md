@@ -15,20 +15,22 @@ environment/cluster.md
 -->
 
 ```{toctree}
-:caption: Guides
+:caption: Announcements
 :hidden:
+Challenges in Enabling PyTorch Native Pipeline Parallelism for Hugging Face Transformer Models <https://github.com/NVIDIA-NeMo/Automodel/discussions/589>
+Google Gemma 3n: Efficient Multimodal Fine-tuning Made Simple <https://github.com/NVIDIA-NeMo/Automodel/discussions/494>
+Fine-tune Hugging Face Models Instantly with Day-0 Support with NVIDIA NeMo AutoModel <https://github.com/NVIDIA-NeMo/Automodel/discussions/477>
 
-guides/omni/gemma3-3n.md
 ```
 
 ```{toctree}
 :caption: E2E Examples
 :hidden:
 
-guides/llm/sft.md
-guides/llm/peft.md
+guides/llm/finetune.md
 guides/llm/mcore-pretraining.md
 guides/llm/nanogpt-pretraining.md
+guides/omni/gemma3-3n.md
 ```
 
 ```{toctree}
@@ -59,4 +61,11 @@ guides/llm/knowledge-distillation.md
 guides/fp8-training.md
 
 apidocs/index.rst
+```
+
+```{toctree}
+:caption: Performance
+:hidden:
+
+performance-summary.md
 ```

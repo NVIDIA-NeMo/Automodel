@@ -35,6 +35,7 @@ class BackendConfig:
     enable_deepep: bool = HAVE_DEEP_EP
     fake_balanced_gate: bool = False
     enable_hf_state_dict_adapter: bool = True
+    enable_fsdp_optimizations: bool = False
 
 
 def initialize_attn_module_and_func(

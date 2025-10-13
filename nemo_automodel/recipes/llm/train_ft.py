@@ -61,7 +61,12 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
-from nemo_automodel.components.training.utils import count_tail_padding, scale_grads_and_clip_grad_norm
+from nemo_automodel.components.training.utils import (
+    count_tail_padding,
+    prepare_for_final_backward,
+    prepare_for_grad_accumulation,
+    scale_grads_and_clip_grad_norm,
+)
 from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
     compile_model,
@@ -183,7 +188,7 @@ def build_model_and_optimizer(
     # hold a copy of the model state dict keys before any parallelization
     state_dict_keys = model.state_dict().keys()
 
-    if not _supports_logits_to_keep(model):
+    if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
         loss_fn = MaskedCrossEntropy()
 
@@ -761,6 +766,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     ("ep_shard",) if self.moe_mesh is not None and "ep_shard" in self.moe_mesh.mesh_dim_names else None
                 ),
                 pp_batch_size=pp_batch_size,
+                patch_stage_backward_maybe_with_nosync=self.cfg.get("model.backend.enable_fsdp_optimizations", False),
                 device=torch.cuda.current_device(),
             )
             assert isinstance(autopipeline, AutoPipeline), (
@@ -967,7 +973,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
-                    (local_loss * self._get_dp_group_size()).backward()
+                    (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
@@ -991,7 +997,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
         num_batches = len(batches)
+        prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
+
         for i, batch in enumerate(batches):
+            if i == num_batches - 1:
+                prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
+
             self._forward_backward_step(
                 i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
             )
@@ -1007,7 +1018,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             pp_axis_name="pp" if self.pp_enabled else None,
             foreach=True,
             num_label_tokens=num_label_tokens,
-            dp_group_size=self._get_dp_group_size(),
+            dp_group_size=self._get_dp_group_size(include_cp=True),
         )
 
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
@@ -1016,6 +1027,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         for opt in self.optimizer:
             opt.step()
             opt.zero_grad()
+
+        if hasattr(self.model_parts[0], "update_moe_gate_bias"):
+            for mp in self.model_parts:
+                mp.update_moe_gate_bias()
 
         if self.lr_scheduler is not None:
             for scheduler in self.lr_scheduler:
@@ -1042,7 +1057,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.timestamp = t
         tps = num_tokens_in_batch / time_delta
         reporting_loss = torch.sum(torch.stack(loss_buffer))
-        reporting_loss = self._dp_allreduce(reporting_loss)
+        reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
         if self.pp_enabled:
             reporting_loss = reporting_loss / num_label_tokens
             reporting_loss = reporting_loss.to(self.dist_env.device)
@@ -1086,7 +1101,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 total_loss += torch.sum(torch.stack(loss_buffer)).item()
                 total_num_label_tokens += num_label_tokens
 
-        total_loss = self._dp_allreduce(total_loss).item()
+        total_loss = self._dp_allreduce(total_loss, include_cp=True).item()
         total_num_label_tokens = self._dp_allreduce(torch.tensor(total_num_label_tokens, dtype=torch.long)).item()
 
         val_loss = total_loss / max(total_num_label_tokens, 1e-8)
@@ -1122,7 +1137,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             "grad_norm": grad_norm,
             "num_tokens_per_step": num_tokens_in_batch,
             "tps": tps,
-            "tps_per_gpu": tps / self._get_dp_group_size(),
+            "tps_per_gpu": tps / max(self._get_dp_group_size(), 1),
         }
         # assumes all model parts' optimizers have the same learning rate
         current_lr = self.optimizer[0].param_groups[0]["lr"]
@@ -1141,7 +1156,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     current_lr,
                     torch.cuda.max_memory_allocated() / 1024**3,
                     tps,
-                    tps / self._get_dp_group_size(),
+                    tps / max(self._get_dp_group_size(), 1),
                     num_label_tokens,
                 )
             )

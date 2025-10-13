@@ -185,6 +185,36 @@ def test_column_mapped_dataset_streaming(tmp_path: Path):
     # But we can iterate and obtain the mapped columns
     first_two = list(itertools.islice(ds, 2))
 
+def test_limit_dataset_samples(tmp_path: Path):
+    """
+    `limit_dataset_samples` should select only the requested number of
+    rows in the dataset.
+    """
+    samples = [
+        {"query": "Why is the sky blue?", "response": "Rayleigh scattering."},
+        {"query": "What is 2+2?", "response": "4."},
+        {"query": "How many r's in the word strawberry?", "response": "3."},
+    ]
+    jsonl_path = tmp_path / "toy.jsonl"
+    with jsonl_path.open("w", encoding="utf-8") as fp:
+        for row in samples:
+            fp.write(json.dumps(row) + "\n")
+
+    column_mapping = {"question": "query", "answer": "response"}
+
+    ds = ColumnMappedTextInstructionDataset(
+        path_or_dataset_id=str(jsonl_path),
+        column_mapping=column_mapping,
+        tokenizer=_DummyTokenizer(),
+        answer_only_loss_mask=False,
+        limit_dataset_samples=1,
+    )
+
+    assert len(ds) == 1
+    first = ds[0]
+    del first["___PAD_TOKEN_IDS___"]
+    assert set(first.keys()) == {"labels", "input_ids", "attention_mask"}
+
 class _TokenizerNoChat:  # noqa: D401 - minimal stub only
     """Tokenizer *without* chat‐template support."""
 
