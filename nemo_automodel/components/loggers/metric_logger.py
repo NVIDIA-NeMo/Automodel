@@ -14,12 +14,12 @@
 import io
 import json
 import os
-from re import L
 import threading
-from datetime import datetime
-from typing import Any, Dict, Optional
-from torch.distributed import dist
 from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict
+
+import torch.distributed as dist
 
 
 @dataclass
@@ -34,6 +34,7 @@ class MetricsSample:
             "epoch": self.epoch,
         } | self.metrics
 
+
 class MetricLogger:
     """
     Simple JSON Lines logger.
@@ -44,7 +45,7 @@ class MetricLogger:
     - UTF-8 without BOM, newline per record.
     """
 
-    def __init__(self, filepath: str, *, flush: bool = False, append: bool = True) -> None:
+    def __init__(self, filepath: str, *, flush: bool = True, append: bool = True) -> None:
         self.filepath = os.path.abspath(filepath)
         self.flush = flush
         self._lock = threading.Lock()
