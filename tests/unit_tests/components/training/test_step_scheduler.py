@@ -98,6 +98,7 @@ def test_is_ckpt_step_parametrized_iterable(max_steps, ckpt_every_steps, is_ckpt
         assert is_ckpt_step.pop(0) == scheduler.is_ckpt_step, i
         if scheduler.is_ckpt_step:
             periodic_ckpt_steps.append(scheduler.step)
+        assert scheduler.step == i
     assert len(is_ckpt_step) == 0
 
     # Finished should trigger a checkpoint at the end regardless of periodicity
