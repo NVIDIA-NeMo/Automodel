@@ -344,32 +344,6 @@ def build_loss_fn(cfg_loss):
     """
     return cfg_loss.instantiate()
 
-def _build_tokenizer(cfg_model, cfg_ds):
-    # if tokenizer is not provided, use the model config to instantiate it
-    if "tokenizer" not in cfg_ds and cfg_model.get("pretrained_model_name_or_path", None) is not None:
-        logging.info("Using model config to instantiate tokenizer")
-        trust_remote_code = getattr(cfg_model, "trust_remote_code", False)
-        tokenizer = AutoTokenizer.from_pretrained(
-            cfg_model.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
-        )
-    elif cfg_ds.get("tokenizer", None) is None:
-        tokenizer = None
-    elif "_target_" not in cfg_ds.tokenizer:
-        tokenizer = AutoTokenizer.from_pretrained(**cfg_ds.tokenizer.to_dict())
-    else:
-        tokenizer = cfg_ds.tokenizer.instantiate()
-
-    # Finally, check if the dataset target accepts a tokenizer parameter
-    kwargs = {}
-    if tokenizer is not None and callable(cfg_ds._target_):
-        try:
-            sig = inspect.signature(cfg_ds._target_)
-            if 'tokenizer' in sig.parameters:
-                kwargs["tokenizer"] = tokenizer
-        except (ValueError, TypeError):
-            # If we can't get the signature, skip adding tokenizer
-            pass
-    return kwargs
 
 def _build_tokenizer(cfg_model, cfg_ds):
     # if tokenizer is not provided, use the model config to instantiate it
