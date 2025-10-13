@@ -27,13 +27,17 @@ class MetricsSample:
     step: int
     epoch: int
     metrics: Dict[str, float]
+    timestamp: str = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "step": self.step,
             "epoch": self.epoch,
+            "timestamp": self.timestamp,
         } | self.metrics
 
+    def __post_init__(self):
+        self.timestamp = datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
 
 class MetricLogger:
     """
@@ -45,7 +49,7 @@ class MetricLogger:
     - UTF-8 without BOM, newline per record.
     """
 
-    def __init__(self, filepath: str, *, flush: bool = True, append: bool = True) -> None:
+    def __init__(self, filepath: str, *, flush: bool = False, append: bool = True) -> None:
         self.filepath = os.path.abspath(filepath)
         self.flush = flush
         self._lock = threading.Lock()
@@ -54,11 +58,8 @@ class MetricLogger:
         # Use buffered writer for performance; rely on flush flag when needed
         self._fp = io.open(self.filepath, mode, encoding="utf-8", buffering=1)
 
-    def log(self, record: Dict[str, Any], *, add_timestamp: bool = True) -> None:
-        entry: Dict[str, Any] = dict(record)
-        if add_timestamp and "timestamp" not in entry:
-            entry["timestamp"] = datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
-        line = json.dumps(entry, ensure_ascii=False)
+    def log(self, record: MetricsSample) -> None:
+        line = json.dumps(record.to_dict(), ensure_ascii=False)
         with self._lock:
             self._fp.write(line + "\n")
             if self.flush:
@@ -95,6 +96,3 @@ class MetricLoggerDist(MetricLogger):
             self.close = lambda: None
             self.__enter__ = lambda: None
             self.__exit__ = lambda: None
-
-    def log(self, record: Dict[str, Any], *, add_timestamp: bool = True) -> None:
-        super().log(record, add_timestamp=add_timestamp)

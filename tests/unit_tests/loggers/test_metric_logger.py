@@ -31,8 +31,8 @@ def test_metric_logger_basic_jsonl(tmp_path):
     logfile = tmp_path / "metrics.jsonl"
     logger = MetricLogger(str(logfile), flush=True, append=False)
 
-    logger.log({"loss": 1.23, "step": 1})
-    logger.log({"accuracy": 0.9, "epoch": 0})
+    logger.log(metric_logger_mod.MetricsSample(step=1, epoch=0, metrics={"loss": 1.23}))
+    logger.log(metric_logger_mod.MetricsSample(step=0, epoch=0, metrics={"accuracy": 0.9}))
     logger.close()
 
     assert logfile.exists()
@@ -54,12 +54,12 @@ def test_append_vs_write_modes(tmp_path):
 
     # First run: write mode (truncate)
     logger = MetricLogger(str(logfile), flush=True, append=False)
-    logger.log({"a": 1})
+    logger.log(metric_logger_mod.MetricsSample(step=0, epoch=0, metrics={"a": 1}))
     logger.close()
 
     # Second run: append mode
     logger2 = MetricLogger(str(logfile), flush=True, append=True)
-    logger2.log({"b": 2})
+    logger2.log(metric_logger_mod.MetricsSample(step=0, epoch=0, metrics={"b": 2}))
     logger2.close()
 
     rows = _read_jsonl(logfile)
@@ -76,7 +76,7 @@ def test_thread_safe_logging(tmp_path):
 
     def worker(tid: int):
         for i in range(per_thread):
-            logger.log({"thread": tid, "i": i})
+            logger.log(metric_logger_mod.MetricsSample(step=0, epoch=0, metrics={"thread": tid, "i": i}))
 
     threads = [threading.Thread(target=worker, args=(t,)) for t in range(num_threads)]
     for t in threads:
@@ -105,8 +105,8 @@ def test_flush_fsync_behavior(tmp_path, monkeypatch):
 
     monkeypatch.setattr(metric_logger_mod.os, "fsync", _fake_fsync)
 
-    logger.log({"x": 1})
-    logger.log({"y": 2})
+    logger.log(metric_logger_mod.MetricsSample(step=0, epoch=0, metrics={"x": 1}))
+    logger.log(metric_logger_mod.MetricsSample(step=0, epoch=0, metrics={"y": 2}))
     logger.close()
 
     # fsync should be called once per log when flush=True
@@ -125,7 +125,7 @@ def test_no_fsync_when_flush_false(tmp_path, monkeypatch):
 
     monkeypatch.setattr(metric_logger_mod.os, "fsync", _fake_fsync)
 
-    logger.log({"a": 1})
+    logger.log(metric_logger_mod.MetricsSample(step=0, epoch=0, metrics={"a": 1}))
     logger.close()
 
     assert called is False
@@ -140,7 +140,7 @@ def test_metric_logger_dist_rank0_logs(tmp_path, monkeypatch):
     monkeypatch.setattr(metric_logger_mod.dist, "get_world_size", lambda: 2)
 
     logger = MetricLoggerDist(str(logfile), flush=True, append=False)
-    logger.log({"k": 1})
+    logger.log(metric_logger_mod.MetricsSample(step=0, epoch=0, metrics={"k": 1}))
     logger.close()
 
     rows = _read_jsonl(logfile)
@@ -158,7 +158,7 @@ def test_metric_logger_dist_nonzero_noop(tmp_path, monkeypatch):
 
     logger = MetricLoggerDist(str(logfile), flush=True, append=False)
     # After __init__, .log is replaced with no-op on nonzero ranks
-    logger.log({"should_not_write": True})
+    logger.log(metric_logger_mod.MetricsSample(step=0, epoch=0, metrics={"should_not_write": True}))
     logger.close()
 
     # File may exist due to opener in base __init__, but it should be empty
