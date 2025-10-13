@@ -65,7 +65,7 @@ In this guide, we will fine-tune Meta’s `LLaMA 3.2 1B` model on the popular [S
 These design choices make LLaMA models highly competitive across various benchmarks, and their open weights make them a strong base for task-specific fine-tuning.
 
 :::{tip}
-In this guide, `meta-llama/Llama-3.2-1B` is used only as a placeholder model ID. You can replace it with any valid Hugging Face model ID, such as `Qwen/Qwen2.5-1.5B`, or any other checkpoint you have access to on the Hugging Face Hub that is supported as per [model coverage](https://github.com/NVIDIA-NeMo/Automodel/docs/model-coverage/llm.md) list. 
+In this guide, `meta-llama/Llama-3.2-1B` is used only as a placeholder model ID. You can replace it with any valid Hugging Face model ID, such as `Qwen/Qwen2.5-1.5B`, or any other checkpoint you have access to on the Hugging Face Hub that is supported as per [model coverage](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/llm.md) list. 
 :::
 
 :::{important}
