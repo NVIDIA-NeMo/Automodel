@@ -52,7 +52,7 @@ RUN cd /opt/Automodel && \
     if [ "$BASE_IMAGE" = "pytorch" ]; then \
         sed -i '/\[tool\.uv\]/r /opt/Automodel/docker/common/uv-pytorch.toml' pyproject.toml && \
         mv /opt/Automodel/docker/common/uv-pytorch.lock /opt/Automodel/uv.lock; \
-    fi && \
+    fi
 
 # Install Deepep
 COPY docker/common/deepep.patch /opt/deepep.patch
