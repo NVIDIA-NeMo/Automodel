@@ -14,12 +14,13 @@
 import io
 import json
 import os
+from re import L
 import threading
 from datetime import datetime
 from typing import Any, Dict, Optional
+from torch.distributed import dist
 
-
-class JSONLLogger:
+class MetricLogger:
     """
     Simple JSON Lines logger.
 
@@ -60,8 +61,19 @@ class JSONLLogger:
             except Exception:
                 pass
 
-    def __enter__(self) -> "JSONLLogger":
+    def __enter__(self) -> "MetricLogger":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+
+
+class MetricLoggerDist(MetricLogger):
+    def __init__(self, filepath: str, *, flush: bool = False, append: bool = True) -> None:
+        super().__init__(filepath, flush=flush, append=append)
+        assert dist.is_initialized(), "torch.distributed must be initialized with "
+        self.rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
+
+    def log(self, record: Dict[str, Any], *, add_timestamp: bool = True) -> None:
+        super().log(record, add_timestamp=add_timestamp)

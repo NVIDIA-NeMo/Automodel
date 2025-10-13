@@ -76,7 +76,7 @@ from nemo_automodel.components.utils.model_utils import (
     print_trainable_parameters,
 )
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.components.loggers.jsonl_logger import JSONLLogger
+from nemo_automodel.components.loggers.metric_logger import MetricLoggerDist
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -750,12 +750,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             run = build_wandb(self.cfg)
             logging.info("🚀 View run at {}".format(run.url))
         # Initialize JSONL loggers on main rank
-        if self.dist_env.is_main:
-            self.jsonl_train_logger = JSONLLogger("training.jsonl", flush=True)
-            self.jsonl_val_logger = JSONLLogger("validation.jsonl", flush=True)
-        else:
-            self.jsonl_train_logger = None
-            self.jsonl_val_logger = None
+        self.jsonl_train_logger = MetricLoggerDist("training.jsonl", flush=True)
+        self.jsonl_val_logger = MetricLoggerDist("validation.jsonl", flush=True)
 
         # Log experiment details on main rank
         self._log_experiment_details()
