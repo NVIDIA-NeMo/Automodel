@@ -11,40 +11,51 @@ def parse_args():
     p = argparse.ArgumentParser("WAN 2.1 T2V Flow Matching Training")
 
     # Model configuration
-    p.add_argument("--model_id", type=str, default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers", help="HuggingFace model ID")
+    p.add_argument("--model_id", type=str, default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers", 
+                   help="HuggingFace model ID")
 
     # Training configuration
-    p.add_argument("--meta_folder", type=str, required=True, help="Path to folder containing .meta files")
-    p.add_argument("--num_epochs", type=int, default=10, help="Number of training epochs")
-    p.add_argument("--batch_size_per_node", type=int, default=1, help="Batch size per NODE (not per GPU)")
-    p.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate")
+    p.add_argument("--meta_folder", type=str, required=True, 
+                   help="Path to folder containing .meta files")
+    p.add_argument("--num_epochs", type=int, default=10, 
+                   help="Number of training epochs")
+    p.add_argument("--batch_size_per_node", type=int, default=1,
+                   help="Batch size per NODE (not per GPU)")
+    p.add_argument("--learning_rate", type=float, default=1e-5, 
+                   help="Learning rate")
 
     # Memory optimization
-    p.add_argument("--cpu_offload", action="store_true", default=True, help="Enable CPU offloading for parameters")
-    p.add_argument("--no_cpu_offload", action="store_false", dest="cpu_offload", help="Disable CPU offloading")
+    p.add_argument("--cpu_offload", action="store_true", default=True,
+                   help="Enable CPU offloading for parameters")
+    p.add_argument("--no_cpu_offload", action="store_false", dest="cpu_offload",
+                   help="Disable CPU offloading")
 
     # Flow matching arguments
-    p.add_argument("--use_sigma_noise", action="store_true", default=True, help="Use flow matching noise scheduling")
-    p.add_argument("--no_sigma_noise", action="store_false", dest="use_sigma_noise", help="Disable flow matching")
-    p.add_argument(
-        "--timestep_sampling",
-        type=str,
-        default="uniform",
-        choices=["uniform", "logit_normal", "mode"],
-        help="Timestep sampling strategy",
-    )
-    p.add_argument("--logit_mean", type=float, default=0.0, help="Mean for logit-normal distribution")
-    p.add_argument("--logit_std", type=float, default=1.0, help="Std for logit-normal distribution")
-    p.add_argument("--flow_shift", type=float, default=3.0, help="Flow matching shift parameter")
-    p.add_argument(
-        "--mix_uniform_ratio", type=float, default=0.1, help="Ratio of uniform sampling mixed with density sampling"
-    )
+    p.add_argument("--use_sigma_noise", action="store_true", default=True,
+                   help="Use flow matching noise scheduling")
+    p.add_argument("--no_sigma_noise", action="store_false", dest="use_sigma_noise",
+                   help="Disable flow matching")
+    p.add_argument("--timestep_sampling", type=str, default="uniform",
+                   choices=["uniform", "logit_normal", "mode"],
+                   help="Timestep sampling strategy")
+    p.add_argument("--logit_mean", type=float, default=0.0,
+                   help="Mean for logit-normal distribution")
+    p.add_argument("--logit_std", type=float, default=1.0,
+                   help="Std for logit-normal distribution")
+    p.add_argument("--flow_shift", type=float, default=3.0,
+                   help="Flow matching shift parameter")
+    p.add_argument("--mix_uniform_ratio", type=float, default=0.1,
+                   help="Ratio of uniform sampling mixed with density sampling")
 
     # Checkpointing
-    p.add_argument("--save_every", type=int, default=500, help="Save checkpoint every N steps")
-    p.add_argument("--log_every", type=int, default=5, help="Log metrics every N steps")
-    p.add_argument("--output_dir", type=str, default="./wan_t2v_flow_outputs", help="Output directory for checkpoints")
-    p.add_argument("--resume_checkpoint", type=str, default=None, help="Path to checkpoint to resume from")
+    p.add_argument("--save_every", type=int, default=500, 
+                   help="Save checkpoint every N steps")
+    p.add_argument("--log_every", type=int, default=5, 
+                   help="Log metrics every N steps")
+    p.add_argument("--output_dir", type=str, default="./wan_t2v_flow_outputs", 
+                   help="Output directory for checkpoints")
+    p.add_argument("--resume_checkpoint", type=str, default=None, 
+                   help="Path to checkpoint to resume from")
 
     return p.parse_args()
 

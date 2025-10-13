@@ -23,7 +23,7 @@ from training_step_t2v import step_fsdp_transformer_t2v
 class WanT2VTrainerFSDP:
     """
     WAN 2.1 T2V FULL fine-tuning trainer with flow matching.
-
+    
     Features:
     - FSDP for intra-node parallelism
     - Data parallelism across nodes
@@ -61,16 +61,14 @@ class WanT2VTrainerFSDP:
         self.local_rank = setup_distributed()
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
         self.device = torch.device("cuda", self.local_rank)
-
+        
         # Calculate node information
         self.local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", self.world_size))
         self.num_nodes = self.world_size // self.local_world_size if self.local_world_size > 0 else 1
         self.node_rank = dist.get_rank() // self.local_world_size if dist.is_initialized() else 0
 
         print0("[INFO] WAN 2.1 T2V Trainer with Flow Matching")
-        print0(
-            f"[INFO] Total GPUs: {self.world_size}, GPUs per node: {self.local_world_size}, Num nodes: {self.num_nodes}"
-        )
+        print0(f"[INFO] Total GPUs: {self.world_size}, GPUs per node: {self.local_world_size}, Num nodes: {self.num_nodes}")
         print0(f"[INFO] Node rank: {self.node_rank}, Local rank: {self.local_rank}")
         print0(f"[INFO] Learning rate: {learning_rate}")
         print0(f"[INFO] CPU offload: {'ENABLED' if cpu_offload else 'DISABLED'}")
@@ -90,7 +88,7 @@ class WanT2VTrainerFSDP:
 
         # Load pipeline without VAE or text encoder
         self.pipe = WanPipeline.from_pretrained(
-            self.model_id,
+            self.model_id, 
             torch_dtype=torch.float32,
             vae=None,
             text_encoder=None,
@@ -140,10 +138,19 @@ class WanT2VTrainerFSDP:
 
         print0(f"[INFO] Optimizing {len(all_params)} parameters")
 
-        self.optimizer = torch.optim.AdamW(all_params, lr=self.learning_rate, weight_decay=0.01, betas=(0.9, 0.999))
+        self.optimizer = torch.optim.AdamW(
+            all_params, 
+            lr=self.learning_rate, 
+            weight_decay=0.01, 
+            betas=(0.9, 0.999)
+        )
 
         # Temporary scheduler - will be reconfigured after dataloader is created
-        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=1000, eta_min=1e-6)
+        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, 
+            T_max=1000, 
+            eta_min=1e-6
+        )
 
     def validate_setup(self):
         """Validate FSDP setup with a test forward pass."""
@@ -169,7 +176,7 @@ class WanT2VTrainerFSDP:
     ):
         """
         Train the model with flow matching.
-
+        
         Args:
             batch_size_per_node: Batch size for each node (NOT per GPU)
         """
@@ -189,14 +196,20 @@ class WanT2VTrainerFSDP:
         total_steps = num_epochs * steps_per_epoch
 
         # Reconfigure scheduler with actual total steps
-        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=total_steps, eta_min=1e-6)
+        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, 
+            T_max=total_steps, 
+            eta_min=1e-6
+        )
         print0(f"[INFO] Scheduler configured for {total_steps} total steps")
 
         global_step = 0
         start_epoch = 0
 
         if resume_checkpoint:
-            global_step = load_fsdp_checkpoint(self.model_map, self.optimizer, self.lr_scheduler, resume_checkpoint)
+            global_step = load_fsdp_checkpoint(
+                self.model_map, self.optimizer, self.lr_scheduler, resume_checkpoint
+            )
             start_epoch = global_step // steps_per_epoch
 
         if is_main_process():
@@ -238,7 +251,6 @@ class WanT2VTrainerFSDP:
             iterable = dataloader
             if is_main_process():
                 from tqdm import tqdm
-
                 iterable = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}")
 
             epoch_loss = 0.0
@@ -275,8 +287,7 @@ class WanT2VTrainerFSDP:
 
                 # Gradient clipping
                 trainable_params = [
-                    p
-                    for p in self.model_map["transformer"]["fsdp_transformer"].parameters()
+                    p for p in self.model_map["transformer"]["fsdp_transformer"].parameters() 
                     if p.requires_grad and p.grad is not None
                 ]
 
@@ -327,7 +338,7 @@ class WanT2VTrainerFSDP:
                         output_dir,
                         global_step,
                         consolidate=True,  # Always save consolidated model
-                    )
+                    )                    
 
             # Epoch summary
             avg_loss = epoch_loss / max(num_steps, 1)
