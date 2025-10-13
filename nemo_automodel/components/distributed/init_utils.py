@@ -29,8 +29,6 @@ def get_rank_safe() -> int:
     Returns:
         The current process rank.
     """
-    # In megatron init, args.rank comes from the torchrun env var.
-    # Once init has been done, args.rank is updated to value of torch get_rank()
     if torch.distributed.is_initialized():
         return torch.distributed.get_rank()
     else:
@@ -44,8 +42,6 @@ def get_world_size_safe() -> int:
     Returns:
         The total number of processes in the distributed job.
     """
-    # In megatron init, args.world_size comes from the torchrun env var.
-    # Once init has been done, args.world_size is updated to value of torch get_world_size()
     if torch.distributed.is_initialized():
         return torch.distributed.get_world_size()
     else:

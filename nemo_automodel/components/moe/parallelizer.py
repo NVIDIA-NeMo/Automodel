@@ -30,7 +30,6 @@ from torch.distributed.tensor import Shard, distribute_module, distribute_tensor
 from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
-from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3Model
 from nemo_automodel.components.moe.layers import (
     GroupedExpertsDeepEP,
     MoE,
@@ -82,12 +81,12 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh):
             )
 
 
-def apply_ac(model: nn.Module, ignore_router: bool = False):
+def apply_ac(model: nn.Module, ignore_router: bool = False, hidden_size: int = 7168, num_experts: int = 256):
     """Apply activation checkpointing to the model."""
 
     def _custom_policy(ctx, func, *args, **kwargs):
         if func == torch.ops.aten.mm.default:
-            if len(args) == 2 and (args[1].shape == (7168, 256) or args[1].shape == (2048, 64)):
+            if len(args) == 2 and (args[1].shape == (hidden_size, num_experts)):
                 return CheckpointPolicy.MUST_SAVE
             else:
                 return CheckpointPolicy.PREFER_RECOMPUTE
@@ -113,7 +112,7 @@ def apply_ac(model: nn.Module, ignore_router: bool = False):
 
 
 def apply_fsdp(
-    model: DeepseekV3Model,
+    model: torch.nn.Module,
     fsdp_mesh: DeviceMesh,
     pp_enabled: bool,
     ep_enabled: bool,
@@ -121,16 +120,17 @@ def apply_fsdp(
     ep_shard_mesh: DeviceMesh | None = None,
     mp_policy: MixedPrecisionPolicy | None = None,
     offload_policy: OffloadPolicy | None = None,
+    reshard_after_forward: bool = False,
 ):
     if mp_policy is None:
         mp_policy = MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16, output_dtype=torch.bfloat16
+            param_dtype=torch.bfloat16, reduce_dtype=torch.float32, output_dtype=torch.bfloat16
         )
 
     fully_shard_default = functools.partial(
         fully_shard,
         mesh=fsdp_mesh,
-        reshard_after_forward=not pp_enabled,
+        reshard_after_forward=reshard_after_forward,
         mp_policy=mp_policy,
         offload_policy=offload_policy,
     )
@@ -148,7 +148,7 @@ def apply_fsdp(
                 block.mlp.experts,
                 mesh=ep_shard_mesh,
                 shard_placement_fn=lambda _: Shard(1),
-                reshard_after_forward=not pp_enabled,
+                reshard_after_forward=reshard_after_forward,
             )
         # If FSDP is disabled for grouped experts because the parameters are already
         # fully sharded by PP and EP, then we need to explicitly remove the parameters
@@ -173,7 +173,7 @@ def apply_fsdp(
 
 
 def parallelize_model(
-    model: DeepseekV3Model,
+    model: torch.nn.Module,
     world_mesh: DeviceMesh,
     moe_mesh: DeviceMesh | None,
     *,
@@ -183,6 +183,8 @@ def parallelize_model(
     tp_axis_name: str | None = None,
     ep_axis_name: str | None = None,
     ep_shard_axis_names: tuple[str, ...] | None = None,
+    activation_checkpointing: bool = False,
+    reshard_after_forward: bool = False,
 ):
     assert tp_axis_name is None or world_mesh[tp_axis_name].size() == 1, (
         "Tensor parallelism not supported for DeepSeek v3 model"
@@ -197,14 +199,15 @@ def parallelize_model(
 
     ep_enabled = ep_axis_name is not None and moe_mesh is not None and moe_mesh[ep_axis_name].size() > 1
     if ep_enabled:
-        assert model.config.n_routed_experts % moe_mesh[ep_axis_name].size() == 0, (
-            f"n_routed_experts {model.config.n_routed_experts} must be divisible by "
+        assert model.model.moe_config.n_routed_experts % moe_mesh[ep_axis_name].size() == 0, (
+            f"n_routed_experts {model.model.moe_config.n_routed_experts} must be divisible by "
             f"expert_parallel_degree {moe_mesh[ep_axis_name].size()}"
         )
 
         apply_ep(model, moe_mesh[ep_axis_name])
 
-    apply_ac(model)
+    if activation_checkpointing:
+        apply_ac(model)
 
     if ep_shard_axis_names is not None:
         ep_shard_mesh = moe_mesh[ep_shard_axis_names]
@@ -225,4 +228,5 @@ def parallelize_model(
             ep_enabled=ep_enabled,
             ep_shard_enabled=ep_shard_mesh is not None and ep_shard_mesh.size() > 1,
             ep_shard_mesh=ep_shard_mesh,
+            reshard_after_forward=reshard_after_forward,
         )

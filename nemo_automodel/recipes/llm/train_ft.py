@@ -43,7 +43,7 @@ from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConf
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
-from nemo_automodel.components.datasets.llm.packed_sequence import PackedSequence
+from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import (
     get_rank_safe,
@@ -61,7 +61,12 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
-from nemo_automodel.components.training.utils import count_tail_padding, scale_grads_and_clip_grad_norm
+from nemo_automodel.components.training.utils import (
+    count_tail_padding,
+    prepare_for_final_backward,
+    prepare_for_grad_accumulation,
+    scale_grads_and_clip_grad_norm,
+)
 from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
     compile_model,
@@ -79,9 +84,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
 # ---------------------------
 #  Stateless helper functions
 # ---------------------------
+def _get_model_name(cfg_model):
+    if cfg_model.get("pretrained_model_name_or_path", None) is not None:
+        return cfg_model.pretrained_model_name_or_path
+    elif cfg_model.get("config", None) is not None:
+        return cfg_model.config.get("pretrained_model_name_or_path", None)
+    else:
+        return None
 
 
 def build_model_and_optimizer(
@@ -100,6 +113,8 @@ def build_model_and_optimizer(
     autopipeline: AutoPipeline | None = None,
     loss_fn=None,
     parallelize_fn=None,
+    load_base_model=True,
+    dequantize_base_checkpoint=False,
 ) -> tuple[nn.Module | AutoPipeline, list[str], list["Optimizer"], nn.Module]:  # noqa: F821
     """
     Build and initialize a model and optimizer.
@@ -173,7 +188,7 @@ def build_model_and_optimizer(
     # hold a copy of the model state dict keys before any parallelization
     state_dict_keys = model.state_dict().keys()
 
-    if not _supports_logits_to_keep(model):
+    if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
         loss_fn = MaskedCrossEntropy()
 
@@ -188,10 +203,12 @@ def build_model_and_optimizer(
                     device,
                     cfg_peft is not None,
                     cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
-                    cfg_model.pretrained_model_name_or_path,
+                    _get_model_name(cfg_model),
                     getattr(cfg_peft, "lora_A_init", None),
                     device_mesh=autopipeline.world_mesh,
                     moe_mesh=autopipeline.moe_mesh,
+                    load_base_model=load_base_model,
+                    quantization=dequantize_base_checkpoint,
                 )
 
             # Create optimizer for all model parts
@@ -230,21 +247,13 @@ def build_model_and_optimizer(
                     cfg_opt.foreach = False
                 optimizer = cfg_opt.instantiate(params=trainable_params)
 
-                if get_world_size_safe() == 1:
-                    logger.info("World size is 1, skipping parallelization.")
-                    model = model.to(device).to(torch.bfloat16)
-                else:
-                    model, optimizer = model_wrapper.parallelize(model, optimizer)
+                model, optimizer = model_wrapper.parallelize(model, optimizer)
 
                 return model, state_dict_keys, [optimizer], loss_fn
 
             else:
                 load_weights = True
-                if get_world_size_safe() == 1:
-                    logger.info("World size is 1, skipping parallelization.")
-                    model = model.to(device).to(torch.bfloat16)
-                else:
-                    model = model_wrapper.parallelize(model)
+                model = model_wrapper.parallelize(model)
 
         # Load the weights into the model in parallel.
         if is_meta_device and load_weights:
@@ -253,10 +262,12 @@ def build_model_and_optimizer(
                 device,
                 cfg_peft is not None,
                 cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
-                cfg_model.pretrained_model_name_or_path,
+                _get_model_name(cfg_model),
                 getattr(cfg_peft, "lora_A_init", None),
                 device_mesh=model_wrapper.device_mesh,
                 moe_mesh=getattr(model_wrapper, "moe_mesh", None),
+                load_base_model=load_base_model,
+                quantization=dequantize_base_checkpoint,
             )
 
         # ensure the model is on device
@@ -312,6 +323,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft, state_d
     if cfg_ckpt is not None:
         cfg_ckpt = cfg_ckpt.to_dict()
         cfg_ckpt.pop("restore_from", None)
+        cfg_ckpt.pop("load_base_model", None)
         ckpt_kwargs |= cfg_ckpt
     if ckpt_kwargs.get("is_peft", False) and ckpt_kwargs.get("model_save_format") == "torch_save":
         raise ValueError(
@@ -335,12 +347,10 @@ def build_loss_fn(cfg_loss):
 
 def _build_tokenizer(cfg_model, cfg_ds):
     # if tokenizer is not provided, use the model config to instantiate it
-    if "tokenizer" not in cfg_ds and cfg_model.get("pretrained_model_name_or_path", None) is not None:
+    if "tokenizer" not in cfg_ds and _get_model_name(cfg_model) is not None:
         logging.info("Using model config to instantiate tokenizer")
         trust_remote_code = getattr(cfg_model, "trust_remote_code", False)
-        tokenizer = AutoTokenizer.from_pretrained(
-            cfg_model.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
-        )
+        tokenizer = AutoTokenizer.from_pretrained(_get_model_name(cfg_model), trust_remote_code=trust_remote_code)
     elif cfg_ds.get("tokenizer", None) is None:
         tokenizer = None
     elif "_target_" not in cfg_ds.tokenizer:
@@ -417,13 +427,15 @@ def build_dataloader(
         # Apply packing if configured
         if packed_sequence_size > 0:
             logger.info(f"Packing dataset with size: {packed_sequence_size}")
-            ds = PackedSequence(
+            if hasattr(ds, "shuffle"):
+                ds = ds.shuffle(seed)
+            ds = pack_dataset(
                 ds,
                 split=cfg_ds.split,  # Assumes split is defined in dataset config
                 packed_sequence_size=packed_sequence_size,
                 split_across_pack=getattr(cfg_ps, "split_across_pack", False),
                 max_packs=getattr(cfg_ps, "max_packs", None),
-            ).pack()
+            )
 
         if isinstance(ds, MegatronPretraining):
             ds = ds.get_dataset(split=cfg_ds.splits_to_build)
@@ -589,7 +601,7 @@ def build_wandb(cfg) -> wandb.Run:
     assert cfg.get("wandb", None) is not None
     kwargs = cfg.wandb.to_dict()
     if kwargs.get("name", "") == "":
-        kwargs["name"] = "_".join(cfg.get("model.pretrained_model_name_or_path").split("/")[-2:])
+        kwargs["name"] = "_".join(_get_model_name(cfg.model).split("/")[-2:])
     run = wandb.init(
         **kwargs,
         config=cfg.to_dict(),
@@ -726,6 +738,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
         autopipeline_cfg = self.cfg.get("autopipeline", None)
         if self.pp_enabled:
+            pp_batch_size = self.cfg.step_scheduler.local_batch_size
+            assert pp_batch_size // self.cfg.autopipeline.pp_microbatch_size >= self.model_wrapper.pp_size, (
+                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {self.cfg.autopipeline.pp_microbatch_size} must be greater than or equal to pp_size {self.model_wrapper.pp_size}"
+            )
             assert autopipeline_cfg is not None, (
                 "AutoPipeline configuration is required when pipeline parallelism is enabled"
             )
@@ -749,7 +765,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 ep_shard_axis_names=(
                     ("ep_shard",) if self.moe_mesh is not None and "ep_shard" in self.moe_mesh.mesh_dim_names else None
                 ),
-                pp_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+                pp_batch_size=pp_batch_size,
+                patch_stage_backward_maybe_with_nosync=self.cfg.get("model.backend.enable_fsdp_optimizations", False),
                 device=torch.cuda.current_device(),
             )
             assert isinstance(autopipeline, AutoPipeline), (
@@ -763,7 +780,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
         self.loss_fn = build_loss_fn(self.cfg.loss_fn)
-        parallelize_fn = self.cfg.get("parallelize_fn", None)
+        parallelize_fn = getattr(self.cfg.get("parallelizer", None), "instantiate", None)
         if parallelize_fn is None and self.pp_enabled:
             parallelize_fn = partial(parallelize_for_pp, model_wrapper=self.model_wrapper)
 
@@ -783,6 +800,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             autopipeline=autopipeline,
             loss_fn=self.loss_fn,
             parallelize_fn=parallelize_fn,
+            load_base_model=self.cfg.get("checkpoint.load_base_model", True),
+            dequantize_base_checkpoint=self.cfg.get("checkpoint.dequantize_base_checkpoint", False),
         )
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
@@ -846,7 +865,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.checkpoint_config = build_checkpoint_config(
             self.cfg.get("checkpoint", None),
             self.cfg.get("model.cache_dir", None),
-            self.cfg.model.get("pretrained_model_name_or_path", None),
+            _get_model_name(self.cfg.model),
             True if self.cfg.get("peft", None) else False,
             model_state_dict_keys,
         )
@@ -954,7 +973,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
-                    (local_loss * self._get_dp_group_size()).backward()
+                    (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
@@ -978,7 +997,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
         num_batches = len(batches)
+        prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
+
         for i, batch in enumerate(batches):
+            if i == num_batches - 1:
+                prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
+
             self._forward_backward_step(
                 i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
             )
@@ -994,7 +1018,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             pp_axis_name="pp" if self.pp_enabled else None,
             foreach=True,
             num_label_tokens=num_label_tokens,
-            dp_group_size=self._get_dp_group_size(),
+            dp_group_size=self._get_dp_group_size(include_cp=True),
         )
 
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
@@ -1003,6 +1027,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         for opt in self.optimizer:
             opt.step()
             opt.zero_grad()
+
+        if hasattr(self.model_parts[0], "update_moe_gate_bias"):
+            for mp in self.model_parts:
+                mp.update_moe_gate_bias()
 
         if self.lr_scheduler is not None:
             for scheduler in self.lr_scheduler:
@@ -1029,7 +1057,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.timestamp = t
         tps = num_tokens_in_batch / time_delta
         reporting_loss = torch.sum(torch.stack(loss_buffer))
-        reporting_loss = self._dp_allreduce(reporting_loss)
+        reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
         if self.pp_enabled:
             reporting_loss = reporting_loss / num_label_tokens
             reporting_loss = reporting_loss.to(self.dist_env.device)
@@ -1073,7 +1101,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 total_loss += torch.sum(torch.stack(loss_buffer)).item()
                 total_num_label_tokens += num_label_tokens
 
-        total_loss = self._dp_allreduce(total_loss).item()
+        total_loss = self._dp_allreduce(total_loss, include_cp=True).item()
         total_num_label_tokens = self._dp_allreduce(torch.tensor(total_num_label_tokens, dtype=torch.long)).item()
 
         val_loss = total_loss / max(total_num_label_tokens, 1e-8)
@@ -1109,7 +1137,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             "grad_norm": grad_norm,
             "num_tokens_per_step": num_tokens_in_batch,
             "tps": tps,
-            "tps_per_gpu": tps / self._get_dp_group_size(),
+            "tps_per_gpu": tps / max(self._get_dp_group_size(), 1),
         }
         # assumes all model parts' optimizers have the same learning rate
         current_lr = self.optimizer[0].param_groups[0]["lr"]
@@ -1128,7 +1156,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     current_lr,
                     torch.cuda.max_memory_allocated() / 1024**3,
                     tps,
-                    tps / self._get_dp_group_size(),
+                    tps / max(self._get_dp_group_size(), 1),
                     num_label_tokens,
                 )
             )

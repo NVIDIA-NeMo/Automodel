@@ -27,6 +27,7 @@ from torch.distributed.tensor.parallel import (
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
+from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.distributed.parallelizer import (
     fsdp2_strategy_parallelize,
     get_hf_tp_shard_plan,
@@ -123,6 +124,10 @@ class FSDP2Manager:
         default=None,
         # init=False,
         metadata={"help": "Total number of processes."},
+    )
+    activation_checkpointing: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Enable activation checkpointing if True. Applies to linear layers."},
     )
 
     def __post_init__(self):
@@ -275,8 +280,13 @@ class FSDP2Manager:
         Raises:
             NotImplemented: If the required TP sharding plan is not supported.
         """
-        if dist.get_world_size() == 1:
+        if get_world_size_safe() == 1:
             logger.info("World size is 1, skipping parallelization.")
+            if self.activation_checkpointing:
+                if hasattr(model, "gradient_checkpointing_enable"):
+                    model.gradient_checkpointing_enable()
+                else:
+                    logger.error("Model does not support gradient checkpointing.")
             return model
 
         if self.device_mesh["tp"].size() > 1:
@@ -327,5 +337,6 @@ class FSDP2Manager:
             mp_policy=self.mp_policy,
             tp_shard_plan=tp_shard_plan,
             offload_policy=self.offload_policy,
+            activation_checkpointing=self.activation_checkpointing,
         )
         return model

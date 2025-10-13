@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from math import ceil
 from typing import Optional
 
 from torch.distributed.checkpoint.stateful import Stateful
@@ -51,11 +52,11 @@ class StepScheduler(Stateful):
             max_steps (int): Total number of steps to run. Default is 2^63-1.
         """
         assert global_batch_size % (local_batch_size * dp_size) == 0, (
-            "global_batch_size must be divisible by (local_batch_size * dp_size)"
+            f"global_batch_size ({global_batch_size}) must be divisible by local_batch_size * dp_size ({local_batch_size} * {dp_size})"
         )
         self.grad_acc_steps = global_batch_size // (local_batch_size * dp_size)
         assert self.grad_acc_steps >= 1, (
-            "grad_acc_steps must be greater than or equal to 1. Please ensure that global_batch_size >= (local_batch_size * dp_size)"
+            f"grad_acc_steps ({self.grad_acc_steps}) must be greater than or equal to 1. Please ensure that global_batch_size >= (local_batch_size * dp_size)"
         )
         self.ckpt_every_steps = ckpt_every_steps
         assert ckpt_every_steps > 0, "ckpt_every_steps must be greater than 0"
@@ -68,7 +69,7 @@ class StepScheduler(Stateful):
         assert num_epochs > 0, "num_epochs must be greater than 0"
         # Throws with IterableDataset.
         try:
-            self.epoch_len = len(dataloader)
+            self.epoch_len = ceil(len(dataloader) / self.grad_acc_steps)
         except:
             self.epoch_len = None
         self.val_every_steps = val_every_steps
@@ -92,8 +93,8 @@ class StepScheduler(Stateful):
         for batch in self.dataloader:
             batch_buffer.append(batch)
             if len(batch_buffer) == self.grad_acc_steps:
-                self.step += 1
                 yield batch_buffer
+                self.step += 1
                 batch_buffer = []
                 if self.step >= self.max_steps:
                     return
@@ -117,7 +118,7 @@ class StepScheduler(Stateful):
         """
         is_val = False
         if self.val_every_steps and self.val_every_steps > 0:
-            is_val = (self.step % self.val_every_steps) == 0
+            is_val = self.step % self.val_every_steps == self.val_every_steps - 1
         return is_val
 
     @property
@@ -130,7 +131,7 @@ class StepScheduler(Stateful):
         """
         last_batch = self.epoch_len is not None and (self.step % self.epoch_len) == self.epoch_len - 1
         finished = self.step >= self.max_steps
-        return ((self.step % self.ckpt_every_steps) == 0 and self.step != 0) or last_batch or finished
+        return ((self.step % self.ckpt_every_steps) == self.ckpt_every_steps - 1) or last_batch or finished
 
     @property
     def epochs(self):

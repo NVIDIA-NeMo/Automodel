@@ -11,25 +11,3 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
-WORKDIR /workspace
-
-# Install dependencies
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.12-dev \
-    python3 \
-    python3-dev \
-    python3-venv \
-    python-is-python3 \
-    curl \
-    git \
-    libopenmpi-dev && \
-    rm -rf /var/lib/apt/lists/*
-
-COPY . .
-RUN --mount=type=secret,id=GH_TOKEN bash -ex <<"EOF"
-    export PAT=$(cat /run/secrets/GH_TOKEN)
-    bash docker/common/install.sh --base-image cuda
-EOF

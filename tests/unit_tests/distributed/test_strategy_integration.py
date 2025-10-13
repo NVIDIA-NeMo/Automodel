@@ -151,7 +151,10 @@ def test_backward_compatibility_nemotron_model(
     assert result is model
 
     # Should have called NemotronH-specific functions
-    mock_parallelize_module.assert_called()  # For TP plans
+    if mock_device_mesh['tp'].size() > 1:
+        mock_parallelize_module.assert_called()  # For TP plans
+    else:
+        mock_parallelize_module.assert_not_called()
     mock_fully_shard.assert_called()  # For FSDP
 
 

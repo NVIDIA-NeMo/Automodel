@@ -85,8 +85,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-vlm = ["pillow", "qwen-vl-utils[decord]", "transformers<=4.55.4","timm==1.0.16","backoff","numpy",
-    "numba","torchcodec","mistral_common[opencv]"]
+vlm = [
+    "pillow",
+    "qwen-vl-utils[decord]; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
+    "transformers<=4.55.4",
+    "timm==1.0.16",
+    "backoff",
+    "numpy",
+    "numba",
+    "torchcodec; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
+    "mistral_common[opencv]"
+]
 fa = ["flash-attn<=2.8.3"]
 moe = [
     # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
@@ -99,6 +108,19 @@ moe = [
     # https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
     # "flash-attn==2.7.4.post1",
     # "grouped_gemm",
+]
+deepep = [
+    "nvidia-nvshmem-cu13",
+]
+dev = [
+    "nemo_automodel[fa]",
+    "nemo_automodel[vlm]",
+]
+all = [
+    "nemo_automodel[deepep]",
+    "nemo_automodel[fa]",
+    "nemo_automodel[moe]",
+    "nemo_automodel[vlm]",
 ]
 
 [project.urls]

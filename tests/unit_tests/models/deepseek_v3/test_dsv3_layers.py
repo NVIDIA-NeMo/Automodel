@@ -73,8 +73,8 @@ class TestPreprocessArgsAndKwargsForAttn:
 
         expected_keys = {"attn_mask_type", "window_size", "attention_mask"}
         assert set(attn_kwargs.keys()) == expected_keys
-        assert attn_kwargs["attn_mask_type"] == "padding"
-        assert attn_kwargs["window_size"] == (-1, -1)
+        assert attn_kwargs["attn_mask_type"] == "padding_causal"
+        assert attn_kwargs["window_size"] == (-1, 0)
 
         # Check padding mask shape and values
         padding_mask = attn_kwargs["attention_mask"]
@@ -140,10 +140,9 @@ class TestPreprocessArgsAndKwargsForAttn:
         assert v_out.shape == (2, 16, 8, 64)
 
         # Check attention kwargs
-        expected_keys = {"attention_mask", "is_causal"}
+        expected_keys = {"is_causal"}
         assert set(attn_kwargs.keys()) == expected_keys
         assert attn_kwargs["is_causal"] == True
-        assert torch.equal(attn_kwargs["attention_mask"], attention_mask.bool())
 
 
 class TestPostprocessOutputForAttn:

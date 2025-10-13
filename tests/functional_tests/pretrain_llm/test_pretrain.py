@@ -22,3 +22,6 @@ class TestPretrainLLM:
 
     def test_pretrain_hf(self):
         run_test_script(TEST_FOLDER, "L2_Pretrain_HF.sh")
+
+    def test_pretrain_moonlight_16b_te_2l(self):
+        run_test_script(TEST_FOLDER, "L2_Pretrain_Moonlight_16B_TE_2L.sh")

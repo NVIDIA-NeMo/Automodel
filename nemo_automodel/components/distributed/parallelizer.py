@@ -144,8 +144,16 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             if model_parallel_plan:
                 parallelize_module(model, tp_mesh, model_parallel_plan)
 
-        # Apply activation checkpointing to MLP layers if requested
+        # Apply activation checkpointing to linear layers if requested
         if activation_checkpointing:
+            # Disable KV caching during training to ensure deterministic
+            # shapes between forward and checkpoint recomputation.
+            if hasattr(model, "config") and getattr(model.config, "use_cache", None) is not False:
+                try:
+                    model.config.use_cache = False
+                except Exception:
+                    pass
+
             for i, layer in enumerate(layers):
                 if hasattr(layer, "mlp"):
                     layers[i].mlp = checkpoint_wrapper(layer.mlp)
@@ -207,25 +215,23 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         assert not sequence_parallel, "Sequence parallelism is not supported for NemotronHForCausalLM"
         assert tp_shard_plan is None, "Custom parallel plan is not supported for NemotronHForCausalLM"
 
-        tp_mesh = device_mesh[tp_mesh_name]
-        dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-        dp_mesh = device_mesh[dp_mesh_dim_names]
-
-        model_tp_plan: dict[str, ParallelStyle] = {
-            "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
-        }
-
-        mlp_tp_plan: dict[str, ParallelStyle] = {
-            "mixer.up_proj": ColwiseParallel(),
-            "mixer.down_proj": RowwiseParallel(),
-        }
-
         layers: torch.nn.ModuleList = model.backbone.layers
-        parallelize_module(model, tp_mesh, model_tp_plan)
+        tp_mesh = device_mesh[tp_mesh_name]
+        if tp_mesh.size() > 1:
+            model_tp_plan: dict[str, ParallelStyle] = {
+                "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+            }
 
-        for layer in model.backbone.layers:
-            if layer.block_type == "mlp":
-                parallelize_module(layer, tp_mesh, mlp_tp_plan)
+            mlp_tp_plan: dict[str, ParallelStyle] = {
+                "mixer.up_proj": ColwiseParallel(),
+                "mixer.down_proj": RowwiseParallel(),
+            }
+
+            parallelize_module(model, tp_mesh, model_tp_plan)
+
+            for layer in model.backbone.layers:
+                if layer.block_type == "mlp":
+                    parallelize_module(layer, tp_mesh, mlp_tp_plan)
 
         if activation_checkpointing:
             for i in range(len(layers)):
@@ -234,6 +240,9 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
 
                 if layers[i].block_type == "mamba":
                     layers[i] = checkpoint_wrapper(layers[i])
+
+        dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
+        dp_mesh = device_mesh[dp_mesh_dim_names]
 
         for layer in layers:
             fully_shard(layer, mesh=dp_mesh, mp_policy=mp_policy, offload_policy=offload_policy)
@@ -549,6 +558,29 @@ def translate_to_torch_parallel_style(style: str):
         raise ValueError(f"Unknown parallel style: {style}")
 
 
+def validate_tp_mesh_for_nemotron_nas(model, tp_size):
+    num_attention_heads = model.config.num_attention_heads
+    assert num_attention_heads % tp_size == 0, "num_attention_heads in config does not match the TP size"
+
+    assert len(model.config.block_configs) >= model.config.num_hidden_layers, (
+        "num_hidden_layers in config does not match the number of block configs"
+    )
+
+    for i in range(model.config.num_hidden_layers):
+        # Valid layer
+        if model.config.block_configs[i].attention.replace_with_linear:
+            print(f"By pass checking for linear layer in layer {i}")
+            # TODO: Check if the linear layer could support TP.
+        else:
+            if model.config.block_configs[i].attention.n_heads_in_group is not None:
+                num_key_value_heads = num_attention_heads // model.config.block_configs[i].attention.n_heads_in_group
+                assert num_key_value_heads % tp_size == 0, (
+                    f"layer {i}: num_key_value_heads in config does not match the TP size"
+                )
+            else:
+                assert model.config.block_configs[i].attention.no_op == True
+
+
 def validate_tp_mesh(model, tp_mesh):
     """
     Validate that attention heads and key value heads are divisible by TP size
@@ -557,6 +589,15 @@ def validate_tp_mesh(model, tp_mesh):
         return  # if tp_mesh.size() == 1, we don't need to validate
 
     model_cls = type(model)
+
+    # There are cases like DeciLMForCausalLM is defined in transformers_modules
+    # which hardly has predefined path to import. Guard access to config/architectures.
+    model_arch = None
+    if hasattr(model, "config") and hasattr(model.config, "architectures") and model.config.architectures:
+        try:
+            model_arch = model.config.architectures[0]
+        except Exception:
+            model_arch = None
 
     if model_cls in [
         Qwen2_5_VLForConditionalGeneration,
@@ -590,6 +631,11 @@ def validate_tp_mesh(model, tp_mesh):
     elif model_cls == Gemma3ForConditionalGeneration:
         num_attention_heads = model.config.text_config.num_attention_heads
         num_key_value_heads = model.config.text_config.num_key_value_heads
+    elif model_arch == "DeciLMForCausalLM" and getattr(model.config, "model_type", None) == "nemotron-nas":
+        validate_tp_mesh_for_nemotron_nas(model, tp_mesh.size())
+
+        # SKip following code and return.
+        return
     elif hasattr(model, "config"):
         num_attention_heads = getattr(model.config, "num_attention_heads", 0)
         num_key_value_heads = getattr(model.config, "num_key_value_heads", 0)
@@ -732,7 +778,10 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         layers.extend(model.transformer.h)
     elif hasattr(model, "model"):
         # Default case for all other models (assumed to be a causal LM)
-        layers.extend(model.model.layers)
+        if isinstance(model.model.layers, nn.ModuleDict):
+            layers.extend(model.model.layers.values())
+        else:
+            layers.extend(model.model.layers)
     elif hasattr(model, "layers"):
         layers.extend(model.layers)
     else:
@@ -832,7 +881,7 @@ def fsdp2_strategy_parallelize(
     - Polymorphic parallelization strategies for different model families
     - Custom parallel plan support (dict or string path)
     - Sequence parallel support
-    - Activation checkpointing for MLP layers
+    - Activation checkpointing for linear layers
     - Model validation (attention heads divisible by TP size)
     - Better fallback logic
 
