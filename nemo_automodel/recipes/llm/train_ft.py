@@ -54,6 +54,7 @@ from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPMana
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.metric_logger import MetricLoggerDist, MetricsSample
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
@@ -76,7 +77,6 @@ from nemo_automodel.components.utils.model_utils import (
     print_trainable_parameters,
 )
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.components.loggers.metric_logger import MetricsSample, MetricLoggerDist
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -913,8 +913,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             model_state_dict_keys,
         )
         # Initialize JSONL loggers on main rank
-        self.metric_logger_train = MetricLoggerDist(pathlib.Path(self.checkpoint_config.checkpoint_dir) / "training.jsonl")
-        self.metric_logger_valid = MetricLoggerDist(pathlib.Path(self.checkpoint_config.checkpoint_dir) / "validation.jsonl")
+        self.metric_logger_train = MetricLoggerDist(
+            pathlib.Path(self.checkpoint_config.checkpoint_dir) / "training.jsonl"
+        )
+        self.metric_logger_valid = MetricLoggerDist(
+            pathlib.Path(self.checkpoint_config.checkpoint_dir) / "validation.jsonl"
+        )
 
         # Optionally resume
         self.load_checkpoint(restore_from)
@@ -1191,7 +1195,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
 
     def log_val_metrics(self, log_data):
-        """ Log metrics to wandb and other loggers
+        """Log metrics to wandb and other loggers
         Args:
             log_data: MetricsSample object, containing:
                 step: int, the current step.
@@ -1240,7 +1244,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
         if not self.dist_env.is_main:
             return
-
 
         if wandb.run is not None:
             wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
