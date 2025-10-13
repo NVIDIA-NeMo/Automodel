@@ -578,31 +578,30 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamSch
     if step_scheduler.max_steps is not None:
         total_steps = min(total_steps, step_scheduler.max_steps)
 
-    # Extract learning rate from optimizer
-    base_lrs = [opt.param_groups[0]["lr"] for opt in optimizer]
-
     # Set defaults for scheduler parameters
-    default_kwargs_list = []
-    for base_lr, opt in zip(base_lrs, optimizer):
-        default_kwargs = dict(
+    optimizer_param_schedulers = []
+    default_kwargs = dict(
+        lr_warmup_steps=min(1000, total_steps // 10),  # 10% warmup or max 1000 steps
+        lr_decay_steps=total_steps,
+        lr_decay_style="cosine",
+        wd_incr_steps=total_steps,
+        wd_incr_style="constant",
+    ) | cfg.to_dict()
+
+    if not isinstance(optimizer, list):
+        optimizer = [optimizer]
+
+    for opt in optimizer:
+        base_lr = opt.param_groups[0]["lr"]
+        default_kwargs.update(dict(
             optimizer=opt,
             init_lr=base_lr * 0.1,  # Start warmup at 10% of base LR
             max_lr=base_lr,
             min_lr=base_lr * 0.01,  # End at 1% of base LR
-            lr_warmup_steps=min(1000, total_steps // 10),  # 10% warmup or max 1000 steps
-            lr_decay_steps=total_steps,
-            lr_decay_style="cosine",
             start_wd=opt.param_groups[0].get("weight_decay", 0.0),
             end_wd=opt.param_groups[0].get("weight_decay", 0.0),
-            wd_incr_steps=total_steps,
-            wd_incr_style="constant",
-        )
-        default_kwargs_list.append(default_kwargs)
-
-    # Override with user-provided config
-    if cfg is not None:
-        user_cfg = cfg.to_dict() if hasattr(cfg, "to_dict") else dict(cfg)
-        default_kwargs.update(user_cfg)
+        ))
+        optimizer_param_schedulers.append(OptimizerParamScheduler(**default_kwargs))
 
     logger.info(
         f"Building LR scheduler with total_steps={total_steps}, "
@@ -610,7 +609,7 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamSch
         f"decay_style={default_kwargs['lr_decay_style']}"
     )
 
-    return [OptimizerParamScheduler(**default_kwargs) for default_kwargs in default_kwargs_list]
+    return optimizer_param_schedulers
 
 
 def build_wandb(cfg) -> wandb.Run:
