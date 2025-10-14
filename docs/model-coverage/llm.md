@@ -15,7 +15,7 @@ To run LLMs with NeMo Automodel, make sure you're using NeMo container version `
 For other installation options (e.g., uv), please see our [Installation Guide](../guides/installation.md).
 
 ## Supported Models
-NeMo Automodel interoperates with most LLMs available on the Hugging Face Hub. During preprocessing, it uses `transformers.AutoTokenizer`, which is sufficient for most LLM cases. If your model requires custom text handling, such as for reasoning tasks, you can override the default tokenizer during the data preparation stage.
+NeMo Automodel interoperates with most LLMs available on the Hugging Face Hub, specifically the <a href=https://huggingface.co/transformers/v3.5.1/model_doc/auto.html#automodelforcausallm>AutoModelForCausalLM<a> in the <a href="https://huggingface.co/models?pipeline_tag=text-generation&sort=trending">Text Generation<a> category. During preprocessing, it uses `transformers.AutoTokenizer`, which is sufficient for most LLM cases. If your model requires custom text handling, such as for reasoning tasks, you can override the default tokenizer during the data preparation stage.
 
 The table below lists the main architectures we test against (FSDP2 combined with SFT/PEFT) and includes a representative checkpoint for each.
 
