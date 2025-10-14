@@ -42,7 +42,7 @@ jobs:
           set +e
           uv lock --check
           EXIT_CODE=$?
-          if [ $EXIT_CODE -eq 0 ];
+          if [ $EXIT_CODE -eq 0 ]; then
             echo 'Uv lock file is update to date'
           else
             echo 'Updating uv lock file'
@@ -55,7 +55,7 @@ jobs:
           sed -i '/\[tool\.uv\]/r docker/common/uv-pytorch.toml' pyproject.toml
           uv lock --check
           EXIT_CODE=$?
-          if [ $EXIT_CODE -eq 0 ];
+          if [ $EXIT_CODE -eq 0 ]; then
             echo 'Uv PyTorch lock file is update to date'
           else
             echo 'Updating uv PyTorch lock file'
