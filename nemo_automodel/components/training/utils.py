@@ -198,9 +198,6 @@ def clip_grad_norm(
         else:
             return 0
 
-    if isinstance(grad_norm, torch.Tensor):
-        grad_norm = grad_norm.item()
-
     return grad_norm
 
 
