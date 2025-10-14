@@ -75,9 +75,11 @@ The table below lists the main architectures we test against (FSDP2 combined wit
 
 The models listed above can be fine-tuned using NeMo Automodel to adapt them to specific tasks or domains. We support two primary fine-tuning approaches:
 
-1. **Parameter-Efficient Fine-Tuning (PEFT)**: Updates only a small subset of parameters (typically <1%) using techniques like Low-Rank Adaptation (LoRA). This is ideal for resource-constrained environments. See our [PEFT Guide](../guides/llm/peft.md) for details.
+1. **Parameter-Efficient Fine-Tuning (PEFT)**: Updates only a small subset of parameters (typically <1%) using techniques like Low-Rank Adaptation (LoRA). This is ideal for resource-constrained environments.
 
-2. **Supervised Fine-Tuning (SFT)**: Updates all or most model parameters for deeper adaptation, suitable for high-precision applications. See our [SFT Guide](../guides/llm/sft.md) for implementation details.
+2. **Supervised Fine-Tuning (SFT)**: Updates all or most model parameters for deeper adaptation, suitable for high-precision applications.
+
+Please see our [Fine-Tuning Guide](../guides/llm/finetune.md) how you can apply both of these fine-tuning methods with your data.
 
 :::{tip}
 In these guides, we use the `SQuAD v1.1` dataset for demonstation purposes, but you can specify your own data as needed.
@@ -109,9 +111,7 @@ This structure makes SQuAD ideal for training context-based question answering m
 ### Get Started with Fine-Tuning
 To fine-tune any of the supported models:
 
-1. Choose your approach:
-   * For parameter-efficient tuning: Follow the [PEFT Guide](../guides/llm/peft.md)
-   * For full model tuning: Follow the [SFT Guide](../guides/llm/sft.md)
+1. Choose your approach (PEFT or SFT), see our [Fine-Tuning Guide](../guides/llm/finetune.md).
 
 2. Key steps in both guides:
    * Model and dataset configuration
