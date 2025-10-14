@@ -77,7 +77,7 @@ def to_cpu(
     state_dict: dict[str, torch.Tensor | dict[str, torch.Tensor]],
 ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
     """Converts a state dictionary to CPU."""
-    return {k: v.cpu() for k, v in state_dict.items() if isinstance(v, torch.Tensor)}
+    return {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in state_dict.items()}
 
 
 def get_validation_loss(
@@ -85,7 +85,7 @@ def get_validation_loss(
 ) -> torch.Tensor:
     """Gets the validation loss for a model."""
     loss_buffer = []
-    val_batch = {k: v.to(device, non_blocking=True) for k, v in val_batch.items()}
+    val_batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in val_batch.items()}
     num_label_tokens = (val_batch["labels"] != -100).sum().item()
     for model_part in model_parts:
         model_part.eval()
