@@ -23,18 +23,8 @@ from diffusers.utils import export_to_video
 
 from nemo_automodel.components._diffusers import NeMoAutoDiffusionPipeline
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
-from nemo_automodel.distributed.init_utils import initialize_distributed
-from nemo_automodel.utils.logging import setup_logging
-
-
-def setup_dist() -> int:
-    dist.init_process_group(backend="nccl")
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
-
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    return local_rank
+from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.loggers.log_utils import setup_logging
 
 
 def parse_args():
