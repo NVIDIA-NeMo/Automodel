@@ -14,16 +14,13 @@
 
 name: Generate Uv lock
 
-# on:
-#   pull_request_target:
-#     paths:
-#       - 'pyproject.toml'
-#     types: [ opened, synchronize, reopened, labeled, unlabeled ]
-
 on:
   pull_request:
     paths:
       - 'pyproject.toml'
+
+permissions:
+  contents: write
 
 jobs:
   check_uv_lock_and_update:
@@ -42,4 +39,36 @@ jobs:
 
       - name: Check Uv lock
         run: |
+          set +e
           uv lock --check
+          EXIT_CODE=$?
+          if [ $EXIT_CODE -eq 0 ];
+            echo 'Uv lock file is update to date'
+          else
+            echo 'Updating uv lock file'
+            uv lock
+          fi
+
+      - name: Check Uv PyTorch lock
+        run: |
+          set +e
+          sed -i '/\[tool\.uv\]/r docker/common/uv-pytorch.toml' pyproject.toml
+          uv lock --check
+          EXIT_CODE=$?
+          if [ $EXIT_CODE -eq 0 ];
+            echo 'Uv PyTorch lock file is update to date'
+          else
+            echo 'Updating uv PyTorch lock file'
+            mv uv.lock uv_main.lock
+            uv lock
+            mv uv.lock docker/common/uv-pytorch.lock
+            mv uv_main.lock uv.lock
+          fi
+
+      - uses: EndBug/add-and-commit@v9
+        with:
+          message: Update uv lock
+          commit: --signoff
+          add: |
+            - uv.lock
+            - docker/common/uv-pytorch.lock
