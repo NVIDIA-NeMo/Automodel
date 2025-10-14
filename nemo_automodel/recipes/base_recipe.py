@@ -170,6 +170,9 @@ class BaseRecipe:
         """
         if not self.checkpointer.config.enabled:
             return
+
+        # Wait for any in-flight checkpoint (async case) to complete
+        self.checkpointer.async_wait()
         is_dist_initialized = torch.distributed.is_initialized()
         is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
 
@@ -185,7 +188,7 @@ class BaseRecipe:
         # TODO(@adil-a): Change this when we create a LR scheduler class
         model, optimizer, scheduler, tokenizer, config = None, None, None, None, None
 
-        for key in self.__dict__["__state_tracked"]:
+        for key in sorted(self.__dict__["__state_tracked"]):
             if is_model(getattr(self, key)):
                 if key == "teacher_model":
                     continue
@@ -237,7 +240,7 @@ class BaseRecipe:
 
         model, optimizer, scheduler = None, None, None
 
-        for key in self.__dict__["__state_tracked"]:
+        for key in sorted(self.__dict__["__state_tracked"]):
             if is_model(getattr(self, key)):
                 model = getattr(self, key)
             elif is_optimizer(getattr(self, key)):

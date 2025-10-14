@@ -26,7 +26,6 @@ from packaging.version import parse
 from safetensors.torch import load_file, save_file
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
-from concurrent.futures import Future
 
 from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
@@ -41,15 +40,34 @@ if TYPE_CHECKING:
     from peft import PeftConfig
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
+
 def _is_geq_torch_2_9() -> bool:
     """
     Check if the current torch version is greater than or equal to 2.9.0.
     """
     return parse(torch.__version__).base_version >= "2.9.0"
 
+
 if _is_geq_torch_2_9():
     from torch.distributed.checkpoint.staging import DefaultStager
-    from torch.distributed.checkpoint.state_dict_saver import AsyncCheckpointerType
+    from torch.distributed.checkpoint.state_dict_saver import AsyncCheckpointerType, AsyncSaveResponse
+
+
+@dataclass
+class _AsyncSaveContext:
+    """
+    Internal container for async checkpointing state.
+
+    One instance is maintained for the model save and one for the optimizer save
+    to keep staging/upload futures and the associated process group and stager
+    together in a single place.
+    """
+
+    stager: Any | None
+    process_group: Any | None  # torch.distributed.ProcessGroup
+    future: Any | None  # AsyncSaveResponse
+    staging_active: bool = False
+
 
 @dataclass
 class CheckpointingConfig:
@@ -119,13 +137,13 @@ class Checkpointer:
         self.pp_rank = pp_rank
 
         # async specific variables
-        self.model_pg = None
-        self.optimizer_pg = None
+        self._model_ctx = _AsyncSaveContext(stager=None, process_group=None, future=None, staging_active=False)
+        self._optim_ctx = _AsyncSaveContext(stager=None, process_group=None, future=None, staging_active=False)
         if self.config.is_async:
-            self.model_stager = DefaultStager()
-            self.optimizer_stager = DefaultStager()
-            self.model_pg = torch.distributed.new_group(backend="gloo")
-            self.optimizer_pg = torch.distributed.new_group(backend="gloo")
+            self._model_ctx.stager = DefaultStager()
+            self._optim_ctx.stager = DefaultStager()
+            self._model_ctx.process_group = torch.distributed.new_group(backend="gloo")
+            self._optim_ctx.process_group = torch.distributed.new_group(backend="gloo")
 
         self.__post_init__()
 
@@ -138,7 +156,6 @@ class Checkpointer:
             self._addons.append(ConsolidatedHFAddon())
         if self.config.is_peft:
             self._addons.append(PeftAddon())
-        self.inflight: Optional[Future] = None
 
     def save_model(
         self,
@@ -162,11 +179,6 @@ class Checkpointer:
             peft_config: Optional PEFT configuration when saving adapters.
             tokenizer: Optional tokenizer to save with consolidated artifacts.
         """
-        # Wait for any in-flight checkpoint (async case) to complete
-        if self.inflight is not None:
-            self.inflight.result()
-            self.inflight = None
-
         # Create the model directories
         model_dir = os.path.join(weights_path, "model")
         consolidated_dir = os.path.join(model_dir, "consolidated") if self._should_write_consolidated() else None
@@ -191,7 +203,7 @@ class Checkpointer:
         fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
 
         storage_writer = self._get_storage_writer(consolidated_dir, fqn_to_file_index_mapping, model_dir)
-        self._do_save(state_dict, model_dir, storage_writer)
+        self._model_ctx.future = self._do_save(state_dict, model_dir, storage_writer)
 
     def save_optimizer(
         self, optimizer: torch.optim.Optimizer, model: nn.Module, weights_path: str, scheduler: Optional[Any] = None
@@ -209,7 +221,7 @@ class Checkpointer:
         _ensure_dirs(optimizer_path)
         optimizer_state = OptimizerState(model, optimizer, scheduler)
         state_dict = optimizer_state.state_dict()
-        self._do_save(state_dict, optimizer_path)
+        self._optim_ctx.future = self._do_save(state_dict, optimizer_path)
 
     def load_optimizer(
         self, optimizer: torch.optim.Optimizer, model: nn.Module, weights_path: str, scheduler: Optional[Any] = None
@@ -333,6 +345,28 @@ class Checkpointer:
         if hasattr(model, "tie_weights") and is_tied_lm_head:
             model.tie_weights()
 
+    def maybe_wait_for_staging(self) -> None:
+        """
+        Wait for the staging to finish if it is enabled.
+        """
+        if self._model_ctx.staging_active and self._model_ctx.future is not None:
+            self._model_ctx.future.staging_completion.result()
+            self._model_ctx.staging_active = False
+        if self._optim_ctx.staging_active and self._optim_ctx.future is not None:
+            self._optim_ctx.future.staging_completion.result()
+            self._optim_ctx.staging_active = False
+
+    def async_wait(self) -> None:
+        """
+        Wait for the async save to finish.
+        """
+        if self._model_ctx.future is not None:
+            self._model_ctx.future.upload_completion.result()
+            self._model_ctx.future = None
+        if self._optim_ctx.future is not None:
+            self._optim_ctx.future.upload_completion.result()
+            self._optim_ctx.future = None
+
     def save_on_dp_ranks(self, state: Any, state_name: str, path: str) -> None:
         """
         Save the stateful object.
@@ -396,7 +430,7 @@ class Checkpointer:
 
     def _do_save(
         self, state_dict: dict[str, torch.Tensor], path: str, storage_writer: Optional[_HuggingFaceStorageWriter] = None
-    ) -> None:
+    ) -> Optional["AsyncSaveResponse"]:
         """
         Save a state dictionary to `path` using DCP or PEFT special-case logic.
 
@@ -407,6 +441,9 @@ class Checkpointer:
             state_dict: State dict to be serialized.
             path: Checkpoint directory path.
             storage_writer: Optional HF storage writer for safetensors sharding.
+
+        Returns:
+            Optional Future object if async mode is enabled.
         """
         # Both model and optimizer saving is done in this function
         is_model = True if "model" in path else False
@@ -415,11 +452,21 @@ class Checkpointer:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 save_file(state_dict, os.path.join(path, "adapter_model.safetensors"))
                 return
+
         if self.config.is_async:
-            # TODO: add process based async ckpt with pinned memory
-            self.inflight = dcp.async_save(state_dict, checkpoint_id=path, storage_writer=storage_writer)
+            ctx = self._model_ctx if is_model else self._optim_ctx
+            ret = dcp.async_save(
+                state_dict,
+                checkpoint_id=path,
+                storage_writer=storage_writer,
+                process_group=ctx.process_group,
+                async_stager=ctx.stager,
+                async_checkpointer_type=AsyncCheckpointerType.PROCESS,
+            )
+            ctx.staging_active = True
         else:
-            dcp.save(state_dict, checkpoint_id=path, storage_writer=storage_writer)
+            ret = dcp.save(state_dict, checkpoint_id=path, storage_writer=storage_writer)
+        return ret
 
     def _should_write_consolidated(self) -> bool:
         """
@@ -606,15 +653,14 @@ def save_config(config: dict[str, Any], weights_path: str) -> None:
 
 def _ensure_dirs(*dirs: Optional[str]) -> None:
     """
-    Create directories on rank 0 and synchronize across ranks.
+    Create directories on all ranks and synchronize across ranks.
 
     Args:
         *dirs: One or more directory paths that should exist.
     """
-    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        for d in dirs:
-            if d:
-                os.makedirs(d, exist_ok=True)
+    for d in dirs:
+        if d:
+            os.makedirs(d, exist_ok=True)
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 

@@ -1030,6 +1030,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model_parts[0].finish_grad_sync()
 
+        self.checkpointer.maybe_wait_for_staging()
         for opt in self.optimizer:
             opt.step()
             opt.zero_grad()
