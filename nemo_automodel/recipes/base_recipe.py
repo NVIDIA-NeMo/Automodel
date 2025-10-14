@@ -253,7 +253,7 @@ class BaseRecipe:
             else:
                 getattr(self, key).load_state_dict(torch.load(os.path.join(ckpt_dir, f"{key}.pt"), weights_only=False))
 
-        self.checkpointer.load_model(model,os.path.join(ckpt_dir, "model"))
+        self.checkpointer.load_model(model, os.path.join(ckpt_dir, "model"))
         self.checkpointer.load_optimizer(optimizer, model, ckpt_dir, scheduler)
 
     def _log_experiment_details(self):

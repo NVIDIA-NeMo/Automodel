@@ -12,26 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Protocol, TYPE_CHECKING, Optional, Any
+import json
 import os
+from typing import TYPE_CHECKING, Protocol
+
 import torch
 from torch import nn
+
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
-import json
 
 if TYPE_CHECKING:
     from peft import PeftConfig
+
 
 class CheckpointAddon(Protocol):
     """
     Optional hooks that run around backend IO (used for PEFT and consolidated HF metadata).
     """
+
     def pre_save(self, **kwargs) -> None: ...
+
 
 class ConsolidatedHFAddon:
     """
     Addon for consolidated HF metadata.
     """
+
     def pre_save(self, **kwargs):
         model_state = kwargs["model_state"]
         consolidated_model_path = kwargs["consolidated_path"]
@@ -60,6 +66,7 @@ class PeftAddon:
     """
     Addon for PEFT metadata.
     """
+
     def pre_save(self, **kwargs):
         model_path = kwargs["model_path"]
         tokenizer = kwargs["tokenizer"]
@@ -120,12 +127,14 @@ def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState) -> d
         "base_model_name_or_path": name_or_path,
     }
 
+
 def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
     """
     Get the PEFT metadata in the format expected by Automodel.
     """
     PEFT_KEYS = {"dim", "alpha"}
     return {k: v for k, v in peft_config.to_dict().items() if k not in PEFT_KEYS}
+
 
 def _extract_target_modules(model: nn.Module) -> list[str]:
     """

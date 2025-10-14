@@ -34,7 +34,7 @@ from wandb import Settings
 
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components._transformers.utils import apply_cache_compatibility_patches
-from nemo_automodel.components.checkpoint.checkpointing_class import CheckpointingConfig, Checkpointer
+from nemo_automodel.components.checkpoint.checkpointing_class import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
@@ -547,7 +547,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.peft_config = None
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
-        
+
         # Build checkpoint config
         checkpoint_config = build_checkpoint_config(
             self.cfg.get("checkpoint", None),
@@ -555,7 +555,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.cfg.model.pretrained_model_name_or_path,
             True if self.cfg.get("peft", None) else False,
         )
-        
+
         # Create Checkpointer instance
         self.checkpointer = Checkpointer(
             config=checkpoint_config,
@@ -564,7 +564,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             pp_rank=self._get_pp_rank(),
             moe_mesh=None,
         )
-        
+
         self.model, model_state_dict_keys, self.optimizer = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,

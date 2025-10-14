@@ -39,7 +39,7 @@ from wandb import Settings
 
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components._transformers.utils import apply_cache_compatibility_patches
-from nemo_automodel.components.checkpoint.checkpointing_class import CheckpointingConfig, Checkpointer
+from nemo_automodel.components.checkpoint.checkpointing_class import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
@@ -785,7 +785,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             _get_model_name(self.cfg.model),
             True if self.cfg.get("peft", None) else False,
         )
-        
+
         # Create Checkpointer instance
         self.checkpointer = Checkpointer(
             config=checkpoint_config,

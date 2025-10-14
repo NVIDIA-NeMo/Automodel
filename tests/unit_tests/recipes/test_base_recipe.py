@@ -21,6 +21,7 @@ import torch.nn as nn
 
 import nemo_automodel.recipes.base_recipe as base_recipe
 from nemo_automodel.recipes.base_recipe import BaseRecipe, _find_latest_checkpoint
+from nemo_automodel.components.config.loader import ConfigNode
 
 try:
     import expecttest
@@ -43,38 +44,64 @@ def _mock_single_rank(monkeypatch):
 @pytest.fixture(autouse=True)
 def _patch_checkpoint_ops(monkeypatch):
     """
-    Replace load_/save_model|optimizer with minimal torch.save/torch.load
-    wrappers so that BaseRecipe can operate without the real NeMo helpers.
+    Replace Checkpointer class with a minimal mock that uses torch.save/torch.load
+    so that BaseRecipe can operate without the real checkpoint infrastructure.
     """
+    from nemo_automodel.components.checkpoint import checkpointing_class
 
-    def _save_model(model, path, _cfg):
-        if model is None:
-            return
-        torch.save(model.state_dict(), os.path.join(path, "model.pt"))
-
-    def _load_model(model, path, _cfg):
-        if model is None:
-            return
-        model.load_state_dict(torch.load(os.path.join(path, "model.pt")))
-
-    def _save_optimizer(opt, _model, path):
-        if opt is None:
-            return
-        torch.save(opt.state_dict(), os.path.join(path, "optimizer.pt"))
-
-    def _load_optimizer(opt, _model, path):
-        if opt is None:
-            return
-        opt.load_state_dict(torch.load(os.path.join(path, "optimizer.pt")))
-
-    monkeypatch.setattr(base_recipe, "save_model", _save_model)
-    monkeypatch.setattr(base_recipe, "load_model", _load_model)
-    monkeypatch.setattr(
-        base_recipe,
-        "save_optimizer",
-        _save_optimizer := _save_optimizer if "save_optimizer" in locals() else _save_optimizer,
-    )
-    monkeypatch.setattr(base_recipe, "load_optimizer", _load_optimizer)
+    class MockCheckpointer:
+        """Mock Checkpointer for testing."""
+        
+        def __init__(self, config, dp_rank, tp_rank, pp_rank, moe_mesh=None):
+            self.config = config
+            self.dp_rank = dp_rank
+            self.tp_rank = tp_rank
+            self.pp_rank = pp_rank
+            self.moe_mesh = moe_mesh
+        
+        def save_model(self, model, path, peft_config=None, tokenizer=None):
+            """Save model state dict."""
+            if model is None:
+                return
+            model_dir = os.path.join(path, "model")
+            os.makedirs(model_dir, exist_ok=True)
+            torch.save(model.state_dict(), os.path.join(model_dir, "model.pt"))
+        
+        def load_model(self, model, model_path, is_init_step=False, use_checkpoint_id=True, 
+                      key_mapping=None, quantization=False):
+            """Load model state dict."""
+            if model is None:
+                return
+            model.load_state_dict(torch.load(os.path.join(model_path, "model.pt"), weights_only=False))
+        
+        def save_optimizer(self, optimizer, model, weights_path, scheduler=None):
+            """Save optimizer state dict."""
+            if optimizer is None:
+                return
+            optim_dir = os.path.join(weights_path, "optim")
+            os.makedirs(optim_dir, exist_ok=True)
+            torch.save(optimizer.state_dict(), os.path.join(optim_dir, "optimizer.pt"))
+        
+        def load_optimizer(self, optimizer, model, weights_path, scheduler=None):
+            """Load optimizer state dict."""
+            if optimizer is None:
+                return
+            optim_path = os.path.join(weights_path, "optim")
+            optimizer.load_state_dict(torch.load(os.path.join(optim_path, "optimizer.pt"), weights_only=False))
+        
+        def save_on_dp_ranks(self, state, state_name, path):
+            """Save stateful object (e.g., dataloader, rng)."""
+            state_dir = os.path.join(path, state_name)
+            os.makedirs(state_dir, exist_ok=True)
+            if self.tp_rank == 0 and self.pp_rank == 0:
+                torch.save(state.state_dict(), os.path.join(state_dir, f"{state_name}.pt"))
+        
+        def load_on_dp_ranks(self, state, state_name, path):
+            """Load stateful object (e.g., dataloader, rng)."""
+            state_dir = os.path.join(path, state_name)
+            state.load_state_dict(torch.load(os.path.join(state_dir, f"{state_name}.pt"), weights_only=False))
+    
+    monkeypatch.setattr(checkpointing_class, "Checkpointer", MockCheckpointer)
     yield
 
 
@@ -109,13 +136,34 @@ class _ToyRecipe(BaseRecipe):
 
     def __init__(self, checkpoint_dir):
         super().__init__()
+        
+        from nemo_automodel.components.checkpoint.checkpointing_class import CheckpointingConfig, Checkpointer
 
-        # The config object only needs the two attributes used by BaseRecipe.
-        self.checkpoint_config = SimpleNamespace(enabled=True, checkpoint_dir=str(checkpoint_dir))
+        checkpoint_config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=str(checkpoint_dir),
+            model_save_format="safetensors",
+            model_cache_dir="",
+            model_repo_id="",
+            save_consolidated=False,
+            is_peft=False,
+            model_state_dict_keys=[],
+        )
+
+        self.checkpointer = Checkpointer(
+            config=checkpoint_config,
+            dp_rank=0,
+            tp_rank=0,
+            pp_rank=0,
+            moe_mesh=None,
+        )
 
         self.model = nn.Linear(2, 2, bias=False)
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.1)
         self.custom_state = _DummyStateful()
+        self.peft_config = None
+
+        self.cfg = ConfigNode({"test": "config"})
 
 
 def test_find_latest_checkpoint(tmp_path):
