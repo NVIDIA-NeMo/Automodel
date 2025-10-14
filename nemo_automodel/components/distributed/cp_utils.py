@@ -18,7 +18,7 @@ from typing import List, Optional, Set
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 
-from nemo_automodel.components.attention.utils import split_batch_into_thd_chunks
+from nemo_automodel.components.utils.thd_utils import split_batch_into_thd_chunks
 
 
 def _build_position_ids(batch, device):
