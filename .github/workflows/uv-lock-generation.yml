@@ -19,7 +19,6 @@ on:
     paths:
       - 'pyproject.toml'
 
-
 jobs:
   check_uv_lock_and_update:
     runs-on: ubuntu-latest

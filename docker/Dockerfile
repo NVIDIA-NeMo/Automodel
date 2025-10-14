@@ -17,7 +17,6 @@ ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:25.09-py3
 ARG BASE_IMAGE=cuda
 
 FROM ${CUDA_IMAGE} AS cuda
-
 # Install dependencies
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
