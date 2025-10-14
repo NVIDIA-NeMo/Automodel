@@ -11,73 +11,78 @@ def parse_args():
     p = argparse.ArgumentParser("WAN 2.1 T2V DMD Training")
 
     # Model configuration
-    p.add_argument("--model_id", type=str, default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
-                   help="HuggingFace model ID for base/generator model")
-    p.add_argument("--teacher_model_path", type=str, default=None,
-                   help="Optional path to teacher model checkpoint (if different from base)")
+    p.add_argument(
+        "--model_id",
+        type=str,
+        default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        help="HuggingFace model ID for base/generator model",
+    )
+    p.add_argument(
+        "--teacher_model_path",
+        type=str,
+        default=None,
+        help="Optional path to teacher model checkpoint (if different from base)",
+    )
 
     # Training configuration
-    p.add_argument("--meta_folder", type=str, required=True,
-                   help="Path to folder containing .meta files")
-    p.add_argument("--num_epochs", type=int, default=1,
-                   help="Number of training epochs (DMD trains fast, 1 epoch often sufficient)")
-    p.add_argument("--batch_size_per_gpu", type=int, default=1,
-                   help="Batch size per GPU")
-    p.add_argument("--learning_rate", type=float, default=1e-5,
-                   help="Learning rate for generator")
-    p.add_argument("--critic_learning_rate", type=float, default=None,
-                   help="Learning rate for critic (defaults to same as generator)")
+    p.add_argument("--meta_folder", type=str, required=True, help="Path to folder containing .meta files")
+    p.add_argument(
+        "--num_epochs",
+        type=int,
+        default=1,
+        help="Number of training epochs (DMD trains fast, 1 epoch often sufficient)",
+    )
+    p.add_argument("--batch_size_per_gpu", type=int, default=1, help="Batch size per GPU")
+    p.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate for generator")
+    p.add_argument(
+        "--critic_learning_rate",
+        type=float,
+        default=None,
+        help="Learning rate for critic (defaults to same as generator)",
+    )
 
     # Memory optimization
-    p.add_argument("--cpu_offload", action="store_true", default=True,
-                   help="Enable CPU offloading for parameters")
-    p.add_argument("--no_cpu_offload", action="store_false", dest="cpu_offload",
-                   help="Disable CPU offloading")
+    p.add_argument("--cpu_offload", action="store_true", default=True, help="Enable CPU offloading for parameters")
+    p.add_argument("--no_cpu_offload", action="store_false", dest="cpu_offload", help="Disable CPU offloading")
 
     # DMD parameters
-    p.add_argument("--num_train_timestep", type=int, default=1000,
-                   help="Total training timesteps")
-    p.add_argument("--min_step", type=int, default=20,
-                   help="Minimum timestep for noise")
-    p.add_argument("--max_step", type=int, default=980,
-                   help="Maximum timestep for noise")
-    p.add_argument("--real_guidance_scale", type=float, default=5.0,
-                   help="CFG scale for teacher model")
-    p.add_argument("--fake_guidance_scale", type=float, default=0.0,
-                   help="CFG scale for critic model")
-    p.add_argument("--timestep_shift", type=float, default=3.0,
-                   help="Flow matching shift parameter")
-    p.add_argument("--ts_schedule", action="store_true", default=True,
-                   help="Use dynamic timestep scheduling")
-    p.add_argument("--no_ts_schedule", action="store_false", dest="ts_schedule",
-                   help="Disable dynamic timestep scheduling")
-    p.add_argument("--ts_schedule_max", action="store_true", default=False,
-                   help="Use max timestep scheduling")
-    p.add_argument("--min_score_timestep", type=int, default=0,
-                   help="Minimum timestep for critic")
-    p.add_argument("--denoising_loss_type", type=str, default="flow",
-                   choices=["flow", "epsilon", "x0"],
-                   help="Type of denoising loss for critic")
+    p.add_argument("--num_train_timestep", type=int, default=1000, help="Total training timesteps")
+    p.add_argument("--min_step", type=int, default=20, help="Minimum timestep for noise")
+    p.add_argument("--max_step", type=int, default=999, help="Maximum timestep for noise (999 for WAN 2.1)")
+    p.add_argument("--real_guidance_scale", type=float, default=5.0, help="CFG scale for teacher model")
+    p.add_argument("--fake_guidance_scale", type=float, default=0.0, help="CFG scale for critic model")
+    p.add_argument("--timestep_shift", type=float, default=3.0, help="Flow matching shift parameter")
+    p.add_argument("--ts_schedule", action="store_true", default=True, help="Use dynamic timestep scheduling")
+    p.add_argument(
+        "--no_ts_schedule", action="store_false", dest="ts_schedule", help="Disable dynamic timestep scheduling"
+    )
+    p.add_argument("--ts_schedule_max", action="store_true", default=False, help="Use max timestep scheduling")
+    p.add_argument("--min_score_timestep", type=int, default=0, help="Minimum timestep for critic")
+    p.add_argument(
+        "--denoising_loss_type",
+        type=str,
+        default="flow",
+        choices=["flow", "epsilon", "x0"],
+        help="Type of denoising loss for critic",
+    )
 
     # Backward simulation
-    p.add_argument("--denoising_step_list", type=str, default="1000,750,500,250,0",
-                   help="Comma-separated list of discrete timesteps for backward simulation")
+    p.add_argument(
+        "--denoising_step_list",
+        type=str,
+        default="999,749,499,249,0",
+        help="Comma-separated list of discrete timesteps for backward simulation",
+    )
 
     # Alternating optimization
-    p.add_argument("--generator_steps", type=int, default=1,
-                   help="Number of generator updates per iteration")
-    p.add_argument("--critic_steps", type=int, default=1,
-                   help="Number of critic updates per iteration")
+    p.add_argument("--generator_steps", type=int, default=1, help="Number of generator updates per iteration")
+    p.add_argument("--critic_steps", type=int, default=1, help="Number of critic updates per iteration")
 
     # Checkpointing
-    p.add_argument("--save_every", type=int, default=500,
-                   help="Save checkpoint every N steps")
-    p.add_argument("--log_every", type=int, default=10,
-                   help="Log metrics every N steps")
-    p.add_argument("--output_dir", type=str, default="./wan_dmd_t2v_outputs",
-                   help="Output directory for checkpoints")
-    p.add_argument("--resume_checkpoint", type=str, default=None,
-                   help="Path to checkpoint to resume from")
+    p.add_argument("--save_every", type=int, default=500, help="Save checkpoint every N steps")
+    p.add_argument("--log_every", type=int, default=10, help="Log metrics every N steps")
+    p.add_argument("--output_dir", type=str, default="./wan_dmd_t2v_outputs", help="Output directory for checkpoints")
+    p.add_argument("--resume_checkpoint", type=str, default=None, help="Path to checkpoint to resume from")
 
     return p.parse_args()
 
@@ -95,7 +100,7 @@ def main():
     print0(f"[INFO] Generator LR: {args.learning_rate}")
     print0(f"[INFO] Critic LR: {args.critic_learning_rate or args.learning_rate}")
     print0(f"[INFO] CPU offload: {'ENABLED' if args.cpu_offload else 'DISABLED'}")
-    print0(f"[INFO] DMD config:")
+    print0("[INFO] DMD config:")
     print0(f"  - Real guidance scale: {args.real_guidance_scale}")
     print0(f"  - Fake guidance scale: {args.fake_guidance_scale}")
     print0(f"  - Timestep shift: {args.timestep_shift}")
@@ -230,7 +235,7 @@ if __name__ == "__main__":
 # ============================================================================
 # MEMORY ESTIMATION
 # ============================================================================
-# 
+#
 # With CPU offload enabled:
 # - Base model (1.3B): ~5GB per model × 3 = 15GB total
 # - With CPU offload: ~3-5GB GPU per model
