@@ -17,6 +17,11 @@ import math
 import pytest
 import torch
 
+from nemo_automodel.components.distributed.te_cp_utils import (
+    generate_positional_ids_for_cp,
+    get_batch_on_this_cp_rank,
+    pad_thd_sequences_for_cp,
+)
 from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     apply_rotary_emb,
     freqs_cis_from_position_ids,
@@ -345,6 +350,254 @@ class TestFreqsCisFromPositionIds:
         # Batch 1: repeated positions should have same values
         torch.testing.assert_close(freqs_cis[1, 0], freqs_cis[1, 1])
         torch.testing.assert_close(freqs_cis[1, 2], freqs_cis[1, 3])
+
+
+class TestFreqsCisWithContextParallel:
+    """Tests for freqs_cis_from_position_ids with context parallelism"""
+
+    @pytest.mark.parametrize("cp_size", [1, 2, 4])
+    def test_freqs_cis_with_different_cp_sizes(self, cp_size):
+        """Test that freqs_cis computation works correctly for different CP sizes"""
+        # Setup
+        batch_size = 2
+        seq_len = 128
+        head_dim = 64
+
+        # Create input_ids, labels, and cu_seqlens for packed sequences
+        # Two sequences of equal length
+        input_ids = torch.randint(0, 1000, (batch_size * seq_len,))
+        labels = torch.randint(0, 1000, (batch_size * seq_len,))
+        cu_seqlens = torch.tensor([0, seq_len, 2 * seq_len])
+
+        # Pad sequences for CP (must be divisible by 2*cp_size for THD format)
+        divisibility_factor = 2 * cp_size
+        input_ids_padded, labels_padded, cu_seqlens_padded = pad_thd_sequences_for_cp(
+            input_ids, labels, cu_seqlens, divisibility_factor
+        )
+
+        # Generate position IDs
+        position_ids = generate_positional_ids_for_cp(cu_seqlens_padded, divisibility_factor)
+
+        # Precompute base frequencies
+        freqs = precompute_freqs_cis(head_dim, seq_len * 2, 10000.0, None)
+
+        # Split data for each CP rank and verify freqs_cis
+        for cp_rank in range(cp_size):
+            _, _, position_ids_rank = get_batch_on_this_cp_rank(
+                cu_seqlens_padded,
+                input_ids_padded,
+                labels_padded,
+                position_ids,
+                cp_size,
+                cp_rank,
+                qvk_format="thd",
+            )
+
+            # Compute freqs_cis for this rank's position_ids
+            position_ids_rank_2d = position_ids_rank.unsqueeze(0)
+            freqs_cis_rank = freqs_cis_from_position_ids(position_ids_rank_2d, freqs)
+
+            # Verify shape and properties
+            assert freqs_cis_rank.shape[0] == 1
+            assert freqs_cis_rank.shape[2] == head_dim // 2
+            assert freqs_cis_rank.dtype == torch.complex64
+
+            # Verify all magnitudes are 1
+            magnitudes = torch.abs(freqs_cis_rank)
+            torch.testing.assert_close(magnitudes, torch.ones_like(magnitudes), rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize("cp_size,cp_rank", [(2, 0), (2, 1), (4, 0), (4, 2), (4, 3)])
+    def test_freqs_cis_consistency_across_ranks(self, cp_size, cp_rank):
+        """Test that freqs_cis values are consistent across CP ranks for same positions"""
+        # Setup
+        batch_size = 2
+        seq_len = 64
+        head_dim = 128
+
+        # Create packed sequences
+        input_ids = torch.randint(0, 1000, (batch_size * seq_len,))
+        labels = torch.randint(0, 1000, (batch_size * seq_len,))
+        cu_seqlens = torch.tensor([0, seq_len, 2 * seq_len])
+
+        divisibility_factor = 2 * cp_size
+        input_ids_padded, labels_padded, cu_seqlens_padded = pad_thd_sequences_for_cp(
+            input_ids, labels, cu_seqlens, divisibility_factor
+        )
+
+        # Generate position IDs
+        position_ids_full = generate_positional_ids_for_cp(cu_seqlens_padded, divisibility_factor)
+
+        # Precompute frequencies
+        freqs = precompute_freqs_cis(head_dim, seq_len * 2, 10000.0, None)
+
+        # Get position_ids for this CP rank
+        _, _, position_ids_rank = get_batch_on_this_cp_rank(
+            cu_seqlens_padded,
+            input_ids_padded,
+            labels_padded,
+            position_ids_full,
+            cp_size,
+            cp_rank,
+            qvk_format="thd",
+        )
+
+        # Compute freqs_cis
+        position_ids_rank_2d = position_ids_rank.unsqueeze(0)
+        freqs_cis_rank = freqs_cis_from_position_ids(position_ids_rank_2d, freqs)
+
+        # Verify that positions with same ID have same freqs_cis
+        unique_positions = torch.unique(position_ids_rank)
+        for pos in unique_positions:
+            mask = position_ids_rank == pos
+            indices = torch.where(mask)[0]
+            if len(indices) > 1:
+                # All tokens at this position should have identical freqs_cis
+                for i in range(1, len(indices)):
+                    torch.testing.assert_close(
+                        freqs_cis_rank[0, indices[0]],
+                        freqs_cis_rank[0, indices[i]]
+                    )
+
+    def test_freqs_cis_cp_with_variable_sequence_lengths(self):
+        """Test freqs_cis with variable-length sequences and CP splitting"""
+        cp_size = 2
+        head_dim = 64
+
+        # Create sequences of different lengths
+        seq_lens = [32, 64, 48]
+        input_ids = torch.cat([torch.randint(0, 1000, (l,)) for l in seq_lens])
+        labels = torch.cat([torch.randint(0, 1000, (l,)) for l in seq_lens])
+        cu_seqlens = torch.tensor([0] + list(torch.cumsum(torch.tensor(seq_lens), 0)))
+
+        divisibility_factor = 2 * cp_size
+        input_ids_padded, labels_padded, cu_seqlens_padded = pad_thd_sequences_for_cp(
+            input_ids, labels, cu_seqlens, divisibility_factor
+        )
+
+        # Generate position IDs
+        position_ids = generate_positional_ids_for_cp(cu_seqlens_padded, divisibility_factor)
+
+        # Precompute frequencies
+        freqs = precompute_freqs_cis(head_dim, max(seq_lens) * 2, 10000.0, None)
+
+        # Test for each CP rank
+        for cp_rank in range(cp_size):
+            _, _, position_ids_rank = get_batch_on_this_cp_rank(
+                cu_seqlens_padded,
+                input_ids_padded,
+                labels_padded,
+                position_ids,
+                cp_size,
+                cp_rank,
+                qvk_format="thd",
+            )
+
+            # Compute freqs_cis
+            position_ids_rank_2d = position_ids_rank.unsqueeze(0)
+            freqs_cis_rank = freqs_cis_from_position_ids(position_ids_rank_2d, freqs)
+
+            # Verify output properties
+            assert freqs_cis_rank.dtype == torch.complex64
+            assert freqs_cis_rank.shape[2] == head_dim // 2
+
+            # Verify magnitudes
+            magnitudes = torch.abs(freqs_cis_rank)
+            torch.testing.assert_close(magnitudes, torch.ones_like(magnitudes), rtol=1e-5, atol=1e-5)
+
+    def test_freqs_cis_cp_reconstructibility(self):
+        """Test that we can reconstruct full freqs_cis from CP-split pieces"""
+        cp_size = 2
+        head_dim = 64
+        seq_len = 128
+
+        # Create simple test case with one sequence
+        input_ids = torch.randint(0, 1000, (seq_len,))
+        labels = torch.randint(0, 1000, (seq_len,))
+        cu_seqlens = torch.tensor([0, seq_len])
+
+        divisibility_factor = 2 * cp_size
+        input_ids_padded, labels_padded, cu_seqlens_padded = pad_thd_sequences_for_cp(
+            input_ids, labels, cu_seqlens, divisibility_factor
+        )
+
+        # Generate position IDs for full sequence
+        position_ids_full = generate_positional_ids_for_cp(cu_seqlens_padded, divisibility_factor)
+
+        # Precompute frequencies
+        freqs = precompute_freqs_cis(head_dim, seq_len * 2, 10000.0, None)
+
+        # Collect freqs_cis from each CP rank
+        freqs_cis_parts = []
+        for cp_rank in range(cp_size):
+            _, _, position_ids_rank = get_batch_on_this_cp_rank(
+                cu_seqlens_padded,
+                input_ids_padded,
+                labels_padded,
+                position_ids_full,
+                cp_size,
+                cp_rank,
+                qvk_format="thd",
+            )
+
+            position_ids_rank_2d = position_ids_rank.unsqueeze(0)
+            freqs_cis_rank = freqs_cis_from_position_ids(position_ids_rank_2d, freqs)
+            freqs_cis_parts.append(freqs_cis_rank)
+
+        # Verify that each part has the expected length
+        expected_part_len = cu_seqlens_padded[-1].item() // cp_size
+        for part in freqs_cis_parts:
+            assert part.shape[1] == expected_part_len
+
+    @pytest.mark.parametrize("cp_size", [1, 2, 4, 8])
+    def test_freqs_cis_cp_different_sizes_with_rope_scaling(self, cp_size):
+        """Test freqs_cis with CP and RoPE scaling for long context"""
+        seq_len = 256
+        head_dim = 128
+        max_seq_len = 4096
+
+        rope_scaling = {
+            "factor": 2.0,
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "original_max_position_embeddings": 2048,
+        }
+
+        # Create test data
+        input_ids = torch.randint(0, 1000, (seq_len,))
+        labels = torch.randint(0, 1000, (seq_len,))
+        cu_seqlens = torch.tensor([0, seq_len])
+
+        divisibility_factor = 2 * cp_size
+        input_ids_padded, labels_padded, cu_seqlens_padded = pad_thd_sequences_for_cp(
+            input_ids, labels, cu_seqlens, divisibility_factor
+        )
+
+        # Generate position IDs
+        position_ids = generate_positional_ids_for_cp(cu_seqlens_padded, divisibility_factor)
+
+        # Precompute frequencies with scaling
+        freqs = precompute_freqs_cis(head_dim, max_seq_len, 10000.0, rope_scaling)
+
+        # Test each CP rank
+        for cp_rank in range(cp_size):
+            _, _, position_ids_rank = get_batch_on_this_cp_rank(
+                cu_seqlens_padded,
+                input_ids_padded,
+                labels_padded,
+                position_ids,
+                cp_size,
+                cp_rank,
+                qvk_format="thd",
+            )
+
+            # Compute freqs_cis
+            position_ids_rank_2d = position_ids_rank.unsqueeze(0)
+            freqs_cis_rank = freqs_cis_from_position_ids(position_ids_rank_2d, freqs)
+
+            # Verify properties
+            assert freqs_cis_rank.dtype == torch.complex64
+            magnitudes = torch.abs(freqs_cis_rank)
+            torch.testing.assert_close(magnitudes, torch.ones_like(magnitudes), rtol=1e-5, atol=1e-5)
 
 
 class TestIntegration:

@@ -21,6 +21,7 @@ from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.qwen3_moe.layers import Qwen3MoeAttention
 from nemo_automodel.components.models.qwen3_moe.state_dict_adapter import Qwen3MoeStateDictAdapter
+from nemo_automodel.components.models.utils import squeeze_input_for_thd
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
 from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
@@ -245,6 +246,12 @@ class Qwen3MoeForCausalLM(nn.Module, MoEFSDPSyncMixin):
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
+                input_ids, position_ids, padding_mask, attn_kwargs
+            )
+            attention_mask = None
+
         hidden = self.model(
             input_ids,
             position_ids=position_ids,
@@ -253,6 +260,8 @@ class Qwen3MoeForCausalLM(nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
         logits = self.lm_head(hidden) if self.lm_head else hidden
+        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+            logits = logits.unsqueeze(0)
         return logits
 
     @torch.no_grad()

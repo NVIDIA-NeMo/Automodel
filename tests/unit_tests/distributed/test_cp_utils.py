@@ -84,10 +84,14 @@ def test_build_position_ids_does_not_override_existing():
 def test_make_cp_batch_and_ctx_no_mesh():
     """When *no* device mesh is provided the call should be a no-op."""
     input_ids = torch.tensor([[1, 2, 3]])
-    batch = {"input_ids": input_ids, "position_ids": torch.tensor([[0, 1, 2]])}
     labels = torch.tensor([[1, 2, 3]])
+    batch = {
+        "input_ids": input_ids,
+        "position_ids": torch.tensor([[0, 1, 2]]),
+        "labels": labels,
+    }
 
-    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(None, batch, labels, loss_mask=None)
+    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(None, batch, loss_mask=None)
 
     # Expect the nullcontext *class* (not an instantiated object)
     assert ctx_obj is contextlib.nullcontext
@@ -117,11 +121,14 @@ def test_make_cp_batch_and_ctx_with_cp(monkeypatch):
     monkeypatch.setattr(_cu, "get_train_context", _fake_get_train_ctx)
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)  # CP enabled (>1)
-    batch = {"input_ids": torch.tensor([[10, 20, 30]])}
     labels = torch.tensor([[10, 20, 30]])
     loss_mask = torch.tensor([[1, 1, 1]])
+    batch = {
+        "input_ids": torch.tensor([[10, 20, 30]]),
+        "labels": labels,
+    }
 
-    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch, labels, loss_mask)
+    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask)
 
     # We expect the stub training context to be returned
     assert ctx_obj == "dummy_train_ctx"
@@ -140,27 +147,22 @@ def test_make_cp_batch_and_ctx_with_cp(monkeypatch):
 # ============================================================================
 
 
-def test_make_cp_batch_for_te_no_cp(monkeypatch):
-    """Test make_cp_batch_for_te with CP size 1."""
-    cp_mesh = _DummySubMesh(size=1)
+def test_make_cp_batch_for_te_basic(monkeypatch):
+    """Test make_cp_batch_for_te with basic input."""
+    cp_mesh = _DummySubMesh(size=2)
 
-    # Create simple batch with 2 sequences in BSHD format
-    # Batch size: 2, max_seq_len: 5
-    # Actual lengths: [3, 5]
-    input_ids = torch.tensor([
-        [1, 2, 3, 0, 0],
-        [4, 5, 6, 7, 8],
-    ])
-    labels = torch.tensor([
-        [10, 20, 30, -100, -100],
-        [40, 50, 60, 70, 80],
-    ])
-    seq_lens = torch.tensor([3, 5])
-    seq_lens_padded = torch.tensor([4, 8])  # Padded to multiples of 4
+    # Create simple batch in BSHD format
+    # 2 sequences: [1,2,3,4] and [5,6,7,8]
+    input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
+    labels = torch.tensor([[10, 20, 30, 40], [50, 60, 70, 80]])
+    position_ids = torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]])
+    seq_lens = torch.tensor([[4], [4]])  # Both sequences have length 4
+    seq_lens_padded = torch.tensor([[4], [4]])
 
     batch = {
         "input_ids": input_ids,
         "labels": labels,
+        "position_ids": position_ids,
         "seq_lens": seq_lens,
         "seq_lens_padded": seq_lens_padded,
     }
@@ -168,34 +170,44 @@ def test_make_cp_batch_for_te_no_cp(monkeypatch):
     def mock_get_rank(group=None):
         return 0
 
-    def mock_pad_thd(input_ids, labels, cu_seqlens, divisibility_factor, padding_token_id, padding_label_id):
-        # For cp_size=1, divisibility_factor=2, sequences should be padded to multiples of 2
-        return input_ids, labels, cu_seqlens
+    # Mock tex.thd_get_partitioned_indices to return all indices (simplified)
+    def mock_thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
+        # For simplicity, just return all indices
+        return torch.arange(total_tokens)
 
-    def mock_generate_pos_ids(cu_seqlens, divisibility_factor, dtype):
-        return torch.tensor([0, 1, 2, 0, 1, 2, 3, 4])
+    # Mock transformer_engine_torch module
+    class MockTex:
+        @staticmethod
+        def thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
+            return mock_thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank)
 
-    def mock_get_batch(cu_seqlens_padded, input_ids_padded, labels_padded, position_ids_padded, cp_size, cp_rank, qvk_format):
-        return input_ids_padded, labels_padded, position_ids_padded
+    # Mock at the module level where it's imported
+    import sys
+    sys.modules['transformer_engine_torch'] = MockTex
 
-    import nemo_automodel.components.distributed.te_cp_utils as te_cp
     monkeypatch.setattr(torch.distributed, "get_rank", mock_get_rank)
-    monkeypatch.setattr(te_cp, "pad_thd_sequences_for_cp", mock_pad_thd)
-    monkeypatch.setattr(te_cp, "generate_positional_ids_for_cp", mock_generate_pos_ids)
-    monkeypatch.setattr(te_cp, "get_batch_on_this_cp_rank", mock_get_batch)
 
     result = _cu.make_cp_batch_for_te(
         cp_mesh=cp_mesh,
         batch=batch,
     )
 
-    # Should always return processed batch
+    # Should return processed batch with correct keys
     assert "input_ids" in result
     assert "labels" in result
     assert "position_ids" in result
     assert "cu_seqlens" in result
     assert "cu_seqlens_padded" in result
+    assert "max_seqlen" in result
     assert "qkv_format" in result
+    assert "padding_mask" in result
+
+    # Verify format
+    assert result["qkv_format"] == "thd"
+
+    # Verify cu_seqlens are properly formatted
+    assert result["cu_seqlens"].dtype == torch.int32
+    assert result["cu_seqlens_padded"].dtype == torch.int32
 
 
 
@@ -210,8 +222,8 @@ def test_make_cp_batch_for_te_unsupported_format():
 
     input_ids = torch.tensor([[1, 2, 3, 4]])
     labels = torch.tensor([[10, 20, 30, 40]])
-    seq_lens = torch.tensor([4])
-    seq_lens_padded = torch.tensor([4])
+    seq_lens = torch.tensor([[4]])
+    seq_lens_padded = torch.tensor([[4]])
 
     batch = {
         "input_ids": input_ids,
@@ -224,239 +236,8 @@ def test_make_cp_batch_for_te_unsupported_format():
         _cu.make_cp_batch_for_te(
             cp_mesh=cp_mesh,
             batch=batch,
-            qvk_format="bshd",
+            qkv_format="bshd",
         )
-
-
-def test_make_cp_batch_for_te_padding_and_sharding(monkeypatch):
-    """Test that make_cp_batch_for_te properly calls padding and sharding functions."""
-    cp_mesh = _DummySubMesh(size=2)
-
-    # BSHD format input
-    input_ids = torch.tensor([[1, 2, 0, 0, 0], [3, 4, 5, 0, 0]])
-    labels = torch.tensor([[10, 20, -100, -100, -100], [30, 40, 50, -100, -100]])
-    seq_lens = torch.tensor([2, 3])
-    seq_lens_padded = torch.tensor([4, 4])
-
-    batch = {
-        "input_ids": input_ids,
-        "labels": labels,
-        "seq_lens": seq_lens,
-        "seq_lens_padded": seq_lens_padded,
-    }
-
-    # Track function calls
-    pad_called = []
-    position_ids_called = []
-    shard_called = []
-
-    def mock_pad_thd_sequences_for_cp(input_ids, labels, cu_seqlens, divisibility_factor,
-                                       padding_token_id, padding_label_id):
-        pad_called.append({
-            "divisibility_factor": divisibility_factor,
-            "padding_token_id": padding_token_id,
-            "padding_label_id": padding_label_id,
-        })
-        # Return padded versions (for CP size 2, divisibility_factor = 4)
-        # Sequence 1: length 2 -> pad to 4
-        # Sequence 2: length 3 -> pad to 4
-        input_ids_padded = torch.tensor([1, 2, 0, 0, 3, 4, 5, 0])
-        labels_padded = torch.tensor([10, 20, -100, -100, 30, 40, 50, -100])
-        cu_seqlens_padded = torch.tensor([0, 4, 8])
-        return input_ids_padded, labels_padded, cu_seqlens_padded
-
-    def mock_generate_positional_ids_for_cp(cu_seqlens, divisibility_factor, dtype):
-        position_ids_called.append({
-            "divisibility_factor": divisibility_factor,
-            "dtype": dtype,
-        })
-        # Generate position IDs for the padded sequences
-        return torch.tensor([0, 1, 2, 3, 0, 1, 2, 3])
-
-    def mock_get_batch_on_this_cp_rank(cu_seqlens_padded, input_ids_padded,
-                                        labels_padded, position_ids_padded,
-                                        cp_size, cp_rank, qvk_format):
-        shard_called.append({
-            "cu_seqlens_padded": cu_seqlens_padded.tolist(),
-            "cp_size": cp_size,
-            "cp_rank": cp_rank,
-            "qvk_format": qvk_format,
-        })
-        # Return the same tensors (simplified for testing)
-        return input_ids_padded, labels_padded, position_ids_padded
-
-    def mock_get_rank(group=None):
-        """Mock torch.distributed.get_rank to return 0."""
-        return 0
-
-    # Mock the imported functions
-    import nemo_automodel.components.distributed.te_cp_utils as te_cp
-    monkeypatch.setattr(te_cp, "pad_thd_sequences_for_cp", mock_pad_thd_sequences_for_cp)
-    monkeypatch.setattr(te_cp, "generate_positional_ids_for_cp", mock_generate_positional_ids_for_cp)
-    monkeypatch.setattr(te_cp, "get_batch_on_this_cp_rank", mock_get_batch_on_this_cp_rank)
-    monkeypatch.setattr(torch.distributed, "get_rank", mock_get_rank)
-
-    result = _cu.make_cp_batch_for_te(
-        cp_mesh=cp_mesh,
-        batch=batch,
-        padding_token_id=0,
-        padding_label_id=-100,
-    )
-
-    # Verify pad function was called with correct divisibility factor (2 * cp_size = 4)
-    assert len(pad_called) == 1
-    assert pad_called[0]["divisibility_factor"] == 4
-    assert pad_called[0]["padding_token_id"] == 0
-    assert pad_called[0]["padding_label_id"] == -100
-
-    # Verify position IDs generation was called
-    assert len(position_ids_called) == 1
-    assert position_ids_called[0]["divisibility_factor"] == 1
-    assert position_ids_called[0]["dtype"] == torch.long
-
-    # Verify sharding function was called with cp_size and cp_rank
-    assert len(shard_called) == 1
-    assert shard_called[0]["cu_seqlens_padded"] == [0, 4, 8]
-    assert shard_called[0]["cp_size"] == 2
-    assert shard_called[0]["cp_rank"] == 0
-    assert shard_called[0]["qvk_format"] == "thd"
-
-    # Verify output structure (new format)
-    assert "input_ids" in result
-    assert "labels" in result
-    assert "position_ids" in result
-    assert "cu_seqlens" in result
-    assert "cu_seqlens_padded" in result
-    assert "qkv_format" in result
-    assert result["qkv_format"] == "thd"
-
-
-
-
-def test_make_cp_batch_for_te_2d_input(monkeypatch):
-    """Test make_cp_batch_for_te with 2D input tensors."""
-    cp_mesh = _DummySubMesh(size=1)
-
-    # 2D tensors with batch dimension
-    input_ids = torch.tensor([[1, 2, 3, 4, 5]])
-    labels = torch.tensor([[10, 20, 30, 40, 50]])
-    seq_lens = torch.tensor([5])
-    seq_lens_padded = torch.tensor([8])
-
-    batch = {
-        "input_ids": input_ids,
-        "labels": labels,
-        "seq_lens": seq_lens,
-        "seq_lens_padded": seq_lens_padded,
-    }
-
-    def mock_get_rank(group=None):
-        return 0
-
-    def mock_pad_thd(input_ids, labels, cu_seqlens, divisibility_factor, padding_token_id, padding_label_id):
-        return input_ids, labels, cu_seqlens
-
-    def mock_generate_pos_ids(cu_seqlens, divisibility_factor, dtype):
-        return torch.tensor([0, 1, 2, 3, 4])
-
-    def mock_get_batch(cu_seqlens_padded, input_ids_padded, labels_padded, position_ids_padded, cp_size, cp_rank, qvk_format):
-        return input_ids_padded, labels_padded, position_ids_padded
-
-    import nemo_automodel.components.distributed.te_cp_utils as te_cp
-    monkeypatch.setattr(torch.distributed, "get_rank", mock_get_rank)
-    monkeypatch.setattr(te_cp, "pad_thd_sequences_for_cp", mock_pad_thd)
-    monkeypatch.setattr(te_cp, "generate_positional_ids_for_cp", mock_generate_pos_ids)
-    monkeypatch.setattr(te_cp, "get_batch_on_this_cp_rank", mock_get_batch)
-
-    result = _cu.make_cp_batch_for_te(
-        cp_mesh=cp_mesh,
-        batch=batch,
-    )
-
-    # Should handle 2D input correctly
-    assert "input_ids" in result
-    assert "labels" in result
-    assert "position_ids" in result
-    assert "cu_seqlens" in result
-    assert "cu_seqlens_padded" in result
-    assert "qkv_format" in result
-
-
-def test_make_cp_batch_for_te_with_seq_lens(monkeypatch):
-    """Test make_cp_batch_for_te with seq_lens for BSHD format input."""
-    cp_mesh = _DummySubMesh(size=1)
-
-    # BSHD format: batch_size=3, max_seq_len=5
-    # Actual sequence lengths: [3, 2, 4]
-    input_ids = torch.tensor([
-        [1, 2, 3, 0, 0],      # seq 1: [1, 2, 3], padding: [0, 0]
-        [4, 5, 0, 0, 0],      # seq 2: [4, 5], padding: [0, 0, 0]
-        [6, 7, 8, 9, 0],      # seq 3: [6, 7, 8, 9], padding: [0]
-    ])
-    labels = torch.tensor([
-        [10, 20, 30, -100, -100],
-        [40, 50, -100, -100, -100],
-        [60, 70, 80, 90, -100],
-    ])
-    seq_lens = torch.tensor([3, 2, 4])
-    seq_lens_padded = torch.tensor([4, 4, 4])
-
-    batch = {
-        "input_ids": input_ids,
-        "labels": labels,
-        "seq_lens": seq_lens,
-        "seq_lens_padded": seq_lens_padded,
-    }
-
-    def mock_get_rank(group=None):
-        return 0
-
-    def mock_pad_thd(input_ids, labels, cu_seqlens, divisibility_factor, padding_token_id, padding_label_id):
-        # Return as-is for simplicity
-        return input_ids, labels, cu_seqlens
-
-    def mock_generate_pos_ids(cu_seqlens, divisibility_factor, dtype):
-        return torch.tensor([0, 1, 2, 0, 1, 0, 1, 2, 3])
-
-    def mock_get_batch(cu_seqlens_padded, input_ids_padded, labels_padded, position_ids_padded, cp_size, cp_rank, qvk_format):
-        return input_ids_padded, labels_padded, position_ids_padded
-
-    import nemo_automodel.components.distributed.te_cp_utils as te_cp
-    monkeypatch.setattr(torch.distributed, "get_rank", mock_get_rank)
-    monkeypatch.setattr(te_cp, "pad_thd_sequences_for_cp", mock_pad_thd)
-    monkeypatch.setattr(te_cp, "generate_positional_ids_for_cp", mock_generate_pos_ids)
-    monkeypatch.setattr(te_cp, "get_batch_on_this_cp_rank", mock_get_batch)
-
-    result = _cu.make_cp_batch_for_te(
-        cp_mesh=cp_mesh,
-        batch=batch,
-    )
-
-    # Should convert to THD format and remove padding
-    assert "input_ids" in result
-    assert "labels" in result
-    assert "position_ids" in result
-    assert "cu_seqlens" in result
-    assert "cu_seqlens_padded" in result
-    assert "qkv_format" in result
-
-    # Input IDs should be concatenated without padding: [1,2,3,4,5,6,7,8,9]
-    expected_input_ids = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9])
-    assert torch.equal(result["input_ids"], expected_input_ids)
-
-    # Labels should be concatenated without padding: [10,20,30,40,50,60,70,80,90]
-    expected_labels = torch.tensor([10, 20, 30, 40, 50, 60, 70, 80, 90])
-    assert torch.equal(result["labels"], expected_labels)
-
-    # cu_seqlens should be [0, 3, 5, 9]
-    expected_cu_seqlens = torch.tensor([0, 3, 5, 9])
-    assert torch.equal(result["cu_seqlens"], expected_cu_seqlens)
-
-    # Position IDs should restart at each sequence
-    expected_position_ids = torch.tensor([0, 1, 2, 0, 1, 0, 1, 2, 3])
-    assert torch.equal(result["position_ids"], expected_position_ids)
-
-
 
 
 def test_make_cp_batch_for_te_requires_seqlens():
@@ -471,7 +252,7 @@ def test_make_cp_batch_for_te_requires_seqlens():
         "labels": labels,
     }
 
-    with pytest.raises(ValueError, match="BSHD format is not supported"):
+    with pytest.raises(KeyError, match="seq_lens"):
         _cu.make_cp_batch_for_te(
             cp_mesh=cp_mesh,
             batch=batch,

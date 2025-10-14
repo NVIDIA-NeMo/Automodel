@@ -39,7 +39,6 @@ from wandb import Settings
 
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components._transformers.utils import apply_cache_compatibility_patches
-from nemo_automodel.components.attention.utils import process_input_for_thd
 from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig, load_model_from_base_checkpoint
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
@@ -96,6 +95,30 @@ def _get_model_name(cfg_model):
         return cfg_model.config.get("pretrained_model_name_or_path", None)
     else:
         return None
+
+
+def _uses_te_dot_product_attention(cfg_model):
+    return (
+        True
+        if hasattr(cfg_model, "backend") and hasattr(cfg_model.backend, "attn") and cfg_model.backend.attn == "te"
+        else False
+    )
+
+
+def _uses_thd_collater(cfg_dataloader):
+    from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
+
+    return (
+        True
+        if hasattr(cfg_dataloader, "collate_fn") and cfg_dataloader.collate_fn == packed_sequence_thd_collater
+        else False
+    )
+
+
+def _get_num_thd_chunks(pp_enabled, cfg):
+    if pp_enabled:
+        return cfg.step_scheduler.local_batch_size // cfg.autopipeline.pp_microbatch_size
+    return 1
 
 
 def build_model_and_optimizer(
@@ -391,6 +414,7 @@ def build_dataloader(
     dp_world_size,
     pp_enabled,
     supports_seq_lens=True,
+    cp_size=1,
 ) -> tuple[DataLoader, PreTrainedTokenizerBase]:
     """Build a DataLoader for the dataset.
 
@@ -442,6 +466,7 @@ def build_dataloader(
                 split_across_pack=getattr(cfg_ps, "split_across_pack", False),
                 max_packs=getattr(cfg_ps, "max_packs", None),
                 padding_idx=getattr(tokenizer, "pad_token_id", 0),
+                cp_size=cp_size,
             )
 
         if isinstance(ds, MegatronPretraining):
@@ -775,9 +800,21 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         autopipeline_cfg = self.cfg.get("autopipeline", None)
         if self.pp_enabled:
             pp_batch_size = self.cfg.step_scheduler.local_batch_size
+            pp_microbatch_size = self.cfg.autopipeline.pp_microbatch_size
             assert pp_batch_size // self.cfg.autopipeline.pp_microbatch_size >= self.model_wrapper.pp_size, (
                 f"pp_batch_size {pp_batch_size} // pp_microbatch_size {self.cfg.autopipeline.pp_microbatch_size} must be greater than or equal to pp_size {self.model_wrapper.pp_size}"
             )
+            if (
+                self.cfg.distributed.get("cp_size", 1) > 1
+                and _uses_te_dot_product_attention(self.cfg.model)
+                and _uses_thd_collater(self.cfg.dataloader)
+            ):
+                pp_microbatch_size = 1
+                pp_batch_size = pp_batch_size // self.cfg.autopipeline.pp_microbatch_size
+                logging.info(
+                    f"Overriding pp_batch_size: {pp_batch_size}, pp_microbatch_size: {pp_microbatch_size} for THD"
+                )
+
             assert autopipeline_cfg is not None, (
                 "AutoPipeline configuration is required when pipeline parallelism is enabled"
             )
@@ -802,6 +839,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     ("ep_shard",) if self.moe_mesh is not None and "ep_shard" in self.moe_mesh.mesh_dim_names else None
                 ),
                 pp_batch_size=pp_batch_size,
+                pp_microbatch_size=pp_microbatch_size,
                 patch_stage_backward_maybe_with_nosync=self.cfg.get("model.backend.enable_fsdp_optimizations", False),
                 device=torch.cuda.current_device(),
             )
@@ -860,6 +898,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             dp_world_size=self._get_dp_group_size(),
             pp_enabled=self.pp_enabled,
             supports_seq_lens=True,
+            cp_size=self.cfg.get("distributed.cp_size", 1),
         )
 
         # Build validation dataloader if the config provides it
@@ -969,9 +1008,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             for k, v in batch.items()
         }
-        batch = process_input_for_thd(batch)
         train_ctx, batch = make_cp_batch_and_ctx(
-            self.device_mesh, batch, use_te=True, padding_token_id=self.tokenizer.pad_token_id
+            self.device_mesh,
+            batch,
+            use_te=_uses_te_dot_product_attention(self.cfg.model) and _uses_thd_collater(self.cfg.dataloader),
+            padding_token_id=self.tokenizer.pad_token_id,
+            num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
         )
         labels = batch.pop("labels")
 

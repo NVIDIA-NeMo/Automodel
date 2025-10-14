@@ -39,9 +39,13 @@ def _pad_pack(
     padding_idx: int,
     packed_sequence_size: int,
     cross_entropy_ignore_idx: int = CROSS_ENTROPY_IGNORE_IDX,
+    cp_size: int = 1,
 ) -> PACK_TYPE:
     """
     Pads a pack to ``packed_sequence_size``.
+
+    seq_lens contains original lengths.
+    seq_lens_padded applies CP padding (if cp_size > 1) and pack-level padding.
     """
     # Pad tokens
     num_padding_tokens = packed_sequence_size - len(pack["input_ids"])
@@ -58,15 +62,31 @@ def _pad_pack(
         value=cross_entropy_ignore_idx,
     )
 
-    # Store original seq_lens (actual sequence lengths without padding)
+    # seq_lens contains original sequence lengths
     original_seq_lens = pack["seq_lens"].clone()
 
-    # seq_lens_padded: add padding tokens to the last sequence length
-    if num_padding_tokens > 0 and len(pack["seq_lens"]) > 0:
-        padded_seq_lens = pack["seq_lens"].clone()
-        padded_seq_lens[-1] = padded_seq_lens[-1] + num_padding_tokens
+    # seq_lens_padded: apply CP padding to each sequence, then add pack padding to last
+    if cp_size > 1:
+        cp_divisibility_factor = 2 * cp_size
+        # Apply CP padding to each sequence length
+        cp_padded_lens = []
+        for seq_len in pack["seq_lens"]:
+            cp_padded_len = ((seq_len + cp_divisibility_factor - 1) // cp_divisibility_factor) * cp_divisibility_factor
+            cp_padded_lens.append(cp_padded_len)
+
+        # Convert to tensor
+        padded_seq_lens = torch.tensor(cp_padded_lens, dtype=pack["seq_lens"].dtype, device=pack["seq_lens"].device)
+
+        # Add pack-level padding to the last sequence
+        if num_padding_tokens > 0 and len(padded_seq_lens) > 0:
+            padded_seq_lens[-1] = padded_seq_lens[-1] + num_padding_tokens
     else:
-        padded_seq_lens = pack["seq_lens"].clone()
+        # No CP padding, just add pack-level padding to last sequence
+        if num_padding_tokens > 0 and len(pack["seq_lens"]) > 0:
+            padded_seq_lens = pack["seq_lens"].clone()
+            padded_seq_lens[-1] = padded_seq_lens[-1] + num_padding_tokens
+        else:
+            padded_seq_lens = pack["seq_lens"].clone()
 
     # Pad position_ids continuing the sequence from last value
     # in position_ids
@@ -86,6 +106,7 @@ def _pad_pack(
         "seq_lens": original_seq_lens,
         "seq_lens_padded": padded_seq_lens,
     }
+
     return padded_pack
 
 
@@ -107,6 +128,7 @@ def _tensorize_and_pad_pack(
     padding_idx: int,
     packed_sequence_size: int,
     cross_entropy_ignore_idx: int = CROSS_ENTROPY_IGNORE_IDX,
+    cp_size: int = 1,
 ) -> None:
     """
     converts to tensors, pads a pack and returns it.
@@ -117,6 +139,7 @@ def _tensorize_and_pad_pack(
         padding_idx=padding_idx,
         packed_sequence_size=packed_sequence_size,
         cross_entropy_ignore_idx=cross_entropy_ignore_idx,
+        cp_size=cp_size,
     )
     return pack
 
@@ -154,6 +177,7 @@ def _split_and_add_pack(
     packed_sequence_size: int,
     padding_idx: int,
     cross_entropy_ignore_idx=CROSS_ENTROPY_IGNORE_IDX,
+    cp_size: int = 1,
 ) -> PACK_TYPE:
     """
     Splits the current pack at the boundary, processes it, adds it to ``packs``.
@@ -183,6 +207,7 @@ def _split_and_add_pack(
             padding_idx=padding_idx,
             packed_sequence_size=packed_sequence_size,
             cross_entropy_ignore_idx=cross_entropy_ignore_idx,
+            cp_size=cp_size,
         )
     )
 
@@ -207,6 +232,7 @@ def pack_dataset(
     max_packs=None,
     padding_idx=0,
     drop_long_samples=False,
+    cp_size=1,
 ):
     """
     Pack the dataset to defined length.
@@ -224,6 +250,8 @@ def pack_dataset(
             to the beginning of the next pack. Default: False
         max_packs (int): Maximum number of packs. Default: None
         drop_long_samples (bool): If True, drop samples that are longer than packed_sequence_size.
+        cp_size (int): Context parallel size. When > 1, each sequence will be padded to be
+            divisible by 2*cp_size for context parallel processing. Default: 1 (no CP).
     """
     packs: list[PACK_TYPE] = []
     try:
@@ -239,7 +267,11 @@ def pack_dataset(
         "position_ids": [],
         "seq_lens": [],
     }
+
     previous_sample_boundary: int = 0
+
+    # Calculate CP divisibility factor
+    cp_divisibility_factor = 2 * cp_size if cp_size > 1 else 1
 
     for sample in dataset:
         input_ids, labels = sample["input_ids"], sample["labels"]
@@ -257,11 +289,25 @@ def pack_dataset(
                 f"Dataset sample is too long ({seq_len} > {packed_sequence_size}). "
                 "Please set `split_across_pack=True` or increase `packed_sequence_size`.",
             )
+
+        # Apply CP padding if needed
+        if cp_size > 1:
+            # Pad sequence to be divisible by 2*cp_size
+            cp_padded_len = ((seq_len + cp_divisibility_factor - 1) // cp_divisibility_factor) * cp_divisibility_factor
+            cp_padding_amount = cp_padded_len - seq_len
+
+            if cp_padding_amount > 0:
+                # Add padding tokens
+                input_ids = input_ids + [padding_idx] * cp_padding_amount
+                labels = labels + [CROSS_ENTROPY_IGNORE_IDX] * cp_padding_amount
+
         # Update the current pack
         # "position_ids" is the pos ids, "seq_lens" is the len of each seq within the pack
         current_pack["input_ids"] += input_ids
         current_pack["labels"] += labels
-        current_pack["position_ids"] += [x % packed_sequence_size for x in range(seq_len)]
+        # Position IDs should continue for the actual length (including CP padding)
+        current_pack["position_ids"] += [x % packed_sequence_size for x in range(len(input_ids))]
+        # Always store original length in seq_lens
         current_pack["seq_lens"] += [seq_len]
 
         # If the current pack is over the packed_sequence_size, add it to packs and
@@ -275,6 +321,7 @@ def pack_dataset(
                 packed_sequence_size=packed_sequence_size,
                 padding_idx=padding_idx,
                 cross_entropy_ignore_idx=CROSS_ENTROPY_IGNORE_IDX,
+                cp_size=cp_size,
             )
 
         # Keep track of previous sample boundary
@@ -292,6 +339,7 @@ def pack_dataset(
                 padding_idx=padding_idx,
                 packed_sequence_size=packed_sequence_size,
                 cross_entropy_ignore_idx=CROSS_ENTROPY_IGNORE_IDX,
+                cp_size=cp_size,
             )
         )
 

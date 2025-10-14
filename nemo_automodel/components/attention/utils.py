@@ -108,11 +108,11 @@ def preprocess_args_and_kwargs_for_attn(
             if "cu_seqlens_padded" in kwargs:
                 attn_kwargs["cu_seqlens_q_padded"] = kwargs["cu_seqlens_padded"]
                 attn_kwargs["cu_seqlens_kv_padded"] = kwargs["cu_seqlens_padded"]
+                attn_kwargs["pad_between_seqs"] = True
 
-            if "max_seqlen_q" in kwargs:
-                attn_kwargs["max_seqlen_q"] = kwargs["max_seqlen_q"]
-            if "max_seqlen_kv" in kwargs:
-                attn_kwargs["max_seqlen_kv"] = kwargs["max_seqlen_kv"]
+            if "max_seqlen" in kwargs:
+                attn_kwargs["max_seqlen_q"] = kwargs["max_seqlen"]
+                attn_kwargs["max_seqlen_kv"] = kwargs["max_seqlen"]
         elif "cu_seqlens_q" in kwargs and "cu_seqlens_kv" in kwargs:
             attn_kwargs = {
                 "qkv_format": "thd",
@@ -122,6 +122,7 @@ def preprocess_args_and_kwargs_for_attn(
             }
             if "cu_seqlens_q_padded" in kwargs:
                 attn_kwargs["cu_seqlens_q_padded"] = kwargs["cu_seqlens_q_padded"]
+                attn_kwargs["pad_between_seqs"] = True
             if "cu_seqlens_kv_padded" in kwargs:
                 attn_kwargs["cu_seqlens_kv_padded"] = kwargs["cu_seqlens_kv_padded"]
             if "max_seqlen_q" in kwargs:
@@ -148,7 +149,8 @@ def postprocess_output_for_attn(x: torch.Tensor, attn_impl: str) -> torch.Tensor
 
 def process_input_for_thd(
     batch: dict[str, torch.Tensor],
-    ignore_seq_len_label_id: int = -1000,
+    seq_lens_padding_value: int = -1000,
+    padding_token_id: int = 0,
 ) -> dict[str, torch.Tensor]:
     """
     Process inputs for THD (total, hidden, depth) format.
@@ -166,12 +168,13 @@ def process_input_for_thd(
             - 'position_ids': Position IDs tensor of shape [batch_size, seq_len] or None
             - 'seq_lens': Sequence lengths tensor of shape [batch_size, num_packs] containing
                 actual sequence lengths (excluding padding/separators). Values matching
-                ignore_seq_len_label_id indicate padding in the seq_lens dimension.
+                seq_lens_padding_value indicate padding in the seq_lens dimension.
             - 'seq_lens_padded': Padded sequence lengths tensor of shape [batch_size, num_packs]
                 containing lengths including separator tokens. Values matching
-                ignore_seq_len_label_id indicate padding in the seq_lens dimension.
-        ignore_seq_len_label_id: Value used to indicate padding in seq_lens/seq_lens_padded
+                seq_lens_padding_value indicate padding in the seq_lens dimension.
+        seq_lens_padding_value: Value used to indicate padding in seq_lens/seq_lens_padded
             tensors (default: -1000)
+        padding_token_id: Token ID used for padding (default: 0)
 
     Returns:
         Dictionary containing:
@@ -189,7 +192,7 @@ def process_input_for_thd(
         ...     'input_ids': torch.tensor([[1, 2, 3, 99, 4, 5], [6, 7, 8, 9, 10, 11]]),
         ...     'labels': torch.tensor([[2, 3, 99, 4, 5, 6], [7, 8, 9, 10, 11, 12]]),
         ...     'position_ids': torch.tensor([[0, 1, 2, 0, 0, 1], [0, 1, 2, 3, 4, 5]]),
-        ...     'seq_lens': torch.tensor([[3, 2], [6, -1000]]),  # -1000 is padding
+        ...     'seq_lens': torch.tensor([[3, 2], [6, -1000]]),  # -1000 is seq_lens_padding_value
         ...     'seq_lens_padded': torch.tensor([[4, 2], [6, -1000]])
         ... }
         >>>
@@ -203,20 +206,24 @@ def process_input_for_thd(
     """
     input_ids = batch["input_ids"]
     labels = batch["labels"]
-    position_ids = batch["position_ids"]
+    position_ids = batch.get("position_ids", None)
     seq_lens = batch["seq_lens"]
     seq_lens_padded = batch["seq_lens_padded"]
 
     # Reshape to THD format: collapse batch dimension
+    # Get total number of tokens from input_ids
+    batch_size, seq_len = input_ids.shape[0], input_ids.shape[1]
+    total_tokens = batch_size * seq_len
+
     position_ids_thd = position_ids.reshape(-1) if position_ids is not None else None
-    input_ids_thd = input_ids.reshape(position_ids_thd.shape[0], -1).squeeze(-1)
-    labels_thd = labels.reshape(position_ids_thd.shape[0], -1).squeeze(-1)
+    input_ids_thd = input_ids.reshape(total_tokens, -1).squeeze(-1)
+    labels_thd = labels.reshape(total_tokens, -1).squeeze(-1)
 
     if seq_lens is not None:
-        # Filter out padding values (-1000) and flatten
-        # seq_lens shape: [batch_size, num_packs] -> flatten and remove -1000 values
+        # Filter out padding values and flatten
+        # seq_lens shape: [batch_size, num_packs] -> flatten and remove padding values
         seq_lens_flat = seq_lens.reshape(-1)
-        valid_seq_lens = seq_lens_flat[seq_lens_flat != ignore_seq_len_label_id]
+        valid_seq_lens = seq_lens_flat[seq_lens_flat != seq_lens_padding_value]
 
         # Compute cumulative sequence lengths for attention
         cu_seqlens = torch.cat(
@@ -230,17 +237,92 @@ def process_input_for_thd(
         if seq_lens_padded is not None:
             # Same processing for padded sequence lengths
             seq_lens_padded_flat = seq_lens_padded.reshape(-1)
-            valid_seq_lens_padded = seq_lens_padded_flat[seq_lens_padded_flat != -1000]
+            valid_seq_lens_padded = seq_lens_padded_flat[seq_lens_padded_flat != seq_lens_padding_value]
 
             cu_seqlens_padded = torch.cat(
                 [torch.tensor([0], device=valid_seq_lens_padded.device), torch.cumsum(valid_seq_lens_padded, dim=0)]
             )
             cu_seqlens_padded = cu_seqlens_padded.to(dtype=torch.int32).to(device=valid_seq_lens_padded.device)
 
-    return {
+    result = {
         "input_ids": input_ids_thd,
         "position_ids": position_ids_thd,
         "cu_seqlens": cu_seqlens,
         "cu_seqlens_padded": cu_seqlens_padded,
         "labels": labels_thd,
+        "padding_mask": (input_ids_thd == padding_token_id),
+    }
+
+    # Preserve qkv_format and other non-tensor keys from the original batch
+    for key, value in batch.items():
+        if key not in result and not isinstance(value, torch.Tensor):
+            result[key] = value
+
+    return result
+
+
+def split_batch_into_thd_chunks(
+    batch: dict[str, torch.Tensor],
+    num_chunks: int,
+    seq_lens_padding_value: int = -1000,
+    padding_token_id: int = 0,
+) -> dict[str, torch.Tensor]:
+    """
+    Process inputs for THD format by splitting batch into chunks.
+
+    This function splits the batch along the batch dimension into num_chunks chunks,
+    processes each chunk with process_input_for_thd, and stacks the tensor results.
+    cu_seqlens are padded with seq_lens_padding_value to ensure uniform length.
+
+    Args:
+        batch: Dictionary containing input tensors (same as process_input_for_thd)
+        num_chunks: Number of chunks to split the batch into
+        seq_lens_padding_value: Value used to indicate padding in seq_lens/seq_lens_padded
+        padding_token_id: Token ID used for padding
+
+    Returns:
+        Dictionary with stacked results from all chunks
+    """
+    if num_chunks <= 1:
+        return process_input_for_thd(batch, seq_lens_padding_value, padding_token_id)
+
+    def pad_and_stack(tensor_list, padding_value):
+        """Pad tensors to same length and stack them."""
+        max_len = max(len(t) for t in tensor_list)
+        padded = []
+        for t in tensor_list:
+            if len(t) < max_len:
+                pad = torch.full((max_len - len(t),), padding_value, dtype=t.dtype, device=t.device)
+                t = torch.cat([t, pad])
+            padded.append(t)
+        return torch.stack(padded)
+
+    chunk_size = batch["input_ids"].shape[0] // num_chunks
+
+    # Process all chunks
+    chunk_results = [
+        process_input_for_thd(
+            {
+                k: v[i * chunk_size : (i + 1) * chunk_size] if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            },
+            seq_lens_padding_value,
+            padding_token_id,
+        )
+        for i in range(num_chunks)
+    ]
+
+    # Stack results
+    return {
+        "input_ids": torch.stack([c["input_ids"] for c in chunk_results]),
+        "labels": torch.stack([c["labels"] for c in chunk_results]),
+        "position_ids": torch.stack([c["position_ids"] for c in chunk_results])
+        if chunk_results[0]["position_ids"] is not None
+        else None,
+        "cu_seqlens": pad_and_stack([c["cu_seqlens"] for c in chunk_results], seq_lens_padding_value),
+        "cu_seqlens_padded": pad_and_stack([c["cu_seqlens_padded"] for c in chunk_results], seq_lens_padding_value)
+        if chunk_results[0]["cu_seqlens_padded"] is not None
+        else None,
+        "padding_mask": torch.stack([c["padding_mask"] for c in chunk_results]),
+        **{k: v for k, v in chunk_results[0].items() if not isinstance(v, torch.Tensor)},
     }

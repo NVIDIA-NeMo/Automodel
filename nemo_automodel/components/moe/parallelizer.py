@@ -180,7 +180,7 @@ def apply_fsdp(
     fully_shard_default(_model)
 
 
-def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "a2a"):
+def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p2p"):
     from transformer_engine.pytorch.attention import DotProductAttention
 
     if hasattr(model, "model") and model.model is not None:
@@ -194,7 +194,7 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "a
             "Context parallelism is only supported for TransformerEngine's DotProductAttention"
         )
         attn_module.set_context_parallel_group(
-            cp_mesh,
+            cp_mesh.get_group(),
             torch.distributed.get_process_group_ranks(cp_mesh.get_group()),
             _get_cp_stream(),
             cp_comm_type=cp_comm_type,
@@ -240,11 +240,7 @@ def parallelize_model(
     else:
         ep_shard_mesh = None
 
-    fsdp_enabled = (
-        dp_axis_names is not None
-        and all(map(lambda x: x in world_mesh.mesh_dim_names, dp_axis_names))
-        and world_mesh[dp_axis_names].size() > 1
-    )
+    fsdp_enabled = dp_axis_names is not None and world_mesh[dp_axis_names].size() > 1
     fsdp_mesh = world_mesh[tuple(dp_axis_names)] if fsdp_enabled else None
     if fsdp_enabled:
         apply_fsdp(

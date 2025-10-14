@@ -18,6 +18,8 @@ from typing import List, Optional, Set
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 
+from nemo_automodel.components.attention.utils import split_batch_into_thd_chunks
+
 
 def _build_position_ids(batch, device):
     """Add position_ids to the batch only if they are missing."""
@@ -105,7 +107,8 @@ def make_cp_batch_and_ctx(
     loss_mask=None,
     use_te: bool = False,
     padding_token_id: int = 0,
-    padding_label_id: int = -100,
+    num_chunks: int = 1,
+    seq_lens_padding_value: int = -1000,
 ):
     """
     Build a CP context manager and shards a batch. If the input device_mesh is None or the size
@@ -136,16 +139,21 @@ def make_cp_batch_and_ctx(
     cp_mesh = _get_submesh(device_mesh, "cp")
     tp_mesh = _get_submesh(device_mesh, "tp")
 
+    if use_te:
+        return nullcontext, make_cp_batch_for_te(
+            cp_mesh,
+            batch,
+            padding_token_id=padding_token_id,
+            qkv_format="thd",
+            num_chunks=num_chunks,
+            seq_lens_padding_value=seq_lens_padding_value,
+        )
+
     if _get_mesh_size(cp_mesh) <= 1:
         return nullcontext, batch
 
     # CP doesn't support packed sequence currently. Let torch SDPA handle attention mask.
     batch.pop("attention_mask", None)
-
-    if use_te:
-        return nullcontext, make_cp_batch_for_te(
-            cp_mesh, batch, padding_token_id=padding_token_id, padding_label_id=padding_label_id, qvk_format="thd"
-        )
 
     if "position_ids" not in batch and (_get_mesh_size(cp_mesh) > 1 or _get_mesh_size(tp_mesh) > 1):
         batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(batch["input_ids"].device)
@@ -179,10 +187,10 @@ def make_cp_batch_and_ctx(
 def make_cp_batch_for_te(
     cp_mesh,
     batch,
-    padding_token_id=0,
-    padding_label_id=-100,
-    qvk_format="thd",
-    max_seq_len=4096,
+    qkv_format="thd",
+    padding_token_id: int = 0,
+    num_chunks: int = 1,
+    seq_lens_padding_value: int = -1000,
 ):
     """
     Build a CP batch for Transformer Engine using THD format.
@@ -212,77 +220,74 @@ def make_cp_batch_for_te(
             - cu_seqlens: Padded cumulative sequence lengths (not sharded)
             - loss_mask (optional): Padded and sharded loss_mask if provided
     """
-    from nemo_automodel.components.distributed.te_cp_utils import (
-        generate_positional_ids_for_cp,
-        get_batch_on_this_cp_rank,
-        pad_thd_sequences_for_cp,
+    if qkv_format != "thd":
+        raise ValueError(f"Currently only 'thd' format is supported, got: {qkv_format}")
+
+    batch = split_batch_into_thd_chunks(
+        batch, num_chunks=num_chunks, seq_lens_padding_value=seq_lens_padding_value, padding_token_id=padding_token_id
     )
 
-    if qvk_format != "thd":
-        raise ValueError(f"Currently only 'thd' format is supported, got: {qvk_format}")
+    if cp_mesh is None or cp_mesh.size() <= 1:
+        return batch
 
-    # Extract fields from batch
-    input_ids = batch["input_ids"]
-    labels = batch["labels"]
+    if num_chunks <= 1:
+        return _shard_thd_chunk_for_te(batch, cp_mesh, qkv_format, seq_lens_padding_value)
+
+    # Extract each chunk from the batched result and shard it
+    chunks = []
+    for i in range(num_chunks):
+        chunk_batch = {k: v[i] if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        chunks.append(_shard_thd_chunk_for_te(chunk_batch, cp_mesh, qkv_format, seq_lens_padding_value))
+
+    return {
+        "input_ids": torch.stack([chunk["input_ids"] for chunk in chunks]),
+        "labels": torch.stack([chunk["labels"] for chunk in chunks]),
+        "position_ids": torch.stack([chunk["position_ids"] for chunk in chunks]),
+        "cu_seqlens": torch.stack([chunk["cu_seqlens"] for chunk in chunks]),
+        "cu_seqlens_padded": torch.stack([chunk["cu_seqlens_padded"] for chunk in chunks]),
+        "max_seqlen": torch.stack([chunk["max_seqlen"] for chunk in chunks]),
+        "qkv_format": qkv_format,
+        "padding_mask": torch.stack([chunk["padding_mask"] for chunk in chunks]),
+    }
+
+
+def _shard_thd_chunk_for_te(
+    batch,
+    cp_mesh,
+    qkv_format,
+    seq_lens_padding_value,
+):
+    import transformer_engine_torch as tex
+
     cu_seqlens = batch.get("cu_seqlens", None)
     cu_seqlens_padded = batch.get("cu_seqlens_padded", None)
+    filtered_cu_seqlens_padded = cu_seqlens_padded[cu_seqlens_padded != seq_lens_padding_value]
 
     # Check for required fields - BSHD format is not supported
     if cu_seqlens is None or cu_seqlens_padded is None:
         raise ValueError(
-            "BSHD format is not supported. Both 'seq_lens' and 'seq_lens_padded' must be present in the batch. "
-            "Please use packed sequence format with seq_lens and seq_lens_padded."
+            "BSHD format is not supported. Both 'cu_seqlens' and 'cu_seqlens_padded' must be present in the batch. "
+            "Please use packed sequence format with cu_seqlens and cu_seqlens_padded."
         )
 
     cp_size = cp_mesh.size()
 
-    # Filter padded tokens based on seq_lens and seq_lens_padded
-    # Extract only the valid tokens (excluding tail padding) for each sequence
-    filtered_input_ids = [input_ids[cu_seqlens[i] : cu_seqlens[i + 1]] for i in range(len(cu_seqlens) - 1)]
-    filtered_labels = [labels[cu_seqlens[i] : cu_seqlens[i + 1]] for i in range(len(cu_seqlens) - 1)]
-    input_ids = torch.cat(filtered_input_ids)
-    labels = torch.cat(filtered_labels)
-
-    # CP requires each sequence to be divisible by 2 * cp_size
-    divisibility_factor = 2 * cp_size
-
-    # Pad sequences
-    input_ids_padded, labels_padded, cu_seqlens_padded = pad_thd_sequences_for_cp(
-        input_ids, labels, cu_seqlens, divisibility_factor, padding_token_id, padding_label_id, max_seq_len=max_seq_len
-    )
-
-    # Generate position IDs for padded sequences
-    position_ids_padded = generate_positional_ids_for_cp(cu_seqlens_padded, divisibility_factor=1, dtype=torch.long).to(
-        input_ids_padded.device
-    )
-
-    # Get CP rank and size
     cp_rank = torch.distributed.get_rank(group=cp_mesh.get_group()) if cp_mesh is not None else 0
+    for key in ["input_ids", "labels", "position_ids", "padding_mask"]:
+        val = batch[key]
+        index = tex.thd_get_partitioned_indices(filtered_cu_seqlens_padded, val.size(0), cp_size, cp_rank)
+        val = val.index_select(0, index)
+        batch[key] = val
 
-    # Shard the batch across CP ranks
-    input_ids_sharded, labels_sharded, position_ids_sharded = get_batch_on_this_cp_rank(
-        cu_seqlens_padded,
-        input_ids_padded,
-        labels_padded,
-        position_ids_padded,
-        cp_size=cp_size,
-        cp_rank=cp_rank,
-        qvk_format=qvk_format,
-    )
-
-    # Build the output batch
-    max_seqlen = (cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]).max().item()
-    # max_seqlen = max_seqlen // cp_size
+    max_seqlen = (filtered_cu_seqlens_padded[1:] - filtered_cu_seqlens_padded[:-1]).max().item()
     output_batch = {
-        "input_ids": input_ids_sharded.to(torch.int64).contiguous(),
-        "labels": labels_sharded.to(torch.int64).contiguous(),
-        "position_ids": position_ids_sharded.to(torch.int64).contiguous(),
-        "cu_seqlens_q": cu_seqlens_padded.to(torch.int32).contiguous(),
-        "cu_seqlens_kv": cu_seqlens_padded.to(torch.int32).contiguous(),
-        "cu_seqlens_q_padded": cu_seqlens_padded.to(torch.int32).contiguous(),
-        "cu_seqlens_kv_padded": cu_seqlens_padded.to(torch.int32).contiguous(),
-        "max_seqlen_q": max_seqlen,
-        "max_seqlen_kv": max_seqlen,
-        "qkv_format": qvk_format,
+        "input_ids": batch["input_ids"].to(torch.int64).contiguous(),
+        "labels": batch["labels"].to(torch.int64).contiguous(),
+        "position_ids": batch["position_ids"].to(torch.int64).contiguous(),
+        "cu_seqlens": cu_seqlens.to(torch.int32).contiguous(),
+        "cu_seqlens_padded": cu_seqlens_padded.to(torch.int32).contiguous(),
+        "max_seqlen": torch.tensor(max_seqlen).to(torch.int32).to(device=cu_seqlens_padded.device),
+        "qkv_format": qkv_format,
+        "padding_mask": batch["padding_mask"].bool().contiguous(),
     }
     return output_batch

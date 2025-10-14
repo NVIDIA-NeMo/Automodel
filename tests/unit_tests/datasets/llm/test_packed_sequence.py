@@ -339,3 +339,214 @@ def test_seq_lens_padded_sum():
     # Sum of seq_lens_padded should equal packed_sequence_size
     assert sum(seq_lens_padded) == packed_sequence_size
     assert seq_lens_padded == [3, 2, 5]  # 1 token + 4 padding = 5
+
+
+def test_cp_aware_packing_basic():
+    """Test basic CP-aware packing with cp_size=2
+
+    When cp_size > 1:
+    - seq_lens contains original lengths
+    - seq_lens_padded contains CP-padded lengths plus final pack-level padding
+    """
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3], [4, 5, 6, 7, 8]],  # lengths: 3, 5
+            "labels": [[1, 2, 3], [4, 5, 6, 7, 8]],
+        }
+    )
+
+    packed_ds = pack_dataset(
+        ds,
+        split="train",
+        packed_sequence_size=16,
+        split_across_pack=False,
+        max_packs=None,
+        cp_size=2,
+    )
+
+    import torch
+    assert len(packed_ds) == 1
+
+    # seq_lens should contain original lengths
+    seq_lens = packed_ds[0]["seq_lens"]
+    if isinstance(seq_lens, torch.Tensor):
+        seq_lens = seq_lens.tolist()
+    assert seq_lens == [3, 5]  # Original lengths
+
+    # seq_lens_padded should contain CP-padded lengths (3->4, 5->8) plus pack padding
+    seq_lens_padded = packed_ds[0]["seq_lens_padded"]
+    if isinstance(seq_lens_padded, torch.Tensor):
+        seq_lens_padded = seq_lens_padded.tolist()
+    assert seq_lens_padded == [4, 12]  # 4 (CP-padded), 8 (CP-padded) + 4 (pack padding) = 12
+    assert sum(seq_lens_padded) == 16
+
+
+def test_cp_aware_packing_different_cp_sizes():
+    """Test CP-aware packing with different cp_size values"""
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3, 4, 5]],  # length: 5
+            "labels": [[1, 2, 3, 4, 5]],
+        }
+    )
+
+    # Test with cp_size=2 (divisibility factor = 4)
+    packed_ds = pack_dataset(
+        ds,
+        split="train",
+        packed_sequence_size=10,
+        cp_size=2,
+    )
+
+    import torch
+    seq_lens = packed_ds[0]["seq_lens"]
+    if isinstance(seq_lens, torch.Tensor):
+        seq_lens = seq_lens.tolist()
+    assert seq_lens == [5]  # Original length
+
+    seq_lens_padded = packed_ds[0]["seq_lens_padded"]
+    if isinstance(seq_lens_padded, torch.Tensor):
+        seq_lens_padded = seq_lens_padded.tolist()
+    assert seq_lens_padded == [10]  # 5 -> 8 (CP-padded) + 2 (pack padding) = 10
+
+    # Test with cp_size=4 (divisibility factor = 8)
+    packed_ds = pack_dataset(
+        ds,
+        split="train",
+        packed_sequence_size=16,
+        cp_size=4,
+    )
+
+    seq_lens = packed_ds[0]["seq_lens"]
+    if isinstance(seq_lens, torch.Tensor):
+        seq_lens = seq_lens.tolist()
+    assert seq_lens == [5]  # Original length
+
+    seq_lens_padded = packed_ds[0]["seq_lens_padded"]
+    if isinstance(seq_lens_padded, torch.Tensor):
+        seq_lens_padded = seq_lens_padded.tolist()
+    assert seq_lens_padded == [16]  # 5 -> 8 (CP-padded) + 8 (pack padding) = 16
+
+
+def test_cp_aware_packing_no_cp():
+    """Test that cp_size=1 (default) behaves like regular packing"""
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3], [4, 5]],
+            "labels": [[1, 2, 3], [4, 5]],
+        }
+    )
+
+    packed_ds = pack_dataset(
+        ds,
+        split="train",
+        packed_sequence_size=10,
+        cp_size=1,  # Default: no CP
+    )
+
+    import torch
+    # seq_lens should contain original lengths (no CP padding)
+    seq_lens = packed_ds[0]["seq_lens"]
+    if isinstance(seq_lens, torch.Tensor):
+        seq_lens = seq_lens.tolist()
+    assert seq_lens == [3, 2]
+
+
+def test_cp_aware_packing_with_split():
+    """Test CP-aware packing with split_across_pack=True
+
+    Note: When sequences are split across packs, the split fragments may not
+    maintain CP alignment (divisibility by 2*cp_size). This is expected behavior
+    since we're splitting CP-padded sequences in the middle.
+    """
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3, 4, 5], [6, 7, 8]],  # lengths: 5, 3
+            "labels": [[1, 2, 3, 4, 5], [6, 7, 8]],
+        }
+    )
+
+    packed_ds = pack_dataset(
+        ds,
+        split="train",
+        packed_sequence_size=10,
+        split_across_pack=True,
+        cp_size=2,
+    )
+
+    import torch
+    # Should create at least 1 pack
+    assert len(packed_ds) >= 1
+
+    # Verify that seq_lens exists
+    seq_lens_0 = packed_ds[0]["seq_lens"]
+    if isinstance(seq_lens_0, torch.Tensor):
+        seq_lens_0 = seq_lens_0.tolist()
+
+    # Should have at least one sequence
+    assert len(seq_lens_0) > 0
+
+
+def test_cp_aware_packing_exact_fit():
+    """Test CP-aware packing when sequences exactly fit after CP padding"""
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3, 4]],  # length: 4 (already divisible by 4)
+            "labels": [[1, 2, 3, 4]],
+        }
+    )
+
+    packed_ds = pack_dataset(
+        ds,
+        split="train",
+        packed_sequence_size=4,
+        cp_size=2,
+    )
+
+    import torch
+    # seq_lens should be 4 (already divisible by 4, no additional padding needed)
+    seq_lens = packed_ds[0]["seq_lens"]
+    if isinstance(seq_lens, torch.Tensor):
+        seq_lens = seq_lens.tolist()
+    assert seq_lens == [4]
+
+    # seq_lens_padded should also be 4 (no pack-level padding needed)
+    seq_lens_padded = packed_ds[0]["seq_lens_padded"]
+    if isinstance(seq_lens_padded, torch.Tensor):
+        seq_lens_padded = seq_lens_padded.tolist()
+    assert seq_lens_padded == [4]
+
+
+def test_cp_aware_packing_multiple_sequences():
+    """Test CP-aware packing with multiple sequences in one pack"""
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3], [4, 5], [6]],  # lengths: 3, 2, 1
+            "labels": [[1, 2, 3], [4, 5], [6]],
+        }
+    )
+
+    packed_ds = pack_dataset(
+        ds,
+        split="train",
+        packed_sequence_size=20,
+        cp_size=2,
+    )
+
+    import torch
+    # seq_lens should contain original lengths
+    seq_lens = packed_ds[0]["seq_lens"]
+    if isinstance(seq_lens, torch.Tensor):
+        seq_lens = seq_lens.tolist()
+    assert seq_lens == [3, 2, 1]  # Original lengths
+
+    # seq_lens_padded should contain CP-padded lengths (each divisible by 4)
+    seq_lens_padded = packed_ds[0]["seq_lens_padded"]
+    if isinstance(seq_lens_padded, torch.Tensor):
+        seq_lens_padded = seq_lens_padded.tolist()
+    # 3->4, 2->4, 1->4 (CP-padded) + 8 (pack padding to reach 20) = [4, 4, 12]
+    assert seq_lens_padded == [4, 4, 12]
+
+    # All should be divisible by 2*cp_size = 4
+    for length in seq_lens_padded:
+        assert length % 4 == 0

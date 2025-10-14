@@ -22,7 +22,7 @@ step_scheduler:
   global_batch_size: 32
   local_batch_size: 4
   ckpt_every_steps: 500
-  val_every_steps: 100  # will run every x number of gradient steps
+  val_every_steps: 500  # will run every x number of gradient steps
   num_epochs: 2
 
 dist_env:
