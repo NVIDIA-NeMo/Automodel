@@ -134,6 +134,8 @@ class FSDP2Manager:
         """
         Post-initialization hook that sets up the distributed environment.
         """
+        if get_world_size_safe() == 1:
+            return None
         return self._setup_distributed()
 
     def _setup_distributed(self):
