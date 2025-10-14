@@ -467,6 +467,9 @@ def get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
     Raises:
         FileNotFoundError: If the index file is not found.
     """
+    if os.path.exists(repo_id):
+        return repo_id
+
     repo_dir = f"models--{repo_id.replace('/', '--')}"
     snapshots_root = Path(cache_dir) / repo_dir / "snapshots"
 

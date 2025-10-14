@@ -30,15 +30,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils import PreTrainedTokenizerBase
 
-from nemo_automodel.components.checkpoint.checkpointing import (
-    load_dp_aware_helper,
-    load_model,
-    load_optimizer,
-    save_config,
-    save_dp_aware_helper,
-    save_model,
-    save_optimizer,
-)
+from nemo_automodel.components.checkpoint.checkpointing_class import save_config
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.rng import StatefulRNG
@@ -176,12 +168,12 @@ class BaseRecipe:
             epoch (int): The current epoch.
             step (int): The current step.
         """
-        if not self.checkpoint_config.enabled:
+        if not self.checkpointer.config.enabled:
             return
         is_dist_initialized = torch.distributed.is_initialized()
         is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
 
-        path = self.checkpoint_config.checkpoint_dir
+        path = self.checkpointer.config.checkpoint_dir
         path = os.path.join(path, f"epoch_{epoch}_step_{step}")
 
         if is_rank_0:
@@ -207,14 +199,7 @@ class BaseRecipe:
             elif is_tokenizer(getattr(self, key)):
                 tokenizer = getattr(self, key)
             elif is_dataloader(getattr(self, key)) or isinstance(getattr(self, key), StatefulRNG):
-                save_dp_aware_helper(
-                    getattr(self, key),
-                    key,
-                    path,
-                    self._get_dp_rank(include_cp=True),
-                    self._get_tp_rank(),
-                    self._get_pp_rank(),
-                )
+                self.checkpointer.save_on_dp_ranks(getattr(self, key), key, path)
             else:
                 if is_rank_0:
                     torch.save(
@@ -222,8 +207,8 @@ class BaseRecipe:
                         os.path.join(path, f"{key}.pt"),
                     )
 
-        save_model(model, path, self.checkpoint_config, peft_config=self.peft_config, tokenizer=tokenizer)
-        save_optimizer(optimizer, model, path, scheduler)
+        self.checkpointer.save_model(model, path, peft_config=self.peft_config, tokenizer=tokenizer)
+        self.checkpointer.save_optimizer(optimizer, model, path, scheduler)
         save_config(config.raw_config, path)
         if is_dist_initialized:
             torch.distributed.barrier()
@@ -232,7 +217,7 @@ class BaseRecipe:
         """
         Loads the latest checkpoint.
         """
-        if not self.checkpoint_config.enabled:
+        if not self.checkpointer.config.enabled:
             if (
                 not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             ) and restore_from is not None:
@@ -243,7 +228,7 @@ class BaseRecipe:
             ckpt_dir = restore_from
         else:
             # Determine the latest checkpoint directory (e.g. ".../step_42").
-            ckpt_dir = _find_latest_checkpoint(self.checkpoint_config.checkpoint_dir)
+            ckpt_dir = _find_latest_checkpoint(self.checkpointer.config.checkpoint_dir)
             if ckpt_dir is None:
                 return
 
@@ -260,7 +245,7 @@ class BaseRecipe:
             elif is_lr_scheduler(getattr(self, key)):
                 scheduler = getattr(self, key)
             elif is_dataloader(getattr(self, key)) or isinstance(getattr(self, key), StatefulRNG):
-                load_dp_aware_helper(getattr(self, key), key, ckpt_dir, self._get_dp_rank(include_cp=True))
+                self.checkpointer.load_on_dp_ranks(getattr(self, key), key, ckpt_dir)
             elif is_tokenizer(getattr(self, key)) or isinstance(getattr(self, key), ConfigNode):
                 # we don't need to load the tokenizer or config from the checkpoint
                 # we only save the tokenizer for consolidated checkpoints for downstream use
@@ -268,14 +253,8 @@ class BaseRecipe:
             else:
                 getattr(self, key).load_state_dict(torch.load(os.path.join(ckpt_dir, f"{key}.pt"), weights_only=False))
 
-        load_model(
-            model,
-            os.path.join(ckpt_dir, "model"),
-            self.checkpoint_config.model_save_format,
-            is_peft=self.checkpoint_config.is_peft,
-            moe_mesh=moe_mesh,
-        )
-        load_optimizer(optimizer, model, ckpt_dir, scheduler)
+        self.checkpointer.load_model(model,os.path.join(ckpt_dir, "model"))
+        self.checkpointer.load_optimizer(optimizer, model, ckpt_dir, scheduler)
 
     def _log_experiment_details(self):
         """Log metadata and resolved config on main rank using YAML markers."""
