@@ -19,15 +19,21 @@ on:
     paths:
       - 'pyproject.toml'
 
-permissions:
-  contents: write
 
 jobs:
   check_uv_lock_and_update:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.ref }}
+          token: ${{ secrets.PAT }}
+          fetch-depth: 0
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
