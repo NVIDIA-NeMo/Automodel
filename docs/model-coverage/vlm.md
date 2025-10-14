@@ -4,7 +4,7 @@
 
 Vision Language Models (VLMs) are advanced models that integrate vision and language processing capabilities. They are trained on extensive datasets containing both interleaved images and text data, allowing them to generate text descriptions of images and answer questions related to images.
 
-NeMo Automodel LLM APIs can be easily extended to support VLM tasks. Specifically, NeMo Automodel supports <a href=https://huggingface.co/docs/transformers/main/model_doc/auto#transformers.AutoModelForImageTextToText>AutoModelForImageTextToText<a> in the <a href="https://huggingface.co/models?pipeline_tag=image-text-to-text&sort=trending">Image-Text-to-Text<a> category. While most of the training setup is the same, some additional steps are required to prepare the data and model for VLM training.
+NeMo Automodel LLM APIs can be easily extended to support VLM tasks. While most of the training setup is the same, some additional steps are required to prepare the data and model for VLM training.
 
 ## Run LLMs with NeMo Automodel
 
@@ -20,7 +20,7 @@ For other installation options (e.g., uv) please see our [Installation Guide](..
 ## Supported Models
 
 
-The following VLM models from Hugging Face have been tested and support both Supervised Fine-Tuning (SFT) and Parameter-Efficient Fine-Tuning (PEFT) with LoRA:
+NeMo Automodel supports <a href=https://huggingface.co/docs/transformers/main/model_doc/auto#transformers.AutoModelForImageTextToText>AutoModelForImageTextToText<a> in the <a href="https://huggingface.co/models?pipeline_tag=image-text-to-text&sort=trending">Image-Text-to-Text<a> category. Specifically, the following VLM models from Hugging Face have been tested and support both Supervised Fine-Tuning (SFT) and Parameter-Efficient Fine-Tuning (PEFT) with LoRA:
 
 
 | Model                              | Dataset                     | FSDP2      | PEFT       |
