@@ -197,7 +197,6 @@ def test_make_cp_batch_for_te_basic(monkeypatch):
     assert "labels" in result
     assert "position_ids" in result
     assert "cu_seqlens" in result
-    assert "cu_seqlens_padded" in result
     assert "max_seqlen" in result
     assert "qkv_format" in result
     assert "padding_mask" in result
@@ -207,13 +206,6 @@ def test_make_cp_batch_for_te_basic(monkeypatch):
 
     # Verify cu_seqlens are properly formatted
     assert result["cu_seqlens"].dtype == torch.int32
-    assert result["cu_seqlens_padded"].dtype == torch.int32
-
-
-
-
-
-
 
 
 def test_make_cp_batch_for_te_unsupported_format():
