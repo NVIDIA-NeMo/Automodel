@@ -26,7 +26,7 @@ from packaging.version import parse
 from safetensors.torch import load_file, save_file
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.futures import Future
+from concurrent.futures import Future
 
 from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
@@ -41,6 +41,15 @@ if TYPE_CHECKING:
     from peft import PeftConfig
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
+def _is_geq_torch_2_9() -> bool:
+    """
+    Check if the current torch version is greater than or equal to 2.9.0.
+    """
+    return parse(torch.__version__).base_version >= "2.9.0"
+
+if _is_geq_torch_2_9():
+    from torch.distributed.checkpoint.staging import DefaultStager
+    from torch.distributed.checkpoint.state_dict_saver import AsyncCheckpointerType
 
 @dataclass
 class CheckpointingConfig:
@@ -66,14 +75,23 @@ class CheckpointingConfig:
         self.model_save_format = SerializationFormat[self.model_save_format.upper()]
 
         # Async is only enabled for torch >= 2.9.0 currently because of large API changes in async DCP from 2.8.0 to 2.9.0
-        if self.is_async and parse(torch.__version__).base_version < "2.9.0":
+        if self.is_async and not _is_geq_torch_2_9():
             logging.error("Async mode is only supported for torch >= 2.9.0, disabling async mode")
             self.is_async = False
 
 
 class Checkpointer:
     """
-    todo
+    High-level checkpoint manager built on torch.distributed.checkpoint (DCP).
+
+    Supports:
+    - HF sharded safetensors via custom storage reader/writer
+    - Optional consolidated export (config, generation config, tokenizer)
+    - PEFT adapter save/load handling
+    - Async save for torch >= 2.9.0
+
+    Also provides DP-aware helpers for saving/loading auxiliary state and
+    utilities to initialize from a base HF checkpoint.
     """
 
     def __init__(
@@ -83,17 +101,37 @@ class Checkpointer:
         tp_rank: int,
         pp_rank: int,
         moe_mesh: Optional[DeviceMesh] = None,
-    ):
+    ) -> None:
+        """
+        Initialize the checkpointer.
+
+        Args:
+            config: Checkpointing configuration.
+            dp_rank: Data parallel rank for the current process.
+            tp_rank: Tensor parallel rank for the current process.
+            pp_rank: Pipeline parallel rank for the current process.
+            moe_mesh: Optional device mesh used for MoE when adapting state dicts.
+        """
         self.config = config
         self.moe_mesh = moe_mesh
         self.dp_rank = dp_rank
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
+
+        # async specific variables
+        self.model_pg = None
+        self.optimizer_pg = None
+        if self.config.is_async:
+            self.model_stager = DefaultStager()
+            self.optimizer_stager = DefaultStager()
+            self.model_pg = torch.distributed.new_group(backend="gloo")
+            self.optimizer_pg = torch.distributed.new_group(backend="gloo")
+
         self.__post_init__()
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """
-        Post-initialization hook.
+        Post-initialization hook that prepares optional addons and inflight state.
         """
         self._addons = []
         if self._should_write_consolidated():
@@ -108,9 +146,21 @@ class Checkpointer:
         weights_path: str,
         peft_config: Optional["PeftConfig"] = None,
         tokenizer: Optional["PreTrainedTokenizerBase"] = None,
-    ):
+    ) -> None:
         """
-        Save the checkpoint.
+        Save model weights to `weights_path/model`.
+
+        Behavior:
+        - PEFT: write `adapter_model.safetensors` and metadata on rank 0.
+        - Safetensors + consolidation: emit HF artifacts under
+          `weights_path/model/consolidated` and build a consolidated index.
+        - Otherwise: use DCP with a Hugging Face or default storage writer to save shards.
+
+        Args:
+            model: Model to checkpoint.
+            weights_path: Base directory for checkpoints.
+            peft_config: Optional PEFT configuration when saving adapters.
+            tokenizer: Optional tokenizer to save with consolidated artifacts.
         """
         # Wait for any in-flight checkpoint (async case) to complete
         if self.inflight is not None:
@@ -145,9 +195,15 @@ class Checkpointer:
 
     def save_optimizer(
         self, optimizer: torch.optim.Optimizer, model: nn.Module, weights_path: str, scheduler: Optional[Any] = None
-    ):
+    ) -> None:
         """
-        Save the optimizer.
+        Save optimizer (and optional scheduler) state to `weights_path/optim` using DCP.
+
+        Args:
+            optimizer: Optimizer whose state will be saved.
+            model: Model providing partitioning context for the optimizer wrapper.
+            weights_path: Base directory for checkpoints.
+            scheduler: Optional LR scheduler to include.
         """
         optimizer_path = os.path.join(weights_path, "optim")
         _ensure_dirs(optimizer_path)
@@ -157,9 +213,15 @@ class Checkpointer:
 
     def load_optimizer(
         self, optimizer: torch.optim.Optimizer, model: nn.Module, weights_path: str, scheduler: Optional[Any] = None
-    ):
+    ) -> None:
         """
-        Load the optimizer.
+        Load optimizer (and optional scheduler) state from `weights_path/optim` using DCP.
+
+        Args:
+            optimizer: Optimizer to populate.
+            model: Model providing partitioning context for the optimizer wrapper.
+            weights_path: Base directory for checkpoints.
+            scheduler: Optional LR scheduler to populate.
         """
         optimizer_state = OptimizerState(model, optimizer, scheduler)
         state_dict = optimizer_state.state_dict()
@@ -174,6 +236,22 @@ class Checkpointer:
         key_mapping: Optional[dict[str, str]] = None,
         quantization: bool = False,
     ) -> None:
+        """
+        Load model weights from `model_path`.
+
+        Behavior:
+        - For PEFT (non-init): rank 0 reads `adapter_model.safetensors`, then broadcasts.
+        - Otherwise: use DCP with a Hugging Face or default storage reader to populate the state dict.
+        - If the model exposes a `state_dict_adapter`, convert to/from HF format as needed.
+
+        Args:
+            model: Model or parallelized model parts to load into.
+            model_path: Path to the model checkpoint directory or HF snapshot.
+            is_init_step: If True, treat load as initialization from a base checkpoint.
+            use_checkpoint_id: Pass `checkpoint_id` to DCP if True; disable when using direct HF paths.
+            key_mapping: Optional key remapping when reading from HF checkpoints.
+            quantization: If True and supported by the adapter, read quantized tensors from HF.
+        """
         # Validate checkpoint directory
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model path {model_path} does not exist")
@@ -198,16 +276,18 @@ class Checkpointer:
         peft_init_method: str,
         load_base_model: bool = True,
         quantization: bool = False,
-    ):
+    ) -> None:
         """
         Load a model from the base Hugging Face checkpoint in parallel.
 
         Args:
             model: Model to load state into
             device: Device to load model onto
-            is_peft: Whether the model is PEFT
-            root_dir: Root directory of the model
-            model_name: Name of the model
+            root_dir: Root directory of the model cache or snapshots
+            model_name: Name of the model or an absolute path to a snapshot
+            peft_init_method: Initialization method used for PEFT adapters
+            load_base_model: If True, restore from HF base checkpoint
+            quantization: If True, allow adapters to load quantized tensors when supported
         """
         from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
 
@@ -292,6 +372,18 @@ class Checkpointer:
         storage_reader: Optional[_HuggingFaceStorageReader] = None,
         is_init_step: bool = False,
     ) -> dict[str, torch.Tensor]:
+        """
+        Load a state dictionary from `path` using DCP or PEFT special-case logic.
+
+        Args:
+            state_dict: Mutable state dict to populate with tensors.
+            path: Checkpoint directory path.
+            storage_reader: Optional HF storage reader for safetensors.
+            is_init_step: True if loading from a base checkpoint during initialization.
+
+        Returns:
+            The populated state dictionary (may be replaced for PEFT).
+        """
         # Both model and optimizer saving is done in this function
         is_model = True if "model" in path else False
         # PEFT loading is broadcasted from rank0 so it is a special case
@@ -304,7 +396,18 @@ class Checkpointer:
 
     def _do_save(
         self, state_dict: dict[str, torch.Tensor], path: str, storage_writer: Optional[_HuggingFaceStorageWriter] = None
-    ):
+    ) -> None:
+        """
+        Save a state dictionary to `path` using DCP or PEFT special-case logic.
+
+        - For PEFT model saves: only rank 0 writes `adapter_model.safetensors`.
+        - If async mode is enabled, schedule an asynchronous save.
+
+        Args:
+            state_dict: State dict to be serialized.
+            path: Checkpoint directory path.
+            storage_writer: Optional HF storage writer for safetensors sharding.
+        """
         # Both model and optimizer saving is done in this function
         is_model = True if "model" in path else False
         # PEFT saving is done on rank0 so it is a special case
@@ -319,6 +422,11 @@ class Checkpointer:
             dcp.save(state_dict, checkpoint_id=path, storage_writer=storage_writer)
 
     def _should_write_consolidated(self) -> bool:
+        """
+        Whether to emit consolidated HF artifacts along with sharded weights.
+
+        Returns True only for non-PEFT safetensors when consolidation is enabled.
+        """
         return (
             self.config.save_consolidated
             and self.config.model_save_format == SerializationFormat.SAFETENSORS
@@ -328,6 +436,19 @@ class Checkpointer:
     def _maybe_build_consolidated_index(
         self, model_state: ModelState, state_dict: dict[str, torch.Tensor]
     ) -> Optional[dict[str, int]]:
+        """
+        Build FQN to shard index mapping for consolidated HF export.
+
+        Uses the base checkpoint index (if present), removes non-persistent keys,
+        and assigns new keys to the last shard by default.
+
+        Args:
+            model_state: Wrapper exposing the primary model part.
+            state_dict: The state dict that will be saved.
+
+        Returns:
+            Mapping from FQN to shard index, or None when not consolidating.
+        """
         if not self._should_write_consolidated():
             return None
         model = model_state.model[0]
@@ -365,6 +486,17 @@ class Checkpointer:
         fqn_to_index_mapping: Optional[dict[str, int]],
         model_path: str,
     ) -> Optional[_HuggingFaceStorageWriter]:
+        """
+        Construct a Hugging Face storage writer for sharded safetensors.
+
+        Args:
+            consolidated_output_path: Optional path for consolidated artifacts.
+            fqn_to_index_mapping: Optional mapping from FQN to shard index.
+            model_path: Path where the model checkpoint is saved.
+
+        Returns:
+            Configured `_HuggingFaceStorageWriter` or None for non-safetensors.
+        """
         if self.config.model_save_format == SerializationFormat.SAFETENSORS:
             return _HuggingFaceStorageWriter(
                 path=model_path,
@@ -376,6 +508,17 @@ class Checkpointer:
     def _get_storage_reader(
         self, model_path: str, key_mapping: Optional[dict[str, str]], is_init_step: bool = False
     ) -> Optional[_HuggingFaceStorageReader]:
+        """
+        Construct a Hugging Face storage reader when loading safetensors or during init.
+
+        Args:
+            model_path: Path to the model checkpoint directory or HF snapshot.
+            key_mapping: Optional key remapping for conversion.
+            is_init_step: If True, always produce a reader for base HF load.
+
+        Returns:
+            Configured `_HuggingFaceStorageReader` or None for other formats.
+        """
         # If loading the model from the base checkpoint, we need to read the base model from the Hugging Face checkpoint
         if self.config.model_save_format == SerializationFormat.SAFETENSORS or is_init_step:
             return _HuggingFaceStorageReader(path=model_path, key_mapping=key_mapping)
@@ -449,7 +592,7 @@ def to_empty_parameters_only(
     return _apply(model, lambda t: torch.empty_like(t, device=device, dtype=dtype), recurse=recurse)
 
 
-def save_config(config: dict[str, Any], weights_path: str):
+def save_config(config: dict[str, Any], weights_path: str) -> None:
     """
     Save a config to a weights path.
 
@@ -462,6 +605,12 @@ def save_config(config: dict[str, Any], weights_path: str):
 
 
 def _ensure_dirs(*dirs: Optional[str]) -> None:
+    """
+    Create directories on rank 0 and synchronize across ranks.
+
+    Args:
+        *dirs: One or more directory paths that should exist.
+    """
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         for d in dirs:
             if d:
@@ -470,7 +619,7 @@ def _ensure_dirs(*dirs: Optional[str]) -> None:
         torch.distributed.barrier()
 
 
-def _init_peft_adapters(model: nn.Module, peft_init_method: str):
+def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:
     """
     Initialize the PEFT adapters with the scaled weights.
 
@@ -486,7 +635,22 @@ def _init_peft_adapters(model: nn.Module, peft_init_method: str):
                 logging.warning(f"Failed to initialize weights for PEFT adapter `{module.__class__.__name__}`: {e}")
 
 
-def _apply(module, fn, recurse=True):
+def _apply(module, fn, recurse=True) -> nn.Module:
+    """
+    Apply a transformation function to parameters (and gradients) only.
+
+    Mirrors `nn.Module.to_empty` for parameters while skipping buffers. Respects
+    future flags controlling in-place vs swap behavior and safely handles
+    wrapper subclasses.
+
+    Args:
+        module: Module whose parameters are to be transformed.
+        fn: Callable applied to each parameter (and its gradient).
+        recurse: Whether to recurse into child modules.
+
+    Returns:
+        The same module instance after transformation.
+    """
     from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
     if recurse:
@@ -569,7 +733,7 @@ def _maybe_adapt_state_dict_to_hf(
     model_part: nn.Module, state_dict: dict[str, torch.Tensor], quantization: bool = False
 ) -> dict[str, torch.Tensor]:
     """
-    Custom models use state dict adapters to conver the state dict to the Hugging Face format.
+    Custom models use state dict adapters to convert the state dict to the Hugging Face format.
     """
     adapter = getattr(model_part, "state_dict_adapter", None)
     if adapter:

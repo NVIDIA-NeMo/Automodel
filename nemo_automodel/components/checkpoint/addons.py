@@ -35,13 +35,24 @@ class CheckpointAddon(Protocol):
 
 class ConsolidatedHFAddon:
     """
-    Addon for consolidated HF metadata.
+    Addon that writes consolidated Hugging Face metadata alongside sharded weights.
+
+    On rank 0, this saves `config.json`, `generation_config.json`, and tokenizer
+    artifacts into the provided consolidated directory, then synchronizes ranks.
     """
 
-    def pre_save(self, **kwargs):
+    def pre_save(self, **kwargs) -> None:
+        """
+        Pre-save hook to emit consolidated HF artifacts.
+
+        Expected kwargs:
+            model_state (ModelState): Wrapper holding the model parts.
+            consolidated_path (str): Target directory for consolidated artifacts.
+            tokenizer (PreTrainedTokenizerBase | None): Optional tokenizer to save.
+        """
         model_state = kwargs["model_state"]
         consolidated_model_path = kwargs["consolidated_path"]
-        tokenizer = kwargs["tokenizer"]
+        tokenizer = kwargs.get("tokenizer", None)
         model_part = model_state.model[0]  # ModelState already converts to list if needed
 
         # Perform save operations on rank 0
@@ -64,12 +75,24 @@ class ConsolidatedHFAddon:
 
 class PeftAddon:
     """
-    Addon for PEFT metadata.
+    Addon that writes PEFT-specific metadata and tokenizer alongside adapter weights.
+
+    On rank 0, this saves `adapter_config.json`, `automodel_peft_config.json`,
+    the tokenizer (if provided), and synchronizes all ranks afterward.
     """
 
-    def pre_save(self, **kwargs):
+    def pre_save(self, **kwargs) -> None:
+        """
+        Pre-save hook to emit PEFT artifacts.
+
+        Expected kwargs:
+            model_path (str): Directory in which to save PEFT files.
+            tokenizer (PreTrainedTokenizerBase | None): Optional tokenizer to save.
+            model_state (ModelState): Wrapper holding the model parts.
+            peft_config (PeftConfig): PEFT configuration for serialization.
+        """
         model_path = kwargs["model_path"]
-        tokenizer = kwargs["tokenizer"]
+        tokenizer = kwargs.get("tokenizer", None)
         model_state = kwargs["model_state"]
         peft_config = kwargs["peft_config"]
         hf_peft_config = _get_hf_peft_config(peft_config, model_state)
@@ -90,7 +113,15 @@ class PeftAddon:
 
 def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState) -> dict:
     """
-    Get the PEFT config in the format expected by Hugging Face.
+    Get the minimal PEFT config in the format expected by Hugging Face.
+
+    Args:
+        peft_config: Source PEFT configuration.
+        model_state: Model wrapper used to infer target modules and model task.
+
+    Returns:
+        A dictionary containing the minimal HF-compatible PEFT configuration
+        (e.g., task type, LoRA rank/alpha, and discovered target modules).
     """
     MODEL_TYPE_TO_PEFT_TASK_TYPE = {
         "SequenceClassification": "SEQ_CLS",
@@ -131,6 +162,13 @@ def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState) -> d
 def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
     """
     Get the PEFT metadata in the format expected by Automodel.
+
+    Args:
+        peft_config: Source PEFT configuration.
+
+    Returns:
+        A dict containing Automodel-specific PEFT metadata fields filtered from
+        the full PEFT configuration.
     """
     PEFT_KEYS = {"dim", "alpha"}
     return {k: v for k, v in peft_config.to_dict().items() if k not in PEFT_KEYS}
@@ -138,10 +176,17 @@ def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
 
 def _extract_target_modules(model: nn.Module) -> list[str]:
     """
-    Extract the target modules from the model.
+    Extract the target modules from the model used by LoRA/PEFT layers.
 
-    Note: When torch.compile is used, module names get prefixed with '_orig_mod.'.
-    This function strips those prefixes to get the original module names.
+    Note:
+        When torch.compile is used, module names get prefixed with `_orig_mod.`.
+        This function strips those prefixes to get the original module names.
+
+    Args:
+        model: The model whose named modules are scanned.
+
+    Returns:
+        A sorted list of unique module name prefixes that contain LoRA layers.
     """
     final_target_modules = set()
     for name, _ in model.named_modules():
