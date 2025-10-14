@@ -195,30 +195,69 @@ def make_cp_batch_for_te(
     """
     Build a CP batch for Transformer Engine using THD format.
 
-    This function pads sequences to be divisible by the CP size and shards the batch
-    across context parallel ranks using the utilities from te_cp_utils.
+    This function converts BSHD format batches to THD format and shards them across
+    context parallel ranks for use with Transformer Engine. It processes the batch
+    in chunks if num_chunks > 1, allowing for better memory efficiency with large
+    sequences.
 
-    Currently only supports THD format with seq_lens and seq_lens_padded in the batch.
+    The function performs three main steps:
+    1. Converts BSHD format to THD format using split_batch_into_thd_chunks
+    2. Optionally splits the batch into multiple chunks for memory efficiency
+    3. Shards each chunk across CP ranks using Transformer Engine's partitioning
 
     Args:
-        cp_mesh (DeviceMesh): The device mesh for context parallel.
-        batch (Dict[str, torch.Tensor]): The input batch containing:
-            - input_ids: Input token IDs
-            - labels: Label token IDs
-            - seq_lens: Sequence lengths (required)
-            - seq_lens_padded: Padded sequence lengths (required)
-            - loss_mask (optional): Loss mask tensor
-        padding_token_id (int): Token ID to use for padding (default: 0)
-        padding_label_id (int): Label ID to use for padding (default: -100)
-        qvk_format (str): Format for QKV tensors (currently only "thd" is supported)
+        cp_mesh (DeviceMesh or None): The device mesh for context parallel. If None or
+            size <= 1, returns the batch in THD format without sharding.
+        batch (Dict[str, torch.Tensor]): The input batch in BSHD format containing:
+            - input_ids: Input token IDs [batch_size, seq_len] or [batch_size, seq_len, hidden_dim]
+            - labels: Label token IDs [batch_size, seq_len]
+            - position_ids (optional): Position IDs [batch_size, seq_len]
+            - seq_lens: Actual sequence lengths [batch_size, num_packs]
+            - seq_lens_padded: Padded sequence lengths [batch_size, num_packs]
+        qkv_format (str): Format for QKV tensors. Currently only "thd" is supported.
+        padding_token_id (int): Token ID used for padding in input_ids (default: 0)
+        num_chunks (int): Number of chunks to split the batch into. If > 1, the batch
+            dimension is split and each chunk is processed separately (default: 1)
+        seq_lens_padding_value (int): Sentinel value used to indicate padding in
+            seq_lens/seq_lens_padded tensors (default: -1000)
 
     Returns:
-        dict: Processed batch with sharded tensors for this CP rank. Contains:
-            - input_ids: Padded and sharded input_ids
-            - labels: Padded and sharded labels
-            - position_ids: Generated and sharded position_ids
-            - cu_seqlens: Padded cumulative sequence lengths (not sharded)
-            - loss_mask (optional): Padded and sharded loss_mask if provided
+        dict: Processed batch in THD format with the following keys:
+            - input_ids: Sharded input token IDs [total_tokens] or [num_chunks, chunk_tokens]
+            - labels: Sharded labels [total_tokens] or [num_chunks, chunk_tokens]
+            - position_ids: Generated and sharded position IDs [total_tokens] or [num_chunks, chunk_tokens]
+            - cu_seqlens: Cumulative sequence lengths [num_seqs+1] or [num_chunks, max_seqs+1]
+            - cu_seqlens_padded: Cumulative padded sequence lengths [num_seqs+1] or [num_chunks, max_seqs+1]
+            - max_seqlen: Maximum sequence length (int32 tensor)
+            - qkv_format: Format string ("thd")
+            - padding_mask: Boolean mask indicating padding tokens
+
+    Raises:
+        ValueError: If qkv_format is not "thd"
+        KeyError: If required fields (seq_lens, seq_lens_padded) are missing from batch
+
+    Example:
+        >>> # Single chunk, no CP
+        >>> batch = {
+        ...     'input_ids': torch.tensor([[1, 2, 3, 4]]),
+        ...     'labels': torch.tensor([[2, 3, 4, 5]]),
+        ...     'seq_lens': torch.tensor([[4]]),
+        ...     'seq_lens_padded': torch.tensor([[4]])
+        ... }
+        >>> result = make_cp_batch_for_te(None, batch)
+        >>> result['input_ids'].shape  # [4] in THD format
+        torch.Size([4])
+
+        >>> # Multiple chunks with CP
+        >>> batch = {
+        ...     'input_ids': torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]]),
+        ...     'labels': torch.tensor([[2, 3, 4, 5], [6, 7, 8, 9]]),
+        ...     'seq_lens': torch.tensor([[4], [4]]),
+        ...     'seq_lens_padded': torch.tensor([[4], [4]])
+        ... }
+        >>> result = make_cp_batch_for_te(cp_mesh, batch, num_chunks=2)
+        >>> result['input_ids'].shape  # [2, chunk_tokens] - 2 chunks
+        torch.Size([2, 2])  # Example: 2 chunks, 2 tokens each after sharding
     """
     if qkv_format != "thd":
         raise ValueError(f"Currently only 'thd' format is supported, got: {qkv_format}")
