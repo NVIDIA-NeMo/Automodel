@@ -653,20 +653,19 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.step_scheduler.set_epoch(epoch)
             self.model.train()
             for batch_idx, batches in enumerate(self.step_scheduler):
-                reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens = self._run_train_optim_step(
-                    batches, 1.0
-                )
+                log_data = self._run_train_optim_step(batches, 1.0)
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step(1)
 
                 # log
-                self.log_train_metrics(reporting_loss, grad_norm, num_tokens_in_batch, tps, num_label_tokens)
+                self.log_train_metrics(log_data)
 
                 if self.step_scheduler.is_ckpt_step:
                     self.save_checkpoint(epoch, self.step_scheduler.step)
 
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                    self._run_validation_epoch()
+                    log_data = self._run_validation_epoch(self.val_dataloader)
+                    self.log_val_metrics(log_data)
                     self.model.train()
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
@@ -766,7 +765,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             metrics={
                 "loss": reporting_loss,
                 "grad_norm": grad_norm,
-                "lr": self.optimizer[0].param_groups[0]["lr"],
+                "lr": self.optimizer.param_groups[0]["lr"],
                 "mem": torch.cuda.max_memory_allocated() / 1024**3,
                 "tps": tps,
                 "tps_per_gpu": tps / max(self._get_dp_group_size(), 1),
