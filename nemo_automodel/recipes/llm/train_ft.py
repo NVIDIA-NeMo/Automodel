@@ -29,7 +29,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.utils.data import DataLoader, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
-from transformers import AutoTokenizer, AutoConfig
+from transformers import AutoConfig, AutoTokenizer
 from transformers.integrations.accelerate import init_empty_weights
 from transformers.modeling_utils import no_init_weights
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -51,7 +51,7 @@ from nemo_automodel.components.distributed.init_utils import (
     initialize_distributed,
 )
 from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
-from nemo_automodel.components.distributed.pipelining import AutoPipeline, hf_utils
+from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
@@ -489,25 +489,26 @@ def build_dataloader(
         # Chain with mask precomputation if PP is enabled
         if pp_enabled:
             from nemo_automodel.components.datasets.utils import add_causal_masks_to_batch
+
             hf_model_config = AutoConfig.from_pretrained(_get_model_name(cfg_model))
-            
+
             if "collate_fn" in dl_kwargs:
                 # Case 1: PP enabled + collate_fn exists -> chain them
                 # base_collate_fn -> add_causal_masks_to_batch
                 base_collate_fn = dl_kwargs["collate_fn"]
-                
+
                 def chained_collate_fn(batch, base_fn=base_collate_fn, config=hf_model_config):
                     batch = base_fn(batch)  # Apply base collate (padding, batching, etc.)
                     batch = add_causal_masks_to_batch(batch, model_config=config)  # Add masks
                     return batch
-                
+
                 dl_kwargs["collate_fn"] = chained_collate_fn
             else:
                 # Case 2: PP enabled + no collate_fn -> only add masks
                 dl_kwargs["collate_fn"] = lambda batch, config=hf_model_config: add_causal_masks_to_batch(
                     batch, model_config=config
                 )
-        
+
         try:
             import torch.multiprocessing as mp
 
@@ -954,7 +955,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             k: (
                 {dk: dv.to(self.dist_env.device, non_blocking=True) if dv is not None else None for dk, dv in v.items()}
                 if isinstance(v, dict)
-                else v.to(self.dist_env.device, non_blocking=True) if v is not None else None
+                else v.to(self.dist_env.device, non_blocking=True)
+                if v is not None
+                else None
             )
             for k, v in batch.items()
         }
