@@ -1322,18 +1322,6 @@ all = [
 deepep = [
     { name = "nvidia-nvshmem-cu13" },
 ]
-dev = [
-    { name = "backoff" },
-    { name = "flash-attn" },
-    { name = "mistral-common", extra = ["opencv"] },
-    { name = "numba" },
-    { name = "numpy" },
-    { name = "pillow" },
-    { name = "qwen-vl-utils", extra = ["decord"], marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
-    { name = "timm" },
-    { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
-    { name = "transformers" },
-]
 fa = [
     { name = "flash-attn" },
 ]
@@ -1391,10 +1379,8 @@ requires-dist = [
     { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'" },
     { name = "nemo-automodel", extras = ["deepep"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["fa"], marker = "extra == 'all'" },
-    { name = "nemo-automodel", extras = ["fa"], marker = "extra == 'dev'" },
     { name = "nemo-automodel", extras = ["moe"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["vlm"], marker = "extra == 'all'" },
-    { name = "nemo-automodel", extras = ["vlm"], marker = "extra == 'dev'" },
     { name = "numba", marker = "extra == 'vlm'" },
     { name = "numpy", marker = "extra == 'vlm'" },
     { name = "nvidia-nvshmem-cu13", marker = "extra == 'deepep'" },
