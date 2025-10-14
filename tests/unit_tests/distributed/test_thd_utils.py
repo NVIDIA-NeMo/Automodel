@@ -15,7 +15,7 @@
 import torch
 import pytest
 
-from nemo_automodel.components.utils.thd_utils import process_input_for_thd, split_batch_into_thd_chunks
+from nemo_automodel.components.distributed.thd_utils import process_input_for_thd, split_batch_into_thd_chunks
 
 
 class TestProcessInputForTHD:

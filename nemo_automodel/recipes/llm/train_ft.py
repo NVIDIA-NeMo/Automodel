@@ -910,7 +910,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 self.cfg.validation_dataset,
                 self.cfg.validation_dataloader,
                 self.cfg.model,
-                cfg_ps=None,  # Use unpacked config for validation
+                cfg_ps=self.cfg.get("packed_sequence", None),  # Use unpacked config for validation
                 seed=self.cfg.get("seed", 42),
                 local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
                 global_batch_size=self.cfg.get("step_scheduler.global_batch_size", 1),
@@ -919,6 +919,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 dp_rank=self._get_dp_rank(),
                 dp_world_size=self._get_dp_group_size(),
                 pp_enabled=self.pp_enabled,
+                supports_seq_lens=True,
+                cp_size=self.cfg.get("distributed.cp_size", 1),
             )
 
         # Scheduler

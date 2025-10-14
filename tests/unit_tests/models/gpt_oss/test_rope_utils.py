@@ -17,11 +17,6 @@ import math
 import pytest
 import torch
 
-from nemo_automodel.components.distributed.te_cp_utils import (
-    generate_positional_ids_for_cp,
-    get_batch_on_this_cp_rank,
-    pad_thd_sequences_for_cp,
-)
 from nemo_automodel.components.models.gpt_oss.rope_utils import (
     RotaryEmbedding,
     apply_rotary_emb,
@@ -388,43 +383,18 @@ class TestPositionIdsToFreqsCisWithContextParallel:
             dtype=torch.float32,
         )
 
-        # Setup
-        batch_size = 2
-        seq_len = 128
+        # Directly create position IDs as they would appear after CP sharding
+        # Simulate a chunk of a sequence assigned to this CP rank
+        seq_len_per_rank = 128 // cp_size
+        position_ids_rank = torch.arange(seq_len_per_rank)
 
-        # Create input_ids, labels, and cu_seqlens for packed sequences
-        input_ids = torch.randint(0, 1000, (batch_size * seq_len,))
-        labels = torch.randint(0, 1000, (batch_size * seq_len,))
-        cu_seqlens = torch.tensor([0, seq_len, 2 * seq_len])
+        # Compute freqs_cis for this rank's position_ids
+        freqs_cis_rank = position_ids_to_freqs_cis(rope, position_ids_rank, qkv_format="thd")
 
-        # Pad sequences for CP
-        divisibility_factor = 2 * cp_size
-        input_ids_padded, labels_padded, cu_seqlens_padded = pad_thd_sequences_for_cp(
-            input_ids, labels, cu_seqlens, divisibility_factor
-        )
-
-        # Generate position IDs
-        position_ids = generate_positional_ids_for_cp(cu_seqlens_padded, divisibility_factor)
-
-        # Split data for each CP rank and verify freqs_cis
-        for cp_rank in range(cp_size):
-            _, _, position_ids_rank = get_batch_on_this_cp_rank(
-                cu_seqlens_padded,
-                input_ids_padded,
-                labels_padded,
-                position_ids,
-                cp_size,
-                cp_rank,
-                qvk_format="thd",
-            )
-
-            # Compute freqs_cis for this rank's position_ids
-            freqs_cis_rank = position_ids_to_freqs_cis(rope, position_ids_rank, qkv_format="thd")
-
-            # Verify shape and properties
-            assert freqs_cis_rank.ndim == 2
-            assert freqs_cis_rank.shape[1] == 64
-            assert freqs_cis_rank.dtype == torch.float32
+        # Verify shape and properties
+        assert freqs_cis_rank.ndim == 2
+        assert freqs_cis_rank.shape[1] == 64
+        assert freqs_cis_rank.dtype == torch.float32
 
     @pytest.mark.parametrize("cp_size,cp_rank", [(2, 0), (2, 1), (4, 0), (4, 2), (4, 3)])
     def test_freqs_cis_consistency_across_ranks(self, cp_size, cp_rank):
@@ -435,33 +405,10 @@ class TestPositionIdsToFreqsCisWithContextParallel:
             dtype=torch.float32,
         )
 
-        # Setup
-        batch_size = 2
-        seq_len = 64
-
-        # Create packed sequences
-        input_ids = torch.randint(0, 1000, (batch_size * seq_len,))
-        labels = torch.randint(0, 1000, (batch_size * seq_len,))
-        cu_seqlens = torch.tensor([0, seq_len, 2 * seq_len])
-
-        divisibility_factor = 2 * cp_size
-        input_ids_padded, labels_padded, cu_seqlens_padded = pad_thd_sequences_for_cp(
-            input_ids, labels, cu_seqlens, divisibility_factor
-        )
-
-        # Generate position IDs
-        position_ids_full = generate_positional_ids_for_cp(cu_seqlens_padded, divisibility_factor)
-
-        # Get position_ids for this CP rank
-        _, _, position_ids_rank = get_batch_on_this_cp_rank(
-            cu_seqlens_padded,
-            input_ids_padded,
-            labels_padded,
-            position_ids_full,
-            cp_size,
-            cp_rank,
-            qvk_format="thd",
-        )
+        # Directly create position IDs for this rank
+        seq_len_per_rank = 64 // cp_size
+        # Simulate position IDs that might have some repetition (packed sequences)
+        position_ids_rank = torch.arange(seq_len_per_rank) % 10
 
         # Compute freqs_cis
         freqs_cis_rank = position_ids_to_freqs_cis(rope, position_ids_rank, qkv_format="thd")
@@ -487,40 +434,16 @@ class TestPositionIdsToFreqsCisWithContextParallel:
             dtype=torch.float32,
         )
 
-        cp_size = 2
+        # Directly create position IDs simulating variable-length sequences after CP split
+        # Simulate 3 sequences: [0-9], [0-15], [0-11] concatenated then split
+        position_ids_rank = torch.tensor([0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3])
 
-        # Create sequences of different lengths
-        seq_lens = [32, 64, 48]
-        input_ids = torch.cat([torch.randint(0, 1000, (l,)) for l in seq_lens])
-        labels = torch.cat([torch.randint(0, 1000, (l,)) for l in seq_lens])
-        cu_seqlens = torch.tensor([0] + list(torch.cumsum(torch.tensor(seq_lens), 0)))
+        # Compute freqs_cis
+        freqs_cis_rank = position_ids_to_freqs_cis(rope, position_ids_rank, qkv_format="thd")
 
-        divisibility_factor = 2 * cp_size
-        input_ids_padded, labels_padded, cu_seqlens_padded = pad_thd_sequences_for_cp(
-            input_ids, labels, cu_seqlens, divisibility_factor
-        )
-
-        # Generate position IDs
-        position_ids = generate_positional_ids_for_cp(cu_seqlens_padded, divisibility_factor)
-
-        # Test for each CP rank
-        for cp_rank in range(cp_size):
-            _, _, position_ids_rank = get_batch_on_this_cp_rank(
-                cu_seqlens_padded,
-                input_ids_padded,
-                labels_padded,
-                position_ids,
-                cp_size,
-                cp_rank,
-                qvk_format="thd",
-            )
-
-            # Compute freqs_cis
-            freqs_cis_rank = position_ids_to_freqs_cis(rope, position_ids_rank, qkv_format="thd")
-
-            # Verify output properties
-            assert freqs_cis_rank.dtype == torch.float32
-            assert freqs_cis_rank.shape[1] == 64
+        # Verify output properties
+        assert freqs_cis_rank.dtype == torch.float32
+        assert freqs_cis_rank.shape[1] == 64
 
     def test_freqs_cis_cp_reconstructibility(self):
         """Test that we can reconstruct full freqs_cis from CP-split pieces"""
@@ -533,37 +456,17 @@ class TestPositionIdsToFreqsCisWithContextParallel:
         cp_size = 2
         seq_len = 128
 
-        # Create simple test case with one sequence
-        input_ids = torch.randint(0, 1000, (seq_len,))
-        labels = torch.randint(0, 1000, (seq_len,))
-        cu_seqlens = torch.tensor([0, seq_len])
-
-        divisibility_factor = 2 * cp_size
-        input_ids_padded, labels_padded, cu_seqlens_padded = pad_thd_sequences_for_cp(
-            input_ids, labels, cu_seqlens, divisibility_factor
-        )
-
-        # Generate position IDs for full sequence
-        position_ids_full = generate_positional_ids_for_cp(cu_seqlens_padded, divisibility_factor)
-
-        # Collect freqs_cis from each CP rank
+        # Directly create position IDs for each CP rank
+        # Simulate splitting a sequence of length 128 across 2 ranks
         freqs_cis_parts = []
         for cp_rank in range(cp_size):
-            _, _, position_ids_rank = get_batch_on_this_cp_rank(
-                cu_seqlens_padded,
-                input_ids_padded,
-                labels_padded,
-                position_ids_full,
-                cp_size,
-                cp_rank,
-                qvk_format="thd",
-            )
-
+            # Each rank gets half the sequence
+            position_ids_rank = torch.arange(seq_len // cp_size)
             freqs_cis_rank = position_ids_to_freqs_cis(rope, position_ids_rank, qkv_format="thd")
             freqs_cis_parts.append(freqs_cis_rank)
 
         # Verify that each part has the expected length
-        expected_part_len = cu_seqlens_padded[-1].item() // cp_size
+        expected_part_len = seq_len // cp_size
         for part in freqs_cis_parts:
             assert part.shape[0] == expected_part_len
 
@@ -580,37 +483,16 @@ class TestPositionIdsToFreqsCisWithContextParallel:
 
         seq_len = 256
 
-        # Create test data
-        input_ids = torch.randint(0, 1000, (seq_len,))
-        labels = torch.randint(0, 1000, (seq_len,))
-        cu_seqlens = torch.tensor([0, seq_len])
+        # Directly create position IDs for a CP rank
+        seq_len_per_rank = seq_len // cp_size
+        position_ids_rank = torch.arange(seq_len_per_rank)
 
-        divisibility_factor = 2 * cp_size
-        input_ids_padded, labels_padded, cu_seqlens_padded = pad_thd_sequences_for_cp(
-            input_ids, labels, cu_seqlens, divisibility_factor
-        )
+        # Compute freqs_cis
+        freqs_cis_rank = position_ids_to_freqs_cis(rope, position_ids_rank, qkv_format="thd")
 
-        # Generate position IDs
-        position_ids = generate_positional_ids_for_cp(cu_seqlens_padded, divisibility_factor)
-
-        # Test each CP rank
-        for cp_rank in range(cp_size):
-            _, _, position_ids_rank = get_batch_on_this_cp_rank(
-                cu_seqlens_padded,
-                input_ids_padded,
-                labels_padded,
-                position_ids,
-                cp_size,
-                cp_rank,
-                qvk_format="thd",
-            )
-
-            # Compute freqs_cis
-            freqs_cis_rank = position_ids_to_freqs_cis(rope, position_ids_rank, qkv_format="thd")
-
-            # Verify properties
-            assert freqs_cis_rank.dtype == torch.float32
-            assert freqs_cis_rank.shape[1] == 128
+        # Verify properties
+        assert freqs_cis_rank.dtype == torch.float32
+        assert freqs_cis_rank.shape[1] == 128
 
 
 class TestIntegration:

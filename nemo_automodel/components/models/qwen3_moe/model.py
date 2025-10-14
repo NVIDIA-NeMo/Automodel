@@ -149,14 +149,6 @@ class Qwen3MoeModel(nn.Module):
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
-        # bsz, seq_len = input_ids.shape[0], input_ids.shape[1]
-        original_kwargs = attn_kwargs
-        # if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
-        #     input_ids, position_ids, attn_kwargs = process_input_for_thd(
-        #         input_ids, position_ids, attn_kwargs["seq_lens"], attn_kwargs["seq_lens_padded"]
-        #     )
-        #     attention_mask = None
-
         if position_ids is None:
             position_ids = (
                 torch.arange(0, input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand(input_ids.shape[0], -1)
@@ -164,7 +156,7 @@ class Qwen3MoeModel(nn.Module):
 
         # Compute freqs_cis from RotaryEmbedding inv_freq and current position_ids; then concat [cos, sin]
         freqs_cis = position_ids_to_freqs_cis(
-            self.rotary_emb, position_ids, qkv_format=original_kwargs.get("qkv_format", "bshd")
+            self.rotary_emb, position_ids, qkv_format=attn_kwargs.get("qkv_format", "bshd")
         )
 
         h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
@@ -179,7 +171,6 @@ class Qwen3MoeModel(nn.Module):
             )
 
         h = self.norm(h) if self.norm else h
-        # h = h.view(bsz, seq_len, -1)
         return h
 
     @torch.no_grad()
