@@ -42,6 +42,7 @@ from nemo_automodel.components.distributed.init_utils import initialize_distribu
 from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.metric_logger import MetricLoggerDist, MetricsSample
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
@@ -624,6 +625,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         restore_from = self.cfg.get("checkpoint.restore_from", None)
 
+        # Initialize JSONL loggers
+        self.metric_logger_train = MetricLoggerDist(
+            pathlib.Path(self.checkpoint_config.checkpoint_dir) / "training.jsonl"
+        )
+        self.metric_logger_valid = MetricLoggerDist(
+            pathlib.Path(self.checkpoint_config.checkpoint_dir) / "validation.jsonl"
+        )
+
         # Optionally resume
         self.load_checkpoint(restore_from)
 
@@ -659,6 +668,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     self._run_validation_epoch()
                     self.model.train()
+        # Close JSONL loggers after training loop completes
+        self.metric_logger_train.close()
+        self.metric_logger_valid.close()
 
         self.checkpointer.close()
 
@@ -747,18 +759,32 @@ class FinetuneRecipeForVLM(BaseRecipe):
         tps = num_tokens_in_batch / time_delta
         reporting_loss = torch.sum(torch.stack(loss_buffer)).item()
         # fix reporting_loss, tps across ranks
-        return reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens
+
+        return MetricsSample(
+            step=self.step_scheduler.step,
+            epoch=self.step_scheduler.epoch,
+            metrics={
+                "loss": reporting_loss,
+                "grad_norm": grad_norm,
+                "lr": self.optimizer[0].param_groups[0]["lr"],
+                "mem": torch.cuda.max_memory_allocated() / 1024**3,
+                "tps": tps,
+                "tps_per_gpu": tps / max(self._get_dp_group_size(), 1),
+                "num_tokens_per_step": num_tokens_in_batch,
+                "num_label_tokens": num_label_tokens,
+            },
+        )
 
     @torch.no_grad()
-    def _run_validation_epoch(self):
+    def _run_validation_epoch(self, val_dataloader):
         """Run one pass over `self.val_dataloader`."""
         with ScopedRNG(seed=1, ranked=True):
             self.model.eval()
 
             total_loss = 0.0
             total_tokens = 0
-
-            for batch in self.val_dataloader:
+            total_num_label_tokens = 0
+            for batch in val_dataloader:
                 batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
                 labels = batch.pop("labels")
                 num_label_tokens = (labels != -100).sum()
@@ -786,25 +812,62 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
                         num_label_tokens=num_label_tokens,
                     )
+                    total_num_label_tokens += num_label_tokens
 
                 total_loss += local_loss.item()
 
         # Aggregate across ranks if distributed is initialized
         total_loss = self._dp_allreduce(torch.FloatTensor([total_loss]), include_cp=True).item()
         total_tokens = self._dp_allreduce(torch.LongTensor([total_tokens]), include_cp=True).item()
+        total_num_label_tokens = self._dp_allreduce(torch.tensor(total_num_label_tokens, dtype=torch.long)).item()
 
         val_loss = total_loss / max(total_tokens, 1e-8)
-        if self.dist_env.is_main:
-            if wandb.run is not None:
-                wandb.log({"val_loss": val_loss, "step": self.step_scheduler.step, "epoch": self.step_scheduler.epoch})
-        current_lr = self.optimizer.param_groups[0]["lr"]
+
+        return MetricsSample(
+            step=self.step_scheduler.step,
+            epoch=self.step_scheduler.epoch,
+            metrics={
+                "val_loss": val_loss,
+                "lr": self.optimizer[0].param_groups[0]["lr"],
+                "num_label_tokens": total_num_label_tokens,
+                "mem": torch.cuda.max_memory_allocated() / 1024**3,
+            },
+        )
+
+    def log_val_metrics(self, log_data):
+        """Log metrics to wandb and other loggers
+        Args:
+            log_data: MetricsSample object, containing:
+                step: int, the current step.
+                epoch: int, the current epoch.
+                metrics: Dict[str, float], containing:
+                    "val_loss": Validation loss.
+                    "lr": Learning rate.
+                    "num_label_tokens": Number of label tokens.
+                    "mem": Memory allocated.
+        """
+
+        if not self.dist_env.is_main or log_data is None:
+            return
+
+        if wandb.run is not None:
+            wandb.log(log_data.to_dict(), step=log_data.step)
+
+        # JSONL validation log
+        self.metric_logger_valid.log(log_data)
+
         logging.info(
-            "[val] step {} | epoch {} | loss {:.4f} | lr {:.2e}".format(
-                self.step_scheduler.step, self.step_scheduler.epoch, val_loss, current_lr
+            "[val] step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
+                log_data.step,
+                log_data.epoch,
+                log_data.metrics["val_loss"],
+                log_data.metrics["lr"],
+                log_data.metrics["num_label_tokens"],
             )
         )
 
-    def log_train_metrics(self, train_loss, grad_norm, num_tokens_in_batch, tps, num_label_tokens) -> float:
+
+    def log_train_metrics(self, log_data) -> float:
         """Log metrics to wandb.
 
         Args:
@@ -813,30 +876,24 @@ class FinetuneRecipeForVLM(BaseRecipe):
             num_tokens_in_batch: Total number of loss tokens.
             tps: Tokens per second.
         """
-        log_data = {
-            "step": self.step_scheduler.step,
-            "epoch": self.step_scheduler.epoch,
-            "train_loss": train_loss,
-            "grad_norm": grad_norm,
-            "num_tokens_per_step": num_tokens_in_batch,
-            "tps": tps,
-        }
-        current_lr = self.optimizer.param_groups[0]["lr"]
-        log_data["learning_rate"] = current_lr
+        if not self.dist_env.is_main:
+            return
 
         if wandb.run is not None:
-            wandb.log(log_data, step=self.step_scheduler.step)
-
+            wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+        # JSONL training log
+        self.metric_logger_train.log(log_data)
         logging.info(
-            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f} | num_label_tokens {}".format(
-                self.step_scheduler.step,
-                self.step_scheduler.epoch,
-                train_loss,
-                grad_norm,
-                current_lr,
-                torch.cuda.max_memory_allocated() / 1024**3,
-                tps,
-                num_label_tokens,
+            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
+                log_data.step,
+                log_data.epoch,
+                log_data.metrics["loss"],
+                log_data.metrics["grad_norm"],
+                log_data.metrics["lr"],
+                log_data.metrics["mem"],
+                log_data.metrics["tps"],
+                log_data.metrics["tps_per_gpu"],
+                log_data.metrics["num_label_tokens"],
             )
         )
         torch.cuda.reset_peak_memory_stats()
