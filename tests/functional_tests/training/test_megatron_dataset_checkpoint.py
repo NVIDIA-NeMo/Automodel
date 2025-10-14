@@ -20,7 +20,7 @@ import torch
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.llm.train_ft import build_distributed, build_dataloader
-from nemo_automodel.components.checkpoint.checkpointing_class import Checkpointer, CheckpointingConfig
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
 """
 This test is to make sure that JSONL dataset can be checkpointed and loaded correctly.

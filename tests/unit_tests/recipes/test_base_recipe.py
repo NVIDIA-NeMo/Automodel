@@ -13,13 +13,11 @@
 # limitations under the License.
 
 import os
-from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
 
-import nemo_automodel.recipes.base_recipe as base_recipe
 from nemo_automodel.recipes.base_recipe import BaseRecipe, _find_latest_checkpoint
 from nemo_automodel.components.config.loader import ConfigNode
 
@@ -137,7 +135,7 @@ class _ToyRecipe(BaseRecipe):
     def __init__(self, checkpoint_dir):
         super().__init__()
         
-        from nemo_automodel.components.checkpoint.checkpointing_class import CheckpointingConfig, Checkpointer
+        from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
         checkpoint_config = CheckpointingConfig(
             enabled=True,
