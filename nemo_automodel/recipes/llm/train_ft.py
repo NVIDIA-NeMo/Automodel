@@ -1014,7 +1014,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.device_mesh,
             batch,
             use_te=_uses_te_dot_product_attention(self.cfg.model) and _uses_thd_collater(self.cfg.dataloader),
-            padding_token_id=self.tokenizer.pad_token_id,
+            padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
             num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
         )
         labels = batch.pop("labels")
