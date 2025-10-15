@@ -96,7 +96,8 @@ def test_thread_safe_logging(tmp_path):
 
 def test_flush_fsync_behavior(tmp_path, monkeypatch):
     logfile = tmp_path / "metrics.jsonl"
-    logger = MetricLogger(str(logfile), flush=True, append=False)
+    # Use buffer_size=1 to force a save (and thus fsync) on each log call
+    logger = MetricLogger(str(logfile), flush=True, append=False, buffer_size=1)
 
     calls = []
 
@@ -109,7 +110,7 @@ def test_flush_fsync_behavior(tmp_path, monkeypatch):
     logger.log(metric_logger_mod.MetricsSample(step=0, epoch=0, metrics={"y": 2}))
     logger.close()
 
-    # fsync should be called once per log when flush=True
+    # fsync should be called once per log when flush=True and buffer_size=1
     assert len(calls) == 2
 
 
