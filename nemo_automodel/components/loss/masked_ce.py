@@ -14,10 +14,12 @@
 from typing import Optional
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
 
 
-class MaskedCrossEntropy:
+class MaskedCrossEntropy(nn.Module):
     def __init__(self, fp32_upcast: bool = True, ignore_index: int = -100, reduction: str = "sum"):
         """
         Masked cross-entropy loss.
@@ -28,15 +30,17 @@ class MaskedCrossEntropy:
             ignore_index (int): label to ignore in CE calculation. Defaults to -100.
             reduction (str): type of reduction. Defaults to "sum".
         """
+        super().__init__()
         self.fp32_upcast = fp32_upcast
         self.ignore_index = ignore_index
         self.reduction = reduction
 
-    def __call__(
+    def forward(
         self,
         logits: torch.Tensor,
         labels: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        num_label_tokens: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Compute the masked cross-entropy loss between logits and targets.
@@ -56,16 +60,27 @@ class MaskedCrossEntropy:
         """
         # this may happen with CPUOffloadPolicy
         if labels.device != logits.device:
-            labels = labels.to(logits.device)
+            labels = labels.to(logits.device)  # pragma: no cover
         # reshape to (N, C) and (N,) respectively
         logits = logits.view(-1, logits.size(-1))
         labels = labels.view(-1)
         if mask is not None:
             with torch.no_grad():
                 if mask.device != labels.device:
-                    mask = mask.to(labels.device)
+                    mask = mask.to(labels.device)  # pragma: no cover
                 labels.masked_fill_(mask.view(-1) == 0, self.ignore_index)
                 del mask
         if self.fp32_upcast:
             logits = logits.float()
-        return F.cross_entropy(logits, labels, reduction=self.reduction)
+
+        if isinstance(logits, DTensor):
+            logits = logits.full_tensor()
+
+        if isinstance(labels, DTensor):
+            labels = labels.full_tensor()
+
+        loss = F.cross_entropy(logits, labels, reduction=self.reduction)
+        if num_label_tokens is not None:
+            assert self.reduction == "sum", "num_label_tokens is only supported when reduction is 'sum'"
+            loss = loss / num_label_tokens
+        return loss

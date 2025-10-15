@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import math
+from typing import Optional
 
 import torch
+from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
 
 def batchify(tensor):
@@ -66,37 +68,178 @@ def pad_within_micro(batch, pad_token_id, pad_seq_len_divisible=None):
     max_len = max(map(len, batch))
     if pad_seq_len_divisible:
         max_len = (pad_seq_len_divisible - max_len % pad_seq_len_divisible) + max_len
+    if pad_token_id is None:
+        # if it's none, extend the last token
+        pad_token_id = batch[0][-1]
     return [item + [pad_token_id] * (max_len - len(item)) for item in batch]
 
 
-def default_collater(batch, pad_token_id=0, pad_seq_len_divisible=None):
+def find_last_non_pad_token(lst: list[int], value: int) -> int | None:
+    # lst = [optional-value .., non-value, ..., non-value, value, ...]
+    # return the index of the last non-value token
+    i = len(lst) - 1
+    found = False
+    while i >= 0:
+        if lst[i] == value:
+            i -= 1
+            found = True
+        else:
+            if found:
+                return i
+            else:
+                return None
+    return None
+
+
+def get_pad_token_from_key(val: str, pad_token_ids: Optional[dict[str, int]] = None) -> int | None:
+    PAD_TOKEN_IDS = {
+        "labels": -100,
+        "attention_mask": 0,
+        "loss_mask": 0,
+    }
+    if pad_token_ids is not None and val in pad_token_ids:
+        return pad_token_ids[val]
+    return PAD_TOKEN_IDS.get(val, None)
+
+
+def make_attention_mask_from_labels(ids: list[int], ignore_token: int = -100) -> list[int]:
+    # if the last token is not an ignore token, then the attention mask is all 1s
+    if len(ids) == 0:
+        return []
+    if ids[-1] != ignore_token:
+        ans = [1] * len(ids)
+    else:
+        # otherwise, find the last non-pad token and set the attention mask to 1s up to that point
+        last_non_pad_token_pos = find_last_non_pad_token(ids, ignore_token)
+        if last_non_pad_token_pos is None:
+            ans = [1] * len(ids)
+        else:
+            ans = [1] * (last_non_pad_token_pos + 1)
+        ans = ans + [0] * (len(ids) - len(ans))
+    assert len(ans) == len(ids)
+    return ans
+
+
+def create_causal_mask_mapping(
+    model_config,
+    batch_size,
+    seq_len,
+    position_ids=None,
+    attention_mask=None,
+    device=None,
+):
+    """
+    Create causal mask mapping for pipeline parallelism.
+
+    This is the core mask creation logic that can be reused by different collate functions.
+    Extracts common mask creation logic to avoid duplication between collate functions.
+
+    Args:
+        model_config: HuggingFace model config
+        batch_size: Batch size
+        seq_len: Sequence length
+        position_ids: Optional position IDs tensor [batch_size, seq_len]
+        attention_mask: Optional 2D attention mask tensor [batch_size, seq_len] for padding
+        device: Device to create tensors on (defaults to cpu)
+
+    Returns:
+        dict: Mapping of mask types to 4D mask tensors
+            - "full_attention": [batch_size, 1, seq_len, seq_len]
+            - "sliding_attention": [batch_size, 1, seq_len, seq_len] (if model uses sliding window)
+    """
+    if device is None:
+        device = torch.device("cpu")
+
+    # Create position_ids if not provided
+    if position_ids is None:
+        position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+
+    # Prepare mask creation kwargs
+    mask_kwargs = {
+        "config": model_config,
+        "input_embeds": torch.empty((batch_size, seq_len), device=device),
+        "attention_mask": attention_mask,
+        "cache_position": position_ids[0],  # Use first row (all rows identical for non-padded data)
+        "past_key_values": None,  # Training only
+        "position_ids": position_ids,
+    }
+
+    # Create causal masks
+    causal_mask_mapping = {
+        "full_attention": create_causal_mask(**mask_kwargs),
+    }
+
+    # Add sliding window mask if model uses it
+    if hasattr(model_config, "sliding_window") and model_config.sliding_window is not None:
+        causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+
+    return causal_mask_mapping
+
+
+def add_causal_masks_to_batch(batch_dict, model_config):
+    """
+    Add precomputed causal masks to an already-batched data dict.
+
+    This function is designed for datasets that yield complete batches (like MockIterableDataset),
+    where we want to add mask precomputation as a separate processing step.
+
+    Args:
+        batch: A dict or list containing a single batched dict with tensors:
+            - input_ids: [batch_size, seq_length]
+            - position_ids: [batch_size, seq_length] (optional)
+            - labels: [batch_size, seq_length]
+        model_config: HuggingFace model config for creating causal masks
+        precompute_masks: If False, skip mask creation (for compatibility with train_ft.py wrapper)
+
+    Returns:
+        dict: Same batch with added causal_mask_mapping field
+    """
+    # Extract info from batch
+    batch_size = batch_dict["input_ids"].shape[0]
+    seq_len = batch_dict["input_ids"].shape[1]
+    position_ids = batch_dict.get("position_ids")
+    attention_mask = batch_dict.get("attention_mask")  # May have padding info
+
+    # Create causal masks using the shared helper function
+    causal_mask_mapping = create_causal_mask_mapping(
+        model_config=model_config,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        device=batch_dict["input_ids"].device,
+    )
+
+    batch_dict["causal_mask_mapping"] = causal_mask_mapping
+    return batch_dict
+
+
+def default_collater(batch, pad_seq_len_divisible=None):
     """
     Default batch collator that handles padding and batching.
 
     Args:
         batch: A batch of examples.
-        pad_token_id: The token ID to use for padding.
         pad_seq_len_divisible: If provided, pad sequence length to be divisible by this value.
 
     Returns:
         dict: A dictionary containing batched tensors.
     """
-    return {
-        key: batchify(
-            torch.LongTensor(
-                pad_within_micro(
-                    extract_key_from_dicts(batch, key),
-                    (
-                        0
-                        if key == "attention_mask" or key == "loss_mask"
-                        else (-100 if key == "labels" else pad_token_id)
-                    ),
-                    pad_seq_len_divisible,
-                ),
-            ),
+    pad_token_ids = batch[0].pop("___PAD_TOKEN_IDS___", None)
+    # ans contains a dict with:
+    # key: str (e.g., "input_ids", "attention_mask", "labels", "loss_mask")
+    # value: list[list[int]] (e.g., [[1, 2, 3], [4, 5, 6]])
+    ans = {
+        key: pad_within_micro(
+            extract_key_from_dicts(batch, key),
+            get_pad_token_from_key(key, pad_token_ids),
+            pad_seq_len_divisible,
         )
         for key in batch[0].keys()
     }
+
+    # convert to tensors
+    return {k: batchify(torch.LongTensor(v)) for k, v in ans.items()}
 
 
 class SFTSingleTurnPreprocessor:

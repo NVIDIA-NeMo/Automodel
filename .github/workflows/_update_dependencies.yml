@@ -6,10 +6,6 @@ on:
         required: true
         type: string
         description: "The target branch to bump"
-      nvfsdp-target-branch:
-        required: true
-        type: string
-        description: "The target branch to bump"
     secrets:
       PAT:
         required: true
@@ -35,28 +31,10 @@ jobs:
         id: ref
         run: echo "date=$(date +%F)" | tee -a "$GITHUB_OUTPUT"
 
-  nvfsdp:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_bump_tomlfile.yml@v0.40.0
-    needs: [pre-flight]
-    name: Bump nvFSDP
-    with:
-      source-repository: NVIDIA-NeMo/NVFSDP
-      source-ref: ${{ inputs.nvfsdp-target-branch }}
-      toml-path: tool.uv.sources.nvfsdp.rev
-      file: pyproject.toml
-      base-branch: ${{ inputs.target-branch }}
-      pr-branch: ${{ needs.pre-flight.outputs.bump-branch }}
-      pr-title: "chore(🤖): Bump dependencies (${{ needs.pre-flight.outputs.date }})"
-      use-gpgkey: true
-    secrets:
-      PAT: ${{ secrets.PAT }}
-      GPG_KEY: ${{ secrets.SSH_KEY }}
-      GPG_PASSPHRASE: ${{ secrets.SSH_PWD }}
-
   update-lockfile:
     environment: nemo-ci
     runs-on: linux-amd64-cpu16
-    needs: [nvfsdp, pre-flight]
+    needs: [pre-flight]
     env:
       SOURCE_BRANCH: ${{ needs.pre-flight.outputs.bump-branch }}
       TARGET_BRANCH: ${{ inputs.target-branch }}

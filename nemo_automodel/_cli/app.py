@@ -104,7 +104,7 @@ def get_automodel_repo_root():
     return None
 
 
-def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
+def launch_with_slurm(args, job_conf_path, job_dir, slurm_config, extra_args=None):
     from nemo_automodel.components.launcher.slurm.config import SlurmConfig, VolumeMapping
     from nemo_automodel.components.launcher.slurm.utils import submit_slurm_job
 
@@ -136,19 +136,28 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config):
         slurm_config["job_name"] = f"{args.domain}_{args.command}"
 
     # create the command
-    command = " ".join(
-        (
-            f"PYTHONPATH={repo_root}:$PYTHONPATH",
-            "python3",
-            f"{repo_root}/nemo_automodel/recipes/{args.domain}/{args.command}.py",
-            "-c",
-            f"{job_conf_path}",
-        )
-    )
+    command_parts = [
+        f"PYTHONPATH={repo_root}:$PYTHONPATH",
+        # Use torchrun to launch multiple processes instead
+        "uv sync --inexact --frozen $(cat /opt/uv_args.txt) && uv run --no-sync torchrun ",
+        f"--nproc_per_node={slurm_config['ntasks_per_node']} ",
+        f"--nnodes={slurm_config['nodes']} ",
+        "--rdzv_backend=c10d ",
+        f"--rdzv_endpoint=${{MASTER_ADDR}}:${{MASTER_PORT}}",  # noqa: F541
+        f"{repo_root}/examples/{args.domain}_{args.command}/{args.command}.py",
+        "-c",
+        f"{job_conf_path}",
+    ]
+    # Append CLI overrides if provided (e.g., --model.pretrained_name_or_path=...)
+    if extra_args:
+        command_parts.extend(extra_args)
+    command = " ".join(command_parts)
     # Add extra mounts
     if not "extra_mounts" in slurm_config:
         slurm_config["extra_mounts"] = []
-    slurm_config["extra_mounts"].append(VolumeMapping(Path(repo_root), Path(repo_root)))
+    # only append to mount if repo_root exists since it could be /opt/Automodel
+    if Path(repo_root).exists():
+        slurm_config["extra_mounts"].append(VolumeMapping(Path(repo_root), Path(repo_root)))
     return submit_slurm_job(SlurmConfig(**slurm_config, command=command, chdir=repo_root), job_dir)
 
 
@@ -165,8 +174,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         metavar="<command>",
-        choices=["finetune"],
-        help="Command within the domain (e.g., finetune, generate, etc)",
+        choices=["finetune", "pretrain", "kd"],
+        help="Command within the domain (e.g., finetune, pretrain, kd, etc)",
     )
     parser.add_argument(
         "domain",
@@ -220,9 +229,12 @@ def run_interactive(args):
     from torch.distributed.run import determine_local_world_size, get_args_parser
     from torch.distributed.run import run as thrun
 
+    COMMAND_ALIASES = {"finetune": "train_ft", "pretrain": "train_ft"}
+    # remap commands: finetune -> train_ft
+    command = COMMAND_ALIASES.get(args.command, args.command)
     config_path = args.config.resolve()
     repo_root = get_repo_root()
-    script_path = repo_root / "nemo_automodel" / "recipes" / args.domain / f"{args.command}.py"
+    script_path = repo_root / "nemo_automodel" / "recipes" / args.domain / f"{command}.py"
 
     # launch job on this node
     num_devices = determine_local_world_size(nproc_per_node="gpu")
@@ -236,7 +248,7 @@ def run_interactive(args):
         logging.info(f"Launching job locally on {num_devices} devices")
         # run the job on multiple ranks on this node.
         torchrun_parser = get_args_parser()
-        torchrun_args = torchrun_parser.parse_args()
+        torchrun_args, extra = torchrun_parser.parse_known_args()
         # overwrite the training script with the actual recipe path
         torchrun_args.training_script = str(script_path)
         # training_script_args=['finetune', '--config', 'examples/llm/llama_3_2_1b_squad.yaml']
@@ -261,7 +273,7 @@ def main():
     Returns:
         int: Job's status code
     """
-    args = build_parser().parse_args()
+    args, extra = build_parser().parse_known_args()
     logging.info(f"Domain:  {args.domain}")
     logging.info(f"Command: {args.command}")
     logging.info(f"Config:  {args.config.resolve()}")
@@ -282,7 +294,7 @@ def main():
         with open(job_conf_path, "w") as fp:
             yaml.dump(config, fp, default_flow_style=False, sort_keys=False)
         logging.info(f"Logging Slurm job in: {job_dir}")
-        return launch_with_slurm(args, job_conf_path, job_dir, slurm_config)
+        return launch_with_slurm(args, job_conf_path, job_dir, slurm_config, extra_args=extra)
     elif "k8s" in config or "kubernetes" in config:
         # launch job on kubernetes.
         raise NotImplementedError("kubernetes support is pending")

@@ -12,12 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
+import logging
 from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as dist
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper,
+)
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+from nemo_automodel.components.distributed.parallelizer import _extract_model_layers
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -38,25 +45,26 @@ class DDPManager:
     # This is populated in setup_distributed(), not by user:
     rank: int = field(init=False, default_factory=lambda: int, metadata={"help": "Global rank of this process."})
 
-    def setup_distributed(self):
+    activation_checkpointing: bool = field(default=False, metadata={"help": "Enable activation checkpointing if True."})
+
+    def __post_init__(self):
+        """
+        Post-initialization hook that sets up the distributed environment.
+        """
+        return self._setup_distributed()
+
+    def _setup_distributed(self):
         """
         Initialize the torch.distributed process group and set up device configuration.
-
-        This method requires the following environment variables to be set:
-            - RANK: Global rank of the process.
-            - WORLD_SIZE: Total number of processes.
-            - MASTER_ADDR: Address of the master node.
-            - MASTER_PORT: Port on which the master node is listening.
 
         The method sets the `rank` and `world_size` of the DDPManager,
         configures the device (GPU for 'nccl' backend, CPU otherwise), and initializes the process group.
         """
+        if not dist.is_available():
+            raise RuntimeError("torch.distributed not available")
+
         if not dist.is_initialized():
-            rank = int(os.environ["RANK"])
-            world = int(os.environ["WORLD_SIZE"])
-            os.environ.setdefault("MASTER_ADDR", os.environ.get("MASTER_ADDR", "localhost"))
-            os.environ.setdefault("MASTER_PORT", os.environ.get("MASTER_PORT", "29500"))
-            dist.init_process_group(self.backend, rank=rank, world_size=world)
+            raise RuntimeError("expected torch.distributed to be initialized")
 
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
@@ -69,7 +77,7 @@ class DDPManager:
         else:
             self.device = torch.device("cpu")
 
-    def wrap_model(self, model):
+    def parallelize(self, model):
         """
         Wraps the given model with DistributedDataParallel (DDP).
 
@@ -82,21 +90,36 @@ class DDPManager:
         Returns:
             torch.nn.parallel.DistributedDataParallel: The DDP-wrapped model.
         """
-        return DDP(model.to(self.device), device_ids=[self.device] if self.device.type == "cuda" else None)
+        if dist.get_world_size() == 1:
+            logger.info("World size is 1, skipping parallelization.")
+            model = model.to("cuda").to(torch.bfloat16)
+            if self.activation_checkpointing:
+                if hasattr(model, "gradient_checkpointing_enable"):
+                    model.gradient_checkpointing_enable()
+                else:
+                    logger.error("Model does not support gradient checkpointing. Skipping.")
+            return model
 
-    # @contextmanager
-    # def no_sync(self):
-    #     """
-    #     Context manager to temporarily disable gradient synchronization during backpropagation.
-    #
-    #     This can be used for gradient accumulation:
-    #         with manager.no_sync():
-    #             loss.backward()
-    #
-    #     When used within a DDP-wrapped model, it skips the gradient all‐reduce.
-    #     """
-    #     if isinstance(self.model, DDP):
-    #         with self.model.no_sync():
-    #             yield
-    #     else:
-    #         yield
+        if self.activation_checkpointing:
+            # Disable KV caching during training to ensure deterministic
+            # shapes between forward and checkpoint recomputation.
+            if hasattr(model, "config") and getattr(model.config, "use_cache", None) is not False:
+                try:
+                    model.config.use_cache = False
+                except Exception:
+                    pass
+
+            layers = _extract_model_layers(model)
+            for i, layer in enumerate(layers):
+                if hasattr(layer, "mlp"):
+                    layers[i].mlp = checkpoint_wrapper(layer.mlp)
+                if hasattr(layer, "self_attn"):
+                    layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)
+
+                if hasattr(layer, "input_layernorm"):
+                    layers[i].input_layernorm = checkpoint_wrapper(layers[i].input_layernorm)
+
+                if hasattr(layer, "post_attention_layernorm"):
+                    layers[i].post_attention_layernorm = checkpoint_wrapper(layers[i].post_attention_layernorm)
+
+        return DDP(model.to(self.device), device_ids=[self.device] if self.device.type == "cuda" else None)

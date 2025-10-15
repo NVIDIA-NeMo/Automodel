@@ -3,44 +3,69 @@
 ```
 
 ```{toctree}
-:caption: 🖥️  Environment Start
+:caption: Get Started
 :hidden:
+repository-structure.md
 guides/installation.md
 environment/local-workstation.md
 ```
+
 <!--
 environment/cluster.md
 -->
 
 ```{toctree}
-:caption: Model Coverage
+:caption: Announcements
 :hidden:
+Challenges in Enabling PyTorch Native Pipeline Parallelism for Hugging Face Transformer Models <https://github.com/NVIDIA-NeMo/Automodel/discussions/589>
+Google Gemma 3n: Efficient Multimodal Fine-tuning Made Simple <https://github.com/NVIDIA-NeMo/Automodel/discussions/494>
+Fine-tune Hugging Face Models Instantly with Day-0 Support with NVIDIA NeMo AutoModel <https://github.com/NVIDIA-NeMo/Automodel/discussions/477>
 
-model_coverage/llm.md
-model_coverage/vlm.md
 ```
 
 ```{toctree}
-:caption: 🚀 E2E Examples
+:caption: E2E Examples
 :hidden:
 
-guides/llm/sft.md
-guides/llm/peft.md
+guides/llm/finetune.md
+guides/llm/mcore-pretraining.md
+guides/llm/nanogpt-pretraining.md
 guides/omni/gemma3-3n.md
 ```
 
 ```{toctree}
-:caption: 📚 Guides
+:caption: Model Coverage
 :hidden:
 
-guides/dataset.md
-guides/checkpointing.md
-guides/gemma3n_blog.md
+model-coverage/llm.md
+model-coverage/vlm.md
 ```
 
 ```{toctree}
-:caption: 🛠️ Development
+:caption: Datasets
 :hidden:
 
+guides/dataset-overview.md
+guides/llm/dataset.md
+guides/llm/column-mapped-text-instruction-dataset.md
+guides/vlm/dataset.md
+```
+
+```{toctree}
+:caption: Development
+:hidden:
+guides/checkpointing.md
+guides/gradient-checkpointing.md
+guides/pipelining.md
+guides/llm/knowledge-distillation.md
+guides/fp8-training.md
+
 apidocs/index.rst
+```
+
+```{toctree}
+:caption: Performance
+:hidden:
+
+performance-summary.md
 ```

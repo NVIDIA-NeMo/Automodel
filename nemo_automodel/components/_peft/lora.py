@@ -120,6 +120,20 @@ class LinearLoRA(nn.Linear):
         )
 
     @torch.no_grad
+    def init_lora_weights(self, init_method: str):
+        """
+        Initialize the LoRA weights.
+
+        Args:
+            init_method (str): Method to initialize the LoRA weights.
+        """
+        if init_method == "xavier":
+            torch.nn.init.uniform_(self.lora_A.weight.data)
+        else:
+            nn.init.kaiming_uniform_(self.lora_A.weight.data, a=math.sqrt(5))
+        self.lora_B.weight.data.fill_(0)
+
+    @torch.no_grad
     @staticmethod
     def _init_adapter(
         obj,
@@ -161,12 +175,8 @@ class LinearLoRA(nn.Linear):
 
         obj.lora_A = nn.Linear(in_features, dim, bias=False, dtype=dtype, device=device)
         obj.lora_B = nn.Linear(dim, out_features, bias=False, dtype=dtype, device=device)
-        if lora_A_init_method == "xavier":
-            torch.nn.init.uniform_(obj.lora_A.weight.data)
-        else:
-            nn.init.kaiming_uniform_(obj.lora_A.weight.data, a=math.sqrt(5))
-        obj.lora_B.weight.data.fill_(0)
-        obj.dropout = nn.Dropout(p=dropout)
+        LinearLoRA.init_lora_weights(obj, lora_A_init_method)
+        obj.dropout_p = dropout
         assert dropout_position in ["pre", "post"], ("dropout position can only be pre/post", dropout_position)
         obj.dropout_position = dropout_position
 
@@ -194,11 +204,11 @@ class LinearLoRA(nn.Linear):
             res = F.linear(x, self.weight, self.bias)
 
         if self.dropout_position == "pre":
-            x = self.dropout(x)
+            x = F.dropout(x, p=self.dropout_p, training=self.training)
         lora_res = self.lora_B(self.lora_A(x))
         lora_res = lora_res * self.scale
         if self.dropout_position == "post":
-            lora_res = self.dropout(lora_res)
+            lora_res = F.dropout(lora_res, p=self.dropout_p, training=self.training)
         return res + lora_res
 
 
@@ -237,10 +247,10 @@ class TritonLinearLoRA(LinearLoRA):
             res = F.linear(x, self.weight, self.bias)
 
         if self.dropout_position == "pre":
-            x = self.dropout(x)
+            x = F.dropout(x, p=self.dropout_p, training=self.training)
         lora_res = LoRATritonFunction.apply(x, self.lora_A.weight, self.lora_B.weight, self.scale, x.dtype)
         if self.dropout_position == "post":
-            lora_res = self.dropout(lora_res)
+            lora_res = F.dropout(lora_res, p=self.dropout_p, training=self.training)
 
         return res + lora_res
 
@@ -306,17 +316,25 @@ def patch_linear_module(
     return orig_linear
 
 
-# -----------------------------------------------------------------------------#
-# 2.  Convenience: patch a model in-place                                      #
-# -----------------------------------------------------------------------------#
+# patch a model in-place
 def apply_lora_to_linear_modules(
     model: nn.Module,
     peft_config: PeftConfig,
+    quantization_config=None,
 ) -> int:
     """
     Replace selected nn.Linear layers with LinearLoRA layers (in-place).
 
-    target_modules accepts wildcard fragments, e.g. ["q_proj", "k_proj", ".*fc.*"].
+    Args:
+        model: The model to apply LoRA to.
+        peft_config: PEFT configuration for LoRA parameters.
+        quantization_config: Optional separate QLoRA quantization configuration.
+
+    Returns:
+        Number of modules that were modified with LoRA.
+
+    Note:
+        target_modules accepts wildcard fragments, e.g. ["q_proj", "k_proj", ".*fc.*"].
     """
     # Freeze base model parameters
     for w in model.parameters():
@@ -337,6 +355,11 @@ def apply_lora_to_linear_modules(
     for name, module in list(model.named_modules()):
         if matcher.match(module, name):
             num_modules_matched += 1
+            # For QLora, set lora_dtype to float16/bfloat16 since base weights are quantized
+            lora_dtype = peft_config.lora_dtype
+            if quantization_config is not None and lora_dtype is None:
+                lora_dtype = quantization_config.bnb_4bit_compute_dtype or torch.bfloat16
+
             patch_linear_module(
                 module,
                 dim=peft_config.dim,
@@ -344,7 +367,7 @@ def apply_lora_to_linear_modules(
                 dropout=peft_config.dropout,
                 dropout_position=peft_config.dropout_position,
                 lora_A_init_method=peft_config.lora_A_init,
-                lora_dtype=peft_config.lora_dtype,
+                lora_dtype=lora_dtype,
                 use_triton=peft_config.use_triton,
             )
 

@@ -16,6 +16,7 @@
 
 import glob
 import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,8 +26,10 @@ import torch
 import torch.distributed
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
+import yaml
 from safetensors import safe_open
 from safetensors.torch import save_file
+from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
@@ -57,6 +60,8 @@ class CheckpointingConfig:
     model_repo_id: str
     save_consolidated: bool
     is_peft: bool
+    model_state_dict_keys: list[str]  # copy of the model state dict keys before any parallelization
+    dequantize_base_checkpoint: bool = False
 
     def __post_init__(self):
         """
@@ -103,8 +108,15 @@ def save_model(
         ):
             os.makedirs(consolidated_model_path, exist_ok=True)
             # save the config.json file
-            with open(os.path.join(consolidated_model_path, "config.json"), "w") as f:
-                f.write(model.config.to_json_string())
+            model_part = model[0] if isinstance(model, list) else model
+
+            if hasattr(model_part, "config"):
+                with open(os.path.join(consolidated_model_path, "config.json"), "w") as f:
+                    f.write(model_part.config.to_json_string())
+            # save the generation_config.json file
+            if hasattr(model_part, "generation_config"):
+                with open(os.path.join(consolidated_model_path, "generation_config.json"), "w") as f:
+                    f.write(model_part.generation_config.to_json_string())
 
             # save the tokenizer
             if tokenizer is not None:
@@ -126,10 +138,13 @@ def save_model(
 
     elif checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
         model_state_dict = model_state.state_dict()
+        state_dict_adapter = getattr((model[0] if isinstance(model, list) else model), "state_dict_adapter", None)
+        if state_dict_adapter:
+            model_state_dict = state_dict_adapter.to_hf(model_state_dict, exclude_key_regex=r".*_extra_state.*")
         fqn_to_file_index_mapping = None
         if checkpoint_config.save_consolidated:
             # we first need to find the FQN -> .safetensors mapping
-            index_path = _get_safetensors_index_path(
+            index_path = get_safetensors_index_path(
                 checkpoint_config.model_cache_dir,
                 checkpoint_config.model_repo_id,
             )
@@ -138,6 +153,14 @@ def save_model(
                 fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(
                     index_path, getattr(model, "_checkpoint_conversion_mapping", None)
                 )
+                # some HF models like Moonlight-16B have non-persistent buffers in the base checkpoint
+                # however, HF initializes buffers with persistent=False, so we need to make sure these
+                # buffer keys are not saved during checkpointing
+                keys_to_remove = list(
+                    set(fqn_to_file_index_mapping.keys()) - set(checkpoint_config.model_state_dict_keys)
+                )
+                for key in keys_to_remove:
+                    fqn_to_file_index_mapping.pop(key)
             else:
                 fqn_to_file_index_mapping = {k: 1 for k in model_state_dict.keys()}
 
@@ -145,7 +168,7 @@ def save_model(
             # These will go to the same file as the last file (or file 1 for single-file models)
             default_index = max(fqn_to_file_index_mapping.values())
 
-            # TODO:(@adil-a): This will need to change when we add PP. Maybe we can cache the keys in ModelState.
+            # add any additional keys that are not in the base checkpoint
             for fqn in list(model_state_dict.keys()):
                 fqn_to_file_index_mapping[fqn] = fqn_to_file_index_mapping.get(fqn, default_index)
 
@@ -166,27 +189,111 @@ def save_model(
         raise ValueError(f"Unsupported model save format: {checkpoint_config.model_save_format}")
 
 
+def load_model_from_base_checkpoint(
+    model: torch.nn.Module,
+    device: torch.device,
+    is_peft: bool,
+    root_dir: str,
+    model_name: str | None,
+    peft_init_method: str,
+    device_mesh: Optional[DeviceMesh] = None,
+    moe_mesh: Optional[DeviceMesh] = None,
+    load_base_model: bool = True,
+    quantization: bool = False,
+):
+    """
+    Load a model from the base Hugging Face checkpoint in parallel.
+
+    Args:
+        model: Model to load state into
+        device: Device to load model onto
+        is_peft: Whether the model is PEFT
+        root_dir: Root directory of the model
+        model_name: Name of the model
+    """
+    from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
+
+    to_empty_parameters_only(model, device=device)
+
+    # HF models set _is_hf_initialized to True after initialization.
+    # But because we initialize on meta device, these are erroneously set to True.
+    # We need to set them to False and call initialize_weights to re-initialize the weights.
+
+    # Gemma3ForConditionalGeneration cannot be pretrained currently. The pinned torch version
+    # doesn't support initialize_weights when the model is sharded. This is because Gemma's
+    # initialize_weights method requires setting a row to zeros in the embedding matrix.
+    # This index selection op is not supported for DTensors in the pinned torch version.
+    if not isinstance(model, Gemma3ForConditionalGeneration):
+        for _, module in model.named_modules():
+            if hasattr(module, "_is_hf_initialized"):
+                module._is_hf_initialized = False
+
+        # init model weights
+        if hasattr(model, "initialize_weights"):
+            model.initialize_weights()
+        else:
+            logging.warning(
+                "Warning: Model does not have initialize_weights method. Requires custom initialization to be implemented."
+            )
+
+    # init peft adapters with the scaled weights
+    _init_peft_adapters(model, peft_init_method)
+
+    if load_base_model:
+        assert model_name is not None, "model_name is required when loading base model"
+        load_model(
+            model,
+            model_path=model_name if os.path.exists(model_name) else get_safetensors_index_path(root_dir, model_name),
+            model_save_format=SerializationFormat.SAFETENSORS,
+            is_peft=is_peft,
+            is_init_step=True,
+            use_checkpoint_id=False,
+            key_mapping=getattr(model, "_checkpoint_conversion_mapping", None),
+            load_peft_adapters=False,
+            moe_mesh=moe_mesh,
+            quantization=quantization,
+        )
+
+    is_tied_lm_head = getattr(getattr(model, "config", {}), "tie_word_embeddings", False)
+    if hasattr(model, "tie_weights") and is_tied_lm_head:
+        model.tie_weights()
+
+
 def load_model(
     model: torch.nn.Module,
-    weights_path: str,
-    checkpoint_config: CheckpointingConfig,
+    model_path: str,
+    model_save_format: SerializationFormat,
+    *,
+    is_peft: bool = False,
+    is_init_step: bool = False,
+    use_checkpoint_id: bool = True,
+    key_mapping: Optional[dict[str, str]] = None,
+    load_peft_adapters: bool = True,
+    moe_mesh: Optional[DeviceMesh] = None,
+    quantization: bool = False,
 ):
     """
     Load a model state dictionary from a weights path.
 
     Args:
         model: Model to load state into
-        weights_path: Path to load model weights from
-        checkpoint_config: Checkpointing configuration
+        model_path: Path to load model weights from
+        model_save_format: Model save format
+        is_peft: Whether the model is PEFT
+        is_init_step: Whether the model is being initialized
+        use_checkpoint_id: Whether to use the checkpoint ID
+        key_mapping: Key mapping for the model
+        load_peft_adapters: Whether to load PEFT adapters
+        moe_mesh: MoE mesh for distributed loading
     """
-    model_path = os.path.join(weights_path, "model")
-
     # Validate checkpoint directory
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model path {model_path} does not exist")
-    model_state = ModelState(model, checkpoint_config.is_peft)
+    model_state = ModelState(model, is_peft=is_peft, is_init_step=is_init_step)
 
-    if checkpoint_config.is_peft:
+    if is_peft and load_peft_adapters:
+        # no PP support for PEFT models
+        model = model[0] if isinstance(model, list) else model
         state_dict = model.state_dict()
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             with safe_open(os.path.join(model_path, "adapter_model.safetensors"), framework="pt") as f:
@@ -195,22 +302,36 @@ def load_model(
         # the call below will broadcast from rank0 to all other ranks
         model_state.load_state_dict(state_dict)
 
-    elif checkpoint_config.model_save_format == SerializationFormat.SAFETENSORS:
-        storage_reader = _HuggingFaceStorageReader(path=model_path)
+    elif model_save_format == SerializationFormat.SAFETENSORS:
+        storage_reader = _HuggingFaceStorageReader(path=model_path, key_mapping=key_mapping)
 
         reinstated_state_dict = model_state.state_dict()
+        state_dict_adapter = getattr((model[0] if isinstance(model, list) else model), "state_dict_adapter", None)
+        if state_dict_adapter:
+            reinstated_state_dict = state_dict_adapter.to_hf(
+                reinstated_state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization
+            )
+
         dcp.load(
             reinstated_state_dict,
-            checkpoint_id=model_path,
+            checkpoint_id=model_path if use_checkpoint_id else None,
             storage_reader=storage_reader,
         )
-        model_state.load_state_dict(reinstated_state_dict)
-    elif checkpoint_config.model_save_format == SerializationFormat.TORCH_SAVE:
+
+        if state_dict_adapter:
+            ep_mesh_dims = [dim for dim in moe_mesh.mesh_dim_names if dim != "pp"] if moe_mesh is not None else []
+            ep_mesh = moe_mesh[tuple(ep_mesh_dims)] if ep_mesh_dims else moe_mesh
+            reinstated_state_dict = state_dict_adapter.from_hf(reinstated_state_dict, device_mesh=ep_mesh)
+
+        model_state.load_state_dict(
+            reinstated_state_dict, strict=not (len(model_state.model) > 1 or state_dict_adapter is not None)
+        )
+    elif model_save_format == SerializationFormat.TORCH_SAVE:
         reinstated_state_dict = model_state.state_dict()
-        dcp.load(reinstated_state_dict, checkpoint_id=model_path)
-        model_state.load_state_dict(reinstated_state_dict)
+        dcp.load(reinstated_state_dict, checkpoint_id=model_path if use_checkpoint_id else None)
+        model_state.load_state_dict(reinstated_state_dict, strict=not (len(model_state.model) > 1))
     else:
-        raise ValueError(f"Unsupported model save format: {checkpoint_config.model_save_format}")
+        raise ValueError(f"Unsupported model save format: {model_save_format}")
 
 
 def save_optimizer(
@@ -260,7 +381,67 @@ def load_optimizer(
     optimizer_state.load_state_dict(reinstated_state_dict)
 
 
-def _get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
+def save_dp_aware_helper(
+    state: Any,
+    state_name: str,
+    path: str,
+    dp_rank: int,
+    tp_rank: int,
+    pp_rank: int,
+):
+    """
+    Save the stateful object.
+
+    This function is a helper function currently used to save the dataloader and rng state.
+
+    Args:
+        state: Stateful object to save
+        state_name: Name of the stateful object
+        path: Path to save stateful object
+        dp_rank: Data parallel rank
+        tp_rank: Tensor parallel rank
+        pp_rank: Pipeline parallel rank
+    """
+    state_dir = os.path.join(path, state_name)
+    os.makedirs(state_dir, exist_ok=True)
+    if tp_rank == 0 and pp_rank == 0:
+        torch.save(state.state_dict(), os.path.join(state_dir, f"{state_name}_dp_rank_{dp_rank}.pt"))
+
+
+def load_dp_aware_helper(
+    state: Any,
+    state_name: str,
+    path: str,
+    dp_rank: int,
+):
+    """
+    Load the stateful object.
+
+    This function is a helper function currently used to load the dataloader and rng state.
+
+    Args:
+        state: Stateful object to load
+        state_name: Name of the stateful object
+        path: Path to load stateful object
+        dp_rank: Data parallel rank
+    """
+    state_dir = os.path.join(path, state_name)
+    state.load_state_dict(torch.load(os.path.join(state_dir, f"{state_name}_dp_rank_{dp_rank}.pt"), weights_only=False))
+
+
+def save_config(config: dict[str, Any], weights_path: str):
+    """
+    Save a config to a weights path.
+
+    Args:
+        config: Config to save
+        weights_path: Path to save config
+    """
+    with open(os.path.join(weights_path, "config.yaml"), "w") as f:
+        yaml.dump(config, f, sort_keys=False, default_flow_style=False)
+
+
+def get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
     """
     Return the directory containing the first `model.safetensors.index.json` found for given model.
 
@@ -306,6 +487,25 @@ def _get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
             raise FileNotFoundError(f"No snapshot directories found in {snapshots_root}")
 
 
+def to_empty_parameters_only(
+    model: nn.Module, *, device: torch.device, recurse: bool = True, dtype: torch.dtype | None = None
+) -> nn.Module:
+    """
+    Move parameters to the specified device without copying storage, skipping buffers.
+
+    Mirrors torch.nn.Module.to_empty but applies only to parameters, not buffers.
+
+    Args:
+        model: The module to transform
+        device: Target device
+        recurse: Whether to recurse into child modules
+
+    Returns:
+        The same module instance
+    """
+    return _apply(model, lambda t: torch.empty_like(t, device=device, dtype=dtype), recurse=recurse)
+
+
 def _save_peft_adapters(
     model_state: ModelState,
     peft_config: "PeftConfig",
@@ -339,14 +539,14 @@ def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState) -> d
         "QuestionAnswering": "QUESTION_ANS",
         "FeatureExtraction": "FEATURE_EXTRACTION",
     }
-    target_modules = _extract_target_modules(model_state.model)
+    target_modules = _extract_target_modules(model_state.model[0])
     try:
-        model_task = model_state.model.config.architectures[0].split("For")[-1]
+        model_task = model_state.model[0].config.architectures[0].split("For")[-1]
     except (AttributeError, IndexError, TypeError):
         model_task = "N/A"
 
     try:
-        name_or_path = model_state.model.config.name_or_path
+        name_or_path = model_state.model[0].config.name_or_path
     except (AttributeError, TypeError):
         name_or_path = "N/A"
 
@@ -377,9 +577,111 @@ def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
 def _extract_target_modules(model: nn.Module) -> list[str]:
     """
     Extract the target modules from the model.
+
+    Note: When torch.compile is used, module names get prefixed with '_orig_mod.'.
+    This function strips those prefixes to get the original module names.
     """
     final_target_modules = set()
     for name, _ in model.named_modules():
         if "lora" in name.lower():
-            final_target_modules.add(name.rsplit(".", 1)[0])
+            # Remove the torch.compile _orig_mod prefix if present
+            target_name = name.rsplit(".", 1)[0]
+            if target_name.startswith("_orig_mod."):
+                target_name = target_name[len("_orig_mod.") :]
+            final_target_modules.add(target_name)
     return sorted(list(final_target_modules))
+
+
+def _init_peft_adapters(model: nn.Module, peft_init_method: str):
+    """
+    Initialize the PEFT adapters with the scaled weights.
+
+    Args:
+        model: Model to initialize PEFT adapters for
+        peft_init_method: Method to initialize PEFT adapters e.g. "xavier". See `LinearLoRA` for more details.
+    """
+    for module in model.modules():
+        if hasattr(module, "init_lora_weights"):
+            try:
+                module.init_lora_weights(peft_init_method)
+            except Exception as e:
+                logging.warning(f"Failed to initialize weights for PEFT adapter `{module.__class__.__name__}`: {e}")
+
+
+def _apply(module, fn, recurse=True):
+    from torch.utils._python_dispatch import is_traceable_wrapper_subclass
+
+    if recurse:
+        for child in module.children():
+            _apply(child, fn, recurse=recurse)
+
+    def compute_should_use_set_data(tensor, tensor_applied):
+        if torch._has_compatible_shallow_copy_type(tensor, tensor_applied):
+            # If the new tensor has compatible tensor type as the existing tensor,
+            # the current behavior is to change the tensor in-place using `.data =`,
+            # and the future behavior is to overwrite the existing tensor. However,
+            # changing the current behavior is a BC-breaking change, and we want it
+            # to happen in future releases. So for now we introduce the
+            # `torch.__future__.get_overwrite_module_params_on_conversion()`
+            # global flag to let the user control whether they want the future
+            # behavior of overwriting the existing tensor or not.
+            return not torch.__future__.get_overwrite_module_params_on_conversion()
+        else:
+            return False
+
+    should_use_swap_tensors = torch.__future__.get_swap_module_params_on_conversion()
+    for key, param in module._parameters.items():
+        if param is None:
+            continue
+        # Tensors stored in modules are graph leaves, and we don't want to
+        # track autograd history of `param_applied`, so we have to use
+        # `with torch.no_grad():`
+        with torch.no_grad():
+            param_applied = fn(param)
+        p_should_use_set_data = compute_should_use_set_data(param, param_applied)
+
+        # subclasses may have multiple child tensors so we need to use swap_tensors
+        p_should_use_swap_tensors = should_use_swap_tensors or is_traceable_wrapper_subclass(param_applied)
+
+        param_grad = param.grad
+        if p_should_use_swap_tensors:
+            try:
+                if param_grad is not None:
+                    # Accessing param.grad makes its at::Tensor's use_count 2, which will prevent swapping.
+                    # Decrement use count of the gradient by setting to None
+                    param.grad = None
+                param_applied = torch.nn.Parameter(param_applied, requires_grad=param.requires_grad)
+                torch.utils.swap_tensors(param, param_applied)
+            except Exception as e:
+                if param_grad is not None:
+                    param.grad = param_grad
+                raise RuntimeError(f"_apply(): Couldn't swap {module._get_name()}.{key}") from e
+            out_param = param
+        elif p_should_use_set_data:
+            param.data = param_applied
+            out_param = param
+        else:
+            assert isinstance(param, torch.nn.Parameter)
+            assert param.is_leaf
+            out_param = torch.nn.Parameter(param_applied, param.requires_grad)
+            module._parameters[key] = out_param
+
+        if param_grad is not None:
+            with torch.no_grad():
+                grad_applied = fn(param_grad)
+            g_should_use_set_data = compute_should_use_set_data(param_grad, grad_applied)
+            if p_should_use_swap_tensors:
+                grad_applied.requires_grad_(param_grad.requires_grad)
+                try:
+                    torch.utils.swap_tensors(param_grad, grad_applied)
+                except Exception as e:
+                    raise RuntimeError(f"_apply(): Couldn't swap {module._get_name()}.{key}.grad") from e
+                out_param.grad = param_grad
+            elif g_should_use_set_data:
+                assert out_param.grad is not None
+                out_param.grad.data = grad_applied
+            else:
+                assert param_grad.is_leaf
+                out_param.grad = grad_applied.requires_grad_(param_grad.requires_grad)
+
+    return module

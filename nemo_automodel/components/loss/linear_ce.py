@@ -61,7 +61,10 @@
 # -------------------------------------------------------------------------------
 
 
+from typing import Optional
+
 import torch
+import torch.nn as nn
 
 from nemo_automodel.shared.import_utils import MISSING_CUT_CROSS_ENTROPY_MSG
 
@@ -70,8 +73,8 @@ try:
     from cut_cross_entropy import linear_cross_entropy
 
     HAVE_CUT_CROSS_ENTROPY = True
-except ImportError:
-    HAVE_CUT_CROSS_ENTROPY = False
+except ImportError:  # pragma: no cover
+    HAVE_CUT_CROSS_ENTROPY = False  # pragma: no cover
 
 
 def new_is_triton_greater_or_equal(version_str):
@@ -113,7 +116,7 @@ if HAVE_CUT_CROSS_ENTROPY:
     tl_utils.is_triton_greater_or_equal_3_2_0 = new_is_triton_greater_or_equal_3_2_0
 
 
-class FusedLinearCrossEntropy:
+class FusedLinearCrossEntropy(nn.Module):
     def __init__(self, ignore_index: int = -100, logit_softcapping: float = 0, reduction: str = "sum"):
         """
         Fused linear cross entropy loss.
@@ -123,15 +126,17 @@ class FusedLinearCrossEntropy:
             logit_softcapping (float): Value for softcapping logits (0 means no capping). Defaults to 0.
             reduction (str): Type of reduction. Defaults to "sum".
         """
+        super().__init__()
         self.ignore_index = ignore_index
         self.logit_softcapping = logit_softcapping
         self.reduction = reduction
 
-    def __call__(
+    def forward(
         self,
         hidden_states: torch.Tensor,
         labels: torch.Tensor,
         lm_weight: torch.Tensor,
+        num_label_tokens: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Compute fused linear cross entropy loss that matches PyTorch's cross_entropy behavior.
@@ -140,6 +145,7 @@ class FusedLinearCrossEntropy:
             hidden_states: Input hidden states
             labels: Target labels
             lm_weight: Weight matrix for linear transformation
+            num_label_tokens: Number of non-padding tokens.
         """
         if not HAVE_CUT_CROSS_ENTROPY:
             raise ImportError(MISSING_CUT_CROSS_ENTROPY_MSG)
@@ -160,4 +166,7 @@ class FusedLinearCrossEntropy:
             shift=False,  # Match PyTorch behavior
             filter_eps=None,  # No token filtering
         )
+        if num_label_tokens is not None:
+            assert self.reduction == "sum", "num_label_tokens is only supported when reduction is 'sum'"
+            loss = loss / num_label_tokens
         return loss

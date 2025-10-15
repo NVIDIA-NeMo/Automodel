@@ -23,12 +23,15 @@ import torch
 import torch.distributed.checkpoint as dcp
 import torch.distributed.tensor
 import torch.nn as nn
+import yaml
 
 from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM, calculate_loss
 
+import datasets
+datasets.disable_caching()
 
 def get_validation_loss(
     model: nn.Module, val_batch: dict[str, torch.Tensor], loss_fn: nn.Module, device: torch.device
@@ -52,14 +55,8 @@ def get_validation_loss(
         return loss
 
 
-def load_dcp(ckpt_dir: Path | str) -> dict[str, torch.Tensor]:
-    """
-    Loads a DCP checkpoint in a state dictionary from a directory.
-    Args:
-        ckpt_dir: The directory containing the DCP checkpoint.
-    Returns:
-        A state dictionary containing the checkpoint.
-    """
+def load_dcp(ckpt_dir: Path | str) -> tuple[dict, dict]:
+    """Loads a DCP checkpoint in a state dictionary from a directory."""
     if not isinstance(ckpt_dir, Path):
         ckpt_dir = Path(ckpt_dir)
     if "model" in ckpt_dir.name:
@@ -68,17 +65,38 @@ def load_dcp(ckpt_dir: Path | str) -> dict[str, torch.Tensor]:
         fs_reader = dcp.FileSystemReader(ckpt_dir)
     metadata = fs_reader.read_metadata()
 
-    state_dict = {
+    # Load tensor data
+    tensor_state_dict = {
         k: torch.empty(tp.size, dtype=tp.properties.dtype)
         for k, tp in metadata.state_dict_metadata.items()
         if type(tp).__name__ == "TensorStorageMetadata"
     }
 
-    dcp.load(
-        state_dict,
-        storage_reader=fs_reader,
-    )
-    return state_dict
+    if tensor_state_dict:
+        dcp.load(tensor_state_dict, storage_reader=fs_reader)
+
+    # Load scheduler data
+    sched_keys = [k for k, tp in metadata.state_dict_metadata.items() if "sched" in k]
+
+    sched_state_dict = {}
+    if sched_keys:
+        sched_state_dict = {k: None for k in sched_keys}
+        try:
+            dcp.load(sched_state_dict, storage_reader=fs_reader)
+        except Exception:
+            sched_state_dict = {}
+
+    return tensor_state_dict, sched_state_dict
+
+
+def compare_configs(source_config: dict, restored_config: dict):
+    """ Recursively compare two configs."""
+    for k, v in source_config.items():
+        if k in restored_config:
+            if isinstance(v, dict):
+                compare_configs(v, restored_config[k])
+            else:
+                assert v == restored_config[k], f"Config mismatch for key {k}. Expected {v} but got {restored_config[k]}"
 
 
 def to_cpu(
@@ -87,13 +105,9 @@ def to_cpu(
     """
     Converts a state dictionary to CPU.
     """
-    return {k: v.cpu() if isinstance(v, torch.Tensor) else to_cpu(v) for k, v in state_dict.items()}
+    return {k: v.cpu() for k, v in state_dict.items() if isinstance(v, torch.Tensor)}
 
-
-def test_hf_vlm_sharded_checkpoint():
-    """
-    Tests HF sharded checkpoint
-    """
+def get_test_hf_sharded_vlm_checkpoint_expected_keys():
     expected_model_keys = {
         "model.vision_tower.vision_model.embeddings.patch_embedding.weight": ([576, 3, 14, 14], torch.bfloat16, "cpu"),
         "model.vision_tower.vision_model.embeddings.patch_embedding.bias": ([576], torch.bfloat16, "cpu"),
@@ -520,9 +534,17 @@ def test_hf_vlm_sharded_checkpoint():
         "optim.state.model.language_model.norm.weight.exp_avg": ([64], torch.bfloat16, "cpu"),
         "optim.state.model.language_model.norm.weight.exp_avg_sq": ([64], torch.bfloat16, "cpu"),
     }
+    return expected_model_keys, expected_optim_keys
+
+def test_hf_vlm_sharded_checkpoint():
+    """
+    Tests HF sharded checkpoint
+    """
+    expected_model_keys, expected_optim_keys = get_test_hf_sharded_vlm_checkpoint_expected_keys()
+
 
     script_path = Path(__file__).parent.resolve()
-    cfg = parse_args_and_load_config(script_path / "gemma_3_vl_4b_cord_v2.yaml")
+    cfg = parse_args_and_load_config(script_path / "gemma3" / "gemma3_vl_4b_cord_v2.yaml")
     trainer = FinetuneRecipeForVLM(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
@@ -538,8 +560,8 @@ def test_hf_vlm_sharded_checkpoint():
         OptimizerState(
             trainer.model,
             trainer.optimizer,
-            trainer.step_scheduler,
-        ).state_dict()["optim"]["state"]
+            trainer.lr_scheduler,
+        ).state_dict()["optim"]
     )
 
     # assert the correct paths exist
@@ -547,17 +569,21 @@ def test_hf_vlm_sharded_checkpoint():
         "model",
         "optim",
         "step_scheduler.pt",
-        "dataloader.pt",
+        "dataloader/dataloader_dp_rank_0.pt",
+        "dataloader/dataloader_dp_rank_1.pt",
+        "rng/rng_dp_rank_0.pt",
+        "rng/rng_dp_rank_1.pt",
         "model/shard-00001-model-00001-of-00001.safetensors",
         "model/shard-00002-model-00001-of-00001.safetensors",
         "optim/__0_0.distcp",
         "optim/__1_0.distcp",
         "optim/.metadata",
         "step_scheduler.pt",
+        "config.yaml",
     ]
 
     for file in output_files:
-        path = Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / file
+        path = Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / file
         assert path.exists(), f"Expected {path} to exist"
         if "." in file:
             assert path.is_file(), f"Expected {path} to be a file"
@@ -565,11 +591,39 @@ def test_hf_vlm_sharded_checkpoint():
             assert path.is_dir(), f"Expected {path} to be a directory"
         assert os.access(path, os.R_OK), f"Expected {path} to be readable"
         assert path.stat().st_size > 0, f"Expected {path} to be non-empty"
-    restored_optim_dict = load_dcp(
-        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "optim",
+
+    # Load checkpoint data
+    restored_optim_dict, saved_lr_scheduler_state = load_dcp(
+        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "optim",
     )
-    restored_model_dict = load_dcp(
-        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "model",
+    # Remove "sched." prefix from keys in saved_lr_scheduler_state if present
+    if saved_lr_scheduler_state is not None:
+        saved_lr_scheduler_state = {
+            (k[6:] if k.startswith("sched.") else k): v for k, v in saved_lr_scheduler_state.items()
+        }
+    if saved_lr_scheduler_state is not None and trainer.lr_scheduler is not None:
+        assert hasattr(trainer, "lr_scheduler") and trainer.lr_scheduler is not None, (
+            "test_dcp_checkpoint: lr_scheduler not found in restored trainer"
+        )
+
+        restored_lr_state = trainer.lr_scheduler.state_dict()
+
+        for key in saved_lr_scheduler_state:
+            assert key in restored_lr_state, f"test_dcp_checkpoint: lr_scheduler key {key} missing in restored state"
+            saved_val = saved_lr_scheduler_state[key]
+            restored_val = restored_lr_state[key]
+
+            if isinstance(saved_val, torch.Tensor):
+                assert torch.equal(saved_val, restored_val), (
+                    f"test_dcp_checkpoint: lr_scheduler tensor mismatch for {key}"
+                )
+            else:
+                assert saved_val == restored_val, (
+                    f"test_dcp_checkpoint: lr_scheduler value mismatch for {key}: saved={saved_val} != restored={restored_val}"
+                )
+
+    restored_model_dict, _ = load_dcp(
+        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "model",
     )
 
     # check if new model and current model give the same CE loss
@@ -580,6 +634,11 @@ def test_hf_vlm_sharded_checkpoint():
     source_model_loss = get_validation_loss(trainer.model, val_batch, trainer.loss_fn, trainer.dist_env.device)
     restored_model_loss = get_validation_loss(restored_model, val_batch, trainer.loss_fn, trainer.dist_env.device)
     assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
+
+    # compare the recipe configs
+    with open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "config.yaml", "r") as f:
+        restored_config = yaml.safe_load(f)
+    compare_configs(trainer.cfg.raw_config, restored_config)
 
     # similarly, the optimizer states are saved in a dictionary formatted as:
     # {
@@ -602,7 +661,7 @@ def test_hf_vlm_sharded_checkpoint():
     #     "optim.state.model.layers.0.self_attn.q_proj.weight.step": ...
     # }
     # so we flatten the in-memory optimizer state dictionary to match the on-disk view
-    flattened_optim_dict = _flatten(optimizer_state_dict, parent_key="optim.state")
+    flattened_optim_dict = _flatten(optimizer_state_dict, parent_key="optim")
 
     # ---------------------------------------------------------------------
     # Compare the flattened in-memory model state with the on-disk view

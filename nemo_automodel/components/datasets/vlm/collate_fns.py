@@ -39,6 +39,16 @@ def create_loss_mask_with_start_of_response_token(input_ids, processor, start_of
     Returns:
         loss_mask: List of 0/1 flags where 0 = masked (prompt), 1 = unmasked (response)
     """
+
+    def find_sequence_in_list(input_ids, target_sequence):
+        """Find the starting index of target_sequence in input_ids"""
+        if not target_sequence:
+            return -1
+        for i in range(len(input_ids) - len(target_sequence) + 1):
+            if input_ids[i : i + len(target_sequence)] == target_sequence:
+                return i
+        return -1
+
     tokenizer = getattr(processor, "tokenizer", processor)
     input_ids = input_ids.tolist()
 
@@ -46,11 +56,9 @@ def create_loss_mask_with_start_of_response_token(input_ids, processor, start_of
         return [1] * len(input_ids)
 
     if isinstance(start_of_response_token, str):
-        start_of_response_token_id = tokenizer(start_of_response_token, add_special_tokens=False)["input_ids"]
-        start_of_turn_token_id = start_of_response_token_id[0]
-    if isinstance(start_of_response_token, str) and input_ids.count(start_of_turn_token_id) >= 2:
-        first_start_of_turn_token_id = input_ids.index(start_of_turn_token_id)
-        response_start = input_ids.index(start_of_turn_token_id, first_start_of_turn_token_id + 1)
+        start_of_response_token_ids = tokenizer(start_of_response_token, add_special_tokens=False)["input_ids"]
+        first_occurrence = find_sequence_in_list(input_ids, start_of_response_token_ids)
+        response_start = first_occurrence if first_occurrence >= 0 else 0
     else:
         response_start = 0
 
@@ -64,6 +72,49 @@ def create_loss_mask_with_start_of_response_token(input_ids, processor, start_of
             loss_mask[i] = 0
 
     return loss_mask
+
+
+def phi4_mm_collate_fn(examples, processor):
+    """Collate function for Phi-4 MM model audio input"""
+
+    # Extract conversations and audio data
+    conversations = [example["conversation"] for example in examples]
+    audios = [example["audio"] for example in examples]
+    texts = [processor.apply_chat_template(conversation, tokenize=False) for conversation in conversations]
+    audio_inputs = [(audio["array"], audio["sampling_rate"]) if isinstance(audio, dict) else audio for audio in audios]
+    batch = processor(
+        text=texts, audios=audio_inputs, return_tensors="pt", padding=True, truncation=True, max_length=1024
+    )
+    labels = batch["input_ids"].clone()[:, 1:]
+    labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
+
+    loss_masks = []
+    for i, conversation in enumerate(conversations):
+        input_ids = batch["input_ids"][i].tolist()
+
+        assistant_content = conversation[1]["content"]
+        assistant_tokens = processor.tokenizer(assistant_content, add_special_tokens=False)["input_ids"]
+
+        loss_mask = [0] * len(input_ids)
+        for start_idx in range(len(input_ids) - len(assistant_tokens) + 1):
+            if input_ids[start_idx : start_idx + len(assistant_tokens)] == assistant_tokens:
+                for j in range(len(assistant_tokens)):
+                    loss_mask[start_idx + j] = 1
+                break
+        loss_masks.append(loss_mask)
+
+    max_len = max(len(mask) for mask in loss_masks)
+    padded_loss_masks = [mask + [0] * (max_len - len(mask)) for mask in loss_masks]
+    batch["loss_mask"] = torch.tensor(padded_loss_masks, dtype=torch.float)
+
+    labels[batch["loss_mask"] == 0] = -100
+    batch["labels"] = labels
+
+    # Remove specified batch features if present
+    for key in ["input_image_embeds", "image_sizes", "image_attention_mask"]:
+        if key in batch:
+            del batch[key]
+    return batch
 
 
 def qwen2_5_collate_fn(
@@ -107,7 +158,8 @@ def default_collate_fn(examples: list, processor, start_of_response_token=None) 
     batch = processor.apply_chat_template(
         [example["conversation"] for example in examples],
         tokenize=True,
-        add_generation_prompt=False,
+        padding=True,
+        truncation=True,
         return_tensors="pt",
         return_dict=True,
     )

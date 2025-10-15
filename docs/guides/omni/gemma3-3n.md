@@ -24,7 +24,7 @@ from nemo_automodel.datasets.vlm.datasets import make_medpix_vqa_dataset
 
 # Load and preprocess the dataset
 dataset = make_medpix_vqa_dataset(
-    path_or_dataset="mmoukouba/MedPix-VQA", 
+    path_or_dataset="mmoukouba/MedPix-VQA",
     split="train"
 )
 ```
@@ -46,7 +46,7 @@ conversation = [
         ],
     },
     {
-        "role": "assistant", 
+        "role": "assistant",
         "content": [{"type": "text", "text": example["answer"]}]
     },
 ]
@@ -60,7 +60,7 @@ Both Gemma 3 and Gemma 3n models work seamlessly with the Hugging Face `AutoProc
 
 ```python
 processor = AutoProcessor.from_pretrained("google/gemma-3-4b-it")
-# For Gemma 3n, get processor: 
+# For Gemma 3n, get processor:
 # processor = AutoProcessor.from_pretrained("google/gemma-3n-e4b-it")
 
 # For Gemma 3 and Gemma 3n, use the default collate function
@@ -72,7 +72,7 @@ def default_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
         return_tensors="pt",
         return_dict=True,
     )
-    
+
     labels = batch["input_ids"].clone()[:, 1:]
     labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
     batch["labels"] = labels
@@ -80,7 +80,7 @@ def default_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
         batch["input_ids"], processor, start_of_response_token=start_of_response_token
     )
     batch["loss_mask"] = loss_mask
-    
+
     return batch
 ```
 
@@ -123,7 +123,7 @@ We provide [example custom collate functions](https://github.com/NVIDIA-NeMo/Aut
 
 ## Run the Fine-Tune Script
 
-The VLM fine-tuning functionality is provided through [`examples/vlm/finetune.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm/finetune.py).
+The VLM fine-tuning functionality is provided through [`examples/vlm_finetune/finetune.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/finetune.py).
 
 ### Apply YAML-Based Configuration
 
@@ -136,14 +136,14 @@ The simplest way to run fine-tuning is with a YAML configuration file. We provid
 * **Single GPU**
 
 ```bash
-uv run examples/vlm/finetune.py --config examples/vlm/gemma_3_vl_3b_medpix_vqa.yaml
+uv run examples/vlm_finetune/finetune.py --config examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix.yaml
 ```
 
 * **Multi GPU**
 
 ```bash
-uv run torchrun --nproc-per-node=2 examples/vlm/finetune.py \
-    --config examples/vlm/gemma_3_vl_3b_medpix_vqa.yaml
+uv run torchrun --nproc-per-node=2 examples/vlm_finetune/finetune.py \
+    --config examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix.yaml
 ```
 
 #### Run Gemma 3n Fine-Tuning
@@ -151,14 +151,14 @@ uv run torchrun --nproc-per-node=2 examples/vlm/finetune.py \
 * **Single GPU**
 
 ```bash
-uv run examples/vlm/finetune.py --config examples/vlm/gemma_3n_vl_4b_medpix_vqa.yaml
+uv run examples/vlm_finetune/finetune.py --config examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml
 ```
 
 * **Multi-GPU**
 
 ```bash
-uv run torchrun --nproc-per-node=2 examples/vlm/finetune.py \
-    --config examples/vlm/gemma_3n_vl_4b_medpix_vqa.yaml
+uv run torchrun --nproc-per-node=2 examples/vlm_finetune/finetune.py \
+    --config examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml
 ```
 
 #### Override Configuration Parameters
@@ -166,8 +166,8 @@ uv run torchrun --nproc-per-node=2 examples/vlm/finetune.py \
 You can override any configuration parameter using dot-notation without modifying the YAML file:
 
 ```bash
-uv run examples/vlm/finetune.py \
-    --config examples/vlm/gemma_3_vl_3b_medpix_vqa.yaml \
+uv run examples/vlm_finetune/finetune.py \
+    --config examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix.yaml \
     --step_scheduler.ckpt_every_steps 100 \
     --step_scheduler.max_steps 1000 \
     --optimizer.lr 2e-5 \
@@ -195,7 +195,7 @@ For memory-efficient training, you can use Low-Rank Adaptation (LoRA) instead of
 To run PEFT with Gemma 3:
 
 ```bash
-uv run examples/vlm/finetune.py --config examples/vlm/gemma_3_vl_3b_medpix_vqa_peft.yaml
+uv run examples/vlm_finetune/finetune.py --config examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix_peft.yaml
 ```
 
 The LoRA configuration excludes vision and audio components from adaptation to preserve pre-trained visual representations:
@@ -206,7 +206,7 @@ peft:
   match_all_linear: False
   exclude_modules:  # exclude all vision and audio modules and lm_head
     - "*vision_tower*"
-    - "*vision*" 
+    - "*vision*"
     - "*visual*"
     - "*audio*"
     - "*image_encoder*"
@@ -218,7 +218,8 @@ peft:
 
 The training loss should look similar to the example below:
 
-<img src="medpix_peft.jpg" alt="Training Loss Curve" width="400">
+<img src="medpix_peft.jpg" alt="Training Loss Curve" width="400px" />
+
 
 ### Checkpointing
 
@@ -256,12 +257,12 @@ After fine-tuning your Gemma 3 or Gemma 3n model, you can use it for inference o
 
 ### Generation Script
 
-The inference functionality is provided through [`examples/vlm/generate.py`](../../../examples/vlm/generate.py), which supports loading fine-tuned checkpoints and performing image-text generation.
+The inference functionality is provided through [`examples/vlm_generate/generate.py`](../../../examples/vlm_generate/generate.py), which supports loading fine-tuned checkpoints and performing image-text generation.
 
 #### Basic Usage
 
 ```bash
-uv run examples/vlm/generate.py \
+uv run examples/vlm_generate/generate.py \
     --checkpoint-path /path/to/checkpoint \
     --prompt "Describe this image." \
     --base-model google/gemma-3-4b-it \
@@ -273,7 +274,7 @@ The output can be either `text` (default) or `json`, with an optional write file
 For models trained on MedPix-VQA, load the trained checkpoint and generate outputs using the following command. Be sure to specify the same base model used during training:
 
 ```bash
-uv run examples/vlm/generate.py \
+uv run examples/vlm_generate/generate.py \
     --checkpoint-path vlm_checkpoints/epoch_0_step_200 \
     --prompt "What medical condition is shown in this image?" \
     --base-model google/gemma-3-4b-it \
@@ -284,7 +285,7 @@ When checkpoints are saved from PEFT training, they contain only the adapter wei
 Run the following command to load and generate from adapters trained on MedPix-VQA:
 
 ```bash
-uv run examples/vlm/generate.py \
+uv run examples/vlm_generate/generate.py \
     --checkpoint-path peft_vlm_checkpoints/epoch_0_step_200/ \
     --prompt "What medical condition is shown in this image?" \
     --image-url medical_image.jpg \
@@ -295,7 +296,8 @@ uv run examples/vlm/generate.py \
 
 Given the following image:
 
-<img src="medpix.jpg" width="200">
+<img src="medpix.jpg" alt="Sample image from the MedPix dataset" width="200px" />
+
 
 And the prompt:
 

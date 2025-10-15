@@ -85,7 +85,9 @@ class DummyDefaultProcessor:
         conv_list,
         *,
         tokenize: bool,
-        add_generation_prompt: bool,
+        add_generation_prompt: bool = True,
+        padding: bool = False,
+        truncation: bool = False,
         return_tensors: str,
         return_dict: bool,
     ):
@@ -222,31 +224,18 @@ class TestCreateLossMaskWithStartOfResponseToken:
         expected = [1, 1, 1, 1, 1]
         assert result == expected
 
-    def test_start_of_response_token_found_twice(self, collate_mod):
-        """Test when start_of_response_token is found twice (normal case)."""
+    def test_complete_sequence_found(self, collate_mod):
+        """Test when complete start_of_response_token sequence is found."""
         processor = DummyQwen25Processor()
-        # Create input_ids with start_of_turn token (100) appearing twice
-        # [0, 100, 1, 2, 100, 101, 102, 3, 4]
-        input_ids = torch.tensor([0, 100, 1, 2, 100, 101, 102, 3, 4])
+        # Input contains the complete sequence [100, 101, 102] at indices 4-6
+        input_ids = torch.tensor([0, 1, 2, 3, 100, 101, 102, 7, 8])
+        
         result = collate_mod.create_loss_mask_with_start_of_response_token(
             input_ids, processor, start_of_response_token="<start_of_turn>model\n"
         )
 
-        # First occurrence at index 1, second occurrence at index 4
-        # Response starts at index 4 + 3 - 1 = 6 (after the response token sequence)
+        # Complete sequence found at index 4-6, response starts at index 4 (include start token)
         expected = [0, 0, 0, 0, 1, 1, 1, 1, 1]
-        assert result == expected
-
-    def test_start_of_response_token_found_only_once(self, collate_mod):
-        """Test when start_of_response_token is found only once."""
-        processor = DummyQwen25Processor()
-        input_ids = torch.tensor([0, 100, 1, 2, 3])
-
-        result = collate_mod.create_loss_mask_with_start_of_response_token(
-            input_ids, processor, start_of_response_token="<start_of_turn>model\n"
-        )
-
-        expected = [0, 1, 1, 1, 1]
         assert result == expected
 
     def test_start_of_response_token_not_found(self, collate_mod):
@@ -258,33 +247,36 @@ class TestCreateLossMaskWithStartOfResponseToken:
             input_ids, processor, start_of_response_token="<start_of_turn>model\n"
         )
 
-        # Should return all 1s when token is not found
+        # Should return all 1s when token sequence is not found
         expected = [1, 1, 1, 1, 1]
         assert result == expected
 
-    def test_with_tensor_input(self, collate_mod):
-        """Test that function works with tensor input."""
+    def test_partial_sequence_not_matched(self, collate_mod):
+        """Test that partial sequences don't trigger false positives."""
         processor = DummyQwen25Processor()
-        input_ids = torch.tensor([0, 100, 1, 2, 100, 101, 102, 3, 4])
+        # Input has token 100 but not the complete sequence [100, 101, 102]
+        input_ids = torch.tensor([1, 100, 2, 3, 4])  # Changed to avoid padding token at start
 
         result = collate_mod.create_loss_mask_with_start_of_response_token(
             input_ids, processor, start_of_response_token="<start_of_turn>model\n"
         )
 
-        expected = [0, 0, 0, 0, 1, 1, 1, 1, 1]
+        # Complete sequence not found, should return all 1s
+        expected = [1, 1, 1, 1, 1]
         assert result == expected
 
     def test_single_token_response_marker(self, collate_mod):
         """Test with single token response marker."""
         processor = DummyQwen25Processor()
-        input_ids = torch.tensor([0, 100, 1, 2, 100, 3, 4])
+        # Looking for single token [100], first occurrence at index 1
+        input_ids = torch.tensor([0, 100, 1, 2, 3])
 
         result = collate_mod.create_loss_mask_with_start_of_response_token(
             input_ids, processor, start_of_response_token="<start_of_turn>"
         )
 
-        # Response starts at index 4 + 1 - 1 = 4
-        expected = [0, 0, 0, 0, 1, 1, 1]
+        # Single token found at index 1, response starts at index 1 (include start token)
+        expected = [0, 1, 1, 1, 1]
         assert result == expected
 
     def test_padding_tokens_masked(self, collate_mod):
@@ -292,14 +284,14 @@ class TestCreateLossMaskWithStartOfResponseToken:
         processor = DummyQwen25Processor()
         processor.tokenizer = DummyTokenizer(pad_token_id=0)
         # Input with padding tokens (0s) at the end
-        input_ids = torch.tensor([1, 100, 2, 3, 100, 101, 102, 4, 0, 0])
+        input_ids = torch.tensor([1, 2, 100, 101, 102, 3, 4, 0, 0])
 
         result = collate_mod.create_loss_mask_with_start_of_response_token(
             input_ids, processor, start_of_response_token="<start_of_turn>model\n"
         )
 
-        # Response starts at index 4 + 3 = 7, but padding tokens at end should be masked
-        expected = [0, 0, 0, 0, 1, 1, 1, 1, 0, 0]
+        # Complete sequence at index 2-4, response starts at index 2 (include start token), padding tokens masked
+        expected = [0, 0, 1, 1, 1, 1, 1, 0, 0]
         assert result == expected
 
     def test_padding_tokens_in_middle(self, collate_mod):
@@ -307,14 +299,14 @@ class TestCreateLossMaskWithStartOfResponseToken:
         processor = DummyQwen25Processor()
         processor.tokenizer = DummyTokenizer(pad_token_id=0)
         # Input with padding tokens (0s) in the middle
-        input_ids = torch.tensor([1, 100, 0, 3, 100, 101, 102, 4, 5])
+        input_ids = torch.tensor([1, 0, 100, 101, 102, 3, 4])
 
         result = collate_mod.create_loss_mask_with_start_of_response_token(
             input_ids, processor, start_of_response_token="<start_of_turn>model\n"
         )
 
-        # Response starts at index 4 + 3 = 7, but padding token at index 2 should be masked
-        expected = [0, 0, 0, 0, 1, 1, 1, 1, 1]
+        # Complete sequence at index 2-4, response starts at index 2 (include start token), padding token at index 1 masked
+        expected = [0, 0, 1, 1, 1, 1, 1]
         assert result == expected
 
     def test_custom_pad_token_id(self, collate_mod):
@@ -322,14 +314,14 @@ class TestCreateLossMaskWithStartOfResponseToken:
         processor = DummyQwen25Processor()
         processor.tokenizer = DummyTokenizer(pad_token_id=999)
         # Input with custom padding tokens (999s) at the end
-        input_ids = torch.tensor([1, 100, 2, 3, 100, 101, 102, 4, 999, 999])
+        input_ids = torch.tensor([1, 2, 100, 101, 102, 3, 999, 999])
 
         result = collate_mod.create_loss_mask_with_start_of_response_token(
             input_ids, processor, start_of_response_token="<start_of_turn>model\n"
         )
 
-        # Response starts at index 4 + 3 = 7, but padding tokens at end should be masked
-        expected = [0, 0, 0, 0, 1, 1, 1, 1, 0, 0]
+        # Complete sequence at index 2-4, response starts at index 2 (include start token), custom padding tokens masked
+        expected = [0, 0, 1, 1, 1, 1, 0, 0]
         assert result == expected
 
 
@@ -391,8 +383,8 @@ class TestCollateFunctionIntegration:
 
         expected = torch.tensor(
             [
-                [0, 0, 0, 0, 1, 1, 1, 1, 0],  # Padding token at end is masked
-                [0, 0, 0, 0, 1, 1, 1, 1, 1],  # No padding tokens
+                [0, 0, 0, 0, 1, 1, 1, 1, 0],  # Complete sequence at 4-6, response starts at 4 (include start token), padding token masked
+                [0, 0, 0, 0, 1, 1, 1, 1, 1],  # Complete sequence at 4-6, response starts at 4 (include start token), no padding
             ],
             dtype=torch.float,
             device=batch_input_ids.device,
@@ -420,7 +412,7 @@ class TestCollateFunctionIntegration:
 
         expected = torch.tensor(
             [
-                [0, 0, 0, 0, 1, 1, 1, 1, 1],  # Valid response start at position 4
+                [0, 0, 0, 0, 1, 1, 1, 1, 1],  # Complete sequence at 4-6, response starts at 4 (include start token)
                 [1, 1, 1, 1, 1, 1, 1, 1, 1],  # No masking (all 1s)
             ],
             dtype=torch.float,
@@ -428,3 +420,159 @@ class TestCollateFunctionIntegration:
         )
 
         assert torch.equal(result, expected)
+
+
+class DummyPhi4Processor:
+    """
+    Mimics the processor API used by phi4_mm_collate_fn:
+      • apply_chat_template(conversation, tokenize=False)
+      • __call__(text, audios, return_tensors="pt", padding=True, truncation=True, max_length=1024)
+      • tokenizer with __call__ method for tokenizing content
+    """
+
+    def __init__(self):
+        self.tokenizer = DummyPhi4Tokenizer()
+
+    def apply_chat_template(self, conversation, tokenize=False):
+        """Generate a chat template string from conversation."""
+        assert not tokenize, "phi4_mm_collate_fn calls this with tokenize=False"
+        # Simulate a chat template that includes both user and assistant parts
+        user_part = conversation[0]["content"]
+        assistant_part = conversation[1]["content"]
+        return f"<|user|>{user_part}<|assistant|>{assistant_part}<|end|>"
+
+    def __call__(self, *, text, audios, return_tensors, padding, truncation, max_length):
+        """Process text and audio inputs."""
+        assert return_tensors == "pt"
+        bs = len(text)
+
+        # Create deterministic input_ids that include both user and assistant parts
+        # User part: [1, 2, 3] Assistant part: [4, 5]
+        input_ids = torch.tensor([[1, 2, 3, 4, 5] for _ in range(bs)])
+
+        # Mock audio embeddings
+        audio_embed_dim = 64
+        audio_seq_len = 10
+        input_audio_embeds = torch.randn(bs, audio_seq_len, audio_embed_dim)
+        audio_embed_sizes = torch.tensor([audio_seq_len] * bs)
+
+        return {
+            "input_ids": input_ids,
+            "input_audio_embeds": input_audio_embeds,
+            "audio_embed_sizes": audio_embed_sizes,
+            "attention_mask": torch.ones_like(input_ids),
+        }
+
+
+class DummyPhi4Tokenizer:
+    """Mock tokenizer for phi4 processor."""
+
+    def __init__(self):
+        self.pad_token_id = 0
+
+    def __call__(self, text, add_special_tokens=False):
+        """Tokenize text content - used for finding assistant content in input_ids."""
+        # Map common assistant responses to token sequences
+        if "Hello there" in text:
+            return {"input_ids": [4, 5]}  # Assistant tokens in our mock input_ids
+        elif "How are you" in text:
+            return {"input_ids": [4, 5]}  # Same tokens for simplicity
+        else:
+            return {"input_ids": [10, 11]}  # Default tokens that won't match
+
+    def decode(self, tokens, skip_special_tokens=False):
+        """Mock decode method."""
+        return f"decoded:{tokens.tolist()}"
+
+
+def test_phi4_mm_collate_fn(collate_mod):
+    """Test basic functionality of phi4_mm_collate_fn."""
+    processor = DummyPhi4Processor()
+
+    examples = [
+        {
+            "conversation": [
+                {"role": "user", "content": "<|audio_1|>What is in this audio?"},
+                {"role": "assistant", "content": "Hello there"},
+            ],
+            "audio": {
+                "array": [0.1, 0.2, 0.3],
+                "sampling_rate": 16000
+            }
+        },
+        {
+            "conversation": [
+                {"role": "user", "content": "<|audio_1|>Transcribe this"},
+                {"role": "assistant", "content": "How are you"},
+            ],
+            "audio": {
+                "array": [0.4, 0.5, 0.6],
+                "sampling_rate": 16000
+            }
+        }
+    ]
+
+    batch = collate_mod.phi4_mm_collate_fn(examples, processor)
+
+    # Check basic structure
+    assert "input_ids" in batch
+    assert "labels" in batch
+    assert "loss_mask" in batch
+    assert "input_audio_embeds" in batch
+    assert "audio_embed_sizes" in batch
+
+    # Check shapes - labels and loss_mask should have same length as input_ids
+    assert batch["input_ids"].shape == batch["labels"].shape
+    assert batch["input_ids"].shape == batch["loss_mask"].shape
+
+    # Check batch size
+    assert batch["input_ids"].shape[0] == 2
+
+    # Check that labels are properly created with -100 padding
+    assert batch["labels"].shape[1] == batch["input_ids"].shape[1]
+
+    # Check audio embeddings
+    assert batch["input_audio_embeds"].dim() == 3  # (batch, seq_len, embed_dim)
+    assert batch["audio_embed_sizes"].shape[0] == 2
+
+    # Verify no unwanted keys remain
+    assert "input_image_embeds" not in batch
+    assert "image_sizes" not in batch
+    assert "image_attention_mask" not in batch
+
+
+def test_phi4_mm_collate_fn_labels_and_loss_mask(collate_mod):
+    """Test that labels and loss_mask are created correctly."""
+    processor = DummyPhi4Processor()
+
+    examples = [
+        {
+            "conversation": [
+                {"role": "user", "content": "<|audio_1|>What is this?"},
+                {"role": "assistant", "content": "Hello there"},  # Will match tokens [4, 5]
+            ],
+            "audio": {
+                "array": [0.1, 0.2],
+                "sampling_rate": 16000
+            }
+        }
+    ]
+
+    batch = collate_mod.phi4_mm_collate_fn(examples, processor)
+
+    # Check that input_ids, labels, and loss_mask have same length
+    input_ids = batch["input_ids"][0]
+    labels = batch["labels"][0]
+    loss_mask = batch["loss_mask"][0]
+
+    assert len(input_ids) == len(labels) == len(loss_mask)
+
+    # Loss mask should have 1s where assistant tokens are found
+    # Our mock sets assistant tokens [4, 5] to be at positions 3, 4 in input_ids [1, 2, 3, 4, 5]
+    expected_loss_mask = [0, 0, 0, 1, 1]  # Only assistant tokens unmasked
+    assert loss_mask.tolist() == expected_loss_mask
+
+    # Labels should have -100 where loss_mask is 0
+    for i, mask_val in enumerate(loss_mask):
+        if mask_val == 0:
+            assert labels[i] == -100
