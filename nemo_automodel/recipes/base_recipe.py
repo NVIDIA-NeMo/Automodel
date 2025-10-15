@@ -173,8 +173,18 @@ class BaseRecipe:
 
         # Wait for any in-flight checkpoint (async case) to complete
         self.checkpointer.async_wait()
+
+        # If a previous async checkpoint just finished, update the "latest" symlink now
+        prev_pending = getattr(self, "_last_pending_checkpoint_dir", None)
         is_dist_initialized = torch.distributed.is_initialized()
         is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
+        if prev_pending is not None:
+            if is_rank_0:
+                self._update_latest_symlink(prev_pending)
+            # clear and remember the last completed path
+            setattr(self, "_last_pending_checkpoint_dir", None)
+            if is_dist_initialized:
+                torch.distributed.barrier()
 
         path = self.checkpointer.config.checkpoint_dir
         path = os.path.join(path, f"epoch_{epoch}_step_{step}")
@@ -215,6 +225,29 @@ class BaseRecipe:
         save_config(config.raw_config, path)
         if is_dist_initialized:
             torch.distributed.barrier()
+
+        # Update latest symlink according to sync/async behavior
+        if getattr(self.checkpointer.config, "is_async", False):
+            # Async: defer symlink until the next call (after async_wait completes)
+            setattr(self, "_last_pending_checkpoint_dir", path)
+        else:
+            # Sync: update immediately
+            if is_rank_0:
+                self._update_latest_symlink(path)
+            if is_dist_initialized:
+                torch.distributed.barrier()
+
+    def _update_latest_symlink(self, target_dir: str) -> None:
+        """
+        Create or update a symlink named "latest" under the checkpoint root
+        that points to `target_dir`.
+        Only called on rank 0.
+        """
+        ckpt_root = self.checkpointer.config.checkpoint_dir
+        link_path = os.path.join(ckpt_root, "LATEST")
+        if os.path.lexists(link_path):
+            os.remove(link_path)
+        os.symlink(os.path.abspath(target_dir), link_path)
 
     def load_checkpoint(self, restore_from: str | None = None, moe_mesh: Optional[DeviceMesh] = None):
         """
@@ -428,28 +461,41 @@ class BaseRecipe:
 
 def _find_latest_checkpoint(checkpoint_dir):
     """
-    Find the latest checkpoint in the checkpoint directory and return it.
+    Resolve the most recent checkpoint directory.
+
+    Preference order:
+      1) Valid LATEST symlink under checkpoint_dir
+      2) Highest step directory under checkpoint_dir matching *step_*
+
+    Returns:
+        Path (or str) of the latest checkpoint directory, or None.
     """
-    checkpoint_dir = Path(checkpoint_dir)
-    if not checkpoint_dir.exists():
+    root = Path(checkpoint_dir)
+    if not root.exists():
         return
-    # Accept checkpoints saved as either `step_<num>` or `epoch_<epoch>_step_<num>`
-    # (or any other pattern that contains the substring `step_`).
-    # This makes the checkpoint loading logic compatible with the naming scheme
-    # used in `save_checkpoint`, which currently saves to `epoch_{epoch}_step_{step}`.
-    checkpoint_files = list(checkpoint_dir.glob("*step_*"))
+
+    # Try LATEST symlink first
+    latest_link = os.path.join(os.fspath(root), "LATEST")
+    if os.path.islink(latest_link):
+        try:
+            resolved = os.readlink(latest_link)
+            if not os.path.isabs(resolved):
+                resolved = os.path.abspath(os.path.join(os.fspath(root), resolved))
+            if os.path.isdir(resolved):
+                return resolved
+        except OSError:
+            pass
+
+    # Fallback to scanning
+    checkpoint_files = list(root.glob("*step_*"))
     if not checkpoint_files:
         return
 
     def _step_num(path: Path):
-        """Return the numeric step from a path stem of the form step_<int>."""
         m = re.search(r"step_(\d+)$", path.stem)
         return int(m.group(1)) if m else -1
 
     latest = max(checkpoint_files, key=_step_num)
-
-    # If no directory followed the expected "step_<int>" pattern, _step_num would be -1 for all of them.
-    # Treat that as "no valid checkpoint".
     if _step_num(latest) == -1:
         return
 

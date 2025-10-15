@@ -453,6 +453,7 @@ class Checkpointer:
                 save_file(state_dict, os.path.join(path, "adapter_model.safetensors"))
                 return
 
+        ret = None
         if self.config.is_async:
             ctx = self._model_ctx if is_model else self._optim_ctx
             ret = dcp.async_save(
@@ -465,7 +466,7 @@ class Checkpointer:
             )
             ctx.staging_active = True
         else:
-            ret = dcp.save(state_dict, checkpoint_id=path, storage_writer=storage_writer)
+            dcp.save(state_dict, checkpoint_id=path, storage_writer=storage_writer)
         return ret
 
     def _should_write_consolidated(self) -> bool:

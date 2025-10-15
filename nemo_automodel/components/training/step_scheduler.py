@@ -154,7 +154,9 @@ class StepScheduler(Stateful):
         Returns:
             dict: Current state with 'step' and 'epoch' keys.
         """
-        return {"step": self.step, "epoch": self.epoch}
+        # At checkpoint time, we need to save step + 1 because we yield before incrementing the step
+        # and the checkpointing happens after the yield but before the increment.
+        return {"step": self.step + 1, "epoch": self.epoch}
 
     def load_state_dict(self, s):
         """
