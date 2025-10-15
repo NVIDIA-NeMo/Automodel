@@ -130,11 +130,7 @@ def get_validation_loss(
             )
         return loss
 
-
-def test_hf_peft_checkpoint(use_triton=False):
-    """
-    Tests HF PEFT checkpoint
-    """
+def get_test_hf_peft_checkpoint_expected_keys():
     expected_model_keys = {
         "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": ([8, 512], torch.bfloat16, "cpu"),
         "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight": ([512, 8], torch.bfloat16, "cpu"),
@@ -1779,6 +1775,13 @@ def test_hf_peft_checkpoint(use_triton=False):
             "cpu",
         ),
     }
+    return expected_model_keys, expected_optim_keys
+
+def test_hf_peft_checkpoint(use_triton=False):
+    """
+    Tests HF PEFT checkpoint
+    """
+    expected_model_keys, expected_optim_keys = get_test_hf_peft_checkpoint_expected_keys()
     expected_config = {
         "base_model_name_or_path": "/home/TestData/akoumparouli/hf_mixtral_2l/",
         "bias": "none",
@@ -1906,7 +1909,7 @@ def test_hf_peft_checkpoint(use_triton=False):
     ]
 
     for file in output_files:
-        path = Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / file
+        path = Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / file
         assert path.exists(), f"Expected {path} to exist"
         if "." in file:
             assert path.is_file(), f"Expected {path} to be a file"
@@ -1915,7 +1918,7 @@ def test_hf_peft_checkpoint(use_triton=False):
         assert os.access(path, os.R_OK), f"Expected {path} to be readable"
         assert path.stat().st_size > 0, f"Expected {path} to be non-empty"
     restored_optim_dict, saved_lr_scheduler_state = load_dcp(
-        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "optim",
+        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "optim",
     )
     # Remove "sched." prefix from keys in saved_lr_scheduler_state if present
     if saved_lr_scheduler_state is not None:
@@ -1945,14 +1948,14 @@ def test_hf_peft_checkpoint(use_triton=False):
                 )
 
     restored_model_dict_consolidated = load_safetensors(
-        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "model" / "adapter_model.safetensors",
+        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "model" / "adapter_model.safetensors",
     )
     restored_config = json.load(
-        open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "model" / "adapter_config.json"),
+        open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "model" / "adapter_config.json"),
     )
     restored_automodel_peft_config = json.load(
         open(
-            Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "model" / "automodel_peft_config.json"
+            Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "model" / "automodel_peft_config.json"
         ),
     )
     _compare_dicts(expected_config, restored_config)
@@ -1968,7 +1971,7 @@ def test_hf_peft_checkpoint(use_triton=False):
     assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
 
     # compare the recipe configs
-    with open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "config.yaml", "r") as f:
+    with open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "config.yaml", "r") as f:
         restored_config = yaml.safe_load(f)
     compare_configs(trainer.cfg.raw_config, restored_config)
 
@@ -2061,7 +2064,7 @@ def test_hf_peft_checkpoint(use_triton=False):
     if torch.distributed.get_rank() == 0:
         base = AutoModelForCausalLM.from_pretrained(cfg.model.pretrained_model_name_or_path)
         peft_model = PeftModel.from_pretrained(
-            base, Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "model"
+            base, Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "model"
         ).to(trainer.model_parts[0].dtype)
 
         for source_key, source_param in model_state_dict.items():

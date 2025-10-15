@@ -16,7 +16,7 @@ import importlib
 import logging
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from functools import lru_cache
+from functools import lru_cache, reduce
 from types import FunctionType
 from typing import Any, Dict, Generator, List, Optional, Union
 
@@ -258,9 +258,106 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         )
 
 
+class WanParallelizationStrategy(ParallelizationStrategy):
+    """Parallelization strategy for Wan-style transformer modules used in Diffusers.
+
+    Applies TP to condition embedders, FFN projections in each block, and final projection,
+    then applies FSDP sharding similarly to other strategies.
+    """
+
+    def parallelize(
+        self,
+        model: nn.Module,
+        device_mesh: DeviceMesh,
+        mp_policy: Optional[MixedPrecisionPolicy] = None,
+        offload_policy: Optional[OffloadPolicy] = None,
+        sequence_parallel: bool = False,
+        activation_checkpointing: bool = False,
+        tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+        dp_replicate_mesh_name: str = "dp_replicate",
+        dp_shard_cp_mesh_name: str = "dp_shard_cp",
+        tp_mesh_name: str = "tp",
+    ) -> nn.Module:
+        # Not using custom tp_shard_plan; apply Wan-specific plan
+        tp_mesh = device_mesh[tp_mesh_name]
+        dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
+        dp_mesh = device_mesh[dp_mesh_dim_names]
+
+        # Apply TP only when TP group size > 1
+        if tp_mesh.size() > 1:
+            # Condition embedders if present
+            try:
+                if hasattr(model, "condition_embedder"):
+                    cond = model.condition_embedder
+                    if hasattr(cond, "text_embedder"):
+                        cond.text_embedder = parallelize_module(
+                            cond.text_embedder,
+                            tp_mesh,
+                            {
+                                "linear_1": ColwiseParallel(),
+                                "linear_2": RowwiseParallel(),
+                            },
+                        )
+                    if hasattr(cond, "time_embedder"):
+                        cond.time_embedder = parallelize_module(
+                            cond.time_embedder,
+                            tp_mesh,
+                            {
+                                "linear_1": ColwiseParallel(),
+                                "linear_2": RowwiseParallel(),
+                            },
+                        )
+                    if hasattr(cond, "time_proj"):
+                        cond.time_proj = parallelize_module(
+                            cond.time_proj,
+                            tp_mesh,
+                            {"": ColwiseParallel()},
+                        )
+            except Exception as e:
+                logger.warning(f"Wan strategy: failed to TP condition embedders: {e}")
+
+            # Blocks FFN and final projection
+            try:
+                if hasattr(model, "blocks"):
+                    for block in model.blocks:
+                        if hasattr(block, "ffn"):
+                            block.ffn = parallelize_module(
+                                block.ffn,
+                                tp_mesh,
+                                {
+                                    "net.0.proj": ColwiseParallel(),
+                                    "net.2": RowwiseParallel(),
+                                },
+                            )
+                if hasattr(model, "proj_out"):
+                    model.proj_out = parallelize_module(model.proj_out, tp_mesh, {"": RowwiseParallel()})
+            except Exception as e:
+                logger.warning(f"Wan strategy: failed to TP blocks/proj_out: {e}")
+
+        # Mixed precision default like Default strategy
+        if not mp_policy:
+            mp_policy = MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+                output_dtype=torch.float32,
+            )
+
+        # Apply FSDP sharding recursively and to root
+        apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy)
+
+        return fully_shard(
+            model,
+            mesh=dp_mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            reshard_after_forward=False,
+        )
+
+
 # Strategy registry mapping model class names to parallelization strategies
 PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
     "NemotronHForCausalLM": NemotronHParallelizationStrategy(),
+    "WanTransformer3DModel": WanParallelizationStrategy(),
 }
 
 # Default strategy instance
@@ -614,71 +711,48 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
     Returns:
         List[nn.Module]: A list of all layers that should be parallelized.
     """
+
+    def _reduce_attrs(model, fqns: List[str]) -> List[nn.Module]:
+        if isinstance(fqns, str):
+            fqns = [fqns]
+        ans = []
+        for fqn in fqns:
+            parts = fqn.split(".")
+            ans.append(reduce(getattr, parts, model))
+        return ans
+
+    VLM_MODEL_CLS_TO_LAYERS = {
+        Gemma3ForConditionalGeneration: ["language_model.layers", "vision_tower.vision_model.encoder.layers"],
+        Qwen2_5_VLForConditionalGeneration: ["language_model.layers", "visual.blocks"],
+        Qwen2VLForConditionalGeneration: ["language_model.layers", "visual.blocks"],
+        # Note: `model.` is not a mistake here, it's the full fqn
+        SmolVLMForConditionalGeneration: ["model.text_model.layers", "model.vision_model.encoder.layers"],
+        LlavaForConditionalGeneration: ["model.language_model.layers", "vision_tower.vision_model.encoder.layers"],
+        LlavaNextForConditionalGeneration: ["model.language_model.layers", "vision_tower.vision_model.encoder.layers"],
+        LlavaNextVideoForConditionalGeneration: [
+            "model.language_model.layers",
+            "vision_tower.vision_model.encoder.layers",
+        ],
+        LlavaOnevisionForConditionalGeneration: [
+            "model.language_model.layers",
+            "vision_tower.vision_model.encoder.layers",
+        ],
+        Mistral3ForConditionalGeneration: ["model.language_model.layers", "model.vision_tower.transformer.layers"],
+        Llama4ForConditionalGeneration: ["language_model.model.layers", "vision_model.model.layers"],
+    }
+    LLM_MODEL_CLS_TO_LAYERS = {
+        "NemotronHForCausalLM": ["backbone.layers"],
+        GPT2LMHeadModel: ["transformer.h"],
+    }
+
+    MODEL_CLS_TO_LAYERS = VLM_MODEL_CLS_TO_LAYERS | LLM_MODEL_CLS_TO_LAYERS
+
     model_cls = type(model)
     layers: List[nn.Module] = []
-
-    # Handle different model structures
-    if model_cls == Gemma3ForConditionalGeneration:
-        # Collect language model layers
-        for layer in model.language_model.layers:
-            layers.append(layer)
-        # Collect vision model layers (siglip encoder has same structure as clip encoder)
-        for layer in model.vision_tower.vision_model.encoder.layers:
-            layers.append(layer)
-
-    elif model_cls in [
-        Qwen2_5_VLForConditionalGeneration,
-        Qwen2VLForConditionalGeneration,
-    ]:
-        # VL models have the language model at model.language_model
-        # Append language model layers
-        for layer in model.language_model.layers:
-            layers.append(layer)
-        # Append visual model layers
-        for layer in model.visual.blocks:
-            layers.append(layer)
-
-    elif model_cls == SmolVLMForConditionalGeneration:
-        # Collect text model layers
-        for layer in model.model.text_model.layers:
-            layers.append(layer)
-        # Collect vision model layers
-        for layer in model.model.vision_model.encoder.layers:
-            layers.append(layer)
-
-    elif model_cls in [
-        LlavaForConditionalGeneration,
-        LlavaNextForConditionalGeneration,
-        LlavaNextVideoForConditionalGeneration,
-        LlavaOnevisionForConditionalGeneration,
-    ]:
-        # Collect language model layers
-        for layer in model.model.language_model.layers:
-            layers.append(layer)
-        # Collect vision model layers
-        for layer in model.vision_tower.vision_model.encoder.layers:
-            layers.append(layer)
-
-    elif model_cls == Mistral3ForConditionalGeneration:
-        # Collect language model layers
-        for layer in model.model.language_model.layers:
-            layers.append(layer)
-        # Collect vision model layers
-        for layer in model.model.vision_tower.transformer.layers:
-            layers.append(layer)
-
-    elif model_cls == Llama4ForConditionalGeneration:
-        # Collect language model layers
-        for layer in model.language_model.model.layers:
-            layers.append(layer)
-        # Collect vision model layers
-        for layer in model.vision_model.model.layers:
-            layers.append(layer)
-    elif model_cls.__name__ == "NemotronHForCausalLM":
-        # NemotronH models use backbone.layers instead of model.layers
-        layers.extend(model.backbone.layers)
-    elif model_cls == GPT2LMHeadModel:
-        layers.extend(model.transformer.h)
+    if model_cls in MODEL_CLS_TO_LAYERS:
+        layers.extend(_reduce_attrs(model, MODEL_CLS_TO_LAYERS[model_cls]))
+    elif model_cls.__name__ in MODEL_CLS_TO_LAYERS:
+        layers.extend(_reduce_attrs(model, MODEL_CLS_TO_LAYERS[model_cls.__name__]))
     elif hasattr(model, "model"):
         # Default case for all other models (assumed to be a causal LM)
         if isinstance(model.model.layers, nn.ModuleDict):
@@ -691,14 +765,15 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         # Use heuristic to find the largest ModuleList in the model
         logger.warning(f"Unknown model type: {model_cls}. Using heuristic to find transformer layers.")
         largest_module_list = _find_largest_module_list(model)
-
-        if largest_module_list is not None:
-            layers.extend(largest_module_list)
-            logger.info(f"Successfully extracted {len(largest_module_list)} layers using heuristic")
-        else:
+        if largest_module_list is None:
             # If no ModuleList found, still raise an exception
             print(model)
             raise ValueError(f"Unknown model type: {model_cls} and no ModuleList found in model structure")
+
+        layers.extend(largest_module_list)
+        logger.info(f"Successfully extracted {len(largest_module_list)} layers using heuristic")
+
+    assert all(isinstance(m, nn.Module) for m in layers), "layers shoudl be nn.Module instances"
     return layers
 
 
@@ -716,30 +791,29 @@ def _get_parallel_plan(
     model_cls = type(model)
 
     # 1. Use custom parallel plan if provided
-    if tp_shard_plan is not None:
-        if isinstance(tp_shard_plan, dict):
-            model_parallel_plan = tp_shard_plan
-            print("Using provided parallel plan (dictionary).")
-        else:
-            try:
-                plan_obj = import_class_from_path(tp_shard_plan)
-                if isinstance(plan_obj, FunctionType):
-                    model_parallel_plan = plan_obj()
-                else:
-                    model_parallel_plan = plan_obj
-                assert isinstance(model_parallel_plan, dict), (
-                    f"Parallel plan must be a dictionary, got {type(model_parallel_plan)}"
-                )
-                print("Using provided parallel plan (from path).")
-            except Exception as e:
-                raise ValueError(
-                    f"Custom parallel plan '{tp_shard_plan}' is not valid. "
-                    f"Please ensure it is one of the following:\n"
-                    "1. A dictionary mapping module names to parallel styles\n"
-                    "2. A path to a dictionary\n"
-                    "3. A path to a function that returns a dictionary\n"
-                    f"Error: {e}"
-                )
+    if isinstance(tp_shard_plan, dict):
+        model_parallel_plan = tp_shard_plan
+        print("Using provided parallel plan (dictionary).")
+    elif tp_shard_plan is not None:
+        try:
+            plan_obj = import_class_from_path(tp_shard_plan)
+            if isinstance(plan_obj, FunctionType):
+                model_parallel_plan = plan_obj()
+            else:
+                model_parallel_plan = plan_obj
+            assert isinstance(model_parallel_plan, dict), (
+                f"Parallel plan must be a dictionary, got {type(model_parallel_plan)}"
+            )
+            print("Using provided parallel plan (from path).")
+        except Exception as e:
+            raise ValueError(
+                f"Custom parallel plan '{tp_shard_plan}' is not valid. "
+                f"Please ensure it is one of the following:\n"
+                "1. A dictionary mapping module names to parallel styles\n"
+                "2. A path to a dictionary\n"
+                "3. A path to a function that returns a dictionary\n"
+                f"Error: {e}"
+            )
 
     # 2. Use optimized parallel plan based on model type
     elif model_cls in PARALLELIZE_FUNCTIONS:
@@ -754,8 +828,7 @@ def _get_parallel_plan(
 
     # 3. Use HF TP plan as fallback
     else:
-        if model_cls not in PARALLELIZE_FUNCTIONS:
-            print(f"Optimized parallel plan is not supported for {model_cls}. Falling back to the HF tp plan.")
+        print(f"Optimized parallel plan is not supported for {model_cls}. Falling back to the HF tp plan.")
         assert not sequence_parallel, "sequence_parallel is not supported in HF tp plan."
         model_parallel_plan = get_hf_tp_shard_plan(model)
 

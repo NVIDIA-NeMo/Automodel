@@ -15,7 +15,7 @@ To run LLMs with NeMo Automodel, make sure you're using NeMo container version `
 For other installation options (e.g., uv), please see our [Installation Guide](../guides/installation.md).
 
 ## Supported Models
-NeMo Automodel interoperates with most LLMs available on the Hugging Face Hub. During preprocessing, it uses `transformers.AutoTokenizer`, which is sufficient for most LLM cases. If your model requires custom text handling, such as for reasoning tasks, you can override the default tokenizer during the data preparation stage.
+NeMo Automodel supports the <a href=https://huggingface.co/transformers/v3.5.1/model_doc/auto.html#automodelforcausallm>AutoModelForCausalLM<a> in the <a href="https://huggingface.co/models?pipeline_tag=text-generation&sort=trending">Text Generation<a> category. During preprocessing, it uses `transformers.AutoTokenizer`, which is sufficient for most LLM cases. If your model requires custom text handling, such as for reasoning tasks, you can override the default tokenizer during the data preparation stage.
 
 The table below lists the main architectures we test against (FSDP2 combined with SFT/PEFT) and includes a representative checkpoint for each.
 
@@ -75,9 +75,11 @@ The table below lists the main architectures we test against (FSDP2 combined wit
 
 The models listed above can be fine-tuned using NeMo Automodel to adapt them to specific tasks or domains. We support two primary fine-tuning approaches:
 
-1. **Parameter-Efficient Fine-Tuning (PEFT)**: Updates only a small subset of parameters (typically <1%) using techniques like Low-Rank Adaptation (LoRA). This is ideal for resource-constrained environments. See our [PEFT Guide](../guides/llm/peft.md) for details.
+1. **Parameter-Efficient Fine-Tuning (PEFT)**: Updates only a small subset of parameters (typically <1%) using techniques like Low-Rank Adaptation (LoRA). This is ideal for resource-constrained environments.
 
-2. **Supervised Fine-Tuning (SFT)**: Updates all or most model parameters for deeper adaptation, suitable for high-precision applications. See our [SFT Guide](../guides/llm/sft.md) for implementation details.
+2. **Supervised Fine-Tuning (SFT)**: Updates all or most model parameters for deeper adaptation, suitable for high-precision applications.
+
+Please see our [Fine-Tuning Guide](../guides/llm/finetune.md) how you can apply both of these fine-tuning methods with your data.
 
 :::{tip}
 In these guides, we use the `SQuAD v1.1` dataset for demonstation purposes, but you can specify your own data as needed.
@@ -109,9 +111,7 @@ This structure makes SQuAD ideal for training context-based question answering m
 ### Get Started with Fine-Tuning
 To fine-tune any of the supported models:
 
-1. Choose your approach:
-   * For parameter-efficient tuning: Follow the [PEFT Guide](../guides/llm/peft.md)
-   * For full model tuning: Follow the [SFT Guide](../guides/llm/sft.md)
+1. Choose your approach (PEFT or SFT), see our [Fine-Tuning Guide](../guides/llm/finetune.md).
 
 2. Key steps in both guides:
    * Model and dataset configuration

@@ -85,7 +85,7 @@ def get_validation_loss(
 ) -> torch.Tensor:
     """Gets the validation loss for a model."""
     loss_buffer = []
-    val_batch = {k: v.to(device, non_blocking=True) for k, v in val_batch.items()}
+    val_batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in val_batch.items()}
     num_label_tokens = (val_batch["labels"] != -100).sum().item()
     for model_part in model_parts:
         model_part.eval()
@@ -128,10 +128,7 @@ def get_validation_loss(
         return loss_buffer
 
 
-
-
-def test_dcp_checkpoint():
-    """Tests DCP checkpoint"""
+def get_test_dcp_checkpoint_expected_keys():
     expected_model_keys = {
         "model.embed_tokens.weight": ([16000, 512], torch.bfloat16, "cpu"),
         "model.layers.0.self_attn.q_proj.weight": ([256, 512], torch.bfloat16, "cpu"),
@@ -781,6 +778,13 @@ def test_dcp_checkpoint():
         "optim.state.lm_head.weight.exp_avg_sq": ([16000, 512], torch.bfloat16, "cpu"),
     }
 
+    return expected_model_keys, expected_optim_keys
+
+def test_dcp_checkpoint():
+    """Tests DCP checkpoint"""
+    expected_model_keys, expected_optim_keys = get_test_dcp_checkpoint_expected_keys()
+
+
     cfg_path = Path(__file__).parents[3] / "examples" / "llm_finetune" / "llama3_2" / "llama3_2_1b_hellaswag.yaml"
     cfg = parse_args_and_load_config(cfg_path)
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
@@ -823,7 +827,7 @@ def test_dcp_checkpoint():
         output_files.append("rng/rng_dp_rank_1.pt")
 
     for file in output_files:
-        path = Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / file
+        path = Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / file
         assert path.exists(), f"Expected {path} to exist"
         if "." in file:
             assert path.is_file(), f"Expected {path} to be a file"
@@ -832,7 +836,7 @@ def test_dcp_checkpoint():
         assert os.access(path, os.R_OK), f"Expected {path} to be readable"
         assert path.stat().st_size > 0, f"Expected {path} to be non-empty"
     restored_optim_dict, saved_lr_scheduler_state = load_dcp(
-        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "optim",
+        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "optim",
     )
     # Remove "sched." prefix from keys in saved_lr_scheduler_state if present
     if saved_lr_scheduler_state is not None:
@@ -862,7 +866,7 @@ def test_dcp_checkpoint():
                 )
 
     restored_model_dict, _ = load_dcp(
-        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "model",
+        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "model",
     )
 
     # check if new model and current model give the same CE loss
@@ -874,7 +878,7 @@ def test_dcp_checkpoint():
     assert sum(source_model_loss) == sum(restored_model_loss), "Model loss mismatch"
 
     # compare the recipe configs
-    with open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "config.yaml", "r") as f:
+    with open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "config.yaml", "r") as f:
         restored_config = yaml.safe_load(f)
     compare_configs(trainer.cfg.raw_config, restored_config)
 
