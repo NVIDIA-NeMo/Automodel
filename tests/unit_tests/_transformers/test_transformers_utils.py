@@ -16,13 +16,13 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from nemo_automodel.components._transformers.utils import sliding_window_overwrite
+from nemo_automodel._transformers.utils import sliding_window_overwrite
 
 
 class TestSlidingWindowOverwrite:
     """Test cases for sliding_window_overwrite function."""
 
-    @patch("nemo_automodel.components._transformers.utils.AutoConfig.from_pretrained")
+    @patch("nemo_automodel._transformers.utils.AutoConfig.from_pretrained")
     def test_sliding_window_overwrite_use_sliding_window_false(self, mock_from_pretrained, capsys):
         """Test sliding_window is set to None when use_sliding_window is False."""
         # Create a mock config with use_sliding_window=False and sliding_window attribute
@@ -46,7 +46,7 @@ class TestSlidingWindowOverwrite:
         assert "use_sliding_window=False in config - overriding sliding_window parameter to None" in captured.out
         assert str(expected_result) in captured.out
 
-    @patch("nemo_automodel.components._transformers.utils.AutoConfig.from_pretrained")
+    @patch("nemo_automodel._transformers.utils.AutoConfig.from_pretrained")
     def test_sliding_window_overwrite_use_sliding_window_true(self, mock_from_pretrained):
         """Test no override when use_sliding_window is True."""
         # Create a mock config with use_sliding_window=True
@@ -64,7 +64,7 @@ class TestSlidingWindowOverwrite:
         # Assert empty dictionary is returned (no override needed)
         assert result == {}
 
-    @patch("nemo_automodel.components._transformers.utils.AutoConfig.from_pretrained")
+    @patch("nemo_automodel._transformers.utils.AutoConfig.from_pretrained")
     def test_sliding_window_overwrite_no_use_sliding_window_attribute(self, mock_from_pretrained):
         """Test no override when use_sliding_window attribute doesn't exist."""
         # Create a mock config without use_sliding_window attribute
@@ -81,7 +81,7 @@ class TestSlidingWindowOverwrite:
         # Assert empty dictionary is returned (no override needed)
         assert result == {}
 
-    @patch("nemo_automodel.components._transformers.utils.AutoConfig.from_pretrained")
+    @patch("nemo_automodel._transformers.utils.AutoConfig.from_pretrained")
     def test_sliding_window_overwrite_missing_sliding_window_attribute(self, mock_from_pretrained):
         """Test assertion error when use_sliding_window is False but sliding_window attribute missing."""
         # Create a mock config with use_sliding_window=False but no sliding_window attribute
@@ -99,7 +99,7 @@ class TestSlidingWindowOverwrite:
         # Assert the function was called correctly
         mock_from_pretrained.assert_called_once_with(model_name, trust_remote_code=True)
 
-    @patch("nemo_automodel.components._transformers.utils.AutoConfig.from_pretrained")
+    @patch("nemo_automodel._transformers.utils.AutoConfig.from_pretrained")
     def test_sliding_window_overwrite_different_model_names(self, mock_from_pretrained):
         """Test function works with different model names."""
         # Create a mock config with use_sliding_window=False
@@ -125,7 +125,7 @@ class TestSlidingWindowOverwrite:
         # Assert the function was called for each model
         assert mock_from_pretrained.call_count == len(model_names)
 
-    @patch("nemo_automodel.components._transformers.utils.AutoConfig.from_pretrained")
+    @patch("nemo_automodel._transformers.utils.AutoConfig.from_pretrained")
     def test_sliding_window_overwrite_trust_remote_code_parameter(self, mock_from_pretrained):
         """Test that trust_remote_code=True is always passed to AutoConfig.from_pretrained."""
         # Create a mock config
@@ -139,7 +139,7 @@ class TestSlidingWindowOverwrite:
         # Verify trust_remote_code=True was passed
         mock_from_pretrained.assert_called_once_with(model_name, trust_remote_code=True)
 
-    @patch("nemo_automodel.components._transformers.utils.AutoConfig.from_pretrained")
+    @patch("nemo_automodel._transformers.utils.AutoConfig.from_pretrained")
     def test_sliding_window_overwrite_hasattr_behavior(self, mock_from_pretrained):
         """Test that hasattr is used correctly to check for attributes."""
         # Create a mock config that behaves correctly with hasattr
