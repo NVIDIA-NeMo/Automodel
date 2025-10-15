@@ -76,7 +76,7 @@ class StepScheduler(Stateful):
         assert val_every_steps is None or val_every_steps > 0, "val_every_steps must be greater than 0 if not None"
         if max_steps is None:
             assert self.epoch_len is not None, "epoch_len must be provided if max_steps is not provided"
-            max_steps = ((self.num_epochs - self.epoch) * self.epoch_len) // self.grad_acc_steps
+            max_steps = ((self.num_epochs - self.epoch) * self.epoch_len)
         self.max_steps = max_steps
         assert max_steps > 0, "max_steps must be greater than 0"
 
@@ -102,8 +102,8 @@ class StepScheduler(Stateful):
                 if self.step >= self.max_steps:
                     return
         if batch_buffer:
-            self.step += 1
             yield batch_buffer
+            self.step += 1
         self.epoch += 1
 
     def set_epoch(self, epoch: int):
@@ -133,7 +133,9 @@ class StepScheduler(Stateful):
             bool: if true, the checkpoint should run.
         """
         last_batch = self.epoch_len is not None and (self.step % self.epoch_len) == self.epoch_len - 1
-        finished = self.step >= self.max_steps
+        # we +1 here because the step is incremented after
+        # the batch is yielded in the tail handling of __iter__
+        finished = self.step + 1 >= self.max_steps
         return ((self.step % self.ckpt_every_steps) == self.ckpt_every_steps - 1) or last_batch or finished
 
     @property
