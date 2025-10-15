@@ -159,7 +159,10 @@ def calculate_virtual_stages(
     if layers_per_stage is not None:
         # Calculate number of virtual stages needed (using ceiling division)
         # This allows for unequal distribution where stages can differ by at most 1 layer
-        num_virtual_stages = math.ceil(num_layers / layers_per_stage) + 1
+        if num_layers % layers_per_stage == 0:
+            num_virtual_stages = num_layers // layers_per_stage
+        else:
+            num_virtual_stages = math.ceil(num_layers / layers_per_stage) + 1
 
         # Validation: check stages per rank based on schedule type
         # Common error message components to reduce duplication
@@ -278,6 +281,7 @@ def split_model_into_stages(
             include_rotary_emb=has_rotary_emb,
             fqn_prefix="model." if has_model_attr else "",
         )
+        print(f"Generated module names per stage: {module_names_per_stage}")
 
     def _build_stage_from_modules(
         stage_idx: int, module_names: list[str], num_stages: int
