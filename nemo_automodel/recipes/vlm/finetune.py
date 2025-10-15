@@ -865,7 +865,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             )
         )
 
-
     def log_train_metrics(self, log_data) -> float:
         """Log metrics to wandb.
 
