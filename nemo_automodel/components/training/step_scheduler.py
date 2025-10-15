@@ -34,7 +34,7 @@ class StepScheduler(Stateful):
         start_step: int = 0,
         start_epoch: int = 0,
         num_epochs: int = 10,
-        max_steps: int = 9223372036854775807,
+        max_steps: int = None,
     ):
         """
         Initialize the StepScheduler.
@@ -74,6 +74,9 @@ class StepScheduler(Stateful):
             self.epoch_len = None
         self.val_every_steps = val_every_steps
         assert val_every_steps is None or val_every_steps > 0, "val_every_steps must be greater than 0 if not None"
+        if max_steps is None:
+            assert self.epoch_len is not None, "epoch_len must be provided if max_steps is not provided"
+            max_steps = ((self.num_epochs - self.epoch) * self.epoch_len) // self.grad_acc_steps
         self.max_steps = max_steps
         assert max_steps > 0, "max_steps must be greater than 0"
 
