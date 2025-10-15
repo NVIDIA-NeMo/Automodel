@@ -140,11 +140,7 @@ def to_cpu(
     """
     return {k: v.cpu() for k, v in state_dict.items() if isinstance(v, torch.Tensor)}
 
-
-def test_hf_sharded_checkpoint():
-    """
-    Tests HF sharded checkpoint
-    """
+def get_test_hf_sharded_checkpoint_expected_keys():
     expected_model_keys = {
         "model.embed_tokens.weight": ([16000, 512], torch.bfloat16, "cpu"),
         "model.layers.0.self_attn.q_proj.weight": ([256, 512], torch.bfloat16, "cpu"),
@@ -793,6 +789,14 @@ def test_hf_sharded_checkpoint():
         "optim.state.lm_head.weight.exp_avg": ([16000, 512], torch.bfloat16, "cpu"),
         "optim.state.lm_head.weight.exp_avg_sq": ([16000, 512], torch.bfloat16, "cpu"),
     }
+    return expected_model_keys, expected_optim_keys
+
+def test_hf_sharded_checkpoint():
+    """
+    Tests HF sharded checkpoint
+    """
+    expected_model_keys, expected_optim_keys = get_test_hf_sharded_checkpoint_expected_keys()
+
 
     script_path = Path(__file__).parent.resolve()
     cfg = parse_args_and_load_config(script_path / "llama3_2" / "llama3_2_1b_hellaswag.yaml")

@@ -130,11 +130,7 @@ def get_validation_loss(
             )
         return loss
 
-
-def test_hf_peft_checkpoint(use_triton=False):
-    """
-    Tests HF PEFT checkpoint
-    """
+def get_test_hf_peft_checkpoint_expected_keys():
     expected_model_keys = {
         "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": ([8, 512], torch.bfloat16, "cpu"),
         "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight": ([512, 8], torch.bfloat16, "cpu"),
@@ -1779,6 +1775,13 @@ def test_hf_peft_checkpoint(use_triton=False):
             "cpu",
         ),
     }
+    return expected_model_keys, expected_optim_keys
+
+def test_hf_peft_checkpoint(use_triton=False):
+    """
+    Tests HF PEFT checkpoint
+    """
+    expected_model_keys, expected_optim_keys = get_test_hf_peft_checkpoint_expected_keys()
     expected_config = {
         "base_model_name_or_path": "/home/TestData/akoumparouli/hf_mixtral_2l/",
         "bias": "none",
