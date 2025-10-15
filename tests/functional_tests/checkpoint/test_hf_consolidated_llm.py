@@ -105,7 +105,7 @@ def to_cpu(
     """
     Converts a state dictionary to CPU.
     """
-    return {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in state_dict.items()}
+    return {k: v.cpu() for k, v in state_dict.items() if isinstance(v, torch.Tensor)}
 
 
 def get_validation_loss(
@@ -155,11 +155,7 @@ def get_validation_loss(
         loss_buffer.append(local_loss.clone().detach())
         return loss_buffer
 
-
-def test_consolidated_llm_checkpoint():
-    """
-    Tests HF consolidated checkpoint for LLM.
-    """
+def get_test_consolidated_llm_checkpoint_expected_keys():
     expected_model_keys = {
         "model.embed_tokens.weight": ([16000, 512], torch.bfloat16, "cpu"),
         "model.layers.0.self_attn.q_proj.weight": ([256, 512], torch.bfloat16, "cpu"),
@@ -808,6 +804,14 @@ def test_consolidated_llm_checkpoint():
         "optim.state.lm_head.weight.exp_avg": ([16000, 512], torch.bfloat16, "cpu"),
         "optim.state.lm_head.weight.exp_avg_sq": ([16000, 512], torch.bfloat16, "cpu"),
     }
+    return expected_model_keys, expected_optim_keys
+
+def test_consolidated_llm_checkpoint():
+    """
+    Tests HF consolidated checkpoint for LLM.
+    """
+    expected_model_keys, expected_optim_keys = get_test_consolidated_llm_checkpoint_expected_keys()
+
 
     script_path = Path(__file__).parent.resolve()
     cfg = parse_args_and_load_config(script_path / "llama3_2" / "llama3_2_1b_hellaswag.yaml")
