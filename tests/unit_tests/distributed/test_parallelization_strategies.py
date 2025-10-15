@@ -14,11 +14,13 @@
 
 """Tests for the parallelization strategy pattern."""
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, call
 from abc import ABC
 
 import pytest
+import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.parallel import ColwiseParallel
@@ -28,6 +30,7 @@ from nemo_automodel.components.distributed.parallelizer import (
     ParallelizationStrategy,
     DefaultParallelizationStrategy,
     NemotronHParallelizationStrategy,
+    WanParallelizationStrategy,
     PARALLELIZATION_STRATEGIES,
     _DEFAULT_STRATEGY,
     get_parallelization_strategy,
@@ -476,6 +479,169 @@ class TestStrategyRegistry:
 
         assert isinstance(strategy, DefaultParallelizationStrategy)
         assert strategy is _DEFAULT_STRATEGY
+
+
+class TestWanParallelizationStrategy:
+    """Tests for WanParallelizationStrategy."""
+
+    @pytest.fixture
+    def wan_strategy(self):
+        return WanParallelizationStrategy()
+
+    @pytest.fixture
+    def wan_model(self):
+        class ConditionEmbedder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.text_embedder = nn.Linear(8, 8)
+                self.time_embedder = nn.Linear(8, 8)
+                self.time_proj = nn.Linear(8, 8)
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.ffn = nn.Linear(8, 8)
+
+        class WanModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.condition_embedder = ConditionEmbedder()
+                self.blocks = nn.ModuleList([Block(), Block()])
+                self.proj_out = nn.Linear(8, 8)
+
+        return WanModel()
+
+    @pytest.fixture
+    def mesh_tp1(self):
+        mesh = MagicMock()
+        tp_mesh = MagicMock()
+        tp_mesh.size.return_value = 1
+        dp_mesh = MagicMock()
+        mesh.__getitem__.side_effect = lambda key: {
+            "tp": tp_mesh,
+            ("dp_replicate", "dp_shard_cp"): dp_mesh,
+        }[key]
+        return mesh, dp_mesh, tp_mesh
+
+    @pytest.fixture
+    def mesh_tp2(self):
+        mesh = MagicMock()
+        tp_mesh = MagicMock()
+        tp_mesh.size.return_value = 2
+        dp_mesh = MagicMock()
+        mesh.__getitem__.side_effect = lambda key: {
+            "tp": tp_mesh,
+            ("dp_replicate", "dp_shard_cp"): dp_mesh,
+        }[key]
+        return mesh, dp_mesh, tp_mesh
+
+    def _mock_env(self, monkeypatch):
+        fully_shard_mock = MagicMock(side_effect=lambda model, **kwargs: model)
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.fully_shard",
+            fully_shard_mock,
+            raising=False,
+        )
+
+        apply_fsdp_mock = MagicMock()
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.apply_fsdp2_sharding_recursively",
+            apply_fsdp_mock,
+            raising=False,
+        )
+
+        parallelize_module_mock = MagicMock(side_effect=lambda module, *_args, **_kwargs: module)
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.parallelize_module",
+            parallelize_module_mock,
+            raising=False,
+        )
+
+        return {
+            "fully_shard": fully_shard_mock,
+            "apply_fsdp": apply_fsdp_mock,
+            "parallelize_module": parallelize_module_mock,
+        }
+
+    def test_no_tp_when_group_size_is_one(self, wan_strategy, wan_model, mesh_tp1, monkeypatch):
+        env = self._mock_env(monkeypatch)
+        mesh, dp_mesh, tp_mesh = mesh_tp1
+
+        result = wan_strategy.parallelize(model=wan_model, device_mesh=mesh)
+
+        # No TP calls when tp size == 1
+        env["parallelize_module"].assert_not_called()
+        # FSDP still applies
+        env["apply_fsdp"].assert_called_once()
+        env["fully_shard"].assert_called()
+        assert result is wan_model
+
+    def test_tp_applied_to_condition_blocks_and_proj(self, wan_strategy, wan_model, mesh_tp2, monkeypatch):
+        env = self._mock_env(monkeypatch)
+        mesh, dp_mesh, tp_mesh = mesh_tp2
+
+        result = wan_strategy.parallelize(model=wan_model, device_mesh=mesh)
+
+        # parallelize_module should be called for text_embedder, time_embedder, time_proj, each block.ffn, and proj_out
+        # There are 2 blocks with ffn → 2 calls + 3 condition embedder + 1 proj_out = 6
+        assert env["parallelize_module"].call_count == 6
+        # FSDP applied
+        from unittest.mock import ANY
+        env["apply_fsdp"].assert_called_once_with(wan_model, dp_mesh, ANY, None)
+        env["fully_shard"].assert_called()
+        assert result is wan_model
+
+    def test_exceptions_in_tp_paths_are_logged_and_ignored(self, wan_strategy, wan_model, mesh_tp2, monkeypatch, caplog):
+        env = self._mock_env(monkeypatch)
+        mesh, dp_mesh, tp_mesh = mesh_tp2
+
+        # Make parallelize_module raise once to hit logging branches
+        calls = {"count": 0}
+
+        def flaky_parallelize(module, *_args, **_kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise RuntimeError("boom")
+            return module
+
+        flaky_mock = MagicMock(side_effect=flaky_parallelize)
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.parallelize_module",
+            flaky_mock,
+            raising=False,
+        )
+
+        caplog.set_level(logging.WARNING)
+        result = wan_strategy.parallelize(model=wan_model, device_mesh=mesh)
+
+        # We should have logged a warning from one of the try/excepts
+        assert "Wan strategy: failed" in caplog.text
+        # Continue to finish and shard
+        assert result is wan_model
+
+    def test_custom_mesh_names(self, wan_strategy, wan_model, monkeypatch):
+        env = self._mock_env(monkeypatch)
+
+        mesh = MagicMock()
+        tp_mesh = MagicMock(); tp_mesh.size.return_value = 2
+        dp_mesh = MagicMock()
+        mesh.__getitem__.side_effect = lambda key: {
+            "custom_tp": tp_mesh,
+            ("custom_dp_repl", "custom_dp_shard"): dp_mesh,
+        }[key]
+
+        result = wan_strategy.parallelize(
+            model=wan_model,
+            device_mesh=mesh,
+            dp_replicate_mesh_name="custom_dp_repl",
+            dp_shard_cp_mesh_name="custom_dp_shard",
+            tp_mesh_name="custom_tp",
+        )
+
+        # Ensure FSDP used the dp_mesh we provided via custom names
+        from unittest.mock import ANY
+        env["apply_fsdp"].assert_called_once_with(wan_model, dp_mesh, ANY, None)
+        assert result is wan_model
 
 
 class TestFsdp2StrategyParallelizeIntegration:
