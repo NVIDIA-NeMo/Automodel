@@ -107,11 +107,7 @@ def to_cpu(
     """
     return {k: v.cpu() for k, v in state_dict.items() if isinstance(v, torch.Tensor)}
 
-
-def test_hf_vlm_sharded_checkpoint():
-    """
-    Tests HF sharded checkpoint
-    """
+def get_test_hf_sharded_vlm_checkpoint_expected_keys():
     expected_model_keys = {
         "model.vision_tower.vision_model.embeddings.patch_embedding.weight": ([576, 3, 14, 14], torch.bfloat16, "cpu"),
         "model.vision_tower.vision_model.embeddings.patch_embedding.bias": ([576], torch.bfloat16, "cpu"),
@@ -538,6 +534,14 @@ def test_hf_vlm_sharded_checkpoint():
         "optim.state.model.language_model.norm.weight.exp_avg": ([64], torch.bfloat16, "cpu"),
         "optim.state.model.language_model.norm.weight.exp_avg_sq": ([64], torch.bfloat16, "cpu"),
     }
+    return expected_model_keys, expected_optim_keys
+
+def test_hf_vlm_sharded_checkpoint():
+    """
+    Tests HF sharded checkpoint
+    """
+    expected_model_keys, expected_optim_keys = get_test_hf_sharded_vlm_checkpoint_expected_keys()
+
 
     script_path = Path(__file__).parent.resolve()
     cfg = parse_args_and_load_config(script_path / "gemma3" / "gemma3_vl_4b_cord_v2.yaml")
