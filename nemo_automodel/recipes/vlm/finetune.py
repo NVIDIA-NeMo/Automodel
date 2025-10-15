@@ -660,6 +660,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     self._run_validation_epoch()
                     self.model.train()
 
+        self.checkpointer.close()
+
     def _run_train_optim_step(self, batches, max_grad_norm=1.0):
         """Execute a single training step.
 
@@ -714,6 +716,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model.finish_grad_sync()
 
+        self.checkpointer.maybe_wait_for_staging()
         self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
 

@@ -916,6 +916,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     for mp in self.model_parts:
                         mp.train()
 
+        self.checkpointer.close()
+
     # ------------------ helpers ------------------
     def _forward_backward_step(
         self,

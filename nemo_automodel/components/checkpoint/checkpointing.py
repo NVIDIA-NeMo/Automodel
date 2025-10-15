@@ -399,6 +399,17 @@ class Checkpointer:
             torch.load(os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt"), weights_only=False)
         )
 
+    def close(self) -> None:
+        """
+        Close the checkpointer.
+        """
+        self.maybe_wait_for_staging()
+        self.async_wait()
+        if self._model_ctx.stager is not None:
+            self._model_ctx.stager.close()
+        if self._optim_ctx.stager is not None:
+            self._optim_ctx.stager.close()
+
     def _do_load(
         self,
         state_dict: dict[str, torch.Tensor],
