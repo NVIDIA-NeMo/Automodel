@@ -113,8 +113,8 @@ class StepScheduler(Stateful):
                 if self.step >= self.max_steps:
                     return
         if batch_buffer:
-            yield batch_buffer
             self.step += 1
+            yield batch_buffer
         self.epoch += 1
 
     def set_epoch(self, epoch: int):
