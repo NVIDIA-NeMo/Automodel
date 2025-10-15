@@ -84,7 +84,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-
 # ---------------------------
 #  Stateless helper functions
 # ---------------------------
@@ -136,6 +135,12 @@ def build_model_and_optimizer(
     Returns:
         The instantiated model on the specified device, the state dict keys before any parallelization, the optimizer, and the loss function.
     """
+    print("preload flash attention", flush=True)
+    from transformers.modeling_flash_attention_utils import lazy_import_flash_attention
+    if torch.cuda.is_available():
+        print("Preloading flash attention to avoid graph breaks...")
+        lazy_import_flash_attention(implementation=None)
+
     is_hf_model = cfg_model.get("pretrained_model_name_or_path", None) is not None
     is_meta_device = False
     if hasattr(cfg_model, "is_meta_device"):
