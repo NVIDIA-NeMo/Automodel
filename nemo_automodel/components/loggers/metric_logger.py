@@ -17,10 +17,11 @@ import os
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict
+from tokenize import group
+from typing import Any, Dict, List
 
 import torch.distributed as dist
-
+import torch
 
 @dataclass
 class MetricsSample:
@@ -39,6 +40,43 @@ class MetricsSample:
     def __post_init__(self):
         self.timestamp = datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
 
+def stack_and_move_tensor_metrics_to_cpu(metric_vector: List[MetricsSample]) -> List[MetricsSample]:
+    # Find all tensor metrics, stack them per metric name across samples, move to CPU,
+    # then place CPU tensors back into the original metrics.
+    def extract_tensor_metric_names(metric: MetricsSample) -> tuple:
+        names = [name for name, value in metric.metrics.items() if isinstance(value, torch.Tensor)]
+        # Sort for stable grouping and use tuple as a hashable key
+        return tuple(sorted(names))
+
+    if len(metric_vector) == 0:
+        return metric_vector
+
+    # Group sample indices by the exact set of tensor metric names they contain
+    grouped_indices_by_names = {}
+    for sample_index, metric in enumerate(metric_vector):
+        names_key = extract_tensor_metric_names(metric)
+        if names_key not in grouped_indices_by_names:
+            grouped_indices_by_names[names_key] = []
+        grouped_indices_by_names[names_key].append(sample_index)
+
+    # For each group, stack tensors per metric name, move to CPU, and redistribute
+    for names_key, indices in grouped_indices_by_names.items():
+        if len(names_key) == 0:
+            continue  # no tensor metrics in this group
+
+        # Stack per metric name across all samples in the group
+        stacked_by_name = {}
+        for name in names_key:
+            stacked = torch.stack([metric_vector[i].metrics[name] for i in indices])
+            # Detach in case these require grad and move to CPU once
+            stacked_by_name[name] = stacked.detach().cpu()
+
+        # Write back the CPU tensors to each sample's metrics
+        for pos, sample_index in enumerate(indices):
+            for name in names_key:
+                metric_vector[sample_index].metrics[name] = stacked_by_name[name][pos].item()
+
+    return metric_vector
 
 class MetricLogger:
     """
@@ -50,9 +88,11 @@ class MetricLogger:
     - UTF-8 without BOM, newline per record.
     """
 
-    def __init__(self, filepath: str, *, flush: bool = False, append: bool = True) -> None:
+    def __init__(self, filepath: str, *, flush: bool = False, append: bool = True, buffer_size: int = 100) -> None:
         self.filepath = os.path.abspath(filepath)
         self.flush = flush
+        self.buffer_size = buffer_size
+        self.buffer = []
         self._lock = threading.Lock()
         os.makedirs(os.path.dirname(self.filepath) or ".", exist_ok=True)
         mode = "a" if append else "w"
@@ -60,15 +100,31 @@ class MetricLogger:
         self._fp = io.open(self.filepath, mode, encoding="utf-8", buffering=1)
 
     def log(self, record: MetricsSample) -> None:
-        line = json.dumps(record.to_dict(), ensure_ascii=False)
+        self.buffer.append(record)
+        if len(self.buffer) < self.buffer_size:
+            return
+        lines = self._move_to_cpu(self.buffer)
+        self.buffer = []
         with self._lock:
-            self._fp.write(line + "\n")
-            if self.flush:
-                self._fp.flush()
-                os.fsync(self._fp.fileno())
+            self._save(lines)
+
+    def _move_to_cpu(self, buffer: List[MetricsSample]) -> List[MetricsSample]:
+        lines = []
+        for record in stack_and_move_tensor_metrics_to_cpu(buffer):
+            lines.append(json.dumps(record.to_dict(), ensure_ascii=False))
+        return lines
+
+    def _save(self, lines: List[str]) -> None:
+        if len(lines) == 0:
+            return
+        self._fp.write("\n".join(lines) + "\n")
+        if self.flush:
+            self._fp.flush()
+            os.fsync(self._fp.fileno())
 
     def close(self) -> None:
         with self._lock:
+            self._save(self._move_to_cpu(self.buffer))
             try:
                 self._fp.flush()
             except Exception:
