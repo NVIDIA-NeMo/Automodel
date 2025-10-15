@@ -37,6 +37,7 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        causal_mask_mapping: Optional[dict] = None,
         **kwargs,
     ) -> Union[torch.Tensor, BaseModelOutputWithPast]:
         # Embeddings handling
@@ -69,21 +70,33 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        # Attention mask
-        if not isinstance((causal_mask_mapping := attention_mask), dict):
-            from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+        # Attention mask handling (compilation-friendly):
+        # causal_mask_mapping should be precomputed in data pipeline via default_collater
+        # If not provided, model will fail - this enforces clean separation
+        if causal_mask_mapping is None:
+            # If causal_mask_mapping is missing, fall back to on-the-fly computation.
+            # This is not recommended for compilation, as it introduces runtime overhead.
+            logger.warning(
+                "causal_mask_mapping not provided; computing it here. "
+                "This is slow and not recommended for compilation. "
+                "Precompute causal_mask_mapping in the data pipeline for best performance."
+            )
+            if not isinstance((causal_mask_mapping := attention_mask), dict):
+                from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
-            mask_kwargs = {
-                "config": self.config,
-                "input_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "cache_position": cache_position,
-                "past_key_values": past_key_values,
-                "position_ids": position_ids,
-            }
-            causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
-            if hasattr(self, "has_sliding_layers") and self.has_sliding_layers:
-                causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+                # Note: input_embeds is only used for shape and dtype, not values
+                # We could use a dummy tensor here, but inputs_embeds is already available
+                mask_kwargs = {
+                    "config": self.config,
+                    "input_embeds": inputs_embeds,
+                    "attention_mask": attention_mask,
+                    "cache_position": cache_position,
+                    "past_key_values": None,  # Training-only: no KV cache
+                    "position_ids": position_ids,
+                }
+                causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
+                if hasattr(self, "has_sliding_layers") and self.has_sliding_layers:
+                    causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
 
         hidden_states = inputs_embeds
 
