@@ -45,7 +45,7 @@ def _patch_checkpoint_ops(monkeypatch):
     Replace Checkpointer class with a minimal mock that uses torch.save/torch.load
     so that BaseRecipe can operate without the real checkpoint infrastructure.
     """
-    from nemo_automodel.components.checkpoint import checkpointing_class
+    from nemo_automodel.components.checkpoint import checkpointing
 
     class MockCheckpointer:
         """Mock Checkpointer for testing."""
@@ -87,6 +87,10 @@ def _patch_checkpoint_ops(monkeypatch):
             optim_path = os.path.join(weights_path, "optim")
             optimizer.load_state_dict(torch.load(os.path.join(optim_path, "optimizer.pt"), weights_only=False))
         
+        def async_wait(self):
+            """No-op for tests to satisfy BaseRecipe interface."""
+            return
+        
         def save_on_dp_ranks(self, state, state_name, path):
             """Save stateful object (e.g., dataloader, rng)."""
             state_dir = os.path.join(path, state_name)
@@ -99,7 +103,7 @@ def _patch_checkpoint_ops(monkeypatch):
             state_dir = os.path.join(path, state_name)
             state.load_state_dict(torch.load(os.path.join(state_dir, f"{state_name}.pt"), weights_only=False))
     
-    monkeypatch.setattr(checkpointing_class, "Checkpointer", MockCheckpointer)
+    monkeypatch.setattr(checkpointing, "Checkpointer", MockCheckpointer)
     yield
 
 
