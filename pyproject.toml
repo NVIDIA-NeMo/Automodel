@@ -71,8 +71,12 @@ classifiers = [
 dependencies = [
     "bitsandbytes==0.45.5; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "datasets>=4.0.0",
+    "diffusers",
+    "ftfy",
+    "imageio-ffmpeg",
     "liger-kernel>=0.5.9; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "megatron-fsdp",
+    "opencv-python-headless==4.10.0.84",
     "pybind11",
     "pyyaml",
     "torch<=2.8.0",
@@ -106,6 +110,19 @@ moe = [
     # https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
     # "flash-attn==2.7.4.post1",
     # "grouped_gemm",
+]
+deepep = [
+    "nvidia-nvshmem-cu13",
+]
+dev = [
+    "nemo_automodel[fa]",
+    "nemo_automodel[vlm]",
+]
+all = [
+    "nemo_automodel[deepep]",
+    "nemo_automodel[fa]",
+    "nemo_automodel[moe]",
+    "nemo_automodel[vlm]",
 ]
 
 [project.urls]

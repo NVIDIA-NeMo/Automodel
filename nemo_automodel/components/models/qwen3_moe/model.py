@@ -21,6 +21,7 @@ from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 from nemo_automodel.components.models.gpt_oss.layers import RotaryEmbedding
 from nemo_automodel.components.models.qwen3_moe.layers import Qwen3MoeAttention
 from nemo_automodel.components.models.qwen3_moe.state_dict_adapter import Qwen3MoeStateDictAdapter
+from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
 from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -193,7 +194,7 @@ class Qwen3MoeModel(nn.Module):
                 layer.init_weights(buffer_device=buffer_device)
 
 
-class Qwen3MoeForCausalLM(nn.Module):
+class Qwen3MoeForCausalLM(nn.Module, MoEFSDPSyncMixin):
     @classmethod
     def from_config(
         cls,

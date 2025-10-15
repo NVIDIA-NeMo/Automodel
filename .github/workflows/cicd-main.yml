@@ -31,7 +31,7 @@ permissions:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.64.1
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.64.2
 
   linting:
     runs-on: ubuntu-latest
@@ -75,7 +75,7 @@ jobs:
       - name: Set up UV
         uses: astral-sh/setup-uv@v1
         with:
-          version: 0.7.2
+          version: 0.8.22
       - name: Install ruff
         env:
           UV_PROJECT_ENVIRONMENT: ./venv
@@ -201,6 +201,10 @@ jobs:
             timeout: 20
           - test-name: L2_HF_Transformer_VLM
             test-folder: hf_transformer_vlm
+            runner: self-hosted-nemo
+            timeout: 60
+          - test-name: L2_LLM_KD
+            test-folder: llm_kd
             runner: self-hosted-nemo
             timeout: 60
           - test-name: L2_Datasets

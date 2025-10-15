@@ -140,11 +140,7 @@ def to_cpu(
     """
     return {k: v.cpu() for k, v in state_dict.items() if isinstance(v, torch.Tensor)}
 
-
-def test_hf_sharded_checkpoint():
-    """
-    Tests HF sharded checkpoint
-    """
+def get_test_hf_sharded_checkpoint_expected_keys():
     expected_model_keys = {
         "model.embed_tokens.weight": ([16000, 512], torch.bfloat16, "cpu"),
         "model.layers.0.self_attn.q_proj.weight": ([256, 512], torch.bfloat16, "cpu"),
@@ -793,6 +789,14 @@ def test_hf_sharded_checkpoint():
         "optim.state.lm_head.weight.exp_avg": ([16000, 512], torch.bfloat16, "cpu"),
         "optim.state.lm_head.weight.exp_avg_sq": ([16000, 512], torch.bfloat16, "cpu"),
     }
+    return expected_model_keys, expected_optim_keys
+
+def test_hf_sharded_checkpoint():
+    """
+    Tests HF sharded checkpoint
+    """
+    expected_model_keys, expected_optim_keys = get_test_hf_sharded_checkpoint_expected_keys()
+
 
     script_path = Path(__file__).parent.resolve()
     cfg = parse_args_and_load_config(script_path / "llama3_2" / "llama3_2_1b_hellaswag.yaml")
@@ -834,7 +838,7 @@ def test_hf_sharded_checkpoint():
     ]
 
     for file in output_files:
-        path = Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / file
+        path = Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / file
         assert path.exists(), f"Expected {path} to exist"
         if "." in file:
             assert path.is_file(), f"Expected {path} to be a file"
@@ -843,7 +847,7 @@ def test_hf_sharded_checkpoint():
         assert os.access(path, os.R_OK), f"Expected {path} to be readable"
         assert path.stat().st_size > 0, f"Expected {path} to be non-empty"
     restored_optim_dict, saved_lr_scheduler_state = load_dcp(
-        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "optim",
+        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "optim",
     )
     # Remove "sched." prefix from keys in saved_lr_scheduler_state if present
     if saved_lr_scheduler_state is not None:
@@ -872,7 +876,7 @@ def test_hf_sharded_checkpoint():
                 )
 
     restored_model_dict, _ = load_dcp(
-        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "model",
+        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "model",
     )
 
     # check if new model and current model give the same CE loss
@@ -884,7 +888,7 @@ def test_hf_sharded_checkpoint():
     assert sum(source_model_loss) == sum(restored_model_loss), "Model loss mismatch"
 
     # compare the recipe configs
-    with open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "config.yaml", "r") as f:
+    with open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "config.yaml", "r") as f:
         restored_config = yaml.safe_load(f)
     compare_configs(trainer.cfg.raw_config, restored_config)
 

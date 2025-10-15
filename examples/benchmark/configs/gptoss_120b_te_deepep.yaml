@@ -24,7 +24,7 @@ benchmark:
   nsys_ranks: []
 
 step_scheduler:
-  global_batch_size: 256
+  global_batch_size: 512
   local_batch_size: 2
   ckpt_every_steps: 1000
   val_every_steps: 1000
@@ -35,9 +35,9 @@ distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   tp_size: 1
   cp_size: 1
-  pp_size: 2
+  pp_size: 1
   dp_replicate_size: 1
-  ep_size: 16
+  ep_size: 64
   sequence_parallel: false
 
 autopipeline:
@@ -57,6 +57,7 @@ dist_env:
 parallelizer:
   _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
   activation_checkpointing: false
+  reshard_after_forward: true
 
 model:
   _target_: nemo_automodel.components.models.gpt_oss.model.GptOssForCausalLM.from_config
@@ -73,6 +74,7 @@ model:
     enable_deepep: true
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: false
+    fsdp_optimization_config: null
 
 checkpoint:
   enabled: false

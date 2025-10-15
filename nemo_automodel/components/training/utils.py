@@ -19,6 +19,8 @@ import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.moe.fsdp_mixin import set_is_optim_step
+
 
 @torch.no_grad()
 def count_tail_padding(labels, ignore_label=-100):
@@ -159,6 +161,9 @@ def clip_grad_norm(
     if max_grad_norm is None:
         return grad_norm
 
+    if pp_enabled and device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
+        return grad_norm
+
     if pp_enabled:
         assert pp_axis_name is not None, "pp_axis_name must be provided when pp_enabled is True"
         pp_mesh = device_mesh[pp_axis_name]
@@ -193,10 +198,45 @@ def clip_grad_norm(
         else:
             return 0
 
-    if isinstance(grad_norm, torch.Tensor):
-        grad_norm = grad_norm.item()
-
     return grad_norm
+
+
+def prepare_for_grad_accumulation(model_parts: list[torch.nn.Module], pp_enabled: bool = False):
+    """Prepare model parts before starting gradient accumulation.
+
+    This is typically called once at the start of gradient accumulation to prepare
+    FSDP states for the upcoming forward and backward passes.
+
+    Args:
+        model_parts: List of model parts (modules) to prepare.
+        pp_enabled: Whether pipeline parallelism is enabled.
+    """
+    set_is_optim_step(False)
+    if pp_enabled:
+        return
+
+    for mp in model_parts:
+        if hasattr(mp, "prepare_for_grad_accumulation"):
+            mp.prepare_for_grad_accumulation(pp_enabled=pp_enabled)
+
+
+def prepare_for_final_backward(model_parts: list[torch.nn.Module], pp_enabled: bool = False):
+    """Prepare model parts before the final backward pass.
+
+    This is typically called before the final gradient accumulation step to prepare
+    FSDP states for gradient synchronization and resharding.
+
+    Args:
+        model_parts: List of model parts (modules) to prepare.
+        pp_enabled: Whether pipeline parallelism is enabled.
+    """
+    set_is_optim_step(True)
+    if pp_enabled:
+        return
+
+    for mp in model_parts:
+        if hasattr(mp, "prepare_for_final_backward"):
+            mp.prepare_for_final_backward(pp_enabled=pp_enabled)
 
 
 @torch.no_grad()

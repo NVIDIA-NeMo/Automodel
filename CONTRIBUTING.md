@@ -1,13 +1,20 @@
 # Contributing To NeMo-Automodel
 
-## Building a dev container
-
-* We recommend to build a container that is close to GitHub's CI.
+## Building a NeMo-Automodel container
 
 * Run the following command to build your container:
 
 ```bash
-docker build -f docker/Dockerfile.ci -t automodel .
+# Set build arguments
+export AUTOMODEL_INSTALL=dev #[all, dev, deepep, fa, moe, vlm]
+export BASE_IMAGE=cuda #[cuda, pytorch]
+export INSTALL_DEEPEP=False #[True, False]
+
+docker build -f docker/Dockerfile \
+--build-arg AUTOMODEL_INSTALL=$AUTOMODEL_INSTALL \
+--build-arg BASE_IMAGE=$BASE_IMAGE \
+--build-arg INSTALL_DEEPEP=$INSTALL_DEEPEP \
+-t automodel --target=automodel_final .
 ```
 
 * Run the following command to start your container:

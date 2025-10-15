@@ -123,11 +123,7 @@ def get_validation_loss(
             )
         return loss
 
-
-def test_consolidated_vlm_checkpoint():
-    """
-    Tests HF consolidated checkpoint for VLM.
-    """
+def get_test_consolidated_vlm_checkpoint_expected_keys():
     expected_model_keys = {
         "model.vision_tower.vision_model.embeddings.patch_embedding.weight": ([576, 3, 14, 14], torch.bfloat16, "cpu"),
         "model.vision_tower.vision_model.embeddings.patch_embedding.bias": ([576], torch.bfloat16, "cpu"),
@@ -414,6 +410,14 @@ def test_consolidated_vlm_checkpoint():
         "optim.state.model.language_model.norm.weight.exp_avg": ([64], torch.bfloat16, "cpu"),
         "optim.state.model.language_model.norm.weight.exp_avg_sq": ([64], torch.bfloat16, "cpu"),
     }
+    return expected_model_keys, expected_optim_keys
+
+def test_consolidated_vlm_checkpoint():
+    """
+    Tests HF consolidated checkpoint for VLM.
+    """
+    expected_model_keys, expected_optim_keys = get_test_consolidated_vlm_checkpoint_expected_keys()
+
 
     script_path = Path(__file__).parent.resolve()
     cfg = parse_args_and_load_config(script_path / "gemma3" / "gemma3_vl_4b_cord_v2.yaml")
@@ -463,7 +467,7 @@ def test_consolidated_vlm_checkpoint():
     ]
 
     for file in output_files:
-        path = Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / file
+        path = Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / file
         assert path.exists(), f"Expected {path} to exist"
         if "." in file:
             assert path.is_file(), f"Expected {path} to be a file"
@@ -474,7 +478,7 @@ def test_consolidated_vlm_checkpoint():
 
     # Load checkpoint data
     restored_optim_dict, saved_lr_scheduler_state = load_dcp(
-        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "optim",
+        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "optim",
     )
     # Remove "sched." prefix from keys in saved_lr_scheduler_state if present
     if saved_lr_scheduler_state is not None:
@@ -504,11 +508,11 @@ def test_consolidated_vlm_checkpoint():
                 )
 
     restored_model_dict, _ = load_dcp(
-        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "model",
+        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "model",
     )
     restored_model_dict_consolidated = load_safetensors(
         Path(trainer.checkpoint_config.checkpoint_dir)
-        / "epoch_0_step_10"
+        / "epoch_0_step_9"
         / "model"
         / "consolidated"
         / "model-00001-of-00001.safetensors",
@@ -524,14 +528,14 @@ def test_consolidated_vlm_checkpoint():
     assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
 
     # compare the recipe configs
-    with open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "config.yaml", "r") as f:
+    with open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "config.yaml", "r") as f:
         restored_config = yaml.safe_load(f)
     compare_configs(trainer.cfg.raw_config, restored_config)
 
     # load consolidated model using HF API and verify it's the same as the trained model
     consolidated_model = (
         AutoModelForImageTextToText.from_pretrained(
-            Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_10" / "model" / "consolidated"
+            Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "model" / "consolidated"
         )
         .to(trainer.model.dtype)
         .to(trainer.dist_env.device)
