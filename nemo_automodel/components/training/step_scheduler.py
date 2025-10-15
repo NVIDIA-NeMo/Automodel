@@ -132,11 +132,26 @@ class StepScheduler(Stateful):
         Returns:
             bool: if true, the checkpoint should run.
         """
-        last_batch = self.epoch_len is not None and (self.step % self.epoch_len) == self.epoch_len - 1
+        is_ckpt_step = ((self.step % self.ckpt_every_steps) == self.ckpt_every_steps - 1)
+        return is_ckpt_step or self.is_last_batch or self.is_last_step
+
+    @property
+    def is_last_step(self):
+        """
+        Returns whether the training is finished.
+        """
         # we +1 here because the step is incremented after
         # the batch is yielded in the tail handling of __iter__
-        finished = self.step + 1 >= self.max_steps
-        return ((self.step % self.ckpt_every_steps) == self.ckpt_every_steps - 1) or last_batch or finished
+        return self.step + 1 >= self.max_steps
+
+    @property
+    def is_last_batch(self):
+        """
+        Returns whether this is the last batch for this epoch.
+        """
+        if self.epoch_len is None:
+            return False
+        return (self.step % self.epoch_len) == self.epoch_len - 1
 
     @property
     def epochs(self):

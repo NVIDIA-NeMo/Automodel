@@ -928,14 +928,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # 1. len(batches) == grad_acc_steps
             # 2. len(batches[0]) == batch_size
             for i, batches in enumerate(self.step_scheduler):
-                if i < 300: continue
                 reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens = self._run_train_optim_step(
                     batches, 1.0
                 )
 
                 # log
                 self.log_train_metrics(reporting_loss, grad_norm, num_tokens_in_batch, tps, num_label_tokens)
-                print(i, self.step_scheduler.step, self.step_scheduler.is_ckpt_step)
+
                 # Save the checkpoint every ckpt_every_steps
                 if self.step_scheduler.is_ckpt_step:
                     self.save_checkpoint(epoch, self.step_scheduler.step)
