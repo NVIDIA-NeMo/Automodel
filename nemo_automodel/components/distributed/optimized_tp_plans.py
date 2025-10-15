@@ -36,9 +36,9 @@ from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
 )
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
+from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
-from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
 
 
 class RotaryEmbedParallel(SequenceParallel):
@@ -254,11 +254,12 @@ def _parallelize_phi3(
             use_local_output=False,
         ),
     }
-    
+
     return cast(
         dict[str, ParallelStyle],
         base_model_tp_plan,
     )
+
 
 # Create the model-specific parallel plan mapping
 PARALLELIZE_FUNCTIONS: Dict[type, Callable[..., Dict[str, ParallelStyle]]] = {

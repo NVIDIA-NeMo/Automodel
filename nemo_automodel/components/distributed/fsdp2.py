@@ -28,11 +28,11 @@ from torch.distributed.tensor.parallel import (
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
+from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE_FUNCTIONS
 from nemo_automodel.components.distributed.parallelizer import (
     fsdp2_strategy_parallelize,
     get_hf_tp_shard_plan,
 )
-from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE_FUNCTIONS
 
 logger = logging.getLogger(__name__)
 
