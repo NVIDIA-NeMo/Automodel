@@ -17,11 +17,11 @@ import os
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
-from tokenize import group
 from typing import Any, Dict, List
 
-import torch.distributed as dist
 import torch
+import torch.distributed as dist
+
 
 @dataclass
 class MetricsSample:
@@ -39,6 +39,7 @@ class MetricsSample:
 
     def __post_init__(self):
         self.timestamp = datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+
 
 def stack_and_move_tensor_metrics_to_cpu(metric_vector: List[MetricsSample]) -> List[MetricsSample]:
     # Find all tensor metrics, stack them per metric name across samples, move to CPU,
@@ -77,6 +78,7 @@ def stack_and_move_tensor_metrics_to_cpu(metric_vector: List[MetricsSample]) -> 
                 metric_vector[sample_index].metrics[name] = stacked_by_name[name][pos].item()
 
     return metric_vector
+
 
 class MetricLogger:
     """
