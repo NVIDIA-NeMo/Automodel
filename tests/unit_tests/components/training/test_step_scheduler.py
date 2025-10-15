@@ -20,17 +20,17 @@ from nemo_automodel.components.training.step_scheduler import StepScheduler
 class SizedDataLoader:
     def __init__(self, num_batches: int, global_batch_size: int = 1, local_batch_size: int = 1):
         self.num_batches = num_batches
-        self.global_batch_size = global_batch_size
-        self.local_batch_size = local_batch_size
+        # self.global_batch_size = global_batch_size
+        # self.local_batch_size = local_batch_size
 
     def __iter__(self):
         for i in range(self.num_batches):
-            ans = []
-            for j in range(self.global_batch_size):
-                yield {"batch": (i, j)}
+            # ans = []
+            # for j in range(self.global_batch_size):
+            yield {"batch": (i, 0)}
 
     def __len__(self):
-        return self.num_batches * (self.global_batch_size // self.local_batch_size)
+        return self.num_batches #* (self.global_batch_size // self.local_batch_size)
 
 
 class IterableDataLoader:
@@ -146,9 +146,7 @@ def test_resume(max_steps, ckpt_every_steps):
 )
 def test_is_ckpt_step_parametrized_iterable(max_steps, ckpt_every_steps, global_batch_size, local_batch_size, is_ckpt_step):
     dataloader = SizedDataLoader(
-        num_batches=max_steps,
-        global_batch_size=global_batch_size,
-        local_batch_size=local_batch_size,
+        num_batches=max_steps * (global_batch_size // local_batch_size),
     )
     scheduler = StepScheduler(
         global_batch_size=global_batch_size,
@@ -205,3 +203,33 @@ def test_is_ckpt_step_triggers_on_last_batch_with_sized_dataloader():
     assert scheduler.is_ckpt_step is True
 
 
+@pytest.mark.parametrize(
+    "max_steps, ckpt_every_steps, epoch, num_epochs, global_batch_size, local_batch_size, num_batches, is_ckpt_step",
+    [
+        (None, 1000, 0, 1, 64, 1, 317 + 1, [False] * 317 + [True]),
+        (1000, 1000, 0, 1, 64, 1, 317 + 1, [False] * 317 + [True]),
+    ],
+)
+def test_ckpt_every_steps_larger_than_max_steps(max_steps, ckpt_every_steps, epoch, num_epochs, global_batch_size, local_batch_size, num_batches, is_ckpt_step):
+    dataloader = SizedDataLoader(
+        num_batches=num_batches * (global_batch_size // local_batch_size),
+    )
+    scheduler = StepScheduler(
+        global_batch_size=global_batch_size,
+        local_batch_size=local_batch_size,
+        dp_size=1,
+        ckpt_every_steps=ckpt_every_steps,
+        dataloader=dataloader,
+        start_epoch=epoch,
+        num_epochs=num_epochs,
+        max_steps=max_steps,
+    )
+
+    for i, batches in enumerate(scheduler):
+        print(i, scheduler.step, scheduler.is_ckpt_step, scheduler.is_last_batch, scheduler.is_last_step)
+        val = is_ckpt_step.pop(0)
+        assert val == scheduler.is_ckpt_step, i
+        assert val == scheduler.is_last_batch, i
+        if max_steps is None:
+            assert val == scheduler.is_last_step, i
+    assert len(is_ckpt_step) == 0
