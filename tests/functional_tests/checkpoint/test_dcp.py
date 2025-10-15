@@ -85,7 +85,7 @@ def get_validation_loss(
 ) -> torch.Tensor:
     """Gets the validation loss for a model."""
     loss_buffer = []
-    val_batch = {k: v.to(device, non_blocking=True) for k, v in val_batch.items()}
+    val_batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in val_batch.items()}
     num_label_tokens = (val_batch["labels"] != -100).sum().item()
     for model_part in model_parts:
         model_part.eval()
@@ -128,10 +128,7 @@ def get_validation_loss(
         return loss_buffer
 
 
-
-
-def test_dcp_checkpoint():
-    """Tests DCP checkpoint"""
+def get_test_dcp_checkpoint_expected_keys():
     expected_model_keys = {
         "model.embed_tokens.weight": ([16000, 512], torch.bfloat16, "cpu"),
         "model.layers.0.self_attn.q_proj.weight": ([256, 512], torch.bfloat16, "cpu"),
@@ -780,6 +777,13 @@ def test_dcp_checkpoint():
         "optim.state.lm_head.weight.exp_avg": ([16000, 512], torch.bfloat16, "cpu"),
         "optim.state.lm_head.weight.exp_avg_sq": ([16000, 512], torch.bfloat16, "cpu"),
     }
+
+    return expected_model_keys, expected_optim_keys
+
+def test_dcp_checkpoint():
+    """Tests DCP checkpoint"""
+    expected_model_keys, expected_optim_keys = get_test_dcp_checkpoint_expected_keys()
+
 
     cfg_path = Path(__file__).parents[3] / "examples" / "llm_finetune" / "llama3_2" / "llama3_2_1b_hellaswag.yaml"
     cfg = parse_args_and_load_config(cfg_path)

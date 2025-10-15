@@ -125,11 +125,7 @@ def to_cpu(
     """
     return {k: v.cpu() for k, v in state_dict.items() if isinstance(v, torch.Tensor)}
 
-
-def test_hf_peft_checkpoint():
-    """
-    Tests HF PEFT checkpoint
-    """
+def get_test_peft_vlm_checkpoint_expected_keys():
     expected_model_keys = {
         "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight": (
             [8, 128],
@@ -598,6 +594,14 @@ def test_hf_peft_checkpoint():
             "cpu",
         ),
     }
+    return expected_model_keys, expected_optim_keys
+
+
+def test_hf_peft_checkpoint():
+    """
+    Tests HF PEFT checkpoint
+    """
+    expected_model_keys, expected_optim_keys = get_test_peft_vlm_checkpoint_expected_keys()
     expected_config = {
         "base_model_name_or_path": "/home/TestData/huiyingl/hf_gemma3_2l/",
         "bias": "none",
