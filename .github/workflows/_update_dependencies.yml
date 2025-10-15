@@ -122,6 +122,8 @@ jobs:
     needs: [update-lockfile, pre-flight]
     runs-on: ubuntu-latest
     environment: main
+    outputs:
+      pr-number: ${{ steps.create-pull-request.outputs.pull-request-number }}
     env:
       SOURCE_BRANCH: ${{ needs.pre-flight.outputs.bump-branch }}
       TARGET_BRANCH: ${{ inputs.target-branch }}
@@ -161,9 +163,79 @@ jobs:
           body: |
             🚀 PR to bump `uv.lock` in `${{ inputs.target-branch }}`.  
 
-            📝 Please remember the following to-do's before merge: 
-            - [ ] Verify the presubmit CI  
+            📝 This PR will be automatically merged if all CI checks pass successfully.
+            If any CI checks fail, the PR will remain open for manual review.
 
-            🙏 Please merge this PR only if the CI workflow completed successfully.
+            🤖 **Auto-merge enabled** - No manual action required if CI passes.
           commit-message: ${{ env.title }}
           signoff: true
+
+  auto-merge:
+    needs: [create-pr, pre-flight]
+    runs-on: ubuntu-latest
+    if: needs.create-pr.outputs.pr-number != ''
+    env:
+      PR_NUMBER: ${{ needs.create-pr.outputs.pr-number }}
+      TARGET_BRANCH: ${{ inputs.target-branch }}
+      GH_TOKEN: ${{ secrets.PAT }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT }}
+
+      - name: Wait for CI checks and auto-merge
+        run: |
+          echo "Monitoring PR #${PR_NUMBER} for CI check completion..."
+          
+          MAX_ATTEMPTS=144  # Wait up to 12 hours (144 attempts * 5 minutes)
+          ATTEMPT=0
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: Checking CI status..."
+            
+            # Get PR status checks
+            STATUS_JSON=$(gh pr view ${PR_NUMBER} --json statusCheckRollup)
+            
+            # Count total checks, successful checks, and failed checks
+            TOTAL_CHECKS=$(echo "$STATUS_JSON" | jq '.statusCheckRollup | length')
+            
+            if [ "$TOTAL_CHECKS" -eq 0 ]; then
+              echo "No status checks found yet. Waiting..."
+              sleep 300
+              continue
+            fi
+            
+            PENDING_CHECKS=$(echo "$STATUS_JSON" | jq '[.statusCheckRollup[] | select(.conclusion == null or .conclusion == "" or .status == "IN_PROGRESS" or .status == "PENDING" or .status == "QUEUED")] | length')
+            FAILED_CHECKS=$(echo "$STATUS_JSON" | jq '[.statusCheckRollup[] | select(.conclusion == "FAILURE" or .conclusion == "CANCELLED" or .conclusion == "TIMED_OUT")] | length')
+            SUCCESS_CHECKS=$(echo "$STATUS_JSON" | jq '[.statusCheckRollup[] | select(.conclusion == "SUCCESS")] | length')
+            
+            echo "Status: $SUCCESS_CHECKS successful, $FAILED_CHECKS failed, $PENDING_CHECKS pending (out of $TOTAL_CHECKS total)"
+            
+            # If any checks failed, exit and leave PR open
+            if [ "$FAILED_CHECKS" -gt 0 ]; then
+              echo "❌ CI checks failed. Leaving PR open for manual review."
+              echo "Failed checks:"
+              echo "$STATUS_JSON" | jq -r '.statusCheckRollup[] | select(.conclusion == "FAILURE" or .conclusion == "CANCELLED" or .conclusion == "TIMED_OUT") | "  - \(.name): \(.conclusion)"'
+              exit 0
+            fi
+            
+            # If all checks are done and successful, merge
+            if [ "$PENDING_CHECKS" -eq 0 ] && [ "$SUCCESS_CHECKS" -gt 0 ]; then
+              echo "✅ All CI checks passed! Auto-merging PR #${PR_NUMBER}..."
+              
+              # Merge the PR
+              gh pr merge ${PR_NUMBER} --squash --auto --delete-branch
+              
+              echo "✅ PR #${PR_NUMBER} has been merged successfully!"
+              exit 0
+            fi
+            
+            # Still waiting for checks to complete
+            echo "Waiting for pending checks to complete..."
+            sleep 300
+          done
+          
+          echo "⏱️  Timeout reached. PR #${PR_NUMBER} will remain open for manual review."
+          exit 0
