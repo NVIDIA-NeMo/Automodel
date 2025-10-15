@@ -131,6 +131,7 @@ jobs:
   cicd-unit-tests:
     strategy:
       fail-fast: false
+      max-parallel: 5
       matrix:
         include:
           - test-name: L0_Unit_Tests_CPU
@@ -169,6 +170,7 @@ jobs:
   cicd-e2e-tests:
     strategy:
       fail-fast: false
+      max-parallel: 5
       matrix:
         include:
           - test-name: L2_Pretrain
