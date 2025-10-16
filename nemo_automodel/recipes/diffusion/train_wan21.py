@@ -13,21 +13,13 @@ import torch
 import torch.distributed as dist
 import wandb
 from nemo_automodel.recipes.diffusion.wan21.data_utils import create_dataloader
-from diffusers import WanPipeline
-from nemo_automodel.recipes.diffusion.wan21.dist_utils import is_main_process, setup_distributed
-from nemo_automodel.recipes.diffusion.wan21.fsdp2_utils_t2v import (
-    get_fsdp_all_parameters,
-    setup_fsdp_for_t2v_pipe,
-    test_fsdp_forward_pass,
-    verify_fsdp_setup,
-)
+
 from nemo_automodel.recipes.diffusion.wan21.training_step_t2v import step_fsdp_transformer_t2v
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
-from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType
-from torch.distributed.fsdp.api import ShardedOptimStateDictConfig, ShardedStateDictConfig
+from torch.distributed.fsdp import MixedPrecisionPolicy
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 import torch.distributed.checkpoint as dcp
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 
@@ -70,7 +62,7 @@ class WanT2VTrainerFSDP:
         self.flow_shift = flow_shift
         self.mix_uniform_ratio = mix_uniform_ratio
 
-        self.local_rank = setup_distributed()
+        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
         self.device = torch.device("cuda", self.local_rank)
         
@@ -94,34 +86,6 @@ class WanT2VTrainerFSDP:
         self.model_map = {}
         self.optimizer = None
         self.lr_scheduler = None
-
-    def setup_pipeline(self):
-        logging.info("[INFO] Loading WAN 2.1 T2V pipeline (transformer only)...")
-
-        # Load pipeline without VAE or text encoder
-        self.pipe = WanPipeline.from_pretrained(
-            self.model_id, 
-            torch_dtype=torch.float32,
-            vae=None,
-            text_encoder=None,
-        )
-
-        # Explicitly delete VAE and text encoder if they were loaded
-        if hasattr(self.pipe, "vae") and self.pipe.vae is not None:
-            logging.info("[INFO] Removing VAE from pipeline...")
-            del self.pipe.vae
-            self.pipe.vae = None
-
-        if hasattr(self.pipe, "text_encoder") and self.pipe.text_encoder is not None:
-            logging.info("[INFO] Removing text encoder from pipeline...")
-            del self.pipe.text_encoder
-            self.pipe.text_encoder = None
-
-        # Clear any cached memory
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        logging.info("[INFO] Pipeline loaded (transformer + scheduler only)")
 
     def nemo_auto_diffusion(
         self,
@@ -189,11 +153,13 @@ class WanT2VTrainerFSDP:
                 "base_transformer": transformer_module,
             }
         }
-
+        # Verify FSDP setup
+        trainable_count = sum(1 for p in transformer_module.parameters() if p.requires_grad)
+        frozen_count = sum(1 for p in transformer_module.parameters() if not p.requires_grad)
+        logging.info(f"[INFO] Trainable parameters: {trainable_count}, Frozen parameters: {frozen_count}")
         # Set up optimizer and a temporary scheduler (reconfigured later after dataloader)
         logging.info("[INFO] Setting up optimizer for NeMoAutoDiffusionPipeline (transformer)")
         trainable_params = [p for p in transformer_module.parameters() if p.requires_grad]
-        verify_fsdp_setup(self.model_map)
         if not trainable_params:
             raise RuntimeError("No trainable parameters found in transformer module!")
 
@@ -203,61 +169,13 @@ class WanT2VTrainerFSDP:
             weight_decay=0.01,
             betas=(0.9, 0.999),
         )
-
-        logging.info("[INFO] NeMoAutoDiffusion setup complete (pipeline + optimizer")
-
-    def setup_fsdp(self):
-        logging.info("[INFO] Setting up FSDP for full fine-tuning...")
-
-        self.model_map = setup_fsdp_for_t2v_pipe(
-            self.pipe,
-            device=self.device,
-            bf16=self.bf16,
-            local_rank=self.local_rank,
-            cpu_offload=self.cpu_offload,
-        )
-
-        # Verify setup
-        verify_fsdp_setup(self.model_map)
-
-        logging.info("[INFO] FSDP setup complete")
-
-    def setup_optim(self):
-        logging.info("[INFO] Setting up optimizer...")
-
-        # Get ALL trainable parameters
-        all_params = get_fsdp_all_parameters(self.model_map)
-
-        if not all_params:
-            raise RuntimeError("No trainable parameters found!")
-
-        logging.info(f"[INFO] Optimizing {len(all_params)} parameters")
-
-        self.optimizer = torch.optim.AdamW(
-            all_params, 
-            lr=self.learning_rate, 
-            weight_decay=0.01, 
-            betas=(0.9, 0.999)
-        )
-
-        # Temporary scheduler - will be reconfigured after dataloader is created
-        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, 
-            T_max=1000, 
-            eta_min=1e-6
-        )
-
-    def validate_setup(self):
-        """Validate FSDP setup with a test forward pass."""
-        logging.info("[INFO] Validating FSDP setup...")
-
-        test_fsdp_forward_pass(self.model_map, self.device, self.bf16)
-
-        # Check memory
+                # Check memory
         if torch.cuda.is_available():
             memory_allocated = torch.cuda.memory_allocated(self.device) / 1024**3
             memory_reserved = torch.cuda.memory_reserved(self.device) / 1024**3
             logging.info(f"[INFO] GPU memory: {memory_allocated:.2f}GB allocated, {memory_reserved:.2f}GB reserved")
+
+        logging.info("[INFO] NeMoAutoDiffusion setup complete (pipeline + optimizer")
 
     def train(
         self,
@@ -279,12 +197,7 @@ class WanT2VTrainerFSDP:
         logging.info(f"[INFO] Batch size per node: {batch_size_per_node}")
         logging.info(f"[INFO] Total effective batch size: {batch_size_per_node * self.num_nodes}")
 
-        # self.setup_pipeline()
-        # self.setup_fsdp()
-        # self.setup_optim()
         self.nemo_auto_diffusion()
-        self.validate_setup()
-
         # Create dataloader
         dataloader, sampler = create_dataloader(meta_folder, batch_size_per_node, self.num_nodes)
 
@@ -586,6 +499,8 @@ def load_fsdp2_checkpoint(
 
     return 0
 
+def is_main_process():
+    return dist.get_rank() == 0
 
 class TrainWan21DiffusionRecipe(BaseRecipe):
     """Config-driven wrapper around WAN 2.1 T2V training."""
