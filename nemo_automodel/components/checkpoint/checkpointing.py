@@ -430,7 +430,7 @@ class Checkpointer:
             The populated state dictionary (may be replaced for PEFT).
         """
         # Both model and optimizer saving is done in this function
-        is_model = True if "model" in path else False
+        is_model = True if "/model" in path else False
         # PEFT loading is broadcasted from rank0 so it is a special case
         if self.config.is_peft and is_model and (not is_init_step):
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
@@ -457,7 +457,7 @@ class Checkpointer:
             Optional Future object if async mode is enabled.
         """
         # Both model and optimizer saving is done in this function
-        is_model = True if "model" in path else False
+        is_model = True if "/model" in path else False
         # PEFT saving is done on rank0 so it is a special case
         if self.config.is_peft and is_model:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:

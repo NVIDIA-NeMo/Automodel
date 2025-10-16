@@ -446,7 +446,8 @@ class BaseRecipe:
         return self.device_mesh.get_local_rank("tp")
 
     def _get_pp_rank(self):
-        if not self.device_mesh or self.device_mesh["pp"].size() == 1:
+        # PP is a special case because it'll only be present in the device mesh if pp is enabled
+        if not self.device_mesh or "pp" not in self.device_mesh.mesh_dim_names or self.device_mesh["pp"].size() == 1:
             return 0
         return self.device_mesh.get_local_rank("pp")
 
