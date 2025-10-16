@@ -76,7 +76,7 @@ class StepScheduler(Stateful):
         assert val_every_steps is None or val_every_steps > 0, "val_every_steps must be greater than 0 if not None"
         if max_steps is None:
             assert self.epoch_len is not None, "epoch_len must be provided if max_steps is not provided"
-            max_steps = ((self.num_epochs - self.epoch) * self.epoch_len)
+            max_steps = (self.num_epochs - self.epoch) * self.epoch_len
         self.max_steps = max_steps
         assert max_steps > 0, "max_steps must be greater than 0"
 
@@ -132,7 +132,7 @@ class StepScheduler(Stateful):
         Returns:
             bool: if true, the checkpoint should run.
         """
-        is_ckpt_step = ((self.step % self.ckpt_every_steps) == self.ckpt_every_steps - 1)
+        is_ckpt_step = (self.step % self.ckpt_every_steps) == self.ckpt_every_steps - 1
         return is_ckpt_step or self.is_last_batch or self.is_last_step
 
     @property
