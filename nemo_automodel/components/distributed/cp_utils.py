@@ -301,7 +301,7 @@ def _shard_thd_chunk_for_te(
     import transformer_engine_torch as tex
 
     cu_seqlens = batch.get("cu_seqlens", None)
-    cu_seqlens_padded = batch.get("cu_seqlens_padded", None)
+    cu_seqlens_padded = batch.get("cu_seqlens_padded", batch["cu_seqlens"])
     filtered_cu_seqlens_padded = cu_seqlens_padded[cu_seqlens_padded != seq_lens_padding_value]
 
     # Check for required fields - BSHD format is not supported

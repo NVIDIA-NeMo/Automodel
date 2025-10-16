@@ -44,7 +44,6 @@ class TestProcessInputForTHD:
 
         # Check cu_seqlens
         assert "cu_seqlens" in result
-        assert "cu_seqlens_padded" in result
         assert torch.equal(result["cu_seqlens"], torch.tensor([0, 6, 12], dtype=torch.int32))
 
     def test_with_multiple_packed_sequences(self):
@@ -63,15 +62,11 @@ class TestProcessInputForTHD:
         assert result["input_ids"].shape == (12,)
         assert result["position_ids"].shape == (12,)
 
-        # Check cu_seqlens: [0, 3, 5, 7, 10]
-        # First batch: seq 1 (len 3), seq 2 (len 2) -> cumsum [0, 3, 5]
-        # Second batch: seq 1 (len 2), seq 2 (len 3) -> cumsum [5, 7, 10]
-        expected_cu_seqlens = torch.tensor([0, 3, 5, 7, 10], dtype=torch.int32)
+        # Check cu_seqlens - uses seq_lens_padded values for CP compatibility
+        # First batch: padded lengths [4, 2] -> cumsum [0, 4, 6]
+        # Second batch: padded lengths [3, 3] -> cumsum [6, 9, 12]
+        expected_cu_seqlens = torch.tensor([0, 4, 6, 9, 12], dtype=torch.int32)
         assert torch.equal(result["cu_seqlens"], expected_cu_seqlens)
-
-        # Check cu_seqlens_padded: [0, 4, 6, 9, 12]
-        expected_cu_seqlens_padded = torch.tensor([0, 4, 6, 9, 12], dtype=torch.int32)
-        assert torch.equal(result["cu_seqlens_padded"], expected_cu_seqlens_padded)
 
     def test_with_variable_num_sequences_and_padding(self):
         """Test with variable number of sequences per example (seq_lens padding with -1000)."""
@@ -89,13 +84,11 @@ class TestProcessInputForTHD:
         assert result["input_ids"].shape == (12,)
         assert result["position_ids"].shape == (12,)
 
-        # Check cu_seqlens: [0, 3, 5, 11] (filters out -1000)
-        expected_cu_seqlens = torch.tensor([0, 3, 5, 11], dtype=torch.int32)
+        # Check cu_seqlens - uses seq_lens_padded values (filters out -1000)
+        # First batch: padded lengths [4, 2] -> cumsum [0, 4, 6]
+        # Second batch: padded length [6] (second is -1000, filtered) -> cumsum [6, 12]
+        expected_cu_seqlens = torch.tensor([0, 4, 6, 12], dtype=torch.int32)
         assert torch.equal(result["cu_seqlens"], expected_cu_seqlens)
-
-        # Check cu_seqlens_padded: [0, 4, 6, 12]
-        expected_cu_seqlens_padded = torch.tensor([0, 4, 6, 12], dtype=torch.int32)
-        assert torch.equal(result["cu_seqlens_padded"], expected_cu_seqlens_padded)
 
     def test_with_qkv_format_preservation(self):
         """Test that non-tensor keys like qkv_format are preserved."""
@@ -130,7 +123,6 @@ class TestProcessInputForTHD:
         assert result["position_ids"].dtype == torch.long
         assert result["labels"].dtype == torch.long
         assert result["cu_seqlens"].dtype == torch.int32
-        assert result["cu_seqlens_padded"].dtype == torch.int32
 
     def test_with_embeddings_3d_input(self):
         """Test with 3D embeddings input (pipeline parallelism scenario)."""
@@ -286,12 +278,14 @@ class TestProcessInputForTHD:
         assert result["input_ids"].shape == (2, 12)
         assert result["labels"].shape == (2, 12)
 
-        # Check cu_seqlens for first chunk: [0, 3, 5, 7, 10]
-        expected_cu_seqlens_0 = torch.tensor([0, 3, 5, 7, 10], dtype=torch.int32)
+        # Check cu_seqlens for first chunk - uses seq_lens_padded values [4, 2] and [3, 3]
+        # First batch: [4, 2] -> cumsum [0, 4, 6]
+        # Second batch: [3, 3] -> cumsum [6, 9, 12]
+        expected_cu_seqlens_0 = torch.tensor([0, 4, 6, 9, 12], dtype=torch.int32)
         assert torch.equal(result["cu_seqlens"][0], expected_cu_seqlens_0)
 
-        # Check cu_seqlens for second chunk: [0, 3, 5, 7, 10]
-        expected_cu_seqlens_1 = torch.tensor([0, 3, 5, 7, 10], dtype=torch.int32)
+        # Check cu_seqlens for second chunk - uses seq_lens_padded values [4, 2] and [3, 3]
+        expected_cu_seqlens_1 = torch.tensor([0, 4, 6, 9, 12], dtype=torch.int32)
         assert torch.equal(result["cu_seqlens"][1], expected_cu_seqlens_1)
 
     def test_chunking_with_embeddings(self):
@@ -343,12 +337,16 @@ class TestProcessInputForTHDWithChunks:
         # cu_seqlens should be [num_chunks, max_seqs_across_chunks+1]
         assert result["cu_seqlens"].shape[0] == 2
 
-        # First chunk: [0, 3, 5, 11] (2 seqs from first batch, 1 seq from second batch)
-        expected_cu_seqlens_0 = torch.tensor([0, 3, 5, 11], dtype=torch.int32)
+        # First chunk - uses seq_lens_padded values [4, 2] and [6]
+        # First batch: [4, 2] -> cumsum [0, 4, 6]
+        # Second batch: [6] -> cumsum [6, 12]
+        expected_cu_seqlens_0 = torch.tensor([0, 4, 6, 12], dtype=torch.int32)
         assert torch.equal(result["cu_seqlens"][0], expected_cu_seqlens_0)
 
-        # Second chunk: [0, 4, 6, 9] (1 seq from third batch, 2 seqs from fourth batch)
-        expected_cu_seqlens_1 = torch.tensor([0, 4, 6, 9], dtype=torch.int32)
+        # Second chunk - uses seq_lens_padded values [4] and [3, 3]
+        # Third batch: [4] -> cumsum [0, 4]
+        # Fourth batch: [3, 3] -> cumsum [4, 7, 10]
+        expected_cu_seqlens_1 = torch.tensor([0, 4, 7, 10], dtype=torch.int32)
         assert torch.equal(result["cu_seqlens"][1], expected_cu_seqlens_1)
 
     def test_single_chunk(self):
@@ -431,8 +429,8 @@ class TestProcessInputForTHDWithChunks:
         # After padding they remain [0, 3, 6]
         assert result["cu_seqlens"].shape == (2, 3)
 
-    def test_cu_seqlens_padded_handling(self):
-        """Test that cu_seqlens_padded is properly handled when present."""
+    def test_cu_seqlens_handling(self):
+        """Test that cu_seqlens is properly handled with chunking."""
         batch = {
             "input_ids": torch.tensor([[1, 2, 3, 99, 4, 5], [6, 7, 8, 9, 10, 11]] * 2),
             "labels": torch.tensor([[2, 3, 99, 4, 5, 6], [7, 8, 9, 10, 11, 12]] * 2),
@@ -443,14 +441,11 @@ class TestProcessInputForTHDWithChunks:
 
         result = split_batch_into_thd_chunks(batch, num_chunks=2)
 
-        # Both cu_seqlens and cu_seqlens_padded should be present
+        # cu_seqlens should be present
         assert "cu_seqlens" in result
-        assert "cu_seqlens_padded" in result
-        assert result["cu_seqlens_padded"] is not None
 
-        # They should have the same first dimension (num_chunks)
+        # cu_seqlens should have shape [num_chunks, ...]
         assert result["cu_seqlens"].shape[0] == 2
-        assert result["cu_seqlens_padded"].shape[0] == 2
 
     def test_chunks_equivalence_to_no_chunks(self):
         """Test that chunking with 1 chunk is equivalent to process_input_for_thd."""
@@ -487,22 +482,7 @@ class TestProcessInputForTHDWithChunks:
         assert result["labels"].dtype == torch.long
         assert result["position_ids"].dtype == torch.long
         assert result["cu_seqlens"].dtype == torch.int32
-        assert result["cu_seqlens_padded"].dtype == torch.int32
 
-    def test_position_ids_none_handling(self):
-        """Test handling when position_ids is None."""
-        batch = {
-            "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]]),
-            "labels": torch.tensor([[2, 3, 4], [5, 6, 7], [8, 9, 10], [11, 12, 13]]),
-            "position_ids": None,
-            "seq_lens": torch.tensor([[3], [3], [3], [3]]),
-            "seq_lens_padded": torch.tensor([[3], [3], [3], [3]]),
-        }
-
-        result = split_batch_into_thd_chunks(batch, num_chunks=2)
-
-        # position_ids should be None in result
-        assert result["position_ids"] is None
 
     def test_padding_mask_correctness(self):
         """Test that padding_mask is correctly generated."""

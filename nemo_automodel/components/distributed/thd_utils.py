@@ -37,7 +37,7 @@ def process_input_for_thd(
             - 'input_ids': Input tensor of shape [batch_size, seq_len] for token IDs or
                 [batch_size, seq_len, hidden_dim] for embeddings (in pipeline parallel scenarios)
             - 'labels': Labels tensor of shape [batch_size, seq_len]
-            - 'position_ids': Position IDs tensor of shape [batch_size, seq_len] or None
+            - 'position_ids': Position IDs tensor of shape [batch_size, seq_len] (required)
             - 'seq_lens': Sequence lengths tensor of shape [batch_size, num_packs] containing
                 actual sequence lengths (excluding padding/separators). Values matching
                 seq_lens_padding_value indicate padding and are filtered out.
@@ -53,11 +53,12 @@ def process_input_for_thd(
             - 'input_ids': Reshaped tensor of shape [total_tokens] for 2D token IDs or
                 [total_tokens, hidden_dim] for 3D embeddings
             - 'labels': Reshaped labels tensor of shape [total_tokens]
-            - 'position_ids': Reshaped tensor of shape [total_tokens] or None if not provided
-            - 'cu_seqlens': Cumulative sequence lengths tensor of shape [num_sequences + 1] (int32)
-                where num_sequences is the total count of non-padded sequences across the batch
-            - 'cu_seqlens_padded': Cumulative padded sequence lengths tensor of shape
-                [num_sequences + 1] (int32) or None if seq_lens_padded is not provided
+            - 'position_ids': Reshaped tensor of shape [total_tokens]
+            - 'cu_seqlens': Cumulative padded sequence lengths tensor of shape [num_sequences + 1] (int32)
+                where num_sequences is the total count of non-padded sequences across the batch.
+                NOTE: This contains cumulative lengths from seq_lens_padded (not seq_lens) since
+                CP doesn't support padding between sequences (resulting in NaNs). The labels or loss mask
+                will ensure that loss is computed correctly.
             - 'padding_mask': Boolean tensor of shape [total_tokens] indicating padding positions
             - Non-tensor keys from input batch are preserved (e.g., 'qkv_format')
 
@@ -76,15 +77,13 @@ def process_input_for_thd(
         >>> # result['input_ids'].shape: [12] (2D input collapsed to 1D)
         >>> # result['labels'].shape: [12]
         >>> # result['position_ids'].shape: [12]
-        >>> # result['cu_seqlens']: tensor([0, 3, 5, 11], dtype=torch.int32)
-        >>> #   Breakdown: [0] + cumsum([3, 2, 6]) = [0, 3, 5, 11]
-        >>> # result['cu_seqlens_padded']: tensor([0, 4, 6, 12], dtype=torch.int32)
-        >>> #   Breakdown: [0] + cumsum([4, 2, 6]) = [0, 4, 6, 12]
+        >>> # result['cu_seqlens']: tensor([0, 4, 6, 12], dtype=torch.int32)
+        >>> #   Breakdown: [0] + cumsum([4, 2, 6]) = [0, 4, 6, 12] (from seq_lens_padded)
         >>> # result['padding_mask'].shape: [12]
     """
     input_ids = batch["input_ids"]
     labels = batch["labels"]
-    position_ids = batch.get("position_ids", None)
+    position_ids = batch["position_ids"]
     seq_lens = batch["seq_lens"]
     seq_lens_padded = batch["seq_lens_padded"]
 
@@ -125,8 +124,8 @@ def process_input_for_thd(
     result = {
         "input_ids": input_ids_thd,
         "position_ids": position_ids_thd,
-        "cu_seqlens": cu_seqlens,
-        "cu_seqlens_padded": cu_seqlens_padded,
+        # Pass cu_seqlens_padded here since CP doesn't support padding between sequences correctly, the labels or loss mask will ensure that loss is computed correctly.
+        "cu_seqlens": cu_seqlens_padded,
         "labels": labels_thd,
         "padding_mask": (input_ids_thd == padding_token_id),
     }
@@ -161,7 +160,7 @@ def split_batch_into_thd_chunks(
         batch: Dictionary containing input tensors with same structure as process_input_for_thd:
             - 'input_ids': [batch_size, seq_len] or [batch_size, seq_len, hidden_dim]
             - 'labels': [batch_size, seq_len]
-            - 'position_ids': [batch_size, seq_len] or None
+            - 'position_ids': [batch_size, seq_len] (required)
             - 'seq_lens': [batch_size, num_packs]
             - 'seq_lens_padded': [batch_size, num_packs]
         num_chunks: Number of chunks to split the batch into. Must evenly divide batch_size.
@@ -175,9 +174,9 @@ def split_batch_into_thd_chunks(
         - When num_chunks > 1:
             - 'input_ids': [num_chunks, tokens_per_chunk] or [num_chunks, tokens_per_chunk, hidden_dim]
             - 'labels': [num_chunks, tokens_per_chunk]
-            - 'position_ids': [num_chunks, tokens_per_chunk] or None
-            - 'cu_seqlens': [num_chunks, max_sequences_per_chunk + 1] (padded with seq_lens_padding_value)
-            - 'cu_seqlens_padded': [num_chunks, max_sequences_per_chunk + 1] or None
+            - 'position_ids': [num_chunks, tokens_per_chunk]
+            - 'cu_seqlens': [num_chunks, max_sequences_per_chunk + 1] (padded with seq_lens_padding_value).
+                Contains cumulative lengths from seq_lens_padded for CP compatibility.
             - 'padding_mask': [num_chunks, tokens_per_chunk]
             - Non-tensor keys from input batch are preserved
         - When num_chunks <= 1:
@@ -235,13 +234,8 @@ def split_batch_into_thd_chunks(
     return {
         "input_ids": torch.stack([c["input_ids"] for c in chunk_results]),
         "labels": torch.stack([c["labels"] for c in chunk_results]),
-        "position_ids": torch.stack([c["position_ids"] for c in chunk_results])
-        if chunk_results[0]["position_ids"] is not None
-        else None,
+        "position_ids": torch.stack([c["position_ids"] for c in chunk_results]),
         "cu_seqlens": pad_and_stack([c["cu_seqlens"] for c in chunk_results], seq_lens_padding_value),
-        "cu_seqlens_padded": pad_and_stack([c["cu_seqlens_padded"] for c in chunk_results], seq_lens_padding_value)
-        if chunk_results[0]["cu_seqlens_padded"] is not None
-        else None,
         "padding_mask": torch.stack([c["padding_mask"] for c in chunk_results]),
         **{k: v for k, v in chunk_results[0].items() if not isinstance(v, torch.Tensor)},
     }
