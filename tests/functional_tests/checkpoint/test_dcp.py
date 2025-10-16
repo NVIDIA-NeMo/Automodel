@@ -827,7 +827,7 @@ def test_dcp_checkpoint():
         output_files.append("rng/rng_dp_rank_1.pt")
 
     for file in output_files:
-        path = Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / file
+        path = Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / file
         assert path.exists(), f"Expected {path} to exist"
         if "." in file:
             assert path.is_file(), f"Expected {path} to be a file"
@@ -836,7 +836,7 @@ def test_dcp_checkpoint():
         assert os.access(path, os.R_OK), f"Expected {path} to be readable"
         assert path.stat().st_size > 0, f"Expected {path} to be non-empty"
     restored_optim_dict, saved_lr_scheduler_state = load_dcp(
-        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "optim",
+        Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "optim",
     )
     # Remove "sched." prefix from keys in saved_lr_scheduler_state if present
     if saved_lr_scheduler_state is not None:
@@ -866,7 +866,7 @@ def test_dcp_checkpoint():
                 )
 
     restored_model_dict, _ = load_dcp(
-        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "model",
+        Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "model",
     )
 
     # check if new model and current model give the same CE loss
@@ -878,7 +878,7 @@ def test_dcp_checkpoint():
     assert sum(source_model_loss) == sum(restored_model_loss), "Model loss mismatch"
 
     # compare the recipe configs
-    with open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "config.yaml", "r") as f:
+    with open(Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "config.yaml", "r") as f:
         restored_config = yaml.safe_load(f)
     compare_configs(trainer.cfg.raw_config, restored_config)
 
@@ -976,8 +976,8 @@ def test_dcp_checkpoint():
                 raise e
     if torch.distributed.get_rank() == 0:
         # delete the checkpoint directory
-        if Path(trainer.checkpoint_config.checkpoint_dir).exists():
-            shutil.rmtree(Path(trainer.checkpoint_config.checkpoint_dir))
+        if Path(trainer.checkpointer.config.checkpoint_dir).exists():
+            shutil.rmtree(Path(trainer.checkpointer.config.checkpoint_dir))
     torch.distributed.barrier()
 
 
