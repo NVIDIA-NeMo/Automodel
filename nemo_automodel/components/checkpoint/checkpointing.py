@@ -89,7 +89,9 @@ class CheckpointingConfig:
         """
         Convert a raw string such as "safetensors" into the right Enum.
         """
-        assert self.model_save_format in SerializationFormat, f"Unsupported model save format: {self.model_save_format}"
+        assert self.model_save_format in [v.value for v in SerializationFormat], (
+            f"Unsupported model save format: {self.model_save_format}"
+        )
         self.model_save_format = SerializationFormat[self.model_save_format.upper()]
 
         # Async is only enabled for torch >= 2.9.0 currently because of large API changes in async DCP from 2.8.0 to 2.9.0
