@@ -409,7 +409,6 @@ def build_dataloader(
             ds = cfg_ds.instantiate(**kwargs)
             ds.build()
         else:
-            kwargs['vocab_size'] = tokenizer.vocab_size
             with FirstRankPerNode():
                 ds = cfg_ds.instantiate(**kwargs)
 
