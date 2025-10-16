@@ -17,6 +17,8 @@ set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1"
+export NVTE_DEBUG=1
+export NVTE_DEBUG_LEVEL=2
 
 # Run Qwen3MoE attention layer CP test with 2 GPUs
 torchrun --nproc_per_node=2 --nnodes=1 \
