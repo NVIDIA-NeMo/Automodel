@@ -206,7 +206,7 @@ def test_is_ckpt_step_triggers_on_last_batch_with_sized_dataloader(expected_last
     # Finished also triggers checkpoint
     assert scheduler.step == 10
     assert scheduler.is_ckpt_step is True
-    assert scheduler.state_dict() == {"step": 10, "epoch": 2, "max_steps": 10}
+    assert scheduler.state_dict() == {"step": 10, "epoch": 2}
 
 @pytest.mark.parametrize(
     "max_steps, ckpt_every_steps, epoch, num_epochs, global_batch_size, local_batch_size, num_batches, is_ckpt_step",
