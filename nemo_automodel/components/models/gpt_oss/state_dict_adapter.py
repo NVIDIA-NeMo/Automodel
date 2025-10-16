@@ -154,7 +154,7 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         Source: https://github.com/huggingface/transformers/blob/869735d37d0f929311ac6611728c482a4414ba8c/src/transformers/integrations/mxfp4.py#L77
         """
         # Check if blocks and scales are on CPU, and move to GPU if so
-        if not blocks.is_cuda and torch.cuda.is_available():
+        if not blocks.is_cuda and torch.cuda.is_available() and torch.distributed.get_world_size() > 1:
             blocks = blocks.cuda()
             scales = scales.cuda()
 
