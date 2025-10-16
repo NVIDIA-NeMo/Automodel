@@ -14,7 +14,7 @@
 
 import pytest
 
-from nemo_automodel.components.training.step_scheduler import StepScheduler
+from nemo_automodel.components.training.step_scheduler import StepScheduler, _calculate_max_steps
 
 
 class SizedDataLoader:
@@ -206,7 +206,7 @@ def test_is_ckpt_step_triggers_on_last_batch_with_sized_dataloader(expected_last
     # Finished also triggers checkpoint
     assert scheduler.step == 10
     assert scheduler.is_ckpt_step is True
-    assert scheduler.state_dict() == {"step": 10, "epoch": 2}
+    assert scheduler.state_dict() == {"step": 10, "epoch": 2, "max_steps": 10}
 
 @pytest.mark.parametrize(
     "max_steps, ckpt_every_steps, epoch, num_epochs, global_batch_size, local_batch_size, num_batches, is_ckpt_step",
@@ -237,3 +237,14 @@ def test_ckpt_every_steps_larger_than_max_steps(max_steps, ckpt_every_steps, epo
         if max_steps is None:
             assert val == scheduler.is_last_step, i
     assert len(is_ckpt_step) == 0
+
+@pytest.mark.parametrize(
+    "num_epochs, epoch_len, expected_max_steps",
+    [
+        (1, 10, 10),
+        (1, None, 9223372036854775807),
+        (2, 10, 20),
+    ],
+)
+def test_calculate_max_steps(num_epochs, epoch_len, expected_max_steps):
+    assert _calculate_max_steps(num_epochs, epoch_len) == expected_max_steps
