@@ -40,6 +40,7 @@ from wandb import Settings
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig, load_model_from_base_checkpoint
+from nemo_automodel.components._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
@@ -105,6 +106,7 @@ def build_model_and_optimizer(
     cfg_peft,
     model_wrapper,
     seed,
+    checkpointer: Checkpointer,
     tp_size=1,
     cp_size=1,
     cfg_fp8=None,
@@ -198,15 +200,12 @@ def build_model_and_optimizer(
         else:
             autopipeline.build(model, loss_fn=loss_fn, parallelize_fn=parallelize_fn)
             for mp in autopipeline.parts:
-                load_model_from_base_checkpoint(
+                checkpointer.load_base_model(
                     mp,
                     device,
-                    cfg_peft is not None,
                     cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
                     _get_model_name(cfg_model),
                     getattr(cfg_peft, "lora_A_init", None),
-                    device_mesh=autopipeline.world_mesh,
-                    moe_mesh=autopipeline.moe_mesh,
                     load_base_model=load_base_model,
                     quantization=dequantize_base_checkpoint,
                 )
@@ -257,15 +256,12 @@ def build_model_and_optimizer(
 
         # Load the weights into the model in parallel.
         if is_meta_device and load_weights:
-            load_model_from_base_checkpoint(
+            checkpointer.load_base_model(
                 model,
                 device,
-                cfg_peft is not None,
                 cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
                 _get_model_name(cfg_model),
                 getattr(cfg_peft, "lora_A_init", None),
-                device_mesh=model_wrapper.device_mesh,
-                moe_mesh=getattr(model_wrapper, "moe_mesh", None),
                 load_base_model=load_base_model,
                 quantization=dequantize_base_checkpoint,
             )
@@ -296,7 +292,7 @@ def build_model_and_optimizer(
     return model, state_dict_keys, optimizer, loss_fn
 
 
-def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft, state_dict_keys) -> CheckpointingConfig:
+def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
     """Build a checkpoint configuration.
 
     Args:
@@ -318,7 +314,6 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft, state_d
         model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
         save_consolidated=False,
         is_peft=is_peft,
-        model_state_dict_keys=state_dict_keys,
     )
     if cfg_ckpt is not None:
         cfg_ckpt = cfg_ckpt.to_dict()
@@ -813,6 +808,23 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if parallelize_fn is None and self.pp_enabled:
             parallelize_fn = partial(parallelize_for_pp, model_wrapper=self.model_wrapper)
 
+        # Build checkpoint config
+        checkpoint_config = build_checkpoint_config(
+            self.cfg.get("checkpoint", None),
+            self.cfg.get("model.cache_dir", None),
+            _get_model_name(self.cfg.model),
+            True if self.cfg.get("peft", None) else False,
+        )
+
+        # Create Checkpointer instance
+        self.checkpointer = Checkpointer(
+            config=checkpoint_config,
+            dp_rank=self._get_dp_rank(include_cp=True),
+            tp_rank=self._get_tp_rank(),
+            pp_rank=self._get_pp_rank(),
+            moe_mesh=self.moe_mesh,
+        )
+
         model, model_state_dict_keys, self.optimizer, self.loss_fn = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
@@ -831,7 +843,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             parallelize_fn=parallelize_fn,
             load_base_model=self.cfg.get("checkpoint.load_base_model", True),
             dequantize_base_checkpoint=self.cfg.get("checkpoint.dequantize_base_checkpoint", False),
+            checkpointer=self.checkpointer,
         )
+        self.checkpointer.config.model_state_dict_keys = model_state_dict_keys
+
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
             self.pp = model
@@ -889,15 +904,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Log model, parameter counts, norms, optimizer and scheduler
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
 
-        # Build checkpointing config
         restore_from = self.cfg.get("checkpoint.restore_from", None)
-        self.checkpoint_config = build_checkpoint_config(
-            self.cfg.get("checkpoint", None),
-            self.cfg.get("model.cache_dir", None),
-            _get_model_name(self.cfg.model),
-            True if self.cfg.get("peft", None) else False,
-            model_state_dict_keys,
-        )
 
         # Optionally resume
         self.load_checkpoint(restore_from, moe_mesh=self.moe_mesh)
@@ -938,6 +945,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     self._run_validation_epoch()
                     for mp in self.model_parts:
                         mp.train()
+
+        self.checkpointer.close()
 
     # ------------------ helpers ------------------
     def _forward_backward_step(
@@ -1063,6 +1072,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model_parts[0].finish_grad_sync()
 
+        self.checkpointer.maybe_wait_for_staging()
         for opt in self.optimizer:
             opt.step()
             opt.zero_grad()
