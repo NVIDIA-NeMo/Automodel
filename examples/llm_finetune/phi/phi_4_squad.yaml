@@ -64,7 +64,7 @@ packed_sequence:
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  shuffle: false
+  shuffle: true
 
 
 validation_dataset:
