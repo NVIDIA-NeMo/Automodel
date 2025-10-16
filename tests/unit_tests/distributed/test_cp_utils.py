@@ -242,6 +242,7 @@ def test_make_cp_batch_for_te_requires_seqlens():
     batch = {
         "input_ids": input_ids,
         "labels": labels,
+        "position_ids": torch.tensor([[0, 1, 2]]),
     }
 
     with pytest.raises(KeyError, match="seq_lens"):
