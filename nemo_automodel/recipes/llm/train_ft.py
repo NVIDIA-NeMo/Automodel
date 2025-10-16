@@ -937,14 +937,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
                 # Save the checkpoint every ckpt_every_steps
                 if self.step_scheduler.is_ckpt_step:
-                    torch.distributed.barrier()
-                    t1 = time.perf_counter()
-                    torch.cuda.synchronize()
                     self.save_checkpoint(epoch, self.step_scheduler.step)
-                    torch.cuda.synchronize()
-                    torch.distributed.barrier()
-                    t2 = time.perf_counter()
-                    print(f"Save checkpoint time: {t2 - t1} seconds")
 
                 # Run validation every val_every_steps
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
