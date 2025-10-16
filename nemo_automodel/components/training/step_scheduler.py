@@ -201,5 +201,3 @@ class StepScheduler(Stateful):
         self.step, self.epoch = s["step"], s["epoch"]
         if "max_steps" in s:
             self.max_steps = s["max_steps"]
-        elif self.max_steps is None:
-            self.max_steps = _calculate_max_steps(self.num_epochs, self.epoch_len)
