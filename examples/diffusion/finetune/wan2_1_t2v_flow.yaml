@@ -1,0 +1,46 @@
+seed: 42
+
+wandb:
+  project: wan-t2v-flow-matching
+  mode: online
+  name: wan2_1_t2v_fm
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  pretrained_model_name_or_path: Wan-AI/Wan2.1-T2V-1.3B-Diffusers
+
+data:
+  meta_folder: /abs/path/to/meta
+
+batch:
+  batch_size_per_node: 1
+
+training:
+  num_epochs: 20
+
+optim:
+  learning_rate: 5e-6
+
+flow_matching:
+  use_sigma_noise: true
+  timestep_sampling: uniform
+  logit_mean: 0.0
+  logit_std: 1.0
+  flow_shift: 3.0
+  mix_uniform_ratio: 0.1
+
+fsdp:
+  cpu_offload: true
+
+logging:
+  save_every: 50
+  log_every: 2
+
+checkpoint:
+  output_dir: /opt/Automodel/wan_t2v_flow_outputs/
+  resume: null
+
+

@@ -68,6 +68,23 @@ def _move_module_to_device(module: nn.Module, device: torch.device, torch_dtype:
         module.to(device=device)
 
 
+
+def _ensure_params_trainable(module: nn.Module, module_name: Optional[str] = None) -> int:
+    """
+    Ensure that all parameters in the given module are trainable.
+
+    Returns the number of parameters marked trainable. If a module name is
+    provided, it will be used in the log message for clarity.
+    """
+    num_trainable_parameters = 0
+    for parameter in module.parameters():
+        parameter.requires_grad = True
+        num_trainable_parameters += parameter.numel()
+    if module_name is None:
+        module_name = module.__class__.__name__
+    logger.info("[Trainable] %s: %s parameters set requires_grad=True", module_name, f"{num_trainable_parameters:,}")
+    return num_trainable_parameters
+
 class NeMoAutoDiffusionPipeline(DiffusionPipeline):
     """
     Drop-in Diffusers pipeline that adds optional FSDP2/TP parallelization during from_pretrained.
@@ -90,6 +107,7 @@ class NeMoAutoDiffusionPipeline(DiffusionPipeline):
         device: Optional[torch.device] = None,
         torch_dtype: Any = "auto",
         move_to_device: bool = True,
+        load_for_training: bool = False,
         **kwargs,
     ) -> DiffusionPipeline:
         pipe: DiffusionPipeline = DiffusionPipeline.from_pretrained(
@@ -98,6 +116,16 @@ class NeMoAutoDiffusionPipeline(DiffusionPipeline):
             torch_dtype=torch_dtype,
             **kwargs,
         )
+                    # Explicitly delete VAE and text encoder if they were loaded
+        if hasattr(pipe, "vae") and pipe.vae is not None:
+            logging.info("[INFO] Removing VAE from pipeline...")
+            del pipe.vae
+            pipe.vae = None
+
+        if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
+            logging.info("[INFO] Removing text encoder from pipeline...")
+            del pipe.text_encoder
+            pipe.text_encoder = None
 
         # Decide device
         dev = _choose_device(device)
@@ -105,7 +133,17 @@ class NeMoAutoDiffusionPipeline(DiffusionPipeline):
         # Move modules to device/dtype first (helps avoid initial OOM during sharding)
         if move_to_device:
             for name, module in _iter_pipeline_modules(pipe):
-                _move_module_to_device(module, dev, torch_dtype)
+                if name == "transformer":
+                    logger.info("!!! [INFO] Moving module: %s to device/dtype", name)
+                    _move_module_to_device(module, dev, torch_dtype)
+
+        # If loading for training, ensure the target module parameters are trainable
+        if load_for_training:
+                
+            for name, module in _iter_pipeline_modules(pipe):
+                if name == "transformer":
+                    logger.info("!!! [INFO] Ensuring params trainable: %s", name)
+                    _ensure_params_trainable(module, module_name=name)
 
         # Use per-component FSDP2Manager mappings to parallelize components
         if parallel_scheme is not None:
