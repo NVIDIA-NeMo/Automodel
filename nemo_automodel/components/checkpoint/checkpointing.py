@@ -462,7 +462,9 @@ class Checkpointer:
         if self.config.is_peft and is_model:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 save_file(state_dict, os.path.join(path, "adapter_model.safetensors"))
-                return
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+            return
 
         ret = None
         if self.config.is_async:
