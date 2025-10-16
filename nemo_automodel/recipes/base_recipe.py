@@ -30,15 +30,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils import PreTrainedTokenizerBase
 
-from nemo_automodel.components.checkpoint.checkpointing import (
-    load_dp_aware_helper,
-    load_model,
-    load_optimizer,
-    save_config,
-    save_dp_aware_helper,
-    save_model,
-    save_optimizer,
-)
+from nemo_automodel.components.checkpoint.checkpointing import save_config
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.rng import StatefulRNG
@@ -176,12 +168,25 @@ class BaseRecipe:
             epoch (int): The current epoch.
             step (int): The current step.
         """
-        if not self.checkpoint_config.enabled:
+        if not self.checkpointer.config.enabled:
             return
+
+        # Wait for any in-flight checkpoint (async case) to complete
+        self.checkpointer.async_wait()
+
+        # If a previous async checkpoint just finished, update the "latest" symlink now
+        prev_pending = getattr(self, "_last_pending_checkpoint_dir", None)
         is_dist_initialized = torch.distributed.is_initialized()
         is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
+        if prev_pending is not None:
+            if is_rank_0:
+                self._update_latest_symlink(prev_pending)
+            # clear and remember the last completed path
+            setattr(self, "_last_pending_checkpoint_dir", None)
+            if is_dist_initialized:
+                torch.distributed.barrier()
 
-        path = self.checkpoint_config.checkpoint_dir
+        path = self.checkpointer.config.checkpoint_dir
         path = os.path.join(path, f"epoch_{epoch}_step_{step}")
 
         if is_rank_0:
@@ -193,7 +198,7 @@ class BaseRecipe:
         # TODO(@adil-a): Change this when we create a LR scheduler class
         model, optimizer, scheduler, tokenizer, config = None, None, None, None, None
 
-        for key in self.__dict__["__state_tracked"]:
+        for key in sorted(self.__dict__["__state_tracked"]):
             if is_model(getattr(self, key)):
                 if key == "teacher_model":
                     continue
@@ -207,14 +212,7 @@ class BaseRecipe:
             elif is_tokenizer(getattr(self, key)):
                 tokenizer = getattr(self, key)
             elif is_dataloader(getattr(self, key)) or isinstance(getattr(self, key), StatefulRNG):
-                save_dp_aware_helper(
-                    getattr(self, key),
-                    key,
-                    path,
-                    self._get_dp_rank(include_cp=True),
-                    self._get_tp_rank(),
-                    self._get_pp_rank(),
-                )
+                self.checkpointer.save_on_dp_ranks(getattr(self, key), key, path)
             else:
                 if is_rank_0:
                     torch.save(
@@ -222,17 +220,40 @@ class BaseRecipe:
                         os.path.join(path, f"{key}.pt"),
                     )
 
-        save_model(model, path, self.checkpoint_config, peft_config=self.peft_config, tokenizer=tokenizer)
-        save_optimizer(optimizer, model, path, scheduler)
+        self.checkpointer.save_model(model, path, peft_config=self.peft_config, tokenizer=tokenizer)
+        self.checkpointer.save_optimizer(optimizer, model, path, scheduler)
         save_config(config.raw_config, path)
         if is_dist_initialized:
             torch.distributed.barrier()
+
+        # Update latest symlink according to sync/async behavior
+        if getattr(self.checkpointer.config, "is_async", False):
+            # Async: defer symlink until the next call (after async_wait completes)
+            setattr(self, "_last_pending_checkpoint_dir", path)
+        else:
+            # Sync: update immediately
+            if is_rank_0:
+                self._update_latest_symlink(path)
+            if is_dist_initialized:
+                torch.distributed.barrier()
+
+    def _update_latest_symlink(self, target_dir: str) -> None:
+        """
+        Create or update a symlink named "latest" under the checkpoint root
+        that points to `target_dir`.
+        Only called on rank 0.
+        """
+        ckpt_root = self.checkpointer.config.checkpoint_dir
+        link_path = os.path.join(ckpt_root, "LATEST")
+        if os.path.lexists(link_path):
+            os.remove(link_path)
+        os.symlink(os.path.abspath(target_dir), link_path)
 
     def load_checkpoint(self, restore_from: str | None = None, moe_mesh: Optional[DeviceMesh] = None):
         """
         Loads the latest checkpoint.
         """
-        if not self.checkpoint_config.enabled:
+        if not self.checkpointer.config.enabled:
             if (
                 not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             ) and restore_from is not None:
@@ -243,7 +264,7 @@ class BaseRecipe:
             ckpt_dir = restore_from
         else:
             # Determine the latest checkpoint directory (e.g. ".../step_42").
-            ckpt_dir = _find_latest_checkpoint(self.checkpoint_config.checkpoint_dir)
+            ckpt_dir = _find_latest_checkpoint(self.checkpointer.config.checkpoint_dir)
             if ckpt_dir is None:
                 return
 
@@ -252,7 +273,7 @@ class BaseRecipe:
 
         model, optimizer, scheduler = None, None, None
 
-        for key in self.__dict__["__state_tracked"]:
+        for key in sorted(self.__dict__["__state_tracked"]):
             if is_model(getattr(self, key)):
                 model = getattr(self, key)
             elif is_optimizer(getattr(self, key)):
@@ -260,7 +281,7 @@ class BaseRecipe:
             elif is_lr_scheduler(getattr(self, key)):
                 scheduler = getattr(self, key)
             elif is_dataloader(getattr(self, key)) or isinstance(getattr(self, key), StatefulRNG):
-                load_dp_aware_helper(getattr(self, key), key, ckpt_dir, self._get_dp_rank(include_cp=True))
+                self.checkpointer.load_on_dp_ranks(getattr(self, key), key, ckpt_dir)
             elif is_tokenizer(getattr(self, key)) or isinstance(getattr(self, key), ConfigNode):
                 # we don't need to load the tokenizer or config from the checkpoint
                 # we only save the tokenizer for consolidated checkpoints for downstream use
@@ -268,14 +289,8 @@ class BaseRecipe:
             else:
                 getattr(self, key).load_state_dict(torch.load(os.path.join(ckpt_dir, f"{key}.pt"), weights_only=False))
 
-        load_model(
-            model,
-            os.path.join(ckpt_dir, "model"),
-            self.checkpoint_config.model_save_format,
-            is_peft=self.checkpoint_config.is_peft,
-            moe_mesh=moe_mesh,
-        )
-        load_optimizer(optimizer, model, ckpt_dir, scheduler)
+        self.checkpointer.load_model(model, os.path.join(ckpt_dir, "model"))
+        self.checkpointer.load_optimizer(optimizer, model, ckpt_dir, scheduler)
 
     def _log_experiment_details(self):
         """Log metadata and resolved config on main rank using YAML markers."""
@@ -431,7 +446,8 @@ class BaseRecipe:
         return self.device_mesh.get_local_rank("tp")
 
     def _get_pp_rank(self):
-        if not self.device_mesh or self.device_mesh["pp"].size() == 1:
+        # PP is a special case because it'll only be present in the device mesh if pp is enabled
+        if not self.device_mesh or "pp" not in self.device_mesh.mesh_dim_names or self.device_mesh["pp"].size() == 1:
             return 0
         return self.device_mesh.get_local_rank("pp")
 
@@ -446,28 +462,41 @@ class BaseRecipe:
 
 def _find_latest_checkpoint(checkpoint_dir):
     """
-    Find the latest checkpoint in the checkpoint directory and return it.
+    Resolve the most recent checkpoint directory.
+
+    Preference order:
+      1) Valid LATEST symlink under checkpoint_dir
+      2) Highest step directory under checkpoint_dir matching *step_*
+
+    Returns:
+        Path (or str) of the latest checkpoint directory, or None.
     """
-    checkpoint_dir = Path(checkpoint_dir)
-    if not checkpoint_dir.exists():
+    root = Path(checkpoint_dir)
+    if not root.exists():
         return
-    # Accept checkpoints saved as either `step_<num>` or `epoch_<epoch>_step_<num>`
-    # (or any other pattern that contains the substring `step_`).
-    # This makes the checkpoint loading logic compatible with the naming scheme
-    # used in `save_checkpoint`, which currently saves to `epoch_{epoch}_step_{step}`.
-    checkpoint_files = list(checkpoint_dir.glob("*step_*"))
+
+    # Try LATEST symlink first
+    latest_link = os.path.join(os.fspath(root), "LATEST")
+    if os.path.islink(latest_link):
+        try:
+            resolved = os.readlink(latest_link)
+            if not os.path.isabs(resolved):
+                resolved = os.path.abspath(os.path.join(os.fspath(root), resolved))
+            if os.path.isdir(resolved):
+                return resolved
+        except OSError:
+            pass
+
+    # Fallback to scanning
+    checkpoint_files = list(root.glob("*step_*"))
     if not checkpoint_files:
         return
 
     def _step_num(path: Path):
-        """Return the numeric step from a path stem of the form step_<int>."""
         m = re.search(r"step_(\d+)$", path.stem)
         return int(m.group(1)) if m else -1
 
     latest = max(checkpoint_files, key=_step_num)
-
-    # If no directory followed the expected "step_<int>" pattern, _step_num would be -1 for all of them.
-    # Treat that as "no valid checkpoint".
     if _step_num(latest) == -1:
         return
 
