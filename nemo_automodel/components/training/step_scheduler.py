@@ -17,13 +17,17 @@ from typing import Optional
 
 from torch.distributed.checkpoint.stateful import Stateful
 
-def _calculate_max_steps(num_epochs: int, epoch_len: Optional[int], default_max_steps: int = 9223372036854775807) -> int:
+
+def _calculate_max_steps(
+    num_epochs: int, epoch_len: Optional[int], default_max_steps: int = 9223372036854775807
+) -> int:
     """
     Calculate the maximum number of steps.
     """
     if epoch_len is None:
         return default_max_steps
     return num_epochs * epoch_len
+
 
 class StepScheduler(Stateful):
     """
@@ -199,4 +203,3 @@ class StepScheduler(Stateful):
             self.max_steps = s["max_steps"]
         elif self.max_steps is None:
             self.max_steps = _calculate_max_steps(self.num_epochs, self.epoch_len)
-
