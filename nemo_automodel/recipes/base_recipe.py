@@ -19,12 +19,10 @@ import re
 import socket
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed.device_mesh import DeviceMesh
 from torch.optim import Optimizer
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.processing_utils import ProcessorMixin
@@ -249,7 +247,7 @@ class BaseRecipe:
             os.remove(link_path)
         os.symlink(os.path.abspath(target_dir), link_path)
 
-    def load_checkpoint(self, restore_from: str | None = None, moe_mesh: Optional[DeviceMesh] = None):
+    def load_checkpoint(self, restore_from: str | None = None):
         """
         Loads the latest checkpoint.
         """
