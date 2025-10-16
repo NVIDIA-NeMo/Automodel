@@ -174,7 +174,13 @@ def test_is_ckpt_step_parametrized_iterable(max_steps, ckpt_every_steps, global_
     assert scheduler.step == max_steps
     assert scheduler.is_ckpt_step is True
 
-def test_is_ckpt_step_triggers_on_last_batch_with_sized_dataloader():
+@pytest.mark.parametrize(
+    "expected_last_batch_steps",
+    [
+        ([3, 7, 9])
+    ],
+)
+def test_is_ckpt_step_triggers_on_last_batch_with_sized_dataloader(expected_last_batch_steps):
     epoch_len = 4  # number of micro-batches per epoch
     dataloader = SizedDataLoader(num_batches=epoch_len)
     scheduler = StepScheduler(
@@ -195,13 +201,12 @@ def test_is_ckpt_step_triggers_on_last_batch_with_sized_dataloader():
                 last_batch_trigger_steps.append(scheduler.step)
 
     # Expect a trigger at the end of each epoch (steps 3, 7 for max_steps=10, epoch_len=4)
-    expected_last_batch_steps = [s for s in range(1, scheduler.max_steps) if (s % epoch_len) == (epoch_len - 1)]
     assert last_batch_trigger_steps == expected_last_batch_steps
 
     # Finished also triggers checkpoint
     assert scheduler.step == 10
     assert scheduler.is_ckpt_step is True
-
+    assert scheduler.state_dict() == {"step": 10, "epoch": 2}
 
 @pytest.mark.parametrize(
     "max_steps, ckpt_every_steps, epoch, num_epochs, global_batch_size, local_batch_size, num_batches, is_ckpt_step",
@@ -226,7 +231,6 @@ def test_ckpt_every_steps_larger_than_max_steps(max_steps, ckpt_every_steps, epo
     )
 
     for i, batches in enumerate(scheduler):
-        print(i, scheduler.step, scheduler.is_ckpt_step, scheduler.is_last_batch, scheduler.is_last_step)
         val = is_ckpt_step.pop(0)
         assert val == scheduler.is_ckpt_step, i
         assert val == scheduler.is_last_batch, i

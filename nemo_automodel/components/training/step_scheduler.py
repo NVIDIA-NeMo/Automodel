@@ -176,7 +176,9 @@ class StepScheduler(Stateful):
         """
         # At checkpoint time, we need to save step + 1 because we yield before incrementing the step
         # and the checkpointing happens after the yield but before the increment.
-        return {"step": self.step + 1, "epoch": self.epoch}
+        # Added min(self.max_steps, self.step + 1) to ensure that the step is not greater than max_steps.
+        # for example, if state_dict is called outside the for loop that increments step scheduler.
+        return {"step": min(self.max_steps, self.step + 1), "epoch": self.epoch}
 
     def load_state_dict(self, s):
         """
