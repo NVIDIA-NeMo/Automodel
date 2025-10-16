@@ -19,12 +19,10 @@ import re
 import socket
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed.device_mesh import DeviceMesh
 from torch.optim import Optimizer
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.processing_utils import ProcessorMixin
