@@ -906,7 +906,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         restore_from = self.cfg.get("checkpoint.restore_from", None)
 
         # Optionally resume
-        self.load_checkpoint(restore_from, moe_mesh=self.moe_mesh)
+        self.load_checkpoint(restore_from)
 
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
