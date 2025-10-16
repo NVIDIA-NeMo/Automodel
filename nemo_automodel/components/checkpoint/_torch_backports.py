@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -52,3 +53,42 @@ def apply_patches() -> None:
     except ModuleNotFoundError:
         # planner module unavailable – nothing to patch
         pass
+
+
+def apply_async_checkpoint_patch() -> None:
+    """
+    Apply stabilization patch for torch.distributed.checkpoint async process executor.
+    This serializes creation of the global background process across concurrent async_save calls.
+    """
+    try:
+        ape_mod = importlib.import_module("torch.distributed.checkpoint._async_process_executor")
+
+        # Idempotent guard
+        if getattr(ape_mod, "_NEMO_PATCHED_CREATE_LOCK", False):
+            return
+
+        # Global creation lock
+        if not hasattr(ape_mod, "_NEMO_CREATE_LOCK"):
+            ape_mod._NEMO_CREATE_LOCK = threading.Lock()
+
+        Exec = getattr(ape_mod, "_ProcessBasedAsyncCheckpointExecutor", None)
+        if Exec is not None and not hasattr(Exec, "_nemo_orig_execute_save_impl"):
+            Exec._nemo_orig_execute_save_impl = Exec._execute_save_impl
+
+            def _nemo_locked_execute_save_impl(*args, **kwargs):
+                with ape_mod._NEMO_CREATE_LOCK:
+                    return Exec._nemo_orig_execute_save_impl(*args, **kwargs)
+
+            try:
+                Exec._execute_save_impl = staticmethod(_nemo_locked_execute_save_impl)
+                logger.debug("Applied creation-lock patch to DCP process executor")
+            except Exception:
+                # Defensive: if staticmethod replacement fails, leave as-is
+                logger.debug("Failed to assign locked _execute_save_impl", exc_info=True)
+
+        ape_mod._NEMO_PATCHED_CREATE_LOCK = True
+    except ModuleNotFoundError:
+        # async_process_executor unavailable – nothing to patch
+        pass
+    except Exception:
+        logger.debug("Unexpected error while applying DCP process executor patch", exc_info=True)

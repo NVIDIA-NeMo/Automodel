@@ -17,6 +17,7 @@ import torch.nn as nn
 from unittest.mock import Mock, patch, MagicMock
 
 from nemo_automodel.recipes.vlm.finetune import _freeze_model, _build_optimizer, build_model_and_optimizer
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
 
 @pytest.fixture(autouse=True)
@@ -146,6 +147,17 @@ def test_build_model_and_optimizer_basic():
     cfg_opt = DummyOptConfig(lr=0.01)
 
     device = torch.device("cpu")
+    # Minimal checkpointer to satisfy build_model_and_optimizer signature
+    ckpt_cfg = CheckpointingConfig(
+        enabled=False,
+        checkpoint_dir="checkpoints/",
+        model_save_format="safetensors",
+        model_cache_dir=".",
+        model_repo_id="dummy/model",
+        save_consolidated=False,
+        is_peft=False,
+    )
+    checkpointer = Checkpointer(config=ckpt_cfg, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
     model, _, optim = build_model_and_optimizer(
         device=device,
         cfg_model=cfg_model,
@@ -154,6 +166,7 @@ def test_build_model_and_optimizer_basic():
         cfg_peft=None,
         model_wrapper=None,
         seed=123,
+        checkpointer=checkpointer,
         tp_size=1,
         freeze_embeddings=True,
     )

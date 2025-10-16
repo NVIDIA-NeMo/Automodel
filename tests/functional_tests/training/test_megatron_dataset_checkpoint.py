@@ -20,7 +20,7 @@ import torch
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.llm.train_ft import build_distributed, build_dataloader
-from nemo_automodel.components.checkpoint.checkpointing import save_dp_aware_helper, load_dp_aware_helper
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
 """
 This test is to make sure that JSONL dataset can be checkpointed and loaded correctly.
@@ -36,6 +36,24 @@ def test_megatron_dataset_checkpointing():
     dp_world_size = device_mesh["dp"].size()
     tp_rank = device_mesh["tp"].get_local_rank()
     pp_rank = device_mesh["pp"].get_local_rank()
+
+    # mock checkpoint config and checkpointer
+    checkpoint_config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=cfg.checkpoint.checkpoint_dir,
+        model_save_format="safetensors",
+        model_cache_dir="",
+        model_repo_id="",
+        save_consolidated=False,
+        is_peft=False,
+        model_state_dict_keys=[],
+    )
+    checkpointer = Checkpointer(
+        config=checkpoint_config,
+        dp_rank=dp_rank,
+        tp_rank=tp_rank,
+        pp_rank=pp_rank,
+    )
 
     dataset = build_dataloader(
         cfg_ds=cfg.dataset,
@@ -56,7 +74,7 @@ def test_megatron_dataset_checkpointing():
     for i, batch in enumerate(dataset):
         if i == 2:
             # save checkpoint
-            save_dp_aware_helper(dataset, "dataloader", cfg.checkpoint.checkpoint_dir, dp_rank, tp_rank, pp_rank)
+            checkpointer.save_on_dp_ranks(dataset, "dataloader", cfg.checkpoint.checkpoint_dir)
         elif i == 3:
             expected_batch = batch
             break
@@ -97,7 +115,7 @@ def test_megatron_dataset_checkpointing():
         assert torch.any(initial_batch[k] != expected_batch[k]), f"Initial batch key {k, initial_batch[k]} should not be equal to expected batch key {k, expected_batch[k]}"
 
     # load checkpoint
-    load_dp_aware_helper(dataset, "dataloader", cfg.checkpoint.checkpoint_dir, dp_rank)
+    checkpointer.load_on_dp_ranks(dataset, "dataloader", cfg.checkpoint.checkpoint_dir)
 
     for i, batch in enumerate(dataset):
         for k in batch.keys():

@@ -125,7 +125,7 @@ def test_consolidated_llm_checkpoint_with_scalar_weight():
 
     trainer.run_train_validation_loop()
 
-    ckpt_dir = Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9"
+    ckpt_dir = Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9"
 
     restored_model_dict, _ = load_dcp(ckpt_dir / "model")
     restored_model_dict_consolidated = load_safetensors(

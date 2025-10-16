@@ -82,7 +82,6 @@ def test_iteration_groups_and_epoch_increment_sized():
 def test_resume(max_steps, ckpt_every_steps):
     from copy import deepcopy
     max_steps = 10
-    ckpt_every_steps = 2
     dataloader = SizedDataLoader(num_batches=max_steps)
     scheduler = StepScheduler(
         global_batch_size=1,  # grad_acc_steps = 1
@@ -96,11 +95,18 @@ def test_resume(max_steps, ckpt_every_steps):
 
     ref_outputs = []
     ref_state = None
+    saved_is_ckpt = None
+    start_collecting = False
     for i, _  in enumerate(scheduler):
         if i == 2:
             ref_state = deepcopy(scheduler.state_dict())
-            ref_outputs = [] # reset ref_outputs
-        ref_outputs.append((scheduler.step, scheduler.is_val_step, scheduler.is_ckpt_step))
+            saved_is_ckpt = scheduler.is_ckpt_step
+            # Start collecting from the NEXT iteration after snapshot
+            start_collecting = True
+            continue
+        if start_collecting:
+            # record exact values; sequence starts at step ref_state['step']
+            ref_outputs.append((scheduler.step, scheduler.is_val_step, scheduler.is_ckpt_step))
 
     del scheduler
     scheduler = StepScheduler(
@@ -114,9 +120,16 @@ def test_resume(max_steps, ckpt_every_steps):
     )
 
     scheduler.load_state_dict(ref_state)
-    for i, _  in enumerate(scheduler):
-        assert ref_outputs.pop(0) == (scheduler.step, scheduler.is_val_step, scheduler.is_ckpt_step)
-        assert scheduler.step == i + 2
+    for j, _  in enumerate(scheduler):
+        expected_step, expected_is_val, expected_is_ckpt = ref_outputs.pop(0)
+        # Ensure we don't checkpoint immediately after resume if we saved on a checkpoint step
+        if j == 0 and saved_is_ckpt and ckpt_every_steps > 1:
+            expected_is_ckpt = False
+        assert (expected_step, expected_is_val, expected_is_ckpt) == (
+            scheduler.step, scheduler.is_val_step, scheduler.is_ckpt_step
+        )
+        # step at resume should be ref_state['step'] + j
+        assert scheduler.step == j + ref_state["step"]
     assert len(ref_outputs) == 0
 
 @pytest.mark.parametrize(

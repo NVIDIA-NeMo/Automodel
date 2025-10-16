@@ -255,6 +255,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             if isinstance(grad_norm, torch.Tensor):
                 grad_norm = grad_norm.item()
 
+        self.checkpointer.maybe_wait_for_staging()
         for opt in self.optimizer:
             opt.step()
             opt.zero_grad()
