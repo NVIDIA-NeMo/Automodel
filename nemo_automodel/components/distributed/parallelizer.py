@@ -213,7 +213,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
     ) -> nn.Module:
         """Apply NemotronH-specific parallelization."""
         assert not sequence_parallel, "Sequence parallelism is not supported for NemotronHForCausalLM"
-        assert tp_shard_plan is None, "Custom parallel plan is not supported for NemotronHForCausalLM"
+        logger.warning("Custom parallel plan is not supported for NemotronHForCausalLM. Using NemotronH-specific TP plan.")
 
         layers: torch.nn.ModuleList = model.backbone.layers
         tp_mesh = device_mesh[tp_mesh_name]
