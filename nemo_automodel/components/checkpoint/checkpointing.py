@@ -467,6 +467,7 @@ class Checkpointer:
             return
 
         ret = None
+        planner = dcp.DefaultSavePlanner(enable_plan_caching=True)
         if self.config.is_async:
             ctx = self._model_ctx if is_model else self._optim_ctx
             ret = dcp.async_save(
@@ -476,10 +477,11 @@ class Checkpointer:
                 process_group=ctx.process_group,
                 async_stager=ctx.stager,
                 async_checkpointer_type=AsyncCheckpointerType.PROCESS,
+                planner=planner,
             )
             ctx.staging_active = True
         else:
-            dcp.save(state_dict, checkpoint_id=path, storage_writer=storage_writer)
+            dcp.save(state_dict, checkpoint_id=path, storage_writer=storage_writer, planner=planner)
         return ret
 
     def _should_write_consolidated(self) -> bool:
