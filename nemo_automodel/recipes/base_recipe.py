@@ -249,7 +249,7 @@ class BaseRecipe:
             os.remove(link_path)
         os.symlink(os.path.abspath(target_dir), link_path)
 
-    def load_checkpoint(self, restore_from: str | None = None, moe_mesh: Optional[DeviceMesh] = None):
+    def load_checkpoint(self, restore_from: str | None = None):
         """
         Loads the latest checkpoint.
         """
