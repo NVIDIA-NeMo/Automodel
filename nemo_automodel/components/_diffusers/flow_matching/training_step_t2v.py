@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-# training_step_t2v.py - Manual Flow Matching (DO NOT use scheduler.add_noise)
-
 import os
 import logging
 from typing import Dict, Tuple
 
 import torch
-from .time_shift_utils import compute_density_for_timestep_sampling
+from nemo_automodel.components._diffusers.flow_matching.time_shift_utils import (
+    compute_density_for_timestep_sampling,
+)
 
 
 logger = logging.getLogger(__name__)
