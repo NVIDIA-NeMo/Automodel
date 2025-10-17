@@ -18,17 +18,6 @@ from typing import Optional
 from torch.distributed.checkpoint.stateful import Stateful
 
 
-def _calculate_max_steps(
-    num_epochs: int, epoch_len: Optional[int], default_max_steps: int = 9223372036854775807
-) -> int:
-    """
-    Calculate the maximum number of steps.
-    """
-    if epoch_len is None:
-        return default_max_steps
-    return num_epochs * epoch_len
-
-
 class StepScheduler(Stateful):
     """
     Scheduler for managing gradient accumulation and checkpointing steps.
@@ -45,7 +34,7 @@ class StepScheduler(Stateful):
         start_step: int = 0,
         start_epoch: int = 0,
         num_epochs: int = 10,
-        max_steps: int = None,
+        max_steps: int = 9223372036854775807,
     ):
         """
         Initialize the StepScheduler.
@@ -85,9 +74,6 @@ class StepScheduler(Stateful):
             self.epoch_len = None
         self.val_every_steps = val_every_steps
         assert val_every_steps is None or val_every_steps > 0, "val_every_steps must be greater than 0 if not None"
-        if max_steps is None:
-            assert self.epoch_len is not None, "epoch_len must be provided if max_steps is not provided"
-            max_steps = _calculate_max_steps(self.num_epochs, self.epoch_len)
         self.max_steps = max_steps
         assert max_steps > 0, "max_steps must be greater than 0"
 
@@ -113,8 +99,8 @@ class StepScheduler(Stateful):
                 if self.step >= self.max_steps:
                     return
         if batch_buffer:
-            yield batch_buffer
             self.step += 1
+            yield batch_buffer
         self.epoch += 1
 
     def set_epoch(self, epoch: int):
@@ -143,26 +129,9 @@ class StepScheduler(Stateful):
         Returns:
             bool: if true, the checkpoint should run.
         """
-        is_ckpt_step = (self.step % self.ckpt_every_steps) == self.ckpt_every_steps - 1
-        return is_ckpt_step or self.is_last_batch or self.is_last_step
-
-    @property
-    def is_last_step(self):
-        """
-        Returns whether the training is finished.
-        """
-        # we +1 here because the step is incremented after
-        # the batch is yielded in the tail handling of __iter__
-        return self.step + 1 >= self.max_steps
-
-    @property
-    def is_last_batch(self):
-        """
-        Returns whether this is the last batch for this epoch.
-        """
-        if self.epoch_len is None:
-            return False
-        return (self.step % self.epoch_len) == self.epoch_len - 1
+        last_batch = self.epoch_len is not None and (self.step % self.epoch_len) == self.epoch_len - 1
+        finished = self.step >= self.max_steps
+        return ((self.step % self.ckpt_every_steps) == self.ckpt_every_steps - 1) or last_batch or finished
 
     @property
     def epochs(self):
@@ -185,11 +154,7 @@ class StepScheduler(Stateful):
         Returns:
             dict: Current state with 'step' and 'epoch' keys.
         """
-        # At checkpoint time, we need to save step + 1 because we yield before incrementing the step
-        # and the checkpointing happens after the yield but before the increment.
-        # Added min(self.max_steps, self.step + 1) to ensure that the step is not greater than max_steps.
-        # for example, if state_dict is called outside the for loop that increments step scheduler.
-        return {"step": min(self.max_steps, self.step + 1), "epoch": self.epoch}
+        return {"step": self.step, "epoch": self.epoch}
 
     def load_state_dict(self, s):
         """
