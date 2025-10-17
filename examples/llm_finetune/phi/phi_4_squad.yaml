@@ -44,7 +44,7 @@ checkpoint:
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: none
-  tp_size: 1
+  tp_size: 2
   cp_size: 1
   sequence_parallel: false
 
@@ -64,7 +64,7 @@ packed_sequence:
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  shuffle: false
+  shuffle: true
 
 
 validation_dataset:
