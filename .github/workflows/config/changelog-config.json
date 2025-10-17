@@ -1,0 +1,118 @@
+{
+    "categories": [
+      {
+        "title": "## Models\n\n",
+        "labels": ["model", "architecture", "llm", "multimodal"],
+        "exclude_labels": ["ignore"]
+      },
+      {
+        "title": "\n## Training\n\n",
+        "labels": ["training", "train", "pretraining", "finetuning"],
+        "exclude_labels": ["ignore"]
+      },
+      {
+        "title": "\n## Data & Preprocessing\n\n",
+        "labels": ["data", "dataset", "preprocessing", "tokenizer"],
+        "exclude_labels": ["ignore"]
+      },
+      {
+        "title": "\n## Inference & Optimization\n\n",
+        "labels": ["inference", "optimization", "quantization", "pruning"],
+        "exclude_labels": ["ignore"]
+      },
+      {
+        "title": "\n## Configuration & CLI\n\n",
+        "labels": ["config", "cli", "yaml"],
+        "exclude_labels": ["ignore"]
+      },
+      {
+        "title": "\n## Documentation\n\n",
+        "labels": ["docs", "documentation"],
+        "exclude_labels": ["ignore"]
+      },
+      {
+        "title": "\n## CI/CD\n\n",
+        "labels": ["ci", "github-actions", "workflow", "testing"],
+        "exclude_labels": ["ignore"]
+      },
+      {
+        "title": "\n## Bug Fixes\n\n",
+        "labels": ["bug", "bugfix", "fix"],
+        "exclude_labels": ["ignore"]
+      }
+    ],
+    "ignore_labels": [
+      "ignore",
+      "skip-changelog"
+    ],
+    "sort": "ASC",
+    "template": "\n${{CHANGELOG}}\n## Others\n\n${{UNCATEGORIZED}}\n",
+    "pr_template": "- ${{TITLE}} [#${{NUMBER}}](${{URL}})",
+    "empty_template": "- No changes in this release",
+    "label_extractor": [
+      {
+        "pattern": "(.*model.*)|(.*architecture.*)|(.*\\bllm\\b.*)|(.*multimodal.*)|(.*gpt.*)|(.*transformer.*)",
+        "target": "model",
+        "flags": "gimu",
+        "on_property": ["title", "body"]
+      },
+      {
+        "pattern": "(.*train.*)|(.*pretrain.*)|(.*finetun.*)|(.*sft.*)|(.*rlhf.*)",
+        "target": "training",
+        "flags": "gimu",
+        "on_property": ["title", "body"]
+      },
+      {
+        "pattern": "(.*\\bdata\\b.*)|(.*dataset.*)|(.*preprocess.*)|(.*tokeniz.*)",
+        "target": "data",
+        "flags": "gimu",
+        "on_property": ["title", "body"]
+      },
+      {
+        "pattern": "(.*inference.*)|(.*optim.*)|(.*quantiz.*)|(.*prun.*)|(.*compression.*)",
+        "target": "inference",
+        "flags": "gimu",
+        "on_property": ["title", "body"]
+      },
+      {
+        "pattern": "(.*config.*)|(.*\\bcli\\b.*)|(.*yaml.*)|(.*argument.*)",
+        "target": "config",
+        "flags": "gimu",
+        "on_property": ["title", "body"]
+      },
+      {
+        "pattern": "(.*doc.*)|(.*readme.*)|(.*guide.*)|(.*tutorial.*)",
+        "target": "docs",
+        "flags": "gimu",
+        "on_property": ["title", "body"]
+      },
+      {
+        "pattern": "(.*\\bci\\b.*)|(.*github.*)|(.*workflow.*)|(.*action.*)|(.*test.*)",
+        "target": "ci",
+        "flags": "gimu",
+        "on_property": ["title", "body"]
+      },
+      {
+        "pattern": "(.*\\[bug.*)|(.*\\bfix\\b.*)|(.*bugfix.*)|(.*patch.*)",
+        "target": "bug",
+        "flags": "gimu",
+        "on_property": ["title", "body"]
+      }
+    ],
+    "duplicate_filter": {
+      "pattern": ".+",
+      "on_property": "title",
+      "method": "match"
+    },
+    "transformers": [
+    ],
+    "max_tags_to_fetch": 100,
+    "max_pull_requests": 500,
+    "max_back_track_time_days": 365,
+    "exclude_merge_branches": [
+    ],
+    "tag_resolver": {
+      "method": "semver"
+    }
+}
+
