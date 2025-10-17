@@ -17,8 +17,9 @@ The function selects a tensor-parallel sharding plan via the following priority:
 
 1. A *custom* plan supplied by the caller (either a dictionary ‑or- an import
    path to a dict/function).
-2. A model-specific plan located in ``PARALLELIZE_FUNCTIONS``.
-3. Fallback to the HuggingFace-derived plan via ``get_hf_tp_shard_plan``.
+2. If requested, the HuggingFace-derived plan via ``get_hf_tp_shard_plan``.
+3. A model-specific plan located in ``PARALLELIZE_FUNCTIONS``; on failure, try HF.
+4. Otherwise, return a default base plan (with SP adjustments when enabled).
 
 This test module covers every branch, including error conditions.
 """
@@ -147,18 +148,103 @@ def test_optimised_plan_fallback_to_hf(monkeypatch):
 
 # 4. HF fallback when no optimised plan exists
 def test_hf_fallback(monkeypatch):
-    sentinel = {"hf": "plan2"}
-    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", lambda m: sentinel, raising=True)
+    # When no optimised plan exists and HF is not explicitly requested, the helper
+    # should return the default base plan.
+    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", lambda m: {"hf": "plan2"}, raising=True)
     _set_global_model_cls(monkeypatch, _DummyModel)
 
     result = _get_parallel_plan(_DummyModel(), sequence_parallel=False)
-    assert result is sentinel
+    assert isinstance(result, dict)
+    # base plan should include embed_tokens and lm_head entries
+    assert "model.embed_tokens" in result
+    assert "lm_head" in result
 
 
 def test_hf_fallback_sequence_parallel_assert(monkeypatch):
-    """When sequence_parallel=True and no optimised plan, helper should assert."""
+    """When sequence_parallel=True and no optimised plan, helper should return base plan with SP entries."""
     monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", lambda m: {}, raising=True)
+    _set_global_model_cls(monkeypatch, _DummyModel)
+
+    result = _get_parallel_plan(_DummyModel(), sequence_parallel=True)
+    assert isinstance(result, dict)
+    # SP-adjusted entries should be present
+    assert "model.norm" in result
+
+
+def test_use_hf_tp_plan_sp_false(monkeypatch):
+    """Explicit HF plan when requested and SP=False returns HF plan."""
+    sentinel = {"hf": "plan"}
+    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", lambda m: sentinel, raising=True)
+    _set_global_model_cls(monkeypatch, _DummyModel)
+
+    result = _get_parallel_plan(_DummyModel(), sequence_parallel=False, use_hf_tp_plan=True)
+    assert result is sentinel
+
+
+def test_use_hf_tp_plan_sp_true_assert(monkeypatch):
+    """Explicit HF plan with SP=True should assert."""
+    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", lambda m: {"hf": "plan"}, raising=True)
+    _set_global_model_cls(monkeypatch, _DummyModel)
+
+    with pytest.raises(AssertionError):
+        _get_parallel_plan(_DummyModel(), sequence_parallel=True, use_hf_tp_plan=True)
+
+
+def test_optimised_plan_and_hf_both_fail_raises_sp_false(monkeypatch):
+    """Optimised plan raises and HF raises → runtime error (SP=False)."""
+    def _broken_fn(model, seq):
+        raise RuntimeError("fail")
+
+    parallelizer.PARALLELIZE_FUNCTIONS[_DummyModel] = _broken_fn
+    def _raise_hf(_model):
+        raise RuntimeError("hf fail")
+    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_hf, raising=True)
+    _set_global_model_cls(monkeypatch, _DummyModel)
+
+    with pytest.raises(RuntimeError, match="hf fail"):
+        _get_parallel_plan(_DummyModel(), sequence_parallel=False)
+
+
+def test_optimised_plan_and_hf_both_fail_assert_sp_true(monkeypatch):
+    """Optimised plan raises then HF path asserts (SP=True)."""
+    def _broken_fn(model, seq):
+        raise RuntimeError("fail")
+
+    parallelizer.PARALLELIZE_FUNCTIONS[_DummyModel] = _broken_fn
+    def _raise_hf2(_model):
+        raise RuntimeError("hf fail")
+    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_hf2, raising=True)
     _set_global_model_cls(monkeypatch, _DummyModel)
 
     with pytest.raises(AssertionError):
         _get_parallel_plan(_DummyModel(), sequence_parallel=True)
+
+
+def test_not_registered_and_hf_fail_base_plan(monkeypatch):
+    """No optimised plan and HF raises → base plan (with/without SP)."""
+    # Ensure dummy not in mapping
+    parallelizer.PARALLELIZE_FUNCTIONS.pop(_DummyModel, None)
+    def _raise_hf3(_model):
+        raise RuntimeError("hf fail")
+    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_hf3, raising=True)
+    _set_global_model_cls(monkeypatch, _DummyModel)
+
+    # SP=False
+    result = _get_parallel_plan(_DummyModel(), sequence_parallel=False)
+    assert "model.embed_tokens" in result and "lm_head" in result
+
+    # SP=True
+    result_sp = _get_parallel_plan(_DummyModel(), sequence_parallel=True)
+    assert "model.norm" in result_sp
+
+
+def test_custom_plan_imports_non_dict_raises(monkeypatch):
+    """If import resolves but returns non-dict object, raise ValueError."""
+    def _fake_import(path):
+        return ["not", "a", "dict"]
+
+    monkeypatch.setattr(parallelizer, "import_class_from_path", _fake_import, raising=True)
+    _set_global_model_cls(monkeypatch, _DummyModel)
+
+    with pytest.raises(ValueError):
+        _get_parallel_plan(_DummyModel(), tp_shard_plan="some.module.NOT_A_DICT")
