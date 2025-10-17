@@ -20,7 +20,7 @@ import pytest
 import torch
 
 
-MODULE_PATH = "nemo_automodel.components._diffusers.auto_diffusion_pipeline"
+MODULE_PATH = "nemo_automodel._diffusers.auto_diffusion_pipeline"
 
 
 class DummyModule(torch.nn.Module):
@@ -54,7 +54,7 @@ class DummyPipeline:
 
 @patch(f"{MODULE_PATH}.torch.cuda.is_available", return_value=False)
 def test_choose_device_cpu_when_no_cuda(mock_is_available):
-    from nemo_automodel.components._diffusers.auto_diffusion_pipeline import _choose_device
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _choose_device
 
     dev = _choose_device(None)
     assert dev.type == "cpu"
@@ -63,7 +63,7 @@ def test_choose_device_cpu_when_no_cuda(mock_is_available):
 @patch(f"{MODULE_PATH}.torch.cuda.is_available", return_value=True)
 @patch.dict("os.environ", {"LOCAL_RANK": "2"}, clear=False)
 def test_choose_device_uses_cuda_and_local_rank(mock_is_available):
-    from nemo_automodel.components._diffusers.auto_diffusion_pipeline import _choose_device
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _choose_device
 
     dev = _choose_device(None)
     assert dev.type == "cuda"
@@ -72,7 +72,7 @@ def test_choose_device_uses_cuda_and_local_rank(mock_is_available):
 
 
 def test_choose_device_respects_explicit_device():
-    from nemo_automodel.components._diffusers.auto_diffusion_pipeline import _choose_device
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _choose_device
 
     explicit = torch.device("cpu")
     dev = _choose_device(explicit)
@@ -80,7 +80,7 @@ def test_choose_device_respects_explicit_device():
 
 
 def test_iter_pipeline_modules_prefers_components_registry():
-    from nemo_automodel.components._diffusers.auto_diffusion_pipeline import _iter_pipeline_modules
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _iter_pipeline_modules
 
     m1, m2 = DummyModule(), DummyModule()
     pipe = DummyPipeline({"unet": m1, "text_encoder": m2, "scheduler": object()})
@@ -90,7 +90,7 @@ def test_iter_pipeline_modules_prefers_components_registry():
 
 
 def test_iter_pipeline_modules_fallback_attribute_scan():
-    from nemo_automodel.components._diffusers.auto_diffusion_pipeline import _iter_pipeline_modules
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _iter_pipeline_modules
 
     class AttrPipe:
         def __init__(self):
@@ -106,7 +106,7 @@ def test_iter_pipeline_modules_fallback_attribute_scan():
 
 @pytest.mark.parametrize("torch_dtype,expected_dtype", [("auto", None), (torch.float16, torch.float16), ("float32", torch.float32)])
 def test_move_module_to_device_respects_dtype(torch_dtype, expected_dtype):
-    from nemo_automodel.components._diffusers.auto_diffusion_pipeline import _move_module_to_device
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _move_module_to_device
 
     mod = DummyModule()
     dev = torch.device("cpu")
@@ -122,7 +122,7 @@ def test_move_module_to_device_respects_dtype(torch_dtype, expected_dtype):
 
 
 def test_from_pretrained_basic_flow_moves_modules_and_returns_pipeline(caplog):
-    from nemo_automodel.components._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 
     # Prepare a real DummyPipeline instance containing two nn.Modules
     m1, m2 = DummyModule(), DummyModule()
@@ -143,7 +143,7 @@ def test_from_pretrained_basic_flow_moves_modules_and_returns_pipeline(caplog):
 
 
 def test_from_pretrained_skips_move_when_flag_false():
-    from nemo_automodel.components._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 
     dummy_pipe = DummyPipeline({"unet": DummyModule()})
     with (
@@ -157,7 +157,7 @@ def test_from_pretrained_skips_move_when_flag_false():
 
 
 def test_from_pretrained_parallel_scheme_applies_managers_and_sets_attrs():
-    from nemo_automodel.components._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 
     unet = DummyModule()
     text_encoder = DummyModule()
@@ -188,7 +188,7 @@ def test_from_pretrained_parallel_scheme_applies_managers_and_sets_attrs():
 
 
 def test_from_pretrained_parallel_scheme_logs_and_continues_on_errors(caplog):
-    from nemo_automodel.components._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 
     comp = DummyModule()
     dummy_pipe = DummyPipeline({"unet": comp})

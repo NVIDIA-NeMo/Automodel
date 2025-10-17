@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from nemo_automodel.components._transformers.auto_model import (
+from nemo_automodel._transformers.auto_model import (
     NeMoAutoModelForCausalLM,
     NeMoAutoModelForImageTextToText,
     NeMoAutoModelForSequenceClassification,

@@ -21,7 +21,7 @@ import torch
 import transformers
 from transformers import AutoConfig
 
-from nemo_automodel.components._transformers.auto_model import (
+from nemo_automodel._transformers.auto_model import (
     NeMoAutoModelForCausalLM,
     NeMoAutoModelForImageTextToText,
     _get_next_fallback_attn,
@@ -42,8 +42,8 @@ class TestNeMoAutoModelForCausalLM:
     def test_from_pretrained_liger_kernel_not_available(self, caplog):
         """Test warning when Liger kernel is not available."""
         with (
-            patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", False),
-            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch("nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL", False),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
             patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_from_pretrained,
         ):
             mock_model = MagicMock()
@@ -62,8 +62,8 @@ class TestNeMoAutoModelForCausalLM:
     def test_from_config_liger_kernel_not_available(self, caplog):
         """Test warning when Liger kernel is not available in from_config."""
         with (
-            patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", False),
-            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch("nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL", False),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
             patch.object(transformers.AutoModelForCausalLM, "from_config") as mock_from_config,
         ):
             mock_model = MagicMock()
@@ -85,8 +85,8 @@ class TestNeMoAutoModelForCausalLM:
         """If AutoConfig.architectures[0] maps to a custom class in ModelRegistry,
         ensure that the registry path is taken and HF loader is not called."""
         with (
-            patch("nemo_automodel.components._transformers.auto_model.AutoConfig.from_pretrained") as mock_cfg_from_pretrained,
-            patch("nemo_automodel.components._transformers.auto_model.ModelRegistry") as mock_registry,
+            patch("nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained") as mock_cfg_from_pretrained,
+            patch("nemo_automodel._transformers.auto_model.ModelRegistry") as mock_registry,
             patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_hf_loader,
         ):
             # Prepare a fake config with architectures
@@ -112,7 +112,7 @@ class TestNeMoAutoModelForCausalLM:
         """If config.architectures[0] maps to a custom class in ModelRegistry,
         ensure that the registry path is taken and HF loader is not called."""
         with (
-            patch("nemo_automodel.components._transformers.auto_model.ModelRegistry") as mock_registry,
+            patch("nemo_automodel._transformers.auto_model.ModelRegistry") as mock_registry,
             patch.object(transformers.AutoModelForCausalLM, "from_config") as mock_hf_loader,
         ):
             # Fake config with architectures attribute
@@ -154,9 +154,9 @@ class TestNeMoAutoModelForCausalLM:
             raise RuntimeError("boom")
 
         with (
-            patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", True),
-            patch("nemo_automodel.components._transformers.auto_model._patch_liger_kernel", new=fake__patch_liger_kernel),
-            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch("nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL", True),
+            patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", new=fake__patch_liger_kernel),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
             patch.object(
                 transformers.AutoModelForCausalLM,
                 "from_pretrained",
@@ -186,9 +186,9 @@ class TestNeMoAutoModelForCausalLM:
         cfg = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
 
         with (
-            patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", True),
-            patch("nemo_automodel.components._transformers.auto_model._patch_liger_kernel", new=fake__patch_liger_kernel),
-            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch("nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL", True),
+            patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", new=fake__patch_liger_kernel),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
             patch.object(
                 transformers.AutoModelForCausalLM, "from_config", side_effect=[model1, model2]
             ) as mock_from_config,
@@ -227,7 +227,7 @@ class TestNeMoAutoModelForCausalLM:
                 return model2
 
         with (
-            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
             patch.object(
                 transformers.AutoModelForCausalLM,
                 "from_pretrained",
@@ -266,7 +266,7 @@ class TestNeMoAutoModelForCausalLM:
             raise ValueError("Some other error not related to attention")
 
         with (
-            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
             patch.object(
                 transformers.AutoModelForCausalLM,
                 "from_pretrained",
@@ -312,7 +312,7 @@ class TestNeMoAutoModelForCausalLM:
                 return model2
 
         with (
-            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
             patch.object(
                 transformers.AutoModelForCausalLM,
                 "from_pretrained",
@@ -369,7 +369,7 @@ class TestNeMoAutoModelForCausalLM:
         cfg = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
 
         with (
-            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
             patch.object(
                 transformers.AutoModelForCausalLM,
                 "from_config",
@@ -405,8 +405,8 @@ class TestNeMoAutoModelForImageTextToText:
     def test_from_pretrained_liger_kernel_not_available(self, caplog):
         """Test warning when Liger kernel is not available."""
         with (
-            patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", False),
-            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch("nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL", False),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
             patch.object(transformers.AutoModelForImageTextToText, "from_pretrained") as mock_from_pretrained,
         ):
             mock_model = Mock()
@@ -425,8 +425,8 @@ class TestNeMoAutoModelForImageTextToText:
     def test_from_config_liger_kernel_not_available(self, caplog):
         """Test warning when Liger kernel is not available in from_config."""
         with (
-            patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", False),
-            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch("nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL", False),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
             patch.object(transformers.AutoModelForImageTextToText, "from_config") as mock_from_config,
         ):
             mock_model = Mock()
@@ -457,9 +457,9 @@ class TestNeMoAutoModelForImageTextToText:
             raise RuntimeError("boom")
 
         with (
-            patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", True),
-            patch("nemo_automodel.components._transformers.auto_model._patch_liger_kernel", new=fake__patch_liger_kernel),
-            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch("nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL", True),
+            patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", new=fake__patch_liger_kernel),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
             patch.object(
                 transformers.AutoModelForImageTextToText,
                 "from_pretrained",
@@ -492,9 +492,9 @@ class TestNeMoAutoModelForImageTextToText:
             raise RuntimeError("boom")
 
         with (
-            patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", True),
-            patch("nemo_automodel.components._transformers.auto_model._patch_liger_kernel", lambda x: x),
-            patch("nemo_automodel.components._transformers.auto_model._patch_attention", fake__patch_attention),
+            patch("nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL", True),
+            patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", lambda x: x),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", fake__patch_attention),
             patch.object(
                 transformers.AutoModelForImageTextToText,
                 "from_pretrained",
@@ -526,9 +526,9 @@ class TestNeMoAutoModelForImageTextToText:
         cfg = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
 
         with (
-            patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", True),
-            patch("nemo_automodel.components._transformers.auto_model._patch_liger_kernel", new=fake__patch_liger_kernel),
-            patch("nemo_automodel.components._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch("nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL", True),
+            patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", new=fake__patch_liger_kernel),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
             patch.object(
                 transformers.AutoModelForImageTextToText, "from_config", side_effect=[model1, model2]
             ) as mock_from_config,
@@ -554,9 +554,9 @@ class TestNeMoAutoModelForImageTextToText:
         cfg = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
 
         with (
-            patch("nemo_automodel.components._transformers.auto_model.HAS_LIGER_KERNEL", True),
-            patch("nemo_automodel.components._transformers.auto_model._patch_liger_kernel", lambda x: x),
-            patch("nemo_automodel.components._transformers.auto_model._patch_attention", fake__patch_attention),
+            patch("nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL", True),
+            patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", lambda x: x),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", fake__patch_attention),
             patch.object(
                 transformers.AutoModelForImageTextToText, "from_config", side_effect=[model1, model2]
             ) as mock_from_config,
@@ -583,8 +583,8 @@ class TestPatchAttention:
         mock_forward.__self__ = mock_obj
 
         with (
-            patch("nemo_automodel.components._transformers.auto_model.sdpa_kernel") as mock_sdpa_kernel,  # noqa: F841
-            patch("nemo_automodel.components._transformers.auto_model._assert_same_signature"),
+            patch("nemo_automodel._transformers.auto_model.sdpa_kernel") as mock_sdpa_kernel,  # noqa: F841
+            patch("nemo_automodel._transformers.auto_model._assert_same_signature"),
         ):
             result = _patch_attention(mock_obj)
 
@@ -607,8 +607,8 @@ class TestPatchAttention:
         custom_sdpa_method = [SDPBackend.FLASH_ATTENTION]
 
         with (
-            patch("nemo_automodel.components._transformers.auto_model.sdpa_kernel") as mock_sdpa_kernel,  # noqa: F841
-            patch("nemo_automodel.components._transformers.auto_model._assert_same_signature"),
+            patch("nemo_automodel._transformers.auto_model.sdpa_kernel") as mock_sdpa_kernel,  # noqa: F841
+            patch("nemo_automodel._transformers.auto_model._assert_same_signature"),
         ):
             result = _patch_attention(mock_obj, custom_sdpa_method)
 
@@ -622,7 +622,7 @@ class TestUtilityFunctions:
 
     def test_assert_same_signature_matching(self):
         """Test _assert_same_signature with matching signatures."""
-        from nemo_automodel.components._transformers.auto_model import _assert_same_signature
+        from nemo_automodel._transformers.auto_model import _assert_same_signature
 
         def func1(a, b, c=None):
             pass
@@ -635,7 +635,7 @@ class TestUtilityFunctions:
 
     def test_assert_same_signature_different(self):
         """Test _assert_same_signature with different signatures."""
-        from nemo_automodel.components._transformers.auto_model import _assert_same_signature
+        from nemo_automodel._transformers.auto_model import _assert_same_signature
 
         def func1(a, b, c=None):
             pass
@@ -747,7 +747,7 @@ def test_success_paths(monkeypatch, use_liger, has_liger):
     1. Liger available & requested  -> kernel applied, _patch_attention called.
     2. Liger *not* requested        -> kernel *not* applied, _patch_attention called.
     """
-    import nemo_automodel.components._transformers.auto_model as tgt
+    import nemo_automodel._transformers.auto_model as tgt
 
     apply_mock, attn_mock = prepare_env(monkeypatch, tgt, has_liger=has_liger, apply_ok=True)
 
@@ -778,7 +778,7 @@ def test_liger_not_available(monkeypatch):
     Expect: return untouched model, _patch_attention still invoked,
             no exceptions thrown.
     """
-    import nemo_automodel.components._transformers.auto_model as tgt
+    import nemo_automodel._transformers.auto_model as tgt
 
     apply_mock, attn_mock = prepare_env(
         monkeypatch,
@@ -803,7 +803,7 @@ def test_liger_apply_failure_raises(monkeypatch):
     If _apply_liger_kernel_to_instance throws, _patch_liger_kernel must
     clean up and raise RuntimeError.
     """
-    import nemo_automodel.components._transformers.auto_model as tgt
+    import nemo_automodel._transformers.auto_model as tgt
 
     prepare_env(
         monkeypatch,
