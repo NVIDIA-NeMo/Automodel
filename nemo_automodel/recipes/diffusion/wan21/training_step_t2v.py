@@ -3,11 +3,14 @@ from __future__ import annotations
 # training_step_t2v.py - Manual Flow Matching (DO NOT use scheduler.add_noise)
 
 import os
+import logging
 from typing import Dict, Tuple
 
 import torch
-from .dist_utils import print0
 from .time_shift_utils import compute_density_for_timestep_sampling
+
+
+logger = logging.getLogger(__name__)
 
 
 def step_fsdp_transformer_t2v(
@@ -109,36 +112,36 @@ def step_fsdp_transformer_t2v(
     # DETAILED LOGGING
     # ====================================================================
     if detailed_log or debug_mode:
-        print0("\n" + "="*80)
-        print0(f"[STEP {global_step}] MANUAL FLOW MATCHING")
-        print0("="*80)
-        print0(f"[WARNING] NOT using scheduler.add_noise() - it explodes!")
-        print0(f"[INFO] Using manual: x_t = (1-σ)x_0 + σ*ε")
-        print0("")
-        print0(f"[SAMPLING] Method: {sampling_method}")
-        print0(f"[FLOW] Shift: {flow_shift}")
-        print0(f"[BATCH] Size: {batch_size}")
-        print0("")
-        print0(f"[U] Range: [{u.min():.4f}, {u.max():.4f}]")
+        logger.info("\n" + "="*80)
+        logger.info(f"[STEP {global_step}] MANUAL FLOW MATCHING")
+        logger.info("="*80)
+        logger.info(f"[WARNING] NOT using scheduler.add_noise() - it explodes!")
+        logger.info(f"[INFO] Using manual: x_t = (1-σ)x_0 + σ*ε")
+        logger.info("")
+        logger.info(f"[SAMPLING] Method: {sampling_method}")
+        logger.info(f"[FLOW] Shift: {flow_shift}")
+        logger.info(f"[BATCH] Size: {batch_size}")
+        logger.info("")
+        logger.info(f"[U] Range: [{u.min():.4f}, {u.max():.4f}]")
         if u.numel() > 1:
-            print0(f"[U] Mean: {u.mean():.4f}, Std: {u.std():.4f}")
+            logger.info(f"[U] Mean: {u.mean():.4f}, Std: {u.std():.4f}")
         else:
-            print0(f"[U] Value: {u.item():.4f}")
-        print0("")
-        print0(f"[SIGMA] Range: [{sigma.min():.4f}, {sigma.max():.4f}]")
+            logger.info(f"[U] Value: {u.item():.4f}")
+        logger.info("")
+        logger.info(f"[SIGMA] Range: [{sigma.min():.4f}, {sigma.max():.4f}]")
         if sigma.numel() > 1:
-            print0(f"[SIGMA] Mean: {sigma.mean():.4f}, Std: {sigma.std():.4f}")
+            logger.info(f"[SIGMA] Mean: {sigma.mean():.4f}, Std: {sigma.std():.4f}")
         else:
-            print0(f"[SIGMA] Value: {sigma.item():.4f}")
-        print0("")
-        print0(f"[TIMESTEPS] Range: [{timesteps.min():.2f}, {timesteps.max():.2f}]")
-        print0("")
-        print0(f"[WEIGHTS] Clean: {(1-sigma_reshaped).squeeze().cpu().numpy()}")
-        print0(f"[WEIGHTS] Noise: {sigma_reshaped.squeeze().cpu().numpy()}")
-        print0("")
-        print0(f"[RANGES] Clean latents: [{video_latents.min():.4f}, {video_latents.max():.4f}]")
-        print0(f"[RANGES] Noise:         [{noise.min():.4f}, {noise.max():.4f}]")
-        print0(f"[RANGES] Noisy latents: [{noisy_latents.min():.4f}, {noisy_latents.max():.4f}]")
+            logger.info(f"[SIGMA] Value: {sigma.item():.4f}")
+        logger.info("")
+        logger.info(f"[TIMESTEPS] Range: [{timesteps.min():.2f}, {timesteps.max():.2f}]")
+        logger.info("")
+        logger.info(f"[WEIGHTS] Clean: {(1-sigma_reshaped).squeeze().cpu().numpy()}")
+        logger.info(f"[WEIGHTS] Noise: {sigma_reshaped.squeeze().cpu().numpy()}")
+        logger.info("")
+        logger.info(f"[RANGES] Clean latents: [{video_latents.min():.4f}, {video_latents.max():.4f}]")
+        logger.info(f"[RANGES] Noise:         [{noise.min():.4f}, {noise.max():.4f}]")
+        logger.info(f"[RANGES] Noisy latents: [{noisy_latents.min():.4f}, {noisy_latents.max():.4f}]")
         
         # Sanity check
         max_expected = max(
@@ -148,16 +151,16 @@ def step_fsdp_transformer_t2v(
             abs(noise.min().item())
         ) * 1.5
         if abs(noisy_latents.max()) > max_expected or abs(noisy_latents.min()) > max_expected:
-            print0(f"\n⚠️  WARNING: Noisy range seems large! Expected ~{max_expected:.1f}")
+            logger.info(f"\n⚠️  WARNING: Noisy range seems large! Expected ~{max_expected:.1f}")
         else:
-            print0(f"\n✓ Noisy latents range is reasonable")
-        print0("="*80 + "\n")
+            logger.info(f"\n✓ Noisy latents range is reasonable")
+        logger.info("="*80 + "\n")
     
     elif summary_log:
-        print0(f"[STEP {global_step}] σ=[{sigma.min():.3f},{sigma.max():.3f}] | "
-               f"t=[{timesteps.min():.1f},{timesteps.max():.1f}] | "
-               f"noisy=[{noisy_latents.min():.1f},{noisy_latents.max():.1f}] | "
-               f"{sampling_method}")
+        logger.info(f"[STEP {global_step}] σ=[{sigma.min():.3f},{sigma.max():.3f}] | "
+                    f"t=[{timesteps.min():.1f},{timesteps.max():.1f}] | "
+                    f"noisy=[{noisy_latents.min():.1f},{noisy_latents.max():.1f}] | "
+                    f"{sampling_method}")
 
     # Convert to bf16
     noisy_latents = noisy_latents.to(bf16)
@@ -181,9 +184,9 @@ def step_fsdp_transformer_t2v(
             model_pred = model_pred[0]
 
     except Exception as e:
-        print0(f"[ERROR] Forward pass failed: {e}")
-        print0(f"[DEBUG] noisy_latents: {noisy_latents.shape}, range: [{noisy_latents.min()}, {noisy_latents.max()}]")
-        print0(f"[DEBUG] timesteps: {timesteps_for_model.shape}, range: [{timesteps_for_model.min()}, {timesteps_for_model.max()}]")
+        logger.info(f"[ERROR] Forward pass failed: {e}")
+        logger.info(f"[DEBUG] noisy_latents: {noisy_latents.shape}, range: [{noisy_latents.min()}, {noisy_latents.max()}]")
+        logger.info(f"[DEBUG] timesteps: {timesteps_for_model.shape}, range: [{timesteps_for_model.min()}, {timesteps_for_model.max()}]")
         raise
 
     # ========================================================================
@@ -212,38 +215,38 @@ def step_fsdp_transformer_t2v(
     
     # Safety check
     if torch.isnan(weighted_loss) or weighted_loss > 100:
-        print0(f"[ERROR] Loss explosion! Loss={weighted_loss.item():.3f}")
-        print0(f"[DEBUG] Stopping training - check hyperparameters")
+        logger.info(f"[ERROR] Loss explosion! Loss={weighted_loss.item():.3f}")
+        logger.info(f"[DEBUG] Stopping training - check hyperparameters")
         raise ValueError(f"Loss exploded: {weighted_loss.item()}")
     
     # ====================================================================
     # LOSS LOGGING
     # ====================================================================
     if detailed_log or debug_mode:
-        print0("="*80)
-        print0(f"[STEP {global_step}] LOSS DEBUG")
-        print0("="*80)
-        print0(f"[TARGET] Flow matching: v = ε - x_0")
-        print0(f"[PREDICTION] Scheduler type (inference only): {type(pipe.scheduler).__name__}")
-        print0("")
-        print0(f"[RANGES] Model pred: [{model_pred.min():.4f}, {model_pred.max():.4f}]")
-        print0(f"[RANGES] Target (v): [{target.min():.4f}, {target.max():.4f}]")
-        print0("")
-        print0(f"[WEIGHTS] Formula: 1 + {flow_shift} * σ")
-        print0(f"[WEIGHTS] Range: [{loss_weight.min():.4f}, {loss_weight.max():.4f}]")
+        logger.info("="*80)
+        logger.info(f"[STEP {global_step}] LOSS DEBUG")
+        logger.info("="*80)
+        logger.info(f"[TARGET] Flow matching: v = ε - x_0")
+        logger.info(f"[PREDICTION] Scheduler type (inference only): {type(pipe.scheduler).__name__}")
+        logger.info("")
+        logger.info(f"[RANGES] Model pred: [{model_pred.min():.4f}, {model_pred.max():.4f}]")
+        logger.info(f"[RANGES] Target (v): [{target.min():.4f}, {target.max():.4f}]")
+        logger.info("")
+        logger.info(f"[WEIGHTS] Formula: 1 + {flow_shift} * σ")
+        logger.info(f"[WEIGHTS] Range: [{loss_weight.min():.4f}, {loss_weight.max():.4f}]")
         if loss_weight.numel() > 1:
-            print0(f"[WEIGHTS] Mean: {loss_weight.mean():.4f}")
+            logger.info(f"[WEIGHTS] Mean: {loss_weight.mean():.4f}")
         else:
-            print0(f"[WEIGHTS] Value: {loss_weight.mean():.4f}")
-        print0("")
-        print0(f"[LOSS] Unweighted: {unweighted_loss.item():.6f}")
-        print0(f"[LOSS] Weighted:   {weighted_loss.item():.6f}")
-        print0(f"[LOSS] Impact:     {(weighted_loss/max(unweighted_loss, 1e-8)):.3f}x")
-        print0("="*80 + "\n")
+            logger.info(f"[WEIGHTS] Value: {loss_weight.mean():.4f}")
+        logger.info("")
+        logger.info(f"[LOSS] Unweighted: {unweighted_loss.item():.6f}")
+        logger.info(f"[LOSS] Weighted:   {weighted_loss.item():.6f}")
+        logger.info(f"[LOSS] Impact:     {(weighted_loss/max(unweighted_loss, 1e-8)):.3f}x")
+        logger.info("="*80 + "\n")
     
     elif summary_log:
-        print0(f"[STEP {global_step}] Loss: {weighted_loss.item():.6f} | "
-               f"w=[{loss_weight.min():.2f},{loss_weight.max():.2f}]")
+        logger.info(f"[STEP {global_step}] Loss: {weighted_loss.item():.6f} | "
+                    f"w=[{loss_weight.min():.2f},{loss_weight.max():.2f}]")
 
     # Metrics
     metrics = {

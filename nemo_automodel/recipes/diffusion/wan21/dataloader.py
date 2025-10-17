@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
-from .dist_utils import print0
 from torch.utils.data import DataLoader, Dataset
 
 # Set up logging
