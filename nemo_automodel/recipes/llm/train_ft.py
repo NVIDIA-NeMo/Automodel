@@ -908,19 +908,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
 
         restore_from = self.cfg.get("checkpoint.restore_from", None)
-        self.checkpoint_config = build_checkpoint_config(
-            self.cfg.get("checkpoint", None),
-            self.cfg.get("model.cache_dir", None),
-            _get_model_name(self.cfg.model),
-            True if self.cfg.get("peft", None) else False,
-            model_state_dict_keys,
-        )
         # Initialize JSONL loggers
         self.metric_logger_train = MetricLoggerDist(
-            pathlib.Path(self.checkpoint_config.checkpoint_dir) / "training.jsonl"
+            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "training.jsonl"
         )
         self.metric_logger_valid = MetricLoggerDist(
-            pathlib.Path(self.checkpoint_config.checkpoint_dir) / "validation.jsonl"
+            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "validation.jsonl"
         )
 
         # Optionally resume
