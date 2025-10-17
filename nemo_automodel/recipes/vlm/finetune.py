@@ -627,10 +627,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         # Initialize JSONL loggers
         self.metric_logger_train = MetricLoggerDist(
-            pathlib.Path(self.checkpoint_config.checkpoint_dir) / "training.jsonl"
+            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "training.jsonl"
         )
         self.metric_logger_valid = MetricLoggerDist(
-            pathlib.Path(self.checkpoint_config.checkpoint_dir) / "validation.jsonl"
+            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "validation.jsonl"
         )
 
         # Optionally resume
