@@ -1,8 +1,4 @@
-#!/usr/bin/env python3
-# validate_t2v.py - Simple T2V validation (loads prompts from .meta files)
-
 import argparse
-import json
 import os
 import pickle
 from pathlib import Path
@@ -245,34 +241,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# ============================================================================
-# USAGE EXAMPLES
-# ============================================================================
-
-# 1. Basic usage (all samples):
-# python validate_t2v.py \
-#     --meta_folder /linnanw/hdvilla_sample/pika/wan21_codes/1.3B_meta
-
-# 2. Limited samples:
-# python validate_t2v.py \
-#     --meta_folder /linnanw/hdvilla_sample/pika/wan21_codes/1.3B_meta \
-#     --num_samples 5
-
-# 3. With checkpoint (uses EMA if available):
-# python validate_t2v.py \
-#     --meta_folder /linnanw/hdvilla_sample/pika/wan21_codes/1.3B_meta \
-#     --checkpoint ./wan_t2v_all_fixes/checkpoint-5000 \
-#     --num_samples 5
-
-# 4. Custom settings:
-# python validate_t2v.py \
-#     --meta_folder /linnanw/hdvilla_sample/pika/wan21_codes/1.3B_meta \
-#     --checkpoint ./checkpoint-5000 \
-#     --height 480 \
-#     --width 832 \
-#     --num_frames 81 \
-#     --num_inference_steps 50 \
-#     --guidance_scale 5.0 \
-#     --num_samples 10
