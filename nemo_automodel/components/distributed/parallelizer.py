@@ -221,7 +221,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
     ) -> nn.Module:
         """Apply NemotronH-specific parallelization."""
         assert not sequence_parallel, "Sequence parallelism is not supported for NemotronHForCausalLM"
-        logger.info(f"Custom parallel plan is not supported for NemotronHForCausalLM. Using NemotronH-specific TP plan.")
+        logger.info("Custom parallel plan is not supported for NemotronHForCausalLM. Using NemotronH-specific TP plan.")
 
         layers: torch.nn.ModuleList = model.backbone.layers
         tp_mesh = device_mesh[tp_mesh_name]
@@ -477,7 +477,6 @@ def get_hf_tp_shard_plan(model):
 
     hf_tp_plan = {}
 
-    
     # model_cls._tp_plan will override model_cls after xxxForCausalLM.post_init() (transformers==4.51.3)
     if hasattr(model_cls, "_tp_plan") and model_cls._tp_plan is not None:
         assert isinstance(model_cls._tp_plan, dict), f"model_cls._tp_plan is not a dict: {model_cls._tp_plan}"

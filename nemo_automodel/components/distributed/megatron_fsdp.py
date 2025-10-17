@@ -19,10 +19,6 @@ from typing import List, Optional
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor.parallel import (
-    ColwiseParallel,
-    RowwiseParallel,
-)
 
 from nemo_automodel.components.distributed.parallelizer import (
     _get_parallel_plan,
