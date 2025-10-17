@@ -32,7 +32,7 @@ from transformers import (
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
 from nemo_automodel import __version__
-from nemo_automodel.components._transformers.registry import ModelRegistry
+from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
 
