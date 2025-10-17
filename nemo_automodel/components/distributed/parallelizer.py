@@ -185,7 +185,6 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 reduce_dtype=torch.float32,
                 output_dtype=torch.float32,
             )
-        logger.info("!!! [INFO] PPLYING FSDP2 SHARDING RECURSIVELY")
         # Find transformer layers and apply parallelisms
         apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy)
 
@@ -349,7 +348,6 @@ class WanParallelizationStrategy(ParallelizationStrategy):
                 reduce_dtype=torch.float32,
                 output_dtype=torch.float32,
             )
-        logger.info("!!! [INFO] APPLYING ACTIVATION CHECKPOINTING")
         # Apply activation checkpointing to transformer blocks if requested
         if activation_checkpointing:
             try:
@@ -363,7 +361,6 @@ class WanParallelizationStrategy(ParallelizationStrategy):
             except Exception as e:
                 logger.warning(f"Wan strategy: failed to apply activation checkpointing: {e}")
         
-        logger.info("!!! [INFO] APPLYING WAN FSDP2 SHARDING RECURSIVELY")
         # Apply FSDP sharding recursively and to root
         apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy)
 

@@ -49,8 +49,6 @@ def build_model_and_optimizer(
 
     world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-    logging.info(f"[INFO] CPU offload: {'ENABLED' if cpu_offload else 'DISABLED'}")
-
     if dp_size is None:
         denom = max(1, tp_size * cp_size * pp_size)
         dp_size = max(1, world_size // denom)
@@ -79,6 +77,7 @@ def build_model_and_optimizer(
         device=device,
         parallel_scheme=parallel_scheme,
         load_for_training=True,
+        components_to_load=["transformer"]
     )
 
     transformer_module = getattr(pipe, "transformer", None)

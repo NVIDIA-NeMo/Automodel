@@ -108,6 +108,7 @@ class NeMoAutoDiffusionPipeline(DiffusionPipeline):
         torch_dtype: Any = "auto",
         move_to_device: bool = True,
         load_for_training: bool = False,
+        components_to_load: Optional[Iterable[str]] = None,
         **kwargs,
     ) -> DiffusionPipeline:
         pipe: DiffusionPipeline = DiffusionPipeline.from_pretrained(
@@ -116,33 +117,21 @@ class NeMoAutoDiffusionPipeline(DiffusionPipeline):
             torch_dtype=torch_dtype,
             **kwargs,
         )
-                    # Explicitly delete VAE and text encoder if they were loaded
-        if hasattr(pipe, "vae") and pipe.vae is not None:
-            logging.info("[INFO] Removing VAE from pipeline...")
-            del pipe.vae
-            pipe.vae = None
-
-        if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
-            logging.info("[INFO] Removing text encoder from pipeline...")
-            del pipe.text_encoder
-            pipe.text_encoder = None
-
         # Decide device
         dev = _choose_device(device)
 
         # Move modules to device/dtype first (helps avoid initial OOM during sharding)
         if move_to_device:
             for name, module in _iter_pipeline_modules(pipe):
-                if name == "transformer":
-                    logger.info("!!! [INFO] Moving module: %s to device/dtype", name)
+                if not components_to_load or name in components_to_load:
+                    logger.info("[INFO] Moving module: %s to device/dtype", name)
                     _move_module_to_device(module, dev, torch_dtype)
 
         # If loading for training, ensure the target module parameters are trainable
-        if load_for_training:
-                
+        if load_for_training:            
             for name, module in _iter_pipeline_modules(pipe):
-                if name == "transformer":
-                    logger.info("!!! [INFO] Ensuring params trainable: %s", name)
+                if not components_to_load or name in components_to_load:
+                    logger.info("[INFO] Ensuring params trainable: %s", name)
                     _ensure_params_trainable(module, module_name=name)
 
         # Use per-component FSDP2Manager mappings to parallelize components
