@@ -20,18 +20,11 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
-from torch.distributed.tensor.parallel import (
-    ColwiseParallel,
-    RowwiseParallel,
-    SequenceParallel,
-)
-from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
-from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE_FUNCTIONS
 from nemo_automodel.components.distributed.parallelizer import (
-    fsdp2_strategy_parallelize,
     _get_parallel_plan,
+    fsdp2_strategy_parallelize,
 )
 
 logger = logging.getLogger(__name__)
