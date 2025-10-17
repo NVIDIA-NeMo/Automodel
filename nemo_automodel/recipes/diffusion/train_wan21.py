@@ -12,8 +12,9 @@ import torch
 import torch.distributed as dist
 import wandb
 
-from nemo_automodel.recipes.diffusion.wan21.data_utils import create_dataloader
-from nemo_automodel.recipes.diffusion.wan21.training_step_t2v import step_fsdp_transformer_t2v
+from nemo_automodel.components._diffusers.flow_matching.training_step_t2v import (
+    step_fsdp_transformer_t2v,
+)
 
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
@@ -123,12 +124,6 @@ def build_model_and_optimizer(
     logging.info("[INFO] NeMoAutoDiffusion setup complete (pipeline + optimizer)")
 
     return pipe, model_map, optimizer
-
-
-def build_dataloader(meta_folder: str, batch_size_per_node: int, num_nodes: int):
-    """Build the WAN 2.1 diffusion dataloader."""
-
-    return create_dataloader(meta_folder, batch_size_per_node, num_nodes)
 
 
 def build_lr_scheduler(
@@ -391,7 +386,6 @@ class TrainWan21DiffusionRecipe(BaseRecipe):
         logging_cfg = self.cfg.get("logging", {})
         checkpoint_cfg = self.cfg.get("checkpoint", {})
 
-        self.meta_folder = self.cfg.get("data.meta_folder")
         self.batch_size_per_node = batch_cfg.get("batch_size_per_node", 1)
         self.num_epochs = training_cfg.get("num_epochs", 1)
         self.save_every = logging_cfg.get("save_every", 500)
@@ -399,11 +393,16 @@ class TrainWan21DiffusionRecipe(BaseRecipe):
         self.output_dir = checkpoint_cfg.get("output_dir", "./wan_t2v_flow_outputs")
         self.resume_checkpoint = checkpoint_cfg.get("resume", None)
 
-        self.dataloader, self.sampler = build_dataloader(
-            self.meta_folder,
-            self.batch_size_per_node,
-            self.num_nodes,
-        )
+        dataloader_cfg = self.cfg.get("data.dataloader")
+        if not hasattr(dataloader_cfg, "instantiate"):
+            raise RuntimeError("data.dataloader must be a config node with instantiate()")
+
+        dataloader_obj = dataloader_cfg.instantiate()
+        if isinstance(dataloader_obj, tuple):
+            self.dataloader, self.sampler = dataloader_obj
+        else:
+            self.dataloader = dataloader_obj
+            self.sampler = getattr(dataloader_obj, "sampler", None)
 
         self.steps_per_epoch = len(self.dataloader)
         if self.steps_per_epoch == 0:

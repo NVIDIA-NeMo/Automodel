@@ -3,7 +3,7 @@ seed: 42
 wandb:
   project: wan-t2v-flow-matching
   mode: online
-  name: wan2_1_t2v_fm
+  name: wan2_1_t2v_fm_updated
 
 dist_env:
   backend: nccl
@@ -13,7 +13,13 @@ model:
   pretrained_model_name_or_path: Wan-AI/Wan2.1-T2V-1.3B-Diffusers
 
 data:
-  meta_folder: /abs/path/to/meta
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_wan21_dataloader
+    meta_folder: /lustre/fsw/portfolios/coreai/users/linnanw/hdvilla_sample/pika/wan21_codes/1.3B_meta/
+    batch_size: 1
+    num_workers: 2
+    device: cpu
+    num_nodes: 1
 
 batch:
   batch_size_per_node: 1
@@ -43,7 +49,7 @@ logging:
   log_every: 2
 
 checkpoint:
-  output_dir: /opt/Automodel/wan_t2v_flow_outputs/
+  output_dir: /opt/Automodel/wan_t2v_flow_outputs_updated/
   resume: null
 
 
