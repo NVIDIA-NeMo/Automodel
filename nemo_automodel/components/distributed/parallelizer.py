@@ -95,6 +95,7 @@ class ParallelizationStrategy(ABC):
         sequence_parallel: bool = False,
         activation_checkpointing: bool = False,
         tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+        use_hf_tp_plan: bool = False,
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
@@ -115,6 +116,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         sequence_parallel: bool = False,
         activation_checkpointing: bool = False,
         tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+        use_hf_tp_plan: bool = False,
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
@@ -137,7 +139,13 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
 
             # Generate or use tensor parallel plan
             model_parallel_plan = {
-                k: translate_to_lora(v) for k, v in _get_parallel_plan(model, sequence_parallel, tp_shard_plan).items()
+                k: translate_to_lora(v)
+                for k, v in _get_parallel_plan(
+                    model,
+                    sequence_parallel,
+                    tp_shard_plan,
+                    use_hf_tp_plan=use_hf_tp_plan,
+                ).items()
             }
 
             # Apply tensor parallelism
@@ -213,7 +221,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
     ) -> nn.Module:
         """Apply NemotronH-specific parallelization."""
         assert not sequence_parallel, "Sequence parallelism is not supported for NemotronHForCausalLM"
-        logger.warning("Custom parallel plan is not supported for NemotronHForCausalLM. Using NemotronH-specific TP plan.")
+        logger.info(f"Custom parallel plan is not supported for NemotronHForCausalLM. Using NemotronH-specific TP plan.")
 
         layers: torch.nn.ModuleList = model.backbone.layers
         tp_mesh = device_mesh[tp_mesh_name]
@@ -469,6 +477,7 @@ def get_hf_tp_shard_plan(model):
 
     hf_tp_plan = {}
 
+    
     # model_cls._tp_plan will override model_cls after xxxForCausalLM.post_init() (transformers==4.51.3)
     if hasattr(model_cls, "_tp_plan") and model_cls._tp_plan is not None:
         assert isinstance(model_cls._tp_plan, dict), f"model_cls._tp_plan is not a dict: {model_cls._tp_plan}"
@@ -496,6 +505,7 @@ def get_hf_tp_shard_plan(model):
         else:
             hf_tp_plan[k] = translate_to_torch_parallel_style(v)
 
+    logger.info(f"Hugging Face tp plan: {hf_tp_plan}")
     return hf_tp_plan
 
 
@@ -781,9 +791,16 @@ def _get_parallel_plan(
     model: nn.Module,
     sequence_parallel: bool = False,
     tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+    use_hf_tp_plan: bool = False,
 ) -> Dict[str, ParallelStyle]:
     """
-    Get the parallel plan for the model.
+    Select the tensor-parallel plan for the given model.
+
+    Priority order:
+    1) If ``tp_shard_plan`` is provided as a dict or import path (to a dict/function), use it.
+    2) If ``use_hf_tp_plan`` is True, use the HF plan directly (asserts when sequence_parallel=True).
+    3) If the model type exists in ``PARALLELIZE_FUNCTIONS``, use its optimised plan; on failure, try HF plan
+    4) Otherwise, use the default base plan.
     """
 
     # Generate or use tensor parallel plan
@@ -793,7 +810,7 @@ def _get_parallel_plan(
     # 1. Use custom parallel plan if provided
     if isinstance(tp_shard_plan, dict):
         model_parallel_plan = tp_shard_plan
-        print("Using provided parallel plan (dictionary).")
+        logger.info(f"Using parallel plan (dictionary). {tp_shard_plan}")
     elif tp_shard_plan is not None:
         try:
             plan_obj = import_class_from_path(tp_shard_plan)
@@ -804,7 +821,7 @@ def _get_parallel_plan(
             assert isinstance(model_parallel_plan, dict), (
                 f"Parallel plan must be a dictionary, got {type(model_parallel_plan)}"
             )
-            print("Using provided parallel plan (from path).")
+            logger.info(f"Using provided parallel plan (from path). {tp_shard_plan}")
         except Exception as e:
             raise ValueError(
                 f"Custom parallel plan '{tp_shard_plan}' is not valid. "
@@ -815,22 +832,48 @@ def _get_parallel_plan(
                 f"Error: {e}"
             )
 
-    # 2. Use optimized parallel plan based on model type
+    # 2. Prefer HF TP plan explicitly if requested
+    elif use_hf_tp_plan:
+        assert not sequence_parallel, "sequence_parallel is not supported in HF tp plan."
+        model_parallel_plan = get_hf_tp_shard_plan(model)
+
+    # 3. Use optimized parallel plan based on model type
     elif model_cls in PARALLELIZE_FUNCTIONS:
         try:
             func = PARALLELIZE_FUNCTIONS[model_cls]
             model_parallel_plan = func(model, sequence_parallel)
-            print("Using optimized parallel plan.")
+            logger.info("Using optimized parallel plan.")
         except Exception as e:
-            print(f"Optimized parallel plan is not available: {e}. Falling back to the HF tp plan.")
+            logger.info(f"Optimized parallel plan is not available: {e}. Falling back to the HF tp plan.")
             assert not sequence_parallel, "sequence_parallel is not supported in HF tp plan."
             model_parallel_plan = get_hf_tp_shard_plan(model)
 
-    # 3. Use HF TP plan as fallback
+    # 4. Otherwise, use the default base plan.
     else:
-        print(f"Optimized parallel plan is not supported for {model_cls}. Falling back to the HF tp plan.")
-        assert not sequence_parallel, "sequence_parallel is not supported in HF tp plan."
-        model_parallel_plan = get_hf_tp_shard_plan(model)
+        base_model_tp_plan = {
+            "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
+            "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+            "model.layers.*.mlp.up_proj": ColwiseParallel(),
+            "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+            "model.layers.*.mlp.down_proj": RowwiseParallel(),
+            "lm_head": ColwiseParallel(output_layouts=Replicate()),
+        }
+        if sequence_parallel:
+            base_model_sp_plan = {
+                "model.embed_tokens": RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1)),
+                "model.norm": SequenceParallel(),
+                "model.layers.*.input_layernorm": SequenceParallel(),
+                "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
+                "model.layers.*.post_attention_layernorm": SequenceParallel(),
+                "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
+                "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate()),
+            }
+            base_model_tp_plan.update(base_model_sp_plan)
+        model_parallel_plan = base_model_tp_plan
+        logger.info("Using default base TP plan. Compatible with huggingface llama3-style models.")
 
     return model_parallel_plan
 

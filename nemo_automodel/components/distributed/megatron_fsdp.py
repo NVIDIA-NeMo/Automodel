@@ -25,7 +25,7 @@ from torch.distributed.tensor.parallel import (
 )
 
 from nemo_automodel.components.distributed.parallelizer import (
-    get_hf_tp_shard_plan,
+    _get_parallel_plan,
     megatron_fsdp_strategy_parallelize,
 )
 
@@ -227,32 +227,13 @@ class MegatronFSDPManager:
                 print("Warning: MegatronFSDP zero_dp_strategy is not 3. Parameters will not be sharded.")
 
         if self.device_mesh["tp"].size() > 1:
-            if self.use_hf_tp_plan:
-                tp_shard_plan = get_hf_tp_shard_plan(model)
-            else:
-                # Parallelize the first embedding and the last linear out projection
-                base_model_tp_plan = {
-                    "model.layers.*.self_attn.q_proj": ColwiseParallel(),
-                    "model.layers.*.self_attn.k_proj": ColwiseParallel(),
-                    "model.layers.*.self_attn.v_proj": ColwiseParallel(),
-                    "model.layers.*.self_attn.o_proj": RowwiseParallel(),
-                    "model.layers.*.mlp.up_proj": ColwiseParallel(),
-                    "model.layers.*.mlp.gate_proj": ColwiseParallel(),
-                    "model.layers.*.mlp.down_proj": RowwiseParallel(),
-                }
-
-                # TODO(boxiangw): investigate SP
-                if self.sequence_parallel and self.device_mesh.get_rank() == 0:
-                    # TODO(boxiangw): Change this to a log
-                    print("Sequence parallelism is disabled. It is not compatible with MegatronFSDP.")
-
-                tp_shard_plan = base_model_tp_plan
-                # TODO(boxiangw): Change this to a log
-                if self.device_mesh.get_rank() == 0:
-                    print(
-                        "Using default TP plan for parallelization. "
-                        "It is compatible with huggingface llama3-style models."
-                    )
+            # Delegate plan selection to central helper. MegatronFSDP currently does not support SP.
+            tp_shard_plan = _get_parallel_plan(
+                model,
+                sequence_parallel=False,  # explicit: SP not supported here
+                tp_shard_plan=None,
+                use_hf_tp_plan=self.use_hf_tp_plan,
+            )
         else:
             tp_shard_plan = None
 

@@ -31,7 +31,7 @@ from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE_FUNCTIONS
 from nemo_automodel.components.distributed.parallelizer import (
     fsdp2_strategy_parallelize,
-    get_hf_tp_shard_plan,
+    _get_parallel_plan,
 )
 
 logger = logging.getLogger(__name__)
@@ -293,47 +293,13 @@ class FSDP2Manager:
             return model
 
         if self.device_mesh["tp"].size() > 1:
-            model_cls = type(model)
-            if self.use_hf_tp_plan:
-                tp_shard_plan = get_hf_tp_shard_plan(model)
-            elif model_cls in PARALLELIZE_FUNCTIONS:
-                # Pass None through to allow downstream selection from PARALLELIZE_FUNCTIONS
-                tp_shard_plan = None
-            else:
-                base_model_tp_plan = {
-                    "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
-                    "model.layers.*.self_attn.q_proj": ColwiseParallel(),
-                    "model.layers.*.self_attn.k_proj": ColwiseParallel(),
-                    "model.layers.*.self_attn.v_proj": ColwiseParallel(),
-                    "model.layers.*.self_attn.o_proj": RowwiseParallel(),
-                    "model.layers.*.mlp.up_proj": ColwiseParallel(),
-                    "model.layers.*.mlp.gate_proj": ColwiseParallel(),
-                    "model.layers.*.mlp.down_proj": RowwiseParallel(),
-                    "lm_head": ColwiseParallel(output_layouts=Replicate()),
-                }
-
-                base_model_sp_plan = {
-                    "model.embed_tokens": RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1)),
-                    "model.norm": SequenceParallel(),
-                    "model.layers.*.input_layernorm": SequenceParallel(),
-                    "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
-                    "model.layers.*.post_attention_layernorm": SequenceParallel(),
-                    "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
-                    "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate()),
-                }
-
-                if self.sequence_parallel:
-                    # Enable sequence parallelism only if TP size > 1
-                    base_model_tp_plan.update(base_model_sp_plan)
-
-                tp_shard_plan = base_model_tp_plan
-
-                # TODO(boxiangw): Change this to a log
-                if self.device_mesh.get_rank() == 0:
-                    print(
-                        "Using default TP plan for parallelization. "
-                        "It is compatible with huggingface llama3-style models."
-                    )
+            # Delegate plan selection to central helper
+            tp_shard_plan = _get_parallel_plan(
+                model,
+                sequence_parallel=bool(self.sequence_parallel),
+                tp_shard_plan=None,
+                use_hf_tp_plan=self.use_hf_tp_plan,
+            )
         else:
             tp_shard_plan = None
 
