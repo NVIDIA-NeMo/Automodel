@@ -514,3 +514,81 @@ class TestConvertMoePackedTensors:
         # Row 2, exponent -1 -> [0.0, 0.0] (signed zeros tolerated)
         torch.testing.assert_close(out_local[0, 4, 0], torch.tensor(0.0))
         torch.testing.assert_close(out_local[0, 5, 0], torch.tensor(0.0))
+
+
+class TestSingleGPUScenarios:
+    def _make_adapter(self):
+        return GPTOSSStateDictAdapter(config=object(), moe_config=object(), backend=object(), dtype=torch.float32)
+
+    def test_convert_single_gpu_stays_on_cpu(self):
+        adapter = self._make_adapter()
+
+        # CPU tensors simulating packed nibble values and zero exponent
+        blocks = torch.tensor([[[[0x12]]]], dtype=torch.uint8)
+        scales = torch.tensor([[[127]]], dtype=torch.uint8)
+
+        # CUDA available but single-process world (no distributed multi-GPU)
+        with patch("torch.cuda.is_available", return_value=True), \
+             patch("torch.distributed.get_world_size", return_value=1):
+            out = adapter._convert_moe_packed_tensors(blocks, scales, dtype=torch.float32, rows_per_chunk=4)
+
+        assert not out.is_cuda
+        assert out.shape == (1, 2, 1)
+        torch.testing.assert_close(out[0, 0, 0], torch.tensor(1.0, dtype=torch.float32))
+        torch.testing.assert_close(out[0, 1, 0], torch.tensor(0.5, dtype=torch.float32))
+
+    def test_from_hf_single_gpu_cpu_dequantize_and_map(self):
+        adapter = self._make_adapter()
+
+        # Packed tensors (CPU) for one expert row, ensure dequantization occurs on CPU
+        blocks = torch.tensor([[[[0x12]]]], dtype=torch.uint8)
+        scales = torch.tensor([[[127]]], dtype=torch.uint8)
+        hf_state = {
+            "model.layers.0.mlp.experts.gate_up_proj_blocks": blocks,
+            "model.layers.0.mlp.experts.gate_up_proj_scales": scales,
+            # also exercise router mapping path
+            "model.layers.0.mlp.router.weight": torch.randn(1),
+        }
+
+        with patch("torch.cuda.is_available", return_value=True), \
+             patch("torch.distributed.get_world_size", return_value=1):
+            out = adapter.from_hf(hf_state)
+
+        # Dequantized key should be mapped to internal name and remain on CPU
+        assert "model.layers.0.mlp.experts.gate_and_up_projs" in out
+        deq = out["model.layers.0.mlp.experts.gate_and_up_projs"]
+        assert isinstance(deq, torch.Tensor)
+        assert not deq.is_cuda
+
+        # Router path mapped
+        assert "model.layers.0.mlp.gate.weight" in out
+
+        # No block/scale artifacts remain
+        assert not any(k.endswith("_blocks") or k.endswith("_scales") for k in out)
+
+    def test_add_quantization_block_scale_tensors_cpu_path_creates_expected_keys(self):
+        adapter = self._make_adapter()
+
+        state_dict = {
+            "model.layers.0.mlp.experts.gate_up_proj": torch.randn(2, 64, 128),
+            "model.layers.0.mlp.experts.down_proj": torch.randn(2, 32, 256),
+        }
+
+        out = adapter._add_quantization_block_scale_tensors(state_dict)
+
+        # Originals removed
+        assert "model.layers.0.mlp.experts.gate_up_proj" not in out
+        assert "model.layers.0.mlp.experts.down_proj" not in out
+
+        # CPU path uses torch.ones producing uint8 blocks/scales with expected shapes
+        g_blocks = out["model.layers.0.mlp.experts.gate_up_proj_blocks"]
+        g_scales = out["model.layers.0.mlp.experts.gate_up_proj_scales"]
+        d_blocks = out["model.layers.0.mlp.experts.down_proj_blocks"]
+        d_scales = out["model.layers.0.mlp.experts.down_proj_scales"]
+
+        assert g_blocks.shape == (2, 128, 90, 16)
+        assert g_scales.shape == (2, 128, 90)
+        assert d_blocks.shape == (2, 256, 90, 16)
+        assert d_scales.shape == (2, 256, 90)
+        assert g_blocks.dtype == torch.uint8 and g_scales.dtype == torch.uint8
+        assert d_blocks.dtype == torch.uint8 and d_scales.dtype == torch.uint8
