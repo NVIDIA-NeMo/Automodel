@@ -592,3 +592,135 @@ class TestSingleGPUScenarios:
         assert d_scales.shape == (2, 256, 90)
         assert g_blocks.dtype == torch.uint8 and g_scales.dtype == torch.uint8
         assert d_blocks.dtype == torch.uint8 and d_scales.dtype == torch.uint8
+
+
+class TestDTensorPaths:
+    def _make_adapter(self):
+        return GPTOSSStateDictAdapter(config=object(), moe_config=object(), backend=object(), dtype=torch.float32)
+
+    def test_add_quantization_block_scale_tensors_dtensor_path(self):
+        adapter = self._make_adapter()
+
+        class FakeDTensor:
+            def __init__(self, shape, placements="P", device_mesh="M"):
+                self.shape = shape
+                self.placements = placements
+                self.device_mesh = device_mesh
+                self.is_cuda = False
+
+        # HF-style keys, with values that are DTensor-like
+        state_dict = {
+            "model.layers.0.mlp.experts.gate_up_proj": FakeDTensor((2, 64, 128), placements="Pg", device_mesh="Mg"),
+            "model.layers.0.mlp.experts.down_proj": FakeDTensor((3, 32, 256), placements="Pd", device_mesh="Md"),
+        }
+
+        def fake_ones(shape, placements=None, device_mesh=None, dtype=None):
+            # Ensure dtype is the expected uint8
+            assert dtype == torch.uint8
+            return FakeDTensor(shape, placements=placements, device_mesh=device_mesh)
+
+        with patch("torch.distributed.tensor.DTensor", new=FakeDTensor, create=True), \
+             patch("torch.distributed.tensor.ones", create=True, side_effect=fake_ones):
+            out = adapter._add_quantization_block_scale_tensors(state_dict)
+
+        # Originals removed
+        assert "model.layers.0.mlp.experts.gate_up_proj" not in out
+        assert "model.layers.0.mlp.experts.down_proj" not in out
+
+        # New DTensor-shaped blocks/scales created preserving placements and mesh
+        g_blocks = out["model.layers.0.mlp.experts.gate_up_proj_blocks"]
+        g_scales = out["model.layers.0.mlp.experts.gate_up_proj_scales"]
+        d_blocks = out["model.layers.0.mlp.experts.down_proj_blocks"]
+        d_scales = out["model.layers.0.mlp.experts.down_proj_scales"]
+
+        assert isinstance(g_blocks, FakeDTensor)
+        assert isinstance(g_scales, FakeDTensor)
+        assert isinstance(d_blocks, FakeDTensor)
+        assert isinstance(d_scales, FakeDTensor)
+
+        assert g_blocks.shape == (2, 128, 90, 16)
+        assert g_scales.shape == (2, 128, 90)
+        assert d_blocks.shape == (3, 256, 90, 16)
+        assert d_scales.shape == (3, 256, 90)
+
+    def test_convert_moe_packed_tensors_dtensor_path_with_simulated_cuda_move(self):
+        adapter = self._make_adapter()
+
+        class FakeDTensor:
+            def __init__(self, tensor, placements="P", device_mesh="M"):
+                self.tensor = tensor
+                self.placements = placements
+                self.device_mesh = device_mesh
+                self._is_cuda = False
+
+            @property
+            def shape(self):
+                return self.tensor.shape
+
+            @property
+            def device(self):
+                return self.tensor.device
+
+            @property
+            def is_cuda(self):
+                return self._is_cuda
+
+            def to(self, dtype):
+                return FakeDTensor(self.tensor.to(dtype), self.placements, self.device_mesh)
+
+            def cuda(self):
+                # Simulate a move to CUDA without requiring a GPU
+                self._is_cuda = True
+                return self
+
+            def reshape(self, *shape):
+                return FakeDTensor(self.tensor.reshape(*shape), self.placements, self.device_mesh)
+
+            def view(self, *shape):
+                return FakeDTensor(self.tensor.view(*shape), self.placements, self.device_mesh)
+
+            def transpose(self, dim0, dim1):
+                return FakeDTensor(self.tensor.transpose(dim0, dim1), self.placements, self.device_mesh)
+
+            def contiguous(self):
+                return FakeDTensor(self.tensor.contiguous(), self.placements, self.device_mesh)
+
+            def to_local(self):
+                return self.tensor
+
+            def __getitem__(self, item):
+                return FakeDTensor(self.tensor.__getitem__(item), self.placements, self.device_mesh)
+
+            def __sub__(self, other):
+                if isinstance(other, FakeDTensor):
+                    return FakeDTensor(self.tensor - other.tensor, self.placements, self.device_mesh)
+                return FakeDTensor(self.tensor - other, self.placements, self.device_mesh)
+
+            def __rsub__(self, other):
+                if isinstance(other, FakeDTensor):
+                    return FakeDTensor(other.tensor - self.tensor, self.placements, self.device_mesh)
+                return FakeDTensor(other - self.tensor, self.placements, self.device_mesh)
+
+        # blocks nibble 0x12 -> [1.0, 0.5], exponent 127 -> 0
+        blocks = FakeDTensor(torch.tensor([[[[0x12]]]], dtype=torch.uint8), placements="Pb", device_mesh="Mb")
+        scales = FakeDTensor(torch.tensor([[[127]]], dtype=torch.uint8), placements="Ps", device_mesh="Ms")
+
+        def fake_empty(shape, placements=None, device_mesh=None, dtype=None):
+            # Must allocate a DTensor-like container preserving placements and mesh
+            return FakeDTensor(torch.empty(shape, dtype=dtype), placements=placements, device_mesh=device_mesh)
+
+        with patch("torch.distributed.tensor.DTensor", new=FakeDTensor, create=True), \
+             patch("torch.distributed.tensor.empty", create=True, side_effect=fake_empty), \
+             patch("torch.cuda.is_available", return_value=True), \
+             patch("torch.distributed.get_world_size", return_value=2):
+            out = adapter._convert_moe_packed_tensors(blocks, scales, dtype=torch.float32, rows_per_chunk=4)
+
+        # Simulated CUDA move occurred
+        assert blocks.is_cuda and scales.is_cuda
+
+        # DTensor path used for output
+        assert isinstance(out, FakeDTensor)
+        out_local = out.to_local()
+        assert out_local.shape == (1, 2, 1)
+        torch.testing.assert_close(out_local[0, 0, 0], torch.tensor(1.0, dtype=torch.float32))
+        torch.testing.assert_close(out_local[0, 1, 0], torch.tensor(0.5, dtype=torch.float32))
