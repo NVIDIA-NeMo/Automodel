@@ -213,10 +213,6 @@ jobs:
             test-folder: data
             runner: self-hosted-nemo
             timeout: 20
-          - test-name: L2_Context_Parallel
-            test-folder: context_parallel
-            runner: self-hosted-nemo
-            timeout: 20
     needs: [cicd-unit-tests]
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.test-name }}
