@@ -20,10 +20,9 @@ import pytest
 import torch
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
+from nemo_automodel.components.attention.utils import postprocess_output_for_attn, preprocess_args_and_kwargs_for_attn
 from nemo_automodel.components.models.qwen3_moe.layers import (
     Qwen3MoeAttention,
-    _postprocess_from_attn,
-    _preprocess_for_attn,
 )
 from nemo_automodel.components.moe.utils import BackendConfig
 
@@ -83,7 +82,7 @@ class TestPreprocessForAttn:
         k = torch.randn_like(q)
         v = torch.randn_like(q)
 
-        q_out, k_out, v_out, kwargs = _preprocess_for_attn(q, k, v, attention_mask=None, backend=te_backend)
+        q_out, k_out, v_out, kwargs = preprocess_args_and_kwargs_for_attn(q, k, v, attention_mask=None, attn_impl=te_backend.attn)
 
         torch.testing.assert_close(q_out, q)
         torch.testing.assert_close(k_out, k)
@@ -96,7 +95,7 @@ class TestPreprocessForAttn:
         v = torch.randn_like(q)
         attention_mask = torch.tensor([[1, 1, 0]], dtype=torch.bool)
 
-        _, _, _, kwargs = _preprocess_for_attn(q, k, v, attention_mask=attention_mask, backend=te_backend)
+        _, _, _, kwargs = preprocess_args_and_kwargs_for_attn(q, k, v, attention_mask=attention_mask, attn_impl=te_backend.attn)
 
         assert kwargs["attn_mask_type"] == "padding_causal"
         assert kwargs["window_size"] == (-1, 0)
@@ -110,7 +109,7 @@ class TestPreprocessForAttn:
         k = torch.randn_like(q)
         v = torch.randn_like(q)
 
-        q_out, k_out, v_out, kwargs = _preprocess_for_attn(q, k, v, attention_mask=None, backend=sdpa_backend)
+        q_out, k_out, v_out, kwargs = preprocess_args_and_kwargs_for_attn(q, k, v, attention_mask=None, attn_impl=sdpa_backend.attn)
 
         assert q_out.shape == (2, 3, 5, 6)
         assert k_out.shape == (2, 3, 5, 6)
@@ -122,14 +121,14 @@ class TestPostprocessFromAttn:
     def test_sdpa_backend_transposes_back(self, sdpa_backend):
         x = torch.randn(2, 4, 6, 8)
 
-        out = _postprocess_from_attn(x, sdpa_backend)
+        out = postprocess_output_for_attn(x, sdpa_backend.attn)
 
         assert out.shape == (2, 6, 4, 8)
         torch.testing.assert_close(out.transpose(1, 2), x)
 
     def test_other_backend_returns_input(self, te_backend):
         x = torch.randn(1, 2, 3, 4)
-        out = _postprocess_from_attn(x, te_backend)
+        out = postprocess_output_for_attn(x, te_backend.attn)
         torch.testing.assert_close(out, x)
 
 
@@ -155,7 +154,7 @@ class TestQwen3MoeAttention:
         fake_attn = torch.zeros(batch_size, config.num_attention_heads, seq_len, config.head_dim)
         attention.attn_func = MagicMock(return_value=fake_attn.to(torch.bfloat16))
 
-        with patch("nemo_automodel.components.models.qwen3_moe.layers._apply_rotary_emb", side_effect=lambda x, *_: x):
+        with patch("nemo_automodel.components.models.qwen3_moe.layers.apply_rotary_emb", side_effect=lambda x, *_: x):
             out = attention(hidden, freqs_cis=freqs_cis)
 
         assert out.shape == (batch_size, seq_len, config.hidden_size)
@@ -171,7 +170,7 @@ class TestQwen3MoeAttention:
         fake_attn = torch.zeros(batch, config.num_attention_heads, seq_len, config.head_dim).to(torch.bfloat16)
         attention.attn_func = MagicMock(return_value=fake_attn.to(torch.bfloat16))
 
-        with patch("nemo_automodel.components.models.qwen3_moe.layers._apply_rotary_emb", side_effect=lambda x, *_: x):
+        with patch("nemo_automodel.components.models.qwen3_moe.layers.apply_rotary_emb", side_effect=lambda x, *_: x):
             attention(hidden, freqs_cis=freqs_cis, attention_mask=attention_mask)
 
         _, kwargs = attention.attn_func.call_args
@@ -187,7 +186,7 @@ class TestQwen3MoeAttention:
             return_value=torch.zeros(batch_size, config.num_attention_heads, seq_len, config.head_dim).to(torch.bfloat16)
         )
 
-        with patch("nemo_automodel.components.models.qwen3_moe.layers._apply_rotary_emb") as mock_rotary:
+        with patch("nemo_automodel.components.models.qwen3_moe.layers.apply_rotary_emb") as mock_rotary:
             mock_rotary.side_effect = lambda x, *_: x
             attention(hidden, freqs_cis=freqs_cis)
 
@@ -220,7 +219,7 @@ class TestQwen3MoeAttention:
         freqs_cis = torch.randn(batch, seq_len, config.head_dim)
         attention_mask = torch.tensor([[1, 0, 1]], dtype=torch.bool)
 
-        with patch("nemo_automodel.components.models.qwen3_moe.layers._apply_rotary_emb", side_effect=lambda x, *_: x):
+        with patch("nemo_automodel.components.models.qwen3_moe.layers.apply_rotary_emb", side_effect=lambda x, *_: x):
             attention(hidden, freqs_cis=freqs_cis, attention_mask=attention_mask)
 
         _, kwargs = attention.attn_func.call_args

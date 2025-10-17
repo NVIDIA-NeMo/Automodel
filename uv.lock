@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
@@ -1381,6 +1381,7 @@ dev = [
     { name = "qwen-vl-utils", extra = ["decord"], marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "timm" },
     { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "transformer-engine", extra = ["pytorch"] },
     { name = "transformers" },
 ]
 fa = [
@@ -1445,6 +1446,7 @@ requires-dist = [
     { name = "nemo-automodel", extras = ["fa"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["fa"], marker = "extra == 'dev'" },
     { name = "nemo-automodel", extras = ["moe"], marker = "extra == 'all'" },
+    { name = "nemo-automodel", extras = ["moe"], marker = "extra == 'dev'" },
     { name = "nemo-automodel", extras = ["vlm"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["vlm"], marker = "extra == 'dev'" },
     { name = "numba", marker = "extra == 'vlm'" },
