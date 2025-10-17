@@ -17,30 +17,27 @@ from typing import Any
 import torch
 import torch.nn as nn
 from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
-from transformers.models.qwen3_next.modeling_qwen3_next import (
-    Qwen3NextAttention,
-    Qwen3NextGatedDeltaNet,
-    Qwen3NextRotaryEmbedding,
-)
+from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextGatedDeltaNet
 
+from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
+from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention
 from nemo_automodel.components.models.qwen3_next.state_dict_adapter import Qwen3NextStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
 from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 class Block(nn.Module):
     def __init__(self, layer_idx: int, config: Qwen3NextConfig, moe_config: MoEConfig, backend: BackendConfig):
         super().__init__()
-        # Use Qwen3NextAttention from transformers
         self.layer_type = config.layer_types[layer_idx]
         if self.layer_type == "linear_attention":
             self.linear_attn = Qwen3NextGatedDeltaNet(config, layer_idx)
         elif self.layer_type == "full_attention":
-            self.self_attn = Qwen3NextAttention(config, layer_idx)
+            self.self_attn = Qwen3NextAttention(config, layer_idx, backend)
 
-        # Qwen3Next sparsifies every decoder_sparse_step layer, unless in mlp_only_layers
         is_moe_layer = (
             (layer_idx not in getattr(config, "mlp_only_layers", []))
             and (getattr(config, "num_experts", 0) > 0)
@@ -61,7 +58,7 @@ class Block(nn.Module):
         self,
         x: torch.Tensor,
         *,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
@@ -71,19 +68,16 @@ class Block(nn.Module):
             padding_mask = attention_mask.bool().logical_not()
 
         x = self.input_layernorm(x)
-        # Token Mixer
         if self.layer_type == "linear_attention":
             attn_out = self.linear_attn(
                 hidden_states=x,
                 attention_mask=attention_mask,
             )
         elif self.layer_type == "full_attention":
-            # Self Attention
-            attn_out, _ = self.self_attn(
-                hidden_states=x,
+            attn_out = self.self_attn(
+                x=x,
                 attention_mask=attention_mask,
-                position_ids=position_ids,
-                position_embeddings=position_embeddings,
+                freqs_cis=freqs_cis,
                 **attn_kwargs,
             )
         x = x + attn_out
@@ -102,7 +96,16 @@ class Block(nn.Module):
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.input_layernorm, self.post_attention_layernorm):
             norm.reset_parameters()
-        # Note: Qwen3NextAttention has its own init_weights from transformers
+        # Initialize attention weights
+        if self.layer_type == "full_attention":
+            self.self_attn.init_weights(buffer_device)
+        elif self.layer_type == "linear_attention":
+            self.linear_attn.dt_bias.data.fill_(1.0)
+            self.linear_attn.A_log.data.uniform_(0, 16).log_()
+            linear_list = [self.linear_attn.in_proj_qkvz, self.linear_attn.in_proj_ba, self.linear_attn.out_proj]
+            for linear in linear_list:
+                nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
+            self.linear_attn.norm.reset_parameters()
         self.mlp.init_weights(buffer_device)
 
 
@@ -142,8 +145,18 @@ class Qwen3NextModel(nn.Module):
             self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, backend)
         self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
 
-        # Use Qwen3NextRotaryEmbedding from transformers
-        self.rotary_emb = Qwen3NextRotaryEmbedding(config=config)
+        # Rotary embedding cache compatible with our rope_utils functions
+        self.max_seq_len = config.max_position_embeddings
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+        self.rotary_emb = RotaryEmbedding(
+            head_dim=self.head_dim,
+            base=config.rope_theta,
+            dtype=torch.float32,
+            scaling_factor=1.0,
+            partial_rotary_factor=partial_rotary_factor,
+            device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+        )
 
     def forward(
         self,
@@ -159,15 +172,17 @@ class Qwen3NextModel(nn.Module):
                 torch.arange(0, input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand(input_ids.shape[0], -1)
             )
 
-        h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
+        # Compute freqs_cis from RotaryEmbedding inv_freq and current position_ids; then concat [cos, sin]
+        freqs_cis = position_ids_to_freqs_cis(
+            self.rotary_emb, position_ids, qkv_format=attn_kwargs.get("qkv_format", "bshd")
+        )
 
-        # Compute position embeddings using Qwen3NextRotaryEmbedding
-        position_embeddings = self.rotary_emb(h, position_ids)
+        h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
 
         for layer in self.layers.values():
             h = layer(
                 x=h,
-                position_embeddings=position_embeddings,
+                freqs_cis=freqs_cis,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
                 position_ids=position_ids,
@@ -186,6 +201,8 @@ class Qwen3NextModel(nn.Module):
                 nn.init.normal_(self.embed_tokens.weight)
             if self.norm is not None:
                 self.norm.reset_parameters()
+            # Ensure rotary embedding uses correct device after dtype move
+            self.rotary_emb.device = buffer_device
 
         for layer in self.layers.values():
             if layer is not None:
@@ -239,6 +256,12 @@ class Qwen3NextForCausalLM(nn.Module, MoEFSDPSyncMixin):
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
+                input_ids, position_ids, padding_mask, attn_kwargs
+            )
+            attention_mask = None
+
         hidden = self.model(
             input_ids,
             position_ids=position_ids,
@@ -247,6 +270,8 @@ class Qwen3NextForCausalLM(nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
         logits = self.lm_head(hidden) if self.lm_head else hidden
+        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+            logits = logits.unsqueeze(0)
         return logits
 
     @torch.no_grad()
@@ -268,6 +293,9 @@ class Qwen3NextForCausalLM(nn.Module, MoEFSDPSyncMixin):
                 )
 
         self.to(dtype)
+        with buffer_device:
+            # Ensure rotary embedding uses correct device after dtype move
+            self.model.rotary_emb.device = buffer_device
 
 
 ModelClass = Qwen3NextForCausalLM
