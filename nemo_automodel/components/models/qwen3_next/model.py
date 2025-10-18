@@ -20,7 +20,7 @@ from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextCon
 from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextGatedDeltaNet
 
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
-from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention
+from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention, Qwen3NextRMSNorm
 from nemo_automodel.components.models.qwen3_next.state_dict_adapter import Qwen3NextStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
@@ -48,10 +48,8 @@ class Block(nn.Module):
         else:
             self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear)
 
-        self.input_layernorm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = initialize_rms_norm_module(
-            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.input_layernorm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layer_idx = layer_idx
 
     def forward(
@@ -67,15 +65,14 @@ class Block(nn.Module):
         if attention_mask is not None and padding_mask is None:
             padding_mask = attention_mask.bool().logical_not()
 
-        x = self.input_layernorm(x)
         if self.layer_type == "linear_attention":
             attn_out = self.linear_attn(
-                hidden_states=x,
+                hidden_states=self.input_layernorm(x),
                 attention_mask=attention_mask,
             )
         elif self.layer_type == "full_attention":
             attn_out = self.self_attn(
-                x=x,
+                x=self.input_layernorm(x),
                 attention_mask=attention_mask,
                 freqs_cis=freqs_cis,
                 **attn_kwargs,
@@ -119,18 +116,18 @@ class Qwen3NextModel(nn.Module):
         self.moe_config = moe_config or MoEConfig(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
-            moe_inter_dim=getattr(config, "moe_intermediate_size", config.intermediate_size),
-            n_routed_experts=getattr(config, "num_experts", 0),
-            n_shared_experts=int(getattr(config, "shared_expert_intermediate_size", 0) > 0),
-            n_activated_experts=getattr(config, "num_experts_per_tok", 1),
+            moe_inter_dim=config.moe_intermediate_size,
+            n_routed_experts=config.num_experts,
+            n_shared_experts=1,
+            n_activated_experts=config.num_experts_per_tok,
             n_expert_groups=1,
             n_limited_groups=1,
             train_gate=True,
             gate_bias_update_factor=0.0,
             score_func="softmax",  # Qwen3Next uses softmax topk routing
             route_scale=1.0,
-            aux_loss_coeff=getattr(config, "router_aux_loss_coef", 0.0),
-            norm_topk_prob=getattr(config, "norm_topk_prob", False),
+            aux_loss_coeff=config.router_aux_loss_coef,
+            norm_topk_prob=config.norm_topk_prob,
             expert_bias=False,
             router_bias=False,
             expert_activation="swiglu",

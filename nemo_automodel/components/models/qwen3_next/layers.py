@@ -27,8 +27,30 @@ from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb
 from nemo_automodel.components.moe.utils import (
     BackendConfig,
     initialize_linear_module,
-    initialize_rms_norm_module,
 )
+
+
+class Qwen3NextRMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.zeros(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float())
+        # Llama does x.to(float16) * w whilst Qwen3Next is (x * w).to(float16)
+        # See https://github.com/huggingface/transformers/pull/29402
+        output = output * (1.0 + self.weight.float())
+        return output.type_as(x)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.eps}"
+
+    def reset_parameters(self):
+        nn.init.zeros_(self.weight)
 
 
 class Qwen3NextAttention(nn.Module):
@@ -56,8 +78,8 @@ class Qwen3NextAttention(nn.Module):
             backend.linear, self.num_heads * self.head_dim, config.hidden_size, False
         )
 
-        self.q_norm = initialize_rms_norm_module(backend.rms_norm, self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = initialize_rms_norm_module(backend.rms_norm, self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         # Attention implementation
         self.scaling = self.head_dim**-0.5
