@@ -37,6 +37,16 @@ class Qwen3NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
     Our native format groups them into:
       model.layers.{L}.mlp.experts.gate_and_up_projs  # [n_experts, dim, 2*moe_inter_dim]
       model.layers.{L}.mlp.experts.down_projs         # [n_experts, moe_inter_dim, dim]
+
+    Qwen3Next HF shared experts use keys:
+      model.layers.{L}.mlp.shared_expert.gate_proj.weight
+      model.layers.{L}.mlp.shared_expert.up_proj.weight
+      model.layers.{L}.mlp.shared_expert.down_proj.weight
+
+    Our native format uses:
+      model.layers.{L}.mlp.shared_experts.gate_proj.weight  # Note: plural "shared_experts"
+      model.layers.{L}.mlp.shared_experts.up_proj.weight
+      model.layers.{L}.mlp.shared_experts.down_proj.weight
     """
 
     def __init__(
@@ -52,10 +62,43 @@ class Qwen3NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         self.dtype = dtype
         self._uses_model_prefix = True
 
+        # Key mapping from HF Qwen3Next format to internal format
+        self.hf_to_internal_map = {
+            ".mlp.shared_expert.": ".mlp.shared_experts.",
+        }
+
+        # Reverse mapping for to_hf conversion
+        self.internal_to_hf_map = {v: k for k, v in self.hf_to_internal_map.items()}
+
+    def _apply_key_mapping(self, state_dict: dict[str, Any], mapping: dict[str, str]) -> dict[str, Any]:
+        """Apply key substring mappings to state dict keys.
+
+        Args:
+            state_dict: State dict to apply mappings to
+            mapping: Dictionary mapping substrings to replace them with
+
+        Returns:
+            New state dict with mapped keys
+        """
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            new_key = key
+            for pattern, replacement in mapping.items():
+                if pattern in key:
+                    new_key = new_key.replace(pattern, replacement)
+                    break
+            new_state_dict[new_key] = value
+        return new_state_dict
+
     def to_hf(
         self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
     ) -> dict[str, Any]:
+        # First convert routed experts from grouped to split format
         hf_state_dict = self._to_hf_w_split_experts(state_dict)
+
+        # Then apply key mappings for shared experts (shared_experts -> shared_expert)
+        hf_state_dict = self._apply_key_mapping(hf_state_dict, self.internal_to_hf_map)
+
         if exclude_key_regex:
             import re
 
@@ -73,4 +116,9 @@ class Qwen3NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
             if ".mlp.experts." in key and key.endswith(".weight"):
                 self._uses_model_prefix = key.startswith("model.")
                 break
+
+        # First apply key mappings for shared experts (shared_expert -> shared_experts)
+        hf_state_dict = self._apply_key_mapping(hf_state_dict, self.hf_to_internal_map)
+
+        # Then convert routed experts from split to grouped format
         return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)

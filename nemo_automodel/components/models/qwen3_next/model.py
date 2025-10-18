@@ -135,6 +135,8 @@ class Qwen3NextModel(nn.Module):
             router_bias=False,
             expert_activation="swiglu",
             softmax_before_topk=True,
+            shared_expert_gate=True,
+            shared_expert_inter_dim=config.shared_expert_intermediate_size,
         )
 
         self.embed_tokens = nn.Embedding(
