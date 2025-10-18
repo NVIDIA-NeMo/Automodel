@@ -12,11 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+import re
+import torch
+import logging
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
 
+GENERATION_REGEX = re.compile(r'\{%-?\s+generation\s+-?%\}')
 
 def _pad_to_seq_length(sample, pad_token_id, seq_length):
     """Pad a sample to a specific sequence length."""
@@ -53,7 +58,7 @@ def _has_chat_template(tokenizer: "PreTrainedTokenizer") -> bool:
     )
 
 
-def _package_tokenized_example(has_chat_template, input_ids, eos_token_id, pad_token_id, seq_length, context_len):
+def _package_tokenized_example(messages, tokenizer, input_ids, assistant_masks, eos_token_id, pad_token_id, seq_length,):
     """
     Package a tokenized example with proper masking and padding.
 
@@ -70,20 +75,18 @@ def _package_tokenized_example(has_chat_template, input_ids, eos_token_id, pad_t
     """
     # llama3 tokenizer does not add eos token
     # see: https://github.com/huggingface/transformers/issues/22794
-    if not has_chat_template and eos_token_id != input_ids[-1]:
+    if not _has_chat_template(tokenizer) and eos_token_id != input_ids[-1]:
         input_ids += [eos_token_id]
 
     labels = input_ids.copy()
-    # [a, b, EOS]
     input_ids = input_ids[:-1]
     # input_ids= [a, b] -> attention_mask = [1, 1]
     attention_mask = [1] * len(input_ids)
-
     # Labels: mask out prompt tokens
-    labels[:context_len] = [-100] * context_len
+    labels[:] = [label if bool(m) else -100 for label, m in zip(labels, assistant_masks)]
     # remove BOS
     labels = labels[1:]
-    if not has_chat_template:
+    if not _has_chat_template(tokenizer):
         assert labels[-1] == eos_token_id, f"labels[-1]={labels[-1]} != eos_token_id={eos_token_id}"
         assert input_ids[-1] != eos_token_id, f"input_ids[-1]={input_ids[-1]} == eos_token_id={eos_token_id}"
     assert len(input_ids) == len(labels), f"len(input_ids)={len(input_ids)} != len(labels)={len(labels)}"
@@ -149,7 +152,6 @@ def format_chat_template(
     eos_token_id: int,
     pad_token_id: int,
     seq_length: Optional[int] = None,
-    start_of_turn_token: Optional[str] = None,
     tools: Optional[List[Dict]] = None,
 ) -> Dict[str, List[int]]:
     """
@@ -169,17 +171,35 @@ def format_chat_template(
     # Ensure we have a usable chat template
     if not _has_chat_template(tokenizer):
         raise ValueError("Tokenizer lacks a usable chat template (chat_template/apply_chat_template)")
-    if tools is not None:
-        input_ids = tokenizer.apply_chat_template(formatted_text, tools=tools)
-    else:
-        input_ids = tokenizer.apply_chat_template(formatted_text)
+    
+    template_has_generation_kwd = GENERATION_REGEX.search(tokenizer.chat_template) is not None
 
-    if isinstance(start_of_turn_token, str):
-        start_of_turn_token_id = tokenizer(start_of_turn_token, add_special_tokens=False)["input_ids"][0]
-        first_start_of_turn_token_id = input_ids.index(start_of_turn_token_id)
-        # Loss mask is starting with the second start of turn token.
-        # labels    = [a b c S d e] ; S is the start of turn token.
-        response_start = input_ids.index(start_of_turn_token_id, first_start_of_turn_token_id + 1)
+    tokenized_chat = tokenizer.apply_chat_template(
+        formatted_text,
+        tools=tools,
+        tokenize=True,
+        return_dict=True,
+        return_assistant_tokens_mask=template_has_generation_kwd,
+    )
+
+    # Choose the last conversation as answer other history are context by finding the last masked token
+    # which indicates end of context and beginning of answer
+    input_ids = tokenized_chat.get("input_ids")
+    if template_has_generation_kwd:
+        mask = tokenized_chat['assistant_masks']
     else:
-        response_start = 0
-    return _package_tokenized_example(True, input_ids, eos_token_id, pad_token_id, seq_length, response_start)
+        mask = [1] * len(input_ids)
+
+    if getattr(tokenizer, "eos_token_id", None) and input_ids[-1] != tokenizer.eos_token_id:
+        input_ids += [tokenizer.eos_token_id]
+        mask += [1]
+
+    return _package_tokenized_example(
+        messages=formatted_text,
+        tokenizer=tokenizer,
+        input_ids=input_ids,
+        assistant_masks=mask,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        seq_length=seq_length,
+    )

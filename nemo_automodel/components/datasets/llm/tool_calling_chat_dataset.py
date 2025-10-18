@@ -142,6 +142,7 @@ class ToolCallingChatDataset(Dataset):
         self.tokenizer = tokenizer
         self.seq_length = seq_length
         self.start_of_turn_token = start_of_turn_token
+        import pdb; pdb.set_trace()
 
         self.dataset = _load_openai_messages(path_or_dataset_id, split=split)
 
@@ -170,7 +171,6 @@ class ToolCallingChatDataset(Dataset):
             eos_token_id,
             self.pad_token_id,
             seq_length=self.seq_length,
-            start_of_turn_token=self.start_of_turn_token,
             tools=tools,
         )
         return sample
