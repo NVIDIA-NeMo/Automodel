@@ -66,6 +66,8 @@ class MoEConfig:
     activation_limit: float = 7.0
     softmax_before_topk: bool = False
     dtype: torch.dtype = torch.bfloat16
+    shared_expert_gate: bool = False
+    shared_expert_inter_dim: int | None = None
 
 
 class MLP(nn.Module):
@@ -875,9 +877,18 @@ class MoE(nn.Module):
             self.experts = GroupedExperts(config)
 
         if config.n_shared_experts > 0:
-            self.shared_experts = MLP(config.dim, config.n_shared_experts * config.moe_inter_dim, backend.linear)
+            self.shared_experts = MLP(
+                config.dim,
+                config.n_shared_experts * (config.shared_expert_inter_dim or config.moe_inter_dim),
+                backend.linear,
+            )
+            if config.shared_expert_gate:
+                self.shared_expert_gate = initialize_linear_module(backend.linear, config.dim, 1, False)
+            else:
+                self.shared_expert_gate = None
         else:
             self.shared_experts = None
+            self.shared_expert_gate = None
 
     def forward(
         self,
@@ -919,6 +930,8 @@ class MoE(nn.Module):
         _shared_experts_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(_shared_experts_stream):
             z = self.shared_experts(x)
+            if self.shared_expert_gate is not None:
+                z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
 
         y = self.experts(x, token_mask, weights, indices)
 

@@ -104,6 +104,76 @@ class TestApplyRotaryEmb:
             result = apply_rotary_emb(x, cos, sin)
             assert result.shape == (batch_size, seq_len, num_heads, head_dim)
 
+    def test_partial_rotary_embeddings(self):
+        """Test partial rotary embeddings where only first rotary_dim dimensions are rotated"""
+        batch_size = 2
+        seq_len = 4
+        num_heads = 8
+        head_dim = 64
+        rotary_dim = 32  # Only rotate half the dimensions
+
+        x = torch.randn(batch_size, seq_len, num_heads, head_dim)
+        # cos/sin have dimension rotary_dim // 2
+        cos = torch.randn(seq_len, rotary_dim // 2)
+        sin = torch.randn(seq_len, rotary_dim // 2)
+
+        # Store the pass-through part
+        x_pass_original = x[..., rotary_dim:].clone()
+
+        result = apply_rotary_emb(x, cos, sin)
+
+        # Check output shape
+        assert result.shape == x.shape
+        assert result.dtype == x.dtype
+
+        # Verify that the pass-through dimensions are unchanged
+        torch.testing.assert_close(result[..., rotary_dim:], x_pass_original)
+
+        # Verify that the rotated dimensions are different
+        assert not torch.allclose(result[..., :rotary_dim], x[..., :rotary_dim])
+
+    def test_partial_rotary_preserves_passthrough(self):
+        """Test that partial rotary embeddings preserve the non-rotated dimensions exactly"""
+        batch_size = 2
+        seq_len = 4
+        num_heads = 4
+        head_dim = 128
+        rotary_dim = 64  # Rotate only first 64 dimensions
+
+        x = torch.randn(batch_size, seq_len, num_heads, head_dim)
+        cos = torch.randn(seq_len, rotary_dim // 2)
+        sin = torch.randn(seq_len, rotary_dim // 2)
+
+        result = apply_rotary_emb(x, cos, sin)
+
+        # The last (head_dim - rotary_dim) dimensions should be identical
+        torch.testing.assert_close(
+            result[..., rotary_dim:],
+            x[..., rotary_dim:],
+            rtol=0,
+            atol=0,
+            msg="Pass-through dimensions should be exactly preserved"
+        )
+
+    def test_partial_rotary_different_factors(self):
+        """Test partial rotary with different rotary dimension sizes"""
+        batch_size = 2
+        seq_len = 4
+        num_heads = 8
+        head_dim = 128
+
+        for rotary_dim in [32, 64, 96]:
+            x = torch.randn(batch_size, seq_len, num_heads, head_dim)
+            cos = torch.randn(seq_len, rotary_dim // 2)
+            sin = torch.randn(seq_len, rotary_dim // 2)
+
+            x_pass = x[..., rotary_dim:].clone()
+            result = apply_rotary_emb(x, cos, sin)
+
+            assert result.shape == x.shape
+            # Verify pass-through is preserved
+            torch.testing.assert_close(result[..., rotary_dim:], x_pass)
+
 
 class TestRotaryEmbedding:
     """Tests for RotaryEmbedding class"""
@@ -244,6 +314,116 @@ class TestRotaryEmbedding:
         # Verify concentration is computed correctly
         expected_concentration = 0.1 * math.log(2.0) + 1.0
         assert abs(concentration - expected_concentration) < 1e-6
+
+    def test_partial_rotary_factor_initialization(self):
+        """Test RotaryEmbedding initialization with partial_rotary_factor"""
+        head_dim = 128
+        partial_rotary_factor = 0.5
+
+        rope = RotaryEmbedding(
+            head_dim=head_dim,
+            base=10000,
+            dtype=torch.float32,
+            partial_rotary_factor=partial_rotary_factor,
+        )
+
+        assert rope.head_dim == head_dim
+        assert rope.partial_rotary_factor == partial_rotary_factor
+        assert rope.rotary_dim == int(head_dim * partial_rotary_factor)
+        assert rope.rotary_dim == 64
+
+    def test_partial_rotary_factor_forward(self):
+        """Test forward pass with partial_rotary_factor"""
+        head_dim = 128
+        partial_rotary_factor = 0.5
+        rotary_dim = int(head_dim * partial_rotary_factor)
+
+        rope = RotaryEmbedding(
+            head_dim=head_dim,
+            base=10000,
+            dtype=torch.float32,
+            partial_rotary_factor=partial_rotary_factor,
+        )
+
+        batch_size = 2
+        seq_len = 8
+        num_heads = 4
+
+        query = torch.randn(batch_size, seq_len, num_heads, head_dim)
+        key = torch.randn(batch_size, seq_len, num_heads, head_dim)
+
+        # Store non-rotated parts
+        query_pass = query[..., rotary_dim:].clone()
+        key_pass = key[..., rotary_dim:].clone()
+
+        query_rot, key_rot = rope(query, key)
+
+        # Check shapes
+        assert query_rot.shape == query.shape
+        assert key_rot.shape == key.shape
+
+        # Verify that non-rotated dimensions are preserved
+        torch.testing.assert_close(query_rot[..., rotary_dim:], query_pass)
+        torch.testing.assert_close(key_rot[..., rotary_dim:], key_pass)
+
+        # Verify that rotated dimensions are different
+        assert not torch.allclose(query_rot[..., :rotary_dim], query[..., :rotary_dim])
+        assert not torch.allclose(key_rot[..., :rotary_dim], key[..., :rotary_dim])
+
+    def test_partial_rotary_factor_different_values(self):
+        """Test RotaryEmbedding with different partial_rotary_factor values"""
+        head_dim = 128
+        batch_size = 2
+        seq_len = 8
+        num_heads = 4
+
+        for partial_rotary_factor in [0.25, 0.5, 0.75, 1.0]:
+            rope = RotaryEmbedding(
+                head_dim=head_dim,
+                base=10000,
+                dtype=torch.float32,
+                partial_rotary_factor=partial_rotary_factor,
+            )
+
+            expected_rotary_dim = int(head_dim * partial_rotary_factor)
+            assert rope.rotary_dim == expected_rotary_dim
+
+            query = torch.randn(batch_size, seq_len, num_heads, head_dim)
+            key = torch.randn(batch_size, seq_len, num_heads, head_dim)
+
+            query_rot, key_rot = rope(query, key)
+
+            assert query_rot.shape == query.shape
+            assert key_rot.shape == key.shape
+
+            # When factor is 1.0, all dimensions should be rotated
+            if partial_rotary_factor == 1.0:
+                assert rope.rotary_dim == head_dim
+            else:
+                # Otherwise, verify pass-through dimensions
+                torch.testing.assert_close(
+                    query_rot[..., expected_rotary_dim:],
+                    query[..., expected_rotary_dim:],
+                )
+
+    def test_partial_rotary_compute_concentration_uses_rotary_dim(self):
+        """Test that _compute_concentration_and_inv_freq uses rotary_dim instead of head_dim"""
+        head_dim = 128
+        partial_rotary_factor = 0.5
+        rotary_dim = int(head_dim * partial_rotary_factor)
+
+        rope = RotaryEmbedding(
+            head_dim=head_dim,
+            base=10000,
+            dtype=torch.float32,
+            partial_rotary_factor=partial_rotary_factor,
+        )
+
+        concentration, inv_freq = rope._compute_concentration_and_inv_freq()
+
+        # inv_freq should have dimension rotary_dim // 2, not head_dim // 2
+        assert inv_freq.shape == (rotary_dim // 2,)
+        assert inv_freq.shape != (head_dim // 2,)
 
 
 class TestPositionIdsToFreqsCis:
@@ -603,3 +783,170 @@ class TestIntegration:
         # Verify that rotation was applied (output should differ from input)
         assert not torch.allclose(query, query_rot)
         assert not torch.allclose(key, key_rot)
+
+    def test_partial_rotary_factor_integration(self):
+        """Test full RoPE pipeline with partial_rotary_factor"""
+        head_dim = 128
+        partial_rotary_factor = 0.5
+        rotary_dim = int(head_dim * partial_rotary_factor)
+
+        rope = RotaryEmbedding(
+            head_dim=head_dim,
+            base=10000,
+            dtype=torch.float32,
+            partial_rotary_factor=partial_rotary_factor,
+        )
+
+        batch_size = 2
+        seq_len = 8
+        num_heads = 4
+
+        query = torch.randn(batch_size, seq_len, num_heads, head_dim)
+        key = torch.randn(batch_size, seq_len, num_heads, head_dim)
+
+        # Store non-rotated parts
+        query_pass = query[..., rotary_dim:].clone()
+        key_pass = key[..., rotary_dim:].clone()
+
+        # Apply RoPE
+        query_rot, key_rot = rope(query, key)
+
+        # Verify shapes
+        assert query_rot.shape == query.shape
+        assert key_rot.shape == key.shape
+
+        # Verify that non-rotated dimensions are exactly preserved
+        torch.testing.assert_close(query_rot[..., rotary_dim:], query_pass, rtol=0, atol=0)
+        torch.testing.assert_close(key_rot[..., rotary_dim:], key_pass, rtol=0, atol=0)
+
+        # Verify that rotated dimensions are different
+        assert not torch.allclose(query_rot[..., :rotary_dim], query[..., :rotary_dim])
+        assert not torch.allclose(key_rot[..., :rotary_dim], key[..., :rotary_dim])
+
+    def test_partial_rotary_with_position_ids_to_freqs_cis(self):
+        """Test position_ids_to_freqs_cis with partial rotary factor"""
+        head_dim = 128
+        partial_rotary_factor = 0.5
+        rotary_dim = int(head_dim * partial_rotary_factor)
+
+        rope = RotaryEmbedding(
+            head_dim=head_dim,
+            base=10000,
+            dtype=torch.float32,
+            partial_rotary_factor=partial_rotary_factor,
+        )
+
+        batch_size = 2
+        seq_len = 8
+        position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, seq_len)
+
+        # Compute freqs_cis
+        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="bshd")
+
+        # freqs_cis should have shape (batch_size, seq_len, rotary_dim)
+        # because it contains concatenated cos and sin, each of size rotary_dim // 2
+        assert freqs_cis.shape == (batch_size, seq_len, rotary_dim)
+        assert freqs_cis.dtype == torch.float32
+
+    def test_partial_rotary_with_scaling(self):
+        """Test partial rotary factor combined with RoPE scaling"""
+        head_dim = 128
+        partial_rotary_factor = 0.5
+        rotary_dim = int(head_dim * partial_rotary_factor)
+
+        rope = RotaryEmbedding(
+            head_dim=head_dim,
+            base=10000,
+            dtype=torch.float32,
+            partial_rotary_factor=partial_rotary_factor,
+            scaling_factor=2.0,
+            initial_context_length=4096,
+        )
+
+        batch_size = 2
+        seq_len = 16
+        num_heads = 4
+
+        query = torch.randn(batch_size, seq_len, num_heads, head_dim)
+        key = torch.randn(batch_size, seq_len, num_heads, head_dim)
+
+        # Store non-rotated parts
+        query_pass = query[..., rotary_dim:].clone()
+        key_pass = key[..., rotary_dim:].clone()
+
+        query_rot, key_rot = rope(query, key)
+
+        # Verify shapes
+        assert query_rot.shape == query.shape
+        assert key_rot.shape == key.shape
+
+        # Verify pass-through dimensions are preserved
+        torch.testing.assert_close(query_rot[..., rotary_dim:], query_pass)
+        torch.testing.assert_close(key_rot[..., rotary_dim:], key_pass)
+
+    def test_partial_rotary_with_ntk(self):
+        """Test partial rotary factor combined with NTK-aware interpolation"""
+        head_dim = 128
+        partial_rotary_factor = 0.75
+        rotary_dim = int(head_dim * partial_rotary_factor)
+
+        rope = RotaryEmbedding(
+            head_dim=head_dim,
+            base=10000,
+            dtype=torch.float32,
+            partial_rotary_factor=partial_rotary_factor,
+            scaling_factor=2.0,
+            ntk_alpha=1.0,
+            ntk_beta=32.0,
+        )
+
+        batch_size = 2
+        seq_len = 8
+        num_heads = 4
+
+        query = torch.randn(batch_size, seq_len, num_heads, head_dim)
+        key = torch.randn(batch_size, seq_len, num_heads, head_dim)
+
+        query_pass = query[..., rotary_dim:].clone()
+        key_pass = key[..., rotary_dim:].clone()
+
+        query_rot, key_rot = rope(query, key)
+
+        # Verify pass-through dimensions
+        torch.testing.assert_close(query_rot[..., rotary_dim:], query_pass)
+        torch.testing.assert_close(key_rot[..., rotary_dim:], key_pass)
+
+        # Verify concentration was computed correctly with scaling
+        concentration, inv_freq = rope._compute_concentration_and_inv_freq()
+        expected_concentration = 0.1 * math.log(2.0) + 1.0
+        assert abs(concentration - expected_concentration) < 1e-6
+
+        # Verify inv_freq uses rotary_dim
+        assert inv_freq.shape == (rotary_dim // 2,)
+
+    def test_partial_rotary_packed_sequences(self):
+        """Test partial rotary factor with packed sequences"""
+        head_dim = 64
+        partial_rotary_factor = 0.5
+        rotary_dim = int(head_dim * partial_rotary_factor)
+
+        rope = RotaryEmbedding(
+            head_dim=head_dim,
+            base=10000,
+            dtype=torch.float32,
+            partial_rotary_factor=partial_rotary_factor,
+        )
+
+        # Packed sequences: 3 sequences of lengths [3, 4, 5]
+        total_tokens = 12
+        position_ids = torch.tensor([0, 1, 2, 0, 1, 2, 3, 0, 1, 2, 3, 4])
+
+        # Compute freqs_cis
+        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="thd")
+
+        # Verify output shape: should be (total_tokens, rotary_dim)
+        assert freqs_cis.shape == (total_tokens, rotary_dim)
+
+        # Tokens at position 0 in different sequences should have same freqs_cis
+        torch.testing.assert_close(freqs_cis[0], freqs_cis[3])
+        torch.testing.assert_close(freqs_cis[0], freqs_cis[7])
