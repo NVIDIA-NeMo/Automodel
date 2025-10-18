@@ -353,7 +353,7 @@ cfg-path: examples/llm_pretrain/megatron_pretrain_gpt2.yaml
 2025-09-01 07:13:17 | INFO | root |     seed: 1111
 2025-09-01 07:13:17 | INFO | root |     ranked: True
 2025-09-01 07:13:17 | INFO | root |   model:
-2025-09-01 07:13:17 | INFO | root |     _target_: <bound method _BaseNeMoAutoModelClass.from_config of <class 'nemo_automodel.components._transformers.auto_model.NeMoAutoModelForCausalLM'>>
+2025-09-01 07:13:17 | INFO | root |     _target_: <bound method _BaseNeMoAutoModelClass.from_config of <class 'nemo_automodel._transformers.auto_model.NeMoAutoModelForCausalLM'>>
 2025-09-01 07:13:17 | INFO | root |     config:
 2025-09-01 07:13:17 | INFO | root |       _target_: <bound method AutoConfig.from_pretrained of <class 'transformers.models.auto.configuration_auto.AutoConfig'>>
 2025-09-01 07:13:17 | INFO | root |       pretrained_model_name_or_path: openai-community/gpt2

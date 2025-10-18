@@ -32,9 +32,9 @@ from transformers.processing_utils import ProcessorMixin
 from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
 from wandb import Settings
 
+from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
-from nemo_automodel.components._transformers.utils import apply_cache_compatibility_patches
-from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig, load_model_from_base_checkpoint
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
@@ -117,6 +117,7 @@ def build_model_and_optimizer(
     cfg_peft,
     model_wrapper,
     seed,
+    checkpointer: Checkpointer,
     tp_size=1,
     freeze_embeddings=True,
     cfg_fp8=None,
@@ -184,10 +185,9 @@ def build_model_and_optimizer(
 
                 # Load the weights into the model in parallel.
                 if is_meta_device:
-                    load_model_from_base_checkpoint(
+                    checkpointer.load_base_model(
                         model,
                         device,
-                        cfg_peft is not None,
                         cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
                         cfg_model.pretrained_model_name_or_path,
                         getattr(cfg_peft, "lora_A_init", None),
@@ -204,7 +204,7 @@ def build_model_and_optimizer(
         return model, state_dict_keys, optimizer
 
 
-def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft, state_dict_keys) -> CheckpointingConfig:
+def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
     """Build a checkpoint configuration.
 
     Args:
@@ -212,7 +212,6 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft, state_d
         cache_dir: Cache directory for the model.
         model_repo_id: Model repository ID.
         is_peft: Whether the model is PEFT.
-        state_dict_keys: Copy of the model state dict keys before any parallelization.
 
     Returns:
         The instantiated checkpoint configuration.
@@ -225,7 +224,6 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft, state_d
         model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
         save_consolidated=False,
         is_peft=is_peft,
-        model_state_dict_keys=state_dict_keys,
     )
     if cfg_ckpt is not None:
         cfg_ckpt = cfg_ckpt.to_dict()
@@ -549,6 +547,24 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.peft_config = None
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
+
+        # Build checkpoint config
+        checkpoint_config = build_checkpoint_config(
+            self.cfg.get("checkpoint", None),
+            self.cfg.get("model.cache_dir", None),
+            self.cfg.model.pretrained_model_name_or_path,
+            True if self.cfg.get("peft", None) else False,
+        )
+
+        # Create Checkpointer instance
+        self.checkpointer = Checkpointer(
+            config=checkpoint_config,
+            dp_rank=self._get_dp_rank(include_cp=True),
+            tp_rank=self._get_tp_rank(),
+            pp_rank=self._get_pp_rank(),
+            moe_mesh=None,
+        )
+
         self.model, model_state_dict_keys, self.optimizer = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
@@ -560,7 +576,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
             tp_size=self.cfg.get("distributed.tp_size", 1),
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
+            checkpointer=self.checkpointer,
         )
+        self.checkpointer.config.model_state_dict_keys = model_state_dict_keys
+
         self.loss_fn = build_loss_fn(self.cfg.loss_fn)
         self.dataloader, self.processor = build_dataloader(
             self.cfg.dataset,
@@ -603,15 +622,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Log model, parameter counts, norms, optimizer and scheduler
         self._log_model_and_optimizer_details(self.model, self.optimizer, self.lr_scheduler)
 
-        # Build checkpointing config
         restore_from = self.cfg.get("checkpoint.restore_from", None)
-        self.checkpoint_config = build_checkpoint_config(
-            self.cfg.get("checkpoint", None),
-            self.cfg.get("model.cache_dir", None),
-            self.cfg.model.pretrained_model_name_or_path,
-            True if self.cfg.get("peft", None) else False,
-            model_state_dict_keys,
-        )
 
         # Optionally resume
         self.load_checkpoint(restore_from)
@@ -648,6 +659,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     self._run_validation_epoch()
                     self.model.train()
+
+        self.checkpointer.close()
 
     def _run_train_optim_step(self, batches, max_grad_norm=1.0):
         """Execute a single training step.
@@ -703,6 +716,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model.finish_grad_sync()
 
+        self.checkpointer.maybe_wait_for_staging()
         self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
 

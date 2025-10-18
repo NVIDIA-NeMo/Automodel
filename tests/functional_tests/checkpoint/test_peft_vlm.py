@@ -647,7 +647,7 @@ def test_hf_peft_checkpoint():
     # first extract the in-memory checkpoint
     model_state_dict = ModelState(
         trainer.model,
-        trainer.checkpoint_config.is_peft,
+        trainer.checkpointer.config.is_peft,
     ).state_dict()
     optimizer_state_dict = to_cpu(
         OptimizerState(
@@ -703,7 +703,7 @@ def test_hf_peft_checkpoint():
     ]
 
     for file in output_files:
-        path = Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / file
+        path = Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / file
         assert path.exists(), f"Expected {path} to exist"
         if "." in file:
             assert path.is_file(), f"Expected {path} to be a file"
@@ -714,7 +714,7 @@ def test_hf_peft_checkpoint():
 
     # Load checkpoint data
     restored_optim_dict, saved_lr_scheduler_state = load_dcp(
-        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "optim",
+        Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "optim",
     )
     # Remove "sched." prefix from keys in saved_lr_scheduler_state if present
     if saved_lr_scheduler_state is not None:
@@ -743,14 +743,14 @@ def test_hf_peft_checkpoint():
                 )
 
     restored_model_dict_consolidated = load_safetensors(
-        Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "model" / "adapter_model.safetensors",
+        Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "model" / "adapter_model.safetensors",
     )
     restored_config = json.load(
-        open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "model" / "adapter_config.json"),
+        open(Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "model" / "adapter_config.json"),
     )
     restored_automodel_peft_config = json.load(
         open(
-            Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "model" / "automodel_peft_config.json"
+            Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "model" / "automodel_peft_config.json"
         ),
     )
     _compare_dicts(expected_config, restored_config)
@@ -766,7 +766,7 @@ def test_hf_peft_checkpoint():
     assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
 
     # compare the recipe configs
-    with open(Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "config.yaml", "r") as f:
+    with open(Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "config.yaml", "r") as f:
         restored_config = yaml.safe_load(f)
     compare_configs(trainer.cfg.raw_config, restored_config)
 
@@ -849,7 +849,7 @@ def test_hf_peft_checkpoint():
     if torch.distributed.get_rank() == 0:
         base = AutoModelForImageTextToText.from_pretrained(cfg.model.pretrained_model_name_or_path)
         peft_model = PeftModel.from_pretrained(
-            base, Path(trainer.checkpoint_config.checkpoint_dir) / "epoch_0_step_9" / "model"
+            base, Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "model"
         ).to(trainer.model.dtype)
 
         for source_key, source_param in model_state_dict.items():
@@ -863,8 +863,8 @@ def test_hf_peft_checkpoint():
 
     if torch.distributed.get_rank() == 0:
         # delete the checkpoint directory
-        if Path(trainer.checkpoint_config.checkpoint_dir).exists():
-            shutil.rmtree(Path(trainer.checkpoint_config.checkpoint_dir))
+        if Path(trainer.checkpointer.config.checkpoint_dir).exists():
+            shutil.rmtree(Path(trainer.checkpointer.config.checkpoint_dir))
     torch.distributed.barrier()
 
 

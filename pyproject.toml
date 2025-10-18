@@ -117,7 +117,6 @@ deepep = [
 dev = [
     "nemo_automodel[fa]",
     "nemo_automodel[vlm]",
-    "nemo_automodel[moe]",
 ]
 all = [
     "nemo_automodel[deepep]",
@@ -243,7 +242,6 @@ name = "Components must not import each other"
 type = "independence"
 modules = [
     "nemo_automodel.components._peft",
-    "nemo_automodel.components._transformers",
     "nemo_automodel.components.checkpoint",
     "nemo_automodel.components.config",
     "nemo_automodel.components.datasets",
