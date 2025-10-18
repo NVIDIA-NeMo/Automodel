@@ -97,14 +97,18 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
                 # gpt-oss has blocks/scales for the down_proj and gate_up_proj weights
                 # we need to add the blocks and scales tensors in a shard-aware manner
                 layer_name, projection_type = key.rsplit(".", 1)
-                placements, device_mesh = value.placements, value.device_mesh
                 n_experts, _, dim = value.shape
-                blocks_tensors = torch.distributed.tensor.ones(
-                    (n_experts, dim, 90, 16), placements=placements, device_mesh=device_mesh, dtype=torch.uint8
-                )
-                scales_tensors = torch.distributed.tensor.ones(
-                    (n_experts, dim, 90), placements=placements, device_mesh=device_mesh, dtype=torch.uint8
-                )
+                if isinstance(value, torch.distributed.tensor.DTensor):
+                    placements, device_mesh = value.placements, value.device_mesh
+                    blocks_tensors = torch.distributed.tensor.ones(
+                        (n_experts, dim, 90, 16), placements=placements, device_mesh=device_mesh, dtype=torch.uint8
+                    )
+                    scales_tensors = torch.distributed.tensor.ones(
+                        (n_experts, dim, 90), placements=placements, device_mesh=device_mesh, dtype=torch.uint8
+                    )
+                else:
+                    blocks_tensors = torch.ones((n_experts, dim, 90, 16), dtype=torch.uint8)
+                    scales_tensors = torch.ones((n_experts, dim, 90), dtype=torch.uint8)
                 state_dict[f"{layer_name}.{projection_type}_blocks"] = blocks_tensors
                 state_dict[f"{layer_name}.{projection_type}_scales"] = scales_tensors
 
@@ -150,7 +154,7 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         Source: https://github.com/huggingface/transformers/blob/869735d37d0f929311ac6611728c482a4414ba8c/src/transformers/integrations/mxfp4.py#L77
         """
         # Check if blocks and scales are on CPU, and move to GPU if so
-        if not blocks.is_cuda and torch.cuda.is_available():
+        if not blocks.is_cuda and torch.cuda.is_available() and torch.distributed.get_world_size() > 1:
             blocks = blocks.cuda()
             scales = scales.cuda()
 
@@ -166,9 +170,12 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         blocks = blocks.reshape(rows_total, B)
         scales = scales.reshape(rows_total, 1)
 
-        out = torch.distributed.tensor.empty(
-            (rows_total, B * 2), placements=blocks.placements, device_mesh=blocks.device_mesh, dtype=dtype
-        )
+        if isinstance(blocks, torch.distributed.tensor.DTensor):
+            out = torch.distributed.tensor.empty(
+                (rows_total, B * 2), placements=blocks.placements, device_mesh=blocks.device_mesh, dtype=dtype
+            )
+        else:
+            out = torch.empty((rows_total, B * 2), dtype=dtype, device=blocks.device)
 
         for r0 in range(0, rows_total, rows_per_chunk):
             r1 = min(r0 + rows_per_chunk, rows_total)
