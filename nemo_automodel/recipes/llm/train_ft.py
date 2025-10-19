@@ -115,7 +115,6 @@ def build_model_and_optimizer(
     loss_fn=None,
     parallelize_fn=None,
     load_base_model=True,
-    dequantize_base_checkpoint=False,
 ) -> tuple[nn.Module | AutoPipeline, list[str], list["Optimizer"], nn.Module]:  # noqa: F821
     """
     Build and initialize a model and optimizer.
@@ -206,7 +205,6 @@ def build_model_and_optimizer(
                     _get_model_name(cfg_model),
                     getattr(cfg_peft, "lora_A_init", None),
                     load_base_model=load_base_model,
-                    quantization=dequantize_base_checkpoint,
                 )
 
             # Create optimizer for all model parts
@@ -262,7 +260,6 @@ def build_model_and_optimizer(
                 _get_model_name(cfg_model),
                 getattr(cfg_peft, "lora_A_init", None),
                 load_base_model=load_base_model,
-                quantization=dequantize_base_checkpoint,
             )
 
         # ensure the model is on device
@@ -841,7 +838,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             loss_fn=self.loss_fn,
             parallelize_fn=parallelize_fn,
             load_base_model=self.cfg.get("checkpoint.load_base_model", True),
-            dequantize_base_checkpoint=self.cfg.get("checkpoint.dequantize_base_checkpoint", False),
             checkpointer=self.checkpointer,
         )
         self.checkpointer.config.model_state_dict_keys = model_state_dict_keys
