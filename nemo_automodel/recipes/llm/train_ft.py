@@ -97,6 +97,7 @@ def _get_model_name(cfg_model):
     else:
         return None
 
+
 def _get_packed_sequence_config(has_packed_sequence, is_hf_model, cp_size):
     kwargs = {}
     if has_packed_sequence and is_hf_model:
@@ -114,6 +115,7 @@ def _get_packed_sequence_config(has_packed_sequence, is_hf_model, cp_size):
         logger.warning("Packed sequence is supported only with SDPA. Setting model's attn_implementation to sdpa")
 
     return kwargs
+
 
 def build_model_and_optimizer(
     device,
