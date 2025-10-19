@@ -147,12 +147,6 @@ class Checkpointer:
             self._model_ctx.process_group = torch.distributed.new_group(backend="gloo")
             self._optim_ctx.process_group = torch.distributed.new_group(backend="gloo")
 
-        self.__post_init__()
-
-    def __post_init__(self) -> None:
-        """
-        Post-initialization hook that prepares optional addons and inflight state.
-        """
         self._addons = []
         if self._should_write_consolidated():
             self._addons.append(ConsolidatedHFAddon())
