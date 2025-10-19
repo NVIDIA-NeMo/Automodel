@@ -14,7 +14,7 @@
 
 
 # To run this recipe, please use the following command:
-# uv run recipes/llm_finetune/finetune.py --config recipes/llm_finetune/qwen/qwen2_5_7b_instruct_toolcall.yaml
+# uv run recipes/llm_finetune/finetune.py --config recipes/llm_finetune/qwen/qwen2_5_7b_instruct_chat.yaml
 
 
 step_scheduler:
