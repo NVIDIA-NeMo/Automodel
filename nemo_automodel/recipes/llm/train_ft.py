@@ -97,6 +97,23 @@ def _get_model_name(cfg_model):
     else:
         return None
 
+def _get_packed_sequence_config(has_packed_sequence, is_hf_model, cp_size):
+    kwargs = {}
+    if has_packed_sequence and is_hf_model:
+        if cp_size == 1:
+            kwargs["attn_implementation"] = "flash_attention_2"
+            logger.warning(
+                "Packed sequence is supported only with Flash Attention. "
+                "Setting model's attn_implementation to flash_attention_2"
+            )
+        else:
+            # TODO: support packed sequence with CP size > 1
+            raise ValueError("Packed sequence is only supported with CP size 1")
+    if cp_size > 1 and is_hf_model:
+        kwargs["attn_implementation"] = "sdpa"
+        logger.warning("Packed sequence is supported only with SDPA. Setting model's attn_implementation to sdpa")
+
+    return kwargs
 
 def build_model_and_optimizer(
     device,
@@ -138,9 +155,8 @@ def build_model_and_optimizer(
         The instantiated model on the specified device, the state dict keys before any parallelization, the optimizer, and the loss function.
     """
     is_hf_model = cfg_model.get("pretrained_model_name_or_path", None) is not None
-    is_meta_device = False
-    if hasattr(cfg_model, "is_meta_device"):
-        is_meta_device = cfg_model.is_meta_device
+    is_meta_device = cfg_model.get("is_meta_device", False)
+    if is_meta_device:
         if is_meta_device and isinstance(model_wrapper, MegatronFSDPManager):
             raise ValueError("Meta device initialization is not supported with MegatronFSDPManager")
         del cfg_model.is_meta_device
@@ -150,19 +166,7 @@ def build_model_and_optimizer(
     init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
     with ScopedRNG(seed=seed, ranked=True):
         kwargs = {}
-        if has_packed_sequence and is_hf_model:
-            if cp_size == 1:
-                kwargs["attn_implementation"] = "flash_attention_2"
-                logger.warning(
-                    "Packed sequence is supported only with Flash Attention. "
-                    "Setting model's attn_implementation to flash_attention_2"
-                )
-            else:
-                # TODO: support packed sequence with CP size > 1
-                raise ValueError("Packed sequence is only supported with CP size 1")
-        if cp_size > 1 and is_hf_model:
-            kwargs["attn_implementation"] = "sdpa"
-            logger.warning("Packed sequence is supported only with SDPA. Setting model's attn_implementation to sdpa")
+        kwargs.update(_get_packed_sequence_config(has_packed_sequence, is_hf_model, cp_size))
 
         if cfg_quantization is not None:
             logger.info("Model weight quantization enabled with BitsAndBytes")
