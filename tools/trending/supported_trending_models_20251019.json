@@ -1,0 +1,39 @@
+{
+    "trendinglist_date": "20251019",
+    "models": [
+        {
+            "model_id": "inclusionAI/Ling-1T",
+            "sft": {
+                "fsdp": [],
+                "tp": [],
+                "pp": [],
+                "cp": [],
+                "ep": []
+            },
+            "peft": {
+                "fsdp": [],
+                "tp": [],
+                "pp": [],
+                "cp": [],
+                "ep": []
+            }
+        },
+        {
+            "model_id": "inclusionAI/Ring-1T",
+            "sft": {
+                "fsdp": [],
+                "tp": [],
+                "pp": [],
+                "cp": [],
+                "ep": []
+            },
+            "peft": {
+                "fsdp": [],
+                "tp": [],
+                "pp": [],
+                "cp": [],
+                "ep": []
+            }
+        }
+    ]
+}
