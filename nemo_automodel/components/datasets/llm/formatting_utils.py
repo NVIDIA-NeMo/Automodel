@@ -12,16 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
-import re
-import torch
 import logging
+import re
+from typing import TYPE_CHECKING, Dict, List, Optional
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
 
-GENERATION_REGEX = re.compile(r'\{%-?\s+generation\s+-?%\}')
+GENERATION_REGEX = re.compile(r"\{%-?\s+generation\s+-?%\}")
+
 
 def _pad_to_seq_length(sample, pad_token_id, seq_length):
     """Pad a sample to a specific sequence length."""
@@ -58,7 +59,15 @@ def _has_chat_template(tokenizer: "PreTrainedTokenizer") -> bool:
     )
 
 
-def _package_tokenized_example(messages, tokenizer, input_ids, assistant_masks, eos_token_id, pad_token_id, seq_length,):
+def _package_tokenized_example(
+    messages,
+    tokenizer,
+    input_ids,
+    assistant_masks,
+    eos_token_id,
+    pad_token_id,
+    seq_length,
+):
     """
     Package a tokenized example with proper masking and padding.
 
@@ -171,7 +180,7 @@ def format_chat_template(
     # Ensure we have a usable chat template
     if not _has_chat_template(tokenizer):
         raise ValueError("Tokenizer lacks a usable chat template (chat_template/apply_chat_template)")
-    
+
     template_has_generation_kwd = GENERATION_REGEX.search(tokenizer.chat_template) is not None
 
     tokenized_chat = tokenizer.apply_chat_template(
@@ -186,7 +195,7 @@ def format_chat_template(
     # which indicates end of context and beginning of answer
     input_ids = tokenized_chat.get("input_ids")
     if template_has_generation_kwd:
-        mask = tokenized_chat['assistant_masks']
+        mask = tokenized_chat["assistant_masks"]
     else:
         mask = [1] * len(input_ids)
 
