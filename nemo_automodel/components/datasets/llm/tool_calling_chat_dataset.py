@@ -142,7 +142,6 @@ class ToolCallingChatDataset(Dataset):
         self.tokenizer = tokenizer
         self.seq_length = seq_length
         self.start_of_turn_token = start_of_turn_token
-        import pdb; pdb.set_trace()
 
         self.dataset = _load_openai_messages(path_or_dataset_id, split=split)
 

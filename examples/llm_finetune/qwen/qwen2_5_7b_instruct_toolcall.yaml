@@ -45,6 +45,12 @@ compile:
   dynamic: true  # Set to false for better performance with fixed shapes
   backend: null  # Use default backend (inductor)
 
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors # safetensors only for peft
+  save_consolidated: false
+
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: none
