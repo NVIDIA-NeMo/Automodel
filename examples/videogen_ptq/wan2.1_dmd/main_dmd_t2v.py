@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# main_dmd_t2v.py - Entry point for WAN 2.1 T2V DMD Training
+# main_dmd_t2v.py - Entry point for WAN 2.1 T2V DMD Training with Self-Forcing
 
 import argparse
 
@@ -8,7 +8,7 @@ from trainer_dmd_t2v import WanDMDTrainerT2V
 
 
 def parse_args():
-    p = argparse.ArgumentParser("WAN 2.1 T2V DMD Training")
+    p = argparse.ArgumentParser("WAN 2.1 T2V DMD Training with Self-Forcing")
 
     # Model configuration
     p.add_argument(
@@ -30,7 +30,7 @@ def parse_args():
         "--num_epochs",
         type=int,
         default=1,
-        help="Number of training epochs (DMD trains fast, 1 epoch often sufficient)",
+        help="Number of training epochs (DMD with self-forcing trains fast, 1 epoch often sufficient)",
     )
     p.add_argument("--batch_size_per_gpu", type=int, default=1, help="Batch size per GPU")
     p.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate for generator")
@@ -66,12 +66,12 @@ def parse_args():
         help="Type of denoising loss for critic",
     )
 
-    # Backward simulation
+    # Self-forcing backward simulation
     p.add_argument(
         "--denoising_step_list",
         type=str,
         default="999,749,499,249,0",
-        help="Comma-separated list of discrete timesteps for backward simulation",
+        help="Comma-separated list of discrete timesteps for self-forcing backward simulation",
     )
 
     # Alternating optimization
@@ -91,7 +91,7 @@ def main():
     args = parse_args()
 
     print0("=" * 80)
-    print0("WAN 2.1 T2V DMD Training")
+    print0("WAN 2.1 T2V DMD Training with Self-Forcing")
     print0("=" * 80)
     print0(f"[INFO] Base model: {args.model_id}")
     if args.teacher_model_path:
@@ -106,11 +106,12 @@ def main():
     print0(f"  - Timestep shift: {args.timestep_shift}")
     print0(f"  - Denoising loss type: {args.denoising_loss_type}")
     print0(f"  - Alternating: {args.generator_steps} gen / {args.critic_steps} critic")
+    print0("[INFO] Self-Forcing: Pipeline internal to DMD model")
     print0("=" * 80)
 
     # Parse denoising step list
     denoising_step_list = [int(x.strip()) for x in args.denoising_step_list.split(",")]
-    print0(f"[INFO] Denoising steps: {denoising_step_list}")
+    print0(f"[INFO] Self-forcing denoising steps: {denoising_step_list}")
 
     # Create trainer
     trainer = WanDMDTrainerT2V(
@@ -130,7 +131,7 @@ def main():
         ts_schedule_max=args.ts_schedule_max,
         min_score_timestep=args.min_score_timestep,
         denoising_loss_type=args.denoising_loss_type,
-        # Backward simulation
+        # Self-forcing backward simulation
         denoising_step_list=denoising_step_list,
         # Alternating optimization
         generator_steps=args.generator_steps,
@@ -149,7 +150,7 @@ def main():
     )
 
     print0("=" * 80)
-    print0("[INFO] DMD Training complete!")
+    print0("[INFO] DMD Training with Self-Forcing complete!")
     print0("=" * 80)
 
 
@@ -161,7 +162,7 @@ if __name__ == "__main__":
 # USAGE EXAMPLES
 # ============================================================================
 
-# 1. Basic DMD training (single node, 8 GPUs):
+# 1. Basic DMD training with self-forcing (single node, 8 GPUs):
 # torchrun --nproc-per-node=8 main_dmd_t2v.py \
 #     --meta_folder /path/to/meta \
 #     --batch_size_per_gpu 1 \
@@ -186,10 +187,10 @@ if __name__ == "__main__":
 #     --batch_size_per_gpu 1 \
 #     --learning_rate 1e-5
 
-# 4. Custom denoising steps (4-step model):
+# 4. Custom self-forcing denoising steps (4-step model):
 # torchrun --nproc-per-node=8 main_dmd_t2v.py \
 #     --meta_folder /path/to/meta \
-#     --denoising_step_list 1000,750,500,250 \
+#     --denoising_step_list 1000,750,500,250,0 \
 #     --batch_size_per_gpu 1
 
 # 5. With separate teacher model:
@@ -199,60 +200,28 @@ if __name__ == "__main__":
 #     --teacher_model_path /path/to/teacher/checkpoint \
 #     --batch_size_per_gpu 1
 
-# 6. Alternating optimization (2 gen steps, 1 critic step):
-# torchrun --nproc-per-node=8 main_dmd_t2v.py \
-#     --meta_folder /path/to/meta \
-#     --generator_steps 2 \
-#     --critic_steps 1 \
-#     --batch_size_per_gpu 1
-
-# 7. Resume from checkpoint:
-# torchrun --nproc-per-node=8 main_dmd_t2v.py \
-#     --meta_folder /path/to/meta \
-#     --resume_checkpoint ./wan_dmd_outputs/checkpoint-1000 \
-#     --batch_size_per_gpu 1
-
-# 8. Without CPU offload (faster, more memory):
-# torchrun --nproc-per-node=8 main_dmd_t2v.py \
-#     --meta_folder /path/to/meta \
-#     --no_cpu_offload \
-#     --batch_size_per_gpu 1
-
-# 9. Custom learning rates:
-# torchrun --nproc-per-node=8 main_dmd_t2v.py \
-#     --meta_folder /path/to/meta \
-#     --learning_rate 5e-6 \
-#     --critic_learning_rate 1e-5 \
-#     --batch_size_per_gpu 1
-
-# 10. Fast training (600 steps, matches Self-Forcing paper):
-# torchrun --nproc-per-node=8 main_dmd_t2v.py \
-#     --meta_folder /path/to/meta \
-#     --num_epochs 1 \
-#     --save_every 100 \
-#     --batch_size_per_gpu 1
-
 # ============================================================================
-# MEMORY ESTIMATION
+# KEY DIFFERENCES FROM ORIGINAL IMPLEMENTATION
 # ============================================================================
 #
-# With CPU offload enabled:
-# - Base model (1.3B): ~5GB per model × 3 = 15GB total
-# - With CPU offload: ~3-5GB GPU per model
-# - Total GPU memory: ~10-15GB per GPU
-# - Recommended: 24GB+ GPUs (e.g., RTX 4090, A100)
+# 1. Self-Forcing Pipeline:
+#    - OLD: BackwardSimulationPipeline created separately in trainer
+#    - NEW: SelfForcingTrainingPipeline created internally by DMD model
 #
-# Without CPU offload:
-# - Total GPU memory: ~30-40GB per GPU
-# - Recommended: 40GB+ GPUs (e.g., A100 40GB/80GB)
+# 2. Random Timestep Selection:
+#    - OLD: All timesteps computed, memory intensive
+#    - NEW: ONE random timestep selected per batch (synchronized across ranks)
+#
+# 3. Gradient Flow:
+#    - OLD: Unclear gradient management
+#    - NEW: Gradients ONLY at randomly selected timestep
+#
+# 4. Memory Efficiency:
+#    - OLD: Stores full trajectory
+#    - NEW: Only stores final prediction (last_step_only=True)
+#
+# 5. Training Speed:
+#    - OLD: ~2 hours on 64 H100 GPUs for unclear number of steps
+#    - NEW: ~2 hours on 64 H100 GPUs for 600 steps (matches Self-Forcing paper)
 #
 # ============================================================================
-# TRAINING TIME ESTIMATION
-# ============================================================================
-#
-# Based on Self-Forcing paper (600 steps, 64 H100 GPUs, 2 hours):
-# - Single 8xH100 node: ~16 hours
-# - 8 nodes × 8 H100: ~2 hours
-# - Single 8xA100 node: ~24-32 hours
-#
-# DMD trains MUCH faster than standard fine-tuning!

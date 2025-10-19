@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-# validate_dmd_t2v.py - Validation script for DMD-trained models
+# validate_dmd_t2v.py - Validation script for DMD-trained models with custom scheduler
 
 import argparse
 import json
 import os
 import pickle
+
+# Import custom scheduler
+import sys
 from pathlib import Path
 
 import torch
 from diffusers import WanPipeline
 from diffusers.utils import export_to_video
+
+sys.path.insert(0, os.path.dirname(__file__))
+from rectified_flow_scheduler import RectifiedFlowScheduler
 
 
 def parse_args():
@@ -34,6 +40,14 @@ def parse_args():
         type=int,
         default=None,
         help="Number of inference steps (auto-computed from denoising_steps)",
+    )
+
+    # Scheduler settings
+    p.add_argument(
+        "--timestep_shift",
+        type=float,
+        default=3.0,
+        help="Timestep shift parameter (must match training)",
     )
 
     # Generation settings
@@ -92,29 +106,35 @@ def load_prompts_from_meta_files(meta_folder: str):
     return prompts
 
 
-def setup_dmd_scheduler(pipe, denoising_steps):
+def setup_custom_scheduler(pipe, denoising_steps, timestep_shift=3.0):
     """
-    Setup scheduler for DMD inference with discrete timesteps.
+    Setup custom Rectified Flow scheduler for DMD inference.
 
-    CRITICAL: DMD models are trained on discrete timesteps, so inference
-    must use the EXACT same timesteps, not a continuous schedule.
-
-    NOTE: WAN 2.1 scheduler uses timesteps [999, 998, ..., 1, 0] by default.
-    We use [999, 749, 499, 249, 0] to match the scheduler's range.
+    CRITICAL: DMD models are trained with custom Rectified Flow scheduler,
+    so inference must use the SAME scheduler with SAME settings.
     """
-    print("[SCHEDULER] Setting up DMD discrete timestep schedule")
+    print("[SCHEDULER] Setting up custom Rectified Flow scheduler")
     print(f"[SCHEDULER] Denoising steps: {denoising_steps}")
+    print(f"[SCHEDULER] Timestep shift: {timestep_shift}")
 
-    # Convert to tensor
-    timesteps = torch.tensor(denoising_steps, dtype=torch.long)
+    # Create custom scheduler
+    custom_scheduler = RectifiedFlowScheduler(
+        num_train_timesteps=1000,
+        shift=timestep_shift,
+        use_discrete_timesteps=True,
+    )
 
-    # Set scheduler timesteps manually
-    # This overrides the default continuous schedule
-    pipe.scheduler.timesteps = timesteps.to(pipe.scheduler.timesteps.device)
-    pipe.scheduler.num_inference_steps = len([t for t in denoising_steps if t > 0])
+    # Set discrete timesteps for inference
+    # Remove the zero timestep (we don't denoise at t=0)
+    inference_steps = [t for t in denoising_steps if t > 0]
+    custom_scheduler.timesteps = torch.tensor(inference_steps, dtype=torch.long)
+    custom_scheduler.num_inference_steps = len(inference_steps)
 
-    print(f"[SCHEDULER] ✓ Configured for {pipe.scheduler.num_inference_steps} inference steps")
-    print(f"[SCHEDULER] Timesteps: {pipe.scheduler.timesteps.tolist()}")
+    # Replace pipeline scheduler
+    pipe.scheduler = custom_scheduler
+
+    print(f"[SCHEDULER] ✓ Configured for {custom_scheduler.num_inference_steps} inference steps")
+    print(f"[SCHEDULER] Timesteps: {custom_scheduler.timesteps.tolist()}")
 
     return pipe
 
@@ -151,21 +171,36 @@ def load_dmd_checkpoint(pipe, checkpoint_path):
     # Try loading from sharded checkpoint (slower, but works)
     generator_model_path = os.path.join(checkpoint_path, "generator_model")
     if os.path.exists(generator_model_path):
-        print("[WARNING] Only sharded checkpoint found, this is slower")
-        print("[INFO] Consider running consolidation first")
-        print("[CHECKPOINT] Loading sharded generator model...")
-        # This would require FSDP loading code - not recommended for inference
-        raise FileNotFoundError(
-            "Sharded checkpoint found but not supported for inference. "
-            "Please use consolidated checkpoint or run training with consolidation."
-        )
+        print("[WARNING] Only sharded checkpoint found")
+        print("[INFO] Attempting to load from sharded checkpoint...")
+
+        # Try to load sharded checkpoint using torch.distributed
+        try:
+            from torch.distributed.checkpoint import FileSystemReader
+            from torch.distributed.checkpoint import load as dist_load
+
+            # Load sharded state dict
+            state_dict = {"model": pipe.transformer.state_dict()}
+            dist_load(
+                state_dict=state_dict,
+                storage_reader=FileSystemReader(generator_model_path),
+            )
+            pipe.transformer.load_state_dict(state_dict["model"], strict=True)
+            print("[CHECKPOINT] ✓ Loaded sharded checkpoint")
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to load sharded checkpoint: {e}")
+            raise FileNotFoundError(
+                "Sharded checkpoint found but loading failed. "
+                "Please run consolidation during training or use consolidated checkpoint."
+            )
 
     raise FileNotFoundError(
         f"No valid checkpoint found at {checkpoint_path}\n"
         f"Expected files:\n"
         f"  - generator_consolidated.bin (recommended)\n"
         f"  - consolidated_model.bin (fallback)\n"
-        f"  - generator_model/ (not supported for inference)"
+        f"  - generator_model/ (requires distributed loading)"
     )
 
 
@@ -214,9 +249,9 @@ def main():
     print("\n[3] Loading DMD checkpoint")
     load_dmd_checkpoint(pipe, args.checkpoint)
 
-    # Setup DMD scheduler with discrete timesteps
-    print("\n[4] Setting up DMD scheduler")
-    pipe = setup_dmd_scheduler(pipe, denoising_steps)
+    # Setup custom Rectified Flow scheduler
+    print("\n[4] Setting up custom Rectified Flow scheduler")
+    pipe = setup_custom_scheduler(pipe, denoising_steps, args.timestep_shift)
 
     # IMPORTANT: Disable CFG for DMD models
     if args.guidance_scale != 1.0:
@@ -233,6 +268,7 @@ def main():
         "checkpoint": args.checkpoint,
         "denoising_steps": denoising_steps,
         "num_inference_steps": args.num_inference_steps,
+        "timestep_shift": args.timestep_shift,
         "guidance_scale": args.guidance_scale,
         "height": args.height,
         "width": args.width,
@@ -250,6 +286,7 @@ def main():
     print(f"[INFO] Inference steps: {args.num_inference_steps} (discrete)")
     print(f"[INFO] Guidance scale: {args.guidance_scale}")
     print(f"[INFO] Denoising schedule: {denoising_steps}")
+    print(f"[INFO] Timestep shift: {args.timestep_shift}")
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -266,8 +303,8 @@ def main():
             # Generate video
             generator = torch.Generator(device="cuda").manual_seed(args.seed + i)
 
-            # IMPORTANT: DMD uses discrete timesteps
-            # The pipeline will automatically use pipe.scheduler.timesteps
+            # IMPORTANT: Custom scheduler handles discrete timesteps
+            # The pipeline will automatically use pipe.scheduler
             output = pipe(
                 prompt=prompt,
                 negative_prompt=args.negative_prompt if args.guidance_scale > 1.0 else None,
@@ -316,56 +353,67 @@ if __name__ == "__main__":
 # python validate_dmd_t2v.py \
 #     --meta_folder /path/to/meta \
 #     --checkpoint ./wan_dmd_outputs/checkpoint-600 \
-#     --denoising_steps 1000,750,500,250,0
+#     --denoising_steps 999,749,499,249,0 \
+#     --timestep_shift 3.0
 
 # 2. Limited samples for quick test:
 # python validate_dmd_t2v.py \
 #     --meta_folder /path/to/meta \
 #     --checkpoint ./wan_dmd_outputs/checkpoint-600 \
-#     --denoising_steps 1000,750,500,250,0 \
+#     --denoising_steps 999,749,499,249,0 \
 #     --num_samples 5
 
 # 3. With 3-step model (ultra fast):
 # python validate_dmd_t2v.py \
 #     --meta_folder /path/to/meta \
 #     --checkpoint ./wan_dmd_outputs/checkpoint-600 \
-#     --denoising_steps 1000,500,0 \
+#     --denoising_steps 999,499,0 \
 #     --num_samples 5
 
 # 4. Custom resolution:
 # python validate_dmd_t2v.py \
 #     --meta_folder /path/to/meta \
 #     --checkpoint ./wan_dmd_outputs/checkpoint-600 \
-#     --denoising_steps 1000,750,500,250,0 \
+#     --denoising_steps 999,749,499,249,0 \
 #     --height 720 \
 #     --width 1280 \
 #     --num_frames 121
 
-# 5. WARNING: Using CFG with DMD (not recommended):
+# 5. Match training settings exactly:
 # python validate_dmd_t2v.py \
 #     --meta_folder /path/to/meta \
 #     --checkpoint ./wan_dmd_outputs/checkpoint-600 \
-#     --denoising_steps 1000,750,500,250,0 \
-#     --guidance_scale 5.0  # Usually produces worse results!
+#     --denoising_steps 999,749,499,249,0 \
+#     --timestep_shift 3.0 \
+#     --guidance_scale 1.0
 
 # ============================================================================
 # IMPORTANT NOTES
 # ============================================================================
 #
 # 1. ALWAYS use the EXACT same denoising_steps as training!
-#    Training: [1000, 750, 500, 250, 0]
-#    Inference: Must use [1000, 750, 500, 250, 0]
+#    Training: [999, 749, 499, 249, 0]
+#    Inference: Must use [999, 749, 499, 249, 0]
 #
-# 2. DMD models work best with guidance_scale=1.0 (no CFG)
+# 2. ALWAYS use the SAME timestep_shift as training!
+#    Default: 3.0 (WAN 2.1 standard)
+#
+# 3. DMD models work best with guidance_scale=1.0 (no CFG)
 #    This is because they're trained without CFG
 #
-# 3. The speedup comes from fewer steps:
+# 4. The speedup comes from fewer steps:
 #    Base model: 40-50 steps
 #    DMD 4-step: 4 steps → 10x faster!
 #    DMD 3-step: 3 steps → 13x faster!
 #
-# 4. Quality should be comparable to base model despite fewer steps
+# 5. Quality should be comparable to base model despite fewer steps
 #    If quality is poor, check:
 #    - Are you using the correct denoising_steps?
+#    - Is timestep_shift correct (must match training)?
 #    - Is guidance_scale set to 1.0?
 #    - Did training complete successfully?
+#
+# 6. Custom scheduler is REQUIRED:
+#    - Training uses RectifiedFlowScheduler
+#    - Inference must use the SAME scheduler
+#    - Diffusers default scheduler will NOT work correctly

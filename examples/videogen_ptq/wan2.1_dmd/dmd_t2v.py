@@ -1,5 +1,4 @@
-# dmd_t2v.py - DMD (Distribution Matching Distillation) for WAN 2.1 T2V
-# FIXED VERSION - Gradient flow bug fixed
+# dmd_t2v.py - DMD with Self-Forcing Training Pipeline
 
 import os
 from typing import Dict, Optional, Tuple
@@ -11,16 +10,19 @@ from dist_utils import print0
 
 class DMDT2V:
     """
-    DMD (Distribution Matching Distillation) for WAN 2.1 T2V.
+    DMD (Distribution Matching Distillation) for WAN 2.1 T2V with Self-Forcing.
 
-    FIXES APPLIED:
-    1. Fixed tensor indexing in _sample_discrete_timestep()
-    2. Fixed device handling in flow/noise conversion
-    3. Consistent timestep ranges (0-999)
-    4. Better numerical stability
-    5. Removed double timestep shift application
-    6. Fixed timestep shapes for transformer vs scheduler
-    7. CRITICAL: Fixed gradient flow bug - removed torch.no_grad() wrapper
+    Key components:
+    1. Generator (student) - trainable, learns to match teacher
+    2. Teacher (real_score) - frozen, provides target distribution
+    3. Critic (fake_score) - trainable, learns to score generated samples
+    4. Self-forcing pipeline - generates training data via backward simulation
+
+    CRITICAL FIXES:
+    - Generator gradients flow through self-forcing pipeline
+    - Teacher completely frozen and isolated
+    - Critic uses detached generator outputs
+    - Self-forcing: ONE random timestep per batch (memory efficient)
     """
 
     def __init__(
@@ -42,7 +44,7 @@ class DMDT2V:
         denoising_loss_type: str = "flow",
         denoising_step_list: list = None,
     ):
-        """Initialize DMD trainer."""
+        """Initialize DMD trainer with self-forcing."""
         self.model_map = model_map
         self.scheduler = scheduler
         self.device = device
@@ -68,41 +70,131 @@ class DMDT2V:
         # Remove zero from list for sampling
         self.denoising_step_list_nonzero = [t for t in self.denoising_step_list if t > 0]
 
-        print0("[DMD] Initialized with:")
+        # Self-forcing pipeline (initialized lazily)
+        self.inference_pipeline = None
+
+        # Verify teacher is frozen
+        self._verify_teacher_frozen()
+
+        print0("[DMD] Initialized with self-forcing:")
         print0(f"  - Real guidance scale: {real_guidance_scale}")
         print0(f"  - Fake guidance scale: {fake_guidance_scale}")
         print0(f"  - Timestep shift: {timestep_shift}")
         print0(f"  - Denoising loss type: {denoising_loss_type}")
         print0(f"  - Discrete timesteps: {self.denoising_step_list}")
-        print0(f"  - Non-zero timesteps for sampling: {self.denoising_step_list_nonzero}")
 
-    def _sample_discrete_timestep(self, batch_size: int, num_frame: int, uniform_timestep: bool = True) -> torch.Tensor:
+    def _verify_teacher_frozen(self):
+        """Verify teacher is completely frozen."""
+        teacher = self.model_map["real_score"]["fsdp_transformer"]
+
+        trainable_count = sum(1 for p in teacher.parameters() if p.requires_grad)
+
+        if trainable_count > 0:
+            raise RuntimeError(
+                f"[BUG] Teacher has {trainable_count} trainable parameters! Teacher MUST be frozen for DMD."
+            )
+
+        print0("[DMD] ✓ Teacher verified frozen (0 trainable params)")
+
+    def _initialize_inference_pipeline(self):
+        """Initialize self-forcing training pipeline (lazy initialization)."""
+        from pipeline_t2v import SelfForcingTrainingPipeline
+
+        try:
+            model_name = self.model_map["generator"]["fsdp_transformer"].config._name_or_path
+        except:
+            model_name = "Wan2.1-T2V-1.3B"
+
+        # CRITICAL: For 21 frames, use independent_first_frame=True
+        # This gives: 1 independent frame + 20 frames (5 blocks of 4)
+        self.inference_pipeline = SelfForcingTrainingPipeline(
+            model_name=model_name,
+            denoising_step_list=self.denoising_step_list,
+            scheduler=self.scheduler,
+            generator=self.model_map["generator"]["fsdp_transformer"],
+            num_frame_per_block=4,
+            independent_first_frame=True,  # FIXED: Was False, should be True for 21 frames
+            same_step_across_blocks=True,
+            last_step_only=True,  ###TODO
+            num_max_frames=21,
+            context_noise=0,
+        )
+
+        print0("[DMD] Self-forcing pipeline initialized")
+        print0(f"  - Configuration: 1 + {(21 - 1)} frames = {(21 - 1) // 4} blocks of 4 frames")
+
+    def _run_generator(
+        self,
+        image_or_video_shape,
+        text_embeddings: torch.Tensor,
+        negative_text_embeddings: Optional[torch.Tensor] = None,
+        initial_latent: Optional[torch.Tensor] = None,
+        clip_fea: Optional[torch.Tensor] = None,
+        y: Optional[torch.Tensor] = None,
+        global_step: int = 0,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], int, int]:
         """
-        Sample DISCRETE timesteps from denoising_step_list for DMD training.
+        Run generator with self-forcing backward simulation.
+
+        KEY: This calls the self-forcing pipeline which:
+        1. Starts from noise
+        2. Iteratively denoises through discrete timesteps
+        3. Computes gradients at ONE random timestep
+        4. Returns final prediction WITH gradients
 
         Args:
-            batch_size: Batch size
-            num_frame: Number of frames
-            uniform_timestep: Use same timestep for all frames (recommended)
+            image_or_video_shape: [B, C, F, H, W]
+            text_embeddings: Text conditioning
+            negative_text_embeddings: Negative conditioning (unused in self-forcing)
+            initial_latent: Optional I2V conditioning
+            clip_fea: Optional CLIP features
+            y: Optional VAE features
+            global_step: Current training step
 
         Returns:
-            Timestep tensor of shape [batch_size, num_frame]
+            generated_latent: Generated latent [B, C, F, H, W] WITH gradients
+            gradient_mask: Optional mask for selective gradient computation
+            denoised_timestep_from: Starting timestep
+            denoised_timestep_to: Ending timestep
         """
-        timestep_tensor = torch.tensor(self.denoising_step_list_nonzero, device=self.device, dtype=torch.long)
+        # Initialize pipeline lazily
+        if self.inference_pipeline is None:
+            self._initialize_inference_pipeline()
 
-        if uniform_timestep:
-            # Sample one discrete timestep per sample in batch
-            indices = torch.randint(0, len(self.denoising_step_list_nonzero), (batch_size,), device=self.device)
-            timesteps = timestep_tensor[indices]
-            timestep = timesteps.unsqueeze(1).repeat(1, num_frame)
-        else:
-            # Sample different discrete timesteps for each frame
-            indices = torch.randint(
-                0, len(self.denoising_step_list_nonzero), (batch_size, num_frame), device=self.device
+        # Create noise
+        batch_size = image_or_video_shape[0]
+        channels, frames, height, width = image_or_video_shape[1:]
+
+        noise = torch.randn(batch_size, channels, frames, height, width, device=self.device, dtype=self.bf16)
+
+        # Run self-forcing backward simulation WITH GRADIENTS
+        generated_latent, denoised_timestep_from, denoised_timestep_to, _ = (
+            self.inference_pipeline.inference_with_trajectory(
+                noise=noise,
+                text_embeddings=text_embeddings,
+                clip_fea=clip_fea,
+                y=y,
+                initial_latent=initial_latent,
+                global_step=global_step,
             )
-            timestep = timestep_tensor[indices.flatten()].reshape(batch_size, num_frame)
+        )
 
-        return timestep
+        # Gradient mask (optional - for slicing last 21 frames)
+        gradient_mask = None
+        if generated_latent.shape[2] > 21:
+            # Only compute loss on last 21 frames (for long video generation)
+            gradient_mask = torch.zeros_like(generated_latent, dtype=torch.bool)
+            gradient_mask[:, :, -21:] = True
+
+            if global_step % 100 == 0:
+                print0("[DMD] Using gradient mask: only last 21 frames")
+
+        return generated_latent, gradient_mask, denoised_timestep_from, denoised_timestep_to
+
+    def _assert_finite(self, tensor: torch.Tensor, name: str):
+        """Assert tensor contains no NaN or Inf."""
+        if not torch.isfinite(tensor).all():
+            raise RuntimeError(f"[BUG] Non-finite values in {name}")
 
     def _compute_kl_grad(
         self,
@@ -116,56 +208,51 @@ class DMDT2V:
         """
         Compute KL gradient (Equation 7 in DMD paper).
 
-        CRITICAL FIX: Fake score model needs gradients, only teacher should be in no_grad
+        CRITICAL: Fake score needs gradients for generator training!
         """
-        batch_size, num_frame = noisy_latent.shape[:2]
+        batch_size = noisy_latent.shape[0]
 
-        # Validate inputs
-        assert noisy_latent.shape == estimated_clean_latent.shape, (
-            f"Shape mismatch: {noisy_latent.shape} vs {estimated_clean_latent.shape}"
-        )
+        # Assert shapes
+        assert noisy_latent.shape == estimated_clean_latent.shape
+        assert noisy_latent.ndim == 5 and noisy_latent.shape[1] == 16
+        assert timestep.ndim == 1 and timestep.shape[0] == batch_size
 
-        # Transformer expects timestep of shape [B], not [B, F]
-        if timestep.ndim == 2:
-            assert (timestep == timestep[:, 0:1]).all(), "All frames must have the same timestep"
-            timestep_model = timestep[:, 0]
-        else:
-            timestep_model = timestep
-
-        # Step 1: Compute fake score (critic prediction) - NEEDS GRADIENTS FOR GENERATOR
+        # Step 1: Compute fake score (critic) - NEEDS GRADIENTS!
         fake_score_model = self.model_map["fake_score"]["fsdp_transformer"]
 
         pred_fake_cond = fake_score_model(
             hidden_states=noisy_latent,
-            timestep=timestep_model.to(self.bf16),
+            timestep=timestep.to(self.bf16),
             encoder_hidden_states=text_embeddings,
             return_dict=False,
         )
         if isinstance(pred_fake_cond, tuple):
             pred_fake_cond = pred_fake_cond[0]
 
+        self._assert_finite(pred_fake_cond, "pred_fake_cond")
+
         # Apply CFG for fake score if needed
         if abs(self.fake_guidance_scale) > 1e-6:
             pred_fake_uncond = fake_score_model(
                 hidden_states=noisy_latent,
-                timestep=timestep_model.to(self.bf16),
+                timestep=timestep.to(self.bf16),
                 encoder_hidden_states=negative_text_embeddings,
                 return_dict=False,
             )
             if isinstance(pred_fake_uncond, tuple):
                 pred_fake_uncond = pred_fake_uncond[0]
 
-            pred_fake_image = pred_fake_cond + (pred_fake_cond - pred_fake_uncond) * self.fake_guidance_scale
+            pred_fake_image = pred_fake_uncond + self.fake_guidance_scale * (pred_fake_cond - pred_fake_uncond)
         else:
             pred_fake_image = pred_fake_cond
 
-        # Step 2: Compute real score (teacher prediction) - NO GRADIENTS NEEDED (FROZEN)
+        # Step 2: Compute real score (teacher) - NO GRADIENTS (frozen)
         real_score_model = self.model_map["real_score"]["fsdp_transformer"]
 
-        with torch.no_grad():  # Only teacher is frozen
+        with torch.no_grad():
             pred_real_cond = real_score_model(
                 hidden_states=noisy_latent,
-                timestep=timestep_model.to(self.bf16),
+                timestep=timestep.to(self.bf16),
                 encoder_hidden_states=text_embeddings,
                 return_dict=False,
             )
@@ -174,17 +261,16 @@ class DMDT2V:
 
             pred_real_uncond = real_score_model(
                 hidden_states=noisy_latent,
-                timestep=timestep_model.to(self.bf16),
+                timestep=timestep.to(self.bf16),
                 encoder_hidden_states=negative_text_embeddings,
                 return_dict=False,
             )
             if isinstance(pred_real_uncond, tuple):
                 pred_real_uncond = pred_real_uncond[0]
 
-            pred_real_image = pred_real_cond + (pred_real_cond - pred_real_uncond) * self.real_guidance_scale
+            pred_real_image = pred_real_uncond + self.real_guidance_scale * (pred_real_cond - pred_real_uncond)
 
         # Step 3: Compute DMD gradient (Equation 7)
-        # CRITICAL: Keep gradients flowing from fake_score
         grad = pred_fake_image - pred_real_image
 
         # Step 4: Gradient normalization (Equation 8)
@@ -194,16 +280,11 @@ class DMDT2V:
             normalizer = torch.clamp(normalizer, min=1e-5)
             grad = grad / normalizer
 
-        # Handle NaN/Inf
-        if torch.isnan(grad).any() or torch.isinf(grad).any():
-            print0("[WARNING] NaN/Inf detected in gradient, clamping...")
-            grad = torch.nan_to_num(grad, nan=0.0, posinf=10.0, neginf=-10.0)
+        self._assert_finite(grad, "dmd_gradient")
 
         log_dict = {
             "dmd_gradient_norm": torch.mean(torch.abs(grad)).detach(),
-            "timestep_mean": timestep_model.float().mean().detach(),
-            "timestep_min": timestep_model.float().min().detach(),
-            "timestep_max": timestep_model.float().max().detach(),
+            "timestep_mean": timestep.float().mean().detach(),
         }
 
         return grad, log_dict
@@ -221,38 +302,59 @@ class DMDT2V:
         """
         Compute DMD loss (Equation 7 in DMD paper).
 
-        CRITICAL FIX: Removed torch.no_grad() wrapper to allow gradient flow
+        Input: generated_latent from self-forcing pipeline (WITH gradients)
+        Output: DMD loss that flows gradients to generator AND critic
         """
         debug_mode = os.environ.get("DEBUG_TRAINING", "0") == "1"
 
         batch_size, num_channels, num_frame, height, width = generated_latent.shape
 
-        # CRITICAL FIX: No torch.no_grad() here! We need gradients to flow!
+        assert generated_latent.ndim == 5 and num_channels == 16
 
-        # Step 1: Sample DISCRETE timestep
-        timestep = self._sample_discrete_timestep(batch_size, num_frame, uniform_timestep=True)
-        timestep = timestep.clamp(self.min_step, self.max_step).long()
+        # Step 1: Sample timestep for DMD loss
+        if self.ts_schedule and denoised_timestep_to is not None:
+            min_timestep = max(denoised_timestep_to, self.min_score_timestep)
+        else:
+            min_timestep = self.min_score_timestep
 
-        # Step 2: Add noise to generated latent
-        noise = torch.randn_like(generated_latent, dtype=torch.float32)
+        if self.ts_schedule_max and denoised_timestep_from is not None:
+            max_timestep = min(denoised_timestep_from, self.num_train_timestep - 1)
+        else:
+            max_timestep = self.num_train_timestep - 1
 
-        # Permute and reshape for scheduler: [B, C, F, H, W] -> [B, F, C, H, W] -> [B*F, C, H, W]
-        generated_permuted = generated_latent.permute(0, 2, 1, 3, 4)
+        min_timestep = max(min_timestep, self.min_step)
+        max_timestep = min(max_timestep, self.max_step)
+
+        if min_timestep >= max_timestep:
+            min_timestep = self.min_step
+            max_timestep = self.max_step
+
+        timestep = torch.randint(min_timestep, max_timestep + 1, (batch_size,), device=self.device, dtype=torch.long)
+
+        # Step 2: Add noise (in fp32)
+        noise = torch.randn_like(generated_latent, dtype=torch.float32, device=self.device)
+        generated_fp32 = generated_latent.float()
+
+        # Permute and flatten for scheduler
+        generated_permuted = generated_fp32.permute(0, 2, 1, 3, 4)
         noise_permuted = noise.permute(0, 2, 1, 3, 4)
 
         generated_flat = generated_permuted.reshape(batch_size * num_frame, num_channels, height, width)
         noise_flat = noise_permuted.reshape(batch_size * num_frame, num_channels, height, width)
-        timestep_flat = timestep.flatten()
 
-        # IMPORTANT: Keep gradient flow through noising operation
-        noisy_latent_flat = self.scheduler.add_noise(generated_flat.float(), noise_flat, timestep_flat)
+        timestep_flat = timestep.unsqueeze(1).repeat(1, num_frame).flatten()
 
-        # Unflatten and permute back: [B*F, C, H, W] -> [B, F, C, H, W] -> [B, C, F, H, W]
+        noisy_latent_flat = self.scheduler.add_noise(generated_flat, noise_flat, timestep_flat)
+
+        # Unflatten and permute back
         noisy_latent_unflat = noisy_latent_flat.reshape(batch_size, num_frame, num_channels, height, width)
-        noisy_latent = noisy_latent_unflat.permute(0, 2, 1, 3, 4)
+        noisy_latent = noisy_latent_unflat.permute(0, 2, 1, 3, 4).to(self.bf16)
 
-        # Convert back to bf16 for model forward
-        noisy_latent = noisy_latent.to(self.bf16)
+        self._assert_finite(noisy_latent, "noisy_latent")
+
+        if debug_mode or (global_step % 100 == 0):
+            print0(f"[DMD LOSS] Step {global_step}")
+            print0(f"  Timestep range: [{timestep.min().item()}, {timestep.max().item()}]")
 
         # Step 3: Compute KL gradient
         grad, dmd_log_dict = self._compute_kl_grad(
@@ -265,34 +367,31 @@ class DMDT2V:
         )
 
         # Step 4: DMD loss (Equation 7)
-        # CRITICAL FIX: Don't detach grad - we need gradients to flow!
+        # CRITICAL: grad is NOT detached - gradients flow to critic!
         if gradient_mask is not None:
             dmd_loss = 0.5 * F.mse_loss(
                 generated_latent.double()[gradient_mask],
-                (generated_latent.double() - grad.double())[gradient_mask],  # Removed .detach()
+                (generated_latent.double() - grad.double())[gradient_mask],
                 reduction="mean",
             )
         else:
             dmd_loss = 0.5 * F.mse_loss(
                 generated_latent.double(),
-                (generated_latent.double() - grad.double()),  # Removed .detach()
+                (generated_latent.double() - grad.double()),  # NO .detach() here!
                 reduction="mean",
             )
 
-        # Check for NaN/Inf in loss
+        # Check for NaN/Inf
         if torch.isnan(dmd_loss) or torch.isinf(dmd_loss):
-            print0("[ERROR] Invalid DMD loss detected!")
-            print0(f"  Generated latent range: [{generated_latent.min():.3f}, {generated_latent.max():.3f}]")
-            print0(f"  Gradient range: [{grad.min():.3f}, {grad.max():.3f}]")
-            raise ValueError("DMD loss is NaN or Inf")
+            print0("[ERROR] Invalid DMD loss!")
+            raise ValueError(f"DMD loss is NaN or Inf: {dmd_loss.item()}")
 
         if debug_mode or (global_step % 100 == 0):
-            print0(f"[DMD LOSS] Step {global_step}")
-            print0(f"  Timestep range: [{timestep.min().item():.1f}, {timestep.max().item():.1f}]")
-            print0(f"  Gradient norm: {dmd_log_dict['dmd_gradient_norm'].item():.6f}")
             print0(f"  DMD loss: {dmd_loss.item():.6f}")
 
         return dmd_loss, dmd_log_dict
+
+    # In dmd_t2v.py, update compute_critic_loss method
 
     def compute_critic_loss(
         self,
@@ -302,24 +401,19 @@ class DMDT2V:
         denoised_timestep_to: Optional[int] = None,
         global_step: int = 0,
     ) -> Tuple[torch.Tensor, Dict]:
-        """
-        Compute critic (fake_score) training loss.
+        """Compute critic loss using custom Rectified Flow scheduler."""
 
-        FIXES FOR STABILITY:
-        1. Detach generated_latent to prevent feedback loop
-        2. Clamp predictions to reasonable range
-        3. Use Huber loss for robustness
-        4. Adaptive loss scaling
-        """
         debug_mode = os.environ.get("DEBUG_TRAINING", "0") == "1"
 
         batch_size, num_channels, num_frame, height, width = generated_latent.shape
 
-        # CRITICAL: Detach generated latent to prevent gradients flowing back to generator
-        # The critic should learn to denoise, not affect the generator
+        # Detach generated latent
         generated_latent = generated_latent.detach()
 
-        # Step 1: Sample timestep for critic
+        # Clamp input
+        generated_latent = torch.clamp(generated_latent, min=-10.0, max=10.0)
+
+        # Sample timestep
         if self.ts_schedule and denoised_timestep_to is not None:
             min_timestep = max(denoised_timestep_to, self.min_score_timestep)
         else:
@@ -330,7 +424,6 @@ class DMDT2V:
         else:
             max_timestep = self.num_train_timestep - 1
 
-        # Ensure valid range
         min_timestep = max(min_timestep, self.min_step)
         max_timestep = min(max_timestep, self.max_step)
 
@@ -338,176 +431,113 @@ class DMDT2V:
             min_timestep = self.min_step
             max_timestep = self.max_step
 
-        # Generate timestep as [B], not [B, F]
         critic_timestep = torch.randint(
             min_timestep, max_timestep + 1, (batch_size,), device=self.device, dtype=torch.long
         )
 
-        # For scheduler, we need [B*F] timesteps
         critic_timestep_scheduler = critic_timestep.unsqueeze(1).repeat(1, num_frame).flatten()
 
-        # Step 2: Add noise to generated latent
-        critic_noise = torch.randn_like(generated_latent, dtype=torch.float32)
+        # Generate noise
+        noise = torch.randn_like(generated_latent, dtype=torch.float32, device=self.device)
 
-        # Permute and reshape for scheduler
+        # Permute for scheduler
         generated_permuted = generated_latent.permute(0, 2, 1, 3, 4)
-        noise_permuted = critic_noise.permute(0, 2, 1, 3, 4)
+        noise_permuted = noise.permute(0, 2, 1, 3, 4)
 
         generated_flat = generated_permuted.reshape(batch_size * num_frame, num_channels, height, width)
         noise_flat = noise_permuted.reshape(batch_size * num_frame, num_channels, height, width)
 
+        # Add noise using custom scheduler
         noisy_generated_flat = self.scheduler.add_noise(generated_flat.float(), noise_flat, critic_timestep_scheduler)
 
-        # Unflatten and permute back
+        # Unflatten
         noisy_generated_unflat = noisy_generated_flat.reshape(batch_size, num_frame, num_channels, height, width)
-        noisy_generated_latent = noisy_generated_unflat.permute(0, 2, 1, 3, 4)
+        noisy_generated_latent = noisy_generated_unflat.permute(0, 2, 1, 3, 4).to(self.bf16)
 
-        # Convert to bf16 for model forward
-        noisy_generated_latent = noisy_generated_latent.to(self.bf16)
+        if debug_mode or (global_step % 100 == 0):
+            print0(
+                f"[CRITIC] Noisy latent range: [{noisy_generated_latent.min():.3f}, {noisy_generated_latent.max():.3f}]"
+            )
 
-        # Step 3: Critic forward pass
+        # Critic forward pass
         fake_score_model = self.model_map["fake_score"]["fsdp_transformer"]
 
-        pred_fake_image = fake_score_model(
+        pred_x0 = fake_score_model(
             hidden_states=noisy_generated_latent,
             timestep=critic_timestep.to(self.bf16),
             encoder_hidden_states=text_embeddings,
             return_dict=False,
         )
-        if isinstance(pred_fake_image, tuple):
-            pred_fake_image = pred_fake_image[0]
+        if isinstance(pred_x0, tuple):
+            pred_x0 = pred_x0[0]
 
-        # STABILITY FIX: Clamp predictions to reasonable range
-        pred_fake_image = torch.clamp(pred_fake_image, min=-50.0, max=50.0)
+        # Clamp prediction
+        pred_x0 = torch.clamp(pred_x0, min=-10.0, max=10.0)
 
-        # Step 4: Compute denoising loss
+        # Compute loss based on denoising_loss_type
         if self.denoising_loss_type == "flow":
-            # Flow matching loss
-            pred_fake_permuted = pred_fake_image.permute(0, 2, 1, 3, 4)
+            # Convert to velocity using CUSTOM SCHEDULER
+            pred_x0_permuted = pred_x0.permute(0, 2, 1, 3, 4)
             noisy_permuted = noisy_generated_latent.permute(0, 2, 1, 3, 4)
             generated_permuted = generated_latent.permute(0, 2, 1, 3, 4)
 
-            pred_fake_flat = pred_fake_permuted.reshape(batch_size * num_frame, num_channels, height, width)
+            pred_x0_flat = pred_x0_permuted.reshape(batch_size * num_frame, num_channels, height, width)
             noisy_flat = noisy_permuted.reshape(batch_size * num_frame, num_channels, height, width)
             generated_flat = generated_permuted.reshape(batch_size * num_frame, num_channels, height, width)
 
-            flow_pred = self._convert_x0_to_flow_pred(
-                x0_pred=pred_fake_flat,
-                xt=noisy_flat,
+            # KEY: Use custom scheduler's velocity computation
+            velocity_pred = self.scheduler.get_velocity_from_x0_pred(
+                x_t=noisy_flat.float(),
+                x_0_pred=pred_x0_flat.float(),
                 timestep=critic_timestep_scheduler,
             )
 
-            target_flow = self._convert_x0_to_flow_pred(
-                x0_pred=generated_flat,
-                xt=noisy_flat,
+            velocity_target = self.scheduler.get_velocity_from_x0_pred(
+                x_t=noisy_flat.float(),
+                x_0_pred=generated_flat.float(),
                 timestep=critic_timestep_scheduler,
             )
 
-            # STABILITY FIX: Clamp flow predictions
-            flow_pred = torch.clamp(flow_pred, min=-100.0, max=100.0)
-            target_flow = torch.clamp(target_flow, min=-100.0, max=100.0)
+            if debug_mode or (global_step % 100 == 0):
+                print0(f"[CRITIC] Velocity pred range: [{velocity_pred.min():.3f}, {velocity_pred.max():.3f}]")
+                print0(f"[CRITIC] Velocity target range: [{velocity_target.min():.3f}, {velocity_target.max():.3f}]")
 
-            # Use Huber loss for robustness (less sensitive to outliers)
-            critic_loss = F.huber_loss(flow_pred.float(), target_flow.float(), delta=1.0)
+            # Compute loss
+            critic_loss = F.huber_loss(velocity_pred, velocity_target, delta=1.0)
 
         elif self.denoising_loss_type == "x0":
-            # Direct x0 prediction with Huber loss
-            critic_loss = F.huber_loss(pred_fake_image.float(), generated_latent.float(), delta=1.0)
-
-        elif self.denoising_loss_type == "epsilon":
-            pred_fake_permuted = pred_fake_image.permute(0, 2, 1, 3, 4)
-            noisy_permuted = noisy_generated_latent.permute(0, 2, 1, 3, 4)
-
-            pred_fake_flat = pred_fake_permuted.reshape(batch_size * num_frame, num_channels, height, width)
-            noisy_flat = noisy_permuted.reshape(batch_size * num_frame, num_channels, height, width)
-
-            pred_noise = self._convert_x0_to_noise(
-                x0=pred_fake_flat,
-                xt=noisy_flat,
-                timestep=critic_timestep_scheduler,
-            )
-
-            critic_noise_flat = critic_noise.permute(0, 2, 1, 3, 4).reshape(
-                batch_size * num_frame, num_channels, height, width
-            )
-
-            # Clamp noise predictions
-            pred_noise = torch.clamp(pred_noise, min=-50.0, max=50.0)
-
-            critic_loss = F.huber_loss(pred_noise.float(), critic_noise_flat.float(), delta=1.0)
+            # Direct x0 loss
+            critic_loss = F.huber_loss(pred_x0.float(), generated_latent.float(), delta=1.0)
 
         else:
             raise ValueError(f"Unknown denoising_loss_type: {self.denoising_loss_type}")
 
-        # STABILITY FIX: Scale loss if it's too large early in training
-        if global_step < 100 and critic_loss > 10.0:
-            critic_loss = critic_loss / 10.0
-            if debug_mode:
-                print0("  [SCALING] Applied 10x loss scaling for early training stability")
-
-        # Check for NaN/Inf
+        # Check for issues
         if torch.isnan(critic_loss) or torch.isinf(critic_loss):
-            print0("[ERROR] Invalid critic loss detected!")
-            print0(f"  pred_fake_image range: [{pred_fake_image.min():.3f}, {pred_fake_image.max():.3f}]")
-            print0(f"  generated_latent range: [{generated_latent.min():.3f}, {generated_latent.max():.3f}]")
+            print0("[ERROR] Invalid critic loss!")
             raise ValueError("Critic loss is NaN or Inf")
 
-        # STABILITY CHECK: Warn if loss is still high but don't crash
-        if critic_loss > 100.0:
-            print0(f"[WARNING] High critic loss: {critic_loss.item():.2f}")
-            print0("  This may indicate instability. Consider:")
-            print0("    - Reducing critic learning rate")
-            print0("    - Using gradient clipping (already enabled)")
-            print0("    - Checking timestep range")
+        # Adaptive explosion threshold
+        if global_step < 50:
+            explosion_threshold = 1000.0
+        elif global_step < 100:
+            explosion_threshold = 500.0
+        else:
+            explosion_threshold = 100.0
+
+        if critic_loss > explosion_threshold:
+            print0(f"[WARNING] High critic loss: {critic_loss.item():.3f} (threshold: {explosion_threshold})")
+
+            if global_step >= 100:
+                print0("[ERROR] Critic loss explosion after warmup!")
+                raise ValueError(f"Critic loss exploded: {critic_loss.item()}")
 
         if debug_mode or (global_step % 100 == 0):
-            print0(f"[CRITIC LOSS] Step {global_step}")
-            print0(f"  Timestep range: [{critic_timestep.min().item():.1f}, {critic_timestep.max().item():.1f}]")
-            print0(f"  Critic loss: {critic_loss.item():.6f}")
-            print0(f"  Pred range: [{pred_fake_image.min().item():.2f}, {pred_fake_image.max().item():.2f}]")
+            print0(f"[CRITIC LOSS] {critic_loss.item():.6f}")
 
         log_dict = {
             "critic_timestep_mean": critic_timestep.float().mean().detach(),
             "critic_loss_value": critic_loss.detach(),
-            "pred_fake_range_min": pred_fake_image.min().detach(),
-            "pred_fake_range_max": pred_fake_image.max().detach(),
         }
 
         return critic_loss, log_dict
-
-    def _convert_x0_to_flow_pred(self, x0_pred: torch.Tensor, xt: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
-        """Convert x0 prediction to flow prediction."""
-        timestep = timestep.to(x0_pred.device, dtype=torch.float32)
-
-        # Normalize timestep to [0, 1]
-        t_norm = timestep / self.num_train_timestep
-        t_norm = torch.clamp(t_norm, min=1e-5, max=1.0)
-
-        # Compute sigma with shift
-        sigma = self.timestep_shift / (self.timestep_shift + (1.0 / t_norm - 1.0))
-        sigma = sigma.view(-1, 1, 1, 1)
-
-        # Flow prediction
-        flow_pred = (x0_pred - xt) / (1.0 - sigma + 1e-5)
-
-        return flow_pred
-
-    def _convert_x0_to_noise(self, x0: torch.Tensor, xt: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
-        """Convert x0 to noise prediction."""
-        timestep = timestep.to(x0.device, dtype=torch.long)
-
-        if hasattr(self.scheduler, "alphas_cumprod") and self.scheduler.alphas_cumprod is not None:
-            max_idx = len(self.scheduler.alphas_cumprod) - 1
-            timestep = torch.clamp(timestep, 0, max_idx)
-
-            alpha_bar = self.scheduler.alphas_cumprod.to(x0.device)[timestep]
-            alpha_bar = alpha_bar.view(-1, 1, 1, 1)
-
-            sqrt_alpha_bar = torch.sqrt(alpha_bar + 1e-8)
-            sqrt_one_minus_alpha_bar = torch.sqrt(torch.clamp(1.0 - alpha_bar, min=1e-8))
-
-            noise_pred = (xt - sqrt_alpha_bar * x0) / sqrt_one_minus_alpha_bar
-        else:
-            noise_pred = xt - x0
-
-        return noise_pred

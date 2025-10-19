@@ -1,4 +1,4 @@
-# trainer_dmd_t2v.py - WAN 2.1 T2V DMD Trainer with Alternating Optimization
+# trainer_dmd_t2v.py - Fixed to remove redundant pipeline
 
 import os
 from typing import Optional
@@ -18,19 +18,20 @@ from fsdp_dmd_utils_t2v import (
     test_fsdp_dmd_forward_pass,
     verify_fsdp_dmd_setup,
 )
-from pipeline_t2v import BackwardSimulationPipeline
 from training_step_dmd_t2v import step_dmd_alternating
 
 
 class WanDMDTrainerT2V:
     """
-    WAN 2.1 T2V DMD Trainer with full parameter fine-tuning.
+    WAN 2.1 T2V DMD Trainer with self-forcing.
 
     This trainer implements Distribution Matching Distillation (DMD) with:
     - 3 full models: generator (student), teacher (real_score), critic (fake_score)
-    - Backward simulation for data-free distillation
+    - Self-forcing backward simulation (internal to DMD model)
     - Alternating optimization of generator and critic
     - Memory-efficient FSDP with CPU offloading
+
+    KEY CHANGE: Pipeline is now internal to DMD model, not created separately.
     """
 
     def __init__(
@@ -57,29 +58,7 @@ class WanDMDTrainerT2V:
         generator_steps: int = 1,
         critic_steps: int = 1,
     ):
-        """
-        Initialize DMD trainer.
-
-        Args:
-            model_id: HuggingFace model ID for base model
-            teacher_model_path: Optional path to teacher checkpoint
-            learning_rate: Learning rate for generator
-            critic_learning_rate: Learning rate for critic (defaults to learning_rate)
-            cpu_offload: Enable CPU offloading for parameters
-            num_train_timestep: Total training timesteps (1000)
-            min_step: Minimum timestep for noise (20)
-            max_step: Maximum timestep for noise (980)
-            real_guidance_scale: CFG scale for teacher (5.0)
-            fake_guidance_scale: CFG scale for critic (0.0)
-            timestep_shift: Flow matching shift parameter (3.0)
-            ts_schedule: Use dynamic timestep scheduling
-            ts_schedule_max: Use max timestep scheduling
-            min_score_timestep: Minimum timestep for critic
-            denoising_loss_type: "flow" or "epsilon" or "x0"
-            denoising_step_list: List of discrete timesteps for backward simulation
-            generator_steps: Number of generator updates per iteration
-            critic_steps: Number of critic updates per iteration
-        """
+        """Initialize DMD trainer with self-forcing."""
         self.model_id = model_id
         self.teacher_model_path = teacher_model_path
         self.learning_rate = learning_rate
@@ -114,7 +93,7 @@ class WanDMDTrainerT2V:
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
         self.device = torch.device("cuda", self.local_rank)
 
-        print0("[INFO] WAN 2.1 T2V DMD Trainer")
+        print0("[INFO] WAN 2.1 T2V DMD Trainer with Self-Forcing")
         print0(f"[INFO] Total GPUs: {self.world_size}, Local rank: {self.local_rank}")
         print0(f"[INFO] Generator LR: {self.learning_rate}")
         print0(f"[INFO] Critic LR: {self.critic_learning_rate}")
@@ -124,18 +103,19 @@ class WanDMDTrainerT2V:
         print0(f"  - Timestep shift: {timestep_shift}")
         print0(f"  - Denoising steps: {self.denoising_step_list}")
         print0(f"  - Alternating: {generator_steps} gen / {critic_steps} critic")
+        print0("[INFO] Self-forcing: Pipeline internal to DMD model")
 
         # Initialize components
         self.pipe = None
         self.model_map = {}
         self.dmd_model = None
-        self.pipeline = None
+        # REMOVED: self.pipeline - now internal to dmd_model
         self.generator_optimizer = None
         self.critic_optimizer = None
         self.lr_scheduler = None
 
     def setup_pipeline(self):
-        """Load WAN 2.1 T2V pipeline (transformer only)."""
+        """Load WAN 2.1 T2V pipeline with custom scheduler."""
         print0("[INFO] Loading WAN 2.1 T2V pipeline...")
 
         # Load pipeline without VAE or text encoder
@@ -146,7 +126,7 @@ class WanDMDTrainerT2V:
             text_encoder=None,
         )
 
-        # Remove VAE and text encoder if loaded
+        # Remove VAE and text encoder
         if hasattr(self.pipe, "vae") and self.pipe.vae is not None:
             del self.pipe.vae
             self.pipe.vae = None
@@ -155,10 +135,17 @@ class WanDMDTrainerT2V:
             del self.pipe.text_encoder
             self.pipe.text_encoder = None
 
+        # CRITICAL: Replace with custom Rectified Flow scheduler
+        from rectified_flow_scheduler import create_wan_scheduler
+
+        print0("[INFO] Replacing scheduler with custom Rectified Flow scheduler...")
+        self.pipe.scheduler = create_wan_scheduler(shift=self.timestep_shift)
+        print0("[INFO] Custom scheduler initialized")
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        print0("[INFO] Pipeline loaded (transformer + scheduler only)")
+        print0("[INFO] Pipeline loaded with custom scheduler")
 
     def setup_fsdp(self):
         """Setup FSDP for 3 models (generator, teacher, critic)."""
@@ -179,8 +166,13 @@ class WanDMDTrainerT2V:
         print0("[INFO] FSDP setup complete")
 
     def setup_dmd_model(self):
-        """Initialize DMD model."""
-        print0("[INFO] Setting up DMD model...")
+        """
+        Initialize DMD model.
+
+        KEY: The self-forcing pipeline is created INTERNALLY by the DMD model.
+        We don't create it separately anymore.
+        """
+        print0("[INFO] Setting up DMD model with self-forcing...")
 
         self.dmd_model = DMDT2V(
             model_map=self.model_map,
@@ -197,25 +189,13 @@ class WanDMDTrainerT2V:
             ts_schedule_max=self.ts_schedule_max,
             min_score_timestep=self.min_score_timestep,
             denoising_loss_type=self.denoising_loss_type,
-            denoising_step_list=self.denoising_step_list,  # CRITICAL: Pass discrete timesteps!
+            denoising_step_list=self.denoising_step_list,
         )
 
         print0("[INFO] DMD model initialized")
+        print0("[INFO] Self-forcing pipeline will be created on first use (lazy init)")
 
-    def setup_backward_simulation(self):
-        """Initialize backward simulation pipeline."""
-        print0("[INFO] Setting up backward simulation pipeline...")
-
-        self.pipeline = BackwardSimulationPipeline(
-            scheduler=self.pipe.scheduler,
-            generator_model=self.model_map["generator"]["fsdp_transformer"],
-            denoising_step_list=self.denoising_step_list,
-            device=self.device,
-            bf16=self.bf16,
-            last_step_only=True,
-        )
-
-        print0("[INFO] Backward simulation pipeline initialized")
+    # REMOVED: setup_backward_simulation() method entirely
 
     def setup_optim(self):
         """Setup optimizers for generator and critic."""
@@ -265,26 +245,17 @@ class WanDMDTrainerT2V:
         resume_checkpoint: Optional[str] = None,
     ):
         """
-        Train the DMD model with alternating optimization.
-
-        Args:
-            meta_folder: Path to preprocessed .meta files
-            num_epochs: Number of training epochs
-            batch_size_per_gpu: Batch size per GPU
-            save_every: Save checkpoint every N steps
-            log_every: Log metrics every N steps
-            output_dir: Output directory for checkpoints
-            resume_checkpoint: Optional checkpoint to resume from
+        Train the DMD model with self-forcing and alternating optimization.
         """
-        print0("[INFO] Starting DMD training")
+        print0("[INFO] Starting DMD training with self-forcing")
         print0(f"[INFO] Batch size per GPU: {batch_size_per_gpu}")
         print0(f"[INFO] Total effective batch size: {batch_size_per_gpu * self.world_size}")
 
         # Setup all components
         self.setup_pipeline()
         self.setup_fsdp()
-        self.setup_dmd_model()
-        self.setup_backward_simulation()
+        self.setup_dmd_model()  # Pipeline created internally
+        # REMOVED: self.setup_backward_simulation()
         self.setup_optim()
         self.validate_setup()
 
@@ -294,13 +265,13 @@ class WanDMDTrainerT2V:
             batch_size=batch_size_per_gpu,
             shuffle=True,
             num_workers=2,
-            device="cpu",  # Load to CPU first, then move to GPU
+            device="cpu",
         )
 
         steps_per_epoch = len(dataloader)
         total_steps = num_epochs * steps_per_epoch
 
-        # Reconfigure scheduler with actual total steps
+        # Reconfigure scheduler
         self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.generator_optimizer, T_max=total_steps, eta_min=1e-6
         )
@@ -328,7 +299,7 @@ class WanDMDTrainerT2V:
                 "batch_size_per_gpu": batch_size_per_gpu,
                 "total_batch_size": batch_size_per_gpu * self.world_size,
                 "total_gpus": self.world_size,
-                "approach": "wan_dmd_t2v_full",
+                "approach": "wan_dmd_t2v_self_forcing",
                 "cpu_offload": self.cpu_offload,
                 # DMD config
                 "real_guidance_scale": self.real_guidance_scale,
@@ -338,10 +309,11 @@ class WanDMDTrainerT2V:
                 "denoising_loss_type": self.denoising_loss_type,
                 "generator_steps": self.generator_steps,
                 "critic_steps": self.critic_steps,
+                "self_forcing": True,
             }
 
             wandb.init(
-                project="wan-dmd-t2v",
+                project="wan-dmd-t2v-self-forcing",
                 config=config,
                 resume=resume_checkpoint is not None,
             )
@@ -370,7 +342,7 @@ class WanDMDTrainerT2V:
                     try:
                         gen_loss, _, metrics = step_dmd_alternating(
                             dmd_model=self.dmd_model,
-                            pipeline=self.pipeline,
+                            pipeline=None,  # No longer used - self-forcing is internal
                             batch=batch,
                             device=self.device,
                             bf16=self.bf16,
@@ -406,7 +378,7 @@ class WanDMDTrainerT2V:
                     try:
                         _, critic_loss, crit_metrics = step_dmd_alternating(
                             dmd_model=self.dmd_model,
-                            pipeline=self.pipeline,
+                            pipeline=None,  # No longer used
                             batch=batch,
                             device=self.device,
                             bf16=self.bf16,
@@ -472,7 +444,7 @@ class WanDMDTrainerT2V:
                         self.lr_scheduler,
                         output_dir,
                         global_step,
-                        consolidate=True,  # Always save consolidated model
+                        consolidate=True,
                     )
 
             # Epoch summary
@@ -503,11 +475,11 @@ class WanDMDTrainerT2V:
                 self.lr_scheduler,
                 output_dir,
                 global_step,
-                consolidate=True,  # Always consolidate final checkpoint
+                consolidate=True,
             )
 
             print0(f"[INFO] Saved final checkpoint at step {global_step}")
 
             wandb.finish()
 
-        print0("[INFO] DMD training complete!")
+        print0("[INFO] DMD training with self-forcing complete!")
