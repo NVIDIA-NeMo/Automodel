@@ -103,7 +103,7 @@ Below are examples for each pattern.
 Below is the minimal GPT‑2 [implementation](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/models/gpt2.py) used for this NanoGPT‑style pretraining flow.
 It is a pure‑PyTorch model with tied embeddings and standard transformer blocks:
 
-```nemo_automodel/components/models/gpt2.py
+```
 """
 Self-contained GPT-2 (Causal LM) implementation.
 
