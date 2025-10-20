@@ -56,6 +56,8 @@ jobs:
       - name: Check Uv PyTorch lock
         run: |
           set +e
+          mv uv.lock uv_main.lock
+          mv docker/common/uv-pytorch.lock uv.lock
           sed -i '/\[tool\.uv\]/r docker/common/uv-pytorch.toml' pyproject.toml
           uv lock --check
           EXIT_CODE=$?
@@ -63,11 +65,10 @@ jobs:
             echo 'Uv PyTorch lock file is update to date'
           else
             echo 'Updating uv PyTorch lock file'
-            mv uv.lock uv_main.lock
             uv lock
-            mv uv.lock docker/common/uv-pytorch.lock
-            mv uv_main.lock uv.lock
           fi
+          mv uv.lock docker/common/uv-pytorch.lock
+          mv uv_main.lock uv.lock
 
       - uses: EndBug/add-and-commit@v9
         with:
