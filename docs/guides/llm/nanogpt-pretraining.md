@@ -1,4 +1,4 @@
-# NanoGPT-style Pre-Training with NeMo Automodel
+# NanoGPT-style Pre-Training with NeMo AutoModel
 
 This guide walks you through **data preparation** and **model training** for a [NanoGPT-like](https://github.com/KellerJordan/modded-nanogpt) run using the new `NanogptDataset` and pre-training recipe.
 
@@ -14,14 +14,14 @@ In particular, it will show you how to:
 
 ## 1. Environment setup
 
-In this guide we will use an interactive environment, to install NeMo Automodel from git. You can always install NeMo Automodel from pypi or use our bi-monthly docker container.
+In this guide we will use an interactive environment, to install NeMo AutoModel from git. You can always install NeMo AutoModel from pypi or use our bi-monthly docker container.
 
 ```bash
-# clone / install Automodel (editable for local hacks)
+# clone / install AutoModel (editable for local hacks)
 cd /path/to/workspace/ # specify to your path as needed.
-git clone git@github.com:NVIDIA-NeMo/Automodel.git
-cd Automodel/
-pip install -e .[all]    # installs NeMo Automodel + optional extras
+git clone git@github.com:NVIDIA-NeMo/AutoModel.git
+cd AutoModel/
+pip install -e .[all]    # installs NeMo AutoModel + optional extras
 ```
 
 :::note
@@ -36,13 +36,19 @@ You can run this guide with a single GPU by changing the config.
 
 ## 2. Pre-process the FineWeb dataset
 
-The 🍷 [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) dataset consists of more than 18.5T tokens (originally 15T tokens) of cleaned and deduplicated english web data from CommonCrawl. The data processing pipeline is optimized for LLM performance and ran on the 🏭 datatrove library, our large scale data processing library.
+### Quick intro to the FineWeb dataset
+The 🍷 [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) dataset consists of more than 18.5T tokens (originally 15T tokens) of cleaned and deduplicated english web data from [CommonCrawl](https://commoncrawl.org/). The data processing pipeline is optimized for LLM performance and ran on the 🏭 datatrove library, our large scale data processing library.
 
-We provide a robust data preprocessing tool at `tools/nanogpt_data_processor.py` that streams datasets from the Hugging Face Hub, tokenizes with GPT-2 BPE (`tiktoken`), and writes **memory-mapped binary shards** that `NanogptDataset` can stream efficiently at training time.
+Briefly, FineWeb is built by extracting main text from CommonCrawl WARC HTML, keeping English pages via fastText language scoring, applying multiple quality filters (e.g., Gopher repetition/quality checks, C4-style rules, and custom heuristics for list-like or repeated/poorly formatted lines), and then MinHash-deduplicating each crawl independently (5-gram shingling with 14×8 hash functions). Basic PII normalization is applied (e.g., anonymizing emails and public IPs). The result is released per-crawl (and convenient sampled subsets), ready for high-throughput streaming.
+
+### Pre-processing and Tokenization
+
+For the purposes of this guide, we provide a robust data preprocessing tool at `tools/nanogpt_data_processor.py` that streams datasets from the Hugging Face Hub, tokenizes with GPT-2 BPE (`tiktoken`), and writes **memory-mapped binary shards** to files. During training, we use the `NanogptDataset` class that can stream efficiently at training time.
+
 
 ```bash
 # Step into repo root
-cd /path/to/workspace/Automodel/
+cd /path/to/workspace/AutoModel/
 
 # Generate 500 million tokens using the 10B raw split
 python tools/nanogpt_data_processor.py \
@@ -173,7 +179,7 @@ Key configuration sections:
 ```yaml
 # Model configuration (two options available)
 model:
-  _target_: nemo_automodel.components.models.gpt2.build_gpt2_model
+  _target_: nemo_AutoModel.components.models.gpt2.build_gpt2_model
   vocab_size: 50258
   n_positions: 2048
   n_embd: 768
@@ -182,20 +188,20 @@ model:
 
 # Dataset configuration
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset
+  _target_: nemo_AutoModel.components.datasets.llm.nanogpt_dataset.NanogptDataset
   file_pattern: "tools/fineweb_max_tokens_500M/dataset.bin"
   seq_len: 1024
   shuffle_files: true
 
 # Distributed training
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  _target_: nemo_AutoModel.components.distributed.fsdp2.FSDP2Manager
   dp_size: none
   tp_size: 1
   cp_size: 1
 ```
 
-**About `_target_` configuration**: The `_target_` field specifies import paths to classes and functions within the nemo_automodel repository (or any Python module). For example, `nemo_automodel.components.models.gpt2.build_gpt2_model` imports and calls the GPT-2 model builder function. You can also specify paths to your own Python files (e.g., `my_custom_models.MyTransformer`) to use custom `nn.Module` implementations, allowing full flexibility in model architecture while leveraging the training infrastructure.
+**About `_target_` configuration**: The `_target_` field specifies import paths to classes and functions within the nemo_AutoModel repository (or any Python module). For example, `nemo_AutoModel.components.models.gpt2.build_gpt2_model` imports and calls the GPT-2 model builder function. You can also specify paths to your own Python files (e.g., `my_custom_models.MyTransformer`) to use custom `nn.Module` implementations, allowing full flexibility in model architecture while leveraging the training infrastructure.
 
 Update the `file_pattern` to match your data location. For example, if using `tools/nanogpt_data_processor.py` with the default settings: `"tools/fineweb_max_tokens_500M/dataset.bin"`
 
@@ -217,11 +223,11 @@ torchrun --standalone --nproc-per-node 8 \
 
 # Using the AutoModel CLI:
 # single-GPU
-automodel pretrain llm -c examples/llm_pretrain/nanogpt_pretrain.yaml
+AutoModel pretrain llm -c examples/llm_pretrain/nanogpt_pretrain.yaml
 
 # multi-GPU (AutoModel CLI + torchrun on 8 GPUs)
-automodel --nproc-per-node 8 \
-  $(which automodel) pretrain llm \
+AutoModel --nproc-per-node 8 \
+  $(which AutoModel) pretrain llm \
   -c examples/llm_pretrain/nanogpt_pretrain.yaml
 ```
 :::tip
