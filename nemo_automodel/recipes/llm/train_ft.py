@@ -98,15 +98,34 @@ def _get_model_name(cfg_model):
         return None
 
 
+def _get_packed_sequence_config(has_packed_sequence, is_hf_model, cp_size):
+    kwargs = {}
+    if has_packed_sequence and is_hf_model:
+        if cp_size == 1:
+            kwargs["attn_implementation"] = "flash_attention_2"
+            logger.warning(
+                "Packed sequence is supported only with Flash Attention. "
+                "Setting model's attn_implementation to flash_attention_2"
+            )
+        else:
+            # TODO: support packed sequence with CP size > 1
+            raise ValueError("Packed sequence is only supported with CP size 1")
+    if cp_size > 1 and is_hf_model:
+        kwargs["attn_implementation"] = "sdpa"
+        logger.warning("Packed sequence is supported only with SDPA. Setting model's attn_implementation to sdpa")
+
+    return kwargs
+
+
 def build_model_and_optimizer(
     device,
     cfg_model,
     cfg_opt,
-    use_hf_fa2,
     cfg_peft,
     model_wrapper,
     seed,
     checkpointer: Checkpointer,
+    has_packed_sequence=False,
     tp_size=1,
     cp_size=1,
     cfg_fp8=None,
@@ -150,12 +169,7 @@ def build_model_and_optimizer(
     init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
     with ScopedRNG(seed=seed, ranked=True):
         kwargs = {}
-        if use_hf_fa2 and is_hf_model:
-            kwargs["attn_implementation"] = "flash_attention_2"
-            logger.warning(
-                "Packed sequence is supported only with Flash Attention. "
-                "Setting model's attn_implementation to flash_attention_2"
-            )
+        kwargs.update(_get_packed_sequence_config(has_packed_sequence, is_hf_model, cp_size))
 
         if cfg_quantization is not None:
             logger.info("Model weight quantization enabled with BitsAndBytes")
@@ -169,6 +183,11 @@ def build_model_and_optimizer(
                 logger.info("Disabling Liger kernel with TP ({}) or CP ({})".format(tp_size, cp_size))
                 kwargs["use_liger_kernel"] = False
             model = cfg_model.instantiate(**kwargs)
+
+            # Check if the model supports SDPA and raise an error if it doesn't
+            if cp_size > 1 and is_hf_model and hasattr(model, "_supports_sdpa"):
+                if model._supports_sdpa is False:
+                    raise ValueError("Model does not support SDPA required for context parallelism")
 
             # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
             if cfg_peft is not None:
@@ -754,9 +773,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._log_experiment_details()
         self._log_library_versions()
 
-        # Check if packed_sequence_size > 0 and use HF's flash_attention_2 for attn implementation.
-        use_hf_fa2 = self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
-
         self.pp_enabled: bool = (
             True if hasattr(self.model_wrapper, "pp_size") and self.model_wrapper.pp_size > 1 else False
         )
@@ -829,9 +845,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.dist_env.device,
             self.cfg.model,
             self.cfg.optimizer,
-            use_hf_fa2,
             self.peft_config,
             self.model_wrapper,
+            has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
             seed=self.cfg.get("seed", 42),
             tp_size=self.cfg.get("distributed.tp_size", 1),
             cp_size=self.cfg.get("distributed.cp_size", 1),
