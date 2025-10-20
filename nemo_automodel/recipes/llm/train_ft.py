@@ -121,6 +121,7 @@ def _get_num_thd_chunks(pp_enabled, cfg):
         return cfg.step_scheduler.local_batch_size // cfg.autopipeline.pp_microbatch_size
     return 1
 
+
 def _get_packed_sequence_config(has_packed_sequence, is_hf_model, cp_size):
     kwargs = {}
     if has_packed_sequence and is_hf_model:
@@ -139,7 +140,6 @@ def _get_packed_sequence_config(has_packed_sequence, is_hf_model, cp_size):
 
     return kwargs
 
-  
 
 def build_model_and_optimizer(
     device,
