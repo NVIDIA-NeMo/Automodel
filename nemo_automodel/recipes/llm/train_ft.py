@@ -157,8 +157,9 @@ def build_model_and_optimizer(
         The instantiated model on the specified device, the state dict keys before any parallelization, the optimizer, and the loss function.
     """
     is_hf_model = cfg_model.get("pretrained_model_name_or_path", None) is not None
-    is_meta_device = cfg_model.get("is_meta_device", False)
-    if is_meta_device:
+    is_meta_device = False
+    if hasattr(cfg_model, "is_meta_device"):
+        is_meta_device = cfg_model.is_meta_device
         if is_meta_device and isinstance(model_wrapper, MegatronFSDPManager):
             raise ValueError("Meta device initialization is not supported with MegatronFSDPManager")
         del cfg_model.is_meta_device
