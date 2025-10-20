@@ -219,16 +219,18 @@ def _parallelize_qwen(
 
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
+
 def _parallelize_qwen_classification(
     model: Union[Qwen3ForSequenceClassification],
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     plan = _parallelize_qwen(model, sequence_parallel)
-    assert not hasattr(model, 'lm_head'), 'Expected model not to have lm_head'
-    del plan['lm_head']
-    assert hasattr(model, 'score'), 'Expected model to have score'
+    assert not hasattr(model, "lm_head"), "Expected model not to have lm_head"
+    del plan["lm_head"]
+    assert hasattr(model, "score"), "Expected model to have score"
     plan["score"] = ColwiseParallel()
     return plan
+
 
 # Phi3: fused attention cannot be sharded; shard MLP as in HF guidance
 def _parallelize_phi3(
