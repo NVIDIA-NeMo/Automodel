@@ -18,46 +18,17 @@ import torch
 from torch import nn
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
-from nemo_automodel.components.moe.rope_utils import apply_rotary_emb, yarn_get_mscale
+from nemo_automodel.components.attention.utils import (
+    initialize_attn_module_and_func,
+    postprocess_output_for_attn,
+    preprocess_args_and_kwargs_for_attn,
+)
+from nemo_automodel.components.models.deepseek_v3.rope_utils import apply_rotary_emb, yarn_get_mscale
 from nemo_automodel.components.moe.utils import (
     BackendConfig,
-    initialize_attn_module_and_func,
     initialize_linear_module,
     initialize_rms_norm_module,
 )
-
-
-def preprocess_args_and_kwargs_for_attn(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attention_mask: torch.Tensor | None, backend: BackendConfig
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-    """Preprocess attention inputs based on backend requirements."""
-    # Create attention kwargs based on backend
-    if backend.attn == "te":
-        if attention_mask is None:
-            attn_kwargs = {}
-        else:
-            padding_mask = attention_mask.logical_not()
-            attn_kwargs = {
-                "attn_mask_type": "padding_causal",
-                "window_size": (-1, 0),
-                "attention_mask": padding_mask.unsqueeze(1).unsqueeze(2),
-            }
-    else:  # sdpa
-        attn_kwargs = {}
-        # Transpose for SDPA
-        q = q.transpose(1, 2).contiguous()
-        k = k.transpose(1, 2).contiguous()
-        v = v.transpose(1, 2).contiguous()
-        attn_kwargs["is_causal"] = True
-
-    return q, k, v, attn_kwargs
-
-
-def postprocess_output_for_attn(x: torch.Tensor, backend: BackendConfig) -> torch.Tensor:
-    """Postprocess attention output based on backend requirements."""
-    if backend.attn == "sdpa":
-        x = x.transpose(1, 2).contiguous()
-    return x
 
 
 class MLA(nn.Module):
@@ -146,34 +117,53 @@ class MLA(nn.Module):
         attention_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ):
-        bsz, local_seq_len, _ = x.size()
+        if len(x.shape) == 2:
+            qkv_format = "thd"
+            num_tokens = x.shape[0]
+        else:
+            qkv_format = "bshd"
+            bsz, local_seq_len, _ = x.size()
 
         if self.q_lora_rank is None:
             q = self.q_proj(x)
         else:
             q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
 
-        q = q.view(bsz, local_seq_len, self.n_heads, self.qk_head_dim)
+        if qkv_format == "thd":
+            q = q.view(num_tokens, self.n_heads, self.qk_head_dim)
+        else:
+            q = q.view(bsz, local_seq_len, self.n_heads, self.qk_head_dim)
+
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        q_pe = apply_rotary_emb(q_pe, freqs_cis)
+        q_pe = apply_rotary_emb(q_pe, freqs_cis, qkv_format, unsqueeze_dim=None)
+
         q = torch.cat([q_nope, q_pe], dim=-1)
 
         kv = self.kv_a_proj_with_mqa(x)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv = self.kv_a_layernorm(kv)
-        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis).squeeze(2)
+        k_pe = apply_rotary_emb(k_pe, freqs_cis, qkv_format, unsqueeze_dim=2)
 
         kv = self.kv_b_proj(kv)
-        kv = kv.view(bsz, -1, self.n_heads, self.qk_nope_head_dim + self.v_head_dim)
+        if qkv_format == "thd":
+            kv = kv.view(num_tokens, self.n_heads, self.qk_nope_head_dim + self.v_head_dim)
+            k_pe = k_pe.unsqueeze(1).expand([num_tokens, self.n_heads, self.qk_rope_head_dim])
+        else:
+            kv = kv.view(bsz, local_seq_len, self.n_heads, self.qk_nope_head_dim + self.v_head_dim)
+            k_pe = k_pe.unsqueeze(2).expand([bsz, local_seq_len, self.n_heads, self.qk_rope_head_dim])
+
         k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        k_pe = k_pe.unsqueeze(2).expand([bsz, -1, self.n_heads, self.qk_rope_head_dim])
         k = torch.cat([k_nope, k_pe], dim=-1)
 
-        q, k, v, attn_kwargs = preprocess_args_and_kwargs_for_attn(q, k, v, attention_mask, self.backend)
-        x = self.attn_func(q, k, v, **attn_kwargs)
-        x = postprocess_output_for_attn(x, self.backend)
+        q, k, v, _attn_kwargs = preprocess_args_and_kwargs_for_attn(
+            q, k, v, attention_mask, self.backend.attn, **attn_kwargs
+        )
 
-        x = self.o_proj(x.flatten(2))
+        x = self.attn_func(q, k, v, **_attn_kwargs)
+        x = postprocess_output_for_attn(x, self.backend.attn)
+
+        flatten_dim = 2 if qkv_format == "bshd" else 1
+        x = self.o_proj(x.flatten(flatten_dim))
         return x
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02):
