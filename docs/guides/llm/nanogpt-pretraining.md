@@ -2,6 +2,14 @@
 
 This guide walks you through **data preparation** and **model training** for a [NanoGPT-like](https://github.com/KellerJordan/modded-nanogpt) run using the new `NanogptDataset` and pre-training recipe.
 
+In particular, it will show you how to:
+1. [Install NeMo AutoModel from git](#environment-setup).
+2. [Pre-process and tokenize the FineWeb dataset](#pre-process-the-fineweb-dataset).
+3. [Define your own model architecture](#define-your-own-model-architecture).
+4. [Setup the YAML configuration](#inspect-and-adjust-the-yaml-configuration).
+5. [Launch training](#launch-training).
+6. [Monitor the training](#Monitoring-and-evaluation).
+
 ---
 
 ## 1. Environment setup
@@ -27,6 +35,8 @@ You can run this guide with a single GPU by changing the config.
 ---
 
 ## 2. Pre-process the FineWeb dataset
+
+The [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) dataset
 
 We provide a robust data preprocessing tool at `tools/nanogpt_data_processor.py` that streams datasets from the Hugging Face Hub, tokenizes with GPT-2 BPE (`tiktoken`), and writes **memory-mapped binary shards** that `NanogptDataset` can stream efficiently at training time.
 
@@ -54,51 +64,7 @@ Consider the following options:
 
 ---
 
-## 3. Inspect and adjust the YAML configuration
-
-`examples/llm_pretrain/nanogpt_pretrain.yaml` is a complete configuration that:
-* Defines a GPT-2 model via the `build_gpt2_model` shorthand (easy to scale up).
-* Points `file_pattern` at preprocessed binary data files (configure based on your preprocessing output).
-* Uses the new `NanogptDataset` with `seq_len=1024`.
-* Sets a vanilla `AdamW` optimizer with learning rate `2e-4`.
-* Includes FSDP2 distributed training configuration.
-
-Key configuration sections:
-
-```yaml
-# Model configuration (two options available)
-model:
-  _target_: nemo_automodel.components.models.gpt2.build_gpt2_model
-  vocab_size: 50258
-  n_positions: 2048
-  n_embd: 768
-  n_layer: 12
-  n_head: 12
-
-# Dataset configuration
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset
-  file_pattern: "tools/fineweb_max_tokens_500M/dataset.bin"
-  seq_len: 1024
-  shuffle_files: true
-
-# Distributed training
-distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
-  dp_size: none
-  tp_size: 1
-  cp_size: 1
-```
-
-**About `_target_` configuration**: The `_target_` field specifies import paths to classes and functions within the nemo_automodel repository (or any Python module). For example, `nemo_automodel.components.models.gpt2.build_gpt2_model` imports and calls the GPT-2 model builder function. You can also specify paths to your own Python files (e.g., `my_custom_models.MyTransformer`) to use custom `nn.Module` implementations, allowing full flexibility in model architecture while leveraging the training infrastructure.
-
-Update the `file_pattern` to match your data location. For example, if using `tools/nanogpt_data_processor.py` with the default settings: `"tools/fineweb_max_tokens_500M/dataset.bin"`
-
-Scale **width/depth**, `batch_size`, or `seq_len` as needed - the recipe is model-agnostic.
-
----
-
-## 4. Use your own model (user-defined `_target_`)
+## 3. Define your own model architecture
 
 You can plug in your own model by pointing the YAML `model._target_` to any callable or class that returns an `nn.Module` (or a compatible Hugging Face model). The config loader resolves `_target_` in three ways:
 
@@ -190,6 +156,50 @@ Notes:
 - The `model._target_` may reference an import path or a local Python file using the `path.py:object` form.
 - Any nested mapping that includes `_target_` (e.g., `config:`) is instantiated first and its result is passed upward. This is how the Hugging Face `from_config` pattern works.
 - You can keep using the same training recipe (optimizer, data, distributed settings); only the `model:` block changes.
+
+---
+
+## 4. Inspect and adjust the YAML configuration
+
+`examples/llm_pretrain/nanogpt_pretrain.yaml` is a complete configuration that:
+* Defines a GPT-2 model via the `build_gpt2_model` shorthand (easy to scale up).
+* Points `file_pattern` at preprocessed binary data files (configure based on your preprocessing output).
+* Uses the new `NanogptDataset` with `seq_len=1024`.
+* Sets a vanilla `AdamW` optimizer with learning rate `2e-4`.
+* Includes FSDP2 distributed training configuration.
+
+Key configuration sections:
+
+```yaml
+# Model configuration (two options available)
+model:
+  _target_: nemo_automodel.components.models.gpt2.build_gpt2_model
+  vocab_size: 50258
+  n_positions: 2048
+  n_embd: 768
+  n_layer: 12
+  n_head: 12
+
+# Dataset configuration
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset
+  file_pattern: "tools/fineweb_max_tokens_500M/dataset.bin"
+  seq_len: 1024
+  shuffle_files: true
+
+# Distributed training
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+```
+
+**About `_target_` configuration**: The `_target_` field specifies import paths to classes and functions within the nemo_automodel repository (or any Python module). For example, `nemo_automodel.components.models.gpt2.build_gpt2_model` imports and calls the GPT-2 model builder function. You can also specify paths to your own Python files (e.g., `my_custom_models.MyTransformer`) to use custom `nn.Module` implementations, allowing full flexibility in model architecture while leveraging the training infrastructure.
+
+Update the `file_pattern` to match your data location. For example, if using `tools/nanogpt_data_processor.py` with the default settings: `"tools/fineweb_max_tokens_500M/dataset.bin"`
+
+Scale **width/depth**, `batch_size`, or `seq_len` as needed - the recipe is model-agnostic.
 
 ---
 
