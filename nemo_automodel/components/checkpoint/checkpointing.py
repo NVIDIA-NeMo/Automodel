@@ -84,6 +84,7 @@ class CheckpointingConfig:
     is_peft: bool
     model_state_dict_keys: list[str] = None  # copy of the model state dict keys before any parallelization
     is_async: bool = False
+    dequantize_base_checkpoint: bool = False
 
     def __post_init__(self):
         """
@@ -248,7 +249,6 @@ class Checkpointer:
         is_init_step: bool = False,
         use_checkpoint_id: bool = True,
         key_mapping: Optional[dict[str, str]] = None,
-        quantization: bool = False,
     ) -> None:
         """
         Load model weights from `model_path`.
@@ -264,7 +264,6 @@ class Checkpointer:
             is_init_step: If True, treat load as initialization from a base checkpoint.
             use_checkpoint_id: Pass `checkpoint_id` to DCP if True; disable when using direct HF paths.
             key_mapping: Optional key remapping when reading from HF checkpoints.
-            quantization: If True and supported by the adapter, read quantized tensors from HF.
         """
         # Validate checkpoint directory
         if not os.path.exists(model_path):
@@ -273,7 +272,9 @@ class Checkpointer:
         state_dict = model_state.state_dict()
         storage_reader = self._get_storage_reader(model_path, key_mapping, is_init_step=is_init_step)
 
-        state_dict = _maybe_adapt_state_dict_to_hf(model_state.model[0], state_dict, quantization=quantization)
+        state_dict = _maybe_adapt_state_dict_to_hf(
+            model_state.model[0], state_dict, quantization=self.config.dequantize_base_checkpoint
+        )
 
         state_dict = self._do_load(state_dict, model_path, storage_reader, is_init_step=is_init_step)
 
@@ -289,7 +290,6 @@ class Checkpointer:
         model_name: str | None,
         peft_init_method: str,
         load_base_model: bool = True,
-        quantization: bool = False,
     ) -> None:
         """
         Load a model from the base Hugging Face checkpoint in parallel.
@@ -301,7 +301,6 @@ class Checkpointer:
             model_name: Name of the model or an absolute path to a snapshot
             peft_init_method: Initialization method used for PEFT adapters
             load_base_model: If True, restore from HF base checkpoint
-            quantization: If True, allow adapters to load quantized tensors when supported
         """
         from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
 
@@ -340,7 +339,6 @@ class Checkpointer:
                 else get_safetensors_index_path(root_dir, model_name),
                 is_init_step=True,
                 key_mapping=getattr(model, "_checkpoint_conversion_mapping", None),
-                quantization=quantization,
             )
 
         is_tied_lm_head = getattr(getattr(model, "config", {}), "tie_word_embeddings", False)
