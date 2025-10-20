@@ -75,7 +75,7 @@ Consider the following options:
 
 NeMo AutoModel follows a simple but powerful flow for training:
 
-1. A Python recipe script (for example, `examples/llm_pretrain/pretrain.py`) is the entry point. It reads a YAML configuration file and wires up all training components.
+1. A Python recipe script (for example, [`examples/llm_pretrain/pretrain.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/pretrain.py)) is the entry point. It contains the trainign recipe. For configuration, it reads a YAML file and options can be overriden via CLI arguments (e.g., `--model.name abc`). The recipe wires up all training components.
 2. The YAML file describes each component of the training job (such as `model`, `dataset`, `optimizer`, `distributed`, `checkpoint`, and optional `wandb`).
 3. Each component is constructed from its `_target_`, which points to a Python callable (function or class constructor) to instantiate. The remaining keys in that YAML block become keyword arguments for that callable.
 
@@ -118,7 +118,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
+# The attention layer
 class CausalSelfAttention(nn.Module):
     """Multi-head self-attention with a causal mask."""
 
@@ -162,7 +162,7 @@ class CausalSelfAttention(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, self.embed_dim)
         return self.out_proj(attn_output)
 
-
+# The MLP
 class MLP(nn.Module):
     """GPT-2 feed-forward network (GEGLU → Linear)."""
 
@@ -176,7 +176,7 @@ class MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B, T, C)
         return self.fc2(self.act(self.fc1(x)))
 
-
+# Transformers
 class TransformerBlock(nn.Module):
     """A single transformer block (LN → Attn → Add → LN → MLP → Add)."""
 
@@ -192,7 +192,7 @@ class TransformerBlock(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
-
+# The GPT2 model definition
 class GPT2LMHeadModel(nn.Module):
     """Minimal GPT-2 Causal-LM with tied input/output embeddings."""
 
@@ -252,7 +252,7 @@ class GPT2LMHeadModel(nn.Module):
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-
+# Helper entrypoint
 def build_gpt2_model(
     *,
     vocab_size: int = 50257,
@@ -364,7 +364,7 @@ Notes:
 
 ## 5. Inspect and adjust the YAML configuration
 
-`examples/llm_pretrain/nanogpt_pretrain.yaml` is a complete configuration that:
+[`examples/llm_pretrain/nanogpt_pretrain.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/nanogpt_pretrain.yaml) is a complete configuration that:
 * Defines a GPT-2 model via the `build_gpt2_model` shorthand (easy to scale up).
 * Points `file_pattern` at preprocessed binary data files (configure based on your preprocessing output).
 * Uses the new `NanogptDataset` with `seq_len=1024`.
