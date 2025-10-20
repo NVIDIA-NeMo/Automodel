@@ -98,7 +98,102 @@ Scale **width/depth**, `batch_size`, or `seq_len` as needed - the recipe is mode
 
 ---
 
-## 4. Launch training
+## 4. Use your own model (user-defined `_target_`)
+
+You can plug in your own model by pointing the YAML `model._target_` to any callable or class that returns an `nn.Module` (or a compatible Hugging Face model). The config loader resolves `_target_` in three ways:
+
+- Import path to a Python object (e.g., `my_pkg.models.build_model`)
+- Local Python file with object name (e.g., `/abs/path/to/my_model.py:build_model`)
+- A library callable such as Hugging Face `transformers.AutoModelForCausalLM.from_config`
+
+Below are examples for each pattern.
+
+### 4.1 Import path to your code (function or class)
+
+```yaml
+# examples/llm_pretrain/nanogpt_pretrain.yaml
+model:
+  _target_: my_project.models.my_gpt.build_model
+  vocab_size: 50258
+  n_positions: 2048
+  n_embd: 768
+  n_layer: 12
+  n_head: 12
+```
+
+Your Python implements either a class constructor or a builder function that returns the model:
+
+```python
+# my_project/models/my_gpt.py
+import torch.nn as nn
+
+class MyGPT(nn.Module):
+    def __init__(self, vocab_size: int, n_positions: int, n_embd: int, n_layer: int, n_head: int):
+        super().__init__()
+        # initialize your modules here
+
+    def forward(self, input_ids, attention_mask=None):
+        # return logits
+        ...
+
+def build_model(vocab_size: int, n_positions: int, n_embd: int, n_layer: int, n_head: int) -> nn.Module:
+    return MyGPT(vocab_size, n_positions, n_embd, n_layer, n_head)
+```
+
+### 4.2 Local Python file path
+
+Point `_target_` to a concrete file on disk and the object inside it using the `path.py:object_name` form. Absolute paths are recommended.
+
+```yaml
+model:
+  _target_: /absolute/path/to/my_model.py:build_model
+  vocab_size: 50258
+  n_positions: 2048
+  n_embd: 768
+  n_layer: 12
+  n_head: 12
+```
+
+This loads `/absolute/path/to/my_model.py`, then calls its `build_model(...)` with the remaining YAML keys as keyword arguments.
+
+### 4.3 Hugging Face models via `from_config`
+
+You can instantiate any Hugging Face causal LM with a config-first flow by targeting a `from_config` callable and providing a nested `config` node. The nested node is itself resolved via `_target_`, so you can compose HF configs directly in YAML.
+
+```yaml
+model:
+  _target_: transformers.AutoModelForCausalLM.from_config
+  # Nested object: built first, then passed to from_config(config=...)
+  config:
+    _target_: transformers.AutoConfig.from_pretrained
+    pretrained_model_name_or_path: gpt2   # or "Qwen/Qwen2-1.5B", etc.
+    n_layer: 12
+    n_head: 12
+    n_positions: 2048
+    vocab_size: 50258
+```
+
+Alternatively, target a specific architecture:
+
+```yaml
+model:
+  _target_: transformers.GPT2LMHeadModel.from_config
+  config:
+    _target_: transformers.GPT2Config
+    n_layer: 12
+    n_head: 12
+    n_positions: 2048
+    vocab_size: 50258
+```
+
+Notes:
+- The `model._target_` may reference an import path or a local Python file using the `path.py:object` form.
+- Any nested mapping that includes `_target_` (e.g., `config:`) is instantiated first and its result is passed upward. This is how the Hugging Face `from_config` pattern works.
+- You can keep using the same training recipe (optimizer, data, distributed settings); only the `model:` block changes.
+
+---
+
+## 5. Launch training
 
 ```bash
 # Single-GPU run (good for local testing)
@@ -132,7 +227,7 @@ Checkpoints are written under `checkpoints/` by default as `safetensors` or `tor
 
 ---
 
-## 5. Monitoring and evaluation
+## 6. Monitoring and evaluation
 
 * **Throughput** and **loss** statistics print every optimization step.
 * Enable `wandb` in the YAML for dashboards (`wandb.project`, `wandb.entity`, etc.).
@@ -148,7 +243,7 @@ wandb:
 
 ---
 
-## 6. Further work
+## 7. Further work
 
 1. **Scaling up** - swap the GPT-2 config for `LlamaForCausalLM`, `Qwen2`, or any HF-compatible causal model; increase `n_layer`, `n_embd`, etc.
 2. **Mixed precision** - FSDP2 + `bfloat16` (`dtype: bfloat16` in distributed config) for memory savings.
