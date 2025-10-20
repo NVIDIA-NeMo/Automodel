@@ -85,6 +85,7 @@ def _package_tokenized_example(
     # see: https://github.com/huggingface/transformers/issues/22794
     if not _has_chat_template(tokenizer) and eos_token_id != input_ids[-1]:
         input_ids += [eos_token_id]
+        assistant_masks += [1]
 
     labels = input_ids.copy()
     input_ids = input_ids[:-1]
