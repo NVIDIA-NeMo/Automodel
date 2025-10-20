@@ -3,7 +3,7 @@
 This guide walks you through **data preparation** and **model training** for a [NanoGPT-like](https://github.com/KellerJordan/modded-nanogpt) run using the new `NanogptDataset` and pre-training recipe.
 
 In particular, it will show you how to:
-1. [Install NeMo AutoModel from git](#environment-setup).
+1. [Install NeMo AutoModel from git](#1-environment-setup).
 2. [Pre-process and tokenize the FineWeb dataset](#pre-process-the-fineweb-dataset).
 3. [Define your own model architecture](#define-your-own-model-architecture).
 4. [Setup the YAML configuration](#inspect-and-adjust-the-yaml-configuration).
