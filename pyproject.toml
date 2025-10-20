@@ -121,7 +121,6 @@ dev = [
 all = [
     "nemo_automodel[deepep]",
     "nemo_automodel[fa]",
-    "nemo_automodel[moe]",
     "nemo_automodel[vlm]",
 ]
 

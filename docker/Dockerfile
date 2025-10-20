@@ -58,6 +58,15 @@ RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     patch -p1 < /opt/deepep.patch && \
     rm -rf /opt/deepep.patch; fi
 
+# Install TE
+ARG INSTALL_TE=False
+ARG TE_COMMIT=release_v2.8
+RUN if [ "INSTALL_TE" = "True" ]; then \
+    git clone https://github.com/NVIDIA/TransformerEngine.git && \
+    git fetch origin $TE_COMMIT && \
+    git checkout FETCH_HEAD; \
+    fi
+
 # Install Automodel
 ARG BASE_IMAGE=cuda
 ARG AUTOMODEL_INSTALL=dev
@@ -69,8 +78,13 @@ RUN cd /opt/Automodel && \
     fi && \
     uv sync --locked --extra $AUTOMODEL_INSTALL --all-groups && \
     if [ "$INSTALL_DEEPEP" = "True" ]; then \
-        TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" \
+        TORCH_CUDA_ARCH_LIST="8.0 9.0 10.0 12.0" \
         uv add --no-build-isolation -v /opt/DeepEP; \
+    fi && \
+    if [ "$INSTALL_TE" = "True" ]; then \
+        uv add nvidia-mathdx==25.1.1 && \
+        env NVTE_CUDA_ARCHS="80;90;100;120" \
+        uv add --no-build-isolation -v /opt/TransformerEngine; \
     fi
 
 # Update torchrun python path
