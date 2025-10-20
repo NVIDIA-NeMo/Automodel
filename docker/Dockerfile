@@ -32,7 +32,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 FROM ${PYTORCH_IMAGE} AS pytorch
 
-FROM ${BASE_IMAGE} AS automodel_final
+FROM ${BASE_IMAGE} AS update_base_container
 
 WORKDIR /opt
 # Install uv
@@ -44,6 +44,25 @@ ENV UV_CACHE_DIR=/opt/uv_cache
 ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
 ENV UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1
 RUN uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+
+# Torchrun uses uv venv
+RUN if [ -f /usr/local/bin/torchrun ]; then \
+        sed -i '1c\#!/opt/venv/bin/python3' /usr/local/bin/torchrun; \
+    fi
+
+# Install TE
+ARG INSTALL_TE=False
+ARG TE_COMMIT=release_v2.8
+RUN if [ "$INSTALL_TE" = "True" ]; then \
+    git clone https://github.com/NVIDIA/TransformerEngine.git && \
+    cd TransformerEngine && \
+    git fetch origin $TE_COMMIT && \
+    git checkout FETCH_HEAD; \
+    pip install nvidia-mathdx==25.1.1 && \
+    env NVTE_CUDA_ARCHS="80;90;100;120" NVTE_BUILD_THREADS_PER_JOB=8 pip install --no-cache-dir --no-build-isolation -v .; \
+    fi
+
+FROM update_base_container AS automodel_dep
 
 # Install Deepep
 COPY docker/common/deepep.patch /opt/deepep.patch
@@ -58,15 +77,7 @@ RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     patch -p1 < /opt/deepep.patch && \
     rm -rf /opt/deepep.patch; fi
 
-# Install TE
-ARG INSTALL_TE=False
-ARG TE_COMMIT=release_v2.8
-RUN if [ "$INSTALL_TE" = "True" ]; then \
-    git clone https://github.com/NVIDIA/TransformerEngine.git && \
-    cd TransformerEngine && \
-    git fetch origin $TE_COMMIT && \
-    git checkout FETCH_HEAD; \
-    fi
+FROM automodel_dep as automodel_final
 
 # Install Automodel
 ARG BASE_IMAGE=cuda
@@ -81,16 +92,6 @@ RUN cd /opt/Automodel && \
     if [ "$INSTALL_DEEPEP" = "True" ]; then \
         TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" \
         uv add --no-build-isolation -v /opt/DeepEP; \
-    fi && \
-    if [ "$INSTALL_TE" = "True" ]; then \
-        uv add nvidia-mathdx==25.1.1 && \
-        env NVTE_CUDA_ARCHS="80;90;100;120" \
-        uv add --no-build-isolation -v /opt/TransformerEngine; \
-    fi
-
-# Update torchrun python path
-RUN if [ -f /usr/local/bin/torchrun ]; then \
-        sed -i '1c\#!/opt/venv/bin/python3' /usr/local/bin/torchrun; \
     fi
 
 COPY <<EOF /opt/venv/env.sh
