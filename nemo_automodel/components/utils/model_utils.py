@@ -15,6 +15,7 @@
 import inspect
 import logging
 
+import torch
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
@@ -158,3 +159,82 @@ def apply_parameter_freezing(model, freeze_config):
     # Freeze language model backbone
     if freeze_language_model:
         _freeze_module_by_attribute_and_patterns(model, "language_model", ["language", "text", "llm"])
+
+
+def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, seqlens_padding_value=-1000):
+    """
+    Squeeze batch dimension and prepare inputs for THD (total, hidden, depth) format.
+
+    This function removes the batch dimension from input tensors and processes attention
+    kwargs for use with Transformer Engine's THD format. It's typically used when the
+    batch has already been converted to THD format (with batch_size=1 as a placeholder
+    dimension) and that dimension needs to be removed.
+
+    The function performs three key operations:
+    1. Removes the batch dimension (dim 0) from input tensors
+    2. Filters out padding values from cumulative sequence length tensors
+    3. Converts max_seqlen from tensor to scalar if needed
+
+    Args:
+        input_ids (torch.Tensor): Input token IDs with shape [1, total_tokens] or
+            [1, total_tokens, hidden_dim]. The first dimension will be squeezed.
+        position_ids (torch.Tensor): Position IDs with shape [1, total_tokens].
+            The first dimension will be squeezed.
+        padding_mask (torch.Tensor): Padding mask with shape [1, total_tokens].
+            The first dimension will be squeezed.
+        attn_kwargs (dict): Dictionary of attention-related tensors. May contain:
+            - cu_seqlens: Cumulative sequence lengths [1, num_seqs+1]
+            - cu_seqlens_padded: Cumulative padded sequence lengths [1, num_seqs+1]
+            - max_seqlen: Maximum sequence length (tensor or int)
+            - Other attention parameters (will be squeezed if tensors)
+        seqlens_padding_value (int): Sentinel value used to indicate padding in
+            cu_seqlens and cu_seqlens_padded tensors. These values will be filtered
+            out. Default: -1000.
+
+    Returns:
+        tuple: A tuple containing:
+            - input_ids (torch.Tensor): Input IDs with batch dimension removed [total_tokens]
+                or [total_tokens, hidden_dim]
+            - position_ids (torch.Tensor): Position IDs with batch dimension removed [total_tokens]
+            - padding_mask (torch.Tensor): Padding mask with batch dimension removed [total_tokens]
+            - attn_kwargs (dict): Updated attention kwargs with:
+                - Batch dimensions removed from all tensor values
+                - Padding values filtered from cu_seqlens and cu_seqlens_padded
+                - max_seqlen converted to scalar if it was a tensor
+
+    Example:
+        >>> input_ids = torch.tensor([[1, 2, 3, 4, 5]])  # [1, 5]
+        >>> position_ids = torch.tensor([[0, 1, 2, 3, 4]])  # [1, 5]
+        >>> padding_mask = torch.tensor([[False, False, False, False, False]])  # [1, 5]
+        >>> attn_kwargs = {
+        ...     'cu_seqlens': torch.tensor([[0, 3, 5, -1000]]),  # [1, 4] with padding
+        ...     'cu_seqlens_padded': torch.tensor([[0, 3, 5, -1000]]),
+        ...     'max_seqlen': torch.tensor([3])
+        ... }
+        >>> ids, pos, mask, kwargs = squeeze_input_for_thd(
+        ...     input_ids, position_ids, padding_mask, attn_kwargs
+        ... )
+        >>> ids.shape
+        torch.Size([5])
+        >>> kwargs['cu_seqlens']  # Padding value filtered out
+        tensor([0, 3, 5])
+        >>> kwargs['max_seqlen']  # Converted to scalar
+        3
+
+    Note:
+        This function modifies attn_kwargs in-place. If you need to preserve the original
+        dictionary, pass a copy.
+    """
+    input_ids = input_ids.squeeze(0)
+    position_ids = position_ids.squeeze(0)
+    if padding_mask is not None:
+        padding_mask = padding_mask.squeeze(0)
+    for key, value in attn_kwargs.items():
+        if isinstance(value, torch.Tensor):
+            attn_kwargs[key] = value.squeeze(0)
+        if key in ["cu_seqlens", "cu_seqlens_padded"]:
+            attn_kwargs[key] = value[value != seqlens_padding_value].contiguous()
+        if key == "max_seqlen" and isinstance(value, torch.Tensor):
+            attn_kwargs[key] = value.item()
+
+    return input_ids, position_ids, padding_mask, attn_kwargs
