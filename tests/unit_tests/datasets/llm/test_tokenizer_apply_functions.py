@@ -155,7 +155,6 @@ def test_apply_tokenizer_chat_template_answer_only_mask():
             {"role": "assistant", "content": ans},
         ],
         eos_token_id=tok.eos_token_id, pad_token_id=tok.eos_token_id,
-        start_of_turn_token=tok._start_of_turn_token
     )
 
     # Basic invariants
@@ -184,7 +183,6 @@ def test_apply_tokenizer_chat_template_full_loss_mask():
         ],
         eos_token_id=tok.eos_token_id,
         pad_token_id=tok.eos_token_id,
-        start_of_turn_token=tok._start_of_turn_token,
     )
     del out["___PAD_TOKEN_IDS___"]
     assert set(out) == {"input_ids", "labels", "attention_mask"}
