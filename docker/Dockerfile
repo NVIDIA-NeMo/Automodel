@@ -73,6 +73,11 @@ RUN cd /opt/Automodel && \
         uv add --no-build-isolation -v /opt/DeepEP; \
     fi
 
+# Update torchrun python path
+RUN if [ -f /usr/local/bin/torchrun ]; then \
+        sed -i '1c\#!/opt/venv/bin/python3' /usr/local/bin/torchrun; \
+    fi
+
 COPY <<EOF /opt/venv/env.sh
 export UV_PROJECT_ENVIRONMENT=/opt/venv
 export PATH="/opt/venv/bin:$PATH"

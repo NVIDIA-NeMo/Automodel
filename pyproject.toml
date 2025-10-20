@@ -105,7 +105,7 @@ moe = [
     # sudo dpkg -i cuda-keyring_1.1-1_all.deb
     # sudo apt-get update
     # sudo apt-get install cudnn-cuda-12
-    "transformer-engine[pytorch]==2.5.0",
+    "transformer-engine[pytorch]==2.8.0",
     # Flash-attn version should be selected to satisfy TE requirements
     # https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
     # "flash-attn==2.7.4.post1",
