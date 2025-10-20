@@ -78,7 +78,7 @@ RUN cd /opt/Automodel && \
     fi && \
     uv sync --locked --extra $AUTOMODEL_INSTALL --all-groups && \
     if [ "$INSTALL_DEEPEP" = "True" ]; then \
-        TORCH_CUDA_ARCH_LIST="8.0 9.0 10.0 12.0" \
+        TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" \
         uv add --no-build-isolation -v /opt/DeepEP; \
     fi && \
     if [ "$INSTALL_TE" = "True" ]; then \
