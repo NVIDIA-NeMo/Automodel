@@ -82,6 +82,16 @@ def _install_torch_and_layers_stubs(monkeypatch):
     nn_stub.Module = Module
     torch_stub.nn = nn_stub
 
+    # cuda submodule
+    cuda_stub = types.ModuleType("torch.cuda")
+
+    class Stream:
+        def __init__(self):
+            pass
+
+    cuda_stub.Stream = Stream
+    torch_stub.cuda = cuda_stub
+
     # distributed submodules and symbols
     dist_stub = types.ModuleType("torch.distributed")
 
@@ -181,6 +191,7 @@ def _install_torch_and_layers_stubs(monkeypatch):
     # register into sys.modules via monkeypatch
     monkeypatch.setitem(sys.modules, "torch", torch_stub)
     monkeypatch.setitem(sys.modules, "torch.nn", nn_stub)
+    monkeypatch.setitem(sys.modules, "torch.cuda", cuda_stub)
     monkeypatch.setitem(sys.modules, "torch.distributed", dist_stub)
     monkeypatch.setitem(sys.modules, "torch.distributed.device_mesh", device_mesh_stub)
     monkeypatch.setitem(sys.modules, "torch.distributed.fsdp", fsdp_stub)
@@ -612,22 +623,6 @@ def test_parallelize_model_asserts_on_invalid_tp_cp_and_ep_divisibility(monkeypa
             dp_axis_names=None,
             cp_axis_name=None,
             tp_axis_name="tp",
-            ep_axis_name=None,
-            ep_shard_axis_names=None,
-            activation_checkpointing=False,
-        )
-
-    # CP size != 1 -> assertion
-    world_mesh_bad_cp = FakeWorldMesh({"tp": 1, "cp": 2}, mesh_dim_names=["tp", "cp"])
-    with pytest.raises(AssertionError):
-        P.parallelize_model(
-            model=model,
-            world_mesh=world_mesh_bad_cp,
-            moe_mesh=moe_mesh,
-            pp_enabled=False,
-            dp_axis_names=None,
-            cp_axis_name="cp",
-            tp_axis_name=None,
             ep_axis_name=None,
             ep_shard_axis_names=None,
             activation_checkpointing=False,

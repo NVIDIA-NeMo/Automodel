@@ -36,6 +36,14 @@ from nemo_automodel.components.moe.layers import (
 )
 
 logger = logging.getLogger(__name__)
+_CP_STREAM = None
+
+
+def _get_cp_stream() -> torch.cuda.Stream:
+    global _CP_STREAM
+    if _CP_STREAM is None:
+        _CP_STREAM = torch.cuda.Stream()
+    return _CP_STREAM
 
 
 class ExpertParallel(ParallelStyle):
@@ -172,6 +180,27 @@ def apply_fsdp(
     fully_shard_default(_model)
 
 
+def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p2p"):
+    from transformer_engine.pytorch.attention import DotProductAttention
+
+    if hasattr(model, "model") and model.model is not None:
+        _model = model.model
+    else:
+        _model = model
+
+    for _, block in _model.layers.named_children():
+        attn_module = block.self_attn.attn_module
+        assert isinstance(attn_module, DotProductAttention), (
+            "Context parallelism is only supported for TransformerEngine's DotProductAttention"
+        )
+        attn_module.set_context_parallel_group(
+            cp_mesh.get_group(),
+            torch.distributed.get_process_group_ranks(cp_mesh.get_group()),
+            _get_cp_stream(),
+            cp_comm_type=cp_comm_type,
+        )
+
+
 def parallelize_model(
     model: torch.nn.Module,
     world_mesh: DeviceMesh,
@@ -187,15 +216,12 @@ def parallelize_model(
     reshard_after_forward: bool = False,
 ):
     assert tp_axis_name is None or world_mesh[tp_axis_name].size() == 1, (
-        "Tensor parallelism not supported for DeepSeek v3 model"
-    )
-    assert cp_axis_name is None or world_mesh[cp_axis_name].size() == 1, (
-        "Context parallelism not supported for DeepSeek v3 model"
+        "Tensor parallelism not supported for custom MoE models"
     )
 
-    # TODO: Add support for context parallelism
-    # if cp_enabled:
-    #     apply_cp(model, meshes["default"]["cp"], parallel_dims)
+    cp_enabled = cp_axis_name is not None and world_mesh[cp_axis_name].size() > 1
+    if cp_enabled:
+        apply_cp(model, world_mesh[cp_axis_name])
 
     ep_enabled = ep_axis_name is not None and moe_mesh is not None and moe_mesh[ep_axis_name].size() > 1
     if ep_enabled:
@@ -214,11 +240,7 @@ def parallelize_model(
     else:
         ep_shard_mesh = None
 
-    fsdp_enabled = (
-        dp_axis_names is not None
-        and all(map(lambda x: x in world_mesh.mesh_dim_names, dp_axis_names))
-        and world_mesh[dp_axis_names].size() > 1
-    )
+    fsdp_enabled = dp_axis_names is not None and world_mesh[dp_axis_names].size() > 1
     fsdp_mesh = world_mesh[tuple(dp_axis_names)] if fsdp_enabled else None
     if fsdp_enabled:
         apply_fsdp(

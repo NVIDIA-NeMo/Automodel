@@ -98,6 +98,30 @@ def _get_model_name(cfg_model):
         return None
 
 
+def _uses_te_dot_product_attention(cfg_model):
+    return (
+        True
+        if hasattr(cfg_model, "backend") and hasattr(cfg_model.backend, "attn") and cfg_model.backend.attn == "te"
+        else False
+    )
+
+
+def _uses_thd_collater(cfg_dataloader):
+    from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
+
+    return (
+        True
+        if hasattr(cfg_dataloader, "collate_fn") and cfg_dataloader.collate_fn == packed_sequence_thd_collater
+        else False
+    )
+
+
+def _get_num_thd_chunks(pp_enabled, cfg):
+    if pp_enabled:
+        return cfg.step_scheduler.local_batch_size // cfg.autopipeline.pp_microbatch_size
+    return 1
+
+
 def _get_packed_sequence_config(has_packed_sequence, is_hf_model, cp_size):
     kwargs = {}
     if has_packed_sequence and is_hf_model:
@@ -245,7 +269,12 @@ def build_model_and_optimizer(
                 world_mesh=model_wrapper.device_mesh,
                 moe_mesh=getattr(model_wrapper, "moe_mesh", None),
                 pp_enabled=False,
-                dp_axis_names=("dp_shard",),
+                dp_axis_names=(
+                    ("dp_replicate", "dp_shard_cp")
+                    if "dp_replicate" in model_wrapper.device_mesh.mesh_dim_names
+                    and "dp_shard_cp" in model_wrapper.device_mesh.mesh_dim_names
+                    else ("dp_shard_cp",)
+                ),
                 cp_axis_name="cp",
                 tp_axis_name="tp",
                 ep_axis_name="ep",
@@ -396,6 +425,7 @@ def build_dataloader(
     dp_world_size,
     pp_enabled,
     supports_seq_lens=True,
+    cp_size=1,
 ) -> tuple[DataLoader, PreTrainedTokenizerBase]:
     """Build a DataLoader for the dataset.
 
@@ -446,6 +476,8 @@ def build_dataloader(
                 packed_sequence_size=packed_sequence_size,
                 split_across_pack=getattr(cfg_ps, "split_across_pack", False),
                 max_packs=getattr(cfg_ps, "max_packs", None),
+                padding_idx=getattr(tokenizer, "pad_token_id", 0),
+                cp_size=cp_size,
             )
 
         if isinstance(ds, MegatronPretraining):
@@ -779,9 +811,21 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         autopipeline_cfg = self.cfg.get("autopipeline", None)
         if self.pp_enabled:
             pp_batch_size = self.cfg.step_scheduler.local_batch_size
+            pp_microbatch_size = self.cfg.autopipeline.pp_microbatch_size
             assert pp_batch_size // self.cfg.autopipeline.pp_microbatch_size >= self.model_wrapper.pp_size, (
                 f"pp_batch_size {pp_batch_size} // pp_microbatch_size {self.cfg.autopipeline.pp_microbatch_size} must be greater than or equal to pp_size {self.model_wrapper.pp_size}"
             )
+            if (
+                self.cfg.distributed.get("cp_size", 1) > 1
+                and _uses_te_dot_product_attention(self.cfg.model)
+                and _uses_thd_collater(self.cfg.dataloader)
+            ):
+                pp_microbatch_size = 1
+                pp_batch_size = pp_batch_size // self.cfg.autopipeline.pp_microbatch_size
+                logging.info(
+                    f"Overriding pp_batch_size: {pp_batch_size}, pp_microbatch_size: {pp_microbatch_size} for THD"
+                )
+
             assert autopipeline_cfg is not None, (
                 "AutoPipeline configuration is required when pipeline parallelism is enabled"
             )
@@ -794,10 +838,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 moe_mesh=self.moe_mesh,
                 pp_axis_name="pp",
                 dp_axis_names=(
-                    ("dp_replicate", "dp_shard")
+                    ("dp_replicate", "dp_shard_cp")
                     if "dp_replicate" in self.device_mesh.mesh_dim_names
-                    and "dp_shard" in self.device_mesh.mesh_dim_names
-                    else ("dp_shard",)
+                    and "dp_shard_cp" in self.device_mesh.mesh_dim_names
+                    else ("dp_shard_cp",)
                 ),
                 cp_axis_name="cp" if "cp" in self.device_mesh.mesh_dim_names else None,
                 tp_axis_name="tp" if "tp" in self.device_mesh.mesh_dim_names else None,
@@ -806,6 +850,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     ("ep_shard",) if self.moe_mesh is not None and "ep_shard" in self.moe_mesh.mesh_dim_names else None
                 ),
                 pp_batch_size=pp_batch_size,
+                pp_microbatch_size=pp_microbatch_size,
                 patch_stage_backward_maybe_with_nosync=self.cfg.get("model.backend.enable_fsdp_optimizations", False),
                 device=torch.cuda.current_device(),
             )
@@ -883,6 +928,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             dp_world_size=self._get_dp_group_size(),
             pp_enabled=self.pp_enabled,
             supports_seq_lens=True,
+            cp_size=self.cfg.get("distributed.cp_size", 1),
         )
 
         # Build validation dataloader if the config provides it
@@ -894,7 +940,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 self.cfg.validation_dataset,
                 self.cfg.validation_dataloader,
                 self.cfg.model,
-                cfg_ps=None,  # Use unpacked config for validation
+                cfg_ps=self.cfg.get("packed_sequence", None),  # Use unpacked config for validation
                 seed=self.cfg.get("seed", 42),
                 local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
                 global_batch_size=self.cfg.get("step_scheduler.global_batch_size", 1),
@@ -903,6 +949,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 dp_rank=self._get_dp_rank(),
                 dp_world_size=self._get_dp_group_size(),
                 pp_enabled=self.pp_enabled,
+                supports_seq_lens=True,
+                cp_size=self.cfg.get("distributed.cp_size", 1),
             )
 
         # Scheduler
@@ -987,14 +1035,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             k: (
                 {dk: dv.to(self.dist_env.device, non_blocking=True) if dv is not None else None for dk, dv in v.items()}
                 if isinstance(v, dict)
-                else v.to(self.dist_env.device, non_blocking=True)
-                if v is not None
-                else None
+                else (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
             )
             for k, v in batch.items()
         }
+        train_ctx, batch = make_cp_batch_and_ctx(
+            self.device_mesh,
+            batch,
+            use_te=_uses_te_dot_product_attention(self.cfg.model) and _uses_thd_collater(self.cfg.dataloader),
+            padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
+            num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
+        )
         labels = batch.pop("labels")
-        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
+
         if self.pp_enabled:
             if not is_train:
                 logging.info("Skipping forward pass for validation because pipeline parallelism is enabled")

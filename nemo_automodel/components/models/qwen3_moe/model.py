@@ -18,12 +18,13 @@ import torch
 import torch.nn as nn
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from nemo_automodel.components.models.gpt_oss.layers import RotaryEmbedding
+from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.qwen3_moe.layers import Qwen3MoeAttention
 from nemo_automodel.components.models.qwen3_moe.state_dict_adapter import Qwen3MoeStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
 from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -153,15 +154,10 @@ class Qwen3MoeModel(nn.Module):
                 torch.arange(0, input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand(input_ids.shape[0], -1)
             )
 
-        # Compute cos/sin from RotaryEmbedding inv_freq and current position_ids; then concat [cos, sin]
-        with torch.no_grad():
-            concentration, inv_freq = self.rotary_emb._compute_concentration_and_inv_freq()
-            inv_freq = inv_freq.to(device=position_ids.device, dtype=torch.float32)
-            # angles: (B, T, D/2)
-            angles = torch.einsum("bt,d->btd", position_ids.to(dtype=torch.float32), inv_freq)
-            cos = torch.cos(angles) * concentration
-            sin = torch.sin(angles) * concentration
-            freqs_cis = torch.cat([cos, sin], dim=-1)  # (B, T, D)
+        # Compute freqs_cis from RotaryEmbedding inv_freq and current position_ids; then concat [cos, sin]
+        freqs_cis = position_ids_to_freqs_cis(
+            self.rotary_emb, position_ids, qkv_format=attn_kwargs.get("qkv_format", "bshd")
+        )
 
         h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
 
@@ -241,6 +237,12 @@ class Qwen3MoeForCausalLM(nn.Module, MoEFSDPSyncMixin):
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
+                input_ids, position_ids, padding_mask, attn_kwargs
+            )
+            attention_mask = None
+
         hidden = self.model(
             input_ids,
             position_ids=position_ids,
@@ -249,6 +251,8 @@ class Qwen3MoeForCausalLM(nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
         logits = self.lm_head(hidden) if self.lm_head else hidden
+        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+            logits = logits.unsqueeze(0)
         return logits
 
     @torch.no_grad()

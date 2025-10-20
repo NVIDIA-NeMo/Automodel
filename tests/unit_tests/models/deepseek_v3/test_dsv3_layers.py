@@ -46,7 +46,7 @@ class TestPreprocessArgsAndKwargsForAttn:
         backend = BackendConfig(attn="te", linear="torch", rms_norm="torch")
 
         q_out, k_out, v_out, attn_kwargs = preprocess_args_and_kwargs_for_attn(
-            q, k, v, attention_mask, backend
+            q, k, v, attention_mask, attn_impl=backend.attn
         )
 
         # For TE backend with no attention mask, tensors should be unchanged
@@ -64,7 +64,7 @@ class TestPreprocessArgsAndKwargsForAttn:
         backend = BackendConfig(attn="te", linear="torch", rms_norm="torch")
 
         q_out, k_out, v_out, attn_kwargs = preprocess_args_and_kwargs_for_attn(
-            q, k, v, attention_mask, backend
+            q, k, v, attention_mask, attn_impl=backend.attn
         )
 
         assert torch.equal(q_out, q)
@@ -93,7 +93,7 @@ class TestPreprocessArgsAndKwargsForAttn:
         backend = BackendConfig(attn="te", linear="torch", rms_norm="torch")
 
         q_out, k_out, v_out, attn_kwargs = preprocess_args_and_kwargs_for_attn(
-            q, k, v, attention_mask, backend
+            q, k, v, attention_mask, attn_impl=backend.attn
         )
 
         padding_mask = attn_kwargs["attention_mask"]
@@ -109,7 +109,7 @@ class TestPreprocessArgsAndKwargsForAttn:
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
 
         q_out, k_out, v_out, attn_kwargs = preprocess_args_and_kwargs_for_attn(
-            q, k, v, attention_mask, backend
+            q, k, v, attention_mask, attn_impl=backend.attn
         )
 
         # SDPA should transpose dim 1 and 2
@@ -131,7 +131,7 @@ class TestPreprocessArgsAndKwargsForAttn:
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
 
         q_out, k_out, v_out, attn_kwargs = preprocess_args_and_kwargs_for_attn(
-            q, k, v, attention_mask, backend
+            q, k, v, attention_mask, attn_impl=backend.attn
         )
 
         # Check transposition
@@ -150,7 +150,7 @@ class TestPostprocessOutputForAttn:
         x = torch.randn(2, 8, 16, 64)
         backend = BackendConfig(attn="te", linear="torch", rms_norm="torch")
 
-        result = postprocess_output_for_attn(x, backend)
+        result = postprocess_output_for_attn(x, backend.attn)
 
         assert torch.equal(result, x)
         assert result.shape == x.shape
@@ -160,7 +160,7 @@ class TestPostprocessOutputForAttn:
         x = torch.randn(2, 16, 8, 64)
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
 
-        result = postprocess_output_for_attn(x, backend)
+        result = postprocess_output_for_attn(x, backend.attn)
 
         # Should transpose back to (batch, heads, seq, dim)
         assert result.shape == (2, 8, 16, 64)
@@ -170,7 +170,7 @@ class TestPostprocessOutputForAttn:
         x = torch.randn(2, 8, 16, 64)
         backend = BackendConfig(attn="unknown", linear="torch", rms_norm="torch")
 
-        result = postprocess_output_for_attn(x, backend)
+        result = postprocess_output_for_attn(x, backend.attn)
 
         assert torch.equal(result, x)
 
@@ -447,7 +447,7 @@ class TestMLAForward:
 
             # Call preprocess function directly to verify integration
             q_out, k_out, v_out, kwargs = preprocess_args_and_kwargs_for_attn(
-                q_dummy, k_dummy, v_dummy, attention_mask, mla.backend
+                q_dummy, k_dummy, v_dummy, attention_mask, attn_impl=mla.backend.attn
             )
 
             # Verify SDPA preprocessing was applied

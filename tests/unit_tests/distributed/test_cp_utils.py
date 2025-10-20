@@ -41,6 +41,10 @@ class _DummySubMesh:
     def size(self) -> int:  # noqa: D401  (simple method)
         return self._size
 
+    def get_group(self):  # noqa: D401  (simple method)
+        """Return None to simulate no distributed process group."""
+        return None
+
 
 class _DummyDeviceMesh(dict):
     """Dictionary-like container expected by :pyfunc:`make_cp_batch_and_ctx`."""
@@ -80,10 +84,14 @@ def test_build_position_ids_does_not_override_existing():
 def test_make_cp_batch_and_ctx_no_mesh():
     """When *no* device mesh is provided the call should be a no-op."""
     input_ids = torch.tensor([[1, 2, 3]])
-    batch = {"input_ids": input_ids, "position_ids": torch.tensor([[0, 1, 2]])}
     labels = torch.tensor([[1, 2, 3]])
+    batch = {
+        "input_ids": input_ids,
+        "position_ids": torch.tensor([[0, 1, 2]]),
+        "labels": labels,
+    }
 
-    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(None, batch, labels, loss_mask=None)
+    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(None, batch, loss_mask=None)
 
     # Expect the nullcontext *class* (not an instantiated object)
     assert ctx_obj is contextlib.nullcontext
@@ -113,11 +121,14 @@ def test_make_cp_batch_and_ctx_with_cp(monkeypatch):
     monkeypatch.setattr(_cu, "get_train_context", _fake_get_train_ctx)
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)  # CP enabled (>1)
-    batch = {"input_ids": torch.tensor([[10, 20, 30]])}
     labels = torch.tensor([[10, 20, 30]])
     loss_mask = torch.tensor([[1, 1, 1]])
+    batch = {
+        "input_ids": torch.tensor([[10, 20, 30]]),
+        "labels": labels,
+    }
 
-    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch, labels, loss_mask)
+    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask)
 
     # We expect the stub training context to be returned
     assert ctx_obj == "dummy_train_ctx"
@@ -128,4 +139,114 @@ def test_make_cp_batch_and_ctx_with_cp(monkeypatch):
     assert torch.equal(new_batch["position_ids"], expected_pos)
 
     # Buffers inside *new_batch* should alias the originals (in-place modification)
-    assert new_batch is batch 
+    assert new_batch is batch
+
+
+# ============================================================================
+# Tests for make_cp_batch_for_te
+# ============================================================================
+
+
+def test_make_cp_batch_for_te_basic(monkeypatch):
+    """Test make_cp_batch_for_te with basic input."""
+    cp_mesh = _DummySubMesh(size=2)
+
+    # Create simple batch in BSHD format
+    # 2 sequences: [1,2,3,4] and [5,6,7,8]
+    input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
+    labels = torch.tensor([[10, 20, 30, 40], [50, 60, 70, 80]])
+    position_ids = torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]])
+    seq_lens = torch.tensor([[4], [4]])  # Both sequences have length 4
+    seq_lens_padded = torch.tensor([[4], [4]])
+
+    batch = {
+        "input_ids": input_ids,
+        "labels": labels,
+        "position_ids": position_ids,
+        "seq_lens": seq_lens,
+        "seq_lens_padded": seq_lens_padded,
+    }
+
+    def mock_get_rank(group=None):
+        return 0
+
+    # Mock tex.thd_get_partitioned_indices to return all indices (simplified)
+    def mock_thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
+        # For simplicity, just return all indices
+        return torch.arange(total_tokens)
+
+    # Mock transformer_engine_torch module
+    class MockTex:
+        @staticmethod
+        def thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
+            return mock_thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank)
+
+    # Mock at the module level where it's imported
+    import sys
+    sys.modules['transformer_engine_torch'] = MockTex
+
+    monkeypatch.setattr(torch.distributed, "get_rank", mock_get_rank)
+
+    result = _cu.make_cp_batch_for_te(
+        cp_mesh=cp_mesh,
+        batch=batch,
+    )
+
+    # Should return processed batch with correct keys
+    assert "input_ids" in result
+    assert "labels" in result
+    assert "position_ids" in result
+    assert "cu_seqlens" in result
+    assert "max_seqlen" in result
+    assert "qkv_format" in result
+    assert "padding_mask" in result
+
+    # Verify format
+    assert result["qkv_format"] == "thd"
+
+    # Verify cu_seqlens are properly formatted
+    assert result["cu_seqlens"].dtype == torch.int32
+
+
+def test_make_cp_batch_for_te_unsupported_format():
+    """Test that unsupported qvk_format raises ValueError."""
+    cp_mesh = _DummySubMesh(size=2)
+
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    labels = torch.tensor([[10, 20, 30, 40]])
+    seq_lens = torch.tensor([[4]])
+    seq_lens_padded = torch.tensor([[4]])
+
+    batch = {
+        "input_ids": input_ids,
+        "labels": labels,
+        "seq_lens": seq_lens,
+        "seq_lens_padded": seq_lens_padded,
+    }
+
+    with pytest.raises(ValueError, match="Currently only 'thd' format is supported"):
+        _cu.make_cp_batch_for_te(
+            cp_mesh=cp_mesh,
+            batch=batch,
+            qkv_format="bshd",
+        )
+
+
+def test_make_cp_batch_for_te_requires_seqlens():
+    """Test that make_cp_batch_for_te raises error when seq_lens and seq_lens_padded are not provided."""
+    cp_mesh = _DummySubMesh(size=1)
+
+    input_ids = torch.tensor([[1, 2, 3]])
+    labels = torch.tensor([[10, 20, 30]])
+
+    batch = {
+        "input_ids": input_ids,
+        "labels": labels,
+        "position_ids": torch.tensor([[0, 1, 2]]),
+    }
+
+    with pytest.raises(KeyError, match="seq_lens"):
+        _cu.make_cp_batch_for_te(
+            cp_mesh=cp_mesh,
+            batch=batch,
+        )
