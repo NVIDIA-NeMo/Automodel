@@ -23,7 +23,6 @@ HF_TRANSFORMER_LLM_MegatronFSDP_TP2_FILENAME = "L2_HF_Transformer_LLM_MegatronFS
 HF_TRANSFORMER_LLM_MegatronFSDP_TP2_HF_TPPLAN_FILENAME = "L2_HF_Transformer_LLM_MegatronFSDP_TP2_HF_TPPLAN.sh"
 HF_TRANSFORMER_LLM_DDP_FILENAME = "L2_HF_Transformer_LLM_DDP.sh"
 
-
 class TestHFTransformerLLM:
     def test_hf_transformer_llm_ddp(self):
         run_test_script(TEST_FOLDER, HF_TRANSFORMER_LLM_DDP_FILENAME)
@@ -31,10 +30,13 @@ class TestHFTransformerLLM:
     @pytest.mark.pleasefixme
     def test_hf_transformer_llm_fsdp2_tp2(self):
         run_test_script(TEST_FOLDER, HF_TRANSFORMER_LLM_FSDP2_TP2_FILENAME)
-    
+
     @pytest.mark.pleasefixme
     def test_hf_transformer_llm_fsdp2_tp2_hf_tpplan(self):
         run_test_script(TEST_FOLDER, HF_TRANSFORMER_LLM_FSDP2_TP2_HF_TPPLAN_FILENAME)
+
+    def test_hf_transformer_llm_fsdp2_tp2_odd_vocab(self):
+        run_test_script(TEST_FOLDER< "L2_HF_Transformer_LLM_FSDP2_TP2_odd_vocab.sh")
 
     # @pytest.mark.pleasefixme
     # def test_hf_transformer_llm_megatron_fsdp_tp2(self):
