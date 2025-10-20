@@ -29,7 +29,7 @@ Fine-tune Hugging Face Models Instantly with Day-0 Support with NVIDIA NeMo Auto
 
 guides/llm/finetune.md
 guides/llm/mcore-pretraining.md
-guides/llm/nanogpt-pretraining.md
+guides/llm/pretraining.md
 guides/omni/gemma3-3n.md
 ```
 
