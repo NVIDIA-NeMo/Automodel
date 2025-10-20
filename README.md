@@ -27,7 +27,8 @@
 Overview
 ---
 
-Nemo AutoModel is a Pytorch DTensor‑native SPMD open-source training library developed by NVIDIA, designed to streamline and scale training and finetuning for LLMs and VLMs. Designed for flexibility, reproducibility, and scale, NeMo AutoModel enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
+Nemo AutoModel is a Pytorch DTensor‑native SPMD open-source training library under [NVIDIA NeMo Framework](https://github.com/NVIDIA-NeMo), designed to streamline and scale training and finetuning for LLMs and VLMs. Designed for flexibility, reproducibility, and scale, NeMo AutoModel enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
+ ![image](/Automodel_diagram.png)
 
 What you can expect:
 
