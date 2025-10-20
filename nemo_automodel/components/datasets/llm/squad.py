@@ -38,9 +38,7 @@ def _formatting_prompts_func(example, tokenizer, eos_token_id, pad_token_id, seq
     )
 
 
-def _formatting_prompts_func_with_chat_template(
-    example, tokenizer, eos_token_id, pad_token_id, seq_length=None
-):
+def _formatting_prompts_func_with_chat_template(example, tokenizer, eos_token_id, pad_token_id, seq_length=None):
     context = example.get("context", None) or ""
     question = example.get("question", None) or ""
     answer = example["answers"]["text"][0].strip()
