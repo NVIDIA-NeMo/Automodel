@@ -135,11 +135,12 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config, extra_args=Non
     if slurm_config.get("job_name", "") == "":
         slurm_config["job_name"] = f"{args.domain}_{args.command}"
 
+    profile_cmd = f"nsys profile -s none --trace=cuda,cudnn,nvtx --cudabacktrace=all --cuda-graph-trace=node --python-backtrace=cuda --wait all -o {job_dir}/automodel_profile_%p.nsys-rep --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop " if slurm_config.get("nsys_enabled", False) else ""
     # create the command
     command_parts = [
         f"PYTHONPATH={repo_root}:$PYTHONPATH",
         # Use torchrun to launch multiple processes instead
-        "uv sync --inexact --frozen $(cat /opt/uv_args.txt) && uv run --no-sync torchrun ",
+        f"uv sync --inexact --frozen $(cat /opt/uv_args.txt) && {profile_cmd}uv run --no-sync torchrun ",
         f"--nproc_per_node={slurm_config['ntasks_per_node']} ",
         f"--nnodes={slurm_config['nodes']} ",
         "--rdzv_backend=c10d ",

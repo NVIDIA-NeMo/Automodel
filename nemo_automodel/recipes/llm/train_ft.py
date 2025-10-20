@@ -1006,7 +1006,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
             self.pp = model
+            import nemo_automodel.autonvtx as autonvtx
+            # Patch each pipeline stage with NVTX profiling
+            for i, part in enumerate(self.model_parts):
+                autonvtx.patch(part, name=f"PipelineStage_{i}")
         else:
+            import nemo_automodel.autonvtx as autonvtx
+            # Patch model with NVTX profiling
+            autonvtx.patch(model, name=model.__class__.__name__)
             self.model_parts = [model]
             self.pp = None
 

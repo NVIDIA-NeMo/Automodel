@@ -200,7 +200,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             if i == nsys_start and rank in nsys_ranks:
                 logger.info(f"Rank {rank} | Starting nsys profiling")
                 torch.cuda.cudart().cudaProfilerStart()
-                torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
+                # Note: autonvtx module already provides NVTX annotations
+                # No need for emit_nvtx which would create duplicate/nested annotations
 
             if rank == 0:
                 logger.info(f"Rank {rank} | Iteration {i}")
@@ -237,7 +238,6 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                             num_batches=ga_steps,
                             is_train=True,
                         )
-
                     torch.cuda.nvtx.range_pop()
 
                 # Optimizer step
