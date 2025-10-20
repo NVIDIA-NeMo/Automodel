@@ -1,0 +1,57 @@
+# Minimal sequence classification config for Yelp Review Full with BERT
+
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 8
+  ckpt_every_steps: 200
+  val_every_steps: 100
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 1
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForSequenceClassification.from_pretrained
+  pretrained_model_name_or_path: google-bert/bert-base-cased
+  num_labels: 5
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors
+  save_consolidated: false
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: none
+  dp_replicate_size: 1
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.seq_cls.YelpReviewFull
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.seq_cls_collater
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.seq_cls.YelpReviewFull
+  split: test
+  num_samples_limit: 512
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.seq_cls_collater
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 2.0e-4
+  weight_decay: 0
+
+
