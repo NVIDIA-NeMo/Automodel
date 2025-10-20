@@ -61,7 +61,7 @@ RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
 # Install TE
 ARG INSTALL_TE=False
 ARG TE_COMMIT=release_v2.8
-RUN if [ "INSTALL_TE" = "True" ]; then \
+RUN if [ "$INSTALL_TE" = "True" ]; then \
     git clone https://github.com/NVIDIA/TransformerEngine.git && \
     git fetch origin $TE_COMMIT && \
     git checkout FETCH_HEAD; \
