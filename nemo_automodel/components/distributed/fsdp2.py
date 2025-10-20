@@ -189,9 +189,10 @@ class FSDP2Manager:
         assert self.dp_replicate_size < self.dp_size or self.dp_replicate_size == 1, (
             "dp_replicate_size must be less than dp_size since ddp usecase is not supported by FSDP2"
         )
-        assert self.dp_size % self.ep_size == 0, "dp_size must be a multiple of ep_size"
-        if self.ep_size < self.dp_size:
-            self.ep_shard_size = self.dp_size // self.ep_size
+        dp_cp_size = self.dp_size * self.cp_size
+        assert dp_cp_size % self.ep_size == 0, f"{dp_cp_size=} must be a multiple of {self.ep_size=}"
+        if self.ep_size < dp_cp_size:
+            self.ep_shard_size = dp_cp_size // self.ep_size
         else:
             self.ep_shard_size = 1
 
