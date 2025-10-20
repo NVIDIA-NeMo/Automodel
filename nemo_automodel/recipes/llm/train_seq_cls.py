@@ -16,29 +16,24 @@ from __future__ import annotations
 
 import logging
 import pathlib
-from typing import Any
 
 import torch
-from transformers import AutoConfig
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.metric_logger import MetricLoggerDist, MetricsSample
+from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import (
     build_checkpoint_config,
-    build_distributed,
     build_dataloader,
+    build_distributed,
     build_lr_scheduler,
     build_model_and_optimizer,
     build_step_scheduler,
 )
-from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.components.loggers.metric_logger import MetricLoggerDist, MetricsSample
-from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.training.rng import StatefulRNG, ScopedRNG
-from nemo_automodel.components.utils.model_utils import print_trainable_parameters
-
 
 logger = logging.getLogger(__name__)
 
@@ -166,28 +161,24 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
 
         restore_from = self.cfg.get("checkpoint.restore_from", None)
-        self.metric_logger_train = MetricLoggerDist(pathlib.Path(self.checkpointer.config.checkpoint_dir) / "training.jsonl")
-        self.metric_logger_valid = MetricLoggerDist(pathlib.Path(self.checkpointer.config.checkpoint_dir) / "validation.jsonl")
+        self.metric_logger_train = MetricLoggerDist(
+            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "training.jsonl"
+        )
+        self.metric_logger_valid = MetricLoggerDist(
+            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "validation.jsonl"
+        )
         self.load_checkpoint(restore_from)
         self._log_step_scheduler_details(self.step_scheduler)
 
     def run_train_validation_loop(self):
         for mp in self.model_parts:
             mp.train()
-        timestamp = torch.tensor(0.0)
-        # local timer per rank
-        import time
 
-        timestamp = time.perf_counter()
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
             for batches in self.step_scheduler:
                 loss = self._train_one_step(batches)
                 # log
-                now = time.perf_counter()
-                time_delta = now - timestamp
-                timestamp = now
-
                 log = MetricsSample(
                     step=self.step_scheduler.step,
                     epoch=self.step_scheduler.epoch,
@@ -230,11 +221,17 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         model = self.model_parts[0]
         losses = []
         for i, batch in enumerate(batches):
-            batch = {k: (v.to(self.dist_env.device, non_blocking=True) if v is not None else None) for k, v in batch.items()}
+            batch = {
+                k: (v.to(self.dist_env.device, non_blocking=True) if v is not None else None) for k, v in batch.items()
+            }
             labels = batch.pop("labels")
             out = model(**batch)
             logits = getattr(out, "logits", out)
-            loss = self.loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1)) if logits.dim() == 3 else self.loss_fn(logits, labels)
+            loss = (
+                self.loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
+                if logits.dim() == 3
+                else self.loss_fn(logits, labels)
+            )
             losses.append(loss.detach().clone())
             (loss * self._get_dp_group_size(include_cp=True)).backward()
             for opt in self.optimizer:
@@ -255,11 +252,17 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         total_loss = 0.0
         count = 0
         for batch in dataloader:
-            batch = {k: (v.to(self.dist_env.device, non_blocking=True) if v is not None else None) for k, v in batch.items()}
+            batch = {
+                k: (v.to(self.dist_env.device, non_blocking=True) if v is not None else None) for k, v in batch.items()
+            }
             labels = batch.pop("labels")
             out = model(**batch)
             logits = getattr(out, "logits", out)
-            loss = self.loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1)) if logits.dim() == 3 else self.loss_fn(logits, labels)
+            loss = (
+                self.loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
+                if logits.dim() == 3
+                else self.loss_fn(logits, labels)
+            )
             total_loss += loss.detach().cpu().item()
             count += 1
         total_loss = total_loss if count == 0 else total_loss / count
@@ -268,7 +271,11 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
 def main(config_path: str | None = None):
     if config_path is None:
-        config_path = pathlib.Path(__file__).parent.resolve() / "../.." / "examples/llm_sequence_classification/yelp/yelp_bert.yaml"
+        config_path = (
+            pathlib.Path(__file__).parent.resolve()
+            / "../.."
+            / "examples/llm_sequence_classification/yelp/yelp_bert.yaml"
+        )
     cfg = parse_args_and_load_config(config_path)
     trainer = TrainFinetuneRecipeForSequenceClassification(cfg)
     trainer.setup()
@@ -277,5 +284,3 @@ def main(config_path: str | None = None):
 
 if __name__ == "__main__":
     main()
-
-
