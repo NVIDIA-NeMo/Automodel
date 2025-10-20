@@ -43,7 +43,7 @@ Briefly, FineWeb is built by extracting main text from CommonCrawl WARC HTML, ke
 
 ### Pre-processing and Tokenization
 
-For the purposes of this guide, we provide a robust data preprocessing tool at `tools/nanogpt_data_processor.py` that streams datasets from the Hugging Face Hub, tokenizes with GPT-2 BPE (`tiktoken`), and writes **memory-mapped binary shards** to files. During training, we use the `NanogptDataset` class that can stream efficiently at training time.
+For the purposes of this guide, we provide a data preprocessing tool at [`nanogpt_data_processor.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/nanogpt_data_processor.py) that streams datasets from the Hugging Face Hub, tokenizes with GPT-2 BPE (`tiktoken`), and writes the output in **memory-mapped binary shards** to files. During training, we use the [`NanogptDataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/nanogpt_dataset.py) class that can stream efficiently at training time.
 
 
 ```bash
