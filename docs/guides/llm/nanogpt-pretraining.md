@@ -239,7 +239,7 @@ Checkpoints are written under `checkpoints/` by default as `safetensors` or `tor
 
 ## 6. Monitoring and evaluation
 
-* **Throughput** and **loss** statistics print every optimization step.
+* **TPS** (tokens per second), **gradient norm** and **loss** statistics print every optimization step.
 * Enable `wandb` in the YAML for dashboards (`wandb.project`, `wandb.entity`, etc.).
 * Periodic checkpoints can be loaded via `TrainFinetuneRecipeForNextTokenPrediction.load_checkpoint()`.
 
