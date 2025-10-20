@@ -4,11 +4,11 @@ This guide walks you through **data preparation** and **model training** for a [
 
 In particular, it will show you how to:
 1. [Install NeMo AutoModel from git](#1-environment-setup).
-2. [Pre-process and tokenize the FineWeb dataset](#pre-process-the-fineweb-dataset).
-3. [Define your own model architecture](#define-your-own-model-architecture).
-4. [Setup the YAML configuration](#inspect-and-adjust-the-yaml-configuration).
-5. [Launch training](#launch-training).
-6. [Monitor the training](#Monitoring-and-evaluation).
+2. [Pre-process and tokenize the FineWeb dataset](#2-pre-process-the-fineweb-dataset).
+3. [Define your own model architecture](#3-define-your-own-model-architecture).
+4. [Setup the YAML configuration](#4-inspect-and-adjust-the-yaml-configuration).
+5. [Launch training](#5-launch-training).
+6. [Monitor the training](#6-monitoring-and-evaluation).
 
 ---
 
