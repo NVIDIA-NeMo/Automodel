@@ -39,7 +39,7 @@ def _formatting_prompts_func(example, tokenizer, eos_token_id, pad_token_id, seq
 
 
 def _formatting_prompts_func_with_chat_template(
-    example, tokenizer, eos_token_id, pad_token_id, seq_length=None, start_of_turn_token=None
+    example, tokenizer, eos_token_id, pad_token_id, seq_length=None
 ):
     context = example.get("context", None) or ""
     question = example.get("question", None) or ""
@@ -56,7 +56,6 @@ def _formatting_prompts_func_with_chat_template(
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
         seq_length=seq_length,
-        start_of_turn_token=start_of_turn_token,
     )
 
 
@@ -64,7 +63,6 @@ def make_squad_dataset(
     tokenizer,
     seq_length=None,
     limit_dataset_samples=None,
-    start_of_turn_token=None,
     fp8=False,
     split="train",
     dataset_name="squad",
@@ -86,9 +84,6 @@ def make_squad_dataset(
             length.
         limit_dataset_samples (int, optional): If set, limit the number of
             examples loaded from the split.
-        start_of_turn_token (str or None): If using a chat template, the
-            token that marks the start of each turn. Used to compute the
-            response offset for `labels`.
         fp8 (bool): Flag for future use (e.g., mixed precision). Currently
             unused.
         split (str): Which split of the dataset to load (e.g. 'train',
@@ -122,7 +117,7 @@ def make_squad_dataset(
         fmt_fn = lambda x: _formatting_prompts_func(x, tokenizer, eos_token_id, pad_token_id, seq_length)
     else:
         fmt_fn = lambda x: _formatting_prompts_func_with_chat_template(
-            x, tokenizer, eos_token_id, pad_token_id, seq_length, start_of_turn_token
+            x, tokenizer, eos_token_id, pad_token_id, seq_length
         )  # noqa: E731
 
     # map the dataset

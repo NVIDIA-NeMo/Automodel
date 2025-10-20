@@ -60,7 +60,6 @@ def _has_chat_template(tokenizer: "PreTrainedTokenizer") -> bool:
 
 
 def _package_tokenized_example(
-    messages,
     tokenizer,
     input_ids,
     assistant_masks,
@@ -72,12 +71,12 @@ def _package_tokenized_example(
     Package a tokenized example with proper masking and padding.
 
     Args:
-        has_chat_template: Whether the tokenizer has a chat template.
+        tokenizer: The tokenizer to use.
         input_ids: The tokenized input ids.
+        assistant_masks: Boolean mask indicating which tokens are assistant/answer tokens (1) vs prompt tokens (0).
         eos_token_id: The end-of-sequence token id.
         pad_token_id: The padding token id.
         seq_length: Optional sequence length for padding.
-        context_len: Length of the context/prompt (to mask in labels).
 
     Returns:
         A dictionary with input_ids, labels, and attention_mask.
@@ -152,7 +151,17 @@ def format_prompt_completion(
     # Tokenize full text
     input_ids = tokenizer(full_text)["input_ids"]
 
-    return _package_tokenized_example(False, input_ids, eos_token_id, pad_token_id, seq_length, len_prompt_ids)
+    # Create assistant_masks: 0 for prompt tokens, 1 for answer tokens
+    assistant_masks = [0] * len_prompt_ids + [1] * (len(input_ids) - len_prompt_ids)
+
+    return _package_tokenized_example(
+        tokenizer=tokenizer,
+        input_ids=input_ids,
+        assistant_masks=assistant_masks,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        seq_length=seq_length,
+    )
 
 
 def format_chat_template(
@@ -172,7 +181,7 @@ def format_chat_template(
         eos_token_id: The end-of-sequence token id.
         pad_token_id: The padding token id.
         seq_length: Optional sequence length for padding.
-        start_of_turn_token: The start of turn token string.
+        tools: Optional list of tool definitions for function calling.
 
     Returns:
         A dictionary with the formatted example.
@@ -204,7 +213,6 @@ def format_chat_template(
         mask += [1]
 
     return _package_tokenized_example(
-        messages=formatted_text,
         tokenizer=tokenizer,
         input_ids=input_ids,
         assistant_masks=mask,
