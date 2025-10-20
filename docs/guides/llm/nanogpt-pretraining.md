@@ -36,7 +36,7 @@ You can run this guide with a single GPU by changing the config.
 
 ## 2. Pre-process the FineWeb dataset
 
-The [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) dataset
+The 🍷 [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) dataset consists of more than 18.5T tokens (originally 15T tokens) of cleaned and deduplicated english web data from CommonCrawl. The data processing pipeline is optimized for LLM performance and ran on the 🏭 datatrove library, our large scale data processing library.
 
 We provide a robust data preprocessing tool at `tools/nanogpt_data_processor.py` that streams datasets from the Hugging Face Hub, tokenizes with GPT-2 BPE (`tiktoken`), and writes **memory-mapped binary shards** that `NanogptDataset` can stream efficiently at training time.
 
