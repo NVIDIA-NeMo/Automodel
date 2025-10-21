@@ -20,11 +20,13 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 
 import os
 import logging
+import re
 from typing import Any, Dict, Optional
 
 import torch
 import torch.distributed as dist
 import wandb
+from math import ceil
 
 from nemo_automodel.components._diffusers.flow_matching.training_step_t2v import (
     step_fsdp_transformer_t2v,
@@ -34,10 +36,10 @@ from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 from torch.distributed.fsdp import MixedPrecisionPolicy
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-import torch.distributed.checkpoint as dcp
-from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.components.training.step_scheduler import StepScheduler
+from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
+from transformers.utils.hub import TRANSFORMERS_CACHE
 
 
 def build_model_and_optimizer(
@@ -136,7 +138,7 @@ def build_model_and_optimizer(
 
     logging.info("[INFO] NeMoAutoDiffusion setup complete (pipeline + optimizer)")
 
-    return pipe, model_map, optimizer
+    return pipe, model_map, optimizer, fsdp2_manager.device_mesh
 
 
 def build_lr_scheduler(
@@ -155,152 +157,6 @@ def build_lr_scheduler(
         T_max=total_steps,
         eta_min=eta_min,
     )
-
-
-def save_fsdp2_checkpoint(
-    model_map: dict,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
-    output_dir: str,
-    step: int,
-    *,
-    save_consolidated: bool = False,
-    extra_state: Optional[Dict[str, Any]] = None,
-) -> None:
-    """Save an FSDP2 checkpoint using PyTorch Distributed Checkpointing (DCP).
-
-    This saves sharded model weights and optimizer state under
-    f"{output_dir}/checkpoint-{step}". Optionally writes a consolidated
-    full-state model for inference.
-    """
-    from torch.distributed.checkpoint import FileSystemWriter
-    from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-
-    ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
-    if not os.path.exists(ckpt_dir):
-        os.makedirs(ckpt_dir, exist_ok=True)
-
-    if dist.is_initialized():
-        dist.barrier()
-
-    fsdp_model = model_map["transformer"]["fsdp_transformer"]
-
-    # Sharded model and optimizer via DCP
-    model_state = {"model": ModelState(fsdp_model)}
-    optim_state = {"optim": OptimizerState(fsdp_model, optimizer, scheduler)}
-
-    model_path = os.path.join(ckpt_dir, "transformer_model")
-    optim_path = os.path.join(ckpt_dir, "optimizer")
-
-    os.makedirs(model_path, exist_ok=True)
-    os.makedirs(optim_path, exist_ok=True)
-
-    dcp.save(model_state, storage_writer=FileSystemWriter(model_path))
-    if dist.is_initialized():
-        dist.barrier()
-    dcp.save(optim_state, storage_writer=FileSystemWriter(optim_path))
-
-    if dist.is_initialized():
-        dist.barrier()
-
-    # Optional consolidated full-state dict for inference on rank 0
-    if save_consolidated:
-        from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-
-        consolidated_saved = False
-        try:
-            # Only use FSDP FULL_STATE_DICT path if the module is actually FSDP
-            if isinstance(fsdp_model, FSDP):
-                with FSDP.state_dict_type(
-                    fsdp_model,
-                    StateDictType.FULL_STATE_DICT,
-                    FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
-                ):
-                    full_state = fsdp_model.state_dict()
-
-                if (not dist.is_initialized()) or dist.get_rank() == 0:
-                    consolidated_path = os.path.join(ckpt_dir, "consolidated_model.bin")
-                    torch.save(full_state, consolidated_path)
-                    consolidated_saved = True
-        except Exception as e:
-            logging.info(f"[WARN] Skipping consolidated save due to error: {e}")
-
-        if not consolidated_saved:
-            logging.info("[INFO] Consolidated save skipped (module not FSDP or unsupported)")
-
-    # Save training state on rank 0
-    is_rank0 = (not dist.is_initialized()) or dist.get_rank() == 0
-
-    if is_rank0:
-        training_state = {
-            "step": step,
-            "scheduler": scheduler.state_dict(),
-        }
-        torch.save(training_state, os.path.join(ckpt_dir, "training_state.pt"))
-
-        if extra_state:
-            torch.save(extra_state, os.path.join(ckpt_dir, "extra_state.pt"))
-
-
-def load_fsdp2_checkpoint(
-    model_map: dict,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
-    ckpt_path: str,
-    *,
-    extra_state: Optional[Dict[str, Any]] = None,
-) -> int:
-    """Load an FSDP2 checkpoint saved by save_fsdp2_checkpoint.
-
-    Returns the restored global step, or 0 if not found.
-    """
-    from torch.distributed.checkpoint import FileSystemReader
-
-    if not os.path.exists(ckpt_path):
-        logging.info(f"[WARNING] Checkpoint {ckpt_path} not found")
-        return 0
-
-    fsdp_model = model_map["transformer"]["fsdp_transformer"]
-
-    # Load model
-    model_dir = os.path.join(ckpt_path, "transformer_model")
-    if os.path.exists(model_dir):
-        model_state = {"model": ModelState(fsdp_model)}
-        dcp.load(model_state, storage_reader=FileSystemReader(model_dir))
-
-    if dist.is_initialized():
-        dist.barrier()
-
-    # Load optimizer + scheduler
-    optim_dir = os.path.join(ckpt_path, "optimizer")
-    if os.path.exists(optim_dir):
-        optim_state = {"optim": OptimizerState(fsdp_model, optimizer, scheduler)}
-        dcp.load(optim_state, storage_reader=FileSystemReader(optim_dir))
-
-    # Load training state and return step
-    train_state_path = os.path.join(ckpt_path, "training_state.pt")
-    if os.path.exists(train_state_path):
-        state = torch.load(train_state_path, map_location="cpu")
-        step = int(state.get("step", 0))
-        if "scheduler" in state:
-            try:
-                scheduler.load_state_dict(state["scheduler"]) 
-            except Exception:
-                pass
-        extra_state_path = os.path.join(ckpt_path, "extra_state.pt")
-        if extra_state and os.path.exists(extra_state_path):
-            state_blob = torch.load(extra_state_path, map_location="cpu")
-            for key, handler in extra_state.items():
-                if key in state_blob:
-                    payload = state_blob[key]
-                    if hasattr(handler, "load_state_dict"):
-                        handler.load_state_dict(payload)
-                    elif callable(handler):
-                        handler(payload)
-        return step
-
-    return 0
-
 
 def is_main_process():
     return (not dist.is_initialized()) or dist.get_rank() == 0
@@ -380,6 +236,7 @@ class TrainWan21DiffusionRecipe(BaseRecipe):
             self.pipe,
             self.model_map,
             self.optimizer,
+            self.device_mesh
         ) = build_model_and_optimizer(
             model_id=self.model_id,
             learning_rate=self.learning_rate,
@@ -394,17 +251,40 @@ class TrainWan21DiffusionRecipe(BaseRecipe):
             optimizer_cfg=self.cfg.get("optim.optimizer", {}),
         )
 
+        # Expose the trainable module as a single model for BaseRecipe tracking
+        self.model = self.model_map["transformer"]["fsdp_transformer"]
+        self.peft_config = None
+
         batch_cfg = self.cfg.get("batch", {})
         training_cfg = self.cfg.get("training", {})
         logging_cfg = self.cfg.get("logging", {})
-        checkpoint_cfg = self.cfg.get("checkpoint", {})
+        checkpoint_cfg = self.cfg.get("checkpoint", None)
 
         self.batch_size_per_node = batch_cfg.get("batch_size_per_node", 1)
         self.num_epochs = training_cfg.get("num_epochs", 1)
         self.save_every = logging_cfg.get("save_every", 500)
         self.log_every = logging_cfg.get("log_every", 5)
-        self.output_dir = checkpoint_cfg.get("output_dir", "./wan_t2v_flow_outputs")
-        self.resume_checkpoint = checkpoint_cfg.get("resume", None)
+
+        # Strictly require checkpoint config from YAML (no fallback)
+        if checkpoint_cfg is None:
+            raise ValueError("checkpoint config is required in YAML (enabled, checkpoint_dir, model_save_format, save_consolidated)")
+        if not checkpoint_cfg.get("enabled", False):
+            raise ValueError("checkpoint.enabled must be true in YAML for diffusion training")
+
+        # Build BaseRecipe-style checkpointing configuration (DCP/TORCH_SAVE) from YAML
+        model_state_dict_keys = list(self.model.state_dict().keys())
+        model_cache_dir = self.cfg.get("model.cache_dir", None)
+        self.checkpoint_config = CheckpointingConfig(
+            enabled=checkpoint_cfg.get("enabled"),
+            checkpoint_dir=checkpoint_cfg.get("checkpoint_dir"),
+            model_save_format=checkpoint_cfg.get("model_save_format"),
+            model_cache_dir=model_cache_dir if model_cache_dir is not None else TRANSFORMERS_CACHE,
+            model_repo_id=self.model_id,
+            save_consolidated=checkpoint_cfg.get("save_consolidated"),
+            is_peft=False,
+            model_state_dict_keys=model_state_dict_keys,
+        )
+        self.restore_from = checkpoint_cfg.get("restore_from", None)
 
         dataloader_cfg = self.cfg.get("data.dataloader")
         if not hasattr(dataloader_cfg, "instantiate"):
@@ -417,9 +297,25 @@ class TrainWan21DiffusionRecipe(BaseRecipe):
             self.dataloader = dataloader_obj
             self.sampler = getattr(dataloader_obj, "sampler", None)
 
-        self.steps_per_epoch = len(self.dataloader)
-        if self.steps_per_epoch == 0:
+        self.raw_steps_per_epoch = len(self.dataloader)
+        if self.raw_steps_per_epoch == 0:
             raise RuntimeError("Training dataloader is empty; cannot proceed with training")
+
+        # Derive DP size consistent with model parallel config
+        denom = max(1, tp_size * cp_size * pp_size)
+        self.dp_size = fsdp_cfg.get("dp_size", None)
+        if self.dp_size is None:
+            self.dp_size = max(1, self.world_size // denom)
+
+        # Infer local micro-batch size from dataloader if available
+        self.local_batch_size = getattr(self.dataloader, "batch_size", 1)
+        # Desired global effective batch size across all DP ranks and nodes
+        self.global_batch_size = max(1, int(self.batch_size_per_node) * int(self.num_nodes))
+
+        # Steps per epoch after gradient accumulation
+        # grad_acc_steps must be an integer; StepScheduler will assert divisibility
+        grad_acc_steps = max(1, self.global_batch_size // max(1, self.local_batch_size * self.dp_size))
+        self.steps_per_epoch = ceil(self.raw_steps_per_epoch / grad_acc_steps)
 
         self.lr_scheduler = build_lr_scheduler(
             self.optimizer,
@@ -429,19 +325,24 @@ class TrainWan21DiffusionRecipe(BaseRecipe):
 
         self.global_step = 0
         self.start_epoch = 0
-
-        if self.resume_checkpoint:
-            self.global_step = load_fsdp2_checkpoint(
-                self.model_map,
-                self.optimizer,
-                self.lr_scheduler,
-                self.resume_checkpoint,
-                extra_state={"rng": self.rng},
-            )
-            self.start_epoch = self.global_step // max(1, self.steps_per_epoch)
+        # Initialize StepScheduler for gradient accumulation and step/epoch bookkeeping
+        self.step_scheduler = StepScheduler(
+            global_batch_size=int(self.global_batch_size),
+            local_batch_size=int(self.local_batch_size),
+            dp_size=int(self.dp_size),
+            ckpt_every_steps=int(self.save_every) if self.save_every else 1,
+            dataloader=self.dataloader,
+            val_every_steps=None,
+            start_step=int(self.global_step),
+            start_epoch=int(self.start_epoch),
+            num_epochs=int(self.num_epochs),
+        )
+        # Optional resume only through config-defined restore_from
+        if self.restore_from:
+            self.load_checkpoint(restore_from=self.restore_from)
 
         if is_main_process():
-            os.makedirs(self.output_dir, exist_ok=True)
+            os.makedirs(self.checkpoint_config.checkpoint_dir, exist_ok=True)
 
             if wandb.run is None:
                 config = {
@@ -465,7 +366,7 @@ class TrainWan21DiffusionRecipe(BaseRecipe):
                 wandb.init(
                     project="wan-t2v-flow-matching",
                     config=config,
-                    resume=self.resume_checkpoint is not None,
+                    resume=self.restore_from is not None,
                 )
 
         if dist.is_initialized():
@@ -476,51 +377,56 @@ class TrainWan21DiffusionRecipe(BaseRecipe):
         logging.info(f"[INFO] Batch size per node: {self.batch_size_per_node}")
         logging.info(f"[INFO] Total effective batch size: {self.batch_size_per_node * self.num_nodes}")
 
-        global_step = self.global_step
+        # Keep global_step synchronized with scheduler
+        global_step = int(self.step_scheduler.step)
 
-        for epoch in range(self.start_epoch, self.num_epochs):
+        for epoch in self.step_scheduler.epochs:
             if self.sampler is not None and hasattr(self.sampler, "set_epoch"):
                 self.sampler.set_epoch(epoch)
 
-            iterable = self.dataloader
+            # Optionally wrap dataloader with tqdm for rank-0
             if is_main_process():
                 from tqdm import tqdm
-
-                iterable = tqdm(self.dataloader, desc=f"Epoch {epoch + 1}/{self.num_epochs}")
+                self.step_scheduler.dataloader = tqdm(self.dataloader, desc=f"Epoch {epoch + 1}/{self.num_epochs}")
+            else:
+                self.step_scheduler.dataloader = self.dataloader
 
             epoch_loss = 0.0
             num_steps = 0
 
-            for step, batch in enumerate(iterable):
+            for batch_group in self.step_scheduler:
                 self.optimizer.zero_grad(set_to_none=True)
 
-                try:
-                    loss, _ = step_fsdp_transformer_t2v(
-                        pipe=self.pipe,
-                        model_map=self.model_map,
-                        batch=batch,
-                        device=self.device,
-                        bf16=self.bf16,
-                        use_sigma_noise=self.use_sigma_noise,
-                        timestep_sampling=self.timestep_sampling,
-                        logit_mean=self.logit_mean,
-                        logit_std=self.logit_std,
-                        flow_shift=self.flow_shift,
-                        mix_uniform_ratio=self.mix_uniform_ratio,
-                        global_step=global_step,
-                    )
-                except Exception as exc:
-                    logging.info(
-                        f"[ERROR] Training step failed at epoch {epoch}, step {step}: {exc}"
-                    )
-                    video_shape = batch.get("video_latents", torch.tensor([])).shape
-                    text_shape = batch.get("text_embeddings", torch.tensor([])).shape
-                    logging.info(
-                        f"[DEBUG] Batch shapes - video: {video_shape}, text: {text_shape}"
-                    )
-                    raise
+                micro_losses = []
+                for micro_batch in batch_group:
+                    try:
+                        loss, _ = step_fsdp_transformer_t2v(
+                            pipe=self.pipe,
+                            model_map=self.model_map,
+                            batch=micro_batch,
+                            device=self.device,
+                            bf16=self.bf16,
+                            use_sigma_noise=self.use_sigma_noise,
+                            timestep_sampling=self.timestep_sampling,
+                            logit_mean=self.logit_mean,
+                            logit_std=self.logit_std,
+                            flow_shift=self.flow_shift,
+                            mix_uniform_ratio=self.mix_uniform_ratio,
+                            global_step=global_step,
+                        )
+                    except Exception as exc:
+                        logging.info(
+                            f"[ERROR] Training step failed at epoch {epoch}, step {num_steps}: {exc}"
+                        )
+                        video_shape = micro_batch.get("video_latents", torch.tensor([])).shape
+                        text_shape = micro_batch.get("text_embeddings", torch.tensor([])).shape
+                        logging.info(
+                            f"[DEBUG] Batch shapes - video: {video_shape}, text: {text_shape}"
+                        )
+                        raise
 
-                loss.backward()
+                    (loss / max(1, len(batch_group))).backward()
+                    micro_losses.append(float(loss.item()))
 
                 trainable_params = [
                     p
@@ -536,9 +442,10 @@ class TrainWan21DiffusionRecipe(BaseRecipe):
                 self.optimizer.step()
                 self.lr_scheduler.step()
 
-                epoch_loss += loss.item()
+                group_loss_mean = float(sum(micro_losses) / max(1, len(micro_losses)))
+                epoch_loss += group_loss_mean
                 num_steps += 1
-                global_step += 1
+                global_step = int(self.step_scheduler.step)
 
                 if (
                     self.log_every
@@ -548,41 +455,29 @@ class TrainWan21DiffusionRecipe(BaseRecipe):
                 ):
                     avg_loss = epoch_loss / max(num_steps, 1)
                     log_dict = {
-                        "train_loss": loss.item(),
+                        "train_loss": group_loss_mean,
                         "train_avg_loss": avg_loss,
                         "lr": self.optimizer.param_groups[0]["lr"],
                         "grad_norm": grad_norm,
                         "epoch": epoch,
                         "global_step": global_step,
                     }
-                    logging.info(f"[INFO] Logging: {log_dict}")
                     if wandb.run is not None:
                         wandb.log(log_dict, step=global_step)
 
-                    if hasattr(iterable, "set_postfix"):
-                        iterable.set_postfix(
+                    # Update tqdm if present
+                    if hasattr(self.step_scheduler.dataloader, "set_postfix"):
+                        self.step_scheduler.dataloader.set_postfix(
                             {
-                                "loss": f"{loss.item():.4f}",
+                                "loss": f"{group_loss_mean:.4f}",
                                 "avg": f"{(avg_loss):.4f}",
                                 "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
                                 "gn": f"{grad_norm:.2f}",
                             }
                         )
 
-                if (
-                    self.save_every
-                    and self.save_every > 0
-                    and (global_step % self.save_every == 0)
-                ):
-                    save_fsdp2_checkpoint(
-                        self.model_map,
-                        self.optimizer,
-                        self.lr_scheduler,
-                        self.output_dir,
-                        global_step,
-                        save_consolidated=False,
-                        extra_state={"rng": self.rng.state_dict()},
-                    )
+                if self.step_scheduler.is_ckpt_step:
+                    self.save_checkpoint(epoch, global_step)
 
             avg_loss = epoch_loss / max(num_steps, 1)
             logging.info(f"[INFO] Epoch {epoch + 1} complete. avg_loss={avg_loss:.6f}")
@@ -592,15 +487,7 @@ class TrainWan21DiffusionRecipe(BaseRecipe):
 
         logging.info("[INFO] Training complete, saving final checkpoint...")
 
-        save_fsdp2_checkpoint(
-            self.model_map,
-            self.optimizer,
-            self.lr_scheduler,
-            self.output_dir,
-            global_step,
-            save_consolidated=False,
-            extra_state={"rng": self.rng.state_dict()},
-        )
+        self.save_checkpoint(epoch=self.step_scheduler.epoch, step=global_step)
 
         if is_main_process():
             logging.info(f"[INFO] Saved final checkpoint at step {global_step}")
@@ -608,4 +495,3 @@ class TrainWan21DiffusionRecipe(BaseRecipe):
                 wandb.finish()
 
         logging.info("[INFO] Training complete!")
-

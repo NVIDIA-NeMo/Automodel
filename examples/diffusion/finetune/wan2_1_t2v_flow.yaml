@@ -22,7 +22,7 @@ data:
     num_nodes: 1
 
 batch:
-  batch_size_per_node: 1
+  batch_size_per_node: 8
 
 training:
   num_epochs: 20
@@ -43,13 +43,19 @@ flow_matching:
 
 fsdp:
   cpu_offload: true
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
 
 logging:
   save_every: 50
   log_every: 2
 
 checkpoint:
-  output_dir: /opt/Automodel/wan_t2v_flow_outputs_updated/
-  resume: null
+  enabled: true
+  checkpoint_dir: /opt/Automodel/wan_t2v_flow_outputs_base_recipe_checkpoint_NEW_new/
+  model_save_format: torch_save
+  save_consolidated: false
+  restore_from: null
 
 

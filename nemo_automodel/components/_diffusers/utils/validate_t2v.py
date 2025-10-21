@@ -139,7 +139,7 @@ def main():
         # Try EMA checkpoint first (best quality)
         ema_path = os.path.join(args.checkpoint, "ema_shadow.pt")
         consolidated_path = os.path.join(args.checkpoint, "consolidated_model.bin")
-        sharded_dir = os.path.join(args.checkpoint, "transformer_model")
+        sharded_dir = os.path.join(args.checkpoint, "model")
         
         if os.path.exists(ema_path):
             print(f"[INFO] Loading EMA checkpoint (best quality)...")
@@ -183,9 +183,9 @@ def main():
             )
 
             # Load shards into the FSDP-wrapped model
-            model_state = {"model": fsdp_transformer.state_dict()}
+            model_state = fsdp_transformer.state_dict()
             dist_load(state_dict=model_state, storage_reader=FileSystemReader(sharded_dir))
-            fsdp_transformer.load_state_dict(model_state["model"])
+            fsdp_transformer.load_state_dict(model_state)
 
             # Unwrap back to the original module for inference
             pipe.transformer = fsdp_transformer.module
