@@ -94,12 +94,12 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
 
         model, model_state_dict_keys, self.optimizer, _ = build_model_and_optimizer(
-            self.dist_env.device,
-            self.cfg.model,
-            self.cfg.optimizer,
-            use_hf_fa2,
-            None,
-            self.model_wrapper,
+            device=self.dist_env.device,
+            cfg_model=self.cfg.model,
+            cfg_opt=self.cfg.optimizer,
+            cfg_peft=None,
+            has_packed_sequence=use_hf_fa2,
+            model_wrapper=self.model_wrapper,
             seed=self.cfg.get("seed", 42),
             tp_size=self.cfg.get("distributed.tp_size", 1),
             cp_size=self.cfg.get("distributed.cp_size", 1),
@@ -267,6 +267,79 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             count += 1
         total_loss = total_loss if count == 0 else total_loss / count
         return total_loss
+
+
+    def log_val_metrics(self, log_data):
+        """Log metrics to wandb and other loggers
+        Args:
+            log_data: MetricsSample object, containing:
+                step: int, the current step.
+                epoch: int, the current epoch.
+                metrics: Dict[str, float], containing:
+                    "val_loss": Validation loss.
+                    "lr": Learning rate.
+                    "num_label_tokens": Number of label tokens.
+                    "mem": Memory allocated.
+        """
+
+        # Pipeline parallelism does not support validation -> log_data is None
+        if not self.dist_env.is_main or log_data is None:
+            return
+
+        # if wandb.run is not None:
+        #     wandb.log(log_data.to_dict(), step=log_data.step)
+
+        # JSONL validation log
+        self.metric_logger_valid.log(log_data)
+
+        logging.info(
+            "[val] step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
+                log_data.step,
+                log_data.epoch,
+                log_data.metrics["val_loss"],
+                log_data.metrics["lr"],
+                log_data.metrics["num_label_tokens"],
+            )
+        )
+
+    def log_train_metrics(self, log_data):
+        """Log metrics to wandb and other loggers.
+
+        Args:
+            log_data: MetricsSample object, containing:
+                step: int, the current step.
+                epoch: int, the current epoch.
+                metrics: Dict[str, float], containing:
+                    "loss": Training loss.
+                    "grad_norm": Grad norm from the training step.
+                    "lr": Learning rate.
+                    "mem": Memory allocated.
+                    "tps": Tokens per second.
+                    "tps_per_gpu": Tokens per second per GPU.
+                    "num_label_tokens": Number of label tokens.
+        """
+        if not self.dist_env.is_main:
+            return
+
+        # if wandb.run is not None:
+        #     wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+        # JSONL training log
+        self.metric_logger_train.log(log_data)
+        logging.info(
+            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
+                log_data.step,
+                log_data.epoch,
+                log_data.metrics["loss"],
+                0,
+                # log_data.metrics["grad_norm"],
+                log_data.metrics["lr"],
+                log_data.metrics["mem"],
+                log_data.metrics["tps"],
+                log_data.metrics["tps_per_gpu"],
+                log_data.metrics["num_label_tokens"],
+            )
+        )
+        torch.cuda.reset_peak_memory_stats()
 
 
 def main(config_path: str | None = None):
