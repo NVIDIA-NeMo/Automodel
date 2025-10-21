@@ -360,7 +360,7 @@ class WanParallelizationStrategy(ParallelizationStrategy):
                         model.blocks[idx] = checkpoint_wrapper(model.blocks[idx])
             except Exception as e:
                 logger.warning(f"Wan strategy: failed to apply activation checkpointing: {e}")
-        
+
         # Apply FSDP sharding recursively and to root
         apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy)
 

@@ -68,7 +68,6 @@ def _move_module_to_device(module: nn.Module, device: torch.device, torch_dtype:
         module.to(device=device)
 
 
-
 def _ensure_params_trainable(module: nn.Module, module_name: Optional[str] = None) -> int:
     """
     Ensure that all parameters in the given module are trainable.
@@ -84,6 +83,7 @@ def _ensure_params_trainable(module: nn.Module, module_name: Optional[str] = Non
         module_name = module.__class__.__name__
     logger.info("[Trainable] %s: %s parameters set requires_grad=True", module_name, f"{num_trainable_parameters:,}")
     return num_trainable_parameters
+
 
 class NeMoAutoDiffusionPipeline(DiffusionPipeline):
     """
@@ -128,7 +128,7 @@ class NeMoAutoDiffusionPipeline(DiffusionPipeline):
                     _move_module_to_device(module, dev, torch_dtype)
 
         # If loading for training, ensure the target module parameters are trainable
-        if load_for_training:            
+        if load_for_training:
             for name, module in _iter_pipeline_modules(pipe):
                 if not components_to_load or name in components_to_load:
                     logger.info("[INFO] Ensuring params trainable: %s", name)

@@ -17,7 +17,6 @@ from __future__ import annotations
 import logging
 import os
 import pickle
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -215,5 +214,3 @@ def create_dataloader(
     num_nodes: int,
 ) -> Tuple[DataLoader, Optional[DistributedSampler]]:
     return build_wan21_dataloader(meta_folder=meta_folder, batch_size=batch_size, num_nodes=num_nodes)
-
-

@@ -14,32 +14,29 @@
 
 from __future__ import annotations
 
-from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.recipes.llm.train_ft import build_distributed, build_wandb
-from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-
-import os
 import logging
-import re
+import os
+from math import ceil
 from typing import Any, Dict, Optional
 
 import torch
 import torch.distributed as dist
 import wandb
-from math import ceil
+from torch.distributed.fsdp import MixedPrecisionPolicy
+from transformers.utils.hub import TRANSFORMERS_CACHE
 
+from nemo_automodel.components._diffusers import NeMoAutoDiffusionPipeline
 from nemo_automodel.components._diffusers.flow_matching.training_step_t2v import (
     step_fsdp_transformer_t2v,
 )
-
-from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.components._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
-from torch.distributed.fsdp import MixedPrecisionPolicy
+from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
-from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
-from transformers.utils.hub import TRANSFORMERS_CACHE
+from nemo_automodel.recipes.base_recipe import BaseRecipe
+from nemo_automodel.recipes.llm.train_ft import build_distributed, build_wandb
 
 
 def build_model_and_optimizer(
@@ -93,18 +90,14 @@ def build_model_and_optimizer(
         device=device,
         parallel_scheme=parallel_scheme,
         load_for_training=True,
-        components_to_load=["transformer"]
+        components_to_load=["transformer"],
     )
 
     transformer_module = getattr(pipe, "transformer", None)
     if transformer_module is None:
         raise RuntimeError("transformer not found in pipeline after parallelization")
 
-    model_map: dict[str, Dict[str, Any]] = {
-        "transformer": {
-            "fsdp_transformer": transformer_module
-        }
-    }
+    model_map: dict[str, Dict[str, Any]] = {"transformer": {"fsdp_transformer": transformer_module}}
 
     trainable_params = [p for p in transformer_module.parameters() if p.requires_grad]
     if not trainable_params:
@@ -113,19 +106,9 @@ def build_model_and_optimizer(
     optimizer_cfg = optimizer_cfg or {}
     weight_decay = optimizer_cfg.get("weight_decay", 0.01)
     betas = optimizer_cfg.get("betas", (0.9, 0.999))
-    optimizer = torch.optim.AdamW(
-        trainable_params,
-        lr=learning_rate,
-        weight_decay=weight_decay,
-        betas=betas
-    )
+    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay, betas=betas)
 
-    logging.info(
-        "[INFO] Optimizer config: lr=%s, weight_decay=%s, betas=%s",
-        learning_rate,
-        weight_decay,
-        betas
-    )
+    logging.info("[INFO] Optimizer config: lr=%s, weight_decay=%s, betas=%s", learning_rate, weight_decay, betas)
 
     trainable_count = sum(1 for p in transformer_module.parameters() if p.requires_grad)
     frozen_count = sum(1 for p in transformer_module.parameters() if not p.requires_grad)
@@ -158,8 +141,10 @@ def build_lr_scheduler(
         eta_min=eta_min,
     )
 
+
 def is_main_process():
     return (not dist.is_initialized()) or dist.get_rank() == 0
+
 
 class TrainWan21DiffusionRecipe(BaseRecipe):
     """Config-driven wrapper around WAN 2.1 T2V training."""
@@ -180,9 +165,7 @@ class TrainWan21DiffusionRecipe(BaseRecipe):
         self.seed = self.cfg.get("seed", 42)
         self.rng = StatefulRNG(seed=self.seed, ranked=True)
 
-        self.model_id = self.cfg.get(
-            "model.pretrained_model_name_or_path", "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
-        )
+        self.model_id = self.cfg.get("model.pretrained_model_name_or_path", "Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
         self.learning_rate = self.cfg.get("optim.learning_rate", 5e-6)
         self.bf16 = torch.bfloat16
 
@@ -196,9 +179,7 @@ class TrainWan21DiffusionRecipe(BaseRecipe):
         self.local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", self.world_size))
         self.local_world_size = max(self.local_world_size, 1)
         self.num_nodes = max(1, self.world_size // self.local_world_size)
-        self.node_rank = (
-            dist.get_rank() // self.local_world_size if dist.is_initialized() else 0
-        )
+        self.node_rank = dist.get_rank() // self.local_world_size if dist.is_initialized() else 0
 
         logging.info("[INFO] WAN 2.1 T2V Trainer with Flow Matching")
         logging.info(
@@ -218,9 +199,7 @@ class TrainWan21DiffusionRecipe(BaseRecipe):
         self.flow_shift = fm_cfg.get("flow_shift", 3.0)
         self.mix_uniform_ratio = fm_cfg.get("mix_uniform_ratio", 0.1)
 
-        logging.info(
-            f"[INFO] Flow matching: {'ENABLED' if self.use_sigma_noise else 'DISABLED'}"
-        )
+        logging.info(f"[INFO] Flow matching: {'ENABLED' if self.use_sigma_noise else 'DISABLED'}")
         if self.use_sigma_noise:
             logging.info(f"[INFO]   - Timestep sampling: {self.timestep_sampling}")
             logging.info(f"[INFO]   - Flow shift: {self.flow_shift}")
@@ -232,12 +211,7 @@ class TrainWan21DiffusionRecipe(BaseRecipe):
         dp_size = fsdp_cfg.get("dp_size", None)
         use_hf_tp_plan = fsdp_cfg.get("use_hf_tp_plan", False)
 
-        (
-            self.pipe,
-            self.model_map,
-            self.optimizer,
-            self.device_mesh
-        ) = build_model_and_optimizer(
+        (self.pipe, self.model_map, self.optimizer, self.device_mesh) = build_model_and_optimizer(
             model_id=self.model_id,
             learning_rate=self.learning_rate,
             device=self.device,
@@ -267,7 +241,9 @@ class TrainWan21DiffusionRecipe(BaseRecipe):
 
         # Strictly require checkpoint config from YAML (no fallback)
         if checkpoint_cfg is None:
-            raise ValueError("checkpoint config is required in YAML (enabled, checkpoint_dir, model_save_format, save_consolidated)")
+            raise ValueError(
+                "checkpoint config is required in YAML (enabled, checkpoint_dir, model_save_format, save_consolidated)"
+            )
         if not checkpoint_cfg.get("enabled", False):
             raise ValueError("checkpoint.enabled must be true in YAML for diffusion training")
 
@@ -387,6 +363,7 @@ class TrainWan21DiffusionRecipe(BaseRecipe):
             # Optionally wrap dataloader with tqdm for rank-0
             if is_main_process():
                 from tqdm import tqdm
+
                 self.step_scheduler.dataloader = tqdm(self.dataloader, desc=f"Epoch {epoch + 1}/{self.num_epochs}")
             else:
                 self.step_scheduler.dataloader = self.dataloader
@@ -415,14 +392,10 @@ class TrainWan21DiffusionRecipe(BaseRecipe):
                             global_step=global_step,
                         )
                     except Exception as exc:
-                        logging.info(
-                            f"[ERROR] Training step failed at epoch {epoch}, step {num_steps}: {exc}"
-                        )
+                        logging.info(f"[ERROR] Training step failed at epoch {epoch}, step {num_steps}: {exc}")
                         video_shape = micro_batch.get("video_latents", torch.tensor([])).shape
                         text_shape = micro_batch.get("text_embeddings", torch.tensor([])).shape
-                        logging.info(
-                            f"[DEBUG] Batch shapes - video: {video_shape}, text: {text_shape}"
-                        )
+                        logging.info(f"[DEBUG] Batch shapes - video: {video_shape}, text: {text_shape}")
                         raise
 
                     (loss / max(1, len(batch_group))).backward()
@@ -447,12 +420,7 @@ class TrainWan21DiffusionRecipe(BaseRecipe):
                 num_steps += 1
                 global_step = int(self.step_scheduler.step)
 
-                if (
-                    self.log_every
-                    and self.log_every > 0
-                    and is_main_process()
-                    and (global_step % self.log_every == 0)
-                ):
+                if self.log_every and self.log_every > 0 and is_main_process() and (global_step % self.log_every == 0):
                     avg_loss = epoch_loss / max(num_steps, 1)
                     log_dict = {
                         "train_loss": group_loss_mean,

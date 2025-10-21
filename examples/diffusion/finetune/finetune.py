@@ -27,5 +27,3 @@ def main(default_config_path="examples/diffusion/finetune/wan2_1_t2v_flow.yaml")
 
 if __name__ == "__main__":
     main()
-
-
