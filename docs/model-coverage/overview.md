@@ -28,7 +28,7 @@ AutoModel includes a custom model registry that allows teams to:
 
 ## When a model available on Hugging Face Hub may not be supported
 
-There are cases where a model is available on the Hugging Face Hub, but you may not be able to finetune this model.
+Sometimes a model listed on the Hugging Face Hub may not support finetuning in NeMo AutoModel.
 If you encounter any such model, please open a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues) requesting support by sharing the model-id of interest as well as any stack trace you see. We summarize here some cases (non-exhaustive):
 
 | Issue                              | Example Error Message    | Solution                                    |
