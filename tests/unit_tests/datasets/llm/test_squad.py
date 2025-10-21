@@ -37,8 +37,8 @@ class DummyTokenizer:
         self.eos_token_id = 0
         self.bos_token_id = 1
         if with_chat_template:
-            # merely a flag that tells make_squad_dataset to use the chat path
-            self.chat_template = True
+            # Set a chat template string with generation keyword for proper masking
+            self.chat_template = "{{ messages }}{% generation %}"
             self._start_tok = start_of_turn
             self.start_of_turn = start_of_turn
 
@@ -59,13 +59,26 @@ class DummyTokenizer:
     #  - Accept list[dict{role, content}]
     #  - Prepend start_of_turn token before each role
     #  - Append eos at very end
-    #  - Return list[int] token ids
-    def apply_chat_template(self, messages, **kwargs):
+    #  - Return dict with input_ids (and optionally assistant_masks) if return_dict=True
+    def apply_chat_template(self, messages, return_dict=False, return_assistant_tokens_mask=False, **kwargs):
         ids = []
+        masks = []
         for msg in messages:
             ids.append(self._tok_to_id(self._start_tok))
-            ids.extend(self(msg["content"], add_special_tokens=False)["input_ids"])
+            masks.append(0)  # start-of-turn is context
+            content_ids = self(msg["content"], add_special_tokens=False)["input_ids"]
+            ids.extend(content_ids)
+            # Only assistant messages contribute to loss
+            is_assistant = msg.get("role") == "assistant"
+            masks.extend([1 if is_assistant else 0] * len(content_ids))
         ids.append(self.eos_token_id)
+        masks.append(1)  # EOS is part of assistant
+        
+        if return_dict:
+            result = {"input_ids": ids}
+            if return_assistant_tokens_mask:
+                result["assistant_masks"] = masks
+            return result
         return ids
 
 
@@ -174,7 +187,7 @@ def test_chat_template_path():
     `formatting_prompts_func_with_chat_template` must be executed.
 
     We also test that:
-      • `start_of_turn_token` is respected when computing `loss_mask`
+      • the chat template correctly identifies assistant tokens for masking
       • everything after the second start-of-turn token gets loss_mask==1
     """
     start_token = "▸"
@@ -182,7 +195,6 @@ def test_chat_template_path():
 
     ds = make_squad_dataset(
         tok,
-        start_of_turn_token=start_token,
         seq_length=None,  # no padding
     )
     row = ds[0]
