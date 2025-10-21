@@ -62,10 +62,10 @@ class _DummyTokenizer:  # noqa: D401
 
     def __init__(self):
         self.pad_token = "<pad>"
-
-    # Dummy special token ids expected by the dataset implementation
-    eos_token_id = None  # End-of-sequence token (unused in tests)
-    bos_token_id = None  # Beginning-of-sequence token (unused in tests)
+        self.pad_token_id = 0
+        self.eos_token_id = 1
+        self.bos_token_id = 2
+        self._counter = 3  # Start token IDs from 3 to avoid conflicts
 
     def __call__(self, text: str, add_special_tokens: bool = True):  # noqa: D401
         """Mimic the Hugging Face tokenizer ``__call__`` API.
@@ -77,7 +77,11 @@ class _DummyTokenizer:  # noqa: D401
         """
 
         # Very simple whitespace tokenisation - one integer per token.
-        input_ids = list(range(len(text.split())))
+        # Start from _counter to avoid conflicts with special tokens
+        tokens = text.split()
+        input_ids = list(range(self._counter, self._counter + len(tokens)))
+        if add_special_tokens:
+            input_ids = [self.bos_token_id] + input_ids + [self.eos_token_id]
         return {"input_ids": input_ids}
 
 

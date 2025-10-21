@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-import nemo_automodel.components.datasets.llm.tool_calling_chat_dataset as tcd
+import nemo_automodel.components.datasets.llm.chat_dataset as tcd
 
 
 def test_is_hf_repo_id_and_as_iter_and_normalize():
@@ -126,7 +126,7 @@ def test_tool_calling_chat_dataset_happy_path_and_edge_cases(monkeypatch):
 
     monkeypatch.setattr(tcd, "_load_openai_messages", lambda *a, **k: dataset_rows)
 
-    ds = tcd.ToolCallingChatDataset("ignored", tok, seq_length=16, start_of_turn_token="<|sot|>", chat_template="OVERRIDE")
+    ds = tcd.ChatDataset("ignored", tok, seq_length=16, start_of_turn_token="<|sot|>", chat_template="OVERRIDE")
 
     # init effects
     assert ds.pad_token_id == 3  # from _add_pad_token
@@ -143,7 +143,7 @@ def test_tool_calling_chat_dataset_happy_path_and_edge_cases(monkeypatch):
 
     # Bad row: messages not a list → ValueError
     monkeypatch.setattr(tcd, "_load_openai_messages", lambda *a, **k: [{"messages": "oops"}])
-    ds_bad = tcd.ToolCallingChatDataset("ignored", tok)
+    ds_bad = tcd.ChatDataset("ignored", tok)
     with pytest.raises(ValueError):
         _ = ds_bad[0]
 
@@ -151,7 +151,7 @@ def test_tool_calling_chat_dataset_happy_path_and_edge_cases(monkeypatch):
 def test_tool_calling_chat_dataset_errors(monkeypatch):
     # No tokenizer
     with pytest.raises(ValueError):
-        tcd.ToolCallingChatDataset("ignored", None)
+        tcd.ChatDataset("ignored", None)
 
     # Tokenizer provided but missing chat template support
     class Tok:
@@ -160,6 +160,6 @@ def test_tool_calling_chat_dataset_errors(monkeypatch):
 
     monkeypatch.setattr(tcd, "_has_chat_template", lambda _tok: False)
     with pytest.raises(ValueError):
-        tcd.ToolCallingChatDataset("ignored", Tok())
+        tcd.ChatDataset("ignored", Tok())
 
 

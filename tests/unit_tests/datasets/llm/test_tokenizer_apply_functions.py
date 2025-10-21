@@ -71,22 +71,52 @@ class _StubTokenizerPlain:  # noqa: D401 – minimal interface only
 class _StubTokenizerChat(_StubTokenizerPlain):  # noqa: D401
     """Extends :class:`_StubTokenizerPlain` with chat-template support."""
 
-    chat_template = "<dummy>"
+    chat_template = "<dummy {% generation %} template>"
     _start_of_turn_token = "<sot>"
     _start_of_turn_token_id = 99
 
-    def apply_chat_template(self, messages):  # type: ignore[override]
+    def apply_chat_template(self, messages, **kwargs):  # type: ignore[override]
         """Very small surrogate that encodes ``messages`` as id sequence.
 
         Encoding scheme:
-        ``[SOT] <user tokens> [SOT] <assistant tokens> <EOS>``
+        ``[SOT] <prompt tokens (system+user)> [SOT] <assistant tokens> <EOS>``
         where ``[SOT]`` is the *start-of-turn* marker (id=99).
         """
+        # Separate prompt messages (system, user) from assistant messages
+        prompt_messages = [m for m in messages if m["role"] != "assistant"]
+        assistant_messages = [m for m in messages if m["role"] == "assistant"]
+        
+        # Build ids: [SOT] + prompt tokens + [SOT] + assistant tokens + [EOS]
         ids: List[int] = [self._start_of_turn_token_id]
-        ids.extend(self._id_for_token(tok) for tok in messages[0]["content"].split())
+        
+        # Add all prompt tokens (system + user)
+        prompt_token_count = 0
+        for msg in prompt_messages:
+            tokens = msg["content"].split()
+            ids.extend(self._id_for_token(tok) for tok in tokens)
+            prompt_token_count += len(tokens)
+        
+        # Add second SOT and assistant tokens
         ids.append(self._start_of_turn_token_id)
-        ids.extend(self._id_for_token(tok) for tok in messages[1]["content"].split())
+        assistant_token_count = 0
+        for msg in assistant_messages:
+            tokens = msg["content"].split()
+            ids.extend(self._id_for_token(tok) for tok in tokens)
+            assistant_token_count += len(tokens)
+        
         ids.append(self.eos_token_id)
+        
+        # Handle return_dict parameter
+        if kwargs.get("return_dict", False):
+            result = {"input_ids": ids}
+            # Handle return_assistant_tokens_mask parameter
+            if kwargs.get("return_assistant_tokens_mask", False):
+                # Create mask: first SOT and prompt tokens are 0 (masked), 
+                # second SOT and assistant tokens are 1 (not masked)
+                mask = [0] * (1 + prompt_token_count)  # first SOT + prompt tokens
+                mask += [1] * (1 + assistant_token_count + 1)  # second SOT + assistant tokens + EOS
+                result["assistant_masks"] = mask
+            return result
         return ids
 
     # ``format_chat_template`` will call the tokenizer on the
@@ -155,7 +185,6 @@ def test_apply_tokenizer_chat_template_answer_only_mask():
             {"role": "assistant", "content": ans},
         ],
         eos_token_id=tok.eos_token_id, pad_token_id=tok.eos_token_id,
-        start_of_turn_token=tok._start_of_turn_token
     )
 
     # Basic invariants
@@ -184,7 +213,6 @@ def test_apply_tokenizer_chat_template_full_loss_mask():
         ],
         eos_token_id=tok.eos_token_id,
         pad_token_id=tok.eos_token_id,
-        start_of_turn_token=tok._start_of_turn_token,
     )
     del out["___PAD_TOKEN_IDS___"]
     assert set(out) == {"input_ids", "labels", "attention_mask"}

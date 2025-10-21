@@ -14,14 +14,14 @@
 
 
 # To run this recipe, please use the following command:
-# uv run recipes/llm_finetune/finetune.py --config recipes/llm_finetune/qwen/qwen2_5_7b_instruct_toolcall.yaml
+# uv run recipes/llm_finetune/finetune.py --config recipes/llm_finetune/qwen/qwen2_5_7b_instruct_chat.yaml
 
 
 step_scheduler:
   global_batch_size: 64
   local_batch_size: 1
-  ckpt_every_steps: 1000
-  val_every_steps: 10  # will run every x number of gradient steps
+  ckpt_every_steps: 100
+  val_every_steps: 20  # will run every x number of gradient steps
   num_epochs: 1
 
 dist_env:
@@ -45,6 +45,12 @@ compile:
   dynamic: true  # Set to false for better performance with fixed shapes
   backend: null  # Use default backend (inductor)
 
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors # safetensors only for peft
+  save_consolidated: false
+
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: none
@@ -64,10 +70,9 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.tool_calling_chat_dataset.ToolCallingChatDataset
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
   path_or_dataset_id: your/path/to/train.jsonl
-  seq_length: 4096
-  # chat_template: null  # Optional: override tokenizer.chat_template
+  #chat_template: none
 
 packed_sequence:
   packed_sequence_size: 0
@@ -78,10 +83,10 @@ dataloader:
   shuffle: false
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.tool_calling_chat_dataset.ToolCallingChatDataset
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
   path_or_dataset_id: your/path/to/validation.jsonl
-  seq_length: 4096
-  # chat_template: null  # Optional: override tokenizer.chat_template
+  #chat_template: none
+
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

@@ -280,7 +280,6 @@ class ColumnMappedTextInstructionDataset(Dataset):
                 eos_token_id,
                 pad_token_id,
                 seq_length=self.seq_length,
-                start_of_turn_token=self.start_of_turn_token,
             )
         else:
             prompt = " ".join(filter(lambda x: x is not None, (context, question, "")))
