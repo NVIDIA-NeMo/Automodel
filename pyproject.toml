@@ -161,7 +161,7 @@ explicit = true
 
 [[tool.uv.index]]
 name = "pytorch"
-url = "https://download.pytorch.org/whl/cu128"
+url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
 [tool.uv.sources]
