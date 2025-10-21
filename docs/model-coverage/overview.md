@@ -20,8 +20,8 @@ AutoModel includes a custom model registry that allows teams to:
 
 | Auto class                          | Task                     | Status     | Notes                                     |
 |-------------------------------------|--------------------------|------------|-------------------------------------------|
-| `AutoModelForCausalLM`              | Text Generation (LLM)    | Supported  | See `docs/model-coverage/llm.md`.         |
-| `AutoModelForImageTextToText`       | Image-Text-to-Text (VLM) | Supported  | See `docs/model-coverage/vlm.md`.         |
+| `AutoModelForCausalLM`              | Text Generation (LLM)    | Supported  | See [`docs/model-coverage/llm.md`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/llm.md).         |
+| `AutoModelForImageTextToText`       | Image-Text-to-Text (VLM) | Supported  | See [`docs/model-coverage/vlm.md`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/vlm.md).         |
 | `AutoModelForSequenceClassification`| Sequence Classification  | WIP        | Early support; interfaces may change.     |
 
 
