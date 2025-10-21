@@ -451,3 +451,33 @@ class SFTSingleTurnPreprocessor:
             )
 
         return tokenized
+
+
+def seq_cls_collater(batch):
+    """
+    Collate function for sequence classification.
+
+    Expects each item in batch to be a dict with keys:
+      - "input_ids": List[int]
+      - "attention_mask": List[int]
+      - "labels": int
+
+    Returns a dict with tensors:
+      - input_ids: LongTensor [batch, seq_len]
+      - attention_mask: LongTensor [batch, seq_len]
+      - labels: LongTensor [batch]
+    """
+    # Extract and stack sequences; assume they are pre-padded to uniform length
+    input_ids = [sample["input_ids"] for sample in batch]
+    attention_mask = [sample.get("attention_mask", [1] * len(sample["input_ids"])) for sample in batch]
+    labels = [int(sample["labels"]) for sample in batch]
+
+    input_ids_tensor = torch.LongTensor(input_ids)
+    attention_mask_tensor = torch.LongTensor(attention_mask)
+    labels_tensor = torch.LongTensor(labels)
+
+    return {
+        "input_ids": input_ids_tensor,
+        "attention_mask": attention_mask_tensor,
+        "labels": labels_tensor,
+    }
