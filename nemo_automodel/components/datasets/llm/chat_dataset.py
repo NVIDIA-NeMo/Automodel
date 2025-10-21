@@ -109,7 +109,7 @@ def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return norm
 
 
-class ToolCallingChatDataset(Dataset):
+class ChatDataset(Dataset):
     """Dataset for OpenAI-format tool-calling chat transcripts.
 
     This class expects each row to contain a `messages` list in OpenAI chat format,
@@ -137,7 +137,7 @@ class ToolCallingChatDataset(Dataset):
             tokenizer.chat_template = chat_template
 
         if not _has_chat_template(tokenizer):
-            raise ValueError("ToolCallingChatDataset requires a tokenizer with chat template support.")
+            raise ValueError("ChatDataset requires a tokenizer with chat template support.")
 
         self.tokenizer = tokenizer
         self.seq_length = seq_length
@@ -170,7 +170,6 @@ class ToolCallingChatDataset(Dataset):
             eos_token_id,
             self.pad_token_id,
             seq_length=self.seq_length,
-            start_of_turn_token=self.start_of_turn_token,
             tools=tools,
         )
         return sample
