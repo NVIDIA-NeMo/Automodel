@@ -26,7 +26,7 @@ AutoModel includes a custom model registry that allows teams to:
 | `AutoModelForSequenceClassification`| Sequence Classification  | WIP        | Early support; interfaces may change.     |
 
 
-## When a model available on Hugging Face Hub may not be supported
+## When a model listed on Hugging Face Hub may not be supported
 
 Sometimes a model listed on the Hugging Face Hub may not support finetuning in NeMo AutoModel.
 If you encounter any such model, please open a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues) requesting support by sharing the model-id of interest as well as any stack trace you see. We summarize here some cases (non-exhaustive):
