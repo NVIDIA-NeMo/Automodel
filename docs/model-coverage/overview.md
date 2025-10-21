@@ -36,7 +36,7 @@ If you encounter any such model, please open a [GitHub issue](https://github.com
 |Model has explicitly disabled training functionality in the model-definition code. | — | Make the model available via our custom registry. Please open a new GitHub issue, requesting support. |
 | Model requires newer transformers version | The checkpoint you are trying to load has model type `deepseek_v32` but Transformers does not recognize this architecture. | Upgrade the transformers version you use, and/or open a new GitHub issue. |
 | Model upper-bounds transformer version, requiring older version | — | Open a new GitHub issue. |
-| Back/stale Checkpoint | OSError: `meta-llama/Llama-2-70b` does not appear to have a file named pytorch_model.bin, model.safetensors, tf_model.h5, model.ckpt or flax_model.msgpack. | Open a new GitHub issue. |
+| Unsupported checkpoint format | OSError: `meta-llama/Llama-2-70b` does not appear to have a file named pytorch_model.bin, model.safetensors, tf_model.h5, model.ckpt or flax_model.msgpack. | Open a new GitHub issue or request from the model publisher to share a safetensors checkpoint. |
 
 These cases typically stem from upstream packaging or dependency constraints and would surface similarly when using `transformers` directly. AutoModel mirrors the familiar load/finetune semantics.
 
