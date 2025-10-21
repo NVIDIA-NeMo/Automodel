@@ -36,7 +36,7 @@ guides/omni/gemma3-3n.md
 ```{toctree}
 :caption: Model Coverage
 :hidden:
-
+model-coverage/overview.md
 model-coverage/llm.md
 model-coverage/vlm.md
 ```
