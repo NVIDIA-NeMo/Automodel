@@ -44,4 +44,4 @@ If you encounter any issue, you can try:
 
 - Upgrade to a NeMo AutoModel release that supports the required `transformers` version.
 - If the model uses custom code, set `trust_remote_code=True` when loading.
-- Open an issue with the model-id and error for us to prioritize support or add a registry-backed implementation.
+- Open a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues) with the model-id and error for us to prioritize support or add a registry-backed implementation.
