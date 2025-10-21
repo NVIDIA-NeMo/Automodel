@@ -4,17 +4,18 @@ NeMo AutoModel integrates with Hugging Face `transformers`. As a result, any LLM
 
 ## Version compatibility and Day‑0 support
 
-- AutoModel tracks the latest `transformers` version that is officially supported within NeMo.
-- Newly released Hugging Face models may depend on a newer `transformers` version than NeMo currently supports. In such cases, those models are not available in AutoModel until NeMo updates its supported `transformers` version.
+- AutoModel closely tracks the latest `transformers` version and updates its dependency on a regular basis.
+- Newly released Hugging Face models may require a more recent `transformers` version than what NeMo currently supports; those models will become available in NeMo AutoModel after the next `transformers` version bump.
+- We are working on introducing a continuous integration (CI) pipeline that will automatically bump the supported `transformers` version as soon as a new release is detected. This will enable even faster support for the newest Hugging Face models.
 
-**Note:** To use newly released models, you may need to upgrade the `transformers` dependency to a version that supports those models and is compatible with NeMo.
+**Note:** To use newly released models, you may need to upgrade your NeMo AutoModel installation. This process is similar to upgrading `transformers` itself to access the latest model support.
 
 ## Extending model support with the custom registry
 
 AutoModel includes a custom model registry that allows teams to:
 
 - Add custom implementations to extend support to models not yet covered upstream.
-- Provide optimized or faster implementations for specific models while retaining the same AutoModel interface.
+- Provide optimized, extended or faster implementations for specific models while retaining the same AutoModel interface.
 
 ## Supported Hugging Face Auto classes
 
