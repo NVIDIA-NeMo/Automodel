@@ -341,7 +341,10 @@ def apply_lora_to_linear_modules(
         w.requires_grad_(False)
 
     matcher = ModuleMatcher(
-        peft_config.target_modules, peft_config.exclude_modules, peft_config.match_all_linear, model,
+        peft_config.target_modules,
+        peft_config.exclude_modules,
+        peft_config.match_all_linear,
+        model,
     )
     num_modules_matched = 0
     for name, module in list(model.named_modules()):

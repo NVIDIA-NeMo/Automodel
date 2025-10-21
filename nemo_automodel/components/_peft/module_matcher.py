@@ -36,6 +36,7 @@ def wildcard_match(pattern, key):
     match = regex_pattern.match(key)
     return match is not None
 
+
 def _get_model_embedding_ptrs(model: nn.Module) -> list[str]:
     ptrs = []
     for name, module in model.named_modules():
@@ -43,6 +44,7 @@ def _get_model_embedding_ptrs(model: nn.Module) -> list[str]:
             continue
         ptrs.append(module.weight.data_ptr())
     return ptrs
+
 
 def _get_tied_target_modules(model: nn.Module) -> list[str]:
     if model is None:
