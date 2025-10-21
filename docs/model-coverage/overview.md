@@ -10,9 +10,9 @@ NeMo AutoModel integrates with Hugging Face `transformers`. As a result, any LLM
 
 **Note:** To use newly released models, you may need to upgrade your NeMo AutoModel installation. This process is similar to upgrading `transformers` itself to access the latest model support. In practice, the upgrade behavior and familiar `Auto*` APIs mirror `transformers`, with AutoModel additionally providing optional performance accelerations and distributed training features.
 
-## Extending model support with the custom registry
+## Extended model support with NeMo AutoModel's custom model registry
 
-AutoModel includes a custom model registry that allows teams to:
+NeMo AutoModel includes a custom model registry that allows teams to:
 
 - Add custom implementations to extend support to models not yet covered upstream.
 - Provide optimized, extended or faster implementations for specific models while retaining the same AutoModel interface.
