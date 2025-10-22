@@ -264,7 +264,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     )
                     # if we have a custom model implementation available, we prioritize that over HF
                     if config.architectures[0] in ModelRegistry.model_arch_name_to_cls:
-                        model = ModelRegistry.model_arch_name_to_cls[config.architectures[0]](config, *model_args, **kwargs)
+                        model = ModelRegistry.model_arch_name_to_cls[config.architectures[0]](
+                            config, *model_args, **kwargs
+                        )
                         logger.info(f"Using custom model implementation for {config.architectures[0]}")
                         return model
                 except Exception as e:
@@ -393,7 +395,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 try:
                     # if we have a custom model implementation available, we prioritize that over HF
                     if config.architectures[0] in ModelRegistry.model_arch_name_to_cls:
-                        model = ModelRegistry.model_arch_name_to_cls[config.architectures[0]](config, *model_args, **kwargs)
+                        model = ModelRegistry.model_arch_name_to_cls[config.architectures[0]](
+                            config, *model_args, **kwargs
+                        )
                         logger.info(f"Using custom model implementation for {config.architectures[0]}")
                         return model
                 except Exception as e:
