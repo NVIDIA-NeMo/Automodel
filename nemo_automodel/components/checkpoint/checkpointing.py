@@ -148,12 +148,6 @@ class Checkpointer:
             self._model_ctx.process_group = torch.distributed.new_group(backend="gloo")
             self._optim_ctx.process_group = torch.distributed.new_group(backend="gloo")
 
-        self.__post_init__()
-
-    def __post_init__(self) -> None:
-        """
-        Post-initialization hook that prepares optional addons and inflight state.
-        """
         self._addons = []
         if self._should_write_consolidated():
             self._addons.append(ConsolidatedHFAddon())
@@ -587,7 +581,7 @@ class Checkpointer:
             return _HuggingFaceStorageReader(path=model_path, key_mapping=key_mapping)
 
 
-def get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
+def get_safetensors_index_path(cache_dir: str, repo_id: str | None) -> str | None:
     """
     Return the directory containing the first `model.safetensors.index.json` found for given model.
 
@@ -613,6 +607,10 @@ def get_safetensors_index_path(cache_dir: str, repo_id: str) -> str:
     Raises:
         FileNotFoundError: If the index file is not found.
     """
+    # repo_id can be None if the model is not Hugging Face Hub yet
+    if repo_id is None:
+        return None
+
     if os.path.exists(repo_id):
         return repo_id
 

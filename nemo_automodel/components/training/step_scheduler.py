@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from math import ceil
 from typing import Optional
 
 from torch.distributed.checkpoint.stateful import Stateful
+
+logger = logging.getLogger(__name__)
 
 
 def _calculate_max_steps(
@@ -39,8 +42,8 @@ class StepScheduler(Stateful):
         global_batch_size: int,
         local_batch_size: int,
         dp_size: int,
-        ckpt_every_steps: int,
         dataloader: Optional[int],
+        ckpt_every_steps: Optional[int] = None,
         val_every_steps: Optional[int] = None,
         start_step: int = 0,
         start_epoch: int = 0,
@@ -54,7 +57,7 @@ class StepScheduler(Stateful):
             global_batch_size (int): Number of steps for gradient accumulation.
             local_batch_size (int): Number of steps for gradient accumulation.
             dp_size (int): Number of steps for gradient accumulation.
-            ckpt_every_steps (int): Frequency of checkpoint steps.
+            ckpt_every_steps (Optional[int]): Frequency of checkpoint steps.
             dataloader (Optional[int]): The training dataloader.
             val_every_steps (int): Number of training steps between validation.
             start_step (int): Initial global step.
@@ -69,8 +72,6 @@ class StepScheduler(Stateful):
         assert self.grad_acc_steps >= 1, (
             f"grad_acc_steps ({self.grad_acc_steps}) must be greater than or equal to 1. Please ensure that global_batch_size >= (local_batch_size * dp_size)"
         )
-        self.ckpt_every_steps = ckpt_every_steps
-        assert ckpt_every_steps > 0, "ckpt_every_steps must be greater than 0"
         self.dataloader = dataloader
         self.step = start_step
         assert start_step >= 0, "start_step must be greater than or equal to 0"
@@ -88,8 +89,17 @@ class StepScheduler(Stateful):
         if max_steps is None:
             assert self.epoch_len is not None, "epoch_len must be provided if max_steps is not provided"
             max_steps = _calculate_max_steps(self.num_epochs, self.epoch_len)
+            logger.info("max_steps not provided; will run for up to {} steps".format(max_steps))
         self.max_steps = max_steps
         assert max_steps > 0, "max_steps must be greater than 0"
+
+        if ckpt_every_steps is None:
+            if self.epoch_len is None:
+                ckpt_every_steps = self.max_steps // 2
+            else:
+                ckpt_every_steps = self.epoch_len
+            logger.info("ckpt_every_steps not provided; will save checkpoint every {} steps".format(ckpt_every_steps))
+        self.ckpt_every_steps = ckpt_every_steps
 
     def __iter__(self):
         """
