@@ -603,7 +603,7 @@ def test_hf_peft_checkpoint():
     """
     expected_model_keys, expected_optim_keys = get_test_peft_vlm_checkpoint_expected_keys()
     expected_config = {
-        "base_model_name_or_path": "/home/TestData/huiyingl/hf_gemma3_2l/",
+        "base_model_name_or_path": "$TEST_DATA_DIR/hf_gemma3_2l/",
         "bias": "none",
         "lora_alpha": 32,
         "peft_type": "LORA",

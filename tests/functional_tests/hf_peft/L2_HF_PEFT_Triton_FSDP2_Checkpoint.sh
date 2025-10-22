@@ -22,14 +22,14 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run \
  --master-port=29599 --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace \
 -m pytest tests/functional_tests/checkpoint/test_peft.py \
     --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
-    --model.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
+    --model.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
     --step_scheduler.max_steps 10 \
     --step_scheduler.global_batch_size 16 \
     --step_scheduler.local_batch_size 8 \
-    --dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
-    --validation_dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
-    --dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
-    --validation_dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
+    --dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
+    --validation_dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
+    --dataset.dataset_name $HF_CACHE/squad/ \
+    --validation_dataset.dataset_name $HF_CACHE/squad/ \
     --dataset.limit_dataset_samples 1000 \
     --step_scheduler.ckpt_every_steps 10 \
     --checkpoint.enabled true \

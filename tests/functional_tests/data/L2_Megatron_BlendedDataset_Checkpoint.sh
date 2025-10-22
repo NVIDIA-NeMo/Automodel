@@ -21,14 +21,14 @@ export CUDA_VISIBLE_DEVICES="0,1"
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace --parallel-mode \
 -m pytest tests/functional_tests/training/test_megatron_dataset_checkpoint.py \
     --config examples/llm_pretrain/megatron_pretrain_gpt2.yaml \
-    --model.config.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
+    --model.config.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
     --dataset._target_ nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining \
-    --dataset.paths '["/home/TestData/adasif/mcore_dataset_fineweb/processed_data_0_text_document", "/home/TestData/adasif/mcore_dataset_fineweb/processed_data_1_text_document"]' \
+    --dataset.paths '["$TEST_DATA_DIR/mcore_dataset_fineweb/processed_data_0_text_document", "$TEST_DATA_DIR/mcore_dataset_fineweb/processed_data_1_text_document"]' \
     --dataset.seq_length 32 \
     --dataset.split "0.99, 0.01, 0.00" \
     --dataset.splits_to_build "train" \
-    --dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
-    --validation_dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
+    --dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
+    --validation_dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
     --checkpoint.checkpoint_dir checkpoints/ \
     --distributed._target_ nemo_automodel.components.distributed.fsdp2.FSDP2Manager \
     --distributed.dp_size none \
