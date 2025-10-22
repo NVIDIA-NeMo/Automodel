@@ -688,7 +688,6 @@ def consolidate_safetensors_files_on_every_rank(
         GLOBAL_OUTPUT_FILES_DATA = {}
         global_output_files_data_list = [None] * world_size
         dist.all_gather_object(global_output_files_data_list, output_files_data)
-        print([type(item) for item in global_output_files_data_list])
         for item in global_output_files_data_list:
             if item:
                 GLOBAL_OUTPUT_FILES_DATA.update(item)
