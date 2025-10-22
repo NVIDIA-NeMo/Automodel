@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import glob
+import json
 import logging
 import os
 from importlib.util import find_spec
@@ -55,13 +56,15 @@ class MegatronPretraining:
         """Pretraining dataset class for Megatron-LM datasets.
         Args:
             paths (Path | List | Dict[str, List]): Paths of the data distributions. Can be either a
-                single path, a list of paths, or a dictionary. If a single path or a list of paths,
-                the given paths will be used to generate the train, validation and test datasets. If
-                providing a list of paths, the format can be either (1) a list of paths, e.g.
+                single path, a list of paths, a dictionary, or a path to a JSON file containing a dictionary.
+                If a single path (not JSON) or a list of paths, the given paths will be used to generate
+                the train, validation and test datasets. If providing a list of paths, the format can be
+                either (1) a list of paths, e.g.
                     ["path/to/dataset_1_prefix", "path/to/dataset_2_prefix"],
                 or (2) a flattened, zipped list of weights and paths, e.g.
                     ["30", "path/to/dataset_1_prefix", "70", "path/to/dataset_2_prefix"]
-                If a dictionary is provided, it is expected to have the following form:
+                If a dictionary is provided (either directly or via JSON file), it is expected to have
+                the following form:
                     {
                         'train': <TRAIN PATHS>,
                         'validation': <VALID PATHS>,
@@ -69,8 +72,16 @@ class MegatronPretraining:
                     }
                 where each value is either a path or a list of paths as described above.
                 In this case, each split will be generated using the given paths.
+                Split name aliases are supported: 'valid', 'val', 'dev' are normalized to 'validation'.
                 Note that if limit_val_batches <= 1, we generate the entire validaton dataset, so
                 weights should not be provided for the validation split.
+
+                Example JSON file format:
+                    {
+                        "train": ["30", "path/to/dataset1", "70", "path/to/dataset2"],
+                        "valid": ["path/to/val_dataset"],
+                        "test": ["path/to/test_dataset"]
+                    }
             seq_length (int): Sequence length.
             tokenizer (Optional[PreTrainedTokenizerBase]): An instance of a PreTrainedTokenizerBase object.
             micro_batch_size (int): Batch size per GPU.
@@ -109,7 +120,12 @@ class MegatronPretraining:
                 )
 
         if not isinstance(paths, (list, tuple, dict)):
-            paths = get_list_of_files(paths)
+            # Check if paths is a JSON file containing blend configuration
+            blend_config_or_none = try_load_blend_from_json(paths)
+            if blend_config_or_none is not None:
+                paths = blend_config_or_none
+            else:
+                paths = get_list_of_files(paths)
         validate_dataset_asset_accessibility(paths)
 
         if isinstance(split, (list, tuple)):
@@ -121,12 +137,12 @@ class MegatronPretraining:
         if isinstance(paths, dict):
             if split is not None:
                 logger.warning(
-                    f"{split=} will be ignored since datasets are being created from 3 separate distributions."
+                    f"{split=} will be ignored since datasets are being created from separate distributions per split."
                 )
             build_kwargs["blend_per_split"] = [
-                get_blend_from_list(paths["train"]),
-                get_blend_from_list(paths["validation"]),
-                get_blend_from_list(paths["test"]),
+                get_blend_from_list(paths.get("train")),
+                get_blend_from_list(paths.get("validation")),
+                get_blend_from_list(paths.get("test")),
             ]
         else:
             paths, weights = get_blend_from_list(paths)
@@ -336,3 +352,65 @@ def get_list_of_files(path: str):
         assert path.endswith(".bin") or path.endswith(".idx"), f"Expected {path} to be a .bin or .idx file."
         unique_paths.add(str(Path(path).with_suffix("")))
     return sorted(list(unique_paths))
+
+
+def try_load_blend_from_json(path: Union[str, Path]) -> Optional[Dict[str, List]]:
+    """
+    Load a data blend configuration from a JSON file.
+
+    Args:
+        path: Path to a JSON file containing the blend configuration.
+              The JSON should contain a dictionary with split names as keys (e.g., 'train', 'valid', 'test'),
+              where each value is a list of dataset paths or a flattened list of weights and paths.
+              Common aliases like 'valid', 'val', 'dev' are automatically normalized to 'validation'.
+
+    Returns:
+        Dictionary containing the blend configuration if the path is a JSON file, None otherwise.
+
+    Raises:
+        FileNotFoundError: If the JSON file does not exist.
+        PermissionError: If the JSON file cannot be read.
+        ValueError: If the JSON is invalid or not a dictionary.
+
+    Example JSON format:
+        {
+            "train": ["30", "path/to/dataset1", "70", "path/to/dataset2"],
+            "valid": ["path/to/val_dataset"],
+            "test": ["path/to/test_dataset"]
+        }
+    """
+    path = Path(path)
+
+    # Check if the path is a JSON file
+    if path.suffix.lower() != ".json":
+        return None
+
+    if not path.exists():
+        raise FileNotFoundError(f"Blend JSON file not found: {path}")
+
+    if not os.access(path, os.R_OK):
+        raise PermissionError(f"Cannot read blend JSON file: {path}")
+
+    try:
+        with open(path, "r") as f:
+            blend_config = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in blend file {path}: {e}")
+
+    if not isinstance(blend_config, dict):
+        raise ValueError(f"Blend JSON file must contain a dictionary, got {type(blend_config)}")
+
+    # Normalize split names (e.g., "valid" -> "validation", "val" -> "validation")
+    split_aliases = {
+        "valid": "validation",
+        "val": "validation",
+        "dev": "validation",
+    }
+
+    normalized_config = {}
+    for key, value in blend_config.items():
+        normalized_key = split_aliases.get(key, key)
+        normalized_config[normalized_key] = value
+
+    logger.info(f"Loaded blend configuration from JSON file: {path} with splits: {list(normalized_config.keys())}")
+    return normalized_config
