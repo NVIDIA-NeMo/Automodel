@@ -91,6 +91,9 @@ class _InputFileData:
     metadata: Any = None
 
 
+GLOBAL_OUTPUT_FILES_DATA: Optional[dict[str, _OutputFileData]] = None
+
+
 def _parse_input_metadata(
     input_files_data: dict[str, _InputFileData],
     output_files_data: dict[str, _OutputFileData],
@@ -670,12 +673,32 @@ def consolidate_safetensors_files_on_every_rank(
             filtered_filename_mapping[fqn] = filename
 
         # Call the existing consolidation function with the filtered mapping
-        _consolidate_safetensors_files(
+        output_files_data = _consolidate_safetensors_files(
             input_dir=input_dir,
             output_dir=output_dir,
             fqn_to_file_mapping=filtered_filename_mapping,
             num_threads=num_threads,
         )
+    else:
+        output_files_data = {}
+
+    global GLOBAL_OUTPUT_FILES_DATA
+    if GLOBAL_OUTPUT_FILES_DATA is None:
+        # cache after the first time we checkpoint
+        GLOBAL_OUTPUT_FILES_DATA = {}
+        global_output_files_data_list = [None] * world_size
+        dist.all_gather_object(global_output_files_data_list, output_files_data)
+        print([type(item) for item in global_output_files_data_list])
+        for item in global_output_files_data_list:
+            if item:
+                GLOBAL_OUTPUT_FILES_DATA.update(item)
+
+    # Write overall model.index.safetensors.json file with weight map
+    if GLOBAL_OUTPUT_FILES_DATA:
+        if rank == 0:
+            _write_overall_metadata_file(output_dir, GLOBAL_OUTPUT_FILES_DATA)
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
 
     logger.info(
         "Rank %d: Done consolidating. Processed %d unique indices in %.2f secs.",
