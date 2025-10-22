@@ -369,7 +369,14 @@ def _write_sub_tensor_to_file_optimized(
         sub_tensor_offsets: Starting offsets of the sub-tensor within the full tensor
         sub_tensor_shape: Shape of the sub-tensor
     """
-    # Handle empty tensors
+    # Handle 0-dim (scalar) tensors explicitly
+    if len(tensor_shape) == 0 and len(sub_tensor_shape) == 0:
+        bytes_to_write = min(len(sub_tensor_bytes), element_size)
+        if bytes_to_write:
+            full_tensor_mv[:bytes_to_write] = sub_tensor_bytes[:bytes_to_write]
+        return
+
+    # Handle invalid/empty shapes (non-scalar)
     if not tensor_shape or not sub_tensor_shape:
         return
 
