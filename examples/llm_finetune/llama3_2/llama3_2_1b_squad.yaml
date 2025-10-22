@@ -99,3 +99,12 @@ lr_scheduler:
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
 
+# Optional Quantization-Aware Training (QAT) configuration (torchao)
+# Produces a standard checkpoint; run a separate quantization step to materialize int weights.
+# To enable, set enabled: true and provide a torchao QAT quantizer.
+qat:
+  enabled: true
+  quantizer:
+    _target_: torchao.quantization.qat.Int8DynActInt4WeightQATQuantizer
+    groupsize: 256
+  fake_quant_after_n_steps: 1000
