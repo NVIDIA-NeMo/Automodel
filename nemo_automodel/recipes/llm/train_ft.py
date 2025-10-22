@@ -37,8 +37,8 @@ from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
 from transformers.utils.hub import TRANSFORMERS_CACHE
 from wandb import Settings
 
+from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
-from nemo_automodel.components._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
@@ -54,6 +54,7 @@ from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPMana
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.metric_logger import MetricLoggerDist, MetricsSample
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
@@ -97,15 +98,58 @@ def _get_model_name(cfg_model):
         return None
 
 
+def _uses_te_dot_product_attention(cfg_model):
+    return (
+        True
+        if hasattr(cfg_model, "backend") and hasattr(cfg_model.backend, "attn") and cfg_model.backend.attn == "te"
+        else False
+    )
+
+
+def _uses_thd_collater(cfg_dataloader):
+    from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
+
+    return (
+        True
+        if hasattr(cfg_dataloader, "collate_fn") and cfg_dataloader.collate_fn == packed_sequence_thd_collater
+        else False
+    )
+
+
+def _get_num_thd_chunks(pp_enabled, cfg):
+    if pp_enabled:
+        return cfg.step_scheduler.local_batch_size // cfg.autopipeline.pp_microbatch_size
+    return 1
+
+
+def _get_packed_sequence_config(has_packed_sequence, is_hf_model, cp_size):
+    kwargs = {}
+    if has_packed_sequence and is_hf_model:
+        if cp_size == 1:
+            kwargs["attn_implementation"] = "flash_attention_2"
+            logger.warning(
+                "Packed sequence is supported only with Flash Attention. "
+                "Setting model's attn_implementation to flash_attention_2"
+            )
+        else:
+            # TODO: support packed sequence with CP size > 1
+            raise ValueError("Packed sequence is only supported with CP size 1")
+    if cp_size > 1 and is_hf_model:
+        kwargs["attn_implementation"] = "sdpa"
+        logger.warning("Packed sequence is supported only with SDPA. Setting model's attn_implementation to sdpa")
+
+    return kwargs
+
+
 def build_model_and_optimizer(
     device,
     cfg_model,
     cfg_opt,
-    use_hf_fa2,
     cfg_peft,
     model_wrapper,
     seed,
     checkpointer: Checkpointer,
+    has_packed_sequence=False,
     tp_size=1,
     cp_size=1,
     cfg_fp8=None,
@@ -115,7 +159,6 @@ def build_model_and_optimizer(
     loss_fn=None,
     parallelize_fn=None,
     load_base_model=True,
-    dequantize_base_checkpoint=False,
 ) -> tuple[nn.Module | AutoPipeline, list[str], list["Optimizer"], nn.Module]:  # noqa: F821
     """
     Build and initialize a model and optimizer.
@@ -150,12 +193,7 @@ def build_model_and_optimizer(
     init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
     with ScopedRNG(seed=seed, ranked=True):
         kwargs = {}
-        if use_hf_fa2 and is_hf_model:
-            kwargs["attn_implementation"] = "flash_attention_2"
-            logger.warning(
-                "Packed sequence is supported only with Flash Attention. "
-                "Setting model's attn_implementation to flash_attention_2"
-            )
+        kwargs.update(_get_packed_sequence_config(has_packed_sequence, is_hf_model, cp_size))
 
         if cfg_quantization is not None:
             logger.info("Model weight quantization enabled with BitsAndBytes")
@@ -169,6 +207,11 @@ def build_model_and_optimizer(
                 logger.info("Disabling Liger kernel with TP ({}) or CP ({})".format(tp_size, cp_size))
                 kwargs["use_liger_kernel"] = False
             model = cfg_model.instantiate(**kwargs)
+
+            # Check if the model supports SDPA and raise an error if it doesn't
+            if cp_size > 1 and is_hf_model and hasattr(model, "_supports_sdpa"):
+                if model._supports_sdpa is False:
+                    raise ValueError("Model does not support SDPA required for context parallelism")
 
             # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
             if cfg_peft is not None:
@@ -206,7 +249,6 @@ def build_model_and_optimizer(
                     _get_model_name(cfg_model),
                     getattr(cfg_peft, "lora_A_init", None),
                     load_base_model=load_base_model,
-                    quantization=dequantize_base_checkpoint,
                 )
 
             # Create optimizer for all model parts
@@ -227,7 +269,12 @@ def build_model_and_optimizer(
                 world_mesh=model_wrapper.device_mesh,
                 moe_mesh=getattr(model_wrapper, "moe_mesh", None),
                 pp_enabled=False,
-                dp_axis_names=("dp_shard",),
+                dp_axis_names=(
+                    ("dp_replicate", "dp_shard_cp")
+                    if "dp_replicate" in model_wrapper.device_mesh.mesh_dim_names
+                    and "dp_shard_cp" in model_wrapper.device_mesh.mesh_dim_names
+                    else ("dp_shard_cp",)
+                ),
                 cp_axis_name="cp",
                 tp_axis_name="tp",
                 ep_axis_name="ep",
@@ -262,7 +309,6 @@ def build_model_and_optimizer(
                 _get_model_name(cfg_model),
                 getattr(cfg_peft, "lora_A_init", None),
                 load_base_model=load_base_model,
-                quantization=dequantize_base_checkpoint,
             )
 
         # ensure the model is on device
@@ -306,12 +352,12 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
     """
 
     ckpt_kwargs = dict(
-        enabled=False,
+        enabled=True,
         checkpoint_dir="checkpoints/",
         model_save_format="safetensors",
         model_repo_id=model_repo_id,
         model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
-        save_consolidated=False,
+        save_consolidated=True,
         is_peft=is_peft,
     )
     if cfg_ckpt is not None:
@@ -379,6 +425,7 @@ def build_dataloader(
     dp_world_size,
     pp_enabled,
     supports_seq_lens=True,
+    cp_size=1,
 ) -> tuple[DataLoader, PreTrainedTokenizerBase]:
     """Build a DataLoader for the dataset.
 
@@ -429,6 +476,8 @@ def build_dataloader(
                 packed_sequence_size=packed_sequence_size,
                 split_across_pack=getattr(cfg_ps, "split_across_pack", False),
                 max_packs=getattr(cfg_ps, "max_packs", None),
+                padding_idx=getattr(tokenizer, "pad_token_id", 0),
+                cp_size=cp_size,
             )
 
         if isinstance(ds, MegatronPretraining):
@@ -577,31 +626,34 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamSch
     if step_scheduler.max_steps is not None:
         total_steps = min(total_steps, step_scheduler.max_steps)
 
-    # Extract learning rate from optimizer
-    base_lrs = [opt.param_groups[0]["lr"] for opt in optimizer]
-
     # Set defaults for scheduler parameters
-    default_kwargs_list = []
-    for base_lr, opt in zip(base_lrs, optimizer):
-        default_kwargs = dict(
-            optimizer=opt,
-            init_lr=base_lr * 0.1,  # Start warmup at 10% of base LR
-            max_lr=base_lr,
-            min_lr=base_lr * 0.01,  # End at 1% of base LR
-            lr_warmup_steps=min(1000, total_steps // 10),  # 10% warmup or max 1000 steps
-            lr_decay_steps=total_steps,
-            lr_decay_style="cosine",
-            start_wd=opt.param_groups[0].get("weight_decay", 0.0),
-            end_wd=opt.param_groups[0].get("weight_decay", 0.0),
-            wd_incr_steps=total_steps,
-            wd_incr_style="constant",
-        )
-        default_kwargs_list.append(default_kwargs)
+    optimizer_param_schedulers = []
+    user_kwargs = cfg.to_dict()
+    default_kwargs = dict(
+        lr_warmup_steps=min(1000, total_steps // 10),  # 10% warmup or max 1000 steps
+        lr_decay_steps=total_steps,
+        lr_decay_style="cosine",
+        wd_incr_steps=total_steps,
+        wd_incr_style="constant",
+    )
 
-    # Override with user-provided config
-    if cfg is not None:
-        user_cfg = cfg.to_dict() if hasattr(cfg, "to_dict") else dict(cfg)
-        default_kwargs.update(user_cfg)
+    if not isinstance(optimizer, list):
+        optimizer = [optimizer]
+
+    for opt in optimizer:
+        base_lr = opt.param_groups[0]["lr"]
+        default_kwargs.update(
+            dict(
+                optimizer=opt,
+                init_lr=base_lr * 0.1,  # Start warmup at 10% of base LR
+                max_lr=base_lr,
+                min_lr=base_lr * 0.01,  # End at 1% of base LR
+                start_wd=opt.param_groups[0].get("weight_decay", 0.0),
+                end_wd=opt.param_groups[0].get("weight_decay", 0.0),
+            )
+        )
+        default_kwargs.update(user_kwargs)
+        optimizer_param_schedulers.append(OptimizerParamScheduler(**default_kwargs))
 
     logger.info(
         f"Building LR scheduler with total_steps={total_steps}, "
@@ -609,7 +661,7 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamSch
         f"decay_style={default_kwargs['lr_decay_style']}"
     )
 
-    return [OptimizerParamScheduler(**default_kwargs) for default_kwargs in default_kwargs_list]
+    return optimizer_param_schedulers
 
 
 def build_wandb(cfg) -> wandb.Run:
@@ -753,18 +805,27 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._log_experiment_details()
         self._log_library_versions()
 
-        # Check if packed_sequence_size > 0 and use HF's flash_attention_2 for attn implementation.
-        use_hf_fa2 = self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
-
         self.pp_enabled: bool = (
             True if hasattr(self.model_wrapper, "pp_size") and self.model_wrapper.pp_size > 1 else False
         )
         autopipeline_cfg = self.cfg.get("autopipeline", None)
         if self.pp_enabled:
             pp_batch_size = self.cfg.step_scheduler.local_batch_size
+            pp_microbatch_size = self.cfg.autopipeline.pp_microbatch_size
             assert pp_batch_size // self.cfg.autopipeline.pp_microbatch_size >= self.model_wrapper.pp_size, (
                 f"pp_batch_size {pp_batch_size} // pp_microbatch_size {self.cfg.autopipeline.pp_microbatch_size} must be greater than or equal to pp_size {self.model_wrapper.pp_size}"
             )
+            if (
+                self.cfg.distributed.get("cp_size", 1) > 1
+                and _uses_te_dot_product_attention(self.cfg.model)
+                and _uses_thd_collater(self.cfg.dataloader)
+            ):
+                pp_microbatch_size = 1
+                pp_batch_size = pp_batch_size // self.cfg.autopipeline.pp_microbatch_size
+                logging.info(
+                    f"Overriding pp_batch_size: {pp_batch_size}, pp_microbatch_size: {pp_microbatch_size} for THD"
+                )
+
             assert autopipeline_cfg is not None, (
                 "AutoPipeline configuration is required when pipeline parallelism is enabled"
             )
@@ -777,10 +838,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 moe_mesh=self.moe_mesh,
                 pp_axis_name="pp",
                 dp_axis_names=(
-                    ("dp_replicate", "dp_shard")
+                    ("dp_replicate", "dp_shard_cp")
                     if "dp_replicate" in self.device_mesh.mesh_dim_names
-                    and "dp_shard" in self.device_mesh.mesh_dim_names
-                    else ("dp_shard",)
+                    and "dp_shard_cp" in self.device_mesh.mesh_dim_names
+                    else ("dp_shard_cp",)
                 ),
                 cp_axis_name="cp" if "cp" in self.device_mesh.mesh_dim_names else None,
                 tp_axis_name="tp" if "tp" in self.device_mesh.mesh_dim_names else None,
@@ -789,6 +850,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     ("ep_shard",) if self.moe_mesh is not None and "ep_shard" in self.moe_mesh.mesh_dim_names else None
                 ),
                 pp_batch_size=pp_batch_size,
+                pp_microbatch_size=pp_microbatch_size,
                 patch_stage_backward_maybe_with_nosync=self.cfg.get("model.backend.enable_fsdp_optimizations", False),
                 device=torch.cuda.current_device(),
             )
@@ -828,9 +890,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.dist_env.device,
             self.cfg.model,
             self.cfg.optimizer,
-            use_hf_fa2,
             self.peft_config,
             self.model_wrapper,
+            has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
             seed=self.cfg.get("seed", 42),
             tp_size=self.cfg.get("distributed.tp_size", 1),
             cp_size=self.cfg.get("distributed.cp_size", 1),
@@ -841,7 +903,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             loss_fn=self.loss_fn,
             parallelize_fn=parallelize_fn,
             load_base_model=self.cfg.get("checkpoint.load_base_model", True),
-            dequantize_base_checkpoint=self.cfg.get("checkpoint.dequantize_base_checkpoint", False),
             checkpointer=self.checkpointer,
         )
         self.checkpointer.config.model_state_dict_keys = model_state_dict_keys
@@ -867,6 +928,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             dp_world_size=self._get_dp_group_size(),
             pp_enabled=self.pp_enabled,
             supports_seq_lens=True,
+            cp_size=self.cfg.get("distributed.cp_size", 1),
         )
 
         # Build validation dataloader if the config provides it
@@ -878,7 +940,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 self.cfg.validation_dataset,
                 self.cfg.validation_dataloader,
                 self.cfg.model,
-                cfg_ps=None,  # Use unpacked config for validation
+                cfg_ps=self.cfg.get("packed_sequence", None),  # Use unpacked config for validation
                 seed=self.cfg.get("seed", 42),
                 local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
                 global_batch_size=self.cfg.get("step_scheduler.global_batch_size", 1),
@@ -887,6 +949,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 dp_rank=self._get_dp_rank(),
                 dp_world_size=self._get_dp_group_size(),
                 pp_enabled=self.pp_enabled,
+                supports_seq_lens=True,
+                cp_size=self.cfg.get("distributed.cp_size", 1),
             )
 
         # Scheduler
@@ -904,6 +968,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
 
         restore_from = self.cfg.get("checkpoint.restore_from", None)
+        # Initialize JSONL loggers
+        self.metric_logger_train = MetricLoggerDist(
+            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "training.jsonl"
+        )
+        self.metric_logger_valid = MetricLoggerDist(
+            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "validation.jsonl"
+        )
 
         # Optionally resume
         self.load_checkpoint(restore_from)
@@ -927,13 +998,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # The step scheduler yields a list of batches with the following properties:
             # 1. len(batches) == grad_acc_steps
             # 2. len(batches[0]) == batch_size
-            for i, batches in enumerate(self.step_scheduler):
-                reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens = self._run_train_optim_step(
-                    batches, 1.0
-                )
-
+            for batches in self.step_scheduler:
+                train_log_data = self._run_train_optim_step(batches, 1.0)
                 # log
-                self.log_train_metrics(reporting_loss, grad_norm, num_tokens_in_batch, tps, num_label_tokens)
+                self.log_train_metrics(train_log_data)
 
                 # Save the checkpoint every ckpt_every_steps
                 if self.step_scheduler.is_ckpt_step:
@@ -941,9 +1009,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
                 # Run validation every val_every_steps
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                    self._run_validation_epoch()
+                    val_log_data = self._run_validation_epoch(self.val_dataloader)
+                    self.log_val_metrics(val_log_data)
                     for mp in self.model_parts:
                         mp.train()
+        # Close JSONL loggers after training loop completes
+        self.metric_logger_train.close()
+        self.metric_logger_valid.close()
 
         self.checkpointer.close()
 
@@ -963,14 +1035,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             k: (
                 {dk: dv.to(self.dist_env.device, non_blocking=True) if dv is not None else None for dk, dv in v.items()}
                 if isinstance(v, dict)
-                else v.to(self.dist_env.device, non_blocking=True)
-                if v is not None
-                else None
+                else (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
             )
             for k, v in batch.items()
         }
+        train_ctx, batch = make_cp_batch_and_ctx(
+            self.device_mesh,
+            batch,
+            use_te=_uses_te_dot_product_attention(self.cfg.model) and _uses_thd_collater(self.cfg.dataloader),
+            padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
+            num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
+        )
         labels = batch.pop("labels")
-        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
+
         if self.pp_enabled:
             if not is_train:
                 logging.info("Skipping forward pass for validation because pipeline parallelism is enabled")
@@ -1118,10 +1195,24 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         reporting_loss = reporting_loss.cpu().item()
         # fix reporting_loss, tps across ranks
-        return reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens
+
+        return MetricsSample(
+            step=self.step_scheduler.step,
+            epoch=self.step_scheduler.epoch,
+            metrics={
+                "loss": reporting_loss,
+                "grad_norm": grad_norm,
+                "lr": self.optimizer[0].param_groups[0]["lr"],
+                "mem": torch.cuda.max_memory_allocated() / 1024**3,
+                "tps": tps,
+                "tps_per_gpu": tps / max(self._get_dp_group_size(), 1),
+                "num_tokens_per_step": num_tokens_in_batch,
+                "num_label_tokens": num_label_tokens,
+            },
+        )
 
     @torch.no_grad()
-    def _run_validation_epoch(self):
+    def _run_validation_epoch(self, val_dataloader):
         """Run one pass over `self.val_dataloader`."""
         if self.pp_enabled:
             logger.warning("Validation is not supported for pipeline parallelism")
@@ -1134,7 +1225,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
             total_num_label_tokens = 0
 
-            for batch in self.val_dataloader:
+            for batch in val_dataloader:
                 loss_buffer = []
                 num_label_tokens = (batch["labels"] != -100).sum().item()
                 self._forward_backward_step(
@@ -1151,63 +1242,88 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         total_loss = self._dp_allreduce(total_loss, include_cp=True).item()
         total_num_label_tokens = self._dp_allreduce(torch.tensor(total_num_label_tokens, dtype=torch.long)).item()
-
         val_loss = total_loss / max(total_num_label_tokens, 1e-8)
-        if self.dist_env.is_main:
-            if wandb.run is not None:
-                wandb.log({"val_loss": val_loss, "step": self.step_scheduler.step, "epoch": self.step_scheduler.epoch})
 
-        # assumes all model parts' optimizers have the same learning rate
-        current_lr = self.optimizer[0].param_groups[0]["lr"]
+        return MetricsSample(
+            step=self.step_scheduler.step,
+            epoch=self.step_scheduler.epoch,
+            metrics={
+                "val_loss": val_loss,
+                "lr": self.optimizer[0].param_groups[0]["lr"],
+                "num_label_tokens": total_num_label_tokens,
+                "mem": torch.cuda.max_memory_allocated() / 1024**3,
+            },
+        )
+
+    def log_val_metrics(self, log_data):
+        """Log metrics to wandb and other loggers
+        Args:
+            log_data: MetricsSample object, containing:
+                step: int, the current step.
+                epoch: int, the current epoch.
+                metrics: Dict[str, float], containing:
+                    "val_loss": Validation loss.
+                    "lr": Learning rate.
+                    "num_label_tokens": Number of label tokens.
+                    "mem": Memory allocated.
+        """
+
+        # Pipeline parallelism does not support validation -> log_data is None
+        if not self.dist_env.is_main or log_data is None:
+            return
+
+        if wandb.run is not None:
+            wandb.log(log_data.to_dict(), step=log_data.step)
+
+        # JSONL validation log
+        self.metric_logger_valid.log(log_data)
+
         logging.info(
             "[val] step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
-                self.step_scheduler.step,
-                self.step_scheduler.epoch,
-                val_loss,
-                current_lr,
-                total_num_label_tokens,
+                log_data.step,
+                log_data.epoch,
+                log_data.metrics["val_loss"],
+                log_data.metrics["lr"],
+                log_data.metrics["num_label_tokens"],
             )
         )
 
-    def log_train_metrics(self, train_loss, grad_norm, num_tokens_in_batch, tps, num_label_tokens) -> float:
-        """Log metrics to wandb.
+    def log_train_metrics(self, log_data):
+        """Log metrics to wandb and other loggers.
 
         Args:
-            train_loss: Training loss.
-            grad_norm: Grad norm from the training step.
-            num_tokens_in_batch: Total number of loss tokens.
-            tps: Tokens per second.
+            log_data: MetricsSample object, containing:
+                step: int, the current step.
+                epoch: int, the current epoch.
+                metrics: Dict[str, float], containing:
+                    "loss": Training loss.
+                    "grad_norm": Grad norm from the training step.
+                    "lr": Learning rate.
+                    "mem": Memory allocated.
+                    "tps": Tokens per second.
+                    "tps_per_gpu": Tokens per second per GPU.
+                    "num_label_tokens": Number of label tokens.
         """
-        log_data = {
-            "step": self.step_scheduler.step,
-            "epoch": self.step_scheduler.epoch,
-            "train_loss": train_loss,
-            "grad_norm": grad_norm,
-            "num_tokens_per_step": num_tokens_in_batch,
-            "tps": tps,
-            "tps_per_gpu": tps / max(self._get_dp_group_size(), 1),
-        }
-        # assumes all model parts' optimizers have the same learning rate
-        current_lr = self.optimizer[0].param_groups[0]["lr"]
-        log_data["learning_rate"] = current_lr
+        if not self.dist_env.is_main:
+            return
 
         if wandb.run is not None:
-            wandb.log(log_data, step=self.step_scheduler.step)
-
-        if self.dist_env.is_main:
-            logging.info(
-                "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
-                    self.step_scheduler.step,
-                    self.step_scheduler.epoch,
-                    train_loss,
-                    grad_norm,
-                    current_lr,
-                    torch.cuda.max_memory_allocated() / 1024**3,
-                    tps,
-                    tps / max(self._get_dp_group_size(), 1),
-                    num_label_tokens,
-                )
+            wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+        # JSONL training log
+        self.metric_logger_train.log(log_data)
+        logging.info(
+            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
+                log_data.step,
+                log_data.epoch,
+                log_data.metrics["loss"],
+                log_data.metrics["grad_norm"],
+                log_data.metrics["lr"],
+                log_data.metrics["mem"],
+                log_data.metrics["tps"],
+                log_data.metrics["tps_per_gpu"],
+                log_data.metrics["num_label_tokens"],
             )
+        )
         torch.cuda.reset_peak_memory_stats()
 
 

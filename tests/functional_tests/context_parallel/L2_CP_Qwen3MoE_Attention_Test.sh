@@ -1,4 +1,5 @@
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
+#!/bin/bash
+# Copyright (c) 2025, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,17 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
-from nemo_automodel.components._transformers.auto_model import (
-    NeMoAutoModelForCausalLM,
-    NeMoAutoModelForImageTextToText,
-    NeMoAutoModelForSequenceClassification,
-    NeMoAutoModelForTextToWaveform,
-)
+export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
+export CUDA_VISIBLE_DEVICES="0,1"
 
-__all__ = [
-    "NeMoAutoModelForCausalLM",
-    "NeMoAutoModelForImageTextToText",
-    "NeMoAutoModelForSequenceClassification",
-    "NeMoAutoModelForTextToWaveform",
-]
+# Run Qwen3MoE attention layer CP test with 2 GPUs
+torchrun --nproc_per_node=2 --nnodes=1 \
+    tests/functional_tests/context_parallel/run_attention_cp.py \
+    --model_type qwen3_moe

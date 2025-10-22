@@ -115,7 +115,9 @@ def precompute_freqs_cis(
     return freqs
 
 
-def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+def apply_rotary_emb(
+    x: torch.Tensor, freqs_cis: torch.Tensor, qkv_format: str = "bshd", unsqueeze_dim: int | None = None
+) -> torch.Tensor:
     """
     Applies rotary positional embeddings to the input tensor.
 
@@ -127,10 +129,23 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         torch.Tensor: Tensor with rotary embeddings applied.
     """
     dtype = x.dtype
+    if qkv_format == "thd":
+        x = x.unsqueeze(0)
+
+    if unsqueeze_dim is not None:
+        x = x.unsqueeze(unsqueeze_dim)
+
     x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))
     freqs_cis = freqs_cis.view(x.size(0), x.size(1), 1, x.size(-1))
     y = torch.view_as_real(x * freqs_cis).flatten(3)
-    return y.to(dtype)
+    y = y.to(dtype)
+
+    if unsqueeze_dim is not None:
+        y = y.squeeze(unsqueeze_dim)
+
+    if qkv_format == "thd":
+        y = y.squeeze(0)
+    return y
 
 
 def freqs_cis_from_position_ids(position_ids: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:

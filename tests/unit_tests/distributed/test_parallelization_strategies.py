@@ -379,16 +379,25 @@ class TestNemotronHParallelizationStrategy:
                 sequence_parallel=True,
             )
 
-    def test_custom_tp_plan_not_supported(self, strategy, mock_device_mesh, nemotron_model):
-        """Test that custom TP plans raise assertion error."""
+    def test_custom_tp_plan_not_supported(self, strategy, mock_device_mesh, nemotron_model, monkeypatch, mock_distributed_env):
+        """Test that passing a custom plan logs info and proceeds (no exception)."""
         mesh, _, _, _ = mock_device_mesh
 
-        with pytest.raises(AssertionError, match="Custom parallel plan is not supported"):
-            strategy.parallelize(
+        # Ensure logger is enabled; capture logs
+        import logging
+        from nemo_automodel.components.distributed import parallelizer as parallelizer_mod
+        logger = parallelizer_mod.logging.getLogger(parallelizer_mod.__name__)
+        old_level = logger.level
+        logger.setLevel(logging.INFO)
+        try:
+            result = strategy.parallelize(
                 model=nemotron_model,
                 device_mesh=mesh,
                 tp_shard_plan={"test": ColwiseParallel()},
             )
+            assert result is nemotron_model
+        finally:
+            logger.setLevel(old_level)
 
     @pytest.mark.parametrize("tp_size", [1, 2])
     @patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
