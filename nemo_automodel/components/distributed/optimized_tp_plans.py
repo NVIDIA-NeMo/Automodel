@@ -38,7 +38,7 @@ from transformers.models.gemma3.modeling_gemma3 import (
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
-from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
+from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
 
 class RotaryEmbedParallel(SequenceParallel):
@@ -220,6 +220,18 @@ def _parallelize_qwen(
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
 
+def _parallelize_qwen_classification(
+    model: Union[Qwen3ForSequenceClassification],
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    plan = _parallelize_qwen(model, sequence_parallel)
+    assert not hasattr(model, "lm_head"), "Expected model not to have lm_head"
+    del plan["lm_head"]
+    assert hasattr(model, "score"), "Expected model to have score"
+    plan["score"] = ColwiseParallel()
+    return plan
+
+
 # Phi3: fused attention cannot be sharded; shard MLP as in HF guidance
 def _parallelize_phi3(
     model: Phi3ForCausalLM,
@@ -265,6 +277,7 @@ def _parallelize_phi3(
 PARALLELIZE_FUNCTIONS: Dict[type, Callable[..., Dict[str, ParallelStyle]]] = {
     Qwen2ForCausalLM: _parallelize_qwen,
     Qwen3ForCausalLM: _parallelize_qwen,
+    Qwen3ForSequenceClassification: _parallelize_qwen_classification,
     LlamaForCausalLM: _parallelize_llama,
     # gemma-3-1b-it uses Gemma3ForCausalLM since it is a text-only model
     Gemma3ForCausalLM: _parallelize_gemma3,
