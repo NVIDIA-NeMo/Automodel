@@ -60,6 +60,12 @@ from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
+from nemo_automodel.components.quantization.qat import (
+    HAVE_TORCHAO_QAT,
+    get_disable_fake_quant_fn,
+    get_enable_fake_quant_fn,
+    prepare_qat_model,
+)
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
@@ -154,6 +160,7 @@ def build_model_and_optimizer(
     cp_size=1,
     cfg_fp8=None,
     cfg_compile=None,
+    cfg_qat=None,
     cfg_quantization=None,
     autopipeline: AutoPipeline | None = None,
     loss_fn=None,
@@ -223,9 +230,21 @@ def build_model_and_optimizer(
                     model, cfg_peft, quantization_config=kwargs.get("quantization_config", None)
                 )
 
-            if cfg_fp8 is not None:
+        if cfg_fp8 is not None:
                 fp8_config = build_fp8_config(cfg_fp8)
                 model = apply_fp8_to_model(model, config=fp8_config)
+
+        # Apply QAT if configured (torchao QAT)
+        if cfg_qat is not None and cfg_qat.get("enabled", False):
+            if not HAVE_TORCHAO_QAT:
+                raise ImportError("QAT requested but torchao QAT is unavailable. Install torchao>=0.7.0")
+            quantizer_cfg = cfg_qat.get("quantizer", None)
+            if quantizer_cfg is None:
+                raise ValueError("QAT enabled but 'quantizer' config is missing")
+            quantizer = quantizer_cfg.instantiate()
+            model, qat_mode = prepare_qat_model(model, quantizer)
+            # Attach helpers for delayed fake-quant toggling if desired
+            model._qat_mode = qat_mode  # type: ignore[attr-defined]
 
     print_trainable_parameters(model)
 
@@ -933,6 +952,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
             cfg_quantization=self.cfg.get("quantization", None),
+            cfg_qat=self.cfg.get("qat", None),
             autopipeline=autopipeline,
             loss_fn=self.loss_fn,
             parallelize_fn=parallelize_fn,
@@ -984,6 +1004,33 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Log model, parameter counts, norms, optimizer and scheduler
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
 
+        # Handle delayed fake-quant toggling for QAT if configured
+        qat_cfg = self.cfg.get("qat", None)
+        self._qat_disable_fn = None
+        self._qat_enable_fn = None
+        self._qat_enable_after = None
+        if qat_cfg is not None and qat_cfg.get("enabled", False):
+            enable_after = qat_cfg.get("fake_quant_after_n_steps", None)
+            self._qat_enable_after = int(enable_after) if enable_after is not None else None
+            # Collect mode from any model part that has it
+            qat_mode = None
+            if hasattr(self, "model_parts") and len(self.model_parts) > 0 and hasattr(self.model_parts[0], "_qat_mode"):
+                qat_mode = getattr(self.model_parts[0], "_qat_mode")
+            elif hasattr(model, "_qat_mode"):
+                qat_mode = getattr(model, "_qat_mode")
+            if qat_mode is not None:
+                self._qat_disable_fn = get_disable_fake_quant_fn(qat_mode)
+                self._qat_enable_fn = get_enable_fake_quant_fn(qat_mode)
+                if self._qat_disable_fn is not None and self._qat_enable_after is not None:
+                    try:
+                        # start with fake-quant disabled, will enable later
+                        target = self.model_parts if hasattr(self, "model_parts") else [model]
+                        for mp in target:
+                            self._qat_disable_fn(mp)
+                        logger.info("QAT fake-quant disabled initially; will enable after %s steps", self._qat_enable_after)
+                    except Exception as e:
+                        logger.warning("Failed to disable fake-quant at setup: %s", e)
+
         restore_from = self.cfg.get("checkpoint.restore_from", None)
         # Initialize JSONL loggers
         self.metric_logger_train = MetricLoggerDist(
@@ -1020,6 +1067,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # 1. len(batches) == grad_acc_steps
             # 2. len(batches[0]) == batch_size
             for batches in self.step_scheduler:
+                # If QAT delayed fake-quant is configured, enable after threshold
+                if getattr(self, "_qat_enable_after", None) is not None and self.step_scheduler.step == self._qat_enable_after:
+                    if getattr(self, "_qat_enable_fn", None) is not None:
+                        try:
+                            target = self.model_parts if hasattr(self, "model_parts") else []
+                            for mp in target:
+                                self._qat_enable_fn(mp)
+                            logger.info("Enabled QAT fake-quant after step %s", self.step_scheduler.step)
+                        except Exception as e:
+                            logger.warning("Failed to enable fake-quant: %s", e)
                 train_log_data = self._run_train_optim_step(batches, 1.0)
                 # log
                 self.log_train_metrics(train_log_data)
