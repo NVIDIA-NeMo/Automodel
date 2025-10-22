@@ -137,7 +137,9 @@ runs:
       run: |
         echo "::group::Build test container"
         docker system prune -af
-        docker build -f docker/Dockerfile --target automodel_final -t automodel .
+        docker build -f docker/Dockerfile \
+          --build-arg BASE_IMAGE=pytorch \
+          --target automodel_final -t automodel .
         echo "::endgroup::"
 
     - name: Start container
