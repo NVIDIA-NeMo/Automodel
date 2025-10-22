@@ -25,7 +25,7 @@ import wandb
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from transformers.utils.hub import TRANSFORMERS_CACHE
 
-from nemo_automodel.components._diffusers import NeMoAutoDiffusionPipeline
+from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 from nemo_automodel.components._diffusers.flow_matching.training_step_t2v import (
     step_fsdp_transformer_t2v,
 )
