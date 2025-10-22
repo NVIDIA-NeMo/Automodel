@@ -185,7 +185,7 @@ class Checkpointer:
         _ensure_dirs(model_dir, consolidated_dir)
 
         # Because this call lies outside of the dcp save call, we need to consolidate on all ranks on the main process
-        # which lies on the critical path. Therefore, we can only do this outside of async mode.
+        # of all ranks, which lies on the critical path. Therefore, we can only do this outside of async mode.
         consolidate_on_all_ranks = self._should_write_consolidated() and not self.config.is_async
 
         model_state = ModelState(model, self.config.is_peft)
