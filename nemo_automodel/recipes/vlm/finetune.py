@@ -218,12 +218,12 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         The instantiated checkpoint configuration.
     """
     ckpt_kwargs = dict(
-        enabled=False,
+        enabled=True,
         checkpoint_dir="checkpoints/",
         model_save_format="safetensors",
         model_repo_id=model_repo_id,
         model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
-        save_consolidated=False,
+        save_consolidated=True,
         is_peft=is_peft,
     )
     if cfg_ckpt is not None:

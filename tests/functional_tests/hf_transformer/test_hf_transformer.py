@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from tests.utils.test_utils import run_test_script
+import shutil
 
 TEST_FOLDER = "hf_transformer"
 HF_TRANSFORMER_FUSED_CE_SFT_FILENAME = "L2_HF_Transformer_Fused_CE_SFT.sh"
@@ -22,13 +23,29 @@ HF_TRANSFORMER_VLM_META_FILENAME = "L2_HF_Transformer_VLM_Meta.sh"
 
 class TestHFTransformer:
     def test_hf_transformer_fused_ce_sft(self):
-        run_test_script(TEST_FOLDER, HF_TRANSFORMER_FUSED_CE_SFT_FILENAME)
+        try:
+            run_test_script(TEST_FOLDER, HF_TRANSFORMER_FUSED_CE_SFT_FILENAME)
+        finally:
+            # remove the checkpoint directory
+            shutil.rmtree("checkpoints/", ignore_errors=True)
 
     def test_hf_transformer_packed_sequence(self):
-        run_test_script(TEST_FOLDER, HF_TRANSFORMER_PACKED_SEQUENCE_FILENAME)
+        try:
+            run_test_script(TEST_FOLDER, HF_TRANSFORMER_PACKED_SEQUENCE_FILENAME)
+        finally:
+            # remove the checkpoint directory
+            shutil.rmtree("checkpoints/", ignore_errors=True)
 
     def test_hf_transformer_llm_meta(self):
-        run_test_script(TEST_FOLDER, HF_TRANSFORMER_LLM_META_FILENAME)
+        try:
+            run_test_script(TEST_FOLDER, HF_TRANSFORMER_LLM_META_FILENAME)
+        finally:
+            # remove the checkpoint directory
+            shutil.rmtree("checkpoints/", ignore_errors=True)
 
     def test_hf_transformer_vlm_meta(self):
-        run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_META_FILENAME)
+        try:
+            run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_META_FILENAME)
+        finally:
+            # remove the checkpoint directory
+            shutil.rmtree("checkpoints/", ignore_errors=True)
