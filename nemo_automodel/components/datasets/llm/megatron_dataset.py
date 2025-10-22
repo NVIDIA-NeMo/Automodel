@@ -119,7 +119,6 @@ class MegatronPretraining:
                     "Could not compile megatron dataset C++ helper functions and therefore cannot import helpers python file."
                 )
 
-       
         if not isinstance(paths, (list, tuple, dict)):
             # Check if paths is a JSON file containing blend configuration
             blend_config_or_none = try_load_blend_from_json(paths)
