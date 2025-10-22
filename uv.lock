@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
@@ -1483,8 +1483,8 @@ requires-dist = [
     { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'vlm'" },
     { name = "torchdata" },
     { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'moe'", specifier = "==2.8.0" },
-    { name = "transformers", specifier = "<=4.55.4" },
-    { name = "transformers", marker = "extra == 'vlm'", specifier = "<=4.55.4" },
+    { name = "transformers", specifier = "<=4.57.1" },
+    { name = "transformers", marker = "extra == 'vlm'", specifier = "<=4.57.1" },
     { name = "wandb" },
 ]
 provides-extras = ["vlm", "fa", "moe", "deepep", "dev", "all"]
