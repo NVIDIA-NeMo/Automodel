@@ -1,0 +1,234 @@
+{
+    "spec_version": "0.1.0",
+    "trendinglist_date": "20251022",
+    "automodel_commit": "249b512a1fbf7383d351c258124b424dd6e7ddf8",
+    "models": [
+        {
+            "model_id": "vandijklab/C2S-Scale-Gemma-2-27B",
+            "sft": {
+                "fsdp": {
+                    "is_supported": true,
+                    "validated_configs": [
+                        {
+                            "distributed": {
+                                "_target_": "nemo_automodel.components.distributed.fsdp2.FSDP2Manager",
+                                "cp_size": 1,
+                                "dp_size": null,
+                                "ep_size": 1,
+                                "sequence_parallel": false,
+                                "tp_size": 2
+                            },
+                            "loss_fn": {
+                                "_target_": "nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy"
+                            },
+                            "lr_scheduler": {
+                                "lr_decay_style": "cosine",
+                                "min_lr": 1e-06
+                            },
+                            "model": {
+                                "_target_": "nemo_automodel.components._transformers.auto_model._BaseNeMoAutoModelClass.from_pretrained",
+                                "pretrained_model_name_or_path": "vandijklab/C2S-Scale-Gemma-2-27B",
+                                "torch_dtype": "bf16",
+                                "trust_remote_code": true
+                            },
+                            "optimizer": {
+                                "_target_": "torch.optim.adam.Adam",
+                                "betas": [
+                                    0.9,
+                                    0.999
+                                ],
+                                "eps": 1e-08,
+                                "lr": 1e-05,
+                                "weight_decay": 0
+                            },
+                            "packed_sequence": {
+                                "packed_sequence_size": 0
+                            },
+                            "step_scheduler": {
+                                "ckpt_every_steps": 50,
+                                "global_batch_size": 16,
+                                "local_batch_size": 1,
+                                "max_steps": 100,
+                                "val_every_steps": 2000
+                            }
+                        }
+                    ]
+                },
+                "tp": {
+                    "is_supported": false,
+                    "validated_configs": []
+                },
+                "pp": {
+                    "is_supported": false,
+                    "validated_configs": []
+                },
+                "cp": {
+                    "is_supported": false,
+                    "validated_configs": []
+                },
+                "ep": {
+                    "is_supported": false,
+                    "validated_configs": []
+                }
+            },
+            "peft": {
+                "fsdp": {
+                    "is_supported": true,
+                    "validated_configs": [
+                        {
+                            "distributed": {
+                                "_target_": "nemo_automodel.components.distributed.fsdp2.FSDP2Manager",
+                                "cp_size": 1,
+                                "dp_size": null,
+                                "ep_size": 1,
+                                "sequence_parallel": false,
+                                "tp_size": 2
+                            },
+                            "loss_fn": {
+                                "_target_": "nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy"
+                            },
+                            "lr_scheduler": {
+                                "lr_decay_style": "cosine",
+                                "min_lr": 1e-06
+                            },
+                            "model": {
+                                "_target_": "nemo_automodel.components._transformers.auto_model._BaseNeMoAutoModelClass.from_pretrained",
+                                "pretrained_model_name_or_path": "vandijklab/C2S-Scale-Gemma-2-27B",
+                                "torch_dtype": "bf16",
+                                "trust_remote_code": true
+                            },
+                            "optimizer": {
+                                "_target_": "torch.optim.adam.Adam",
+                                "betas": [
+                                    0.9,
+                                    0.999
+                                ],
+                                "eps": 1e-08,
+                                "lr": 1e-05,
+                                "weight_decay": 0
+                            },
+                            "packed_sequence": {
+                                "packed_sequence_size": 0,
+                                "split_across_pack": false
+                            },
+                            "step_scheduler": {
+                                "ckpt_every_steps": 50,
+                                "global_batch_size": 16,
+                                "local_batch_size": 1,
+                                "max_steps": 100,
+                                "val_every_steps": 2000
+                            }
+                        },
+                        {
+                            "distributed": {
+                                "_target_": "nemo_automodel.components.distributed.fsdp2.FSDP2Manager",
+                                "cp_size": 1,
+                                "dp_size": null,
+                                "ep_size": 1,
+                                "sequence_parallel": false,
+                                "tp_size": 1
+                            },
+                            "loss_fn": {
+                                "_target_": "nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy"
+                            },
+                            "lr_scheduler": {
+                                "lr_decay_style": "cosine",
+                                "min_lr": 1e-06
+                            },
+                            "model": {
+                                "_target_": "nemo_automodel.components._transformers.auto_model._BaseNeMoAutoModelClass.from_pretrained",
+                                "pretrained_model_name_or_path": "vandijklab/C2S-Scale-Gemma-2-27B",
+                                "torch_dtype": "bf16",
+                                "trust_remote_code": true
+                            },
+                            "optimizer": {
+                                "_target_": "torch.optim.adam.Adam",
+                                "betas": [
+                                    0.9,
+                                    0.999
+                                ],
+                                "eps": 1e-08,
+                                "lr": 1e-05,
+                                "weight_decay": 0
+                            },
+                            "packed_sequence": {
+                                "packed_sequence_size": 0,
+                                "split_across_pack": false
+                            },
+                            "step_scheduler": {
+                                "ckpt_every_steps": 50,
+                                "global_batch_size": 16,
+                                "local_batch_size": 1,
+                                "max_steps": 100,
+                                "val_every_steps": 2000
+                            }
+                        }
+                    ]
+                },
+                "tp": {
+                    "is_supported": false,
+                    "validated_configs": []
+                },
+                "pp": {
+                    "is_supported": false,
+                    "validated_configs": []
+                },
+                "cp": {
+                    "is_supported": false,
+                    "validated_configs": []
+                },
+                "ep": {
+                    "is_supported": false,
+                    "validated_configs": []
+                }
+            }
+        },
+        {
+            "model_id": "facebook/MobileLLM-Pro",
+            "sft": {
+                "fsdp": {
+                    "is_supported": false,
+                    "validated_configs": []
+                },
+                "tp": {
+                    "is_supported": false,
+                    "validated_configs": []
+                },
+                "pp": {
+                    "is_supported": false,
+                    "validated_configs": []
+                },
+                "cp": {
+                    "is_supported": false,
+                    "validated_configs": []
+                },
+                "ep": {
+                    "is_supported": false,
+                    "validated_configs": []
+                }
+            },
+            "peft": {
+                "fsdp": {
+                    "is_supported": false,
+                    "validated_configs": []
+                },
+                "tp": {
+                    "is_supported": false,
+                    "validated_configs": []
+                },
+                "pp": {
+                    "is_supported": false,
+                    "validated_configs": []
+                },
+                "cp": {
+                    "is_supported": false,
+                    "validated_configs": []
+                },
+                "ep": {
+                    "is_supported": false,
+                    "validated_configs": []
+                }
+            }
+        }
+    ]
+}
