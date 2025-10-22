@@ -164,7 +164,7 @@ runs:
           --env HF_CACHE=/home/TestData/lite/hf_cache \
           --env HF_HOME=/home/TestData/HF_HOME \
           --env RUN_ID=${{ github.run_id }} \
-          --env TEST_DATA=/home/TestData/automodel \
+          --env TEST_DATA_DIR=/home/TestData/automodel \
           --volume $(pwd)/NeMo-Automodel:/workspace \
           --workdir /workspace \
           --volume $MNT_PATH/TestData:/home/TestData \
