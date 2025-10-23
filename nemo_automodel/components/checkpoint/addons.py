@@ -33,6 +33,8 @@ class CheckpointAddon(Protocol):
 
     def pre_save(self, **kwargs) -> None: ...
 
+    def post_save(self, **kwargs) -> None: ...
+
 
 class ConsolidatedHFAddon:
     """
@@ -139,6 +141,9 @@ class PeftAddon:
                 json.dump(automodel_peft_metadata, f, indent=2, sort_keys=True)
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
+
+    def post_save(self, **kwargs) -> None:
+        pass
 
 
 def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState) -> dict:
