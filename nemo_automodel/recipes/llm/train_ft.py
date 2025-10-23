@@ -732,6 +732,44 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
     return loss_fn(**loss_fn_kwargs)
 
 
+def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled):
+    def _prepare_val_ds_name(val_ds_name):
+        val_ds_name = val_ds_name.replace("validation_dataset", "")
+        if len(val_ds_name) > 1 and val_ds_name[0] in ("_", "-", "."):
+            val_ds_name = val_ds_name[1:]
+        if val_ds_name == "":
+            val_ds_name = "default"
+        return val_ds_name
+
+    if pp_enabled:
+        logging.warning("Validation is not supported for pipeline parallelism")
+        return {}
+
+    # Build validation dataloader if the config provides it
+    val_dataloaders = {}
+    for val_ds_name in filter(lambda x: x.startswith("validation_dataset"), cfg.to_dict().keys()):
+        val_ds_cfg = cfg.get(val_ds_name, None)
+        val_ds_name = _prepare_val_ds_name(val_ds_name)
+        val_dataloaders[val_ds_name] = build_dataloader(
+            val_ds_cfg,
+            cfg.validation_dataloader,
+            cfg.model,
+            cfg_ps=None,  # Use unpacked config for validation
+            seed=cfg.get("seed", 42),
+            local_batch_size=cfg.get("step_scheduler.local_batch_size", 1),
+            global_batch_size=cfg.get("step_scheduler.global_batch_size", 1),
+            max_steps=cfg.get("step_scheduler.max_steps", None),
+            val_check_interval=cfg.get("step_scheduler.val_every_steps", None),
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+            pp_enabled=False,
+            supports_seq_lens=True,
+            cp_size=cfg.get("distributed.cp_size", 1),
+        )[0]
+
+    return val_dataloaders
+
+
 def parallelize_for_pp(
     model: nn.Module,
     *,
@@ -930,33 +968,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             supports_seq_lens=True,
             cp_size=self.cfg.get("distributed.cp_size", 1),
         )
-
-        # Build validation dataloader if the config provides it
-        self.val_dataloaders = {}
-        for val_ds_name in filter(lambda x: x.startswith("validation_dataset"), self.cfg.to_dict().keys()):
-            val_ds_cfg = self.cfg.get(val_ds_name, None)
-            val_ds_name = val_ds_name.replace("validation_dataset", "")
-            if len(val_ds_name) > 1 and val_ds_name[0] in ("_", "-", "."):
-                val_ds_name = val_ds_name[1:]
-            if val_ds_name == "":
-                val_ds_name = "default"
-            self.val_dataloaders[val_ds_name] = build_dataloader(
-                val_ds_cfg,
-                self.cfg.validation_dataloader,
-                self.cfg.model,
-                cfg_ps=None,  # Use unpacked config for validation
-                seed=self.cfg.get("seed", 42),
-                local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-                global_batch_size=self.cfg.get("step_scheduler.global_batch_size", 1),
-                max_steps=self.cfg.get("step_scheduler.max_steps", None),
-                val_check_interval=self.cfg.get("step_scheduler.val_every_steps", None),
-                dp_rank=self._get_dp_rank(),
-                dp_world_size=self._get_dp_group_size(),
-                pp_enabled=self.pp_enabled,
-                supports_seq_lens=True,
-                cp_size=self.cfg.get("distributed.cp_size", 1),
-            )[0]
-
+        self.val_dataloaders = build_validation_dataloader(
+            self.cfg,
+            self._get_dp_group_size(),
+            self._get_dp_rank(),
+            self.pp_enabled,
+        )
         # Scheduler
         self.step_scheduler = build_step_scheduler(
             self.cfg.get("step_scheduler", None),
