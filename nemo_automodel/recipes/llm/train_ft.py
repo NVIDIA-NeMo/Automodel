@@ -947,6 +947,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 dp_rank=self._get_dp_rank(),
                 dp_world_size=self._get_dp_group_size(),
                 pp_enabled=self.pp_enabled,
+                supports_seq_lens=True,
                 cp_size=self.cfg.get("distributed.cp_size", 1),
             )[0]
 
@@ -1006,6 +1007,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
                 # Run validation every val_every_steps
                 if self.step_scheduler.is_val_step:
+                    if self.pp_enabled:
+                        logger.warning("Validation is not supported for pipeline parallelism")
+                        continue
                     for val_name, val_dataloader in self.val_dataloaders.items():
                         val_log_data = self._run_validation_epoch(val_name, val_dataloader)
                         self.log_val_metrics(val_name, val_log_data)
@@ -1208,16 +1212,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 "num_label_tokens": num_label_tokens,
             },
         )
-
-    @torch.no_grad()
-    def _run_validation_epoch(self, val_dataloader):
-        """Run one pass over `self.val_dataloader`."""
-        if self.pp_enabled:
-            logger.warning("Validation is not supported for pipeline parallelism")
-            return
-
-        for val_name, val_dataloader in self.val_dataloader.items():
-            self._run_validation_epoch(val_name, val_dataloader)
 
     @torch.no_grad()
     def _run_validation_epoch(self, val_name, val_dataloader):
