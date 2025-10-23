@@ -24,9 +24,9 @@ Fine-tune Hugging Face Models Instantly with Day-0 Support with NVIDIA NeMo Auto
 ```
 
 ```{toctree}
-:caption: E2E Examples
+:caption: Recipes & E2E Examples
 :hidden:
-
+guides/overview.md
 guides/llm/finetune.md
 guides/llm/mcore-pretraining.md
 guides/llm/pretraining.md
