@@ -120,8 +120,8 @@ class Qwen3NextModel(nn.Module):
             n_routed_experts=config.num_experts,
             n_shared_experts=1,
             n_activated_experts=config.num_experts_per_tok,
-            n_expert_groups=1,
-            n_limited_groups=1,
+            n_expert_groups=0,
+            n_limited_groups=0,
             train_gate=True,
             gate_bias_update_factor=0.0,
             score_func="softmax",  # Qwen3Next uses softmax topk routing
