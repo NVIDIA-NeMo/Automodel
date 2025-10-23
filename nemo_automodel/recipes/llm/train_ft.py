@@ -932,8 +932,17 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
 
         # Build validation dataloader if the config provides it
+        # print(self.cfg)
+        # print(self.cfg.to_dict().keys())
+        # quit()
         self.val_dataloaders = {}
-        for val_ds_name, val_ds_cfg in self.cfg.get("validation_dataset", {}).items():
+        for val_ds_name in filter(lambda x: x.startswith("validation_dataset"), self.cfg.to_dict().keys()):
+            val_ds_cfg = self.cfg.get(val_ds_name, None)
+            val_ds_name = val_ds_name.replace("validation_dataset", "")
+            if len(val_ds_name) > 1 and val_ds_name[0] in ("_", "-", '.'):
+                val_ds_name = val_ds_name[1:]
+            if val_ds_name == "":
+                val_ds_name = "default"
             self.val_dataloaders[val_ds_name] = build_dataloader(
                 val_ds_cfg,
                 self.cfg.validation_dataloader,
@@ -970,9 +979,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.metric_logger_train = MetricLoggerDist(
             pathlib.Path(self.checkpointer.config.checkpoint_dir) / "training.jsonl"
         )
-        self.metric_logger_valid = MetricLoggerDist(
-            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "validation.jsonl"
-        )
+        self.metric_logger_valid = {
+            name: MetricLoggerDist(
+                pathlib.Path(self.checkpointer.config.checkpoint_dir) / f"validation_{name}.jsonl"
+            ) for name in self.val_dataloaders.keys()
+        }
 
         # Optionally resume
         self.load_checkpoint(restore_from)
@@ -1012,12 +1023,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         continue
                     for val_name, val_dataloader in self.val_dataloaders.items():
                         val_log_data = self._run_validation_epoch(val_name, val_dataloader)
-                        self.log_val_metrics(val_name, val_log_data)
+                        self.log_val_metrics(val_log_data, self.metric_logger_valid[val_name])
                     for mp in self.model_parts:
                         mp.train()
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
-        self.metric_logger_valid.close()
+        for v in self.metric_logger_valid.values():
+            v.close()
 
         self.checkpointer.close()
 
@@ -1258,7 +1270,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             },
         )
 
-    def log_val_metrics(self, val_name, log_data):
+    def log_val_metrics(self, log_data, metric_logger=None):
         """Log metrics to wandb and other loggers
         Args:
             log_data: MetricsSample object, containing:
@@ -1272,17 +1284,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
 
         # Pipeline parallelism does not support validation -> log_data is None
-        if not self.dist_env.is_main or log_data is None:
+        if not self.dist_env.is_main or log_data is None or len(log_data) == 0:
             return
 
         if wandb.run is not None:
-            wandb.log(log_data.to_dict(), step=log_data.step)
+            for val_name, val_log_data in log_data.items():
+                wandb.log(val_log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
 
         # JSONL validation log
-        self.metric_logger_valid.log(log_data)
+        if metric_logger not is None:
+            metric_logger.log(log_data)
 
         logging.info(
-            "[val] name {} | step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
+            "[val] name \"{}\" | step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
                 val_name,
                 log_data.step,
                 log_data.epoch,
