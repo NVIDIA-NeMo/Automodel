@@ -1282,7 +1282,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.metric_logger_valid.log(log_data)
 
         logging.info(
-            f"[val] name {} | step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
+            "[val] name {} | step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
                 val_name,
                 log_data.step,
                 log_data.epoch,
