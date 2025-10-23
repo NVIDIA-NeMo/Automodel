@@ -208,7 +208,6 @@ class Checkpointer:
                 peft_config=peft_config,
                 fqn_to_file_index_mapping=fqn_to_file_index_mapping,
             )
-        torch.distributed.breakpoint()
 
         storage_writer = self._get_storage_writer(
             consolidated_dir, fqn_to_file_index_mapping, model_dir, consolidate_on_all_ranks
