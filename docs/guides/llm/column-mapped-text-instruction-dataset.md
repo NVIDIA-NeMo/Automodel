@@ -165,6 +165,7 @@ dataset:
 | Arg                     | Default | Description |
 |-------------------------|---------|-------------|
 | `split`                 | `None`  | Which split to pull from a HF repo (`train`, `validation`, *etc.*). Ignored for local files. |
+(`dataset[idx]`) are **not** available — iterate instead. |
 | `name`                  | `None`  | Name of the dataset configuration/subset to load |
 | `answer_only_loss_mask` | `True`  | Create a `loss_mask` where only the answer tokens contribute to the loss. Requires `start_of_turn_token`. |
 | `start_of_turn_token`   | `None`  | String token marking the assistant's response. Required when `answer_only_loss_mask=True` for tokenizers with chat template. |
