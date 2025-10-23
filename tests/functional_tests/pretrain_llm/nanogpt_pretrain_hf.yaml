@@ -16,14 +16,14 @@ dist_env:
 # Option 1 – shorthand builder
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: $TEST_DATA_DIR/hf_gemma3_2l/
+  pretrained_model_name_or_path: /home/TestData/automodel/hf_gemma3_2l/
 
 # Dataset
 # Point this to the location where your *.bin shards live.
 # The pattern below matches the sample shards included in *modded-nanogpt*.
 dataset:
   _target_: nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset
-  file_pattern: "$TEST_DATA_DIR/fineweb10B/fineweb_train_*.bin"
+  file_pattern: "/home/TestData/automodel/fineweb10B/fineweb_train_*.bin"
   seq_len: 1024
   shuffle_files: true
   align_to_bos: false

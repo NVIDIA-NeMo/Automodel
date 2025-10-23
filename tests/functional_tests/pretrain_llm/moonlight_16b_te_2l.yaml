@@ -122,7 +122,7 @@ loss_fn:
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset
-  file_pattern: "$TEST_DATA_DIR/fineweb10B/fineweb_train_*.bin"
+  file_pattern: "/home/TestData/automodel/fineweb10B/fineweb_train_*.bin"
   seq_len: 1024
   shuffle_files: true
   align_to_bos: false
