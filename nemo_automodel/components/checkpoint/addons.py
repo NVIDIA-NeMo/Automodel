@@ -55,6 +55,7 @@ class ConsolidatedHFAddon:
         """
         model_state = kwargs["model_state"]
         hf_metadata_dir = kwargs["hf_metadata_dir"]
+        fqn_to_file_index_mapping = kwargs["fqn_to_file_index_mapping"]
         tokenizer = kwargs.get("tokenizer", None)
         model_part = model_state.model[0]  # ModelState already converts to list if needed
 
@@ -72,6 +73,10 @@ class ConsolidatedHFAddon:
             # save the tokenizer
             if tokenizer is not None:
                 tokenizer.save_pretrained(hf_metadata_dir)
+
+            # save the fqn_to_file_index_mapping file
+            with open(os.path.join(hf_metadata_dir, "fqn_to_file_index_mapping.json"), "w") as f:
+                json.dump(fqn_to_file_index_mapping, f, indent=2, sort_keys=True)
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
@@ -96,10 +101,11 @@ class ConsolidatedHFAddon:
         if (not torch.distributed.is_initialized()) or (torch.distributed.get_rank() == 0):
             # Move each item inside hf_metadata_dir into consolidated_path
             for item_name in os.listdir(hf_metadata_path):
+                if item_name == "fqn_to_file_index_mapping.json":
+                    continue  # this is saved by the consolidation step
                 src_path = os.path.join(hf_metadata_path, item_name)
                 dst_path = os.path.join(consolidated_path, item_name)
                 shutil.move(src_path, dst_path)
-            # Remove the now-empty hf_metadata_dir
             shutil.rmtree(hf_metadata_path, ignore_errors=True)
         if torch.distributed.is_initialized():
             torch.distributed.barrier()

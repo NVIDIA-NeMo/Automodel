@@ -185,6 +185,11 @@ class Checkpointer:
         model_state = ModelState(model, self.config.is_peft)
         state_dict = model_state.state_dict()
 
+        # Convert to HF format if using custom model implementations
+        state_dict = _maybe_adapt_state_dict_to_hf(model_state.model[0], state_dict, quantization=False)
+        # Build the consolidated model.safetensors.index.json if needed
+        fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
+
         # Run pre-saves for addons e.g., PEFT or consolidated HF safetensors
         for addon in self._addons:
             addon.pre_save(
@@ -194,12 +199,9 @@ class Checkpointer:
                 hf_metadata_dir=hf_metadata_dir,
                 tokenizer=tokenizer,
                 peft_config=peft_config,
+                fqn_to_file_index_mapping=fqn_to_file_index_mapping,
             )
-
-        # Convert to HF format if using custom model implementations
-        state_dict = _maybe_adapt_state_dict_to_hf(model_state.model[0], state_dict, quantization=False)
-        # Build the consolidated model.safetensors.index.json if needed
-        fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
+        torch.distributed.breakpoint()
 
         storage_writer = self._get_storage_writer(consolidated_dir, fqn_to_file_index_mapping, model_dir)
         self._model_ctx.future = self._do_save(state_dict, model_dir, storage_writer)
