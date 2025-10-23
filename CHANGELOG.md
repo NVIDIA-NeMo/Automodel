@@ -1,5 +1,14 @@
 # Changelog
 
+## NVIDIA NeMo-Automodel 0.1.1
+
+- Features:
+  - Included support for limiting the number of samples with the ColumnMappedDataset
+
+- Bug Fixes (step scheduler):
+  - Switched to zero-based indexing
+  - Epoch length accounts for accumulation steps
+
 ## NVIDIA NeMo-Automodel 0.1.0
 
 - Pretraining support for
