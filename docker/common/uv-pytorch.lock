@@ -1628,6 +1628,7 @@ all = [
     { name = "qwen-vl-utils", extra = ["decord"], marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "timm" },
     { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "torchvision", marker = "sys_platform == 'never'" },
     { name = "transformers" },
 ]
 deepep = [
@@ -1644,6 +1645,7 @@ dev = [
     { name = "qwen-vl-utils", extra = ["decord"], marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "timm" },
     { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "torchvision", marker = "sys_platform == 'never'" },
     { name = "transformers" },
 ]
 fa = [
@@ -1662,6 +1664,7 @@ vlm = [
     { name = "qwen-vl-utils", extra = ["decord"], marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "timm" },
     { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "torchvision", marker = "sys_platform == 'never'" },
     { name = "transformers" },
 ]
 
@@ -1725,9 +1728,10 @@ requires-dist = [
     { name = "torchao" },
     { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'vlm'" },
     { name = "torchdata" },
+    { name = "torchvision", marker = "extra == 'vlm'" },
     { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'moe'", specifier = "==2.8.0" },
-    { name = "transformers", specifier = "<=4.55.4" },
-    { name = "transformers", marker = "extra == 'vlm'", specifier = "<=4.55.4" },
+    { name = "transformers", specifier = "<=4.57.1" },
+    { name = "transformers", marker = "extra == 'vlm'", specifier = "<=4.57.1" },
     { name = "wandb" },
 ]
 provides-extras = ["vlm", "fa", "moe", "deepep", "dev", "all"]
