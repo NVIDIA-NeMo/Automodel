@@ -1,6 +1,8 @@
 # Run on Your Local Workstation
 
-NeMo AutoModel supports running on a single machine (single- or multi-GPU). Use this guide for local, single-node workflows. For setup details, refer to our [Installation Guide](../guides/installation.md). If you want to submit distributed jobs to a Slurm cluster, see [Run on a Cluster](./cluster.md).
+NeMo AutoModel supports running training/finetuning job from a single node with a single GPU to multiple multi-GPU nodes.
+Use this guide for local, single-node workflows. For setup details, refer to our [Installation Guide](../guides/installation.md).
+For executing distributed multi-node jobs, please refer to our [Run on a Cluster](./cluster.md) guide.
 
 ## Quick start: Choose your launch option
 
