@@ -1,10 +1,10 @@
-# Run on Your Local Workstation
+# Run on a Cluster (Slurm / Multi-node)
 
-NeMo AutoModel supports various methods for launching jobs, allowing you to choose the approach that best fits your workflow and development needs. For setup details, refer to our [Installation Guide](../guides/installation.md).
+Use this guide for submitting distributed training jobs on Slurm clusters (single- or multi-node). For single-node workstation usage, see [Run on Your Local Workstation](./local-workstation.md). For setup details, refer to our [Installation Guide](../guides/installation.md).
 
-## Run with Automodel CLI
+## Run with Automodel CLI (Slurm)
 
-The AutoModel CLI is the preferred method for most users. It offers a unified interface to launch training jobs locally or across distributed systems such as Slurm clusters, without requiring deep knowledge of the underlying infrastructure.
+The AutoModel CLI is the preferred method for most users. It provides a unified interface to submit Slurm batch jobs without deep knowledge of cluster specifics.
 
 ### Basic Usage
 
@@ -18,24 +18,7 @@ Where:
 - `<domain>`: The model domain (`llm` or `vlm`)
 - `<config_file>`: Path to your YAML configuration file
 
-### Train on a Single GPU
-
-For simple fine-tuning on a single GPU:
-
-```bash
-automodel finetune llm -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
-```
-
-### Train on Multiple GPUs
-
-For interactive single-node jobs, the CLI automatically detects the number of available GPUs and
-uses `torchrun` for multi-GPU training. You can specify manually the number of GPUs using the `--nproc-per-node` option, as follows:
-
-```bash
-automodel finetune llm -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node=2
-```
-
-If you don't specify `--nproc-per-node`, it will use all available GPUs on your system.
+For workstation single-node instructions, see [Run on Your Local Workstation](./local-workstation.md).
 
 ### Submit a Batch Job with Slurm
 
@@ -75,7 +58,7 @@ slurm:
   # env_vars:
   #   ENV_VAR: value
   # Optional: Specify custom job directory (defaults to cwd/slurm_jobs)
-  # job_dir: /path/to/slurm/jobs  
+  # job_dir: /path/to/slurm/jobs
 ```
 
 Then submit the job:
@@ -87,21 +70,9 @@ The CLI will automatically submit the job to Slurm and handle the distributed se
 
 ## Run with uv (Development Mode)
 
-When you need more control over the environment or are actively developing with the codebase, you can use `uv` to run training scripts directly. This approach gives you direct access to the underlying Python scripts and is ideal for debugging or customization.
+When developing on clusters, you can use `uv` to prepare and test scripts locally. For single-node `torchrun` examples, see [Run on Your Local Workstation](./local-workstation.md). Cluster execution should be done through the CLI with `slurm` configs above.
 
-### Train on a Single GPU
-
-```bash
-uv run nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
-```
-
-### Train on Multiple GPUs with Torchrun
-
-For multi-GPU training, use `torchrun` directly:
-
-```bash
-uv run torchrun --nproc-per-node=2 nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
-```
+For Slurm-based execution, rely on the `slurm` section in your YAML and submit with the CLI.
 
 ### Why use uv?
 
@@ -115,21 +86,7 @@ uv provides several advantages for development and experimentation:
 
 ## Run with Torchrun
 
-If you have NeMo Automodel installed in your environment and prefer to run recipes directly without uv, you can use `torchrun` directly:
-
-### Train on a Single GPU
-
-```bash
-python nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
-```
-
-### Train on Multiple GPUs
-
-```bash
-torchrun --nproc-per-node=2 nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
-```
-
-This approach requires that you have already installed NeMo Automodel and its dependencies in your Python environment (see the [installation guide](../guides/installation.md) for details).
+For cluster usage, prefer submitting via the CLI with `slurm` configuration. Direct `torchrun` is recommended for single-node development; see [Run on Your Local Workstation](./local-workstation.md).
 
 ## Customize Configuration Settings
 
@@ -149,7 +106,7 @@ For example, if you want to fine-tune `Qwen/Qwen3-0.6B` instead of `meta-llama/L
 
 **Use the Automodel CLI when:**
 - You want a simple, unified interface
-- You are running on production clusters (Slurm)
+- You are submitting jobs to production clusters (Slurm)
 - You don't need to modify the underlying code
 - You prefer a higher-level abstraction
 
@@ -166,4 +123,4 @@ For example, if you want to fine-tune `Qwen/Qwen3-0.6B` instead of `meta-llama/L
 - You're working in environments where uv is not available
 - You're integrating with existing PyTorch workflows
 
-All approaches use the same configuration files and provide the same training capabilities - choose based on your workflow preferences and requirements.
+All approaches use the same configuration files. For single-node workflows, see [Run on Your Local Workstation](./local-workstation.md).
