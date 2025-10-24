@@ -251,7 +251,6 @@ class BaseRecipe:
         relative_target = os.path.relpath(target_abs, start=ckpt_root_abs)
         os.symlink(relative_target, link_path)
 
-
     def load_checkpoint(self, restore_from: str | None = None):
         """
         Loads the latest checkpoint.
