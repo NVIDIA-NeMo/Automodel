@@ -531,7 +531,7 @@ class Checkpointer:
         Returns:
             Mapping from FQN to shard index, or None when not consolidating.
         """
-        if not self._should_write_consolidated():
+        if not self._should_write_hf():
             return None
         model = model_state.model[0]
         # we first need to find the FQN -> .safetensors mapping

@@ -124,18 +124,18 @@ def main() -> None:
     with open(os.path.join(hf_metadata_dir, "fqn_to_file_index_mapping.json"), "r") as f:
         fqn_to_index_mapping = json.load(f)
 
-    if get_rank_safe() == 0:
-        copy_metadata_files(hf_metadata_dir, args.output_dir)
-
-    if get_world_size_safe() > 1:
-        dist.barrier()
-
     consolidate_safetensors_files_on_every_rank(
         args.input_dir,
         args.output_dir,
         fqn_to_index_mapping,
         num_threads=args.num_threads,
     )
+
+    if get_world_size_safe() > 1:
+        dist.barrier()
+
+    if get_rank_safe() == 0:
+        copy_metadata_files(hf_metadata_dir, args.output_dir)
 
     if get_world_size_safe() > 1:
         dist.barrier()
