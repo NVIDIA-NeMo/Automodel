@@ -100,14 +100,14 @@ lr_scheduler:
 #   save_dir: <your_wandb_save_dir>
 
 # Uncomment and configure for Mlflow logging
-mlflow:
-  experiment_name: "automodel-llm-llama3_2_1b_squad-finetune"
-  run_name: ""
-  tracking_uri: null
-  artifact_location: null 
-  tags:
-    task: "squad-finetune"
-    model_family: "llama3.2"
-    model_size: "1b"
-    dataset: "squad"
-    framework: "automodel"
+# mlflow:
+#   experiment_name: "automodel-llm-llama3_2_1b_squad-finetune"
+#   run_name: ""
+#   tracking_uri: null
+#   artifact_location: null 
+#   tags:
+#     task: "squad-finetune"
+#     model_family: "llama3.2"
+#     model_size: "1b"
+#     dataset: "squad"
+#     framework: "automodel"
