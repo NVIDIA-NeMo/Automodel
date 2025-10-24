@@ -245,7 +245,11 @@ class BaseRecipe:
         link_path = os.path.join(ckpt_root, "LATEST")
         if os.path.lexists(link_path):
             os.remove(link_path)
-        os.symlink(os.path.abspath(target_dir), link_path)
+
+        ckpt_root_abs = os.path.abspath(ckpt_root)
+        target_abs = os.path.abspath(target_dir)
+        relative_target = os.path.relpath(target_abs, start=ckpt_root_abs)
+        os.symlink(relative_target, link_path)
 
     def load_checkpoint(self, restore_from: str | None = None):
         """
