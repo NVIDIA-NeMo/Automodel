@@ -14,6 +14,7 @@
 
 import json
 import os
+import shutil
 from typing import TYPE_CHECKING, Protocol
 
 import torch
@@ -32,6 +33,8 @@ class CheckpointAddon(Protocol):
 
     def pre_save(self, **kwargs) -> None: ...
 
+    def post_save(self, **kwargs) -> None: ...
+
 
 class ConsolidatedHFAddon:
     """
@@ -47,11 +50,12 @@ class ConsolidatedHFAddon:
 
         Expected kwargs:
             model_state (ModelState): Wrapper holding the model parts.
-            consolidated_path (str): Target directory for consolidated artifacts.
+            hf_metadata_dir (str): Target directory for HF metadata artifacts.
             tokenizer (PreTrainedTokenizerBase | None): Optional tokenizer to save.
         """
         model_state = kwargs["model_state"]
-        consolidated_model_path = kwargs["consolidated_path"]
+        hf_metadata_dir = kwargs["hf_metadata_dir"]
+        fqn_to_file_index_mapping = kwargs["fqn_to_file_index_mapping"]
         tokenizer = kwargs.get("tokenizer", None)
         model_part = model_state.model[0]  # ModelState already converts to list if needed
 
@@ -59,16 +63,50 @@ class ConsolidatedHFAddon:
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             # save the config.json file
             if hasattr(model_part, "config"):
-                with open(os.path.join(consolidated_model_path, "config.json"), "w") as f:
+                with open(os.path.join(hf_metadata_dir, "config.json"), "w") as f:
                     f.write(model_part.config.to_json_string())
             # save the generation_config.json file
             if hasattr(model_part, "generation_config"):
-                with open(os.path.join(consolidated_model_path, "generation_config.json"), "w") as f:
+                with open(os.path.join(hf_metadata_dir, "generation_config.json"), "w") as f:
                     f.write(model_part.generation_config.to_json_string())
 
             # save the tokenizer
             if tokenizer is not None:
-                tokenizer.save_pretrained(consolidated_model_path)
+                tokenizer.save_pretrained(hf_metadata_dir)
+
+            # save the fqn_to_file_index_mapping file
+            with open(os.path.join(hf_metadata_dir, "fqn_to_file_index_mapping.json"), "w") as f:
+                json.dump(fqn_to_file_index_mapping, f, indent=2, sort_keys=True)
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+    def post_save(self, **kwargs) -> None:
+        """
+        Move the saved HF metadata to the consolidated directory.
+
+        The reason we keep it this way is because the HF metadata needs to be available
+        for offline consolidation, otherwise any changes made to the config during training
+        will be lost.
+
+        Expected kwargs:
+            consolidated_path (str): Target directory for consolidated artifacts.
+            hf_metadata_dir (str): Target directory for HF metadata artifacts.
+        """
+        consolidated_path = kwargs["consolidated_path"]
+        hf_metadata_path = kwargs["hf_metadata_path"]
+        if not consolidated_path:
+            # in this case we are just saving the sharded HF safetensors
+            return
+
+        if (not torch.distributed.is_initialized()) or (torch.distributed.get_rank() == 0):
+            # Move each item inside hf_metadata_dir into consolidated_path
+            for item_name in os.listdir(hf_metadata_path):
+                if item_name == "fqn_to_file_index_mapping.json":
+                    continue  # this is saved by the consolidation step
+                src_path = os.path.join(hf_metadata_path, item_name)
+                dst_path = os.path.join(consolidated_path, item_name)
+                shutil.move(src_path, dst_path)
+            shutil.rmtree(hf_metadata_path, ignore_errors=True)
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
@@ -109,6 +147,9 @@ class PeftAddon:
                 json.dump(automodel_peft_metadata, f, indent=2, sort_keys=True)
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
+
+    def post_save(self, **kwargs) -> None:
+        pass
 
 
 def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState) -> dict:
