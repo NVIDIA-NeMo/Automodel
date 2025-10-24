@@ -20,11 +20,17 @@ from nemo_automodel.shared.import_utils import MISSING_QWEN_VL_UTILS_MSG
 
 try:
     from qwen_vl_utils import process_vision_info
-
     HAVE_QWEN_VL_UTILS = True
 except ImportError:
     HAVE_QWEN_VL_UTILS = False
     process_vision_info = MagicMock()
+
+try:
+    from qwen_omni_utils import process_mm_info
+    HAVE_QWEN_OMNI_UTILS = True
+except ImportError:
+    HAVE_QWEN_OMNI_UTILS = False
+    process_mm_info = MagicMock()
 
 
 def create_loss_mask_with_start_of_response_token(input_ids, processor, start_of_response_token=None):
@@ -148,6 +154,73 @@ def qwen2_5_collate_fn(
     return batch
 
 
+def qwen3_omni_collate_fn(
+    examples: list, processor, start_of_response_token="<|im_start|>assistant\n", use_audio_in_video=False
+) -> dict[str, torch.Tensor]:
+
+    if not HAVE_QWEN_OMNI_UTILS:
+        raise ImportError("qwen_omni_utils is required for qwen3_omni_collate_fn. Install it with: pip install qwen-omni-utils")
+
+    skipped_tokens = extract_skipped_token_ids(processor)
+
+    # Extract conversations from examples
+    conversations = [example["conversation"] for example in examples]
+    
+    # Apply chat template to get text for each example
+    texts = [processor.apply_chat_template(conversation, add_generation_prompt=False, tokenize=False) 
+             for conversation in conversations]
+    
+    # Process multimodal info (audios, images, videos) for each conversation
+    all_audios = []
+    all_images = []
+    all_videos = []
+    for conversation in conversations:
+        audios, images, videos = process_mm_info(conversation, use_audio_in_video=use_audio_in_video)
+        all_audios.append(audios)
+        all_images.append(images)
+        all_videos.append(videos)
+    
+    # Helper function to check if a modality has actual data
+    def has_data(modality_list):
+        """Check if any item in the list contains actual data (not None or empty list)."""
+        for item in modality_list:
+            if item is None:
+                continue
+            if isinstance(item, list) and len(item) == 0:
+                continue
+            return True
+        return False
+    
+    processor_kwargs = {
+        "text": texts,
+        "return_tensors": "pt",
+        "padding": True,
+    }
+    
+    if has_data(all_audios):
+        processor_kwargs["audio"] = all_audios
+    if has_data(all_images):
+        processor_kwargs["images"] = all_images
+    if has_data(all_videos):
+        processor_kwargs["videos"] = all_videos
+    
+    batch = processor(**processor_kwargs)
+    
+    labels = batch["input_ids"].clone()[:, 1:]
+    labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
+    
+    labels[torch.isin(labels, skipped_tokens)] = -100
+    batch["labels"] = labels
+    
+    # Create loss masks to only compute loss on assistant responses
+    loss_masks = [
+        create_loss_mask_with_start_of_response_token(input_ids, processor, start_of_response_token)
+        for input_ids in batch["input_ids"]
+    ]
+    batch["loss_mask"] = torch.tensor(loss_masks, dtype=torch.float, device=batch["input_ids"].device)
+    return batch
+
+
 def default_collate_fn(examples: list, processor, start_of_response_token=None) -> dict[str, torch.Tensor]:
     """Default collate function for VLM models."""
     if not HAVE_QWEN_VL_UTILS:
@@ -186,5 +259,6 @@ def default_collate_fn(examples: list, processor, start_of_response_token=None) 
 # Mapping of processor types to their collate functions
 COLLATE_FNS = {
     "Qwen2_5_VLProcessor": qwen2_5_collate_fn,
+    "Qwen3OmniMoeProcessor": qwen3_omni_collate_fn,
     "default": default_collate_fn,
 }
