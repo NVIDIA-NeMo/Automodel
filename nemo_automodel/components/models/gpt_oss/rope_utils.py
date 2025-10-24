@@ -23,12 +23,35 @@ def apply_rotary_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> torch.Tensor:
+    """Apply rotary embeddings to input tensor.
+
+    If cos/sin have fewer dimensions than x (due to partial_rotary_factor < 1.0),
+    only the first rotary_dim dimensions of x are rotated, and the rest are passed through.
+
+    Args:
+        x: Input tensor (..., head_dim)
+        cos: Cosine tensor (..., rotary_dim // 2)
+        sin: Sine tensor (..., rotary_dim // 2)
+    """
     cos = cos.unsqueeze(-2).to(x.dtype)
     sin = sin.unsqueeze(-2).to(x.dtype)
-    x1, x2 = torch.chunk(x, 2, dim=-1)
-    o1 = x1 * cos - x2 * sin
-    o2 = x2 * cos + x1 * sin
-    return torch.cat((o1, o2), dim=-1)
+
+    # Handle partial rotary embeddings
+    # cos/sin have dimension rotary_dim//2, so full rotary_dim is cos.shape[-1] * 2
+    rotary_dim = cos.shape[-1] * 2
+    if rotary_dim < x.shape[-1]:
+        # Only apply rotary to the first rotary_dim dimensions
+        x_rot, x_pass = x[..., :rotary_dim], x[..., rotary_dim:]
+        x1, x2 = torch.chunk(x_rot, 2, dim=-1)
+        o1 = x1 * cos - x2 * sin
+        o2 = x2 * cos + x1 * sin
+        return torch.cat((o1, o2, x_pass), dim=-1)
+    else:
+        # Standard full rotary embeddings
+        x1, x2 = torch.chunk(x, 2, dim=-1)
+        o1 = x1 * cos - x2 * sin
+        o2 = x2 * cos + x1 * sin
+        return torch.cat((o1, o2), dim=-1)
 
 
 class RotaryEmbedding(torch.nn.Module):
@@ -41,10 +64,14 @@ class RotaryEmbedding(torch.nn.Module):
         scaling_factor: float = 1.0,
         ntk_alpha: float = 1.0,
         ntk_beta: float = 32.0,
+        partial_rotary_factor: float = 1.0,
         device: torch.device | None = None,
     ) -> None:
         super().__init__()
         self.head_dim = head_dim
+        self.partial_rotary_factor = partial_rotary_factor
+        # Compute the actual dimension to apply RoPE to (may be less than head_dim)
+        self.rotary_dim = int(head_dim * partial_rotary_factor)
         self.base = base
         self.dtype = dtype
         self.initial_context_length = initial_context_length
@@ -56,12 +83,17 @@ class RotaryEmbedding(torch.nn.Module):
     @functools.cache
     @torch.no_grad()
     def _compute_concentration_and_inv_freq(self) -> torch.Tensor:
-        """See YaRN paper: https://arxiv.org/abs/2309.00071"""
-        freq = self.base ** (torch.arange(0, self.head_dim, 2, dtype=torch.float, device=self.device) / self.head_dim)
+        """See YaRN paper: https://arxiv.org/abs/2309.00071
+
+        Uses rotary_dim instead of head_dim to support partial rotary embeddings.
+        """
+        freq = self.base ** (
+            torch.arange(0, self.rotary_dim, 2, dtype=torch.float, device=self.device) / self.rotary_dim
+        )
         if self.scaling_factor > 1.0:
             concentration = 0.1 * math.log(self.scaling_factor) + 1.0  # YaRN concentration
 
-            d_half = self.head_dim / 2
+            d_half = self.rotary_dim / 2
             # NTK by parts
             low = d_half * math.log(self.initial_context_length / (self.ntk_beta * 2 * math.pi)) / math.log(self.base)
             high = d_half * math.log(self.initial_context_length / (self.ntk_alpha * 2 * math.pi)) / math.log(self.base)
