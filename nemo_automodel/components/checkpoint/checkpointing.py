@@ -181,7 +181,9 @@ class Checkpointer:
         """
         # Create the model directories
         model_dir = os.path.join(weights_path, "model")
-        consolidated_dir = os.path.join(model_dir, "consolidated") if self._should_write_consolidated_safetensors() else None
+        consolidated_dir = (
+            os.path.join(model_dir, "consolidated") if self._should_write_consolidated_safetensors() else None
+        )
         hf_metadata_dir = os.path.join(model_dir, ".hf_metadata") if self._should_write_hf_metadata() else None
         _ensure_dirs(model_dir, consolidated_dir, hf_metadata_dir)
 
