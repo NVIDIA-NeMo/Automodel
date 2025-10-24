@@ -14,7 +14,7 @@
 
 import logging
 import re
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +125,8 @@ def format_prompt_completion(
     eos_token_id: int,
     pad_token_id: int,
     seq_length: Optional[int] = None,
+    padding: Union[str, bool] = None,
+    truncation: Union[str, bool] = None,
     answer_only_loss_mask: bool = True,
 ) -> Dict[str, List[int]]:
     """
@@ -150,7 +152,7 @@ def format_prompt_completion(
     else:
         len_prompt_ids = 0
     # Tokenize full text
-    input_ids = tokenizer(full_text)["input_ids"]
+    input_ids = tokenizer(full_text, padding=padding, truncation=truncation, max_length=seq_length)["input_ids"]
 
     # Create assistant_masks: 0 for prompt tokens, 1 for answer tokens
     assistant_masks = [0] * len_prompt_ids + [1] * (len(input_ids) - len_prompt_ids)
@@ -171,6 +173,8 @@ def format_chat_template(
     eos_token_id: int,
     pad_token_id: int,
     seq_length: Optional[int] = None,
+    padding: Union[str, bool] = None,
+    truncation: Union[str, bool] = None,
     tools: Optional[List[Dict]] = None,
 ) -> Dict[str, List[int]]:
     """
@@ -199,6 +203,9 @@ def format_chat_template(
         tokenize=True,
         return_dict=True,
         return_assistant_tokens_mask=template_has_generation_kwd,
+        padding=padding,
+        truncation=truncation,
+        max_length=seq_length,
     )
 
     # Choose the last conversation as answer other history are context by finding the last masked token
