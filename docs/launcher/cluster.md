@@ -2,6 +2,20 @@
 
 Use this guide for submitting distributed training jobs on Slurm clusters (single- or multi-node). For single-node workstation usage, see [Run on Your Local Workstation](./local-workstation.md). For setup details, refer to our [Installation Guide](../guides/installation.md).
 
+## Quick start: Choose your runner
+
+- **CLI (recommended for Slurm)**
+  ```bash
+  automodel finetune llm -c your_config_with_slurm.yaml
+  ```
+
+- **Direct recipe script (typically for local testing)**
+  - Single node, multiple GPUs
+    ```bash
+    torchrun --nproc-per-node=8 nemo_automodel/recipes/llm_finetune/finetune.py -c your_config.yaml
+    ```
+  - Note: For multi-node, prefer the CLI with `slurm` configuration.
+
 ## Run with Automodel CLI (Slurm)
 
 The AutoModel CLI is the preferred method for most users. It provides a unified interface to submit Slurm batch jobs without deep knowledge of cluster specifics.
@@ -67,6 +81,58 @@ automodel finetune llm -c your_config_with_slurm.yaml
 ```
 
 The CLI will automatically submit the job to Slurm and handle the distributed setup.
+
+### Standalone Slurm Script (advanced)
+
+If you prefer to submit with your own Slurm script, here is a standalone bash script adapted from the Automodel launcher template. See the upstream template for the authoritative reference: [Automodel Slurm template](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/launcher/slurm/template.py).
+
+```bash
+#!/bin/bash
+#SBATCH -A <account>
+#SBATCH -p <partition>
+#SBATCH -N <nodes>
+#SBATCH --ntasks-per-node 1<gpus_per_node_directive>
+#SBATCH --time <HH:MM:SS>
+#SBATCH --mail-type=FAIL
+#SBATCH --exclusive
+#SBATCH --output=<job_dir>/slurm_%x_%j.out
+#SBATCH -J <job_name>
+
+# Multi-node env
+export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
+export MASTER_PORT=<master_port>
+export NUM_GPUS=<num_gpus>
+export WORLD_SIZE=$(($NUM_GPUS * $SLURM_NNODES))
+
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export TORCH_NCCL_AVOID_RECORD_STREAMS=1
+export NCCL_NVLS_ENABLE=0
+
+# Experiment env
+export WANDB_API_KEY=<wandb_key>
+export HF_HOME=<hf_home>
+export HF_TOKEN=<hf_token>
+# Add any custom env vars below, e.g.:
+# export MY_ENV_VAR=value
+
+# User command
+read -r -d '' CMD <<'EOF'
+cd <chdir>; whoami; date; pwd;
+<command>
+EOF
+echo "$CMD"
+
+srun \
+    --mpi=pmix \
+    --container-entrypoint \
+    --no-container-mount-home \
+    --container-image=<container_image> \
+    --container-mounts=<container_mounts> \
+    --export=ALL \
+    bash -c "$CMD"
+```
+
+Replace bracketed placeholders (e.g., `<account>`, `<container_image>`, `<command>`) with your values. For multi-node training, ensure your `<command>` uses `torchrun` with `--nnodes=$SLURM_NNODES --nproc-per-node=$NUM_GPUS --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT` or rely on the Automodel CLI which configures this for you.
 
 ## Run with uv (Development Mode)
 
