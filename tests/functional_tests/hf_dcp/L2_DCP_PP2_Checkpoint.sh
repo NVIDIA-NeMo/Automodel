@@ -30,7 +30,7 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
     --validation_dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
     --dataset.limit_dataset_samples 1000 \
-    --dataset.max_seq_length 512 \
+    --dataset.seq_length 512 \
     --validation_dataset.seq_length 512 \
     --step_scheduler.ckpt_every_steps 10 \
     --checkpoint.enabled true \

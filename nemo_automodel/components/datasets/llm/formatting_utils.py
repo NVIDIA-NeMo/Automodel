@@ -25,7 +25,7 @@ GENERATION_REGEX = re.compile(r"\{%-?\s+generation\s+-?%\}")
 
 
 class NoContextLeftError(RuntimeError):
-    """Raised when context must be fully removed to satisfy max_seq_length."""
+    """Raised when context must be fully removed to satisfy seq_length."""
 
 
 def _pad_to_seq_length(sample, pad_token_id, seq_length):
@@ -124,7 +124,7 @@ def _truncate_prompt_to_fit_plain(
     answer: str,
     eos_token_id: int,
     pad_token_id: int,
-    max_seq_length: Optional[int],
+    seq_length: Optional[int],
     answer_only_loss_mask: bool,
 ) -> str:
     """Iteratively remove leading context words until packaged length fits.
@@ -132,20 +132,20 @@ def _truncate_prompt_to_fit_plain(
     Splits on spaces to avoid mid-word truncation. Raises NoContextLeftError
     if the prompt must be fully removed to satisfy the constraint.
     """
-    if not isinstance(max_seq_length, int):
+    if not isinstance(seq_length, int):
         return prompt
 
     current_prompt = prompt
     while True:
         context_len = len(tokenizer(current_prompt)["input_ids"]) if answer_only_loss_mask else 0
         full_ids = tokenizer(current_prompt + answer)["input_ids"]
-        packaged = _package_tokenized_example(False, full_ids, eos_token_id, pad_token_id, max_seq_length, context_len)
-        if len(packaged["labels"]) <= max_seq_length:
+        packaged = _package_tokenized_example(False, full_ids, eos_token_id, pad_token_id, seq_length, context_len)
+        if len(packaged["labels"]) <= seq_length:
             return current_prompt
         # remove up to the first space from the left
         cut = current_prompt.find(" ")
         if cut == -1:
-            raise NoContextLeftError("Context fully removed but sequence still exceeds max_seq_length")
+            raise NoContextLeftError("Context fully removed but sequence still exceeds seq_length")
         current_prompt = current_prompt[cut + 1 :]
         # Skip any additional spaces
         while current_prompt.startswith(" "):
@@ -160,11 +160,11 @@ def _truncate_prompt_to_fit_chat(
     answer: str,
     eos_token_id: int,
     pad_token_id: int,
-    max_seq_length: Optional[int],
+    seq_length: Optional[int],
     start_of_turn_token: Optional[str],
 ) -> str:
     """Iteratively remove leading context words for chat-template path."""
-    if not isinstance(max_seq_length, int):
+    if not isinstance(seq_length, int):
         return prompt
 
     current_prompt = prompt
@@ -181,14 +181,14 @@ def _truncate_prompt_to_fit_chat(
         else:
             response_start = 0
         packaged = _package_tokenized_example(
-            True, input_ids, eos_token_id, pad_token_id, max_seq_length, response_start
+            True, input_ids, eos_token_id, pad_token_id, seq_length, response_start
         )
-        if len(packaged["labels"]) <= max_seq_length:
+        if len(packaged["labels"]) <= seq_length:
             return current_prompt
         # remove up to the first space from the left
         cut = current_prompt.find(" ")
         if cut == -1:
-            raise NoContextLeftError("Context fully removed but sequence still exceeds max_seq_length")
+            raise NoContextLeftError("Context fully removed but sequence still exceeds seq_length")
         current_prompt = current_prompt[cut + 1 :]
         while current_prompt.startswith(" "):
             current_prompt = current_prompt[1:]
@@ -202,7 +202,7 @@ def format_prompt_completion(
     answer: str,
     eos_token_id: int,
     pad_token_id: int,
-    max_seq_length: Optional[int] = None,
+    seq_length: Optional[int] = None,
     answer_only_loss_mask: bool = True,
 ) -> Dict[str, List[int]]:
     """
@@ -214,7 +214,7 @@ def format_prompt_completion(
         answer: The answer string.
         eos_token_id: The end-of-sequence token id.
         pad_token_id: The padding token id.
-        max_seq_length: Optional maximum sequence length. If the packaged
+        seq_length: Optional maximum sequence length. If the packaged
             sequence exceeds this length, context is removed from the left at
             space boundaries. No padding is applied.
 
@@ -223,7 +223,7 @@ def format_prompt_completion(
     """
     # Optionally truncate prompt to fit the requested maximum length
     truncated_prompt = _truncate_prompt_to_fit_plain(
-        tokenizer, prompt, answer, eos_token_id, pad_token_id, max_seq_length, answer_only_loss_mask
+        tokenizer, prompt, answer, eos_token_id, pad_token_id, seq_length, answer_only_loss_mask
     )
 
     # Tokenize separately to locate answer start

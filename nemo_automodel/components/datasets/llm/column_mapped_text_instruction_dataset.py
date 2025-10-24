@@ -154,7 +154,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
         *,
         split: Optional[str] = None,
         answer_only_loss_mask: bool = True,
-        max_seq_length: Optional[int] = None,
+        seq_length: Optional[int] = None,
         start_of_turn_token: Optional[str] = None,
         limit_dataset_samples: Optional[int] = None,
     ) -> None:
@@ -213,7 +213,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
 
         self.answer_only_loss_mask = answer_only_loss_mask
         self.start_of_turn_token = start_of_turn_token
-        self.max_seq_length = max_seq_length
+        self.seq_length = seq_length
 
     def __len__(self) -> int:  # noqa: D401
         """
@@ -240,7 +240,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
         Raises:
             RuntimeError: If streaming is enabled.
         """
-        # Try current idx, then successive ones, to find a sample that fits max_seq_length
+        # Try current idx, then successive ones, to find a sample that fits seq_length
         total = len(self.dataset)
         cur_idx = idx
         last_error: Optional[Exception] = None
@@ -306,6 +306,6 @@ class ColumnMappedTextInstructionDataset(Dataset):
                 answer,
                 eos_token_id,
                 pad_token_id,
-                max_seq_length=self.max_seq_length,
+                seq_length=self.seq_length,
                 answer_only_loss_mask=self.answer_only_loss_mask,
             )

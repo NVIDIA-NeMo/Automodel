@@ -233,7 +233,7 @@ def test_truncation_raises_when_answer_alone_exceeds_max_len():
             answer,
             eos_token_id=tok.eos_token_id,
             pad_token_id=tok.eos_token_id,
-            max_seq_length=1,
+            seq_length=1,
         )
 
 
@@ -242,14 +242,14 @@ def test_space_aware_left_truncation_keeps_whole_words():
     # Five-word context; one-word answer; max length allows only last two context words
     prompt = "one two three four five "
     answer = "ok"
-    S = 4  # max_seq_length
+    S = 4  # seq_length
     out = format_prompt_completion(
         tok,
         prompt,
         answer,
         eos_token_id=tok.eos_token_id,
         pad_token_id=tok.eos_token_id,
-        max_seq_length=S,
+        seq_length=S,
         answer_only_loss_mask=True,
     )
     del out["___PAD_TOKEN_IDS___"]
