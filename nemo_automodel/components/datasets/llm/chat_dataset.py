@@ -46,16 +46,23 @@ def _as_iter(val: Union[str, Sequence[str]]) -> Iterator[str]:
             yield x
 
 
-def _load_openai_messages(path_or_dataset_id: Union[str, Sequence[str]], split: Optional[str] = None):
+def _load_openai_messages(
+    path_or_dataset_id: Union[str, Sequence[str]], split: Optional[str] = None, name: Optional[str] = None
+):
     """Load OpenAI chat messages datasets from HF or local JSON/JSONL files.
 
     For HF repo IDs, we delegate to datasets.load_dataset.
     For local files, we manually parse JSONL/JSON to avoid pyarrow type
     inference issues (e.g., heterogeneous field types under `tools`).
+
+    Args:
+        path_or_dataset_id: HF dataset ID or local file path(s).
+        split: Dataset split to load (e.g., "train", "validation").
+        name: Dataset configuration/subset name
     """
     if isinstance(path_or_dataset_id, str) and _is_hf_repo_id(path_or_dataset_id):
         return load_dataset(
-            path_or_dataset_id, split=split, streaming=False, verification_mode=VerificationMode.NO_CHECKS
+            path_or_dataset_id, name=name, split=split, streaming=False, verification_mode=VerificationMode.NO_CHECKS
         )
 
     files = list(_as_iter(path_or_dataset_id))
@@ -124,6 +131,7 @@ class ChatDataset(Dataset):
         tokenizer,
         *,
         split: Optional[str] = None,
+        name: Optional[str] = None,
         seq_length: Optional[int] = None,
         start_of_turn_token: Optional[str] = None,
         chat_template: Optional[str] = None,
@@ -143,7 +151,7 @@ class ChatDataset(Dataset):
         self.seq_length = seq_length
         self.start_of_turn_token = start_of_turn_token
 
-        self.dataset = _load_openai_messages(path_or_dataset_id, split=split)
+        self.dataset = _load_openai_messages(path_or_dataset_id, split=split, name=name)
 
         # Ensure pad token presence for downstream padding
         eos_token_id = getattr(self.tokenizer, "eos_token_id", 0)
