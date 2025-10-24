@@ -2,14 +2,18 @@
 
 Use this guide for submitting distributed training jobs on Slurm clusters (single- or multi-node). For single-node workstation usage, see [Run on Your Local Workstation](./local-workstation.md). For setup details, refer to our [Installation Guide](../guides/installation.md).
 
-## Quick start: Choose your runner
+## Quick start: Choose your job launch option
 
 - **CLI (recommended for Slurm)**
   ```bash
   automodel finetune llm -c your_config_with_slurm.yaml
   ```
 
-- **Direct recipe script (typically for local testing)**
+- **Direct recipe script (typically for interactive testing)**
+  - Single node, single GPU
+    ```bash
+    python3 nemo_automodel/recipes/llm_finetune/finetune.py -c your_config.yaml
+    ```
   - Single node, multiple GPUs
     ```bash
     torchrun --nproc-per-node=8 nemo_automodel/recipes/llm_finetune/finetune.py -c your_config.yaml
