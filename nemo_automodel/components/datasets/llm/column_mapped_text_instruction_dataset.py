@@ -112,7 +112,11 @@ def _load_dataset(
     """
     if isinstance(path_or_dataset_id, str) and _str_is_hf_repo_id(path_or_dataset_id):
         return load_dataset(
-            path_or_dataset_id, name=name, split=split, streaming=streaming, verification_mode=VerificationMode.NO_CHECKS
+            path_or_dataset_id,
+            name=name,
+            split=split,
+            streaming=streaming,
+            verification_mode=VerificationMode.NO_CHECKS,
         )
 
     data_files = list(make_iterable(path_or_dataset_id))

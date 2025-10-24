@@ -54,7 +54,7 @@ def _load_openai_messages(
     For HF repo IDs, we delegate to datasets.load_dataset.
     For local files, we manually parse JSONL/JSON to avoid pyarrow type
     inference issues (e.g., heterogeneous field types under `tools`).
-    
+
     Args:
         path_or_dataset_id: HF dataset ID or local file path(s).
         split: Dataset split to load (e.g., "train", "validation").
