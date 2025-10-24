@@ -2,6 +2,23 @@
 
 NeMo AutoModel supports running on a single machine (single- or multi-GPU). Use this guide for local, single-node workflows. For setup details, refer to our [Installation Guide](../guides/installation.md). If you want to submit distributed jobs to a Slurm cluster, see [Run on a Cluster](./cluster.md).
 
+## Quick start: Choose your launch option
+
+- **CLI (recommended)**
+  ```bash
+  automodel finetune llm -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+  ```
+
+- **Direct recipe script**
+  - Single GPU
+    ```bash
+    python nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+    ```
+  - Multi-GPU (single node)
+    ```bash
+    torchrun --nproc-per-node=2 nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+    ```
+
 ## Run with Automodel CLI (Single Node)
 
 The AutoModel CLI is the preferred method for most users. It offers a unified interface to launch training jobs on your workstation without requiring deep knowledge of the underlying distributed setup.
