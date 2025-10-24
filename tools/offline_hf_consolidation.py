@@ -50,7 +50,6 @@ def copy_metadata_files(input_dir, output_dir):
     """
     Copy the metadata files over from the input directory to the output directory.
     """
-    # Move each item inside hf_metadata_dir into consolidated_path
     for item_name in os.listdir(input_dir):
         if item_name == "fqn_to_file_index_mapping.json":
             continue  # this is saved by the consolidation step
@@ -107,13 +106,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # Initialize distributed
     backend = args.backend
     if backend == "auto":
         backend = "nccl" if torch.cuda.device_count() > 0 else "gloo"
     initialize_distributed(backend)
 
-    # Ensure output directory
     os.makedirs(args.output_dir, exist_ok=True)
 
     if not os.path.exists(args.input_dir):
@@ -124,11 +121,9 @@ def main() -> None:
     if not os.path.exists(hf_metadata_dir) and not os.path.isdir(hf_metadata_dir):
         raise FileNotFoundError("Expected to find the .hf_metadata directory in the input directory.")
 
-    # Load the FQN mapping from the .hf_metadata directory.
     with open(os.path.join(hf_metadata_dir, "fqn_to_file_index_mapping.json"), "r") as f:
         fqn_to_index_mapping = json.load(f)
 
-    # Copy metadata and perform consolidation (rank 0 only), then synchronize
     if get_rank_safe() == 0:
         copy_metadata_files(hf_metadata_dir, args.output_dir)
 
@@ -142,7 +137,6 @@ def main() -> None:
         num_threads=args.num_threads,
     )
 
-    # Best-effort sync for multi-rank runs
     if get_world_size_safe() > 1:
         dist.barrier()
 
