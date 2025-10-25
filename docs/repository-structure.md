@@ -3,9 +3,9 @@
 This introductory guide presents the structure of the NeMo Automodel repository, provides a brief overview of its parts, introduces concepts such as components and recipes, and explains how everything fits together.
 
 ## What is NeMo Automodel?
-NeMo Automodel is a PyTorch library for fine-tuning and pre-training models from the Hugging Face Hub. It provides:
-- **Day-0 support** for most LLMs and VLMs on the Hugging Face Hub.
+NeMo Automodel is a PyTorch library for fine-tuning and pre-training large scale models. In particular, it provides:
 - **Optimized implementations** for training efficiency, including fused kernels and memory-saving techniques.
+- [**Day-0 support**](model-coverage/overview.md) for LLMs and VLMs available on the Hugging Face Hub.
 - **Seamless integration** with Hugging Face datasets, tokenizers, and related tools.
 - **Distributed training strategies** using FSDP2 and MegatronFSDP across multi-GPU and multi-node environments.
 - **End-to-end workflows** with recipes for data preparation, training, and evaluation.
@@ -15,8 +15,7 @@ NeMo Automodel is a PyTorch library for fine-tuning and pre-training models from
 The Automodel source code is available under the [`nemo_automodel`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/nemo_automodel) directory. It is organized into three directories:
 - [`components/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/nemo_automodel/components)  - Self-contained modules
 - [`recipes/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/nemo_automodel/recipes) - End-to-end training workflows
-- [`cli/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/nemo_automodel/_cli) - launch fine-tuning jobs.
-
+- [`cli/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/nemo_automodel/_cli) - Job launcher.
 
 ### Components Directory
 The `components/` directory contains isolated modules used in training loops.
@@ -28,15 +27,18 @@ The following directory listing shows all components along with explanations of 
 $ tree -L 1 nemo_automodel/components/
 
 ├── _peft/          - Implementations of PEFT methods, such as LoRA.
-├── _transformers/  - Optimized model implementations for Hugging Face models.
+├── attention/      - Efficient attention modules and related utilities (e.g., flash attention, rotary embeddings).
 ├── checkpoint/     - Checkpoint save and load-related logic.
 ├── config/         - Utils to load YAML files and CLI-parsing helpers.
 ├── datasets/       - LLM and VLM datasets and utils (collate functions, preprocessing).
 ├── distributed/    - Distributed processing primitives (DDP, FSDP2, MegatronFSDP).
 ├── launcher/       - Job launcher for interactive and batch (Slurm, K8s) processing.
-├── loggers/        - Metric/event logging for Weights & Biases and other tools
+├── loggers/        - Metric/event logging for Weights & Biases and other tools.
 ├── loss/           - Loss functions (such as cross-entropy and linear cross-entropy, etc.).
+├── models/         - Optimized model implementations for LLMs and VLMs.
+├── moe/            - Mixture of Experts modules and routing utilities for scalable model architectures.
 ├── optim/          - Optimizers and LR schedulers, including fused or second-order variants.
+├── quantization/   - Quantization layers and helpers for 4-bit/8-bit or other reduced-precision training and inference.
 ├── training/       - Training and fine-tuning utils.
 └── utils/          - Small, dependency-free helpers (seed, profiler, timing, fs).
 ```
@@ -55,19 +57,25 @@ The following directory listing shows all components along with explanations of 
 ```
 $ tree -L 2 nemo_automodel/recipes/
 ├── llm
-│   └── finetune.py   - Finetune recipe for LLMs (SFT, PEFT).
+│   ├── benchmark.py  - Benchmark recipe for LLMs
+│   ├── kd.py         - Knowledge Distillation for LLMs
+│   └── train_ft.py   - Train recipe for LLMs (Pretrain & Finetune SFT, PEFT).
 └── vlm
     └── finetune.py   - Finetune recipe for VLMs (SFT, PEFT).
 ```
 
 #### Run a Recipe
 
-Each recipe can be executed directly using torchrun, for example, from the root directory:
+Each recipe script can be executed directly using torchrun, for example, from the root directory:
 ```bash
 torchrun --nproc-per-node=2 nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
 The above command will fine-tune the Llama3.2-1B model on the SQuaD dataset with two GPUs.
+If you want to execute on a single GPU replace `torchrun --nproc-per-node` with `python3`:
+```bash
+python3 nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+```
 
 Each recipe, imports the components it needs from the `nemo_automodel/components/` catalog.
 The recipe/components structure enables you to:
@@ -98,44 +106,16 @@ dataset:
 More recipe examples are available under the [`examples/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples) directory.
 
 ### CLI Directory
-The `automodel` CLI application simplifies job execution across different environments, from 
+The `automodel` CLI application simplifies job execution across different environments, from
 single-GPU interactive sessions to batch multi-node runs. Currently, it supports Slurm clusters, with Kubernetes support coming soon.
 
-#### Run the LLM Fine-Tuning Recipe
-For example, to run the same torchrun LLM fine-tuning workflow described in the recipes section above, use the following command:
-```bash
-automodel llm finetune -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node=2
-```
 
-#### Launch a Batch Job on Slurm
+## Next steps
 
-The automodel CLI application also lets you launch batch jobs across cluster environments. For example, to run a job on a Slurm cluster, extend your YAML configuration file with the following parameters:
+Learn how to train models with NeMo AutoModel on:
+- **Your local workstation**: See `docs/launcher/local-workstation.md` or open [Run on Your Local Workstation](./launcher/local-workstation.md).
+- **A cluster**: See `docs/launcher/cluster.md` or open [Run on a Cluster](./launcher/cluster.md).
 
-```yaml
-slurm:
-  job_name: llm-finetune  # if no job_name is provided will use {domain}_{command} from invocation
-  nodes: 1
-  ntasks_per_node: 8
-  time: 00:05:00
-  account: coreai_dlalgo_llm
-  partition: batch
-  container_image: nvcr.io/nvidia/nemo:dev # can also use path to sqsh, e.g.: /foo/bar/image.sqsh
-  gpus_per_node: 8
-  extra_mounts:
-    - /a/b/c:/d/e
-```
-The section above defines the Slurm hyperparameters required to launch a batch job on a Slurm cluster using one node (`nodes` argument) and eight GPUs per node (`ntasks_per_node`).
-
-#### Launch a Batch Job on Slurm with Modified Code
-
-The `slurm` YAML configuration above uses the Automodel installation provided in the `container_image`. However, if the command is executed from within a Git repository accessible to Slurm workers, the SBATCH script will prioritize the repository for running the experiments instead of using the container installation.
-
-For example,
-```bash
-git clone git@github.com:NVIDIA-NeMo/Automodel.git automodel_test_repo
-cd automodel_test_repo/
-automodel llm finetune -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node=2
-```
-
-This will launch the job using the source code contained in the `automodel_test_repo` directory instead of the version bundled in the Docker image.
-<!-- The [Automodel CLI guide](docs/automodel_cli.md) provides an in-depth explanation of the automodel util. -->
+Feel free to explore our guides:
+- **Your local workstation**: See [`docs/launcher/local-workstation.md`](launcher/local-workstation.md).
+- **A cluster**: See [`docs/launcher/cluster.md`](docs/launcher/cluster.md).
