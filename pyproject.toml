@@ -83,7 +83,9 @@ dependencies = [
     "torchdata",
     "transformers<=4.57.1",
     "wandb",
-    "torchao"
+    "torchao",
+    "mlflow>=3.5.1",
+    "psutil>=7.1.1",
 ]
 
 [project.optional-dependencies]
