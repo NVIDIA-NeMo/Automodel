@@ -259,7 +259,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
         row = self.dataset[idx]
         mapped = {dest: row[src] for dest, src in self.column_mapping.items() if src in row}
         mapped = self._apply_tokenizer(mapped)
-        if not any(l != -100 for l in mapped["labels"]):
+        if not any(label != -100 for label in mapped["labels"]):
             return self.__getitem__((idx + 1) % len(self.dataset))
         assert _check_all_values_equal_length(mapped), "All values must be of the same length"
         return mapped
