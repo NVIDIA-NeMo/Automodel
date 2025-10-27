@@ -77,7 +77,7 @@ RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     git checkout FETCH_HEAD && \
     patch -p1 < /opt/deepep.patch && \
     pip install --no-cache-dir nvidia-nvshmem-cu13 && \
-    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install --no-cache-dir --no-build-isolation -v .; && \
+    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install --no-cache-dir --no-build-isolation -v . && \
     rm -rf /opt/deepep.patch; fi
 
 FROM automodel_dep as automodel_final
