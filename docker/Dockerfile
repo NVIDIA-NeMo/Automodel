@@ -92,7 +92,7 @@ RUN cd /opt/Automodel && \
     uv sync --locked --extra $AUTOMODEL_INSTALL --all-groups && \
     if [ "$INSTALL_DEEPEP" = "True" ]; then \
         TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" \
-        uv add --no-build-isolation -v /opt/DeepEP; \
+        uv pip install --no-build-isolation -v /opt/DeepEP; \
     fi
 
 COPY <<EOF /opt/venv/env.sh
