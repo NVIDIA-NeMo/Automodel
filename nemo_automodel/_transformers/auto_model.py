@@ -19,7 +19,7 @@ import logging
 import os
 import types
 from contextlib import contextmanager
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -41,6 +41,9 @@ from nemo_automodel.components.distributed.init_utils import get_local_world_siz
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code
 from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
+from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
+from nemo_automodel.components.distributed.ddp import DDPManager
+from torch.distributed.device_mesh import DeviceMesh
 
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 
@@ -241,6 +244,27 @@ def _verify_sdpa_support(model, is_hf_model, cp_size):
     if cp_size > 1 and is_hf_model and hasattr(model, "_supports_sdpa"):
         if model._supports_sdpa is False:
             raise ValueError("Model does not support SDPA required for context parallelism")
+def _choose_device(device: Optional[torch.device]) -> torch.device:
+    if device is not None:
+        return device
+    if torch.cuda.is_available():
+        import os
+
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        return torch.device("cuda", local_rank)
+    return torch.device("cpu")
+
+
+def _move_module_to_device(module: torch.nn.Module, device: torch.device, torch_dtype: Any) -> None:
+    # torch_dtype can be "auto", torch.dtype, or string
+    if torch_dtype == "auto":
+        dtype = None
+    else:
+        dtype = dtype_from_str(torch_dtype) if isinstance(torch_dtype, str) else torch_dtype
+    if dtype is not None:
+        module.to(device=device, dtype=dtype)
+    else:
+        module.to(device=device)
 
 
 def _download_model_weights(hf_config, pretrained_model_name_or_path):
@@ -337,6 +361,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         attn_implementation: str = "flash_attention_2",
         quantization_config=None,
         force_hf: bool = False,
+        device_mesh: Optional[DeviceMesh] = None,
+        distributed: Optional[Dict[str, Any]] = None,
+        device: Optional[torch.device] = None,
+        move_to_device: bool = False,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -410,6 +438,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
+                device_mesh=device_mesh,
+                distributed=distributed,
+                device=device,
+                move_to_device=move_to_device,
                 **kwargs,
             )
 
@@ -455,6 +487,47 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 return _retry(attn_implementation=attn_implementation)
             raise e
 
+        # Decide kernel patching based on requested parallelism
+        if distributed is not None:
+            conf = distributed if isinstance(distributed, dict) else {}
+            tp = int(conf.get("tp_size", 1))
+            cp = int(conf.get("cp_size", 1))
+            if tp > 1 or cp > 1:
+                use_liger_kernel = False
+
+        # Build internal wrapper (FSDP2 or DDP) using device_mesh or config
+        internal_wrapper = None
+        if torch.distributed.is_initialized():
+            conf = distributed if isinstance(distributed, dict) else {}
+            tp = int(conf.get("tp_size", 1))
+            cp = int(conf.get("cp_size", 1))
+            pp = int(conf.get("pp_size", 1))
+            dp = int(conf.get("dp_size", 0))
+            world_size = conf.get("world_size", torch.distributed.get_world_size())
+            backend = conf.get("backend", "nccl" if torch.cuda.is_available() else "gloo")
+
+            if tp > 1 or cp > 1 or pp > 1:
+                internal_wrapper = FSDP2Manager(
+                    dp_size=dp if dp > 0 else None,
+                    tp_size=tp,
+                    cp_size=cp,
+                    pp_size=pp,
+                    backend=backend,
+                    world_size=world_size,
+                    use_hf_tp_plan=bool(conf.get("use_hf_tp_plan", False)),
+                    sequence_parallel=bool(conf.get("sequence_parallel", False)),
+                    activation_checkpointing=bool(conf.get("activation_checkpointing", False)),
+                )
+                # If caller provided a prebuilt DeviceMesh, inject it
+                if device_mesh is not None:
+                    internal_wrapper.device_mesh = device_mesh
+            elif conf:
+                internal_wrapper = DDPManager(
+                    backend=backend,
+                    activation_checkpointing=bool(conf.get("activation_checkpointing", False)),
+                )
+            # no-op: model_wrapper removed; liger disabled via conf above
+
         # Kernel patching
         try:
             if use_liger_kernel:
@@ -474,6 +547,21 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             return _retry(use_sdpa_patching=False)
 
         _verify_sdpa_support(model, is_hf_model, cp_size)
+        # Optional: parallelize model according to parallel_scheme decision
+        # Priority: FSDP2 when tp_size>1 or cp_size>1; else DDP when dp_size>1; else single GPU
+        if internal_wrapper is not None:
+            if torch.distributed.is_initialized():
+                try:
+                    model = internal_wrapper.parallelize(model)
+                except Exception as e:
+                    logger.warning("internal parallelize failed: %s", e)
+            else:
+                logger.warning("distributed requested but torch.distributed is not initialized; skipping parallelize")
+
+        # Finally move the model to the chosen device (post-parallelization), if requested
+        if move_to_device:
+            dev = _choose_device(device)
+            _move_module_to_device(model, dev, torch_dtype)
 
         model.config.update({"nemo_version": __version__})
         return model
@@ -490,6 +578,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         attn_implementation: str = "flash_attention_2",
         quantization_config=None,
         force_hf: bool = False,
+        device_mesh: Optional[DeviceMesh] = None,
+        distributed: Optional[Dict[str, Any]] = None,
+        device: Optional[torch.device] = None,
+        move_to_device: bool = False,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -560,6 +652,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
+                device_mesh=device_mesh,
+                distributed=distributed,
+                device=device,
+                move_to_device=move_to_device,
                 **kwargs,
             )
 
@@ -604,6 +700,31 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 return _retry(attn_implementation="eager")
             raise e
 
+        # Initialize model wrapper from `distributed` if provided
+        if distributed is not None and model_wrapper is None:
+            if isinstance(distributed, FSDP2Manager):
+                model_wrapper = distributed
+            elif isinstance(distributed, dict):
+                init_kwargs = dict(distributed)
+                try:
+                    import torch.distributed as dist
+
+                    if "world_size" not in init_kwargs and dist.is_available() and dist.is_initialized():
+                        init_kwargs["world_size"] = dist.get_world_size()
+                except Exception:
+                    pass
+                if "backend" not in init_kwargs:
+                    init_kwargs["backend"] = "nccl" if torch.cuda.is_available() else "gloo"
+                model_wrapper = FSDP2Manager(**init_kwargs)
+
+        # If distributed tensor/context parallelism is requested, avoid Liger patch like in train_ft
+        if model_wrapper is not None:
+            try:
+                if getattr(model_wrapper, "tp_size", 1) > 1 or getattr(model_wrapper, "cp_size", 1) > 1:
+                    use_liger_kernel = False
+            except Exception:
+                pass
+
         # Kernel patching
         try:
             if use_liger_kernel:
@@ -623,6 +744,53 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             return _retry(use_sdpa_patching=False)
 
         _verify_sdpa_support(model, is_hf_model, cp_size)
+        # Optional: parallelize model according to parallel_scheme decision
+        # Priority: FSDP2 when tp_size>1 or cp_size>1; else DDP when dp_size>1; else single GPU
+        if model_wrapper is not None:
+            if torch.distributed.is_initialized():
+                try:
+                    model = model_wrapper.parallelize(model)
+                except Exception as e:
+                    logger.warning("model_wrapper.parallelize failed: %s", e)
+            else:
+                logger.warning("model_wrapper provided but torch.distributed is not initialized; skipping parallelize")
+        elif distributed is not None and torch.distributed.is_initialized():
+            conf = distributed if isinstance(distributed, dict) else {}
+            tp = int(conf.get("tp_size", 1))
+            cp = int(conf.get("cp_size", 1))
+            pp = int(conf.get("pp_size", 1))
+            dp = int(conf.get("dp_size", 0))
+            world_size = conf.get("world_size", torch.distributed.get_world_size())
+            backend = conf.get("backend", "nccl" if torch.cuda.is_available() else "gloo")
+
+            if tp > 1 or cp > 1 or pp > 1:
+                manager = FSDP2Manager(
+                    dp_size=dp if dp > 0 else None,
+                    tp_size=tp,
+                    cp_size=cp,
+                    pp_size=pp,
+                    backend=backend,
+                    world_size=world_size,
+                    use_hf_tp_plan=bool(conf.get("use_hf_tp_plan", False)),
+                    sequence_parallel=bool(conf.get("sequence_parallel", False)),
+                    activation_checkpointing=bool(conf.get("activation_checkpointing", False)),
+                )
+                try:
+                    model = manager.parallelize(model)
+                except Exception as e:
+                    logger.warning("FSDP2Manager.parallelize failed: %s", e)
+            else:
+                ddp_backend = backend
+                try:
+                    ddp_manager = DDPManager(backend=ddp_backend, activation_checkpointing=bool(conf.get("activation_checkpointing", False)))
+                    model = ddp_manager.parallelize(model)
+                except Exception as e:
+                    logger.warning("DDPManager.parallelize failed: %s", e)
+
+        # Finally move the model to the chosen device (post-parallelization), if requested
+        if move_to_device:
+            dev = _choose_device(device)
+            _move_module_to_device(model, dev, torch_dtype)
 
         model.config.update({"nemo_version": __version__})
         return model
