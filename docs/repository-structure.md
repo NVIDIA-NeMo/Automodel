@@ -49,8 +49,8 @@ $ tree -L 1 nemo_automodel/components/
 - Unit tests are colocated with the component they cover.
 
 ### Recipes Directory
-Recipes define **end-to-end workflows** (data → training → eval) for a variety of tasks, such as,
-training, fine-tuning, knowledge distillation, and combining components into usable pipelines.
+Recipes define **end-to-end workflows** (data and model loading → training with custom loop → saving the output checkpoint)
+for a variety of tasks, such as, training, fine-tuning, knowledge distillation, and combining components into usable pipelines.
 
 #### Available Recipes
 The following directory listing shows all components along with explanations of their contents.
