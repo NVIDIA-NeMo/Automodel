@@ -84,7 +84,7 @@ FROM automodel_dep as automodel_final
 
 # Install Automodel
 ARG BASE_IMAGE=cuda
-ARG AUTOMODEL_INSTALL=dev
+ARG AUTOMODEL_INSTALL=vlm
 COPY . /opt/Automodel
 RUN cd /opt/Automodel && \
     if [ "$BASE_IMAGE" = "pytorch" ]; then \

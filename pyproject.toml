@@ -112,10 +112,6 @@ moe = [
     # "flash-attn==2.7.4.post1",
     # "grouped_gemm",
 ]
-all = [
-    "nemo_automodel[fa]",
-    "nemo_automodel[vlm]",
-]
 
 [project.urls]
 Homepage = "https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/stable/"
