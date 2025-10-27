@@ -1,10 +1,31 @@
 # Run on Your Local Workstation
 
-NeMo AutoModel supports various methods for launching jobs, allowing you to choose the approach that best fits your workflow and development needs. For setup details, refer to our [Installation Guide](../guides/installation.md).
+NeMo AutoModel supports running training/finetuning job from a single node with a single GPU to multiple multi-GPU nodes.
+Use this guide for local, single-node workflows. For setup details, refer to our [Installation Guide](../guides/installation.md).
+For executing distributed multi-node jobs, please refer to our [Run on a Cluster](./cluster.md) guide.
 
-## Run with Automodel CLI
+NeMo Automodel uses recipes to run end-to-end workflows. If you're new to recipes, see the [Repository Structure](../repository-structure.md) guide.
 
-The AutoModel CLI is the preferred method for most users. It offers a unified interface to launch training jobs locally or across distributed systems such as Slurm clusters, without requiring deep knowledge of the underlying infrastructure.
+## Quick start: Choose your job launch option
+
+- **CLI (recommended)**
+  ```bash
+  automodel finetune llm -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+  ```
+
+- **Direct recipe script**
+  - Single GPU
+    ```bash
+    python nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+    ```
+  - Multi-GPU (single node)
+    ```bash
+    torchrun --nproc-per-node=2 nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+    ```
+
+## Run with Automodel CLI (Single Node)
+
+The AutoModel CLI is the preferred method for most users. It offers a unified interface to launch training jobs on your workstation without requiring deep knowledge of the underlying distributed setup.
 
 ### Basic Usage
 
@@ -26,10 +47,10 @@ For simple fine-tuning on a single GPU:
 automodel finetune llm -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
-### Train on Multiple GPUs
+### Train on Multiple GPUs (Single Node)
 
 For interactive single-node jobs, the CLI automatically detects the number of available GPUs and
-uses `torchrun` for multi-GPU training. You can specify manually the number of GPUs using the `--nproc-per-node` option, as follows:
+uses `torchrun` for multi-GPU training. You can manually specify the number of GPUs using the `--nproc-per-node` option:
 
 ```bash
 automodel finetune llm -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node=2
@@ -37,53 +58,7 @@ automodel finetune llm -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml 
 
 If you don't specify `--nproc-per-node`, it will use all available GPUs on your system.
 
-### Submit a Batch Job with Slurm
-
-For distributed training on Slurm clusters, add a `slurm` section to your YAML configuration:
-
-```yaml
-# Your existing model, dataset, training config...
-step_scheduler:
-  grad_acc_steps: 4
-  num_epochs: 1
-
-model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
-
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
-  split: train
-
-# Add Slurm configuration
-slurm:
-  job_name: llm-finetune
-  nodes: 1
-  ntasks_per_node: 8
-  time: 00:30:00
-  account: your_account
-  partition: gpu
-  container_image: nvcr.io/nvidia/nemo:25.07
-  gpus_per_node: 8 # This adds "#SBATCH --gpus-per-node=8" to the script
-  # Optional: Add extra mount points if needed
-  extra_mounts:
-    - /lustre:/lustre
-  # Optional: Specify custom HF_HOME location (will auto-create if not specified)
-  hf_home: /path/to/your/HF_HOME
-  # Optional : Specify custom env vars
-  # env_vars:
-  #   ENV_VAR: value
-  # Optional: Specify custom job directory (defaults to cwd/slurm_jobs)
-  # job_dir: /path/to/slurm/jobs  
-```
-
-Then submit the job:
-```bash
-automodel finetune llm -c your_config_with_slurm.yaml
-```
-
-The CLI will automatically submit the job to Slurm and handle the distributed setup.
+Looking for Slurm or multi-node? See [Run on a Cluster](./cluster.md).
 
 ## Run with uv (Development Mode)
 
@@ -95,9 +70,9 @@ When you need more control over the environment or are actively developing with 
 uv run nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
-### Train on Multiple GPUs with Torchrun
+### Train on Multiple GPUs with Torchrun (Single Node)
 
-For multi-GPU training, use `torchrun` directly:
+For multi-GPU single-node training, use `torchrun` directly:
 
 ```bash
 uv run torchrun --nproc-per-node=2 nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
@@ -123,7 +98,7 @@ If you have NeMo Automodel installed in your environment and prefer to run recip
 python nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
-### Train on Multiple GPUs
+### Train on Multiple GPUs (Single Node)
 
 ```bash
 torchrun --nproc-per-node=2 nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
@@ -149,7 +124,7 @@ For example, if you want to fine-tune `Qwen/Qwen3-0.6B` instead of `meta-llama/L
 
 **Use the Automodel CLI when:**
 - You want a simple, unified interface
-- You are running on production clusters (Slurm)
+- You are running locally on a single machine
 - You don't need to modify the underlying code
 - You prefer a higher-level abstraction
 
@@ -166,4 +141,4 @@ For example, if you want to fine-tune `Qwen/Qwen3-0.6B` instead of `meta-llama/L
 - You're working in environments where uv is not available
 - You're integrating with existing PyTorch workflows
 
-All approaches use the same configuration files and provide the same training capabilities - choose based on your workflow preferences and requirements.
+All approaches use the same configuration files and provide the same training capabilities on a single node. For Slurm-based multi-node training, see [Run on a Cluster](./cluster.md).
