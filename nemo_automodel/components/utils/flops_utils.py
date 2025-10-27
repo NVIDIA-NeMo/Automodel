@@ -715,6 +715,90 @@ def gpt_oss_flops(config, gbs=1, seq_len=None):
     )
 
 
+def glm4_moe_flops(config, gbs=1, seq_len=None):
+    if seq_len is None:
+        seq_len = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 2048
+
+    layers = config.num_hidden_layers
+    hs = config.hidden_size
+    attention_heads = config.num_attention_heads
+    query_groups = config.num_key_value_heads if hasattr(config, "num_key_value_heads") else attention_heads
+    vocab_size = config.vocab_size
+
+    # GLM4 MoE attention config
+    head_dim = getattr(config, "head_dim", hs // attention_heads)
+    query_projection_to_hidden_size_ratio = (head_dim * attention_heads) / hs
+
+    # MoE config
+    ffn_hs = config.intermediate_size  # for dense layers
+    moe_intermediate_size = config.moe_intermediate_size if hasattr(config, "moe_intermediate_size") else ffn_hs
+    moe_router_topk = config.num_experts_per_tok if hasattr(config, "num_experts_per_tok") else 1
+    n_shared_experts = config.n_shared_experts if hasattr(config, "n_shared_experts") else 0
+    first_k_dense_replace = config.first_k_dense_replace if hasattr(config, "first_k_dense_replace") else 0
+
+    causal_self_attn = True
+    hidden_size = hs
+    gated_linear_multiplier = 2  # SwiGLU
+
+    # Attention flops for GQA (Qwen3-style)
+    attention_flops = (
+        3
+        * 2
+        * gbs
+        * layers
+        * seq_len
+        * hidden_size
+        * hidden_size
+        * query_projection_to_hidden_size_ratio
+        * (
+            (query_groups / attention_heads * 2 + 1)  # QKV gemm
+            + (seq_len / hidden_size * 2 * (0.5 if causal_self_attn else 1))  # attention
+            + 1  # attention proj gemm
+        )
+    )
+
+    # MLP flops (DeepSeek V3-style MoE)
+    # Dense layers: first_k_dense_replace layers
+    dense_mlp_flops = (
+        3 * 2 * gbs * first_k_dense_replace * seq_len * hidden_size * (1 + gated_linear_multiplier) * ffn_hs
+    )
+
+    # MoE layers: (layers - first_k_dense_replace) layers
+    # Each MoE layer has: shared experts + routed experts (topk selected)
+    num_moe_layers = layers - first_k_dense_replace
+
+    # Shared expert flops (always computed)
+    shared_expert_flops = (
+        3
+        * 2
+        * gbs
+        * num_moe_layers
+        * seq_len
+        * hidden_size
+        * (1 + gated_linear_multiplier)
+        * (moe_intermediate_size * n_shared_experts)
+    )
+
+    # Routed expert flops (topk selected)
+    routed_expert_flops = (
+        3
+        * 2
+        * gbs
+        * num_moe_layers
+        * seq_len
+        * hidden_size
+        * (1 + gated_linear_multiplier)
+        * (moe_intermediate_size * moe_router_topk)
+    )
+
+    mlp_flops = dense_mlp_flops + shared_expert_flops + routed_expert_flops
+
+    # Vocab flops
+    vocab_flops = 3 * 2 * gbs * seq_len * hidden_size * vocab_size
+
+    return attention_flops + mlp_flops + vocab_flops
+
+
 def get_flops_formula_for_hf_config(config: Any) -> Optional[Callable]:
     """
     Get the appropriate FLOPs formula function for a given HuggingFace config.
@@ -752,6 +836,8 @@ def get_flops_formula_for_hf_config(config: Any) -> Optional[Callable]:
         "DeepseekV3Config": deepseekv3_flops,
         # GPT-OSS
         "GptOssConfig": gpt_oss_flops,
+        # GLM4 MoE
+        "Glm4MoeConfig": glm4_moe_flops,
         # T5 family (encoder-decoder)
         "T5Config": transformer_flops,
         "MT5Config": transformer_flops,
