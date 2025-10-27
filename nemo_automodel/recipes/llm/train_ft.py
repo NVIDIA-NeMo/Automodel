@@ -182,6 +182,32 @@ def build_model_and_optimizer(
 
             kwargs["quantization_config"] = create_bnb_config(cfg_quantization)
 
+        # Optionally pass internal parallel scheme for HF models (non-pipeline) to let the model self-parallelize
+        used_internal_parallel = False
+        if (
+            is_hf_model
+            and autopipeline is None
+            and get_world_size_safe() > 1
+            and not isinstance(model_wrapper, MegatronFSDPManager)
+        ):
+            internal_scheme = {
+                "tp_size": int(tp_size) if tp_size is not None else 1,
+                "cp_size": int(cp_size) if cp_size is not None else 1,
+                "pp_size": 1,
+            }
+            try:
+                world_size = get_world_size_safe()
+                denom = max(1, internal_scheme["tp_size"] * internal_scheme["cp_size"])
+                if world_size > 1 and world_size % denom == 0:
+                    internal_scheme["dp_size"] = world_size // denom
+            except Exception:
+                pass
+            internal_scheme["backend"] = "nccl" if torch.cuda.is_available() else "gloo"
+            kwargs["distributed"] = internal_scheme
+            if getattr(model_wrapper, "device_mesh", None) is not None:
+                kwargs["device_mesh"] = model_wrapper.device_mesh
+            used_internal_parallel = True
+
         # Instantiate the model in meta device to avoid OOM
         with init_ctx:
             model = cfg_model.instantiate(**kwargs)
@@ -273,7 +299,7 @@ def build_model_and_optimizer(
             model = autopipeline
     else:
         load_weights = False
-        if parallelize_fn is not None and get_world_size_safe() > 1:
+        if not (is_hf_model and autopipeline is None and get_world_size_safe() > 1 and 'distributed' in kwargs) and parallelize_fn is not None and get_world_size_safe() > 1:
             parallelize_fn(
                 model,
                 world_mesh=model_wrapper.device_mesh,
@@ -291,7 +317,7 @@ def build_model_and_optimizer(
                 ep_shard_axis_names=("ep_shard",),
             )
             load_weights = True
-        elif callable(getattr(model_wrapper, "parallelize", None)):
+        elif not (is_hf_model and autopipeline is None and get_world_size_safe() > 1 and 'distributed' in kwargs) and callable(getattr(model_wrapper, "parallelize", None)):
             # FSDP2 and MegatronFSDP should already be on the correct device
             if isinstance(model_wrapper, MegatronFSDPManager):
                 # MegatronFSDP instantiate optimizer inside parallelize_function
