@@ -32,32 +32,7 @@ is executed without any other input from the user (e.g., no keyboard input), whi
     ```
   - Note: For multi-node, prefer the CLI with `slurm` configuration.
 
-## Run with Automodel CLI (Slurm)
-
-The AutoModel CLI is the preferred method for most users. It provides a unified interface to submit Slurm batch jobs without deep knowledge of cluster specifics.
-
-### Basic Usage
-
-The CLI follows this format:
-```bash
-automodel <command> <domain> -c <config_file> [options]
-```
-
-Where:
-- `<command>`: The operation to perform (`finetune`)
-- `<domain>`: The model domain (`llm` or `vlm`)
-- `<config_file>`: Path to your YAML configuration file
-
-For workstation single-node instructions, see [Run on Your Local Workstation](./local-workstation.md).
-
-### Example: Run the LLM Fine-Tuning Recipe
-
-For a quick CLI example using two GPUs on a single node:
-```bash
-automodel finetune llm -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node=2
-```
-
-### Submit a Batch Job with Slurm
+## Submit a Batch Job with Slurm
 
 For distributed training on Slurm clusters, add a `slurm` section to your YAML configuration:
 
@@ -103,27 +78,20 @@ Then submit the job:
 automodel finetune llm -c your_config_with_slurm.yaml
 ```
 
+The AutoModel CLI is the preferred method for most users. It provides a unified interface to submit Slurm batch jobs without deep knowledge of cluster specifics.
 The CLI will automatically submit the job to Slurm and handle the distributed setup.
+The above example launches one node with eight workers per node inside torchrun (`--nproc_per_node=8`).
+The Slurm script itself uses `#SBATCH --ntasks-per-node 1`, and when `gpus_per_node` is set, it adds `#SBATCH --gpus-per-node=8` as well.
 
-### Alternate Slurm YAML Example
-
-Here is an alternative, minimal `slurm` configuration with additional notes:
-
-```yaml
-slurm:
-  job_name: llm-finetune  # if no job_name is provided will use {domain}_{command} from invocation
-  nodes: 1
-  ntasks_per_node: 8
-  time: 00:05:00
-  account: coreai_dlalgo_llm
-  partition: batch
-  container_image: nvcr.io/nvidia/nemo:dev # can also use path to sqsh, e.g.: /foo/bar/image.sqsh
-  gpus_per_node: 8
-  extra_mounts:
-    - /a/b/c:/d/e
+The CLI follows this format:
+```bash
+automodel <command> <domain> -c <config_file> [options]
 ```
 
-This launches one node with eight workers per node inside torchrun (`--nproc_per_node=8`). The Slurm script itself uses `#SBATCH --ntasks-per-node 1`, and when `gpus_per_node` is set, it adds `#SBATCH --gpus-per-node=8` as well.
+Where:
+- `<command>`: The operation to perform (`finetune`)
+- `<domain>`: The model domain (`llm` or `vlm`)
+- `<config_file>`: Path to your YAML configuration file
 
 ### Launch a Batch Job on Slurm with Modified Code
 
@@ -138,7 +106,7 @@ automodel finetune llm -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml 
 
 This will launch the job using the source code in the `automodel_test_repo` directory instead of the version bundled in the Docker image.
 
-### Standalone Slurm Script (advanced)
+## Standalone Slurm Script (advanced)
 
 If you prefer to submit with your own Slurm script, here is a standalone bash script adapted from the Automodel launcher template. See the upstream template for the authoritative reference: [Automodel Slurm template](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/launcher/slurm/template.py).
 
