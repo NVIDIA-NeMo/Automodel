@@ -165,6 +165,8 @@ class ColumnMappedTextInstructionDataset(Dataset):
         name: Optional[str] = None,
         answer_only_loss_mask: bool = True,
         seq_length: Optional[int] = None,
+        padding: Union[str, bool] = None,
+        truncation: Union[str, bool] = None,
         start_of_turn_token: Optional[str] = None,
         limit_dataset_samples: Optional[int] = None,
     ) -> None:
@@ -226,6 +228,8 @@ class ColumnMappedTextInstructionDataset(Dataset):
         self.answer_only_loss_mask = answer_only_loss_mask
         self.start_of_turn_token = start_of_turn_token
         self.seq_length = seq_length
+        self.padding = padding
+        self.truncation = truncation
 
     def __len__(self) -> int:  # noqa: D401
         """
@@ -293,6 +297,8 @@ class ColumnMappedTextInstructionDataset(Dataset):
                 eos_token_id,
                 pad_token_id,
                 seq_length=self.seq_length,
+                padding=self.padding,
+                truncation=self.truncation,
             )
         else:
             prompt = " ".join(filter(lambda x: x is not None, (context, question, "")))
@@ -304,5 +310,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
                 eos_token_id,
                 pad_token_id,
                 seq_length=self.seq_length,
+                padding=self.padding,
+                truncation=self.truncation,
                 answer_only_loss_mask=self.answer_only_loss_mask,
             )
