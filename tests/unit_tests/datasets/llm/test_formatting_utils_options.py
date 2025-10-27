@@ -39,7 +39,7 @@ def test_format_prompt_completion_options(seq_length, padding, truncation):
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["HF_HUB_OFFLINE"] = "1"
 
-    tok = AutoTokenizer.from_pretrained("/home/TestData/automodel/hf_mixtral_2l//")
+    tok = AutoTokenizer.from_pretrained("/home/TestData/automodel/hf_mixtral_2l")
     # Only applicable when tokenizer lacks chat template
     assert getattr(tok, "chat_template", None) is None
 
@@ -120,7 +120,7 @@ def test_format_chat_template_options(seq_length, padding, truncation):
     os.environ["HF_HUB_OFFLINE"] = "1"
 
 
-    tok = AutoTokenizer.from_pretrained("/home/TestData/automodel/qwen3_4b_instruct_2407/")
+    tok = AutoTokenizer.from_pretrained("/home/TestData/automodel/qwen3_4b_instruct_2407")
     # Only applicable when tokenizer DOES define a chat template
     if not getattr(tok, "chat_template", None):
         pytest.skip(f"Tokenizer qwen3_4b_instruct_2407 has no chat_template; skipping chat-template tests.")
