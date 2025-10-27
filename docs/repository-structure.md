@@ -66,12 +66,12 @@ $ tree -L 2 nemo_automodel/recipes/
 
 #### Run a Recipe
 
-Each recipe script can be executed directly using torchrun, for example, from the root directory:
+Each recipe script can be executed directly using `torchrun`, for example, from the root directory:
 ```bash
 torchrun --nproc-per-node=2 nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
-The above command will fine-tune the Llama3.2-1B model on the SQuaD dataset with two GPUs.
+The above command will fine-tune the Llama3.2-1B model on the SQuaD dataset with two GPUs using the [`llama3_2_1b_squad.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/824408f007c42e11471a1f9e1c975b570514d2a8/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) config
 If you want to execute on a single GPU replace `torchrun --nproc-per-node` with `python3`:
 ```bash
 python3 nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
@@ -113,9 +113,5 @@ single-GPU interactive sessions to batch multi-node runs. Currently, it supports
 ## Next steps
 
 Learn how to train models with NeMo AutoModel on:
-- **Your local workstation**: See `docs/launcher/local-workstation.md` or open [Run on Your Local Workstation](./launcher/local-workstation.md).
-- **A cluster**: See `docs/launcher/cluster.md` or open [Run on a Cluster](./launcher/cluster.md).
-
-Feel free to explore our guides:
 - **Your local workstation**: See [`docs/launcher/local-workstation.md`](launcher/local-workstation.md).
 - **A cluster**: See [`docs/launcher/cluster.md`](docs/launcher/cluster.md).
