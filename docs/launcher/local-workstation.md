@@ -4,6 +4,8 @@ NeMo AutoModel supports running training/finetuning job from a single node with 
 Use this guide for local, single-node workflows. For setup details, refer to our [Installation Guide](../guides/installation.md).
 For executing distributed multi-node jobs, please refer to our [Run on a Cluster](./cluster.md) guide.
 
+NeMo Automodel uses recipes to run end-to-end workflows. If you're new to recipes, see the [Repository Structure](../repository-structure.md) guide.
+
 ## Quick start: Choose your job launch option
 
 - **CLI (recommended)**
