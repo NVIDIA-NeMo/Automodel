@@ -220,20 +220,13 @@ For example, if you want to fine-tune `Qwen/Qwen3-0.6B` instead of `meta-llama/L
 **Use the Automodel CLI when:**
 - You want a simple, unified interface
 - You are submitting jobs to production clusters (Slurm)
-- You don't need to modify the underlying code
-- You prefer a higher-level abstraction
 
 **Use uv when:**
 - You're developing or debugging the codebase
 - You want automatic dependency management
-- You need maximum control over the execution
-- You want to avoid manual environment setup
-- You're experimenting with custom modifications
 
 **Use Torchrun when:**
 - You have a stable, pre-configured environment
 - You prefer explicit control over Python execution
-- You're working in environments where uv is not available
-- You're integrating with existing PyTorch workflows
 
-All approaches use the same configuration files. For single-node workflows, see [Run on Your Local Workstation](./local-workstation.md).
+All approaches use the same configuration files. For single-node workflows, see our [Run on Your Local Workstation](./local-workstation.md) guide.
