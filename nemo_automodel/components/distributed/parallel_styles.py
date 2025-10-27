@@ -42,6 +42,12 @@ class ColwiseParallelLora(ColwiseParallel):
         # colwise shard weight/bias to Shard(0), weight be Shard(0)
         # means Colwise as Linear is input * weight^T + bias, where
         # weight would become Shard(1)
+        # 
+        # For LoRA: Enable all-gather between lora_A and lora_B to ensure
+        # correct output placement (Replicate) for LoRA pathway
+        if hasattr(module, 'lora_allgather_intermediate'):
+            module.lora_allgather_intermediate = True
+        
         def _get_module_and_name(module, name):
             if name.endswith("lora_A.weight"):
                 assert hasattr(module, "lora_A"), f"lora_A not found in {module}"
@@ -60,7 +66,6 @@ class ColwiseParallelLora(ColwiseParallel):
         # colwise shard embedding.weight is straight forward as Shard(1)
         for name, param in module.named_parameters():
             _distribute_param(module, name, device_mesh, self.src_data_rank, [Shard(1)])
-
 
 class RowwiseParallelLora(RowwiseParallel):
     def _partition_linear_fn(self, name, module, device_mesh):
