@@ -1623,24 +1623,6 @@ all = [
     { name = "numba" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.3.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "nvidia-nvshmem-cu13" },
-    { name = "pillow" },
-    { name = "qwen-vl-utils", extra = ["decord"], marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
-    { name = "timm" },
-    { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
-    { name = "torchvision", marker = "sys_platform == 'never'" },
-    { name = "transformers" },
-]
-deepep = [
-    { name = "nvidia-nvshmem-cu13" },
-]
-dev = [
-    { name = "backoff" },
-    { name = "flash-attn", marker = "sys_platform == 'never'" },
-    { name = "mistral-common", extra = ["opencv"] },
-    { name = "numba" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.3.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pillow" },
     { name = "qwen-vl-utils", extra = ["decord"], marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "timm" },
@@ -1709,14 +1691,10 @@ requires-dist = [
     { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", specifier = ">=0.5.9" },
     { name = "megatron-fsdp" },
     { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'" },
-    { name = "nemo-automodel", extras = ["deepep"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["fa"], marker = "extra == 'all'" },
-    { name = "nemo-automodel", extras = ["fa"], marker = "extra == 'dev'" },
     { name = "nemo-automodel", extras = ["vlm"], marker = "extra == 'all'" },
-    { name = "nemo-automodel", extras = ["vlm"], marker = "extra == 'dev'" },
     { name = "numba", marker = "extra == 'vlm'" },
     { name = "numpy", marker = "extra == 'vlm'" },
-    { name = "nvidia-nvshmem-cu13", marker = "extra == 'deepep'" },
     { name = "opencv-python-headless", specifier = "==4.10.0.84" },
     { name = "pillow", marker = "extra == 'vlm'" },
     { name = "pybind11" },
@@ -1734,7 +1712,7 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'vlm'", specifier = "<=4.57.1" },
     { name = "wandb" },
 ]
-provides-extras = ["vlm", "fa", "moe", "deepep", "dev", "all"]
+provides-extras = ["vlm", "fa", "moe", "all"]
 
 [package.metadata.requires-dev]
 build = [
@@ -2071,15 +2049,6 @@ source = { registry = "https://pypi.org/simple" }
 name = "nvidia-nvjitlink-cu12"
 version = "12.8.93"
 source = { registry = "https://pypi.org/simple" }
-
-[[package]]
-name = "nvidia-nvshmem-cu13"
-version = "3.4.5"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/dc/0f/05cc9c720236dcd2db9c1ab97fff629e96821be2e63103569da0c9b72f19/nvidia_nvshmem_cu13-3.4.5-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:6dc2a197f38e5d0376ad52cd1a2a3617d3cdc150fd5966f4aee9bcebb1d68fe9", size = 60215947, upload-time = "2025-09-06T00:32:20.022Z" },
-    { url = "https://files.pythonhosted.org/packages/3c/35/a9bf80a609e74e3b000fef598933235c908fcefcef9026042b8e6dfde2a9/nvidia_nvshmem_cu13-3.4.5-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:290f0a2ee94c9f3687a02502f3b9299a9f9fe826e6d0287ee18482e78d495b80", size = 60412546, upload-time = "2025-09-06T00:32:41.564Z" },
-]
 
 [[package]]
 name = "nvidia-sphinx-theme"
