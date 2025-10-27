@@ -46,16 +46,23 @@ def _as_iter(val: Union[str, Sequence[str]]) -> Iterator[str]:
             yield x
 
 
-def _load_openai_messages(path_or_dataset_id: Union[str, Sequence[str]], split: Optional[str] = None):
+def _load_openai_messages(
+    path_or_dataset_id: Union[str, Sequence[str]], split: Optional[str] = None, name: Optional[str] = None
+):
     """Load OpenAI chat messages datasets from HF or local JSON/JSONL files.
 
     For HF repo IDs, we delegate to datasets.load_dataset.
     For local files, we manually parse JSONL/JSON to avoid pyarrow type
     inference issues (e.g., heterogeneous field types under `tools`).
+
+    Args:
+        path_or_dataset_id: HF dataset ID or local file path(s).
+        split: Dataset split to load (e.g., "train", "validation").
+        name: Dataset configuration/subset name
     """
     if isinstance(path_or_dataset_id, str) and _is_hf_repo_id(path_or_dataset_id):
         return load_dataset(
-            path_or_dataset_id, split=split, streaming=False, verification_mode=VerificationMode.NO_CHECKS
+            path_or_dataset_id, name=name, split=split, streaming=False, verification_mode=VerificationMode.NO_CHECKS
         )
 
     files = list(_as_iter(path_or_dataset_id))
@@ -109,7 +116,7 @@ def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return norm
 
 
-class ToolCallingChatDataset(Dataset):
+class ChatDataset(Dataset):
     """Dataset for OpenAI-format tool-calling chat transcripts.
 
     This class expects each row to contain a `messages` list in OpenAI chat format,
@@ -124,6 +131,7 @@ class ToolCallingChatDataset(Dataset):
         tokenizer,
         *,
         split: Optional[str] = None,
+        name: Optional[str] = None,
         seq_length: Optional[int] = None,
         start_of_turn_token: Optional[str] = None,
         chat_template: Optional[str] = None,
@@ -137,13 +145,13 @@ class ToolCallingChatDataset(Dataset):
             tokenizer.chat_template = chat_template
 
         if not _has_chat_template(tokenizer):
-            raise ValueError("ToolCallingChatDataset requires a tokenizer with chat template support.")
+            raise ValueError("ChatDataset requires a tokenizer with chat template support.")
 
         self.tokenizer = tokenizer
         self.seq_length = seq_length
         self.start_of_turn_token = start_of_turn_token
 
-        self.dataset = _load_openai_messages(path_or_dataset_id, split=split)
+        self.dataset = _load_openai_messages(path_or_dataset_id, split=split, name=name)
 
         # Ensure pad token presence for downstream padding
         eos_token_id = getattr(self.tokenizer, "eos_token_id", 0)
@@ -170,7 +178,6 @@ class ToolCallingChatDataset(Dataset):
             eos_token_id,
             self.pad_token_id,
             seq_length=self.seq_length,
-            start_of_turn_token=self.start_of_turn_token,
             tools=tools,
         )
         return sample

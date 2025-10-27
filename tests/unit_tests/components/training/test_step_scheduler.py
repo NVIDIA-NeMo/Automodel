@@ -248,3 +248,54 @@ def test_ckpt_every_steps_larger_than_max_steps(max_steps, ckpt_every_steps, epo
 )
 def test_calculate_max_steps(num_epochs, epoch_len, expected_max_steps):
     assert _calculate_max_steps(num_epochs, epoch_len) == expected_max_steps
+
+@pytest.mark.parametrize(
+    "dataloader, is_iterable",
+    [
+        (SizedDataLoader(num_batches=10), False),
+        (IterableDataLoader(num_batches=10), True),
+    ],
+)
+def test_ckpt_every_steps_is_none(dataloader, is_iterable):
+    scheduler = StepScheduler(
+        global_batch_size=1,
+        local_batch_size=1,
+        dp_size=1,
+        ckpt_every_steps=None,
+        dataloader=dataloader,
+        num_epochs=1,
+        max_steps=10,
+    )
+    if is_iterable:
+        assert scheduler.epoch_len is None
+        assert scheduler.ckpt_every_steps is 10 // 2
+    else:
+        assert scheduler.epoch_len is 10
+        assert scheduler.ckpt_every_steps is 10
+
+def test_iterable_dataloader():
+    dataloader = IterableDataLoader(num_batches=10)
+    scheduler = StepScheduler(
+        global_batch_size=1,
+        local_batch_size=1,
+        dp_size=1,
+        ckpt_every_steps=1000,
+        dataloader=dataloader,
+        num_epochs=1,
+        max_steps=10,
+    )
+    assert scheduler.epoch_len is None
+
+def test_set_epoch():
+    dataloader = SizedDataLoader(num_batches=10)
+    scheduler = StepScheduler(
+        global_batch_size=1,
+        local_batch_size=1,
+        dp_size=1,
+        ckpt_every_steps=1000,
+        dataloader=dataloader,
+        num_epochs=1,
+        max_steps=10,
+    )
+    scheduler.set_epoch(2)
+    assert scheduler.epoch == 2

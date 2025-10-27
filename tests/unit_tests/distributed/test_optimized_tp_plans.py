@@ -45,7 +45,7 @@ from transformers.models.gemma3.modeling_gemma3 import (
 )
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
-from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
+from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
 
 class MockModel:
@@ -56,6 +56,7 @@ class MockModel:
             "llama": LlamaForCausalLM,
             "qwen2": Qwen2ForCausalLM,
             "qwen3": Qwen3ForCausalLM,
+            "qwen3_seq_cls": Qwen3ForSequenceClassification,
             "gemma3_causal": Gemma3ForCausalLM,
             "gemma3_conditional": Gemma3ForConditionalGeneration,
         }[model_type]
@@ -403,6 +404,7 @@ class TestParallelizeFunctionsMapping:
         expected_types = [
             Qwen2ForCausalLM,
             Qwen3ForCausalLM,
+            Qwen3ForSequenceClassification,
             LlamaForCausalLM,
             Gemma3ForCausalLM,
             Gemma3ForConditionalGeneration,
@@ -422,6 +424,9 @@ class TestParallelizeFunctionsMapping:
             # Create a mock model of the appropriate type
             mock_model = Mock()
             mock_model.__class__ = model_type
+            # @akoumparouli: explicitly deleting the lm_head because the parallelizer asserts on it
+            if model_type == Qwen3ForSequenceClassification:
+                del mock_model.lm_head
             mock_model.config = SimpleNamespace(tie_word_embeddings=False)
 
             result = func(mock_model, sequence_parallel=False)

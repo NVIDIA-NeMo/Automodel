@@ -81,10 +81,15 @@ def _str_is_hf_repo_id(val: str) -> bool:
     Returns:
         True if the string is a valid huggingface dataset id, False otherwise.
     """
-    return re.match(r"^[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+$", val) is not None and not Path(val).exists()
+    return re.match(r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$", val) is not None and not Path(val).exists()
 
 
-def _load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str] = None, streaming: bool = False):
+def _load_dataset(
+    path_or_dataset_id: Union[str, List[str]],
+    split: Optional[str] = None,
+    streaming: bool = False,
+    name: Optional[str] = None,
+):
     """Load a dataset either from the Hugging Face Hub or from local JSON/JSONL files.
 
     If *path_or_dataset_id* resembles a HF repo ID (i.e. of the form
@@ -99,13 +104,19 @@ def _load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str
         split: Optional split to load when retrieving a remote dataset. This
             parameter is ignored for local files as the *json* script always
             returns a single split.
+        streaming: Whether to stream the dataset.
+        name: Optional name of the dataset configuration/subset to load
 
     Returns:
         datasets.Dataset: The loaded dataset.
     """
     if isinstance(path_or_dataset_id, str) and _str_is_hf_repo_id(path_or_dataset_id):
         return load_dataset(
-            path_or_dataset_id, split=split, streaming=streaming, verification_mode=VerificationMode.NO_CHECKS
+            path_or_dataset_id,
+            name=name,
+            split=split,
+            streaming=streaming,
+            verification_mode=VerificationMode.NO_CHECKS,
         )
 
     data_files = list(make_iterable(path_or_dataset_id))
@@ -151,6 +162,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
         tokenizer,
         *,
         split: Optional[str] = None,
+        name: Optional[str] = None,
         answer_only_loss_mask: bool = True,
         seq_length: Optional[int] = None,
         start_of_turn_token: Optional[str] = None,
@@ -164,6 +176,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
             column_mapping: The mapping of the columns.
             tokenizer: The tokenizer to use.
             split: The split of the dataset to load.
+            name: The name of the dataset configuration/subset to load
             answer_only_loss_mask: Whether to compute the loss mask only on the answer tokens.
             seq_length: The sequence length to use for padding.
             start_of_turn_token: The token to use to indicate the start of a turn.
@@ -181,7 +194,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
         assert tokenizer is not None, "Tokenizer is required"
         self.tokenizer = tokenizer
 
-        self.dataset = _load_dataset(path_or_dataset_id, split=split, streaming=False)
+        self.dataset = _load_dataset(path_or_dataset_id, split=split, streaming=False, name=name)
 
         if limit_dataset_samples is not None:
             self.dataset = self.dataset.select(range(limit_dataset_samples))
@@ -280,7 +293,6 @@ class ColumnMappedTextInstructionDataset(Dataset):
                 eos_token_id,
                 pad_token_id,
                 seq_length=self.seq_length,
-                start_of_turn_token=self.start_of_turn_token,
             )
         else:
             prompt = " ".join(filter(lambda x: x is not None, (context, question, "")))
