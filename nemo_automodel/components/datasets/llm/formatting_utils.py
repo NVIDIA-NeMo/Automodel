@@ -66,7 +66,7 @@ def _package_tokenized_example(
     eos_token_id,
     pad_token_id,
     seq_length,
-    truncation = None,
+    truncation=None,
 ):
     """
     Package a tokenized example with proper masking and padding.
