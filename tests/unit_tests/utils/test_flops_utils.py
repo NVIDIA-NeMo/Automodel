@@ -149,6 +149,23 @@ def _gpt_oss_cfg() -> SimpleNamespace:
     )
 
 
+def _glm4_moe_cfg() -> SimpleNamespace:
+    return SimpleNamespace(
+        hidden_size=4096,
+        num_hidden_layers=46,
+        num_attention_heads=96,
+        num_key_value_heads=8,
+        intermediate_size=10944,
+        vocab_size=151552,
+        moe_intermediate_size=1408,
+        num_experts_per_tok=8,
+        n_shared_experts=1,
+        n_routed_experts=128,
+        first_k_dense_replace=1,
+        max_position_embeddings=131072,
+    )
+
+
 @pytest.mark.parametrize(
     "name, func, cfg_factory, kwargs, expected",
     [
@@ -161,6 +178,7 @@ def _gpt_oss_cfg() -> SimpleNamespace:
         ("bert", flops_utils.bert_flops, _bert_cfg, dict(gbs=1, seq_len=512), 361920724992),
         ("transformer", flops_utils.transformer_flops, _transformer_cfg, dict(gbs=1, seq_len=1024), 8363320541184),
         ("gpt_oss", flops_utils.gpt_oss_flops, _gpt_oss_cfg, dict(gbs=1, seq_len=1024), 7356800827392),
+        ("glm4_moe", flops_utils.glm4_moe_flops, _glm4_moe_cfg, dict(gbs=1, seq_len=2048), 120277337899008),
         ("deepseekv3_moonlight", flops_utils.deepseekv3_flops, _moonlight_16b_config, dict(gbs=1, seq_len=2048), 30625801175040),
         ("deepseekv3_dsv3", flops_utils.deepseekv3_flops, _deepseek_v3_config, dict(gbs=1, seq_len=1024), 233225179889664),
     ],

@@ -773,7 +773,7 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         layers.extend(_reduce_attrs(model, MODEL_CLS_TO_LAYERS[model_cls]))
     elif model_cls.__name__ in MODEL_CLS_TO_LAYERS:
         layers.extend(_reduce_attrs(model, MODEL_CLS_TO_LAYERS[model_cls.__name__]))
-    elif hasattr(model, "model"):
+    elif hasattr(model, "model") and hasattr(model.model, "layers"):
         # Default case for all other models (assumed to be a causal LM)
         if isinstance(model.model.layers, nn.ModuleDict):
             layers.extend(model.model.layers.values())
