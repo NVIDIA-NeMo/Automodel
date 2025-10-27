@@ -114,4 +114,4 @@ single-GPU interactive sessions to batch multi-node runs. Currently, it supports
 
 Learn how to train models with NeMo AutoModel on:
 - **Your local workstation**: See [`docs/launcher/local-workstation.md`](launcher/local-workstation.md).
-- **A cluster**: See [`docs/launcher/cluster.md`](docs/launcher/cluster.md).
+- **A cluster**: See [`docs/launcher/cluster.md`](launcher/cluster.md).
