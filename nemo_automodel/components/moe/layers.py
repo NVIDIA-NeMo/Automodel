@@ -610,9 +610,7 @@ class Gate(nn.Module):
             self.bias = None
 
         if self.bias_update_factor > 0:
-            self.e_score_correction_bias = nn.Parameter(
-                torch.empty(config.n_routed_experts, dtype=config.dtype), requires_grad=False
-            )
+            self.register_buffer("e_score_correction_bias", torch.zeros((self.n_experts), dtype=config.dtype))
         else:
             self.e_score_correction_bias = None
 
