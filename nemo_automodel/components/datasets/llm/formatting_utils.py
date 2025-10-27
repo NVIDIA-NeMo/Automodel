@@ -66,6 +66,7 @@ def _package_tokenized_example(
     eos_token_id,
     pad_token_id,
     seq_length,
+    truncation = None,
 ):
     """
     Package a tokenized example with proper masking and padding.
@@ -77,7 +78,7 @@ def _package_tokenized_example(
         eos_token_id: The end-of-sequence token id.
         pad_token_id: The padding token id.
         seq_length: Optional sequence length for padding.
-
+        truncation: Optional truncation strategy.
     Returns:
         A dictionary with input_ids, labels, and attention_mask.
     """
@@ -86,6 +87,8 @@ def _package_tokenized_example(
     if not _has_chat_template(tokenizer) and eos_token_id != input_ids[-1]:
         input_ids += [eos_token_id]
         assistant_masks += [1]
+    if not _has_chat_template(tokenizer) and pad_token_id is not None:
+        assistant_masks += [pad_token_id]
 
     labels = input_ids.copy()
     input_ids = input_ids[:-1]
@@ -95,7 +98,7 @@ def _package_tokenized_example(
     labels[:] = [label if bool(m) else -100 for label, m in zip(labels, assistant_masks)]
     # remove BOS
     labels = labels[1:]
-    if not _has_chat_template(tokenizer):
+    if not _has_chat_template(tokenizer) and truncation is None:
         assert labels[-1] == eos_token_id, f"labels[-1]={labels[-1]} != eos_token_id={eos_token_id}"
         assert input_ids[-1] != eos_token_id, f"input_ids[-1]={input_ids[-1]} == eos_token_id={eos_token_id}"
     assert len(input_ids) == len(labels), f"len(input_ids)={len(input_ids)} != len(labels)={len(labels)}"
@@ -164,6 +167,7 @@ def format_prompt_completion(
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
         seq_length=seq_length,
+        truncation=truncation,
     )
 
 

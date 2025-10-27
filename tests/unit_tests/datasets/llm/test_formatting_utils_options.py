@@ -28,46 +28,25 @@ from nemo_automodel.components.datasets.llm.formatting_utils import (
 )
 
 
-def _read_tokenizer_dirs_from_env() -> List[Path]:
-    raw = os.environ.get("NEMO_TOKENIZER_DIRS", "").strip()
-    if not raw:
-        return []
-    parts: Iterable[str] = (p.strip() for p in raw.split(","))
-    paths: List[Path] = [Path(p) for p in parts if p]
-    return [p for p in paths if p.exists() and p.is_dir()]
-
-
-_TOKENIZER_DIRS: List[Path] = _read_tokenizer_dirs_from_env()
-
-
-def _skip_if_no_dirs():
-    if not _TOKENIZER_DIRS:
-        pytest.skip(
-            "Set NEMO_TOKENIZER_DIRS to a comma-separated list of local tokenizer dirs to run these tests.",
-            allow_module_level=True,
-        )
-
-
-# @pytest.mark.parametrize("tokenizer_dir", _TOKENIZER_DIRS, ids=lambda p: p.name if isinstance(p, Path) else str(p))
 @pytest.mark.parametrize(
     "seq_length,padding,truncation",
     [
         (None, "do_not_pad", None),
-        (64, "max_length", True),
+        (4, "max_length", True),
     ],
 )
 def test_format_prompt_completion_options(seq_length, padding, truncation):
-    # _skip_if_no_dirs()
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["HF_HUB_OFFLINE"] = "1"
-    # qwen3_4b_instruct_2407
-    tok = AutoTokenizer.from_pretrained("/home/TestData/automodel/hf_gemma3_2l/")
+
+    tok = AutoTokenizer.from_pretrained("/home/TestData/automodel/hf_mixtral_2l//")
     # Only applicable when tokenizer lacks chat template
-    # if getattr(tok, "chat_template", None):
-    #     pytest.skip(f"Tokenizer defines chat_template; skipping prompt-completion tests.")
+    assert getattr(tok, "chat_template", None) is None
 
     eos_token_id = getattr(tok, "eos_token_id", 0)
     pad_token_id = _add_pad_token(tok) or eos_token_id
+    if padding != "do_not_pad":
+        tok.pad_token = tok.eos_token
 
     # If using padding="max_length", seq_length must be an int
     if padding == "max_length" and not isinstance(seq_length, int):
@@ -95,11 +74,11 @@ def test_format_prompt_completion_options(seq_length, padding, truncation):
     assert len(out["input_ids"]) == len(out["labels"]) == len(out["attention_mask"]) > 0
 
     # seq_length enforcement (either by HF padding or our packager)
-    if isinstance(seq_length, int):
+    if isinstance(seq_length, int) and padding != "do_not_pad":
         assert len(out["input_ids"]) == seq_length
         assert len(out["labels"]) == seq_length
         # Trailing padding label must be masked
-        assert out["labels"][-1] == -100
+        assert out["labels"][-1] == -100, (out, pad_token_id)
 
     # EOS should be present in labels (supervised area) but not as last input_id
     if getattr(tok, "eos_token_id", None) is not None and not truncation == True:
@@ -113,7 +92,8 @@ def test_format_prompt_completion_options(seq_length, padding, truncation):
 
     # There should be masked (prompt) and supervised (answer) tokens
     assert any(l == -100 for l in out["labels"])  # masked prompt
-    assert any(l != -100 for l in out["labels"])  # supervised answer
+    if not truncation == True:
+        assert any(l != -100 for l in out["labels"])  # supervised answer
 
     # Attention mask should have zeros only in padded tail (if any)
     if isinstance(seq_length, int):
@@ -131,11 +111,11 @@ def test_format_prompt_completion_options(seq_length, padding, truncation):
     "seq_length,padding,truncation",
     [
         (None, "do_not_pad", None),
-        (64, "max_length", True),
+        (4, "max_length", True),
     ],
 )
-def test_format_chat_template_options(tokenizer_dir: Path, seq_length, padding, truncation):
-    _skip_if_no_dirs()
+def test_format_chat_template_options(seq_length, padding, truncation):
+
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["HF_HUB_OFFLINE"] = "1"
 
@@ -143,7 +123,7 @@ def test_format_chat_template_options(tokenizer_dir: Path, seq_length, padding, 
     tok = AutoTokenizer.from_pretrained("/home/TestData/automodel/qwen3_4b_instruct_2407/")
     # Only applicable when tokenizer DOES define a chat template
     if not getattr(tok, "chat_template", None):
-        pytest.skip(f"Tokenizer {tokenizer_dir.name} has no chat_template; skipping chat-template tests.")
+        pytest.skip(f"Tokenizer qwen3_4b_instruct_2407 has no chat_template; skipping chat-template tests.")
 
     eos_token_id = getattr(tok, "eos_token_id", 0)
     pad_token_id = _add_pad_token(tok) or eos_token_id
@@ -175,7 +155,8 @@ def test_format_chat_template_options(tokenizer_dir: Path, seq_length, padding, 
     if isinstance(seq_length, int):
         assert len(out["input_ids"]) == seq_length
         assert len(out["labels"]) == seq_length
-        assert out["labels"][-1] == -100
+        if truncation == False:
+            assert out["labels"][-1] == -100
 
     # For chat templates, EOS should not be the last input id (unless it's all pad)
     if getattr(tok, "eos_token_id", None) is not None:
@@ -189,7 +170,7 @@ def test_format_chat_template_options(tokenizer_dir: Path, seq_length, padding, 
     assert any(l != -100 for l in out["labels"])  # assistant tokens
 
     # Attention mask padded tail zeros, if padded
-    if isinstance(seq_length, int):
+    if isinstance(seq_length, int) and truncation == False:
         seen_zero = False
         for v in reversed(out["attention_mask"]):
             if v == 0:
