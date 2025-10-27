@@ -84,6 +84,9 @@ class ModelState:
         """
         self.model = [model] if isinstance(model, torch.nn.Module) else model
         self.is_tied_lm_head = getattr(getattr(self.model[0], "config", {}), "tie_word_embeddings", False)
+        if self.is_tied_lm_head:
+            _, lm_head_param_name = _get_lm_head_weight_and_name(self.model[0])
+            self.lm_head_param_name = lm_head_param_name
         self.is_peft = is_peft
         self.is_init_step = is_init_step
 
@@ -106,8 +109,7 @@ class ModelState:
 
         if self.is_tied_lm_head:
             # PP models don't have tied embeddings. Safe to pass in model[0] here.
-            _, lm_head_param_name = _get_lm_head_weight_and_name(self.model[0])
-            model_state_dict.pop(lm_head_param_name, None)
+            model_state_dict.pop(self.lm_head_param_name, None)
 
         if self.is_peft:
             # HF PEFT models are saved with a "base.model." prefix. This is so they can be loaded
@@ -150,8 +152,7 @@ class ModelState:
         model_state_dict = {k: v for sd in map(get_model_state_dict, self.model) for k, v in sd.items()}
         if self.is_tied_lm_head:
             # PP models don't have tied embeddings. Safe to pass in model[0] here.
-            _, lm_head_param_name = _get_lm_head_weight_and_name(self.model[0])
-            model_state_dict.pop(lm_head_param_name, None)
+            model_state_dict.pop(self.lm_head_param_name, None)
         if self.is_peft:
             keys_to_remove = [k for k in model_state_dict.keys() if "lora" in k]
             for k in keys_to_remove:

@@ -550,8 +550,10 @@ class Checkpointer:
             # however, HF initializes buffers with persistent=False, so we need to make sure these
             # buffer keys are not saved during checkpointing
             keys_to_remove = list(set(fqn_to_file_index_mapping.keys()) - set(self.config.model_state_dict_keys))
+            if model_state.is_tied_lm_head:
+                keys_to_remove.append(model_state.lm_head_param_name)
             for key in keys_to_remove:
-                fqn_to_file_index_mapping.pop(key)
+                fqn_to_file_index_mapping.pop(key, None)
         else:
             fqn_to_file_index_mapping = {k: 1 for k in state_dict.keys()}
 
