@@ -41,6 +41,32 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
 
+class SequenceParallelAllGatherActivation(SequenceParallel):
+    """ColwiseParallel that explicitly all-gathers the output after computation.
+    
+    This is useful when the input tensor is already a DTensor with Shard placement
+    (e.g., from sequence parallelism) and the output needs to be replicated after
+    the column-wise parallel matmul operation.
+    """
+
+    @staticmethod
+    def _prepare_output_fn(use_local_output, mod, outputs, device_mesh):
+        """Prepare outputs by redistributing sharded DTensors to replicated placement."""
+        # If output is a DTensor with Shard placement, redistribute to Replicate
+        if isinstance(outputs, DTensor):
+            if any(isinstance(p, Shard) for p in outputs.placements):
+                # Redistribute to replicated placement (performs all-gather)
+                outputs = outputs.redistribute(
+                    device_mesh=device_mesh,
+                    placements=[Replicate()]
+                )
+        else:
+            raise ValueError(f"Expected output to be a DTensor, but got {type(outputs)}")
+        
+        # Call the parent's prepare_output_fn to handle use_local_output
+        return SequenceParallel._prepare_output_fn(use_local_output, mod, outputs, device_mesh)
+
+
 class RotaryEmbedParallel(SequenceParallel):
     """Custom SequenceParallel class for Qwen2 / Gemma3 rotary embeddings because the input is a tuple."""
 
@@ -129,12 +155,12 @@ def _parallelize_llama(
     """Parallelizes a LlamaForCausalLM model across data and tensor parallel dimensions."""
     base_model_tp_plan: dict[str, ParallelStyle] = {
         "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
-        "model.layers.*.self_attn.q_proj": ColwiseParallel(),
-        "model.layers.*.self_attn.k_proj": ColwiseParallel(),
-        "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.q_proj": ColwiseParallel(use_local_output=True),
+        "model.layers.*.self_attn.k_proj": ColwiseParallel(use_local_output=True),
+        "model.layers.*.self_attn.v_proj": ColwiseParallel(use_local_output=True),
         "model.layers.*.self_attn.o_proj": RowwiseParallel(),
-        "model.layers.*.mlp.up_proj": ColwiseParallel(),
-        "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+        "model.layers.*.mlp.up_proj": ColwiseParallel(use_local_output=True),
+        "model.layers.*.mlp.gate_proj": ColwiseParallel(use_local_output=True),
         "model.layers.*.mlp.down_proj": RowwiseParallel(),
         "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
     }
@@ -142,9 +168,9 @@ def _parallelize_llama(
     base_model_sp_plan = {
         "model.embed_tokens": RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1)),
         "model.norm": SequenceParallel(),
-        "model.layers.*.input_layernorm": SequenceParallel(),
+        "model.layers.*.input_layernorm": SequenceParallelAllGatherActivation(use_local_output=False),
         "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
-        "model.layers.*.post_attention_layernorm": SequenceParallel(),
+        "model.layers.*.post_attention_layernorm": SequenceParallelAllGatherActivation(use_local_output=False),
         "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
         "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False),
     }
