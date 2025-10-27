@@ -553,7 +553,7 @@ class Checkpointer:
             if model_state.is_tied_lm_head:
                 keys_to_remove.append(model_state.lm_head_param_name)
             for key in keys_to_remove:
-                fqn_to_file_index_mapping.pop(key)
+                fqn_to_file_index_mapping.pop(key, None)
         else:
             fqn_to_file_index_mapping = {k: 1 for k in state_dict.keys()}
 
