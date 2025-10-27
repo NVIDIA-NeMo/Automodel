@@ -1,22 +1,34 @@
 # Run on a Cluster (Slurm / Multi-node)
 
-Use this guide for submitting distributed training jobs on Slurm clusters (single- or multi-node). For single-node workstation usage, see [Run on Your Local Workstation](./local-workstation.md). For setup details, refer to our [Installation Guide](../guides/installation.md).
+In this guide you will learn how to submit distributed training jobs on Slurm clusters (single- or multi-node). For single-node workstation usage, see [Run on Your Local Workstation](./local-workstation.md). For setup details, refer to our [Installation Guide](../guides/installation.md).
+
+NeMo Automodel uses recipes to run end-to-end workflows. If you're new to recipes, see the [Repository Structure](../repository-structure.md) guide.
+
+
+:::{note}
+Kubernetes support is coming soon.
+:::
 
 ## Quick start: Choose your job launch option
 
+Slurm jobs support two modes of execution: `batch` and `interactive`. In `batch` mode, the job is submitted to the cluster queue and
+is executed without any other input from the user (e.g., no keyboard input), while the `interactive` mode, as the name implies, enables keyboard input.
+
 - **CLI (recommended for Slurm)**
+  This only requires to configure the `slurm` section in the YAML file, and the launcher will render the SBATCH script.
   ```bash
   automodel finetune llm -c your_config_with_slurm.yaml
   ```
 
 - **Direct recipe script (typically for interactive testing)**
+  You can also launch an interactive job on a Slurm node, and on the node run:
   - Single node, single GPU
     ```bash
-    python3 nemo_automodel/recipes/llm_finetune/finetune.py -c your_config.yaml
+    python3 examples/llm_finetune/finetune.py -c your_config.yaml
     ```
   - Single node, multiple GPUs
     ```bash
-    torchrun --nproc-per-node=8 nemo_automodel/recipes/llm_finetune/finetune.py -c your_config.yaml
+    torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py -c your_config.yaml
     ```
   - Note: For multi-node, prefer the CLI with `slurm` configuration.
 
@@ -37,6 +49,13 @@ Where:
 - `<config_file>`: Path to your YAML configuration file
 
 For workstation single-node instructions, see [Run on Your Local Workstation](./local-workstation.md).
+
+### Example: Run the LLM Fine-Tuning Recipe
+
+For a quick CLI example using two GPUs on a single node:
+```bash
+automodel finetune llm -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node=2
+```
 
 ### Submit a Batch Job with Slurm
 
@@ -66,7 +85,7 @@ slurm:
   account: your_account
   partition: gpu
   container_image: nvcr.io/nvidia/nemo:25.07
-  gpus_per_node: 8 # This adds "#SBATCH --gpus-per-node=8" to the script
+  gpus_per_node: 8 # Adds an SBATCH line: "#SBATCH --gpus-per-node=8"
   # Optional: Add extra mount points if needed
   extra_mounts:
     - /lustre:/lustre
@@ -85,6 +104,39 @@ automodel finetune llm -c your_config_with_slurm.yaml
 ```
 
 The CLI will automatically submit the job to Slurm and handle the distributed setup.
+
+### Alternate Slurm YAML Example
+
+Here is an alternative, minimal `slurm` configuration with additional notes:
+
+```yaml
+slurm:
+  job_name: llm-finetune  # if no job_name is provided will use {domain}_{command} from invocation
+  nodes: 1
+  ntasks_per_node: 8
+  time: 00:05:00
+  account: coreai_dlalgo_llm
+  partition: batch
+  container_image: nvcr.io/nvidia/nemo:dev # can also use path to sqsh, e.g.: /foo/bar/image.sqsh
+  gpus_per_node: 8
+  extra_mounts:
+    - /a/b/c:/d/e
+```
+
+This launches one node with eight workers per node inside torchrun (`--nproc_per_node=8`). The Slurm script itself uses `#SBATCH --ntasks-per-node 1`, and when `gpus_per_node` is set, it adds `#SBATCH --gpus-per-node=8` as well.
+
+### Launch a Batch Job on Slurm with Modified Code
+
+If the command is executed from within a Git repository accessible to Slurm workers, the generated SBATCH script will prioritize the repository source over the Automodel installation inside the container image.
+
+For example:
+```bash
+git clone git@github.com:NVIDIA-NeMo/Automodel.git automodel_test_repo
+cd automodel_test_repo/
+automodel finetune llm -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node=2
+```
+
+This will launch the job using the source code in the `automodel_test_repo` directory instead of the version bundled in the Docker image.
 
 ### Standalone Slurm Script (advanced)
 
@@ -157,6 +209,29 @@ uv provides several advantages for development and experimentation:
 ## Run with Torchrun
 
 For cluster usage, prefer submitting via the CLI with `slurm` configuration. Direct `torchrun` is recommended for single-node development; see [Run on Your Local Workstation](./local-workstation.md).
+
+### Standard PyTorch multi-node example
+
+If you need a straightforward reference for manual multi-node launching with PyTorch (outside of Slurm helpers), use the pattern below. Run this on each node, updating `NODE_RANK` per node and adjusting `--nnodes`/`--nproc-per-node` as needed for your setup.
+
+```bash
+export MASTER_ADDR=node0.hostname   # master node's host/IP
+export MASTER_PORT=29500
+export NODE_RANK=0                  # node0 -> 0, node1 -> 1, ...
+
+torchrun \
+  --nnodes=2 \
+  --nproc_per_node=8 \
+  --node_rank=${NODE_RANK} \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
+  train.py --batch_size 32
+```
+
+Notes:
+- Set `NODE_RANK=0` on the master node (where `MASTER_ADDR` resolves), `NODE_RANK=1` on the second node, and so on.
+- Ensure `--nproc_per_node` matches the number of GPUs per node.
+- When launching under Slurm, prefer the CLI `slurm` configuration above or ensure equivalent rendezvous/env settings are provided via the scheduler.
 
 ## Customize Configuration Settings
 
