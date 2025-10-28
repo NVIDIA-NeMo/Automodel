@@ -411,11 +411,12 @@ def apply_fsdp2_sharding_recursively(
         for layer_id, transformer_block in enumerate(module):
             # As an optimization, do not reshard after forward for the last
             # transformer block since FSDP would prefetch it immediately
+            reshard_after_forward = int(layer_id) < len(module) - 1
             fully_shard(
                 transformer_block,
                 mesh=mesh,
                 mp_policy=mp_policy,
-                reshard_after_forward=True,
+                reshard_after_forward=reshard_after_forward,
                 offload_policy=offload_policy,
             )
             module[layer_id] = transformer_block
