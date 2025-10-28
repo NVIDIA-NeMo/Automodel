@@ -4,7 +4,7 @@ on:
     branches:
       - "pull-request/[0-9]+"
 
-job:
+jobs:
   downstream_pipeline:
     runs-on: ubuntu-latest
     steps:
