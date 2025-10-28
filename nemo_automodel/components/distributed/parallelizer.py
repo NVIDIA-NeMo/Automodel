@@ -377,6 +377,10 @@ def get_parallelization_strategy(model: nn.Module) -> ParallelizationStrategy:
     model_name = type(model).__name__
     return PARALLELIZATION_STRATEGIES.get(model_name, _DEFAULT_STRATEGY)
 
+def register_parallel_strategy(cls):
+    """Decorator to register out-of-tree parallelism strategies"""
+    PARALLELIZATION_STRATEGIES[cls.__name__] = cls()
+    return cls
 
 def apply_fsdp2_sharding_recursively(
     module: nn.Module,
@@ -407,12 +411,11 @@ def apply_fsdp2_sharding_recursively(
         for layer_id, transformer_block in enumerate(module):
             # As an optimization, do not reshard after forward for the last
             # transformer block since FSDP would prefetch it immediately
-            reshard_after_forward = int(layer_id) < len(module) - 1
             fully_shard(
                 transformer_block,
                 mesh=mesh,
                 mp_policy=mp_policy,
-                reshard_after_forward=reshard_after_forward,
+                reshard_after_forward=True,
                 offload_policy=offload_policy,
             )
             module[layer_id] = transformer_block
