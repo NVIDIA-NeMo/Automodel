@@ -21,10 +21,10 @@
 step_scheduler:
   global_batch_size: 512
   local_batch_size: 4
-  ckpt_every_steps: 500
+  ckpt_every_steps: 1000
   val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 1
-  max_steps: 9500
+  max_steps: 57205
 
 dist_env:
   backend: nccl
@@ -41,7 +41,7 @@ parallelizer:
 
 model:
   _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_config
-  pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
+  pretrained_model_name_or_path: /lustre/fsw/coreai_dlalgo_genai/adasif/models/models--moonshotai--Moonlight-16B-A3B/snapshots/ce8bc137e6e29c3b7540ebdd515bbc5bdb20d915/
   trust_remote_code: true
   is_meta_device: true
   backend:
@@ -55,9 +55,9 @@ model:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: checkpoints/
-  model_save_format: torch_save # torch_save or safetensors
-  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  checkpoint_dir: /lustre/fsw/coreai_dlalgo_genai/adasif/checkpoints/moonlight_dclm/
+  model_save_format: safetensors # torch_save or safetensors
+  save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
   load_base_model: false
 
 distributed:
@@ -74,11 +74,11 @@ loss_fn:
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
-  paths: /path/to/fineweb_edu/processed_data_*_text_document*  # REPLACE THIS
-  index_mapping_dir: /path/to/fineweb_edu/mapping_dir  # REPLACE THIS
+  paths: /lustre/fsw/coreai_dlalgo_genai/adasif/dclm/moonlight_mcore/processed_data_*_text_document*  # REPLACE THIS
+  index_mapping_dir: /lustre/fsw/coreai_dlalgo_genai/adasif/dclm/moonlight_mcore/mapping_dir  # REPLACE THIS
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
+    pretrained_model_name_or_path: /lustre/fsw/coreai_dlalgo_genai/adasif/models/models--moonshotai--Moonlight-16B-A3B/snapshots/ce8bc137e6e29c3b7540ebdd515bbc5bdb20d915/
     trust_remote_code: true
   seq_length: 2048
   split: "0.99, 0.01, 0.00"  # train, validation, test
@@ -91,11 +91,11 @@ dataloader:
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
-  paths: /path/to/fineweb_edu/processed_data_*_text_document*  # REPLACE THIS
-  index_mapping_dir: /path/to/fineweb_edu/mapping_dir  # REPLACE THIS
+  paths: /lustre/fsw/coreai_dlalgo_genai/adasif/dclm/moonlight_mcore/processed_data_*_text_document*  # REPLACE THIS
+  index_mapping_dir: /lustre/fsw/coreai_dlalgo_genai/adasif/dclm/moonlight_mcore/mapping_dir  # REPLACE THIS
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
+    pretrained_model_name_or_path: /lustre/fsw/coreai_dlalgo_genai/adasif/models/models--moonshotai--Moonlight-16B-A3B/snapshots/ce8bc137e6e29c3b7540ebdd515bbc5bdb20d915/
     trust_remote_code: true
   seq_length: 2048
   split: "0.99, 0.01, 0.00"  # train, validation, test
@@ -110,18 +110,18 @@ validation_dataloader:
 optimizer:
   _target_: torch.optim.AdamW
   betas: [0.9, 0.95]
-  eps: 1e-5
-  lr: 4.2e-4
-  weight_decay: 0.1
+  eps: 1e-8
+  lr: 3e-3
+  weight_decay: 0.033
 
 lr_scheduler:
   lr_decay_style: cosine
-  lr_warmup_steps: 500
+  lr_warmup_steps: 5000
   min_lr: 0.0
 
 # Uncomment and configure for W&B logging
-# wandb:
-#   project: <your_wandb_project>
-#   entity: <your_wandb_entity>
-#   name: <your_wandb_exp_name>
+wandb:
+  project: adil-workspace
+  entity: Nemo-automodel
+  name: moonlight-16b-dclm-2048-seq_len-512-gbs-lr-3e-3
 #   save_dir: <your_wandb_save_dir>

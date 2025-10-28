@@ -64,7 +64,7 @@ class Encoder(object):
 
     def initializer(self):
         # Use Encoder class as a container for global data
-        Encoder.tokenizer = AutoTokenizer.from_pretrained(self.args.pretrained_model_name_or_path)
+        Encoder.tokenizer = AutoTokenizer.from_pretrained(self.args.pretrained_model_name_or_path, trust_remote_code=True)
         if self.args.split_sentences:
             if not nltk_available:
                 print("NLTK is not available to split sentences.")
@@ -88,38 +88,46 @@ class Encoder(object):
             Encoder.splitter = IdentitySplitter()
 
     def split(self, json_line):
-        data = json.loads(json_line)
-        output = {}
-        for key in self.args.json_keys:
-            text = data[key]
-            max_len = 1000000
-            tokens_list = [Encoder.splitter.tokenize(text[i : i + max_len]) for i in range(0, len(text), max_len)]
-            output[key] = [tokens for partial in tokens_list for tokens in partial]
-        return json.dumps(output), len(json_line)
+        try:
+            data = json.loads(json_line)
+            output = {}
+            for key in self.args.json_keys:
+                text = data[key]
+                max_len = 1000000
+                tokens_list = [
+                    Encoder.splitter.tokenize(text[i : i + max_len]) for i in range(0, len(text), max_len)
+                ]
+                output[key] = [tokens for partial in tokens_list for tokens in partial]
+            return json.dumps(output), len(json_line)
+        except Exception:
+            return None, len(json_line)
 
     def encode(self, json_line):
-        data = json.loads(json_line)
-        ids = {}
-        lens = {}
-        for key in self.args.json_keys:
-            text = data[key]
-            if isinstance(text, list):
-                sentences = text
-            else:
-                sentences = [text]
-            doc_ids = []
-            sentence_lens = []
-            for sentence in sentences:
-                sentence_ids = Encoder.tokenizer(sentence).input_ids
-                if len(sentence_ids) > 0:
-                    doc_ids.extend(sentence_ids)
-                    sentence_lens.append(len(sentence_ids))
-            if len(doc_ids) > 0 and self.args.append_eod:
-                doc_ids.append(Encoder.tokenizer.eos_token_id)
-                sentence_lens[-1] += 1
-            ids[key] = doc_ids
-            lens[key] = sentence_lens
-        return ids, lens, len(json_line)
+        try:
+            data = json.loads(json_line)
+            ids = {}
+            lens = {}
+            for key in self.args.json_keys:
+                text = data[key]
+                if isinstance(text, list):
+                    sentences = text
+                else:
+                    sentences = [text]
+                doc_ids = []
+                sentence_lens = []
+                for sentence in sentences:
+                    sentence_ids = Encoder.tokenizer(sentence).input_ids
+                    if len(sentence_ids) > 0:
+                        doc_ids.extend(sentence_ids)
+                        sentence_lens.append(len(sentence_ids))
+                if len(doc_ids) > 0 and self.args.append_eod:
+                    doc_ids.append(Encoder.tokenizer.eos_token_id)
+                    sentence_lens[-1] += 1
+                ids[key] = doc_ids
+                lens[key] = sentence_lens
+            return ids, lens, len(json_line)
+        except Exception:
+            return None, None, len(json_line)
 
 
 class Partition(object):
@@ -149,10 +157,20 @@ class Partition(object):
 
         proc_start = time.time()
         total_bytes_processed = 0
+        failed_lines = 0
         for i, (doc, bytes_processed) in enumerate(split_docs, start=1):
             total_bytes_processed += bytes_processed
-            fout.write(doc + "\n")
+            if doc is None:
+                failed_lines += 1
+            else:
+                fout.write(doc + "\n")
             self.print_processing_stats(i, proc_start, total_bytes_processed, source=input_file_name)
+
+        if failed_lines > 0:
+            print(
+                f"Failed to process {failed_lines} lines in {os.path.basename(input_file_name)}",
+                file=sys.stderr,
+            )
 
         fin.close()
         fout.close()
@@ -164,7 +182,7 @@ class Partition(object):
 
         startup_start = time.time()
         encoder = Encoder(self.args)
-        tokenizer = AutoTokenizer.from_pretrained(self.args.pretrained_model_name_or_path)
+        tokenizer = AutoTokenizer.from_pretrained(self.args.pretrained_model_name_or_path, trust_remote_code=True)
         pool = multiprocessing.Pool(self.workers, initializer=encoder.initializer)
         encoded_docs = pool.imap(encoder.encode, fin, 32)
 
@@ -188,11 +206,26 @@ class Partition(object):
         proc_start = time.time()
         total_bytes_processed = 0
         print("Time to startup:", startup_end - startup_start)
-        for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
+        failed_lines = 0
+        for i, result in enumerate(encoded_docs, start=1):
+            try:
+                doc, sentence_lens, bytes_processed = result
+            except Exception:
+                failed_lines += 1
+                continue
             total_bytes_processed += bytes_processed
-            for key in doc.keys():
-                builders[key].add_document(doc[key], sentence_lens[key])
+            if doc is None:
+                failed_lines += 1
+            else:
+                for key in doc.keys():
+                    builders[key].add_document(doc[key], sentence_lens[key])
             self.print_processing_stats(i, proc_start, total_bytes_processed, source=input_file_name)
+
+        if failed_lines > 0:
+            print(
+                f"Failed to process {failed_lines} lines in {os.path.basename(input_file_name)}",
+                file=sys.stderr,
+            )
 
         fin.close()
         builders[key].finalize(output_idx_files[key])
