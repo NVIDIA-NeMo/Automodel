@@ -1,0 +1,16 @@
+name: Trigger Downstream Pipeline
+on:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+
+job:
+  downstream_pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger GitLab CI/CD
+        run: |
+          curl --request POST \
+            --form token=${{ secrets.GITLAB_TRIGGER_TOKEN }} \
+            --form ref=main \
+            "https://gitlab-master.nvidia.com/dl/JoC/nemo-ci"
