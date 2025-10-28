@@ -128,8 +128,8 @@ def format_prompt_completion(
     eos_token_id: int,
     pad_token_id: int,
     seq_length: Optional[int] = None,
-    padding: Union[str, bool] = None,
-    truncation: Union[str, bool] = None,
+    padding: Union[str, bool] = "do_not_pad",
+    truncation: Union[str, bool] = "do_not_truncate",
     answer_only_loss_mask: bool = True,
 ) -> Dict[str, List[int]]:
     """
@@ -177,8 +177,8 @@ def format_chat_template(
     eos_token_id: int,
     pad_token_id: int,
     seq_length: Optional[int] = None,
-    padding: Union[str, bool] = None,
-    truncation: Union[str, bool] = None,
+    padding: Union[str, bool] = "do_not_pad",
+    truncation: Union[str, bool] = "do_not_truncate",
     tools: Optional[List[Dict]] = None,
 ) -> Dict[str, List[int]]:
     """
