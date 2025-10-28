@@ -210,6 +210,20 @@ def _write_metadata(
             # Store the total metadata size (header + JSON) for later use
             output_data.metadata_size = f.tell()
 
+            # Pre-allocate/truncate the file to the final logical size so that
+            # the metadata section is fully covered by the actual file size.
+            # This avoids safetensors readers failing with "file not fully covered"
+            # when later data writes are sparse (seek+write at large offsets).
+            total_size = output_data.metadata_size + curr_offset
+            try:
+                # Prefer truncate when supported by the underlying filesystem
+                f.truncate(total_size)
+            except Exception:
+                # Fallback: extend by seeking to the last byte and writing a zero
+                if total_size > 0:
+                    f.seek(total_size - 1)
+                    f.write(b"\0")
+
 
 def _read_tensor_data_mmap(
     input_fs: fsspec.AbstractFileSystem,
@@ -858,6 +872,7 @@ def consolidate_safetensors_files(
             metadata, size = _get_safetensors_file_metadata(f)
             input_files_data[safetensor_file] = _InputFileData(metadata_size=size, metadata=metadata)
 
+    breakpoint()
     # Step 1: Parse metadata to determine tensor shapes and types
     _parse_input_metadata(input_files_data, output_files_data)
 

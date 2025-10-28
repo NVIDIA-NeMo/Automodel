@@ -97,7 +97,7 @@ def clip_grad_norm_with_ep(
     torch.nn.utils.clip_grads_with_norm_(ep_params, max_norm, total_norm, foreach)
     torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_norm, total_norm, foreach)
 
-    return total_norm
+    return total_norm, non_ep_grads_total_norm, ep_grads_total_norm
 
 
 @torch.no_grad()
@@ -175,7 +175,7 @@ def clip_grad_norm(
         # MoE present without PP: handle expert-parallel aware clipping
         if moe_mesh is not None:
             assert ep_axis_name is not None, "ep_axis_name must be provided when moe_mesh is not None"
-            grad_norm = clip_grad_norm_with_ep(
+            grad_norm, non_ep_grads_total_norm, ep_grads_total_norm = clip_grad_norm_with_ep(
                 [p for p in model_parts[0].parameters() if p.requires_grad],
                 max_norm=max_grad_norm,
                 norm_type=norm_type,
@@ -196,7 +196,7 @@ def clip_grad_norm(
     if isinstance(grad_norm, torch.Tensor):
         grad_norm = grad_norm.item()
 
-    return grad_norm
+    return grad_norm, non_ep_grads_total_norm, ep_grads_total_norm
 
 
 @torch.no_grad()

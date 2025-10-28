@@ -36,6 +36,7 @@ except ImportError:
 from nemo_automodel.components.moe.megatron.moe_utils import (
     MoEAuxLossAutoScaler,
     weighted_bias_swiglu_impl,
+    WeightedSwiGLUFunction,
 )
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEConfig as MegatronMoEConfig
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher
@@ -489,7 +490,10 @@ class GroupedExpertsDeepEP(nn.Module):
                 down_bias = self.down_proj_bias.to_local()
                 output2 = self._apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
         else:
-            output2 = torch.zeros((0, x.size(-1)), dtype=x.dtype, device=x.device)
+            # output2 = torch.zeros((0, x.size(-1)), dtype=x.dtype, device=x.device)
+            output1 = torch.matmul(x[0] * 0, self.gate_and_up_projs.to_local()[0])
+            output1_ = WeightedSwiGLUFunction.apply(output1, permuted_probs, False)
+            output2 = torch.matmul(output1_, self.down_projs.to_local()[0])
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y

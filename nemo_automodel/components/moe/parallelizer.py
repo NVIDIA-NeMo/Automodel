@@ -147,7 +147,8 @@ def apply_fsdp(
                 block.mlp.experts,
                 mesh=ep_shard_mesh,
                 shard_placement_fn=lambda _: Shard(1),
-                reshard_after_forward=not pp_enabled,
+                # reshard_after_forward=not pp_enabled,
+                reshard_after_forward=False,
             )
         # If FSDP is disabled for grouped experts because the parameters are already
         # fully sharded by PP and EP, then we need to explicitly remove the parameters

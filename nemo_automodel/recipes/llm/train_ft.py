@@ -551,9 +551,9 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamSch
     for base_lr, opt in zip(base_lrs, optimizer):
         default_kwargs = dict(
             optimizer=opt,
-            init_lr=base_lr * 0.1,  # Start warmup at 10% of base LR
+            init_lr=0,  # Start warmup at 10% of base LR
             max_lr=base_lr,
-            min_lr=base_lr * 0.01,  # End at 1% of base LR
+            min_lr=0,  # End at 1% of base LR
             lr_warmup_steps=min(1000, total_steps // 10),  # 10% warmup or max 1000 steps
             lr_decay_steps=total_steps,
             lr_decay_style="cosine",
@@ -860,6 +860,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Optionally resume
         self.load_checkpoint(restore_from, moe_mesh=self.moe_mesh)
+        torch.distributed.breakpoint()
 
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
@@ -881,12 +882,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # 1. len(batches) == grad_acc_steps
             # 2. len(batches[0]) == batch_size
             for i, batches in enumerate(self.step_scheduler):
-                reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens = self._run_train_optim_step(
+                reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens, non_ep_grads_total_norm, ep_grads_total_norm = self._run_train_optim_step(
                     batches, 1.0
                 )
 
                 # log
-                self.log_train_metrics(reporting_loss, grad_norm, num_tokens_in_batch, tps, num_label_tokens)
+                self.log_train_metrics(reporting_loss, grad_norm, num_tokens_in_batch, tps, num_label_tokens, non_ep_grads_total_norm, ep_grads_total_norm)
 
                 # Save the checkpoint every ckpt_every_steps
                 if self.step_scheduler.is_ckpt_step:
@@ -990,7 +991,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
             )
 
-        grad_norm = scale_grads_and_clip_grad_norm(
+        grad_norm, non_ep_grads_total_norm, ep_grads_total_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
             self.model_parts,
             norm_type=2.0,
@@ -1053,7 +1054,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         reporting_loss = reporting_loss.cpu().item()
         # fix reporting_loss, tps across ranks
-        return reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens
+        return reporting_loss, grad_norm, tps, num_tokens_in_batch, num_label_tokens, non_ep_grads_total_norm, ep_grads_total_norm
 
     @torch.no_grad()
     def _run_validation_epoch(self):
@@ -1104,7 +1105,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
         )
 
-    def log_train_metrics(self, train_loss, grad_norm, num_tokens_in_batch, tps, num_label_tokens) -> float:
+    def log_train_metrics(self, train_loss, grad_norm, num_tokens_in_batch, tps, num_label_tokens, non_ep_grads_total_norm, ep_grads_total_norm) -> float:
         """Log metrics to wandb.
 
         Args:
@@ -1121,6 +1122,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             "num_tokens_per_step": num_tokens_in_batch,
             "tps": tps,
             "tps_per_gpu": tps / self._get_dp_group_size(),
+            "non_ep_grads_total_norm": non_ep_grads_total_norm,
+            "ep_grads_total_norm": ep_grads_total_norm,
         }
         # assumes all model parts' optimizers have the same learning rate
         current_lr = self.optimizer[0].param_groups[0]["lr"]
