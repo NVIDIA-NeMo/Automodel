@@ -169,6 +169,39 @@ class TestGPTOSSStateDictAdapter:
         assert len(adapter.hf_to_internal_map) == 4
         assert len(adapter.internal_to_hf_map) == 4
 
+    def test_initialization_with_te_backend(self):
+        """Test that TE backend adds sinks mapping to adapter."""
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config(attn="te")
+
+        adapter = GPTOSSStateDictAdapter(config=config, moe_config=moe_config, backend=backend, dtype=torch.float16)
+
+        # With TE backend, we should have 5 mappings (4 base + 1 sinks mapping)
+        assert len(adapter.hf_to_internal_map) == 5
+        assert len(adapter.internal_to_hf_map) == 5
+
+        # Verify the sinks mapping exists
+        assert "self_attn.sinks" in adapter.hf_to_internal_map
+        assert adapter.hf_to_internal_map["self_attn.sinks"] == "self_attn.attn_module.softmax_offset"
+        assert "self_attn.attn_module.softmax_offset" in adapter.internal_to_hf_map
+        assert adapter.internal_to_hf_map["self_attn.attn_module.softmax_offset"] == "self_attn.sinks"
+
+    def test_initialization_with_flex_backend(self):
+        """Test that Flex backend does not add sinks mapping."""
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config(attn="flex")
+
+        adapter = GPTOSSStateDictAdapter(config=config, moe_config=moe_config, backend=backend, dtype=torch.float16)
+
+        # With Flex backend, we should have 4 base mappings only
+        assert len(adapter.hf_to_internal_map) == 4
+        assert len(adapter.internal_to_hf_map) == 4
+
+        # Verify the sinks mapping does not exist
+        assert "self_attn.sinks" not in adapter.hf_to_internal_map
+
     def test_to_hf_applies_mapping_and_exclude(self):
         config = self.create_mock_config()
         moe_config = self.create_mock_moe_config()
@@ -349,6 +382,48 @@ class TestGPTOSSStateDictAdapter:
         assert "layers.0.mlp.gate.bias" in out
         assert "layers.0.mlp.router.weight" not in out
         assert "layers.0.mlp.router.bias" not in out
+
+    def test_from_hf_with_te_backend_sinks_mapping(self):
+        """Test from_hf applies sinks mapping with TE backend."""
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config(attn="te")
+        adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
+
+        hf_state = {
+            "model.layers.0.self_attn.sinks": torch.randn(8),
+            "model.layers.0.mlp.router.weight": torch.randn(2, 2),
+        }
+
+        out = adapter.from_hf(hf_state)
+
+        # Sinks should be mapped to softmax_offset
+        assert "model.layers.0.self_attn.attn_module.softmax_offset" in out
+        assert "model.layers.0.self_attn.sinks" not in out
+
+        # Router mapping should still work
+        assert "model.layers.0.mlp.gate.weight" in out
+
+    def test_to_hf_with_te_backend_sinks_mapping(self):
+        """Test to_hf applies sinks mapping with TE backend."""
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config(attn="te")
+        adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
+
+        state_dict = {
+            "model.layers.0.self_attn.attn_module.softmax_offset": torch.randn(8),
+            "model.layers.0.mlp.gate.weight": torch.randn(2, 2),
+        }
+
+        out = adapter.to_hf(state_dict, quantization=False)
+
+        # softmax_offset should be mapped to sinks
+        assert "model.layers.0.self_attn.sinks" in out
+        assert "model.layers.0.self_attn.attn_module.softmax_offset" not in out
+
+        # Gate mapping should still work
+        assert "model.layers.0.mlp.router.weight" in out
 
 
 class TestConvertMoePackedTensors:
