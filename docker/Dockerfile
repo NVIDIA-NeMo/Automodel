@@ -60,7 +60,8 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
     git checkout FETCH_HEAD && \
     git submodule init && git submodule update && \
     pip install nvidia-mathdx==25.1.1 && \
-    env NVTE_CUDA_ARCHS="80;90;100;120" NVTE_BUILD_THREADS_PER_JOB=8 pip install --no-cache-dir --no-build-isolation -v .; \
+    env NVTE_CUDA_ARCHS="80;90;100;120" NVTE_BUILD_THREADS_PER_JOB=8 pip install --no-cache-dir --no-build-isolation -v . && \
+    rm -rf TransformerEngine; \
     fi
 
 FROM update_base_container AS automodel_dep
@@ -78,7 +79,9 @@ RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     patch -p1 < /opt/deepep.patch && \
     pip install --no-cache-dir nvidia-nvshmem-cu13 && \
     TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install --no-cache-dir --no-build-isolation -v . && \
-    rm -rf /opt/deepep.patch; fi
+    rm -rf /opt/deepep.patch && \
+    rm -rf DeepEP; \
+    fi
 
 FROM automodel_dep as automodel_final
 
