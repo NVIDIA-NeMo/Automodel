@@ -180,8 +180,6 @@ class LinearLoRA(nn.Linear):
         obj.dropout_p = dropout
         assert dropout_position in ["pre", "post"], ("dropout position can only be pre/post", dropout_position)
         obj.dropout_position = dropout_position
-        # Flag to control whether to all-gather between lora_A and lora_B (set by ColwiseParallelLora)
-        obj.lora_allgather_intermediate = False
 
     def forward(self, x):
         """
@@ -209,40 +207,7 @@ class LinearLoRA(nn.Linear):
         if self.dropout_position == "pre":
             x = F.dropout(x, p=self.dropout_p, training=self.training)
         
-        # LoRA pathway: lora_A -> (optional all_gather) -> lora_B
-        lora_a_out = self.lora_A(x)
-        
-        # If enabled (e.g., for ColwiseParallelLora), all-gather between lora_A and lora_B
-        if getattr(self, 'lora_allgather_intermediate', False):
-            try:
-                from torch.distributed.tensor import DTensor
-                from torch.distributed.tensor.placement_types import Replicate, Shard
-                if isinstance(lora_a_out, DTensor):
-                    if any(isinstance(p, Shard) for p in lora_a_out.placements):
-                        # All-gather: redistribute from Shard to Replicate
-                        lora_a_out = lora_a_out.redistribute(
-                            device_mesh=lora_a_out.device_mesh,
-                            placements=[Replicate()]
-                        )
-            except ImportError:
-                # DTensor not available, proceed without redistribution
-                pass
-        elif getattr(self, 'lora_reducescatter_intermediate', False):
-            try:
-                from torch.distributed.tensor import DTensor
-                from torch.distributed.tensor.placement_types import Replicate, Shard
-                if isinstance(lora_a_out, DTensor):
-                    if any(isinstance(p, Shard) for p in lora_a_out.placements):
-                        lora_a_out = lora_a_out.redistribute(
-                            device_mesh=lora_a_out.device_mesh,
-                            placements=[Shard(-1)]
-                        )
-            except ImportError:
-                # DTensor not available, proceed without redistribution
-                pass
-
-        
-        lora_res = self.lora_B(lora_a_out)
+        lora_res = self.lora_B(self.lora_A(x))
         lora_res = lora_res * self.scale
         if self.dropout_position == "post":
             lora_res = F.dropout(lora_res, p=self.dropout_p, training=self.training)

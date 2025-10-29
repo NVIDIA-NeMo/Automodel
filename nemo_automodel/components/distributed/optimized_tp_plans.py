@@ -29,7 +29,6 @@ from torch.distributed.tensor.parallel import (
     SequenceParallel,
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
-
 # Import model classes for type checking and parallel plan mapping
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForCausalLM,
@@ -42,12 +41,7 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForS
 
 
 class SequenceParallelAllGatherActivation(SequenceParallel):
-    """ColwiseParallel that explicitly all-gathers the output after computation.
-    
-    This is useful when the input tensor is already a DTensor with Shard placement
-    (e.g., from sequence parallelism) and the output needs to be replicated after
-    the column-wise parallel matmul operation.
-    """
+    """SequenceParallel that all-gathers activations for sequence parallelism."""
 
     @staticmethod
     def _prepare_output_fn(use_local_output, mod, outputs, device_mesh):
@@ -62,10 +56,9 @@ class SequenceParallelAllGatherActivation(SequenceParallel):
                 )
         else:
             raise ValueError(f"Expected output to be a DTensor, but got {type(outputs)}")
-        
+
         # Call the parent's prepare_output_fn to handle use_local_output
         return SequenceParallel._prepare_output_fn(use_local_output, mod, outputs, device_mesh)
-
 
 class RotaryEmbedParallel(SequenceParallel):
     """Custom SequenceParallel class for Qwen2 / Gemma3 rotary embeddings because the input is a tuple."""
