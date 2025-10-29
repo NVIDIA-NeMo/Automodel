@@ -66,6 +66,9 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
 
 FROM update_base_container AS automodel_dep
 
+# Install Grouped Gemm
+RUN pip install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
+
 # Install Deepep
 COPY docker/common/deepep.patch /opt/deepep.patch
 ARG INSTALL_DEEPEP=False
