@@ -28,6 +28,8 @@ from nemo_automodel.components.datasets.llm.formatting_utils import (
     format_prompt_completion,
 )
 
+logger = logging.getLogger(__name__)
+
 # Supported cases:
 # Format:
 # - Context + question + answer
@@ -195,12 +197,12 @@ class ColumnMappedTextInstructionDataset(Dataset):
 
         assert tokenizer is not None, "Tokenizer is required"
         self.tokenizer = tokenizer
-        if getattr(self.tokenizer, 'pad_token', None) is None:
-            if hasattr(self.tokenizer, 'eos_token'):
+        if getattr(self.tokenizer, "pad_token", None) is None:
+            if hasattr(self.tokenizer, "eos_token"):
                 self.tokenizer.pad_token = self.tokenizer
             else:
                 logger.warning("Setting tokenizer pad_token to ' '. tokenizer does not have `eos_token`.")
-                self.tokenizer.pad_token = ' '
+                self.tokenizer.pad_token = " "
 
         self.dataset = _load_dataset(path_or_dataset_id, split=split, streaming=False, name=name)
 
