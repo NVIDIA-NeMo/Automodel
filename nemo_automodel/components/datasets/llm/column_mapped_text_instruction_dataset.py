@@ -165,8 +165,8 @@ class ColumnMappedTextInstructionDataset(Dataset):
         name: Optional[str] = None,
         answer_only_loss_mask: bool = True,
         seq_length: Optional[int] = None,
-        padding: Union[str, bool] = None,
-        truncation: Union[str, bool] = None,
+        padding: Union[str, bool] = "do_not_pad",
+        truncation: Union[str, bool] = "do_not_truncate",
         start_of_turn_token: Optional[str] = None,
         limit_dataset_samples: Optional[int] = None,
     ) -> None:
@@ -195,6 +195,12 @@ class ColumnMappedTextInstructionDataset(Dataset):
 
         assert tokenizer is not None, "Tokenizer is required"
         self.tokenizer = tokenizer
+        if getattr(self.tokenizer, 'pad_token', None) is None:
+            if hasattr(self.tokenizer, 'eos_token'):
+                self.tokenizer.pad_token = self.tokenizer
+            else:
+                logger.warning("Setting tokenizer pad_token to ' '. tokenizer does not have `eos_token`.")
+                self.tokenizer.pad_token = ' '
 
         self.dataset = _load_dataset(path_or_dataset_id, split=split, streaming=False, name=name)
 
