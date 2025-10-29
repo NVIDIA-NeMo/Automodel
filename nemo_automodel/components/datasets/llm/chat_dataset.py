@@ -133,6 +133,8 @@ class ChatDataset(Dataset):
         split: Optional[str] = None,
         name: Optional[str] = None,
         seq_length: Optional[int] = None,
+        padding: Union[str, bool] = "do_not_pad",
+        truncation: Union[str, bool] = "do_not_truncate",
         start_of_turn_token: Optional[str] = None,
         chat_template: Optional[str] = None,
     ) -> None:
@@ -149,6 +151,8 @@ class ChatDataset(Dataset):
 
         self.tokenizer = tokenizer
         self.seq_length = seq_length
+        self.padding = padding
+        self.truncation = truncation
         self.start_of_turn_token = start_of_turn_token
 
         self.dataset = _load_openai_messages(path_or_dataset_id, split=split, name=name)
@@ -178,6 +182,8 @@ class ChatDataset(Dataset):
             eos_token_id,
             self.pad_token_id,
             seq_length=self.seq_length,
+            padding=self.padding,
+            truncation=self.truncation,
             tools=tools,
         )
         return sample
