@@ -28,6 +28,8 @@ from nemo_automodel.components.datasets.llm.formatting_utils import (
     format_prompt_completion,
 )
 
+logger = logging.getLogger(__name__)
+
 # Supported cases:
 # Format:
 # - Context + question + answer
@@ -165,6 +167,8 @@ class ColumnMappedTextInstructionDataset(Dataset):
         name: Optional[str] = None,
         answer_only_loss_mask: bool = True,
         seq_length: Optional[int] = None,
+        padding: Union[str, bool] = "do_not_pad",
+        truncation: Union[str, bool] = "do_not_truncate",
         start_of_turn_token: Optional[str] = None,
         limit_dataset_samples: Optional[int] = None,
     ) -> None:
@@ -193,6 +197,12 @@ class ColumnMappedTextInstructionDataset(Dataset):
 
         assert tokenizer is not None, "Tokenizer is required"
         self.tokenizer = tokenizer
+        if getattr(self.tokenizer, "pad_token", None) is None:
+            if hasattr(self.tokenizer, "eos_token"):
+                self.tokenizer.pad_token = self.tokenizer
+            else:
+                logger.warning("Setting tokenizer pad_token to ' '. tokenizer does not have `eos_token`.")
+                self.tokenizer.pad_token = " "
 
         self.dataset = _load_dataset(path_or_dataset_id, split=split, streaming=False, name=name)
 
@@ -226,6 +236,8 @@ class ColumnMappedTextInstructionDataset(Dataset):
         self.answer_only_loss_mask = answer_only_loss_mask
         self.start_of_turn_token = start_of_turn_token
         self.seq_length = seq_length
+        self.padding = padding
+        self.truncation = truncation
 
     def __len__(self) -> int:  # noqa: D401
         """
@@ -255,6 +267,8 @@ class ColumnMappedTextInstructionDataset(Dataset):
         row = self.dataset[idx]
         mapped = {dest: row[src] for dest, src in self.column_mapping.items() if src in row}
         mapped = self._apply_tokenizer(mapped)
+        if not any(label != -100 for label in mapped["labels"]):
+            return self.__getitem__((idx + 1) % len(self.dataset))
         assert _check_all_values_equal_length(mapped), "All values must be of the same length"
         return mapped
 
@@ -293,6 +307,8 @@ class ColumnMappedTextInstructionDataset(Dataset):
                 eos_token_id,
                 pad_token_id,
                 seq_length=self.seq_length,
+                padding=self.padding,
+                truncation=self.truncation,
             )
         else:
             prompt = " ".join(filter(lambda x: x is not None, (context, question, "")))
@@ -304,5 +320,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
                 eos_token_id,
                 pad_token_id,
                 seq_length=self.seq_length,
+                padding=self.padding,
+                truncation=self.truncation,
                 answer_only_loss_mask=self.answer_only_loss_mask,
             )
