@@ -112,18 +112,6 @@ moe = [
     # "flash-attn==2.7.4.post1",
     # "grouped_gemm",
 ]
-deepep = [
-    "nvidia-nvshmem-cu13",
-]
-dev = [
-    "nemo_automodel[fa]",
-    "nemo_automodel[vlm]",
-]
-all = [
-    "nemo_automodel[deepep]",
-    "nemo_automodel[fa]",
-    "nemo_automodel[vlm]",
-]
 
 [project.urls]
 Homepage = "https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/stable/"
@@ -162,7 +150,7 @@ explicit = true
 
 [[tool.uv.index]]
 name = "pytorch"
-url = "https://download.pytorch.org/whl/cu128"
+url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
 [tool.uv.sources]

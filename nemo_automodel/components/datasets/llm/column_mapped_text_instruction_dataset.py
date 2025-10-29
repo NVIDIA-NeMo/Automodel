@@ -28,6 +28,8 @@ from nemo_automodel.components.datasets.llm.formatting_utils import (
     format_prompt_completion,
 )
 
+logger = logging.getLogger(__name__)
+
 # Supported cases:
 # Format:
 # - Context + question + answer
@@ -81,10 +83,15 @@ def _str_is_hf_repo_id(val: str) -> bool:
     Returns:
         True if the string is a valid huggingface dataset id, False otherwise.
     """
-    return re.match(r"^[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+$", val) is not None and not Path(val).exists()
+    return re.match(r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$", val) is not None and not Path(val).exists()
 
 
-def _load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str] = None, streaming: bool = False):
+def _load_dataset(
+    path_or_dataset_id: Union[str, List[str]],
+    split: Optional[str] = None,
+    streaming: bool = False,
+    name: Optional[str] = None,
+):
     """Load a dataset either from the Hugging Face Hub or from local JSON/JSONL files.
 
     If *path_or_dataset_id* resembles a HF repo ID (i.e. of the form
@@ -99,13 +106,19 @@ def _load_dataset(path_or_dataset_id: Union[str, List[str]], split: Optional[str
         split: Optional split to load when retrieving a remote dataset. This
             parameter is ignored for local files as the *json* script always
             returns a single split.
+        streaming: Whether to stream the dataset.
+        name: Optional name of the dataset configuration/subset to load
 
     Returns:
         datasets.Dataset: The loaded dataset.
     """
     if isinstance(path_or_dataset_id, str) and _str_is_hf_repo_id(path_or_dataset_id):
         return load_dataset(
-            path_or_dataset_id, split=split, streaming=streaming, verification_mode=VerificationMode.NO_CHECKS
+            path_or_dataset_id,
+            name=name,
+            split=split,
+            streaming=streaming,
+            verification_mode=VerificationMode.NO_CHECKS,
         )
 
     data_files = list(make_iterable(path_or_dataset_id))
@@ -151,8 +164,11 @@ class ColumnMappedTextInstructionDataset(Dataset):
         tokenizer,
         *,
         split: Optional[str] = None,
+        name: Optional[str] = None,
         answer_only_loss_mask: bool = True,
         seq_length: Optional[int] = None,
+        padding: Union[str, bool] = "do_not_pad",
+        truncation: Union[str, bool] = "do_not_truncate",
         start_of_turn_token: Optional[str] = None,
         limit_dataset_samples: Optional[int] = None,
     ) -> None:
@@ -164,6 +180,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
             column_mapping: The mapping of the columns.
             tokenizer: The tokenizer to use.
             split: The split of the dataset to load.
+            name: The name of the dataset configuration/subset to load
             answer_only_loss_mask: Whether to compute the loss mask only on the answer tokens.
             seq_length: The sequence length to use for padding.
             start_of_turn_token: The token to use to indicate the start of a turn.
@@ -180,8 +197,14 @@ class ColumnMappedTextInstructionDataset(Dataset):
 
         assert tokenizer is not None, "Tokenizer is required"
         self.tokenizer = tokenizer
+        if getattr(self.tokenizer, "pad_token", None) is None:
+            if hasattr(self.tokenizer, "eos_token"):
+                self.tokenizer.pad_token = self.tokenizer
+            else:
+                logger.warning("Setting tokenizer pad_token to ' '. tokenizer does not have `eos_token`.")
+                self.tokenizer.pad_token = " "
 
-        self.dataset = _load_dataset(path_or_dataset_id, split=split, streaming=False)
+        self.dataset = _load_dataset(path_or_dataset_id, split=split, streaming=False, name=name)
 
         if limit_dataset_samples is not None:
             self.dataset = self.dataset.select(range(limit_dataset_samples))
@@ -213,6 +236,8 @@ class ColumnMappedTextInstructionDataset(Dataset):
         self.answer_only_loss_mask = answer_only_loss_mask
         self.start_of_turn_token = start_of_turn_token
         self.seq_length = seq_length
+        self.padding = padding
+        self.truncation = truncation
 
     def __len__(self) -> int:  # noqa: D401
         """
@@ -242,6 +267,8 @@ class ColumnMappedTextInstructionDataset(Dataset):
         row = self.dataset[idx]
         mapped = {dest: row[src] for dest, src in self.column_mapping.items() if src in row}
         mapped = self._apply_tokenizer(mapped)
+        if not any(label != -100 for label in mapped["labels"]):
+            return self.__getitem__((idx + 1) % len(self.dataset))
         assert _check_all_values_equal_length(mapped), "All values must be of the same length"
         return mapped
 
@@ -280,6 +307,8 @@ class ColumnMappedTextInstructionDataset(Dataset):
                 eos_token_id,
                 pad_token_id,
                 seq_length=self.seq_length,
+                padding=self.padding,
+                truncation=self.truncation,
             )
         else:
             prompt = " ".join(filter(lambda x: x is not None, (context, question, "")))
@@ -291,5 +320,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
                 eos_token_id,
                 pad_token_id,
                 seq_length=self.seq_length,
+                padding=self.padding,
+                truncation=self.truncation,
                 answer_only_loss_mask=self.answer_only_loss_mask,
             )

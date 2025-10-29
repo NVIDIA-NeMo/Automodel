@@ -246,11 +246,13 @@ class ConfigNode:
                 "Instantiation failed for `{}`\n"
                 "Accepted signature : {}\n"
                 "Positional args    : {}\n"
-                "Keyword args       : {}\n".format(
+                "Keyword args       : {}\n"
+                "Exception          : {}\n".format(
                     func.__name__,
                     sig,
                     args,
                     pprint.pformat(config_kwargs, compact=True, indent=4),
+                    e,
                 ),
                 file=sys.stderr,
             )
