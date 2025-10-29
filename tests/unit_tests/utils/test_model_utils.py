@@ -64,6 +64,7 @@ def test_print_trainable_parameters_counts(dummy_model, caplog, monkeypatch):
     and prints to stdout only when rank == 0.
     """
     import logging
+    level = caplog.level
     caplog.set_level(logging.DEBUG)
     dummy_model.other.weight.requires_grad = False
     trainable, total = model_utils.print_trainable_parameters(dummy_model)
@@ -74,6 +75,7 @@ def test_print_trainable_parameters_counts(dummy_model, caplog, monkeypatch):
     # Check logging output
     assert "Trainable parameters" in caplog.text
     assert "Total parameters" in caplog.text
+    caplog.set_level(level)
 
 def test_print_trainable_parameters_non_zero_rank(dummy_model, capsys, monkeypatch):
     """
