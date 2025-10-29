@@ -22,8 +22,14 @@ This module provides thin wrappers to:
 from __future__ import annotations
 
 import logging
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    from torchao.quantization.qat.api import FakeQuantizeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +114,104 @@ def prepare_qat_model(model, quantizer) -> tuple[object, Optional[str]]:
     return model, mode
 
 
+try:
+    # Import Nemo's LoRA base to identify patched Linear modules
+    from nemo_automodel.components._peft.lora import LinearLoRA
+except Exception:  # pragma: no cover - optional dependency
+    LinearLoRA = None  # type: ignore
+
+
+def _attach_qat_to_lora_linear(
+    linear: nn.Module,
+    activation_qat_config: Optional["FakeQuantizeConfig"],
+    weight_qat_config: Optional["FakeQuantizeConfig"],
+) -> None:
+    """In-place augment a LoRA-patched Linear with QAT fake-quantizers and QAT forward.
+
+    This preserves parameter names and FQNs by swapping the class of the existing module.
+    """
+    if not HAVE_TORCHAO_QAT:
+        raise ImportError("torchao QAT is not available. Please install torchao>=0.7.0")
+
+    try:
+        from torchao.quantization.qat.api import FakeQuantizeConfig  # type: ignore
+        from torchao.quantization.qat.fake_quantizer import FakeQuantizer  # type: ignore
+    except Exception as err:  # pragma: no cover - optional dependency
+        raise ImportError("QAT helpers require torchao>=0.7.0") from err
+
+    # Basic validity checks
+    if getattr(linear, "bias", None) is not None:
+        raise ValueError("Bias is not supported in QAT + LoRA yet")
+    if getattr(linear, "quant_state", None) is not None:
+        raise ValueError("QLoRA base quantization is not compatible with QAT + LoRA")
+
+    # Validate config types if provided and instantiate fake quantizers
+    if activation_qat_config is not None and not isinstance(activation_qat_config, FakeQuantizeConfig):
+        raise TypeError("activation_qat_config must be a torchao FakeQuantizeConfig or None")
+    if weight_qat_config is not None and not isinstance(weight_qat_config, FakeQuantizeConfig):
+        raise TypeError("weight_qat_config must be a torchao FakeQuantizeConfig or None")
+
+    activation_fake_quantizer = FakeQuantizer(activation_qat_config) if activation_qat_config else nn.Identity()
+    weight_fake_quantizer = FakeQuantizer(weight_qat_config) if weight_qat_config else nn.Identity()
+
+    # Attach as attributes so they are part of the state dict
+    setattr(linear, "activation_fake_quantizer", activation_fake_quantizer)
+    setattr(linear, "weight_fake_quantizer", weight_fake_quantizer)
+
+    # Define the QAT forward; keep LoRA path identical and fake-quantize only base path
+    def qat_lora_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:  # noqa: ANN001
+        _x = self.activation_fake_quantizer(x)
+        w = self.weight_fake_quantizer(self.weight)
+        out = F.linear(_x, w, None)
+
+        if getattr(self, "dropout_position", "post") == "pre":
+            x = F.dropout(x, p=getattr(self, "dropout_p", 0.0), training=self.training)
+        lora_res = self.lora_B(self.lora_A(x))
+        lora_res = lora_res * getattr(self, "scale", 1.0)
+        if getattr(self, "dropout_position", "post") == "post":
+            lora_res = F.dropout(lora_res, p=getattr(self, "dropout_p", 0.0), training=self.training)
+        return out + lora_res
+
+    # Swap class to inject the new forward while preserving MRO and parameters
+    NewCls = type("QAT" + linear.__class__.__name__, (linear.__class__,), {"forward": qat_lora_forward})
+    linear.__class__ = NewCls
+
+
+def swap_lora_linear_with_qat(
+    module: nn.Module,
+    # TODO: make the types Optional[FakeQuantizeConfig] once torchao 0.7+ is default
+    activation_qat_config: Optional["FakeQuantizeConfig"] = None,
+    weight_qat_config: Optional["FakeQuantizeConfig"] = None,
+) -> None:
+    """Swap all Nemo LoRA-patched Linear layers with QAT-enabled versions.
+
+    The resulting computation becomes:
+        x -> fake_quantize(W_frozen) @ fake_quantize(x) + BAx
+
+    Args:
+        module: Root module to traverse.
+        activation_qat_config: torchao FakeQuantizeConfig for input activations.
+        weight_qat_config: torchao FakeQuantizeConfig for base weights.
+    """
+    for name, child in module.named_children():
+        # Identify Nemo LoRA-patched linears by isinstance to LinearLoRA or the presence of lora attributes
+        is_nemo_lora = False
+        if LinearLoRA is not None and isinstance(child, LinearLoRA):
+            is_nemo_lora = True
+        elif (
+            hasattr(child, "lora_A")
+            and hasattr(child, "lora_B")
+            and isinstance(getattr(child, "weight", None), torch.Tensor)
+        ):
+            is_nemo_lora = True
+
+        if is_nemo_lora:
+            _attach_qat_to_lora_linear(child, activation_qat_config, weight_qat_config)
+            continue
+
+        swap_lora_linear_with_qat(child, activation_qat_config, weight_qat_config)
+
+
 __all__ = [
     "HAVE_TORCHAO_QAT",
     "get_quantizer_mode",
@@ -115,5 +219,3 @@ __all__ = [
     "get_enable_fake_quant_fn",
     "prepare_qat_model",
 ]
-
-
