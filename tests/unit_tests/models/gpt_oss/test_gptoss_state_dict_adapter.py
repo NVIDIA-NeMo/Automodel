@@ -23,7 +23,9 @@ from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSSt
 
 class TestApplyKeyMapping:
     def _make_adapter(self):
-        return GPTOSSStateDictAdapter(config=object(), moe_config=object(), backend=object(), dtype=torch.float32)
+        backend = Mock(spec=BackendConfig)
+        backend.attn = "flex"
+        return GPTOSSStateDictAdapter(config=object(), moe_config=object(), backend=backend, dtype=torch.float32)
 
     def test_exact_suffix_replacement(self):
         adapter = self._make_adapter()
@@ -428,7 +430,9 @@ class TestGPTOSSStateDictAdapter:
 
 class TestConvertMoePackedTensors:
     def _make_adapter(self):
-        return GPTOSSStateDictAdapter(config=object(), moe_config=object(), backend=object(), dtype=torch.float32)
+        backend = Mock(spec=BackendConfig)
+        backend.attn = "flex"
+        return GPTOSSStateDictAdapter(config=object(), moe_config=object(), backend=backend, dtype=torch.float32)
 
     def test_convert_basic_nibble_decode_and_shape(self):
         adapter = self._make_adapter()
@@ -593,7 +597,9 @@ class TestConvertMoePackedTensors:
 
 class TestSingleGPUScenarios:
     def _make_adapter(self):
-        return GPTOSSStateDictAdapter(config=object(), moe_config=object(), backend=object(), dtype=torch.float32)
+        backend = Mock(spec=BackendConfig)
+        backend.attn = "flex"
+        return GPTOSSStateDictAdapter(config=object(), moe_config=object(), backend=backend, dtype=torch.float32)
 
     def test_convert_single_gpu_stays_on_cpu(self):
         adapter = self._make_adapter()
@@ -671,7 +677,9 @@ class TestSingleGPUScenarios:
 
 class TestDTensorPaths:
     def _make_adapter(self):
-        return GPTOSSStateDictAdapter(config=object(), moe_config=object(), backend=object(), dtype=torch.float32)
+        backend = Mock(spec=BackendConfig)
+        backend.attn = "flex"
+        return GPTOSSStateDictAdapter(config=object(), moe_config=object(), backend=backend, dtype=torch.float32)
 
     def test_add_quantization_block_scale_tensors_dtensor_path(self):
         adapter = self._make_adapter()
