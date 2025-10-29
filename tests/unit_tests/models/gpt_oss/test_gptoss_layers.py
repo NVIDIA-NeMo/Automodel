@@ -22,6 +22,7 @@ from nemo_automodel.components.models.gpt_oss.layers import (
     GptOssAttention,
 )
 from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.shared.import_utils import is_te_min_version
 
 
 @pytest.fixture
@@ -188,6 +189,7 @@ class TestGptOssAttention:
             pytest.fail(f"Forward pass failed with rotary embedding: {e}")
 
 
+@pytest.mark.skipif(not is_te_min_version("2.8.0"), reason="TE version 2.8.0 or higher is required")
 class TestGptOssAttentionWithTE:
     """Test GptOssAttention with Transformer Engine backend."""
 
