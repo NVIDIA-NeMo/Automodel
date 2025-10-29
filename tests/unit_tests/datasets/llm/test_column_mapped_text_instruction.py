@@ -67,7 +67,7 @@ class _DummyTokenizer:  # noqa: D401
         self.bos_token_id = 2
         self._counter = 3  # Start token IDs from 3 to avoid conflicts
 
-    def __call__(self, text: str, add_special_tokens: bool = True):  # noqa: D401
+    def __call__(self, text: str, add_special_tokens: bool = True, padding=None, truncation=None, max_length=None):  # noqa: D401
         """Mimic the Hugging Face tokenizer ``__call__`` API.
 
         The real tokenizer would convert *text* into a list of integer token IDs.

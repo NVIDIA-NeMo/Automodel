@@ -58,7 +58,7 @@ class _StubTokenizerPlain:  # noqa: D401 – minimal interface only
             self._cursor += 1
         return self._vocab[tok]
 
-    def __call__(self, text: str, *, add_special_tokens: bool = True):  # type: ignore[override]
+    def __call__(self, text: str, *, add_special_tokens: bool = True, padding=None, truncation=None, max_length=None):  # type: ignore[override]
         ids: List[int] = []
         if add_special_tokens:
             ids.append(self.bos_token_id)
