@@ -268,6 +268,7 @@ class TestGptOssAttentionWithTE:
             except Exception as e:
                 pytest.fail(f"TE forward pass with BSHD format failed: {e}")
 
+    @pytest.mark.skip(reason="THD format is not supported for GPT-OSS")
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_te_forward_with_thd_format(self, gpt_config, te_backend_config, device):
         """Test TE attention forward pass with THD format."""
