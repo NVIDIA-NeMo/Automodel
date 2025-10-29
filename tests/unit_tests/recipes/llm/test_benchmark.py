@@ -22,6 +22,14 @@ import torch
 from nemo_automodel.recipes.llm.benchmark import BenchmarkingRecipeForNextTokenPrediction
 
 
+class ConfigNamespace(SimpleNamespace):
+    """A SimpleNamespace that also supports dict-like .get() method."""
+
+    def get(self, key, default=None):
+        """Get attribute with a default value like a dict."""
+        return getattr(self, key, default)
+
+
 @pytest.fixture
 def patch_torch_distributed_for_benchmark():
     """
@@ -64,7 +72,7 @@ def patch_torch_distributed_for_benchmark():
 @pytest.fixture
 def mock_config():
     """Create a mock configuration for testing."""
-    config = SimpleNamespace(
+    config = ConfigNamespace(
         benchmark=SimpleNamespace(
             warmup_steps=10,
             peak_tflops=989,
@@ -127,6 +135,11 @@ def mock_recipe(mock_config):
         recipe._bench_nsys_end = -1
         recipe._bench_nsys_ranks = []
         recipe._bench_seq_len = 2048
+        recipe._bench_json_output_path = None
+        recipe._wandb_enabled = False
+        recipe.wandb_run = None
+        recipe._dp_allreduce = MagicMock(side_effect=lambda x, include_cp=False: x)
+        recipe.device_mesh = None
         return recipe
 
 
@@ -210,7 +223,13 @@ class TestBenchmarkingRecipeRunBenchmark:
     def test_run_benchmark_sets_models_to_train_mode(self, mock_recipe):
         """Test that run_benchmark sets all models to training mode."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
-        mock_recipe._forward_backward_step = MagicMock()
+
+        # Mock _forward_backward_step to append loss to loss_buffer
+        def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):
+            if loss_buffer is not None:
+                loss_buffer.append(torch.tensor(0.5))
+
+        mock_recipe._forward_backward_step = MagicMock(side_effect=mock_forward_backward_step)
         # Mock timers to return a dict with the expected structure
         mock_recipe.timers._get_global_min_max_time = MagicMock(
             return_value={"iteration_warmup": (0.0, 1.0), "iteration": (0.0, 1.0)}
@@ -246,7 +265,13 @@ class TestBenchmarkingRecipeRunBenchmark:
     def test_run_benchmark_calculates_gradient_accumulation_steps(self, mock_recipe):
         """Test that gradient accumulation steps are calculated correctly."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
-        mock_recipe._forward_backward_step = MagicMock()
+
+        # Mock _forward_backward_step to append loss to loss_buffer
+        def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):
+            if loss_buffer is not None:
+                loss_buffer.append(torch.tensor(0.5))
+
+        mock_recipe._forward_backward_step = MagicMock(side_effect=mock_forward_backward_step)
         # Mock timers to return a dict with the expected structure
         mock_recipe.timers._get_global_min_max_time = MagicMock(
             return_value={"iteration_warmup": (0.0, 1.0), "iteration": (0.0, 1.0)}
@@ -285,7 +310,13 @@ class TestBenchmarkingRecipeRunBenchmark:
     def test_run_benchmark_zero_grads_per_iteration(self, mock_recipe):
         """Test that gradients are zeroed at the start of each iteration."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
-        mock_recipe._forward_backward_step = MagicMock()
+
+        # Mock _forward_backward_step to append loss to loss_buffer
+        def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):
+            if loss_buffer is not None:
+                loss_buffer.append(torch.tensor(0.5))
+
+        mock_recipe._forward_backward_step = MagicMock(side_effect=mock_forward_backward_step)
         # Mock timers to return a dict with the expected structure
         mock_recipe.timers._get_global_min_max_time = MagicMock(
             return_value={"iteration_warmup": (0.0, 1.0), "iteration": (0.0, 1.0)}
@@ -321,7 +352,13 @@ class TestBenchmarkingRecipeRunBenchmark:
     def test_run_benchmark_optimizer_step_per_iteration(self, mock_recipe):
         """Test that optimizer step is called once per iteration."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
-        mock_recipe._forward_backward_step = MagicMock()
+
+        # Mock _forward_backward_step to append loss to loss_buffer
+        def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):
+            if loss_buffer is not None:
+                loss_buffer.append(torch.tensor(0.5))
+
+        mock_recipe._forward_backward_step = MagicMock(side_effect=mock_forward_backward_step)
         # Mock timers to return a dict with the expected structure
         mock_recipe.timers._get_global_min_max_time = MagicMock(
             return_value={"iteration_warmup": (0.0, 1.0), "iteration": (0.0, 1.0)}
@@ -373,7 +410,7 @@ class TestBenchmarkingRecipeHelpers:
 
     def test_init_requires_benchmark_section(self):
         """Test that __init__ raises error if benchmark section is missing."""
-        config_without_benchmark = SimpleNamespace(
+        config_without_benchmark = ConfigNamespace(
             step_scheduler=SimpleNamespace(max_steps=30),
             dataset=SimpleNamespace(seq_len=2048),
         )
