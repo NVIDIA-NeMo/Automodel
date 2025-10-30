@@ -1,14 +1,14 @@
 # Contributing To NeMo-Automodel
 
-## Building a NeMo-Automodel container
+## Building NeMo-Automodel container
 
-* Run the following command to build your container:
+* Testing and validation occurs through the Automodel container. This is the primary and recommended path for development. Container can be built using the following command:
 
 ```bash
 # Set build arguments
-export AUTOMODEL_INSTALL=dev #[all, dev, deepep, fa, moe, vlm]
-export BASE_IMAGE=cuda #[cuda, pytorch]
-export INSTALL_DEEPEP=False #[True, False]
+export AUTOMODEL_INSTALL=vlm #[fa, moe, vlm]
+export BASE_IMAGE=pytorch #[cuda, pytorch]
+export INSTALL_DEEPEP=True #[True, False]
 
 docker build -f docker/Dockerfile \
 --build-arg AUTOMODEL_INSTALL=$AUTOMODEL_INSTALL \
@@ -17,10 +17,42 @@ docker build -f docker/Dockerfile \
 -t automodel --target=automodel_final .
 ```
 
+* All testing is currently executed with PyTorch base image. This is the recommended installation path.
+
 * Run the following command to start your container:
 
 ```bash
 docker run --rm -it --entrypoint bash --runtime nvidia --gpus all automodel
+```
+
+## Installing dependencies from source
+
+* Install Transformer Engine from source:
+
+```bash
+git clone https://github.com/NVIDIA/TransformerEngine.git
+cd TransformerEngine
+git checkout <commit_hash>
+git submodule init && git submodule update
+pip install nvidia-mathdx==25.1.1
+env NVTE_CUDA_ARCHS="80;90;100;120" NVTE_BUILD_THREADS_PER_JOB=8 pip install --no-cache-dir --no-build-isolation -v .
+```
+
+* Install Grouped Gemm:
+
+```bash
+RUN pip install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
+```
+
+* Install DeepEP from source:
+
+```bash
+git clone https://github.com/deepseek-ai/DeepEP.git
+cd DeepEP
+git checkout <commit_hash>
+patch -p1 < <path_to_Automodel/docker/common/deepep.patch
+pip install --no-cache-dir nvidia-nvshmem-cu13
+TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install --no-cache-dir --no-build-isolation -v .
 ```
 
 ## Development Dependencies
