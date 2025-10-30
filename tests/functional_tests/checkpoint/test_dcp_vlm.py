@@ -617,7 +617,7 @@ def test_vlm_dcp_checkpoint():
     )
 
     # check if new model and current model give the same CE loss
-    val_batch = next(iter(trainer.val_dataloader))
+    val_batch = next(iter(trainer.val_dataloaders['default']))
     restored_model = FinetuneRecipeForVLM(cfg)
     restored_model.setup()
     restored_model = restored_model.model

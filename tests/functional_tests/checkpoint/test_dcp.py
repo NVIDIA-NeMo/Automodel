@@ -870,7 +870,7 @@ def test_dcp_checkpoint():
     )
 
     # check if new model and current model give the same CE loss
-    val_batch = next(iter(trainer.val_dataloaders[0]))
+    val_batch = next(iter(trainer.val_dataloaders['default']))
     restored_model = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     restored_model.setup()
     source_model_loss = get_validation_loss(trainer.model_parts, val_batch, trainer.loss_fn, trainer.dist_env.device, trainer.pp_enabled, trainer.pp)
