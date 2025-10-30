@@ -177,39 +177,15 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
             for batches in self.step_scheduler:
-                loss = self._train_one_step(batches)
-                # log
-                log = MetricsSample(
-                    step=self.step_scheduler.step,
-                    epoch=self.step_scheduler.epoch,
-                    metrics={
-                        "loss": loss,
-                        "lr": self.optimizer[0].param_groups[0]["lr"],
-                        "mem": torch.cuda.max_memory_allocated() / 1024**3,
-                        "tps": 0.0,
-                        "tps_per_gpu": 0.0,
-                        "num_tokens_per_step": 0,
-                        "num_label_tokens": 0,
-                    },
-                )
-                self.log_train_metrics(log)
+                train_log_data = self._run_train_optim_step(batches)
+                self.log_train_metrics(train_log_data)
 
                 if self.step_scheduler.is_ckpt_step:
                     self.save_checkpoint(epoch, self.step_scheduler.step)
 
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                    val_loss = self._validate_one_epoch(self.val_dataloader)
-                    vlog = MetricsSample(
-                        step=self.step_scheduler.step,
-                        epoch=self.step_scheduler.epoch,
-                        metrics={
-                            "val_loss": val_loss,
-                            "lr": self.optimizer[0].param_groups[0]["lr"],
-                            "num_label_tokens": 0,
-                            "mem": torch.cuda.max_memory_allocated() / 1024**3,
-                        },
-                    )
-                    self.log_val_metrics(vlog)
+                    val_log_data = self._validate_one_epoch(self.val_dataloader)
+                    self.log_val_metrics(val_log_data)
                     for mp in self.model_parts:
                         mp.train()
 
@@ -217,7 +193,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         self.metric_logger_valid.close()
         self.checkpointer.close()
 
-    def _train_one_step(self, batches):
+    def _run_train_optim_step(self, batches):
         model = self.model_parts[0]
         losses = []
         for i, batch in enumerate(batches):
@@ -242,9 +218,21 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                     scheduler.step(1)
 
         total_loss = torch.sum(torch.stack(losses))
-        total_loss = self._dp_allreduce(total_loss, include_cp=True).cpu().item()
-        return total_loss / len(batches)
-
+        total_loss = self._dp_allreduce(total_loss, include_cp=True).detach()
+        loss = total_loss / len(batches)
+        return MetricsSample(
+            step=self.step_scheduler.step,
+            epoch=self.step_scheduler.epoch,
+            metrics={
+                "loss": loss,
+                "lr": self.optimizer[0].param_groups[0]["lr"],
+                "mem": torch.cuda.max_memory_allocated() / 1024**3,
+                "tps": 0.0,
+                "tps_per_gpu": 0.0,
+                "num_tokens_per_step": 0,
+                "num_label_tokens": 0,
+            },
+        )
     @torch.no_grad()
     def _validate_one_epoch(self, dataloader):
         model = self.model_parts[0]
@@ -263,10 +251,19 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 if logits.dim() == 3
                 else self.loss_fn(logits, labels)
             )
-            total_loss += loss.detach().cpu().item()
+            total_loss += loss.detach()
             count += 1
         total_loss = total_loss if count == 0 else total_loss / count
-        return total_loss
+        return MetricsSample(
+            step=self.step_scheduler.step,
+            epoch=self.step_scheduler.epoch,
+            metrics={
+                "val_loss": total_loss,
+                "lr": self.optimizer[0].param_groups[0]["lr"],
+                "num_label_tokens": 0,
+                "mem": torch.cuda.max_memory_allocated() / 1024**3,
+            },
+        )
 
 
     def log_val_metrics(self, log_data):
