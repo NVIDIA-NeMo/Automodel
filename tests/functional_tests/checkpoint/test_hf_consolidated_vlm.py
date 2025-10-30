@@ -519,7 +519,7 @@ def test_consolidated_vlm_checkpoint():
     )
 
     # check if newly restored model and current model give the same CE loss
-    val_batch = next(iter(trainer.val_dataloaders['default']))
+    val_batch = next(iter(trainer.val_dataloader))
     restored_model = FinetuneRecipeForVLM(cfg)
     restored_model.setup()
     restored_model = restored_model.model
