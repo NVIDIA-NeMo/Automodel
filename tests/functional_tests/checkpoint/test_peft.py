@@ -1962,7 +1962,7 @@ def test_hf_peft_checkpoint(use_triton=False):
     _compare_dicts(expected_automodel_peft_config, restored_automodel_peft_config)
 
     # check if new model and current model give the same CE loss
-    val_batch = next(iter(trainer.val_dataloader))
+    val_batch = next(iter(trainer.val_dataloader[0]))
     restored_model = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     restored_model.setup()
     restored_model = restored_model.model_parts[0]
