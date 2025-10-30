@@ -50,7 +50,7 @@ RUN pip install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
 git clone https://github.com/deepseek-ai/DeepEP.git
 cd DeepEP
 git checkout <commit_hash>
-patch -p1 < <path_to_Automodel/docker/common/deepep.patch
+patch -p1 < <path_to_Automodel>/docker/common/deepep.patch
 pip install --no-cache-dir nvidia-nvshmem-cu13
 TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install --no-cache-dir --no-build-isolation -v .
 ```
