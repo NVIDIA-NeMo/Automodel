@@ -66,10 +66,13 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
 
 FROM update_base_container AS automodel_dep
 
+# Install Grouped Gemm
+RUN pip install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
+
 # Install Deepep
 COPY docker/common/deepep.patch /opt/deepep.patch
 ARG INSTALL_DEEPEP=False
-ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
+ARG DEEPEP_COMMIT=ef73fd9a4c098e09929e48dfd696505ddc8e2043
 RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     git clone https://github.com/deepseek-ai/DeepEP.git && \
     cd DeepEP && \

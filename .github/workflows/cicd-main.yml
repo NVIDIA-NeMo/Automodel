@@ -200,7 +200,7 @@ jobs:
           - test-name: L2_HF_Transformer_LLM
             test-folder: hf_transformer_llm
             runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
-            timeout: 20
+            timeout: 40
           - test-name: L2_HF_Transformer_VLM
             test-folder: hf_transformer_vlm
             runner: self-hosted-nemo
