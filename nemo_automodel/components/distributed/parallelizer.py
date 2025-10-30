@@ -377,6 +377,10 @@ def get_parallelization_strategy(model: nn.Module) -> ParallelizationStrategy:
     model_name = type(model).__name__
     return PARALLELIZATION_STRATEGIES.get(model_name, _DEFAULT_STRATEGY)
 
+def register_parallel_strategy(cls):
+    """Decorator to register out-of-tree parallelism strategies"""
+    PARALLELIZATION_STRATEGIES[cls.__name__] = cls()
+    return cls
 
 def apply_fsdp2_sharding_recursively(
     module: nn.Module,
