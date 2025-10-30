@@ -50,17 +50,19 @@ class Qwen3MoeAttention(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = getattr(config, "head_dim", config.hidden_size // self.num_heads)
 
+        attention_bias = getattr(config, 'attention_bias', False)
+
         self.q_proj = initialize_linear_module(
-            backend.linear, config.hidden_size, self.num_heads * self.head_dim, False
+            backend.linear, config.hidden_size, self.num_heads * self.head_dim, attention_bias
         )
         self.k_proj = initialize_linear_module(
-            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, False
+            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, attention_bias
         )
         self.v_proj = initialize_linear_module(
-            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, False
+            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, attention_bias
         )
         self.o_proj = initialize_linear_module(
-            backend.linear, self.num_heads * self.head_dim, config.hidden_size, False
+            backend.linear, self.num_heads * self.head_dim, config.hidden_size, attention_bias
         )
 
         # Per-head RMSNorm
@@ -130,5 +132,7 @@ class Qwen3MoeAttention(nn.Module):
         linear_list = [self.q_proj, self.k_proj, self.v_proj, self.o_proj]
         for linear in linear_list:
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
+            if hasattr(linear, 'bias') and linear.bias is not None:
+                nn.init.zeros_(linear.bias)
         for norm in (self.q_norm, self.k_norm):
             norm.reset_parameters()
