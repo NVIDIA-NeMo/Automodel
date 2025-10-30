@@ -35,18 +35,17 @@ model:
   _target_: transformers.Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
 
-
-# peft:
-#   _target_: nemo_automodel.components._peft.lora.PeftConfig
-#   match_all_linear: False
-#   exclude_modules:  # exclude all vision/audio modules and lm_head
-#     - "*visual*"
-#     - "*vision*"         # Vision encoder
-#     - "*audio*"   # Audio encoder
-#     - "*lm_head*"       # Output layer
-#   dim: 8
-#   alpha: 32
-#   use_triton: False
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: False
+  exclude_modules:  # exclude all vision/audio modules and lm_head
+    - "*visual*"
+    - "*vision*"         # Vision encoder
+    - "*audio*"   # Audio encoder
+    - "*lm_head*"       # Output layer
+  dim: 8
+  alpha: 32
+  use_triton: False
 
 checkpoint:
   enabled: true
@@ -56,7 +55,7 @@ checkpoint:
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: none
-  tp_size: 4
+  tp_size: 2
   cp_size: 1
   sequence_parallel: false
 
