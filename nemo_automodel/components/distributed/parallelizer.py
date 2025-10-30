@@ -40,6 +40,10 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
+
+# Import model-specific tensor parallel plans from the dedicated module
+from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE_FUNCTIONS
+from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
 )
@@ -65,10 +69,6 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
     Qwen2VLForConditionalGeneration,
 )
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
-
-# Import model-specific tensor parallel plans from the dedicated module
-from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE_FUNCTIONS
-from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
 
 # TODO(boxiangw): Change to MegatronFSDP once it got published
 HAVE_MEGATRON_FSDP = False
@@ -391,7 +391,7 @@ def apply_fsdp2_sharding_recursively(
     to each module. For ModuleList instances (commonly used for transformer layers),
     it applies an optimization where the last layer doesn't reshard after forward
     since FSDP2 will prefetch it immediately.
-    
+
     Handles both single-level and nested ModuleList structures. If a ModuleList
     contains other ModuleLists, it will recurse into them instead of trying to
     wrap them (since ModuleList doesn't have a forward method).
