@@ -1051,7 +1051,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         qat_mode = None
         if hasattr(model_parts[0], "_qat_mode"):
             qat_mode = getattr(model_parts[0], "_qat_mode")
-        print(qat_mode)
 
         if qat_mode is None:
             return None, None, None
