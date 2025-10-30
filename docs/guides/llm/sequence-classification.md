@@ -2,7 +2,7 @@
 
 ## Introduction
 
-Sequence classification tasks (e.g., sentiment analysis, topic classification, GLUE tasks) map input text to a discrete label. NeMo Automodel provides a lightweight recipe specialized for this setting that plugs into Hugging Face models and datasets with minimal configuration.
+Sequence classification tasks (e.g., sentiment analysis, topic classification, GLUE tasks) map input text to a discrete label. NeMo Automodel provides a lightweight recipe specialized for this setting that integrates with popular pretrained model formats and dataset sources. Integration with Hugging Face is supported.
 
 This guide shows how to train a sequence classification model using the `TrainFinetuneRecipeForSequenceClassification` recipe, including optional Parameter-Efficient Fine-Tuning (LoRA).
 
@@ -97,4 +97,4 @@ torchrun --nproc-per-node=2 -m examples.llm_seq_cls.seq_cls --config examples/ll
 
 ## Inference and Adapters
 
-Checkpoints are HF-native. For PEFT, the recipe saves adapter weights alongside a minimal adapter config. Load them with standard HF + PEFT APIs, similar to the examples in the fine-tune guide.
+Checkpoints are compatible with common tooling, including Hugging Face. For PEFT, the recipe saves adapter weights alongside a minimal adapter config. You can load them with standard APIs (e.g., Hugging Face + PEFT), similar to the examples in the fine-tune guide.
