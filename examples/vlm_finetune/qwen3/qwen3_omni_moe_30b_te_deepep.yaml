@@ -38,48 +38,16 @@ model:
   config:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
+  backend:
+    _target_: nemo_automodel.components.moe.utils.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: te
+    enable_deepep: true
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
   is_meta_device: true
 
-# peft:
-#   _target_: nemo_automodel.components._peft.lora.PeftConfig
-#   match_all_linear: False
-#   exclude_modules:  # exclude all vision/audio modules and lm_head
-#     - "*visual*"
-#     - "*vision*"         # Vision encoder
-#     - "*audio*"   # Audio encoder
-#     - "*lm_head*"       # Output layer
-#   dim: 8
-#   alpha: 32
-#   use_triton: False
-
-# Optional: Override backend defaults (uncomment if needed)
-# backend:
-#   _target_: nemo_automodel.components.moe.utils.BackendConfig
-#   fake_balanced_gate: true        # Enable balanced routing for MoE (default: False)
-#   enable_fsdp_optimizations: true # Enable FSDP2 optimizations (default: False)
-
-# OPTION 2: Direct instantiation (explicit, same result)
-# model:
-#   _target_: nemo_automodel.components.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerForConditionalGeneration.from_config
-#   config:
-#     _target_: transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe.Qwen3OmniMoeThinkerConfig.from_pretrained
-#     pretrained_model_name_or_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
-#   trust_remote_code: true
-#   is_meta_device: true
-#   backend:
-#     _target_: nemo_automodel.components.moe.utils.BackendConfig
-#     attn: te
-#     linear: te
-#     rms_norm: te
-#     enable_deepep: true
-#     fake_balanced_gate: true
-#     enable_hf_state_dict_adapter: true
-#     enable_fsdp_optimizations: true
-
-# OPTION 3: HF implementation without TE (fallback - slower)
-# model:
-#   _target_: transformers.Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained
-#   pretrained_model_name_or_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
 
 checkpoint:
   enabled: false
