@@ -376,7 +376,6 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         if not metric_logger is None:
             metric_logger.log(log_data)
 
-
         # assumes all model parts' optimizers have the same learning rate
         logging.info(
             "[val] {} | step {} | epoch {} | loss {:.4f} | ce_loss {:.4f} | kd_loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
