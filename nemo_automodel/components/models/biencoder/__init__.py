@@ -12,18 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .chat_dataset import ChatDataset  # noqa: F401
-from .column_mapped_text_instruction_dataset import ColumnMappedTextInstructionDataset  # noqa: F401
-from .nanogpt_dataset import NanogptDataset  # noqa: F401
-from .retrieval_collator import RetrievalBiencoderCollator  # noqa: F401
-from .retrieval_dataset import make_retrieval_dataset  # noqa: F401
-from .squad import make_squad_dataset  # noqa: F401
+"""
+Biencoder models for embedding and retrieval tasks.
+
+This module contains biencoder architectures and bidirectional models
+optimized for information retrieval and semantic search tasks.
+"""
+
+from .biencoder_model import BiencoderModel, BiencoderOutput  # noqa: F401
+from .llama_bidirectional_model import (  # noqa: F401
+    LlamaBidirectionalConfig,
+    LlamaBidirectionalModel,
+    LlamaBidirectionalForSequenceClassification,
+)
 
 __all__ = [
-    "NanogptDataset",
-    "make_squad_dataset",
-    "make_retrieval_dataset",
-    "RetrievalBiencoderCollator",
-    "ColumnMappedTextInstructionDataset",
-    "ChatDataset",
+    "BiencoderModel",
+    "BiencoderOutput",
+    "LlamaBidirectionalConfig",
+    "LlamaBidirectionalModel",
+    "LlamaBidirectionalForSequenceClassification",
 ]
+
