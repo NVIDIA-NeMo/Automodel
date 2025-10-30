@@ -342,10 +342,15 @@ def apply_lora_to_linear_modules(
 
     is_causal_lm = False
     try:
-        if hasattr(model, "config") and "CausalLM" in model.config.architectures[0]:
+        if (
+            hasattr(model, "config")
+            and model.config.architectures is not None
+            and len(model.config.architectures) > 0
+            and "CausalLM" in model.config.architectures[0]
+        ):
             # for example, LlamaForCausalLM
             is_causal_lm = True
-    except AttributeError:
+    except (AttributeError, TypeError):
         is_causal_lm = False
 
     matcher = ModuleMatcher(

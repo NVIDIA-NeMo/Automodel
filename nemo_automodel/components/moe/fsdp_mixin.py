@@ -56,6 +56,13 @@ def _iter_fsdp_modules(module: torch.nn.Module) -> Iterator[FSDPModule]:
     if hasattr(module, "lm_head") and isinstance(module.lm_head, FSDPModule):
         yield module.lm_head
 
+    # TODO: cover all possible multimodal component names
+    if hasattr(module, "audio_tower") and isinstance(module.audio_tower, FSDPModule):
+        yield module.audio_tower
+    
+    if hasattr(module, "visual") and isinstance(module.visual, FSDPModule):
+        yield module.visual
+
     # Check experts in each layer
     if hasattr(_model, "layers"):
         for _, block in _model.layers.named_children():

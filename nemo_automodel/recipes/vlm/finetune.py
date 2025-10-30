@@ -18,11 +18,12 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
 import torch.nn as nn
 import wandb
+from torch.distributed.device_mesh import DeviceMesh
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoProcessor
@@ -38,7 +39,11 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, Che
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
-from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.distributed.init_utils import (
+    get_rank_safe,
+    get_world_size_safe,
+    initialize_distributed,
+)
 from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -49,7 +54,10 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
-from nemo_automodel.components.training.utils import count_tail_padding
+from nemo_automodel.components.training.utils import (
+    count_tail_padding,
+    scale_grads_and_clip_grad_norm,
+)
 from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
     compile_model,
@@ -68,6 +76,13 @@ logger = logging.getLogger(__name__)
 #  Stateless helper functions
 # ---------------------------
 
+def _get_model_name(cfg_model):
+    if cfg_model.get("pretrained_model_name_or_path", None) is not None:
+        return cfg_model.pretrained_model_name_or_path
+    elif cfg_model.get("config", None) is not None:
+        return cfg_model.config.get("pretrained_model_name_or_path", None)
+    else:
+        return None
 
 def _freeze_model(model: nn.Module, cfg_freeze: Optional[Dict[str, Any]] = None, freeze_embeddings: bool = True):
     """
@@ -123,6 +138,8 @@ def build_model_and_optimizer(
     freeze_embeddings=True,
     cfg_fp8=None,
     cfg_compile=None,
+    parallelize_fn=None,
+    load_base_model=True,
 ) -> tuple[nn.Module, list[str], "Optimizer"]:  # noqa: F821
     """
     Build and initialize a model for VLM.
@@ -139,19 +156,20 @@ def build_model_and_optimizer(
         freeze_embeddings: Whether to freeze embeddings.
         cfg_fp8: Configuration for FP8.
         cfg_compile: Configuration for torch.compile.
+        parallelize_fn: Optional parallelization function.
+        load_base_model: Whether to load the base model.
 
     Returns:
         The instantiated model on the specified device, the state dict keys before any parallelization, and the optimizer.
     """
     is_meta_device = False
-    init_ctx = nullcontext()
     if hasattr(cfg_model, "is_meta_device"):
         is_meta_device = cfg_model.is_meta_device
         if is_meta_device and isinstance(model_wrapper, MegatronFSDPManager):
             raise ValueError("Meta device initialization is not supported with MegatronFSDPManager")
-        init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else init_ctx
         del cfg_model.is_meta_device
 
+    init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
     with ScopedRNG(seed=seed, ranked=True):
         kwargs = {}
 
@@ -172,7 +190,26 @@ def build_model_and_optimizer(
         # hold a copy of the model state dict keys before any parallelization
         state_dict_keys = model.state_dict().keys()
 
-        if callable(getattr(model_wrapper, "parallelize", None)):
+        load_weights = False
+        if parallelize_fn is not None and get_world_size_safe() > 1:
+            parallelize_fn(
+                model,
+                world_mesh=model_wrapper.device_mesh,
+                moe_mesh=getattr(model_wrapper, "moe_mesh", None),
+                pp_enabled=False,
+                dp_axis_names=(
+                    ("dp_replicate", "dp_shard_cp")
+                    if "dp_replicate" in model_wrapper.device_mesh.mesh_dim_names
+                    and "dp_shard_cp" in model_wrapper.device_mesh.mesh_dim_names
+                    else ("dp_shard_cp",)
+                ),
+                cp_axis_name="cp",
+                tp_axis_name="tp",
+                ep_axis_name="ep",
+                ep_shard_axis_names=("ep_shard",),
+            )
+            load_weights = True
+        elif callable(getattr(model_wrapper, "parallelize", None)):
             if isinstance(model_wrapper, MegatronFSDPManager):
                 trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
                 assert len(trainable_params) > 0, "trainable_params cannot be empty"
@@ -182,17 +219,19 @@ def build_model_and_optimizer(
                 model, optimizer = model_wrapper.parallelize(model, optimizer)
                 return model, state_dict_keys, optimizer
             else:
+                load_weights = True
                 model = model_wrapper.parallelize(model)
 
-                # Load the weights into the model in parallel.
-                if is_meta_device:
-                    checkpointer.load_base_model(
-                        model,
-                        device,
-                        cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
-                        cfg_model.pretrained_model_name_or_path,
-                        getattr(cfg_peft, "lora_A_init", None),
-                    )
+        # Load the weights into the model in parallel.
+        if is_meta_device and load_weights:
+            checkpointer.load_base_model(
+                model,
+                device,
+                cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
+                _get_model_name(cfg_model),
+                getattr(cfg_peft, "lora_A_init", None),
+                load_base_model=load_base_model,
+            )
 
         model = model.to(device)
         optimizer = _build_optimizer(model, cfg_opt, tp_size)
@@ -229,6 +268,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
     if cfg_ckpt is not None:
         cfg_ckpt = cfg_ckpt.to_dict()
         cfg_ckpt.pop("restore_from", None)
+        cfg_ckpt.pop("load_base_model", None)
         ckpt_kwargs |= cfg_ckpt
     if ckpt_kwargs.get("is_peft", False) and ckpt_kwargs.get("model_save_format") == "torch_save":
         raise ValueError(
@@ -251,14 +291,14 @@ def build_loss_fn(cfg_loss):
 
 
 def build_dataloader(
-    cfg_ds, cfg_dl, cfg_model, cfg_processor, device_mesh, seed, local_batch_size
+    cfg_ds, cfg_dl, pretrained_model_name_or_path, cfg_processor, device_mesh, seed, local_batch_size
 ) -> tuple[DataLoader, ProcessorMixin]:
     """Build a DataLoader for the VLM dataset.
 
     Args:
         cfg_ds: Dataset configuration.
         cfg_dl: DataLoader configuration.
-        cfg_model: Model configuration.
+        pretrained_model_name_or_path: Pretrained model name or path for processor loading.
         cfg_processor: Processor configuration or None.
         device_mesh: Device mesh for distributed training.
         seed: Random seed.
@@ -287,11 +327,11 @@ def build_dataloader(
         # If no processor was instantiated, try AutoProcessor
         if processor is None:
             try:
-                processor = AutoProcessor.from_pretrained(cfg_model.pretrained_model_name_or_path, **processor_kwargs)
+                processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
             except Exception as e:
                 # Some models do not provide an AutoProcessor
                 processor = None
-                logging.warning(f"AutoProcessor not available for {cfg_model.pretrained_model_name_or_path} ({e}). ")
+                logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
 
         with FirstRankPerNode():
             ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
@@ -436,7 +476,7 @@ def build_wandb(cfg) -> wandb.Run:
     assert cfg.get("wandb", None) is not None
     kwargs = cfg.wandb.to_dict()
     if kwargs.get("name", "") == "":
-        kwargs["name"] = "_".join(cfg.get("model.pretrained_model_name_or_path").split("/")[-2:])
+        kwargs["name"] = "_".join(_get_model_name(cfg.model).split("/")[-2:])
     run = wandb.init(
         **kwargs,
         config=cfg.to_dict(),
@@ -530,10 +570,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
         self.device_mesh = None
+        self.moe_mesh = None
         self.model_wrapper = None
         if "distributed" in self.cfg:
             self.model_wrapper = self.cfg.distributed.instantiate(world_size=self.dist_env.world_size)
             self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
+            self.moe_mesh = getattr(self.model_wrapper, "moe_mesh", None)
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -549,11 +591,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
 
+        parallelize_fn = getattr(self.cfg.get("parallelizer", None), "instantiate", None)
+
         # Build checkpoint config
         checkpoint_config = build_checkpoint_config(
             self.cfg.get("checkpoint", None),
             self.cfg.get("model.cache_dir", None),
-            self.cfg.model.pretrained_model_name_or_path,
+            _get_model_name(self.cfg.model),
             True if self.cfg.get("peft", None) else False,
         )
 
@@ -563,7 +607,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             dp_rank=self._get_dp_rank(include_cp=True),
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),
-            moe_mesh=None,
+            moe_mesh=self.moe_mesh
         )
 
         self.model, model_state_dict_keys, self.optimizer = build_model_and_optimizer(
@@ -577,6 +621,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             tp_size=self.cfg.get("distributed.tp_size", 1),
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
+            parallelize_fn=parallelize_fn,
             checkpointer=self.checkpointer,
         )
         self.checkpointer.config.model_state_dict_keys = model_state_dict_keys
@@ -585,7 +630,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.dataloader, self.processor = build_dataloader(
             self.cfg.dataset,
             self.cfg.dataloader,
-            self.cfg.model,
+            _get_model_name(self.cfg.model),
             self.cfg.get("processor", None),
             device_mesh=self.device_mesh,
             seed=self.cfg.get("seed", 42),
@@ -598,7 +643,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.val_dataloader, _ = build_dataloader(
                 self.cfg.validation_dataset,
                 self.cfg.validation_dataloader,
-                self.cfg.model,
+                _get_model_name(self.cfg.model),
                 self.cfg.get("processor", None),
                 device_mesh=self.device_mesh,
                 seed=self.cfg.get("seed", 42),
@@ -701,28 +746,36 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         raise ValueError(
                             "FusedLinearCrossEntropy requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
                         )
+                    logits = out["logits"]
+                    hidden_states = out["hidden_states"]
                 else:
-                    out = self.model(**batch)
+                    logits = self.model(**batch)
+                    hidden_states = None
+
                 local_loss = calculate_loss(
                     self.loss_fn,
-                    logits=out.logits,
+                    logits=logits,
                     labels=labels,
                     model=self.model,
-                    hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
+                    hidden_states=hidden_states[-1] if hidden_states is not None else None,
                     num_label_tokens=num_label_tokens,
                 )
                 loss_buffer.append(local_loss.clone().detach())
                 local_loss.backward()
 
-        grad_norm = 0.0
-        # Clip gradients **after** any rescaling.
-        # TODO(@boxiangw): Fix TP gradient clipping
-        if max_grad_norm is not None and (not self.device_mesh or self.device_mesh["tp"].size() == 1):
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                [p for p in self.model.parameters() if p.requires_grad], max_grad_norm
-            )
-            if isinstance(grad_norm, torch.Tensor):
-                grad_norm = grad_norm.item()
+        grad_norm = scale_grads_and_clip_grad_norm(
+            max_grad_norm,
+            [self.model],
+            norm_type=2.0,
+            pp_enabled=False,
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
+            pp_axis_name=None,
+            foreach=True,
+            num_label_tokens=num_label_tokens,
+            dp_group_size=self._get_dp_group_size(include_cp=True),
+        )
 
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model.finish_grad_sync()
