@@ -16,7 +16,7 @@ python -m examples.llm_seq_cls.seq_cls --config examples/llm_seq_cls/glue/mrpc_r
 
 - Loads `roberta-large` with `num_labels: 2`
 - Builds GLUE MRPC datasets (train/validation)
-- Enables LoRA via the `peft` block
+- Optionally, enables LoRA via the `peft` block
 - Trains and validates per `step_scheduler`
 
 ## What is the Sequence Classification Recipe?
