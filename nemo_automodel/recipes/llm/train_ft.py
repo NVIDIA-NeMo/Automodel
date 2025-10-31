@@ -741,10 +741,6 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled):
             val_ds_name = "default"
         return val_ds_name
 
-    if pp_enabled:
-        logging.warning("Validation is not supported for pipeline parallelism")
-        return {}
-
     # Build validation dataloader if the config provides it
     val_dataloaders = {}
     for val_ds_name in filter(lambda x: x.startswith("validation_dataset"), cfg.to_dict().keys()):
