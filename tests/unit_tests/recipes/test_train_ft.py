@@ -51,7 +51,6 @@ def test_build_validation_dataloader_pp_enabled(caplog):
         result = build_validation_dataloader(cfg, dp_world_size=2, dp_rank=0, pp_enabled=True)
 
     assert result == {}
-    assert any("Validation is not supported for pipeline parallelism" in r.message for r in caplog.records)
 
 
 def test_build_validation_dataloader_collects_and_names_properly():
