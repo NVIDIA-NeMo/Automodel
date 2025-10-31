@@ -145,7 +145,7 @@ def load_module_from_file(file_path):
     if not _is_safe_path(p) and not ENABLE_USER_MODULES:
         raise ImportError(
             "Loading modules from outside the safe base directory is disabled by default. "
-            "To allow arbitrary code execution, set environment variable NEMO_ENABLE_USER_MODULES=1 "
+            "To allow out-of-tree code execution, set environment variable NEMO_ENABLE_USER_MODULES=1 "
             "or call set_enable_user_modules(True). Path: {}".format(p)
         )
 
@@ -181,7 +181,7 @@ def _resolve_target(dotted_path: str):
         if not _is_safe_attr(attr):
             raise ImportError(
                 "Access to private or dunder attributes is disabled by default. "
-                "To allow arbitrary access, set NEMO_ENABLE_USER_MODULES=1 or call set_enable_user_modules(True)."
+                "To allow out-of-tree code, set NEMO_ENABLE_USER_MODULES=1 or call set_enable_user_modules(True)."
             )
         return getattr(module, attr)
 
@@ -197,7 +197,7 @@ def _resolve_target(dotted_path: str):
             if i == 1 and not ENABLE_USER_MODULES:
                 raise ImportError(
                     f"Importing from '{module_name}' is blocked by default. "
-                    "To allow arbitrary imports, set NEMO_ENABLE_USER_MODULES=1 or call set_enable_user_modules(True)."
+                    "To allow out-of-tree imports, set NEMO_ENABLE_USER_MODULES=1 or call set_enable_user_modules(True)."
                 )
             continue
 
@@ -211,7 +211,7 @@ def _resolve_target(dotted_path: str):
             if not _is_safe_attr(name) and not ENABLE_USER_MODULES:
                 raise ImportError(
                     "Access to private or dunder attributes is disabled by default. "
-                    "To allow arbitrary access, set NEMO_ENABLE_USER_MODULES=1 or call set_enable_user_modules(True)."
+                    "To allow out-of-tree code, set NEMO_ENABLE_USER_MODULES=1 or call set_enable_user_modules(True)."
                 )
             try:
                 obj = getattr(obj, name)
