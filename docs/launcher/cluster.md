@@ -1,4 +1,4 @@
-# Run on a Cluster (Slurm / Multi-node)
+# Run on a Cluster (Slurm / Multi-node) 
 
 In this guide you will learn how to submit distributed training jobs on Slurm clusters (single- or multi-node). For single-node workstation usage, see [Run on Your Local Workstation](./local-workstation.md). For setup details, refer to our [Installation Guide](../guides/installation.md).
 
