@@ -39,6 +39,12 @@ from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
+# Also import custom Llama model
+try:
+    from nemo_automodel.components.models.llama import LlamaForCausalLM as CustomLlamaForCausalLM
+except ImportError:
+    CustomLlamaForCausalLM = None  # Gracefully handle if custom model doesn't exist
+
 
 class SequenceParallelAllGatherActivation(SequenceParallel):
     """SequenceParallel that all-gathers activations for sequence parallelism."""
@@ -306,3 +312,7 @@ PARALLELIZE_FUNCTIONS: Dict[type, Callable[..., Dict[str, ParallelStyle]]] = {
     Gemma3ForConditionalGeneration: _parallelize_gemma3,
     Phi3ForCausalLM: _parallelize_phi3,
 }
+
+# Add custom Llama model if available (use same parallelization function)
+if CustomLlamaForCausalLM is not None:
+    PARALLELIZE_FUNCTIONS[CustomLlamaForCausalLM] = _parallelize_llama
