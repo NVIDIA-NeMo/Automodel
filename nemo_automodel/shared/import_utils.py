@@ -396,3 +396,26 @@ def is_torch_min_version(version, check_equality=True):
     if check_equality:
         return get_torch_version() >= PkgVersion(version)
     return get_torch_version() > PkgVersion(version)
+
+
+def get_te_version():
+    """Get TE version from __version__."""
+    try:
+        import transformer_engine as te
+
+        if hasattr(te, "__version__"):
+            _version = str(te.__version__)
+        else:
+            from importlib.metadata import version
+
+            _version = version("transformer-engine")
+    except ImportError:
+        _version = "0.0.0"
+    return PkgVersion(_version)
+
+
+def is_te_min_version(version, check_equality=True):
+    """Check if minimum version of `transformer-engine` is installed."""
+    if check_equality:
+        return get_te_version() >= PkgVersion(version)
+    return get_te_version() > PkgVersion(version)
