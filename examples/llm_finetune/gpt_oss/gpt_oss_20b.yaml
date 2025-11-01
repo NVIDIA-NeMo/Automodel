@@ -14,7 +14,7 @@
 
 step_scheduler:
   global_batch_size: 512
-  local_batch_size: 64
+  local_batch_size: 32
   ckpt_every_steps: 500
   val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 2
@@ -33,11 +33,19 @@ parallelizer:
   activation_checkpointing: false
 
 model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
-  config:
-    _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: openai/gpt-oss-20b
+  _target_:  nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: openai/gpt-oss-20b
   is_meta_device: true
+  # Customize this backend for fine grained control
+  # backend:
+  #   _target_: nemo_automodel.components.moe.utils.BackendConfig
+  #   attn: te
+  #   linear: te
+  #   rms_norm: te
+  #   enable_deepep: true
+  #   fake_balanced_gate: false
+  #   enable_hf_state_dict_adapter: true
+  #   enable_fsdp_optimizations: true
 
 checkpoint:
   enabled: false

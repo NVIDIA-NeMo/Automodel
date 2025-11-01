@@ -141,62 +141,6 @@ class TestPreprocessArgsAndKwargsForAttn:
         assert "window_size" in attn_kwargs
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_te_with_seq_lens(self):
-        """Test TE preprocessing with seq_lens for packed sequences."""
-        pytest.importorskip("transformer_engine")
-
-        device = torch.device("cuda")
-        seq_lens = torch.tensor([50, 78], device=device)
-
-        q_gpu = self.q.to(device)
-        k_gpu = self.k.to(device)
-        v_gpu = self.v.to(device)
-
-        q_out, k_out, v_out, attn_kwargs = preprocess_args_and_kwargs_for_attn(
-            q_gpu, k_gpu, v_gpu, attention_mask=None, attn_impl="te", seq_lens=seq_lens
-        )
-
-        assert q_out.shape == q_gpu.shape
-        assert "qkv_format" in attn_kwargs
-        assert attn_kwargs["qkv_format"] == "thd"
-        assert "cu_seqlens_q" in attn_kwargs
-        assert "cu_seqlens_kv" in attn_kwargs
-        assert attn_kwargs["cu_seqlens_q"].shape == (3,)  # [0, 50, 128]
-        assert attn_kwargs["cu_seqlens_q"][0] == 0
-        assert attn_kwargs["cu_seqlens_q"][1] == 50
-        assert attn_kwargs["cu_seqlens_q"][2] == 128
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_te_with_seq_lens_and_seq_lens_padded(self):
-        """Test TE preprocessing with both seq_lens and seq_lens_padded."""
-        pytest.importorskip("transformer_engine")
-
-        device = torch.device("cuda")
-        seq_lens = torch.tensor([50, 78], device=device)
-        seq_lens_padded = torch.tensor([52, 80], device=device)
-
-        q_gpu = self.q.to(device)
-        k_gpu = self.k.to(device)
-        v_gpu = self.v.to(device)
-
-        q_out, k_out, v_out, attn_kwargs = preprocess_args_and_kwargs_for_attn(
-            q_gpu,
-            k_gpu,
-            v_gpu,
-            attention_mask=None,
-            attn_impl="te",
-            seq_lens=seq_lens,
-            seq_lens_padded=seq_lens_padded,
-        )
-
-        assert "cu_seqlens_q_padded" in attn_kwargs
-        assert "cu_seqlens_kv_padded" in attn_kwargs
-        assert attn_kwargs["cu_seqlens_q_padded"].shape == (3,)
-        assert attn_kwargs["cu_seqlens_q_padded"][0] == 0
-        assert attn_kwargs["cu_seqlens_q_padded"][1] == 52
-        assert attn_kwargs["cu_seqlens_q_padded"][2] == 132
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_te_with_cu_seqlens(self):
         """Test TE preprocessing with cu_seqlens."""
         pytest.importorskip("transformer_engine")
@@ -264,6 +208,44 @@ class TestPreprocessArgsAndKwargsForAttn:
         expected_shape = (self.batch_size, self.seq_len, self.num_heads, self.head_dim)
         assert q_out.shape == expected_shape
 
+    def test_flex_preprocessing(self):
+        """Test Flex preprocessing (transposes tensors like SDPA)."""
+        q_out, k_out, v_out, attn_kwargs = preprocess_args_and_kwargs_for_attn(
+            self.q, self.k, self.v, attention_mask=None, attn_impl="flex"
+        )
+
+        # Flex expects [B, H, S, D] -> [B, S, H, D]
+        expected_shape = (self.batch_size, self.seq_len, self.num_heads, self.head_dim)
+        assert q_out.shape == expected_shape
+        assert k_out.shape == expected_shape
+        assert v_out.shape == expected_shape
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_te_default_window_size(self):
+        """Test TE preprocessing includes default window_size."""
+        pytest.importorskip("transformer_engine")
+
+        q_out, k_out, v_out, attn_kwargs = preprocess_args_and_kwargs_for_attn(
+            self.q, self.k, self.v, attention_mask=None, attn_impl="te"
+        )
+
+        # Should include default window_size
+        assert "window_size" in attn_kwargs
+        assert attn_kwargs["window_size"] == (-1, 0)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_te_custom_window_size(self):
+        """Test TE preprocessing with custom window_size."""
+        pytest.importorskip("transformer_engine")
+
+        q_out, k_out, v_out, attn_kwargs = preprocess_args_and_kwargs_for_attn(
+            self.q, self.k, self.v, attention_mask=None, attn_impl="te", window_size=(512, 0)
+        )
+
+        # Should use custom window_size
+        assert "window_size" in attn_kwargs
+        assert attn_kwargs["window_size"] == (512, 0)
+
 
 class TestPostprocessOutputForAttn:
     """Tests for postprocess_output_for_attn function."""
@@ -299,15 +281,16 @@ class TestPostprocessOutputForAttn:
         assert x_out.shape == x.shape
         assert torch.equal(x, x_out)
 
-    def test_flex_postprocessing_no_change(self):
-        """Test Flex postprocessing (no change)."""
-        x = torch.randn(self.batch_size, self.num_heads, self.seq_len, self.head_dim)
+    def test_flex_postprocessing_transposes_back(self):
+        """Test Flex postprocessing (transposes back like SDPA)."""
+        # Flex output is [B, S, H, D] (after preprocessing transpose)
+        x = torch.randn(self.batch_size, self.seq_len, self.num_heads, self.head_dim)
 
         x_out = postprocess_output_for_attn(x, attn_impl="flex")
 
-        # Flex doesn't transpose, so output should be identical
-        assert x_out.shape == x.shape
-        assert torch.equal(x, x_out)
+        # Should transpose back to [B, H, S, D]
+        expected_shape = (self.batch_size, self.num_heads, self.seq_len, self.head_dim)
+        assert x_out.shape == expected_shape
 
 
 class TestEndToEndWorkflow:

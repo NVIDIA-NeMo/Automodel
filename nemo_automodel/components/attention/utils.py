@@ -71,64 +71,70 @@ def preprocess_args_and_kwargs_for_attn(
     """Preprocess attention inputs based on backend requirements."""
     # Create attention kwargs based on backend
     if attn_impl == "te":
-        attn_kwargs = {}
+        attn_kwargs = {
+            "window_size": kwargs.get("window_size", (-1, 0)),
+        }
         if attention_mask is not None:
             padding_mask = attention_mask.logical_not()
-            attn_kwargs = {
-                "attn_mask_type": "padding_causal",
-                "window_size": (-1, 0),
-                "attention_mask": padding_mask.unsqueeze(1).unsqueeze(2),
-            }
-        elif "seq_lens" in kwargs:
-            cu_seqlens = torch.cat(
-                [torch.tensor([0], device=kwargs["seq_lens"].device), torch.cumsum(kwargs["seq_lens"], dim=0)]
-            ).to(dtype=torch.int32, device=q.device)
-            attn_kwargs = {
-                "qkv_format": "thd",
-                "attn_mask_type": "padding_causal",
-                "cu_seqlens_q": cu_seqlens,
-                "cu_seqlens_kv": cu_seqlens,
-            }
-            if "seq_lens_padded" in kwargs:
-                cu_seqlens_padded = torch.cat(
-                    [
-                        torch.tensor([0], device=kwargs["seq_lens_padded"].device),
-                        torch.cumsum(kwargs["seq_lens_padded"], dim=0),
-                    ]
-                ).to(dtype=torch.int32, device=q.device)
-                attn_kwargs["cu_seqlens_q_padded"] = cu_seqlens_padded
-                attn_kwargs["cu_seqlens_kv_padded"] = cu_seqlens_padded
+            attn_kwargs.update(
+                {
+                    "attn_mask_type": "padding_causal",
+                    "attention_mask": padding_mask.unsqueeze(1).unsqueeze(2),
+                }
+            )
         elif "cu_seqlens" in kwargs:
-            attn_kwargs = {
-                "qkv_format": "thd",
-                "attn_mask_type": "padding_causal",
-                "cu_seqlens_q": kwargs["cu_seqlens"],
-                "cu_seqlens_kv": kwargs["cu_seqlens"],
-            }
+            attn_kwargs.update(
+                {
+                    "qkv_format": "thd",
+                    "attn_mask_type": "padding_causal",
+                    "cu_seqlens_q": kwargs["cu_seqlens"],
+                    "cu_seqlens_kv": kwargs["cu_seqlens"],
+                }
+            )
             if "cu_seqlens_padded" in kwargs:
-                attn_kwargs["cu_seqlens_q_padded"] = kwargs["cu_seqlens_padded"]
-                attn_kwargs["cu_seqlens_kv_padded"] = kwargs["cu_seqlens_padded"]
-                attn_kwargs["pad_between_seqs"] = True
-
+                attn_kwargs.update(
+                    {
+                        "cu_seqlens_q_padded": kwargs["cu_seqlens_padded"],
+                        "cu_seqlens_kv_padded": kwargs["cu_seqlens_padded"],
+                        "pad_between_seqs": True,
+                    }
+                )
             if "max_seqlen" in kwargs:
-                attn_kwargs["max_seqlen_q"] = kwargs["max_seqlen"]
-                attn_kwargs["max_seqlen_kv"] = kwargs["max_seqlen"]
+                attn_kwargs.update(
+                    {
+                        "max_seqlen_q": kwargs["max_seqlen"],
+                        "max_seqlen_kv": kwargs["max_seqlen"],
+                    }
+                )
         elif "cu_seqlens_q" in kwargs and "cu_seqlens_kv" in kwargs:
-            attn_kwargs = {
-                "qkv_format": "thd",
-                "attn_mask_type": "padding_causal",
-                "cu_seqlens_q": kwargs["cu_seqlens_q"],
-                "cu_seqlens_kv": kwargs["cu_seqlens_kv"],
-            }
+            attn_kwargs.update(
+                {
+                    "qkv_format": "thd",
+                    "attn_mask_type": "padding_causal",
+                    "cu_seqlens_q": kwargs["cu_seqlens_q"],
+                    "cu_seqlens_kv": kwargs["cu_seqlens_kv"],
+                }
+            )
             if "cu_seqlens_q_padded" in kwargs:
-                attn_kwargs["cu_seqlens_q_padded"] = kwargs["cu_seqlens_q_padded"]
-                attn_kwargs["pad_between_seqs"] = True
+                attn_kwargs.update(
+                    {
+                        "cu_seqlens_q_padded": kwargs["cu_seqlens_q_padded"],
+                        "pad_between_seqs": True,
+                    }
+                )
             if "cu_seqlens_kv_padded" in kwargs:
                 attn_kwargs["cu_seqlens_kv_padded"] = kwargs["cu_seqlens_kv_padded"]
             if "max_seqlen_q" in kwargs:
                 attn_kwargs["max_seqlen_q"] = kwargs["max_seqlen_q"]
             if "max_seqlen_kv" in kwargs:
                 attn_kwargs["max_seqlen_kv"] = kwargs["max_seqlen_kv"]
+
+    elif attn_impl == "flex":
+        attn_kwargs = kwargs
+        # Transpose for SDPA
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
     else:  # sdpa
         attn_kwargs = {}
         # Transpose for SDPA
@@ -142,6 +148,6 @@ def preprocess_args_and_kwargs_for_attn(
 
 def postprocess_output_for_attn(x: torch.Tensor, attn_impl: str) -> torch.Tensor:
     """Postprocess attention output based on attn_impl requirements."""
-    if attn_impl == "sdpa":
+    if attn_impl in ("sdpa", "flex"):
         x = x.transpose(1, 2).contiguous()
     return x
