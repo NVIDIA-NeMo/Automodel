@@ -181,7 +181,7 @@ def build_model_and_optimizer(
         The instantiated model on the specified device, the state dict keys before any parallelization, the optimizer, and the loss function.
     """
     is_hf_model = cfg_model.get("pretrained_model_name_or_path", None) is not None
-    is_meta_device = False
+    is_meta_device = is_hf_model  # Default to True for HuggingFace models to avoid OOM
     if hasattr(cfg_model, "is_meta_device"):
         is_meta_device = cfg_model.is_meta_device
         if is_meta_device and isinstance(model_wrapper, MegatronFSDPManager):
@@ -229,8 +229,8 @@ def build_model_and_optimizer(
 
     print_trainable_parameters(model)
 
-    # hold a copy of the model state dict keys before any parallelization
-    state_dict_keys = model.state_dict().keys()
+    # hold a list copy of the model state dict keys before any parallelization
+    state_dict_keys = list(model.state_dict().keys())
 
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
