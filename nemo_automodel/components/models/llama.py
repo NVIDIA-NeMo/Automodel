@@ -29,15 +29,20 @@ model:
 from __future__ import annotations
 
 import math
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import LlamaConfig, AutoModelForCausalLM
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.masking_utils import create_causal_mask
 from transformers.cache_utils import Cache, DynamicCache
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers.modeling_layers import GradientCheckpointingLayer
+from transformers.processing_utils import Unpack
+from transformers.utils import TransformersKwargs, can_return_tuple
+from transformers.utils.generic import check_model_inputs
 
 # Import HuggingFace's Llama components directly to ensure exact same behavior
 from transformers.models.llama.modeling_llama import (
@@ -54,13 +59,13 @@ __all__ = ["build_llama_model", "LlamaForCausalLM"]
 
 
 class LlamaAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
+    """Multi-headed attention from 'Attention Is All You Need' paper with optional fused QKV."""
 
     def __init__(
         self,
         config: LlamaConfig,
         layer_idx: int,
-        use_fused_qkv: bool = True,
+        use_fused_qkv: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -96,10 +101,10 @@ class LlamaAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Any] = None,
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
+        **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -187,15 +192,18 @@ class FusedLlamaMLP(nn.Module):
         return self.down_proj(self.act_fn(gate) * up)
 
 
-class LlamaDecoderLayer(nn.Module):
-    """Single Llama decoder layer with RMSNorm, attention, and MLP."""
+class LlamaDecoderLayer(GradientCheckpointingLayer):
+    """Single Llama decoder layer with RMSNorm, attention, and MLP.
+    
+    Inherits from GradientCheckpointingLayer for efficient activation checkpointing.
+    """
 
     def __init__(
         self,
         config: LlamaConfig,
         layer_idx: int,
-        use_fused_qkv: bool = True,
-        use_fused_gate_up: bool = True,
+        use_fused_qkv: bool = False,
+        use_fused_gate_up: bool = False,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -220,11 +228,11 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Any] = None,
+        past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        **kwargs,
+        **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -249,17 +257,38 @@ class LlamaDecoderLayer(nn.Module):
         return hidden_states
 
 
-class LlamaModel(nn.Module):
+class LlamaPreTrainedModel(PreTrainedModel):
+    """
+    An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
+    models.
+    """
+    config_class = LlamaConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["LlamaDecoderLayer"]
+    _skip_keys_device_placement = ["past_key_values"]
+    _supports_flash_attn = True
+    _supports_sdpa = True
+    _supports_flex_attn = True
+
+    _can_compile_fullgraph = True
+    _supports_attention_backend = True
+    _can_record_outputs = {
+        "hidden_states": LlamaDecoderLayer,
+        "attentions": LlamaAttention,
+    }
+
+
+class LlamaModel(LlamaPreTrainedModel):
     """Llama transformer model (embeddings + decoder layers + norm)."""
 
     def __init__(
         self,
         config: LlamaConfig,
-        use_fused_qkv: bool = True,
-        use_fused_gate_up: bool = True,
+        use_fused_qkv: bool = False,
+        use_fused_gate_up: bool = False,
     ):
-        super().__init__()
-        self.config = config
+        super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
@@ -277,21 +306,30 @@ class LlamaModel(nn.Module):
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        self.gradient_checkpointing = False
 
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    @check_model_inputs
     def forward(
         self,
-        input_ids: torch.LongTensor,
+        input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Any] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        batch_size, seq_len = input_ids.shape
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> BaseModelOutputWithPast:
+        # Validate inputs
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         # Embeddings
-        hidden_states = self.embed_tokens(input_ids)
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
 
         # Initialize cache if needed
         if use_cache and past_key_values is None:
@@ -301,7 +339,7 @@ class LlamaModel(nn.Module):
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + seq_len, device=input_ids.device
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
 
         # Position IDs
@@ -311,21 +349,21 @@ class LlamaModel(nn.Module):
         # Create proper causal mask (matches HuggingFace implementation)
         causal_mask = create_causal_mask(
             config=self.config,
-            input_embeds=hidden_states,
+            input_embeds=inputs_embeds,
             attention_mask=attention_mask,
             cache_position=cache_position,
             past_key_values=past_key_values,
             position_ids=position_ids,
         )
 
-        # Rotary embeddings
+        hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        # Decoder layers
-        for decoder_layer in self.layers:
+        # Decoder layers (slice to support partial layer execution like in HF)
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             hidden_states = decoder_layer(
-                hidden_states=hidden_states,
-                attention_mask=causal_mask,  # Use proper causal mask
+                hidden_states,
+                attention_mask=causal_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
@@ -335,23 +373,26 @@ class LlamaModel(nn.Module):
             )
 
         hidden_states = self.norm(hidden_states)
-        return hidden_states
+        
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values,
+        )
 
 
-class LlamaForCausalLM(nn.Module):
+class LlamaForCausalLM(LlamaPreTrainedModel):
     """Llama model with causal language modeling head."""
+    _tied_weights_keys = ["lm_head.weight"]
+    _tp_plan = {"lm_head": "colwise_rep"}
+    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
     def __init__(
         self,
         config: LlamaConfig,
-        use_fused_qkv: bool = True,
-        use_fused_gate_up: bool = True,
+        use_fused_qkv: bool = False,
+        use_fused_gate_up: bool = False,
     ):
-        super().__init__()
-        
-        # Store config (required for LoRA and other tools)
-        self.config = config
-        
+        super().__init__(config)
         self.model = LlamaModel(
             config=config,
             use_fused_qkv=use_fused_qkv,
@@ -360,43 +401,84 @@ class LlamaForCausalLM(nn.Module):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        # Initialize weights
-        self._init_weights()
+        # Initialize weights and apply final processing
+        self.post_init()
 
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
+    def set_decoder(self, decoder):
+        self.model = decoder
+
+    def get_decoder(self):
+        return self.model
+
+    @can_return_tuple
     def forward(
         self,
-        input_ids: torch.LongTensor,
+        input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-    ) -> torch.Tensor:
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> CausalLMOutputWithPast:
         """
-        Forward pass returning logits.
+        Forward pass returning CausalLMOutputWithPast.
         
         Args:
             input_ids: (batch_size, seq_len)
             attention_mask: Optional attention mask
             position_ids: Optional position indices
+            past_key_values: Optional cached key/values
+            inputs_embeds: Optional pre-computed embeddings
+            labels: Optional labels for computing loss
+            use_cache: Whether to use KV caching
+            cache_position: Position in cache
+            logits_to_keep: Number of final logits to compute (0=all, N=last N tokens)
             
         Returns:
-            logits: (batch_size, seq_len, vocab_size)
+            CausalLMOutputWithPast with loss, logits, past_key_values
         """
-        hidden_states = self.model(
+        outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
         )
-        logits = self.lm_head(hidden_states)
-        return logits
 
-    def _init_weights(self):
-        """Initialize weights following Llama conventions."""
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, mean=0.0, std=0.02)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Embedding):
-                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        hidden_states = outputs.last_hidden_state
+        
+        # Only compute necessary logits (optimization for training and generation)
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+        )
 
 
 def build_llama_model(pretrained_model_name_or_path: str, **kwargs: Any) -> nn.Module:
@@ -420,29 +502,32 @@ def build_llama_model(pretrained_model_name_or_path: str, **kwargs: Any) -> nn.M
                   - attention_dropout: Attention dropout probability
                   - pad_token_id: Padding token ID
                   - attn_implementation: Attention backend ("eager", "sdpa", "flash_attention_2")
-                  - use_fused_qkv: Whether to use fused QKV projection
-                  - use_fused_gate_up: Whether to use fused gate_up projection
+                  - use_fused_qkv: Whether to use fused QKV projection (default: True)
+                  - use_fused_gate_up: Whether to use fused gate_up projection (default: True)
 
     Returns:
         LlamaForCausalLM model instance
         
     Example:
-        # Load with separate projections (default, matches HuggingFace)
-        model = build_llama_model("meta-llama/Meta-Llama-3-70B")
+        # Load with fused projections (efficient)
+        model = build_llama_model("meta-llama/Meta-Llama-3-70B", 
+                                   use_fused_qkv=True, 
+                                   use_fused_gate_up=True)
+        
+        # Load with separate projections (matches HuggingFace exactly)
+        model = build_llama_model("meta-llama/Meta-Llama-3-70B", 
+                                   use_fused_qkv=False, 
+                                   use_fused_gate_up=False)
         
         # Use SDPA for faster attention
         model = build_llama_model("meta-llama/Meta-Llama-3-70B", 
-                                   attn_implementation="sdpa")
-        
-        # Load with fused gate_up (experimental, may be slower due to split overhead)
-        model = build_llama_model("meta-llama/Meta-Llama-3-70B", 
+                                   attn_implementation="sdpa",
                                    use_fused_gate_up=True)
         
         # Override for testing with fewer layers
         model = build_llama_model("meta-llama/Meta-Llama-3-70B", num_hidden_layers=4)
     """
     # Extract fusion options (not part of HuggingFace config)
-    # Note: HuggingFace uses fused QKV (qkv_proj) but separate gate/up projections
     use_fused_qkv = kwargs.pop('use_fused_qkv', True)
     use_fused_gate_up = kwargs.pop('use_fused_gate_up', True)
     
@@ -476,7 +561,7 @@ def build_llama_model(pretrained_model_name_or_path: str, **kwargs: Any) -> nn.M
                 # Final fallback to eager
                 config._attn_implementation = "eager"
     
-    if torch.distributed.get_rank() == 0:
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
         print(f"[build_llama_model] Attention implementation: {config._attn_implementation}")
         print(f"[build_llama_model] Use fused QKV: {use_fused_qkv}")
         print(f"[build_llama_model] Use fused gate_up: {use_fused_gate_up}")
