@@ -70,6 +70,8 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
             "mlp.experts.gate_up_proj": "mlp.experts.gate_and_up_projs",
             "mlp.experts.down_proj": "mlp.experts.down_projs",
         }
+        if self.backend.attn == "te":
+            self.hf_to_internal_map["self_attn.sinks"] = "self_attn.attn_module.softmax_offset"
 
         # Reverse mapping for to_hf conversion
         self.internal_to_hf_map = {v: k for k, v in self.hf_to_internal_map.items() if v is not None}

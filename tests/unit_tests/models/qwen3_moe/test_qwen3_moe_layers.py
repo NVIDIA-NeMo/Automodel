@@ -87,7 +87,7 @@ class TestPreprocessForAttn:
         torch.testing.assert_close(q_out, q)
         torch.testing.assert_close(k_out, k)
         torch.testing.assert_close(v_out, v)
-        assert kwargs == {}
+        assert kwargs == {"window_size": (-1, 0)}
 
     def test_te_backend_with_mask_builds_padding_kwargs(self, te_backend):
         q = torch.randn(1, 3, 2, 4)

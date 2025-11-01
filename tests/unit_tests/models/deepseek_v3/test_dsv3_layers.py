@@ -53,7 +53,7 @@ class TestPreprocessArgsAndKwargsForAttn:
         assert torch.equal(q_out, q)
         assert torch.equal(k_out, k)
         assert torch.equal(v_out, v)
-        assert attn_kwargs == {}
+        assert attn_kwargs == {"window_size": (-1, 0)}
 
     @skip_te
     def test_te_backend_with_attention_mask(self):

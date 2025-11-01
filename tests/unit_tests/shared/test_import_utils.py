@@ -156,3 +156,21 @@ def test_is_unavailable_identifies_placeholder():
     """
     _, placeholder = si.safe_import(_random_module_name())
     assert si.is_unavailable(placeholder) is True
+
+
+def test_get_te_version_type():
+    """
+    ``get_te_version`` should *never* raise – even when TE is unavailable
+    while building docs – and must always return a ``packaging.version.Version``.
+    """
+    ver = si.get_te_version()
+    assert isinstance(ver, PkgVersion)
+
+
+def test_is_te_min_version():
+    """
+    * A ridiculously low requirement must be satisfied.
+    * A far-future version must *not* be satisfied.
+    """
+    assert si.is_te_min_version("0.0.0") is True
+    assert si.is_te_min_version("9999.0.0", check_equality=False) is False

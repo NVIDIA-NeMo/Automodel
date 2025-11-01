@@ -22,6 +22,7 @@ from nemo_automodel.components.models.gpt_oss.layers import (
     GptOssAttention,
 )
 from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.shared.import_utils import is_te_min_version
 
 
 @pytest.fixture
@@ -186,3 +187,136 @@ class TestGptOssAttention:
             # Test passes if no exception is raised
         except Exception as e:
             pytest.fail(f"Forward pass failed with rotary embedding: {e}")
+
+
+@pytest.mark.skipif(not is_te_min_version("2.8.0"), reason="TE version 2.8.0 or higher is required")
+class TestGptOssAttentionWithTE:
+    """Test GptOssAttention with Transformer Engine backend."""
+
+    @pytest.fixture
+    def te_backend_config(self):
+        return BackendConfig(
+            linear="torch",
+            attn="te",
+            rms_norm="torch",
+            enable_deepep=False,
+            fake_balanced_gate=False,
+            enable_hf_state_dict_adapter=False,
+        )
+
+    def test_te_backend_requires_min_version(self, gpt_config):
+        """Test that TE backend requires minimum TE version 2.8.0."""
+        te_backend = BackendConfig(attn="te")
+
+        # Mock TE version check to simulate old version
+        from unittest.mock import patch
+        with patch("nemo_automodel.components.models.gpt_oss.layers.is_te_min_version", return_value=False):
+            with pytest.raises(ValueError, match="Transformer Engine DotProductAttention for GPT-OSS is only supported for TE version 2.8.0 or higher"):
+                GptOssAttention(gpt_config, te_backend)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_gpt_oss_attention_te_init(self, gpt_config, te_backend_config):
+        """Test GptOssAttention initialization with TE backend."""
+        pytest.importorskip("transformer_engine")
+
+        # Mock version check to allow initialization
+        from unittest.mock import patch
+        with patch("nemo_automodel.components.models.gpt_oss.layers.is_te_min_version", return_value=True):
+            attention = GptOssAttention(gpt_config, te_backend_config)
+
+            assert attention.backend.attn == "te"
+            assert attention.head_dim == gpt_config.head_dim
+            assert attention.num_attention_heads == gpt_config.num_attention_heads
+            # TE backend should not have sinks as a separate parameter
+            assert attention.sinks is None
+            # TE backend should have softmax_offset in attn_module
+            assert hasattr(attention.attn_module, "softmax_offset")
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_te_init_weights(self, gpt_config, te_backend_config, device):
+        """Test weight initialization with TE backend."""
+        pytest.importorskip("transformer_engine")
+
+        from unittest.mock import patch
+        with patch("nemo_automodel.components.models.gpt_oss.layers.is_te_min_version", return_value=True):
+            attention = GptOssAttention(gpt_config, te_backend_config)
+
+            # Store original softmax_offset to verify it changes
+            original_softmax_offset = attention.attn_module.softmax_offset.clone()
+
+            attention.init_weights(device, init_std=0.02)
+
+            # softmax_offset should have changed
+            assert not torch.equal(attention.attn_module.softmax_offset, original_softmax_offset)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_te_forward_with_bshd_format(self, gpt_config, te_backend_config, device):
+        """Test TE attention forward pass with BSHD format."""
+        pytest.importorskip("transformer_engine")
+
+        from unittest.mock import patch
+        with patch("nemo_automodel.components.models.gpt_oss.layers.is_te_min_version", return_value=True):
+            attention = GptOssAttention(gpt_config, te_backend_config)
+            attention = attention.to(device)
+
+            batch_size, seq_len = 2, 8
+            x = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
+            freqs_cis = torch.randn(batch_size, seq_len, gpt_config.head_dim, dtype=torch.bfloat16, device=device)
+
+            try:
+                output = attention(x, freqs_cis)
+                assert output.shape == (batch_size, seq_len, gpt_config.hidden_size)
+                assert output.device == device
+            except Exception as e:
+                pytest.fail(f"TE forward pass with BSHD format failed: {e}")
+
+    @pytest.mark.skip(reason="THD format is not supported for GPT-OSS")
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_te_forward_with_thd_format(self, gpt_config, te_backend_config, device):
+        """Test TE attention forward pass with THD format."""
+        pytest.importorskip("transformer_engine")
+
+        from unittest.mock import patch
+        with patch("nemo_automodel.components.models.gpt_oss.layers.is_te_min_version", return_value=True):
+            attention = GptOssAttention(gpt_config, te_backend_config)
+            attention = attention.to(device)
+
+            # THD format: (num_tokens, hidden_size)
+            num_tokens = 16
+            x = torch.randn(num_tokens, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
+            freqs_cis = torch.randn(num_tokens, gpt_config.head_dim, dtype=torch.bfloat16, device=device)
+
+            # Provide cu_seqlens for packed sequence
+            cu_seqlens = torch.tensor([0, 8, 16], dtype=torch.int32, device=device)
+
+            try:
+                output = attention(x, freqs_cis, cu_seqlens=cu_seqlens, max_seqlen=8)
+                assert output.shape == (num_tokens, gpt_config.hidden_size)
+                assert output.device == device
+            except Exception as e:
+                pytest.fail(f"TE forward pass with THD format failed: {e}")
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_te_forward_with_sliding_window(self, gpt_config, te_backend_config, device):
+        """Test TE attention forward pass with sliding window."""
+        pytest.importorskip("transformer_engine")
+
+        # Set sliding window in config
+        gpt_config.sliding_window = 256
+
+        from unittest.mock import patch
+        with patch("nemo_automodel.components.models.gpt_oss.layers.is_te_min_version", return_value=True):
+            attention = GptOssAttention(gpt_config, te_backend_config, use_sliding_attention=True)
+            attention = attention.to(device)
+
+            assert attention.sliding_window == 256
+
+            batch_size, seq_len = 2, 8
+            x = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
+            freqs_cis = torch.randn(batch_size, seq_len, gpt_config.head_dim, dtype=torch.bfloat16, device=device)
+
+            try:
+                output = attention(x, freqs_cis)
+                assert output.shape == (batch_size, seq_len, gpt_config.hidden_size)
+            except Exception as e:
+                pytest.fail(f"TE forward pass with sliding window failed: {e}")

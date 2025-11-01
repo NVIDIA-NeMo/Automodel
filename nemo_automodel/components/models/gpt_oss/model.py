@@ -49,12 +49,15 @@ class Block(nn.Module):
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        **attn_kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if attention_mask is not None and padding_mask is None:
             padding_mask = attention_mask.bool().logical_not()
 
         # TODO: Support arbitrary attention masks
-        attn_out = self.self_attn(self.input_layernorm(x), freqs_cis=freqs_cis)
+        attn_out = self.self_attn(
+            self.input_layernorm(x), freqs_cis=freqs_cis, attention_mask=attention_mask, **attn_kwargs
+        )
         x = x + attn_out
 
         mlp_in = self.post_attention_layernorm(x)
@@ -149,7 +152,9 @@ class GptOssModel(nn.Module):
             )
 
         # Compute cos/sin from RotaryEmbedding inv_freq and current position_ids; then concat [cos, sin]
-        freqs_cis = position_ids_to_freqs_cis(self.rotary_emb, position_ids)
+        freqs_cis = position_ids_to_freqs_cis(
+            self.rotary_emb, position_ids, qkv_format=attn_kwargs.get("qkv_format", "bshd")
+        )
 
         h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
 
@@ -159,6 +164,7 @@ class GptOssModel(nn.Module):
                 freqs_cis=freqs_cis,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
+                **attn_kwargs,
             )
 
         h = self.norm(h) if self.norm else h
@@ -212,10 +218,6 @@ class GptOssForCausalLM(nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig(attn="flex")
-        if self.backend.attn != "flex":
-            # if the user passes a non-flex attention implementation, we switch to flex
-            logger.error(f"Unsupported attention implementation for GPT-OSS: {self.backend.attn}, switching to flex")
-            self.backend.attn = "flex"
         self.model = GptOssModel(config, backend=self.backend, moe_config=moe_config)
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
