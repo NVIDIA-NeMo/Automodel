@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Benchmarking config for Moonlight 16B Torch
+# Benchmarking config for Qwen3 Next Te Deepep
 
 seed: 1234
 
@@ -22,11 +22,10 @@ benchmark:
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []
-  # json_output_path: benchmark_summary.json  # Optional: path to save JSON summary
 
 step_scheduler:
-  global_batch_size: 256
-  local_batch_size: 4
+  global_batch_size: 512
+  local_batch_size: 1
   ckpt_every_steps: 1000
   val_every_steps: 1000
   num_epochs: 1
@@ -38,14 +37,14 @@ distributed:
   cp_size: 1
   pp_size: 1
   dp_replicate_size: 1
-  ep_size: 8
+  ep_size: 64
   sequence_parallel: false
 
 autopipeline:
   _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
   pp_schedule: interleaved1f1b
-  pp_microbatch_size: 4
-  round_virtual_stages_to_pp_multiple: up
+  pp_microbatch_size: 2
+  round_virtual_stages_to_pp_multiple: down
   scale_grads_in_schedule: false
   patch_inner_model: false
   patch_causal_lm_model: false
@@ -58,22 +57,24 @@ dist_env:
 parallelizer:
   _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
   activation_checkpointing: false
+  reshard_after_forward: false
 
 model:
-  _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_config
+  _target_: nemo_automodel.components.models.qwen3_next.model.Qwen3NextForCausalLM.from_config
   config:
     _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
+    pretrained_model_name_or_path: Qwen/Qwen3-Next-80B-A3B-Instruct
   trust_remote_code: true
   is_meta_device: true
   backend:
     _target_: nemo_automodel.components.moe.utils.BackendConfig
-    attn: sdpa
-    linear: torch
-    rms_norm: torch
-    enable_deepep: false
+    attn: te
+    linear: te
+    rms_norm: te
+    enable_deepep: true
     fake_balanced_gate: true
-    enable_hf_state_dict_adapter: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
 
 checkpoint:
   enabled: false
@@ -85,7 +86,7 @@ loss_fn:
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
-  seq_len: 2048
+  seq_len: 4096
   num_samples: 100000
 
 dataloader:
