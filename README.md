@@ -51,10 +51,10 @@ What you can expect:
 
 > ⚠️ Note: NeMo AutoModel is under active development. New features, improvements, and documentation updates are released regularly. We are working toward a stable release, so expect the interface to solidify over time. Your feedback and contributions are welcome, and we encourage you to follow along as new updates roll out.
 
-### Why DTensor and SPMD
+### Why PyTorch Distributed and SPMD
 
 - **One program, any scale**: The same training script runs on 1 GPU or 1000+ by changing the mesh.
-- **DTensor‑native**: Partition model/optimizer states with `DeviceMesh` + placements (`Shard`, `Replicate`).
+- **PyTorch Distributed native**: Partition model/optimizer states with `DeviceMesh` + placements (`Shard`, `Replicate`).
 - **SPMD first**: Parallelism is configuration. No model rewrites when scaling up or changing strategy.
 - **Decoupled concerns**: Model code stays pure PyTorch; parallel strategy lives in config.
 - **Composability**: Mix **tensor**, **sequence**, and **data** parallel by editing placements.
