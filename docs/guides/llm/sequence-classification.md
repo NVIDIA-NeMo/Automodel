@@ -11,7 +11,7 @@ This guide shows how to train a sequence classification model using the `TrainFi
 Use the example config for GLUE MRPC with RoBERTa-large + LoRA:
 
 ```bash
-python -m examples.llm_seq_cls.seq_cls --config examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml
+python3 examples/llm_seq_cls/seq_cls.py --config examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml
 ```
 
 - Loads `roberta-large` with `num_labels: 2`
@@ -32,19 +32,47 @@ It follows the same design as the SFT recipe in the fine-tune guide, but uses a 
 ## Minimal Config Anatomy
 
 ```yaml
+# GLUE MRPC with RoBERTa-large + LoRA
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 32
+  ckpt_every_steps: 200
+  val_every_steps: 100
+  num_epochs: 2
+  max_steps: 10
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 1
+
 model:
   _target_: nemo_automodel.NeMoAutoModelForSequenceClassification.from_pretrained
   pretrained_model_name_or_path: roberta-large
   num_labels: 2
 
-peft:  # optional (enable LoRA)
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors
+  save_consolidated: true
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: none
+  dp_replicate_size: 1
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  target_modules: "*.proj"
+  target_modules:
+  - "*.query"
+  - "*.value"
   dim: 8
   alpha: 16
   dropout: 0.1
 
-# GLUE MRPC dataset
 dataset:
   _target_: nemo_automodel.components.datasets.llm.seq_cls.GLUE_MRPC
   split: train
@@ -61,14 +89,14 @@ validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.seq_cls_collater
 
-step_scheduler:
-  global_batch_size: 64
-  local_batch_size: 8
-  num_epochs: 3
-
 optimizer:
-  _target_: torch.optim.Adam
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.999]
+  eps: 1e-8
   lr: 3.0e-4
+  weight_decay: 0
+
+
 ```
 
 ## Dataset Notes
@@ -83,18 +111,10 @@ optimizer:
 - `dim` (rank), `alpha`, `dropout`: tune per model/compute budget. Values `dim=8, alpha=16, dropout=0.1` are a good starting point for RoBERTa.
 - The recipe automatically applies the adapters; no additional code changes are required.
 
-## Additional Examples
-
-- `examples/llm_seq_cls/yelp/yelp_bert.yaml`: 5-way Yelp classification with BERT
-- `examples/llm_seq_cls/imdb/imdb_qwen.yaml`: IMDB sentiment with Qwen
-- `examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml`: MRPC + RoBERTa-large + LoRA
-
 ## Running with torchrun
 
 ```bash
-torchrun --nproc-per-node=2 -m examples.llm_seq_cls.seq_cls --config examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml
+torchrun --nproc-per-node=2 examples/llm_seq_cls/seq_cls.py --config examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml
 ```
+You can adjust the number of GPUs as necessary via the `--nproc-per-node` knob.
 
-## Inference and Adapters
-
-Checkpoints are compatible with common tooling, including Hugging Face. For PEFT, the recipe saves adapter weights alongside a minimal adapter config. You can load them with standard APIs (e.g., Hugging Face + PEFT), similar to the examples in the fine-tune guide.
