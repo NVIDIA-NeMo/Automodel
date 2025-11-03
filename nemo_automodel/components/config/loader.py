@@ -28,7 +28,7 @@ from typing import Any, Mapping
 import yaml
 
 # Only allow importing from these module prefixes by default
-ALLOWED_IMPORT_PREFIXES = ("nemo_automodel",)
+ALLOWED_IMPORT_PREFIXES = ("nemo_automodel", "torch", "transformers", "torchdata", "torchao", "liger_kernel")
 
 # Define a safe base dir for loading modules from files (default: repo root)
 SAFE_BASE_DIR = Path(__file__).resolve().parents[2]
