@@ -43,6 +43,8 @@ from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.generic import check_model_inputs
+    
+from nemo_automodel.shared.utils import dtype_from_str
 
 # Import HuggingFace's Llama components directly to ensure exact same behavior
 from transformers.models.llama.modeling_llama import (
@@ -531,6 +533,13 @@ def build_llama_model(pretrained_model_name_or_path: str, **kwargs: Any) -> nn.M
     use_fused_qkv = kwargs.pop('use_fused_qkv', True)
     use_fused_gate_up = kwargs.pop('use_fused_gate_up', True)
     
+    # Extract and convert torch_dtype
+    torch_dtype = kwargs.pop('torch_dtype', None)
+    if torch_dtype is not None and isinstance(torch_dtype, str):
+        torch_dtype = dtype_from_str(torch_dtype)
+    elif torch_dtype is None:
+        torch_dtype = torch.bfloat16  # Default to bf16
+    
     # Extract attention implementation if specified, otherwise auto-detect
     # This matches nemo_automodel/_transformers/auto_model.py approach
     attn_implementation = kwargs.pop('attn_implementation', None)
@@ -565,10 +574,16 @@ def build_llama_model(pretrained_model_name_or_path: str, **kwargs: Any) -> nn.M
         print(f"[build_llama_model] Attention implementation: {config._attn_implementation}")
         print(f"[build_llama_model] Use fused QKV: {use_fused_qkv}")
         print(f"[build_llama_model] Use fused gate_up: {use_fused_gate_up}")
-
+        print(f"[build_llama_model] torch_dtype: {torch_dtype}")
     
-    return LlamaForCausalLM(
+    # Create model with specified dtype
+    model = LlamaForCausalLM(
         config=config,
         use_fused_qkv=use_fused_qkv,
         use_fused_gate_up=use_fused_gate_up,
     )
+    
+    # need to convert model manually since LlamaForCausalLM does not support to(dtype=...)
+    model = model.to(dtype=torch_dtype)
+    
+    return model
