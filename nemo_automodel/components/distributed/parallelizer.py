@@ -379,6 +379,10 @@ def get_parallelization_strategy(model: nn.Module) -> ParallelizationStrategy:
 
 def register_parallel_strategy(cls):
     """Decorator to register out-of-tree parallelism strategies"""
+    # The decorator receives a class, not an instance.
+    assert isinstance(cls, type) and issubclass(
+        cls, ParallelizationStrategy
+    ), f"cls must be a subclass of ParallelizationStrategy, but got {type(cls)} {cls}"
     PARALLELIZATION_STRATEGIES[cls.__name__] = cls()
     return cls
 
