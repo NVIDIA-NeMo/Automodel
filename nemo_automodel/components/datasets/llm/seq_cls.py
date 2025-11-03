@@ -70,5 +70,5 @@ class GLUE_MRPC:
                 "input_ids": self.tokenizer.pad_token_id,
                 "labels": -100,
                 "attention_mask": 0,
-            }
+            },
         }

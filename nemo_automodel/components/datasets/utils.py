@@ -103,6 +103,7 @@ def get_pad_token_from_key(val: str, pad_token_ids: Optional[dict[str, int]] = {
     ans = pad_token_ids.get(val, PAD_TOKEN_IDS.get(val, None))
     return ans
 
+
 def make_attention_mask_from_labels(ids: list[int], ignore_token: int = -100) -> list[int]:
     # if the last token is not an ignore token, then the attention mask is all 1s
     if len(ids) == 0:

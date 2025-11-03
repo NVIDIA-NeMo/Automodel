@@ -261,7 +261,6 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             },
         )
 
-
     def log_val_metrics(self, log_data):
         """Log metrics to wandb and other loggers
         Args:
