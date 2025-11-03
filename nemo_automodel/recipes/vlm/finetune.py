@@ -790,6 +790,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
 
+        if hasattr(self.model, "update_moe_gate_bias"):
+            self.model.update_moe_gate_bias()
+
         # Precompute FP8 scales
         fp8_config = self.cfg.get("fp8", None)
         if (
