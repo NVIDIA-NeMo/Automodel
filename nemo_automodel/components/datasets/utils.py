@@ -101,7 +101,6 @@ def get_pad_token_from_key(val: str, pad_token_ids: Optional[dict[str, int]] = {
         "input_ids": 0,
     }
     ans = pad_token_ids.get(val, PAD_TOKEN_IDS.get(val, None))
-    assert ans is not None, val
     return ans
 
 def make_attention_mask_from_labels(ids: list[int], ignore_token: int = -100) -> list[int]:
