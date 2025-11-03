@@ -24,6 +24,8 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 
+from nemo_automodel.components.models.qwen3_omni_moe.model import Qwen3OmniMoeThinkerForConditionalGeneration
+
 _PREFIX = "model."
 
 
@@ -84,6 +86,10 @@ class ModelState:
         """
         self.model = [model] if isinstance(model, torch.nn.Module) else model
         self.is_tied_lm_head = getattr(getattr(self.model[0], "config", {}), "tie_word_embeddings", False)
+
+        if isinstance(self.model[0], Qwen3OmniMoeThinkerForConditionalGeneration):
+            self.is_tied_lm_head = False
+        
         if self.is_tied_lm_head:
             _, lm_head_param_name = _get_lm_head_weight_and_name(self.model[0])
             self.lm_head_param_name = lm_head_param_name
