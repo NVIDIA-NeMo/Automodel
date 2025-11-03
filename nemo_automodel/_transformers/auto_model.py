@@ -270,10 +270,18 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                         model = ModelRegistry.model_arch_name_to_cls[config.architectures[0]](
                             config, *model_args, **kwargs
                         )
-                        # if we are able to init the custom model, we will now download the model weights on rank 0
-                        if (not dist.is_initialized() or dist.get_rank() == 0) and not os.path.isdir(
-                            pretrained_model_name_or_path
-                        ):
+                        # if we are able to init the custom model, we will now download the model weights on local rank 0
+                        if (
+                            not dist.is_initialized() or int(os.environ.get("LOCAL_RANK", "0")) == 0
+                        ) and not os.path.isdir(pretrained_model_name_or_path):
+                            num_nodes = (
+                                dist.get_world_size() % int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+                            ) + 1  # 1-indexed
+                            if num_nodes > 1:
+                                logging.info(
+                                    f"""Downloading model weights on {num_nodes} nodes. This incurs high storage usage. 
+                                    It is recommended to download once with `hf download` and pass in the downloaded path to the `pretrained_model_name_or_path` argument."""
+                                )
                             _get_resolved_checkpoint_files(
                                 pretrained_model_name_or_path=pretrained_model_name_or_path,
                                 subfolder="",
