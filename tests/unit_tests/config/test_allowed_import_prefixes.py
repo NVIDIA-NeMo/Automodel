@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import types
 import sys
 import builtins
@@ -73,5 +72,52 @@ def test_resolve_target_allows_allowed_prefix_when_import_succeeds(monkeypatch):
     # Since 'torch' is allowlisted, this should resolve successfully
     obj = loader._resolve_target("torch.fakeattr")
     assert obj is sentinel
+
+
+def test_redact_top_level_sensitive_keys():
+    data = {
+        "username": "alice",
+        "password": "supersecret",
+        "api_key": "AKIA...",
+        "Auth": "Bearer something",
+    }
+
+    redacted = loader._redact(data)
+
+    assert redacted["username"] == "alice"
+    assert redacted["password"] == "******"
+    assert redacted["api_key"] == "******"
+    assert redacted["Auth"] == "******"  # case-insensitive match via substring 'auth'
+
+
+def test_redact_nested_sensitive_keys_and_lists():
+    data = {
+        "outer": {
+            "token": "t0k3n",
+            "inner": {"normal": 1, "SECRET": "dontshow"},
+        },
+        "items": [
+            {"name": "x", "authorization": "AAA"},
+            {"nested": {"ApiKey": "BBB"}},
+            123,
+        ],
+    }
+
+    redacted = loader._redact(data)
+
+    assert redacted["outer"]["token"] == "******"
+    assert redacted["outer"]["inner"]["normal"] == 1
+    assert redacted["outer"]["inner"]["SECRET"] == "******"
+
+    assert redacted["items"][0]["name"] == "x"
+    assert redacted["items"][0]["authorization"] == "******"
+    assert redacted["items"][1]["nested"]["ApiKey"] == "******"
+    assert redacted["items"][2] == 123
+
+
+def test_redact_does_not_touch_non_sensitive_keys():
+    data = {"email": "a@b.com", "profile": {"city": "nyc"}}
+    redacted = loader._redact(data)
+    assert redacted == {"email": "a@b.com", "profile": {"city": "nyc"}}
 
 
