@@ -154,14 +154,14 @@ def _parallelize_llama(
     """Parallelizes a LlamaForCausalLM model across data and tensor parallel dimensions."""
     base_model_tp_plan: dict[str, ParallelStyle] = {
         "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
-        "model.layers.*.self_attn.q_proj": ColwiseParallel(use_local_output=True),
-        "model.layers.*.self_attn.k_proj": ColwiseParallel(use_local_output=True),
-        "model.layers.*.self_attn.v_proj": ColwiseParallel(use_local_output=True),
-        "model.layers.*.self_attn.qkv_proj": ColwiseParallel(use_local_output=True),  # Combined QKV projection
-        "model.layers.*.mlp.gate_up_proj": ColwiseParallel(use_local_output=True),  # Fused gate and up projection
+        "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),  # Combined QKV projection
+        "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),  # Fused gate and up projection
         "model.layers.*.self_attn.o_proj": RowwiseParallel(),
-        "model.layers.*.mlp.up_proj": ColwiseParallel(use_local_output=True),
-        "model.layers.*.mlp.gate_proj": ColwiseParallel(use_local_output=True),
+        "model.layers.*.mlp.up_proj": ColwiseParallel(),
+        "model.layers.*.mlp.gate_proj": ColwiseParallel(),
         "model.layers.*.mlp.down_proj": RowwiseParallel(),
         "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
     }
