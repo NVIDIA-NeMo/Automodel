@@ -667,7 +667,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     log_data = self._run_validation_epoch(self.val_dataloader)
                     self.log_val_metrics(log_data)
                     self.model.train()
-
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
         self.metric_logger_valid.close()

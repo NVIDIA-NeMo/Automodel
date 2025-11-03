@@ -1038,7 +1038,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
                     for mp in self.model_parts:
                         mp.train()
-
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
         for v in self.metric_logger_valid.values():
