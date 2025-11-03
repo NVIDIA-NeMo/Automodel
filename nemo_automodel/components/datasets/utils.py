@@ -452,33 +452,3 @@ class SFTSingleTurnPreprocessor:
             )
 
         return tokenized
-
-
-def seq_cls_collater(batch, pad_seq_len_divisible=None):
-    """
-    Collate function for sequence classification.
-
-    Expects each item in batch to be a dict with keys:
-      - "input_ids": List[int]
-      - "attention_mask": List[int]
-      - "labels": int
-
-    Returns a dict with tensors:
-      - input_ids: LongTensor [batch, seq_len]
-      - attention_mask: LongTensor [batch, seq_len]
-      - labels: LongTensor [batch]
-    """
-    pad_token_ids = batch[0].pop("___PAD_TOKEN_IDS___", None)
-    # ans contains a dict with:
-    # key: str (e.g., "input_ids", "attention_mask", "labels", "loss_mask")
-    # value: list[list[int]] (e.g., [[1, 2, 3], [4, 5, 6]])
-    return {
-        key: batchify(
-            pad_within_micro(
-                extract_key_from_dicts(batch, key),
-                get_pad_token_from_key(key, pad_token_ids),
-                pad_seq_len_divisible,
-            )
-        )
-        for key in batch[0].keys()
-    }

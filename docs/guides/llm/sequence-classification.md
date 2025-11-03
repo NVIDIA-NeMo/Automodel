@@ -79,7 +79,7 @@ dataset:
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.seq_cls_collater
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.seq_cls.GLUE_MRPC
@@ -87,7 +87,7 @@ validation_dataset:
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.seq_cls_collater
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -103,7 +103,6 @@ optimizer:
 
 - For single-sentence datasets (e.g., `yelp_review_full`, `imdb`), use `YelpReviewFull` or `IMDB` from `nemo_automodel.components.datasets.llm.seq_cls`.
 - For GLUE MRPC (sentence-pair classification), use `GLUE_MRPC`, which tokenizes `(sentence1, sentence2)` with padding/truncation.
-- The `seq_cls_collater` expects fixed-length tokenized inputs and outputs tensors: `input_ids`, `attention_mask`, `labels`.
 
 ## LoRA (PEFT) Settings
 

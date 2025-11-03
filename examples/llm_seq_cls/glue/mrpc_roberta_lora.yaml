@@ -46,7 +46,7 @@ dataset:
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.seq_cls_collater
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.seq_cls.GLUE_MRPC
@@ -54,7 +54,7 @@ validation_dataset:
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.seq_cls_collater
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
 
 optimizer:
   _target_: torch.optim.AdamW
