@@ -64,6 +64,7 @@ def test_register_parallel_strategy_decorator_raises_error_if_not_a_strategy():
 def test_register_parallel_strategy_with_custom_name_registers_under_provided_key():
     original_registry = dict(p.PARALLELIZATION_STRATEGIES)
     try:
+
         @register_parallel_strategy(name="CustomKeyName")
         class SomeStrategy(ParallelizationStrategy):
             def parallelize(self, model: nn.Module, *args, **kwargs) -> nn.Module:

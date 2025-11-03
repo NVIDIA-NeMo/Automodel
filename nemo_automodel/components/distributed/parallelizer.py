@@ -394,6 +394,7 @@ def register_parallel_strategy(arg=None, *, name: Optional[str] = None):
         assert name not in PARALLELIZATION_STRATEGIES, f"name {name} already registered"
         PARALLELIZATION_STRATEGIES[name] = cls()
         return cls
+
     if name is None:
         raise ValueError("name is required")
     # If used with parentheses (possibly with arguments)
