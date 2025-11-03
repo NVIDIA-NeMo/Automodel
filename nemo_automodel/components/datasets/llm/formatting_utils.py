@@ -103,7 +103,7 @@ def _package_tokenized_example(
         assert input_ids[-1] != eos_token_id, f"input_ids[-1]={input_ids[-1]} == eos_token_id={eos_token_id}"
     assert len(input_ids) == len(labels), f"len(input_ids)={len(input_ids)} != len(labels)={len(labels)}"
 
-    if isinstance(seq_length, int):
+    if isinstance(seq_length, int) and padding not in [None, "do_not_pad", False]:
         input_ids = _pad_to_seq_length(input_ids, pad_token_id, seq_length)
         labels = _pad_to_seq_length(labels, -100, seq_length)
 
