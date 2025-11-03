@@ -40,10 +40,8 @@ parallelizer:
   reshard_after_forward: false
 
 model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
-  config:
-    _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
   backend:
     _target_: nemo_automodel.components.moe.utils.BackendConfig
     attn: te
