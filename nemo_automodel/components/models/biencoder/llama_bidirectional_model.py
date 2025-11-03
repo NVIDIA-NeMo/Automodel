@@ -20,25 +20,31 @@ for embedding and retrieval tasks. Unlike the standard causal Llama model,
 this version can attend to all tokens bidirectionally.
 """
 
-from typing import List, Optional, Tuple, Union
+import copy
+import os
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple, Union, Unpack
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch import nn
+from torch import Tensor
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-from transformers.cache_utils import Cache
-from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask
+from transformers import PreTrainedModel
+from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
+    ModelOutput,
     SequenceClassifierOutputWithPast,
 )
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import (
     LlamaForSequenceClassification,
     LlamaModel,
-    LlamaPreTrainedModel,
 )
-from transformers.utils import logging
+from transformers.utils import auto_docstring, can_return_tuple, logging
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+
 
 logger = logging.get_logger(__name__)
 
@@ -136,41 +142,105 @@ class LlamaBidirectionalModel(LlamaModel):
     def _update_causal_mask(
         self,
         attention_mask: torch.Tensor,
-        input_tensor: torch.Tensor,
-        cache_position: torch.Tensor,
-        past_key_values: Cache,
-        output_attentions: bool,
+        dtype,
     ):
-        """
-        Override the causal mask to support bidirectional attention.
-        
-        Args:
-            attention_mask: Attention mask
-            input_tensor: Input tensor
-            cache_position: Cache position for generation
-            past_key_values: Past key values for generation
-            output_attentions: Whether to output attentions
-            
-        Returns:
-            Bidirectional attention mask
-        """
-        assert self.config._attn_implementation in ["flash_attention_2", "eager"], (
-            f"Unsupported attention implementation: {self.config._attn_implementation}, "
-            "only support flash_attention_2 or eager"
-        )
- 
-        if self.config._attn_implementation == "flash_attention_2":
-            if attention_mask is not None and (attention_mask == 0.0).any():
-                return attention_mask
-            return None
-        elif self.config._attn_implementation == "eager":
-            # Generates bi-directional attention mask
-            causal_mask = _prepare_4d_attention_mask(
-                attention_mask,
-                dtype=input_tensor.dtype,
-            )
-            return causal_mask
+        if attention_mask is not None and (attention_mask == 0.0).any():
+            return attention_mask.to(dtype)
+        return None
 
+    @can_return_tuple
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
+    ) -> BaseModelOutputWithPast:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if self.gradient_checkpointing and self.training and use_cache:
+            logger.warning_once(
+                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
+            )
+            use_cache = False
+
+        # TODO (joao): remove this exception in v4.56 -- it exists for users that try to pass a legacy cache
+        if not isinstance(past_key_values, (type(None), Cache)):
+            raise ValueError("The `past_key_values` should be either a `Cache` object or `None`.")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache()
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        causal_mask = self._update_causal_mask(attention_mask=attention_mask, dtype=inputs_embeds.dtype)
+
+        hidden_states = inputs_embeds
+
+        # create position embeddings to be shared across the decoder layers
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        # decoder layers
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **flash_attn_kwargs,
+            )
+
+            hidden_states = layer_outputs[0]
+
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+
+        hidden_states = self.norm(hidden_states)
+
+        # add hidden states from the last decoder layer
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values if use_cache else None,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+        )
 
 class LlamaBidirectionalForSequenceClassification(LlamaForSequenceClassification):
     """
@@ -296,4 +366,227 @@ class LlamaBidirectionalForSequenceClassification(LlamaForSequenceClassification
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
+
+
+@dataclass
+class BiencoderOutput(ModelOutput):
+    """Output dataclass for biencoder model."""
+    q_reps: Optional[Tensor] = None
+    p_reps: Optional[Tensor] = None
+    loss: Optional[Tensor] = None
+    labels: Optional[Tensor] = None
+    scores: Optional[Tensor] = None
+
+
+class BiencoderModel(nn.Module):
+    """
+    Biencoder Model with essential functions for training.
+    
+    This model encodes queries and passages separately and computes contrastive loss.
+    """
+    
+    def __init__(
+        self,
+        args,
+        lm_q: PreTrainedModel,
+        lm_p: PreTrainedModel,
+        linear_pooler: nn.Module = None,
+    ):
+        super().__init__()
+        self.args = args
+        self.lm_q = lm_q
+        self.lm_p = lm_p
+        self.cross_entropy = nn.CrossEntropyLoss(reduction="mean")
+        self.linear_pooler = linear_pooler if linear_pooler is not None else nn.Identity()
+        self.config = self.lm_q.config
+        self.trainer = None
+        
+    def forward(
+        self, 
+        query: Dict[str, Tensor] = None, 
+        passage: Dict[str, Tensor] = None
+    ):
+        """Forward pass for training."""
+        
+        # Get current number of passages per query
+        if self.training:
+            current_train_n_passages = self.args.train_n_passages
+        else:
+            current_train_n_passages = self.args.eval_negative_size + 1
+            
+        # Encode query and passage
+        q_reps = self._encode(self.lm_q, query)
+        p_reps = self._encode(self.lm_p, passage)
+        
+        # Compute scores and loss
+        scores, labels = self._compute_scores(q_reps, p_reps, current_train_n_passages)
+        loss = self.cross_entropy(scores, labels)
+        
+        return BiencoderOutput(
+            loss=loss,
+            q_reps=q_reps,
+            p_reps=p_reps,
+            labels=labels,
+            scores=scores,
+        )
+    
+    def _encode(
+        self, 
+        encoder: PreTrainedModel, 
+        input_dict: dict
+    ) -> Optional[torch.Tensor]:
+        """Encode input using the encoder."""
+        if not input_dict:
+            return None
+            
+        import inspect
+        
+        # Remove token_type_ids if encoder doesn't support it
+        if (
+            "token_type_ids" not in inspect.getfullargspec(encoder.forward).args
+            and "token_type_ids" in input_dict.keys()
+        ):
+            input_dict = {k: v for k, v in input_dict.items() if k != "token_type_ids"}
+            
+        # Get encoder outputs
+        outputs = encoder(
+            **{k: v for k, v in input_dict.items() if k not in ["kd_labels"]},
+            return_dict=True,
+            output_hidden_states=True,
+        )
+        
+        # Extract hidden states
+        if hasattr(outputs, "last_hidden_state"):
+            hidden_state = outputs.last_hidden_state
+        else:
+            hidden_state = outputs.hidden_states[-1]
+            
+        # Pool the representations
+        embeds = pool(
+            last_hidden_states=hidden_state,
+            attention_mask=input_dict["attention_mask"],
+            pool_type=self.args.pooling,
+        )
+        
+        # Apply linear pooler
+        embeds = self.linear_pooler(embeds)
+        
+        # L2 normalize if required
+        if self.args.l2_normalize:
+            embeds = F.normalize(embeds, dim=-1)
+            
+        return embeds.contiguous()
+    
+    def _compute_scores(
+        self,
+        q_reps: torch.Tensor,
+        p_reps: torch.Tensor,
+        current_train_n_passages: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute similarity scores and labels."""
+        
+        # Reshape passage representations
+        # p_reps: (batch_size * n_passages, hidden_dim)
+        # q_reps: (batch_size, hidden_dim)
+        batch_size = q_reps.shape[0]
+        
+        # Compute similarity scores
+        scores = torch.matmul(q_reps, p_reps.transpose(0, 1))
+        
+        # Create labels (first passage for each query is positive)
+        labels = torch.arange(
+            start=0,
+            end=batch_size * current_train_n_passages,
+            step=current_train_n_passages,
+            dtype=torch.long,
+            device=scores.device
+        )
+        
+        # Apply temperature scaling if l2_normalize is enabled
+        if self.args.l2_normalize:
+            scores = scores / self.args.t
+            
+        return scores, labels
+    
+    @classmethod
+    def build(cls, args, **hf_kwargs):
+        """Build biencoder model from pretrained."""
+        
+        logger.info(f"Building BiencoderModel from {args.model_name_or_path}")
+
+        # Select model class based on base_model
+        if args.base_model == "bidirc_llama3":
+            ModelClass = LlamaBidirectionalModel
+            logger.info("Using LlamaBidirectionalModel for bidirc_llama3")
+        else:
+            raise ValueError(f"Unsupported base model: {args.base_model}")
+        
+        # Load model locally or from hub using selected model class
+        if os.path.isdir(args.model_name_or_path):
+            if args.share_encoder:
+                lm_q = ModelClass.from_pretrained(
+                    args.model_name_or_path, 
+                    trust_remote_code=True, 
+                    **hf_kwargs
+                )
+                lm_p = lm_q
+            else:
+                _qry_model_path = os.path.join(args.model_name_or_path, "query_model")
+                _psg_model_path = os.path.join(args.model_name_or_path, "passage_model")
+                
+                if not os.path.exists(_qry_model_path):
+                    _qry_model_path = args.model_name_or_path
+                    _psg_model_path = args.model_name_or_path
+                    
+                lm_q = ModelClass.from_pretrained(_qry_model_path, trust_remote_code=True, **hf_kwargs)
+                lm_p = ModelClass.from_pretrained(_psg_model_path, trust_remote_code=True, **hf_kwargs)
+        else:
+            # Load from hub
+            lm_q = ModelClass.from_pretrained(args.model_name_or_path, **hf_kwargs)
+            
+            if args.share_encoder:
+                lm_p = lm_q
+            else:
+                lm_p = copy.deepcopy(lm_q)
+            
+        # Enable gradient checkpointing if requested
+        if args.do_gradient_checkpointing:
+            lm_q.gradient_checkpointing_enable()
+            if lm_p is not lm_q:
+                lm_p.gradient_checkpointing_enable()
+        
+        # Create linear pooler if needed
+        if args.add_linear_pooler:
+            linear_pooler = nn.Linear(lm_q.config.hidden_size, args.out_dimension)
+            
+            pooler_path = os.path.join(args.model_name_or_path, "pooler.pt")
+            if os.path.exists(pooler_path):
+                logger.info("Loading pooler weights from local files")
+                state_dict = torch.load(pooler_path, map_location="cpu")
+                linear_pooler.load_state_dict(state_dict)
+        else:
+            linear_pooler = nn.Identity()
+            
+        model = cls(args=args, lm_q=lm_q, lm_p=lm_p, linear_pooler=linear_pooler)
+        return model
+    
+    def save(self, output_dir: str):
+        """Save model to output directory."""
+        
+        logger.info(f"Saving BiencoderModel to {output_dir}")
+        
+        # Save the model
+        if self.args.share_encoder:
+            self.lm_q.save_pretrained(output_dir)
+        else:
+            os.makedirs(os.path.join(output_dir, "query_model"), exist_ok=True)
+            os.makedirs(os.path.join(output_dir, "passage_model"), exist_ok=True)
+            self.lm_q.save_pretrained(os.path.join(output_dir, "query_model"))
+            self.lm_p.save_pretrained(os.path.join(output_dir, "passage_model"))
+        
+        # Save linear pooler if exists
+        if self.args.add_linear_pooler:
+            pooler_path = os.path.join(output_dir, "pooler.pt")
+            logger.info(f"Saving linear pooler to {pooler_path}")
+            torch.save(self.linear_pooler.state_dict(), pooler_path)
 

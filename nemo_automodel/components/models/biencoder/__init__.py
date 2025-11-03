@@ -19,8 +19,10 @@ This module contains biencoder architectures and bidirectional models
 optimized for information retrieval and semantic search tasks.
 """
 
-from .biencoder_model import BiencoderModel, BiencoderOutput  # noqa: F401
+from .biencoder_model import NeMoAutoModelBiencoder  # noqa: F401
 from .llama_bidirectional_model import (  # noqa: F401
+    BiencoderModel,
+    BiencoderOutput,
     LlamaBidirectionalConfig,
     LlamaBidirectionalModel,
     LlamaBidirectionalForSequenceClassification,
@@ -29,6 +31,7 @@ from .llama_bidirectional_model import (  # noqa: F401
 __all__ = [
     "BiencoderModel",
     "BiencoderOutput",
+    "NeMoAutoModelBiencoder",
     "LlamaBidirectionalConfig",
     "LlamaBidirectionalModel",
     "LlamaBidirectionalForSequenceClassification",
