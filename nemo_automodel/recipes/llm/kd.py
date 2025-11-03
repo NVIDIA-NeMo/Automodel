@@ -365,16 +365,21 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             },
         )
 
-    def log_val_metrics(self, log_data):
+    def log_val_metrics(self, val_name, log_data, metric_logger=None):
         if not self.dist_env.is_main or log_data is None:
             return
 
         if wandb.run is not None:
-            wandb.log(log_data.to_dict(), step=log_data.step)
+            wandb.log(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
+
+        # JSONL validation log
+        if not metric_logger is None:
+            metric_logger.log(log_data)
 
         # assumes all model parts' optimizers have the same learning rate
         logging.info(
-            "[val] step {} | epoch {} | loss {:.4f} | ce_loss {:.4f} | kd_loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
+            "[val] {} | step {} | epoch {} | loss {:.4f} | ce_loss {:.4f} | kd_loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
+                val_name,
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["val_loss"],

@@ -732,6 +732,40 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
     return loss_fn(**loss_fn_kwargs)
 
 
+def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled):
+    def _prepare_val_ds_name(val_ds_name):
+        val_ds_name = val_ds_name.replace("validation_dataset", "")
+        if len(val_ds_name) > 1 and val_ds_name[0] in ("_", "-", "."):
+            val_ds_name = val_ds_name[1:]
+        if val_ds_name == "":
+            val_ds_name = "default"
+        return val_ds_name
+
+    # Build validation dataloader if the config provides it
+    val_dataloaders = {}
+    for val_ds_name in filter(lambda x: x.startswith("validation_dataset"), cfg.to_dict().keys()):
+        val_ds_cfg = cfg.get(val_ds_name, None)
+        val_ds_name = _prepare_val_ds_name(val_ds_name)
+        val_dataloaders[val_ds_name] = build_dataloader(
+            val_ds_cfg,
+            cfg.validation_dataloader,
+            cfg.model,
+            cfg_ps=None,  # Use unpacked config for validation
+            seed=cfg.get("seed", 42),
+            local_batch_size=cfg.get("step_scheduler.local_batch_size", 1),
+            global_batch_size=cfg.get("step_scheduler.global_batch_size", 1),
+            max_steps=cfg.get("step_scheduler.max_steps", None),
+            val_check_interval=cfg.get("step_scheduler.val_every_steps", None),
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+            pp_enabled=False,
+            supports_seq_lens=True,
+            cp_size=cfg.get("distributed.cp_size", 1),
+        )[0]
+
+    return val_dataloaders
+
+
 def parallelize_for_pp(
     model: nn.Module,
     *,
@@ -930,29 +964,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             supports_seq_lens=True,
             cp_size=self.cfg.get("distributed.cp_size", 1),
         )
-
-        # Build validation dataloader if the config provides it
-        self.val_dataloader = None
-        if "validation_dataset" in self.cfg:
-            # For validation, do not use packed sequences for fair comparison with baseline
-
-            self.val_dataloader, _ = build_dataloader(
-                self.cfg.validation_dataset,
-                self.cfg.validation_dataloader,
-                self.cfg.model,
-                cfg_ps=self.cfg.get("packed_sequence", None),  # Use unpacked config for validation
-                seed=self.cfg.get("seed", 42),
-                local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-                global_batch_size=self.cfg.get("step_scheduler.global_batch_size", 1),
-                max_steps=self.cfg.get("step_scheduler.max_steps", None),
-                val_check_interval=self.cfg.get("step_scheduler.val_every_steps", None),
-                dp_rank=self._get_dp_rank(),
-                dp_world_size=self._get_dp_group_size(),
-                pp_enabled=self.pp_enabled,
-                supports_seq_lens=True,
-                cp_size=self.cfg.get("distributed.cp_size", 1),
-            )
-
+        self.val_dataloaders = build_validation_dataloader(
+            self.cfg,
+            self._get_dp_group_size(),
+            self._get_dp_rank(),
+            self.pp_enabled,
+        )
         # Scheduler
         self.step_scheduler = build_step_scheduler(
             self.cfg.get("step_scheduler", None),
@@ -972,9 +989,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.metric_logger_train = MetricLoggerDist(
             pathlib.Path(self.checkpointer.config.checkpoint_dir) / "training.jsonl"
         )
-        self.metric_logger_valid = MetricLoggerDist(
-            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "validation.jsonl"
-        )
+        self.metric_logger_valid = {
+            name: MetricLoggerDist(
+                pathlib.Path(self.checkpointer.config.checkpoint_dir)
+                / (f"validation_{name}.jsonl" if name != "default" else "validation.jsonl")
+            )
+            for name in self.val_dataloaders.keys()
+        }
 
         # Optionally resume
         self.load_checkpoint(restore_from)
@@ -1008,14 +1029,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     self.save_checkpoint(epoch, self.step_scheduler.step)
 
                 # Run validation every val_every_steps
-                if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                    val_log_data = self._run_validation_epoch(self.val_dataloader)
-                    self.log_val_metrics(val_log_data)
+                if self.step_scheduler.is_val_step:
+                    if self.pp_enabled:
+                        logger.warning("Validation is not supported for pipeline parallelism")
+                        continue
+                    for val_name, val_dataloader in self.val_dataloaders.items():
+                        val_log_data = self._run_validation_epoch(val_dataloader)
+                        self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
                     for mp in self.model_parts:
                         mp.train()
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
-        self.metric_logger_valid.close()
+        for v in self.metric_logger_valid.values():
+            v.close()
 
         self.checkpointer.close()
 
@@ -1213,11 +1239,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
     @torch.no_grad()
     def _run_validation_epoch(self, val_dataloader):
-        """Run one pass over `self.val_dataloader`."""
-        if self.pp_enabled:
-            logger.warning("Validation is not supported for pipeline parallelism")
-            return
+        """Run one pass over a single validation dataloader.
 
+        Args:
+            val_name: Name of the validation dataset.
+            val_dataloader: DataLoader for the validation dataset.
+        """
         with ScopedRNG(seed=1, ranked=True):
             for mp in self.model_parts:
                 mp.eval()
@@ -1255,7 +1282,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             },
         )
 
-    def log_val_metrics(self, log_data):
+    def log_val_metrics(self, val_name, log_data, metric_logger=None):
         """Log metrics to wandb and other loggers
         Args:
             log_data: MetricsSample object, containing:
@@ -1273,13 +1300,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             return
 
         if wandb.run is not None:
-            wandb.log(log_data.to_dict(), step=log_data.step)
+            wandb.log(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
 
         # JSONL validation log
-        self.metric_logger_valid.log(log_data)
+        if not metric_logger is None:
+            metric_logger.log(log_data)
 
         logging.info(
-            "[val] step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
+            '[val] name "{}" | step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}'.format(
+                val_name,
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["val_loss"],
