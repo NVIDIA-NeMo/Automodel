@@ -67,6 +67,7 @@ def _package_tokenized_example(
     pad_token_id,
     seq_length,
     truncation=None,
+    padding=None,
 ):
     """
     Package a tokenized example with proper masking and padding.
@@ -168,6 +169,7 @@ def format_prompt_completion(
         pad_token_id=pad_token_id,
         seq_length=seq_length,
         truncation=truncation,
+        padding=padding,
     )
 
 
@@ -231,4 +233,6 @@ def format_chat_template(
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
         seq_length=seq_length,
+        truncation=truncation,
+        padding=padding,
     )
