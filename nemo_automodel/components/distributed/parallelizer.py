@@ -377,14 +377,28 @@ def get_parallelization_strategy(model: nn.Module) -> ParallelizationStrategy:
     model_name = type(model).__name__
     return PARALLELIZATION_STRATEGIES.get(model_name, _DEFAULT_STRATEGY)
 
-def register_parallel_strategy(cls):
-    """Decorator to register out-of-tree parallelism strategies"""
-    # The decorator receives a class, not an instance.
-    assert isinstance(cls, type) and issubclass(
-        cls, ParallelizationStrategy
-    ), f"cls must be a subclass of ParallelizationStrategy, but got {type(cls)} {cls}"
-    PARALLELIZATION_STRATEGIES[cls.__name__] = cls()
-    return cls
+
+def register_parallel_strategy(arg=None, *, name: Optional[str] = None):
+    """Decorator to register out-of-tree parallelism strategies.
+
+    Supports:
+    - @register_parallel_strategy(name="CustomModelName")
+    """
+
+    def _register(cls):
+        # The decorator receives a class, not an instance.
+        assert isinstance(cls, type) and issubclass(cls, ParallelizationStrategy), (
+            f"cls must be a subclass of ParallelizationStrategy, but got {type(cls)} {cls}"
+        )
+        assert name is not None, "name is required"
+        assert name not in PARALLELIZATION_STRATEGIES, f"name {name} already registered"
+        PARALLELIZATION_STRATEGIES[name] = cls()
+        return cls
+    if name is None:
+        raise ValueError("name is required")
+    # If used with parentheses (possibly with arguments)
+    return _register
+
 
 def apply_fsdp2_sharding_recursively(
     module: nn.Module,
