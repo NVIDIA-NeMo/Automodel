@@ -80,6 +80,7 @@ def _package_tokenized_example(
         pad_token_id: The padding token id.
         seq_length: Optional sequence length for padding.
         truncation: Optional truncation strategy.
+        padding: Optional padding strategy.
     Returns:
         A dictionary with input_ids, labels, and attention_mask.
     """
