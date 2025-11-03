@@ -18,6 +18,8 @@ from typing import Optional
 
 from torch.distributed.checkpoint.stateful import Stateful
 
+from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
+
 logger = logging.getLogger(__name__)
 
 
@@ -100,6 +102,7 @@ class StepScheduler(Stateful):
                 ckpt_every_steps = self.epoch_len
             logger.info("ckpt_every_steps not provided; will save checkpoint every {} steps".format(ckpt_every_steps))
         self.ckpt_every_steps = ckpt_every_steps
+        self.sig_handler = DistributedSignalHandler().__enter__()
 
     def __iter__(self):
         """
@@ -173,6 +176,14 @@ class StepScheduler(Stateful):
         if self.epoch_len is None:
             return False
         return (self.step % self.epoch_len) == self.epoch_len - 1
+
+    @property
+    def sigterm_received(self):
+        """
+        Returns whether SIGTERM was received.
+        """
+        self.sigterm_flag = getattr(self, "sigterm_flag", False) or any(self.sig_handler.signals_received())
+        return self.sigterm_flag
 
     @property
     def epochs(self):

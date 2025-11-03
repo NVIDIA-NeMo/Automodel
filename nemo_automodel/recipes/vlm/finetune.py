@@ -660,6 +660,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 # log
                 self.log_train_metrics(log_data)
 
+                # If any rank received SIGTERM, save checkpoint immediately and exit
+                if self.step_scheduler.sigterm_received:
+                    logging.info("SIGTERM detected on at least one rank; saving checkpoint and terminating...")
+                    self.save_checkpoint(epoch, self.step_scheduler.step)
+                    break
+
                 if self.step_scheduler.is_ckpt_step:
                     self.save_checkpoint(epoch, self.step_scheduler.step)
 
@@ -667,6 +673,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     log_data = self._run_validation_epoch(self.val_dataloader)
                     self.log_val_metrics(log_data)
                     self.model.train()
+
+            if self.step_scheduler.sigterm_received:
+                break
+
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
         self.metric_logger_valid.close()
