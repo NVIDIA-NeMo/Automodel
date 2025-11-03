@@ -1024,12 +1024,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # log
                 self.log_train_metrics(train_log_data)
 
-                # If any rank received SIGTERM, save checkpoint immediately and exit
-                if self.step_scheduler.sigterm_received:
-                    logging.info("SIGTERM detected on at least one rank; saving checkpoint and terminating...")
-                    self.save_checkpoint(epoch, self.step_scheduler.step)
-                    break
-
                 # Save the checkpoint every ckpt_every_steps
                 if self.step_scheduler.is_ckpt_step:
                     self.save_checkpoint(epoch, self.step_scheduler.step)
@@ -1044,9 +1038,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
                     for mp in self.model_parts:
                         mp.train()
-
-            if self.step_scheduler.sigterm_received:
-                break
 
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()

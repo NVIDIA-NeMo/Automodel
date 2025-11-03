@@ -102,7 +102,9 @@ class StepScheduler(Stateful):
                 ckpt_every_steps = self.epoch_len
             logger.info("ckpt_every_steps not provided; will save checkpoint every {} steps".format(ckpt_every_steps))
         self.ckpt_every_steps = ckpt_every_steps
+
         self.sig_handler = DistributedSignalHandler().__enter__()
+        self.sigterm_flag = False
 
     def __iter__(self):
         """
@@ -123,7 +125,7 @@ class StepScheduler(Stateful):
                 yield batch_buffer
                 self.step += 1
                 batch_buffer = []
-                if self.step >= self.max_steps:
+                if self.step >= self.max_steps or self.sigterm_received:
                     return
         if batch_buffer:
             yield batch_buffer
@@ -144,7 +146,7 @@ class StepScheduler(Stateful):
         Returns whether this step needs to call the validation.
         """
         is_val = False
-        if self.val_every_steps and self.val_every_steps > 0:
+        if self.val_every_steps and self.val_every_steps > 0 and not self.sigterm_received:
             is_val = self.step % self.val_every_steps == self.val_every_steps - 1
         return is_val
 
@@ -157,7 +159,7 @@ class StepScheduler(Stateful):
             bool: if true, the checkpoint should run.
         """
         is_ckpt_step = (self.step % self.ckpt_every_steps) == self.ckpt_every_steps - 1
-        return is_ckpt_step or self.is_last_batch or self.is_last_step
+        return is_ckpt_step or self.is_last_batch or self.is_last_step or self.sigterm_received
 
     @property
     def is_last_step(self):
@@ -182,7 +184,7 @@ class StepScheduler(Stateful):
         """
         Returns whether SIGTERM was received.
         """
-        self.sigterm_flag = getattr(self, "sigterm_flag", False) or any(self.sig_handler.signals_received())
+        self.sigterm_flag = self.sigterm_flag or any(self.sig_handler.signals_received())
         return self.sigterm_flag
 
     @property
@@ -195,7 +197,7 @@ class StepScheduler(Stateful):
         """
         epoch = self.epoch
         for e in range(epoch, self.num_epochs):
-            if self.step >= self.max_steps:
+            if self.step >= self.max_steps or self.sigterm_received:
                 return
             yield e
 
