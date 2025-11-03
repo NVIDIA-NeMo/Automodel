@@ -1,11 +1,12 @@
 # GLUE MRPC with RoBERTa-large + LoRA
 
 step_scheduler:
-  global_batch_size: 64
-  local_batch_size: 8
+  global_batch_size: 32
+  local_batch_size: 32
   ckpt_every_steps: 200
   val_every_steps: 100
-  num_epochs: 3
+  num_epochs: 2
+  max_steps: 10
 
 dist_env:
   backend: nccl
@@ -17,10 +18,10 @@ model:
   num_labels: 2
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: safetensors
-  save_consolidated: false
+  save_consolidated: true
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
@@ -29,6 +30,15 @@ distributed:
   tp_size: 1
   cp_size: 1
   sequence_parallel: false
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules:
+  - "*.query"
+  - "*.value"
+  dim: 8
+  alpha: 16
+  dropout: 0.1
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.seq_cls.GLUE_MRPC
@@ -47,16 +57,9 @@ validation_dataloader:
   collate_fn: nemo_automodel.components.datasets.utils.seq_cls_collater
 
 optimizer:
-  _target_: torch.optim.Adam
+  _target_: torch.optim.AdamW
   betas: [0.9, 0.999]
   eps: 1e-8
   lr: 3.0e-4
   weight_decay: 0
-
-peft:
-  _target_: nemo_automodel.components._peft.lora.PeftConfig
-  target_modules: "*.proj"
-  dim: 8
-  alpha: 16
-  dropout: 0.1
 
