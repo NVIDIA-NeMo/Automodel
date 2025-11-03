@@ -51,7 +51,7 @@ distributed:
   tp_size: 8
   cp_size: 1
   pp_size: 1
-  sequence_parallel: true
+  sequence_parallel: false
   activation_checkpointing: false
 
 
