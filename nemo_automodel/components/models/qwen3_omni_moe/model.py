@@ -23,9 +23,9 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeAudioEncoder,
     Qwen3OmniMoeVisionEncoder,
+    Qwen3OmniMoeThinkerTextRotaryEmbedding
 )
 
-from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.qwen3_moe.model import Block
 from nemo_automodel.components.models.qwen3_omni_moe.state_dict_adapter import Qwen3OmniMoeStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -45,121 +45,6 @@ def _get_feat_extract_output_lengths(input_lengths):
     feat_lengths = (input_lengths_leave - 1) // 2 + 1
     output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
     return output_lengths
-
-
-class MRopeRotaryEmbedding(nn.Module):
-    """Multi-dimensional Rotary Position Embedding for Qwen3OmniMoe.
-    
-    MRoPE extends RoPE to handle 3D position indices (temporal, height, width).
-    The frequencies are computed separately for each dimension and then interleaved.
-    """
-
-    def __init__(
-        self,
-        head_dim: int,
-        base: int = 10000,
-        mrope_section: list[int] | None = None,
-        dtype: torch.dtype = torch.float32,
-        device: torch.device | None = None,
-    ):
-        super().__init__()
-        self.head_dim = head_dim
-        self.base = base
-        self.dtype = dtype
-        self.device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
-        
-        # Default MRoPE sections for temporal, height, width dimensions
-        self.mrope_section = mrope_section or [24, 20, 20]
-        
-        # Create separate rotary embeddings for each dimension
-        # Each dimension gets head_dim // 3 channels (roughly)
-        self.rotary_emb = RotaryEmbedding(
-            head_dim=head_dim // 2,  # MRoPE uses half the head_dim for interleaving
-            base=base,
-            dtype=dtype,
-            initial_context_length=4096,
-            scaling_factor=1.0,
-            ntk_alpha=1.0,
-            ntk_beta=32.0,
-            device=self.device,
-        )
-        
-        # Attention scaling factor (from concentration in YaRN)
-        self.attention_scaling = 1.0
-
-    def apply_interleaved_mrope(self, freqs: torch.Tensor, mrope_section: list[int]):
-        """Apply interleaved MRoPE to 3D rotary embeddings.
-        
-        Reorganizes frequency layout from chunked [TTT...HHH...WWW] to
-        interleaved [THTHWHTHW...TT], preserving frequency continuity.
-        
-        Args:
-            freqs: Frequencies for all 3 dimensions stacked [3, B, S, head_dim//2]
-                   where first dimension is (temporal, height, width)
-            mrope_section: List of 3 integers specifying section lengths for [T, H, W]
-            
-        Returns:
-            Interleaved frequencies [B, S, head_dim//2]
-        """
-        freqs_t = freqs[0] # [B, S, head_dim//2]
-        for dim, offset in enumerate((1, 2), start=1):  # H, W
-            length = mrope_section[dim] * 3
-            idx = slice(offset, length, 3)
-            freqs_t[..., idx] = freqs[dim, ..., idx]
-        return freqs_t
-
-
-def compute_mrope_freqs_cis(
-    rotary_emb: MRopeRotaryEmbedding,
-    position_ids: torch.Tensor,
-    qkv_format: str = "bshd",
-) -> torch.Tensor:
-    """Compute MRoPE frequency tensors from 3D position IDs.
-    
-    Args:
-        rotary_emb: MRoPE rotary embedding module
-        position_ids: 3D position IDs [3, B, S] where first dim is (temporal, height, width)
-        qkv_format: Either "bshd" or "thd"
-        
-    Returns:
-        Concatenated [cos, sin] frequencies [B, S, head_dim] or [T, head_dim]
-    """
-    if position_ids.ndim == 2:
-        # Standard 1D position IDs, expand to 3D
-        position_ids = position_ids[None, ...].expand(3, -1, -1)
-    
-    # Compute frequencies using the same approach as HF's Qwen3OmniMoeThinkerTextRotaryEmbedding
-    # Note: RotaryEmbedding from gpt_oss.rope_utils computes inv_freq dynamically
-    _, inv_freq = rotary_emb.rotary_emb._compute_concentration_and_inv_freq()
-    inv_freq = inv_freq.to(device=position_ids.device, dtype=torch.float32)
-    
-    # Expand inv_freq and position_ids following HF pattern
-    # inv_freq: [D] -> [3, bs, D, 1]
-    inv_freq_expanded = inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1)
-    # position_ids: [3, bs, positions] -> [3, bs, 1, positions]
-    position_ids_expanded = position_ids[:, :, None, :].float()
-    
-    # Compute frequencies: [3, bs, D, 1] @ [3, bs, 1, positions] = [3, bs, D, positions]
-    # Then transpose(2, 3) to get [3, bs, positions, D]
-    freqs = (inv_freq_expanded @ position_ids_expanded).transpose(2, 3)
-    
-    # Apply interleaved MRoPE pattern - interleave the 3 dimensions
-    freqs = rotary_emb.apply_interleaved_mrope(freqs, rotary_emb.mrope_section)
-    
-    # Concatenate to get full rotation
-    emb = torch.cat((freqs, freqs), dim=-1)  # [B, S, head_dim]
-    
-    # Apply attention scaling and return cos and sin
-    cos = emb.cos() * rotary_emb.attention_scaling
-    sin = emb.sin() * rotary_emb.attention_scaling
-    
-    if qkv_format == "thd":
-        # Squeeze batch dimension for THD format
-        cos = cos.squeeze(0)
-        sin = sin.squeeze(0)
-    
-    return torch.cat([cos, sin], dim=-1)
-
 
 class Qwen3OmniMoeThinkerTextModel(nn.Module):  #corresponding to qwen3_moe/model.py Qwen3MoeModel, diff: use MRopeRotaryEmbedding instead of RotaryEmbedding
     """Qwen3OmniMoe Thinker Text Model with MRoPE and sparse MoE layers."""
@@ -200,25 +85,8 @@ class Qwen3OmniMoeThinkerTextModel(nn.Module):  #corresponding to qwen3_moe/mode
             [Block(layer_id, config, self.moe_config, backend) for layer_id in range(config.num_hidden_layers)]
         )
         self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = Qwen3OmniMoeThinkerTextRotaryEmbedding(config)
         
-
-        # MRoPE (Multi-dimensional Rotary Position Embedding)
-        self.max_seq_len = config.max_position_embeddings
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        
-        # Get MRoPE sections from config
-        mrope_section = None
-        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            mrope_section = config.rope_scaling.get("mrope_section", [24, 20, 20])
-        
-        self.rotary_emb = MRopeRotaryEmbedding(
-            head_dim=self.head_dim,
-            base=config.rope_theta,
-            mrope_section=mrope_section,
-            dtype=torch.float32,
-            device=torch.device(f"cuda:{torch.cuda.current_device()}"),
-        )
-
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -248,12 +116,10 @@ class Qwen3OmniMoeThinkerTextModel(nn.Module):  #corresponding to qwen3_moe/mode
 
         # the hard coded `3` is for temporal, height and width.
         if position_ids is None:
-            # Default 1D position IDs, expanded to 3D for MRoPE
             seq_length = inputs_embeds.shape[1]
             position_ids = torch.arange(seq_length, device=inputs_embeds.device).unsqueeze(0).expand(inputs_embeds.shape[0], -1)
             position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
         elif position_ids.ndim == 2:
-            # 2D position IDs, expand to 3D
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
         if position_ids.ndim == 3 and position_ids.shape[0] == 4:
@@ -262,12 +128,11 @@ class Qwen3OmniMoeThinkerTextModel(nn.Module):  #corresponding to qwen3_moe/mode
         else:
             text_position_ids = position_ids[0]
 
-        # Compute MRoPE freqs_cis from 3D position_ids
-        freqs_cis = compute_mrope_freqs_cis(
-            self.rotary_emb, position_ids, qkv_format=attn_kwargs.get("qkv_format", "bshd")
-        )
-
         hidden_states = inputs_embeds
+
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        half = position_embeddings[0].shape[-1] // 2
+        freqs_cis = torch.cat((position_embeddings[0][..., :half], position_embeddings[1][..., :half]), dim=-1)
 
         # decoder layers
         for layer_idx, decoder_layer in enumerate(self.layers):
