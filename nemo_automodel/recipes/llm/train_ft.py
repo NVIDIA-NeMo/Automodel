@@ -76,6 +76,7 @@ from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     print_trainable_parameters,
 )
+from nemo_automodel.components.utils.sig_utils import DistributedSignalHandler
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
@@ -787,6 +788,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         apply_cache_compatibility_patches()
         # Set up the stateful random number generator
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
+        self.sig_handler = DistributedSignalHandler().__enter__()
 
         self.device_mesh = None
         self.moe_mesh = None
@@ -1003,6 +1005,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # log
                 self.log_train_metrics(train_log_data)
 
+                # If any rank received SIGTERM, save checkpoint immediately and exit
+                if any(self.sig_handler.signals_received()):
+                    logging.info("SIGTERM detected on at least one rank; saving checkpoint and terminating...")
+                    self.save_checkpoint(epoch, self.step_scheduler.step)
+                    break
+
                 # Save the checkpoint every ckpt_every_steps
                 if self.step_scheduler.is_ckpt_step:
                     self.save_checkpoint(epoch, self.step_scheduler.step)
@@ -1013,6 +1021,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     self.log_val_metrics(val_log_data)
                     for mp in self.model_parts:
                         mp.train()
+
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
         self.metric_logger_valid.close()
