@@ -725,12 +725,18 @@ class FinetuneRecipeForVLM(BaseRecipe):
             batches: List of batches of training data.
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
         """
-        num_label_tokens = sum((batch["labels"] != -100).sum().item() for batch in batches)
+        num_label_tokens = torch.tensor(
+            sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
+        )
+        num_label_tokens = self._dp_allreduce(num_label_tokens).item()
         loss_buffer = []
 
         # number of tokens in the batch, excluding any tail padding.
-        num_tokens_in_batch = sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches)
-        num_tokens_in_batch = self._dp_allreduce(torch.LongTensor([num_tokens_in_batch])).item()
+        num_tokens_in_batch = torch.tensor(
+            sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
+            dtype=torch.long,
+        )
+        num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
         num_batches = len(batches)
         for i, batch in enumerate(batches):
