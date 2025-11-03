@@ -18,6 +18,7 @@ import logging
 import pathlib
 
 import torch
+import wandb
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -93,11 +94,12 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             moe_mesh=self.moe_mesh,
         )
 
+        self.peft_config = self.cfg.instantiate_path("peft")
         model, model_state_dict_keys, self.optimizer, _ = build_model_and_optimizer(
             device=self.dist_env.device,
             cfg_model=self.cfg.model,
             cfg_opt=self.cfg.optimizer,
-            cfg_peft=None,
+            cfg_peft=self.peft_config,
             has_packed_sequence=use_hf_fa2,
             model_wrapper=self.model_wrapper,
             seed=self.cfg.get("seed", 42),
@@ -112,6 +114,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             load_base_model=self.cfg.get("checkpoint.load_base_model", True),
             checkpointer=self.checkpointer,
         )
+
         self.checkpointer.config.model_state_dict_keys = model_state_dict_keys
 
         self.model_parts = [model]
@@ -196,18 +199,14 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
     def _run_train_optim_step(self, batches):
         model = self.model_parts[0]
         losses = []
-        for i, batch in enumerate(batches):
+        for batch in batches:
             batch = {
                 k: (v.to(self.dist_env.device, non_blocking=True) if v is not None else None) for k, v in batch.items()
             }
             labels = batch.pop("labels")
             out = model(**batch)
             logits = getattr(out, "logits", out)
-            loss = (
-                self.loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
-                if logits.dim() == 3
-                else self.loss_fn(logits, labels)
-            )
+            loss = self.loss_fn(logits, labels.view(-1))
             losses.append(loss.detach().clone())
             (loss * self._get_dp_group_size(include_cp=True)).backward()
             for opt in self.optimizer:
@@ -233,6 +232,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 "num_label_tokens": 0,
             },
         )
+
     @torch.no_grad()
     def _validate_one_epoch(self, dataloader):
         model = self.model_parts[0]
@@ -246,11 +246,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             labels = batch.pop("labels")
             out = model(**batch)
             logits = getattr(out, "logits", out)
-            loss = (
-                self.loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
-                if logits.dim() == 3
-                else self.loss_fn(logits, labels)
-            )
+            loss = self.loss_fn(logits, labels.view(-1))
             total_loss += loss.detach()
             count += 1
         total_loss = total_loss if count == 0 else total_loss / count
@@ -283,8 +279,8 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         if not self.dist_env.is_main or log_data is None:
             return
 
-        # if wandb.run is not None:
-        #     wandb.log(log_data.to_dict(), step=log_data.step)
+        if wandb.run is not None:
+            wandb.log(log_data.to_dict(), step=log_data.step)
 
         # JSONL validation log
         self.metric_logger_valid.log(log_data)
@@ -318,8 +314,9 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        # if wandb.run is not None:
-        #     wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+        if wandb.run is not None:
+            wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+
         # JSONL training log
         self.metric_logger_train.log(log_data)
         logging.info(
