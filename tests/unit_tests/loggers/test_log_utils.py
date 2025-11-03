@@ -115,32 +115,103 @@ def test_setup_logging_full(monkeypatch, caplog):
     """
     mod = reload_module()
 
+    # ---- snapshot logging state to avoid leaking to other tests ----
+    root = logging.getLogger()
+    root_level_before = root.level
+    root_filters_before = list(root.filters)
+    # Snapshot root handlers and key attributes we may mutate
+    root_handlers_before = [
+        (h, getattr(h, "level", logging.NOTSET), list(getattr(h, "filters", [])), getattr(h, "formatter", None))
+        for h in list(root.handlers)
+    ]
+    disable_threshold_before = logging.root.manager.disable
+    # Snapshot per-logger levels and filters
+    logger_state_before = {}
+    for _name, _obj in logging.root.manager.loggerDict.items():
+        _logger = logging.getLogger(_name)
+        if isinstance(_logger, logging.Logger):
+            logger_state_before[_name] = {
+                "level": _logger.level,
+                "filters": list(getattr(_logger, "filters", [])),
+            }
+
     # ---- environment override ----
     monkeypatch.setenv("LOGGING_LEVEL", str(logging.DEBUG))
 
     # ---- rank env ----
     monkeypatch.setenv("RANK", "0")  # keep logging on
 
-    # Configure logging
-    caplog.set_level(logging.DEBUG)
-    mod.setup_logging(
-        logging_level=logging.INFO,  # should be overridden by env
-        filter_warning=True,
-        modules_to_filter=["secret"],
-        set_level_for_all_loggers=True,
-    )
+    try:
+        # Configure logging
+        caplog.set_level(logging.DEBUG)
+        mod.setup_logging(
+            logging_level=logging.INFO,  # should be overridden by env
+            filter_warning=True,
+            modules_to_filter=["secret"],
+            set_level_for_all_loggers=True,
+        )
 
-    # Logger for allowed module
-    log_ok = logging.getLogger("public.module")
+        # Logger for allowed module
+        log_ok = logging.getLogger("public.module")
 
-    # Emit records
-    with caplog.at_level(logging.DEBUG):
-        log_ok.debug("visible-debug")
-        log_ok.warning("hidden-warning")  # should be suppressed via warning_filter
+        # Emit records
+        with caplog.at_level(logging.DEBUG):
+            log_ok.debug("visible-debug")
+            log_ok.warning("hidden-warning")  # should be suppressed via warning_filter
 
-    messages = {rec.message for rec in caplog.records}
+        messages = {rec.message for rec in caplog.records}
 
-    assert "visible-debug" in messages
+        assert "visible-debug" in messages
 
-    # Confirm root level got set from env override
-    assert logging.getLogger().level == logging.DEBUG
+        # Confirm root level got set from env override
+        assert logging.getLogger().level == logging.DEBUG
+    finally:
+        # ---- restore logging state ----
+        # Restore per-logger levels and filters
+        current_logger_names = list(logging.root.manager.loggerDict.keys())
+        for _name in current_logger_names:
+            _logger = logging.getLogger(_name)
+            if not isinstance(_logger, logging.Logger):
+                continue
+            if _name in logger_state_before:
+                _saved = logger_state_before[_name]
+                _logger.setLevel(_saved["level"])
+                # Reset filters
+                _logger.filters[:] = []
+                for _f in _saved["filters"]:
+                    _logger.addFilter(_f)
+            else:
+                # New logger created during test: reset to default and clear filters
+                _logger.setLevel(logging.NOTSET)
+                _logger.filters[:] = []
+
+        # Restore root filters
+        root.filters[:] = []
+        for _f in root_filters_before:
+            root.addFilter(_f)
+
+        # Restore root handlers and their attributes
+        for _h in list(root.handlers):
+            root.removeHandler(_h)
+        for _h, _lvl, _filters, _fmt in root_handlers_before:
+            # Restore handler attributes
+            try:
+                _h.setLevel(_lvl)
+            except Exception:
+                pass
+            try:
+                _h.filters[:] = []
+                for _f in _filters:
+                    _h.addFilter(_f)
+            except Exception:
+                pass
+            try:
+                if _fmt is not None:
+                    _h.setFormatter(_fmt)
+            except Exception:
+                pass
+            root.addHandler(_h)
+
+        # Restore root level and global disable threshold
+        root.setLevel(root_level_before)
+        logging.disable(disable_threshold_before)
