@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import os
 import gc
 import inspect
 import logging
@@ -33,6 +34,7 @@ from transformers import (
 )
 from transformers.modeling_utils import _get_resolved_checkpoint_files
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
+from transformers.utils.hub import TRANSFORMERS_CACHE
 
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel import __version__
@@ -44,6 +46,7 @@ from nemo_automodel.shared.utils import dtype_from_str
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 from nemo_automodel.components.distributed.ddp import DDPManager
 from torch.distributed.device_mesh import DeviceMesh
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 
@@ -487,6 +490,12 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 return _retry(attn_implementation=attn_implementation)
             raise e
 
+        # Copy state dict keys before any parallelization (used by checkpointing)
+        try:
+            state_dict_keys_before_parallel = list(model.state_dict().keys())
+        except Exception:
+            state_dict_keys_before_parallel = []
+
         # Decide kernel patching based on requested parallelism
         if distributed is not None:
             conf = distributed if isinstance(distributed, dict) else {}
@@ -494,6 +503,14 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             cp = int(conf.get("cp_size", 1))
             if tp > 1 or cp > 1:
                 use_liger_kernel = False
+
+            # Guard for CP requiring SDPA support on some models (moved from train_ft)
+            try:
+                if cp > 1 and hasattr(model, "_supports_sdpa") and model._supports_sdpa is False:
+                    raise ValueError("Model does not support SDPA required for context parallelism")
+            except Exception:
+                # If attribute missing, do not block
+                pass
 
         # Build internal wrapper (FSDP2 or DDP) using device_mesh or config
         internal_wrapper = None
@@ -562,6 +579,46 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         if move_to_device:
             dev = _choose_device(device)
             _move_module_to_device(model, dev, torch_dtype)
+
+        # Auto-detect local NeMo checkpoint path and load via Checkpointer
+        try:
+            is_local_path = isinstance(pretrained_model_name_or_path, str) and os.path.isdir(pretrained_model_name_or_path)
+            ckpt_model_dir = (
+                os.path.join(pretrained_model_name_or_path, "model") if is_local_path else None
+            )
+            if ckpt_model_dir and os.path.isdir(ckpt_model_dir):
+                ckpt_conf_dict = dict(
+                    enabled=True,
+                    checkpoint_dir=pretrained_model_name_or_path,
+                    model_save_format="safetensors",
+                    model_repo_id=None,
+                    model_cache_dir=kwargs.get("cache_dir", TRANSFORMERS_CACHE),
+                    save_consolidated=True,
+                    is_peft=False,
+                    is_async=False,
+                    dequantize_base_checkpoint=False,
+                )
+                if state_dict_keys_before_parallel:
+                    ckpt_conf_dict["model_state_dict_keys"] = state_dict_keys_before_parallel
+                checkpoint_config = CheckpointingConfig(**ckpt_conf_dict)
+
+                dp_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                tp_rank = 0
+                pp_rank = 0
+
+                model._nemo_checkpointer = Checkpointer(
+                    config=checkpoint_config,
+                    dp_rank=dp_rank,
+                    tp_rank=tp_rank,
+                    pp_rank=pp_rank,
+                    moe_mesh=getattr(internal_wrapper, "moe_mesh", None) if 'internal_wrapper' in locals() else None,
+                )
+                try:
+                    model._nemo_checkpointer.load_model(model, ckpt_model_dir)
+                except Exception as e:
+                    logger.warning(f"Failed to load local NeMo checkpoint from {ckpt_model_dir}: {e}")
+        except Exception as e:
+            logger.warning(f"Checkpoint autodetection failed: {e}")
 
         model.config.update({"nemo_version": __version__})
         return model
@@ -700,30 +757,41 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 return _retry(attn_implementation="eager")
             raise e
 
-        # Initialize model wrapper from `distributed` if provided
-        if distributed is not None and model_wrapper is None:
-            if isinstance(distributed, FSDP2Manager):
-                model_wrapper = distributed
-            elif isinstance(distributed, dict):
-                init_kwargs = dict(distributed)
-                try:
-                    import torch.distributed as dist
+        # Build internal wrapper (FSDP2 or DDP) using device_mesh or config
+        internal_wrapper = None
+        if torch.distributed.is_initialized():
+            conf = distributed if isinstance(distributed, dict) else {}
+            tp = int(conf.get("tp_size", 1))
+            cp = int(conf.get("cp_size", 1))
+            pp = int(conf.get("pp_size", 1))
+            dp = int(conf.get("dp_size", 0))
+            world_size = conf.get("world_size", torch.distributed.get_world_size())
+            backend = conf.get("backend", "nccl" if torch.cuda.is_available() else "gloo")
 
-                    if "world_size" not in init_kwargs and dist.is_available() and dist.is_initialized():
-                        init_kwargs["world_size"] = dist.get_world_size()
-                except Exception:
-                    pass
-                if "backend" not in init_kwargs:
-                    init_kwargs["backend"] = "nccl" if torch.cuda.is_available() else "gloo"
-                model_wrapper = FSDP2Manager(**init_kwargs)
+            if tp > 1 or cp > 1 or pp > 1:
+                internal_wrapper = FSDP2Manager(
+                    dp_size=dp if dp > 0 else None,
+                    tp_size=tp,
+                    cp_size=cp,
+                    pp_size=pp,
+                    backend=backend,
+                    world_size=world_size,
+                    use_hf_tp_plan=bool(conf.get("use_hf_tp_plan", False)),
+                    sequence_parallel=bool(conf.get("sequence_parallel", False)),
+                    activation_checkpointing=bool(conf.get("activation_checkpointing", False)),
+                )
+                # If caller provided a prebuilt DeviceMesh, inject it
+                if device_mesh is not None:
+                    internal_wrapper.device_mesh = device_mesh
+            elif conf:
+                internal_wrapper = DDPManager(
+                    backend=backend,
+                    activation_checkpointing=bool(conf.get("activation_checkpointing", False)),
+                )
 
         # If distributed tensor/context parallelism is requested, avoid Liger patch like in train_ft
-        if model_wrapper is not None:
-            try:
-                if getattr(model_wrapper, "tp_size", 1) > 1 or getattr(model_wrapper, "cp_size", 1) > 1:
-                    use_liger_kernel = False
-            except Exception:
-                pass
+        # (handled above when building internal_wrapper in from_pretrained; for from_config, we only rely on
+        # distributed dict and internal_wrapper built below.)
 
         # Kernel patching
         try:
@@ -746,14 +814,14 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         _verify_sdpa_support(model, is_hf_model, cp_size)
         # Optional: parallelize model according to parallel_scheme decision
         # Priority: FSDP2 when tp_size>1 or cp_size>1; else DDP when dp_size>1; else single GPU
-        if model_wrapper is not None:
+        if internal_wrapper is not None:
             if torch.distributed.is_initialized():
                 try:
-                    model = model_wrapper.parallelize(model)
+                    model = internal_wrapper.parallelize(model)
                 except Exception as e:
-                    logger.warning("model_wrapper.parallelize failed: %s", e)
+                    logger.warning("internal parallelize failed: %s", e)
             else:
-                logger.warning("model_wrapper provided but torch.distributed is not initialized; skipping parallelize")
+                logger.warning("distributed requested but torch.distributed is not initialized; skipping parallelize")
         elif distributed is not None and torch.distributed.is_initialized():
             conf = distributed if isinstance(distributed, dict) else {}
             tp = int(conf.get("tp_size", 1))
