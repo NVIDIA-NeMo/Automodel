@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Adjust batch config as needed.
+# Current config targeting DGX Spark
 step_scheduler:
   global_batch_size: 128
   local_batch_size: 32
@@ -31,12 +33,6 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: openai/gpt-oss-20b
-  is_meta_device: true
-  backend:
-    _target_: nemo_automodel.components.moe.utils.BackendConfig
-    enable_deepep: false
-    attn: flex
-    linear: torch  # TE currently not supported for PEFT
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
