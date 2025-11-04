@@ -22,7 +22,9 @@ from nemo_automodel.components.datasets.llm.formatting_utils import (
 )
 
 
-def _formatting_prompts_func(example, tokenizer, eos_token_id, pad_token_id, seq_length=None, padding=None, truncation=None):
+def _formatting_prompts_func(
+    example, tokenizer, eos_token_id, pad_token_id, seq_length=None, padding=None, truncation=None
+):
     question = example["question"]
     context = example["context"]
     answer = example["answers"]["text"][0].strip() if example["answers"]["text"] else ""
@@ -40,7 +42,9 @@ def _formatting_prompts_func(example, tokenizer, eos_token_id, pad_token_id, seq
     )
 
 
-def _formatting_prompts_func_with_chat_template(example, tokenizer, eos_token_id, pad_token_id, seq_length=None, padding=None, truncation=None):
+def _formatting_prompts_func_with_chat_template(
+    example, tokenizer, eos_token_id, pad_token_id, seq_length=None, padding=None, truncation=None
+):
     context = example.get("context", None) or ""
     question = example.get("question", None) or ""
     answer = example["answers"]["text"][0].strip()
