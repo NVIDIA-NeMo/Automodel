@@ -141,6 +141,7 @@ class TestNeMoAutoModelForCausalLM:
             patch("nemo_automodel._transformers.auto_model._get_resolved_checkpoint_files") as mock_get_files,
             patch("nemo_automodel._transformers.auto_model.os.path.isdir", return_value=False),
             patch("nemo_automodel._transformers.auto_model.dist.is_initialized", return_value=True),
+            patch("nemo_automodel._transformers.auto_model.dist.get_world_size", return_value=1),
             patch("nemo_automodel._transformers.auto_model.dist.get_rank", return_value=0),
             patch("nemo_automodel._transformers.auto_model.dist.barrier") as mock_barrier,
         ):
@@ -178,6 +179,7 @@ class TestNeMoAutoModelForCausalLM:
             patch("nemo_automodel._transformers.auto_model._get_resolved_checkpoint_files") as mock_get_files,
             patch("nemo_automodel._transformers.auto_model.os.path.isdir", return_value=False),
             patch("nemo_automodel._transformers.auto_model.dist.is_initialized", return_value=False),
+            patch("nemo_automodel._transformers.auto_model.dist.get_world_size", return_value=1),
             patch("nemo_automodel._transformers.auto_model.dist.barrier") as mock_barrier,
         ):
             # Prepare a fake config with architectures and commit hash
