@@ -22,6 +22,7 @@ benchmark:
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []
+  num_nodes: 1
 
 step_scheduler:
   global_batch_size: 256
