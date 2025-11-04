@@ -308,6 +308,38 @@ class ConfigNode:
         """
         return self._raw_config
 
+    def instantiate_path(self, dotted_path, default=None, *args, **kwargs):
+        """
+        Instantiate the target object specified in the configuration by path.
+
+        If the path is not found, returns the default value.
+
+        For example, this is useful when you want to do something like:
+
+        cfg_peft = self.cfg.get("peft", None)
+        if cfg_peft is not None:
+            cfg_peft = cfg_peft.instantiate()
+
+        In this case, you first check if the dotted path (in this case "peft") is in the configuration.
+        If it is, you instantiate it, otherwise you return the default value (in this case None).
+
+        With instantiate_path, you can do:
+        cfg_peft = self.cfg.instantiate_path("peft", default=None)
+
+        Args:
+            dotted_path (str): The path to the target object (e.g., "model.config").
+            default: A default value to return if the path is not found.
+            *args: Positional arguments for the target instantiation.
+            **kwargs: Keyword arguments to override or add to the configuration values.
+
+        Returns:
+            The instantiated object.
+        """
+        item = self.get(dotted_path, default)
+        if item is default:
+            return default
+        return item.instantiate(*args, **kwargs)
+
     def instantiate(self, *args, **kwargs):
         """Instantiate the target object specified in the configuration.
 
