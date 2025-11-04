@@ -29,6 +29,7 @@ from torch.distributed.tensor.parallel import (
     SequenceParallel,
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
+
 # Import model classes for type checking and parallel plan mapping
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForCausalLM,
@@ -39,11 +40,7 @@ from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
-# Also import custom Llama model
-try:
-    from nemo_automodel.components.models.llama import LlamaForCausalLM as CustomLlamaForCausalLM
-except ImportError:
-    CustomLlamaForCausalLM = None  # Gracefully handle if custom model doesn't exist
+from nemo_automodel.components.models.llama import LlamaForCausalLM as CustomLlamaForCausalLM
 
 
 class SequenceParallelAllGatherActivation(SequenceParallel):
@@ -311,8 +308,5 @@ PARALLELIZE_FUNCTIONS: Dict[type, Callable[..., Dict[str, ParallelStyle]]] = {
     # The larger gemma models use Gemma3ForConditionalGeneration, which are for text-image input
     Gemma3ForConditionalGeneration: _parallelize_gemma3,
     Phi3ForCausalLM: _parallelize_phi3,
+    CustomLlamaForCausalLM: _parallelize_llama,
 }
-
-# Add custom Llama model if available (use same parallelization function)
-if CustomLlamaForCausalLM is not None:
-    PARALLELIZE_FUNCTIONS[CustomLlamaForCausalLM] = _parallelize_llama

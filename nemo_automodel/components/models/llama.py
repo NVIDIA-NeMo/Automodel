@@ -28,34 +28,33 @@ model:
 
 from __future__ import annotations
 
-import math
 from typing import Any, Callable, Optional, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import LlamaConfig, AutoModelForCausalLM
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.masking_utils import create_causal_mask
+from transformers import LlamaConfig
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers.masking_utils import create_causal_mask
 from transformers.modeling_layers import GradientCheckpointingLayer
-from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, can_return_tuple
-from transformers.utils.generic import check_model_inputs
-    
-from nemo_automodel.shared.utils import dtype_from_str
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.models.llama.modeling_llama import (
+    LlamaMLP as HFLlamaMLP,  # HuggingFace's standard MLP
+)
 
 # Import HuggingFace's Llama components directly to ensure exact same behavior
 from transformers.models.llama.modeling_llama import (
     LlamaRMSNorm,
     LlamaRotaryEmbedding,
-    LlamaMLP as HFLlamaMLP,  # HuggingFace's standard MLP
-    rotate_half,
     apply_rotary_pos_emb,
-    repeat_kv,
     eager_attention_forward,
 )
+from transformers.processing_utils import Unpack
+from transformers.utils import TransformersKwargs, can_return_tuple
+from transformers.utils.generic import check_model_inputs
+
+from nemo_automodel.shared.utils import dtype_from_str
 
 __all__ = ["build_llama_model", "LlamaForCausalLM"]
 
@@ -560,7 +559,6 @@ def build_llama_model(pretrained_model_name_or_path: str, **kwargs: Any) -> nn.M
         # Auto-detect best available implementation (same as nemo_automodel default)
         try:
             # Try flash_attention_2 first (fastest)
-            from flash_attn import flash_attn_func
             config._attn_implementation = "flash_attention_2"
         except (ImportError, ModuleNotFoundError):
             # Fall back to SDPA if available (PyTorch 2.0+)
