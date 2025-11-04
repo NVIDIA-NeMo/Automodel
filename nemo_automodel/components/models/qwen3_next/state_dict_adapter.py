@@ -93,16 +93,14 @@ class Qwen3NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
     def to_hf(
         self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
     ) -> dict[str, Any]:
-        # First convert routed experts from grouped to split format
-        hf_state_dict = self._to_hf_w_split_experts(state_dict)
+        hf_state_dict = {}
+        for fqn, tensor in state_dict.items():
+            converted_tensors = self.convert_single_tensor_to_hf(
+                fqn, tensor, exclude_key_regex=exclude_key_regex, quantization=quantization, **kwargs
+            )
+            for key, value in converted_tensors:
+                hf_state_dict[key] = value
 
-        # Then apply key mappings for shared experts (shared_experts -> shared_expert)
-        hf_state_dict = self._apply_key_mapping(hf_state_dict, self.internal_to_hf_map)
-
-        if exclude_key_regex:
-            import re
-
-            hf_state_dict = {k: v for k, v in hf_state_dict.items() if not re.match(exclude_key_regex, k)}
         return hf_state_dict
 
     def from_hf(
@@ -122,3 +120,38 @@ class Qwen3NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
 
         # Then convert routed experts from split to grouped format
         return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
+
+    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+        """Convert a single tensor from native format to HuggingFace format.
+
+        Args:
+            fqn: Fully qualified name of the tensor in native format
+            tensor: The tensor to convert
+            **kwargs: Additional arguments for conversion
+
+        Returns:
+            List of (fqn, tensor) tuples in HuggingFace format
+        """
+        exclude_key_regex = kwargs.get("exclude_key_regex", None)
+
+        expert_result = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
+        if expert_result is not None:
+            result = expert_result
+        else:
+            result = [(fqn, tensor)]
+
+        mapped_result = []
+        for key, value in result:
+            new_key = key
+            for pattern, replacement in self.internal_to_hf_map.items():
+                if pattern in key:
+                    new_key = new_key.replace(pattern, replacement)
+                    break
+            mapped_result.append((new_key, value))
+
+        if exclude_key_regex:
+            import re
+
+            mapped_result = [(k, v) for k, v in mapped_result if not re.match(exclude_key_regex, k)]
+
+        return mapped_result

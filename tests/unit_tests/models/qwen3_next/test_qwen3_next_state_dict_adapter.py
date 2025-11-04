@@ -448,3 +448,111 @@ class TestQwen3NextStateDictAdapter:
             assert f"model.layers.{layer}.mlp.shared_expert.gate_proj.weight" not in out
             assert f"model.layers.{layer}.mlp.shared_expert.up_proj.weight" not in out
             assert f"model.layers.{layer}.mlp.shared_expert.down_proj.weight" not in out
+
+
+class TestConvertSingleTensorToHf:
+    def create_mock_config(self):
+        config = Mock()
+        config.num_layers = 2
+        config.hidden_size = 64
+        return config
+
+    def create_mock_moe_config(self):
+        moe_config = Mock()
+        moe_config.n_routed_experts = 8
+        moe_config.moe_inter_dim = 512
+        return moe_config
+
+    def create_mock_backend_config(self):
+        backend = Mock()
+        backend.enable_deepep = False
+        return backend
+
+    def test_expert_tensor_conversion_with_mapping(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+        adapter = Qwen3NextStateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(8, 256, 1024)
+        fqn = "model.layers.0.mlp.experts.gate_and_up_projs"
+
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts') as mock_convert:
+            mock_convert.return_value = [
+                ("model.layers.0.mlp.experts.0.gate_proj.weight", torch.randn(512, 256)),
+                ("model.layers.0.mlp.experts.0.up_proj.weight", torch.randn(512, 256)),
+            ]
+
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor)
+
+            mock_convert.assert_called_once_with(fqn, tensor)
+            assert len(result) == 2
+
+    def test_shared_expert_key_mapping(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+        adapter = Qwen3NextStateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(128, 256)
+        fqn = "model.layers.0.mlp.shared_experts.gate_proj.weight"
+
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor)
+
+            assert len(result) == 1
+            # Should be mapped to singular "shared_expert"
+            assert result[0][0] == "model.layers.0.mlp.shared_expert.gate_proj.weight"
+            assert torch.equal(result[0][1], tensor)
+
+    def test_non_expert_tensor_conversion(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+        adapter = Qwen3NextStateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(64, 64)
+        fqn = "model.layers.0.attention.weight"
+
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor)
+
+            assert len(result) == 1
+            assert result[0][0] == fqn
+            assert torch.equal(result[0][1], tensor)
+
+    def test_exclude_key_regex(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+        adapter = Qwen3NextStateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(64, 64)
+        fqn = "exclude_this.weight"
+
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor, exclude_key_regex=r"exclude.*")
+
+            assert len(result) == 0
+
+    def test_expert_tensor_with_exclude_regex_and_mapping(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+        adapter = Qwen3NextStateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(8, 256, 1024)
+        fqn = "model.layers.0.mlp.experts.gate_and_up_projs"
+
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts') as mock_convert:
+            mock_convert.return_value = [
+                ("model.layers.0.mlp.shared_experts.gate_proj.weight", torch.randn(128, 256)),
+                ("exclude_me.weight", torch.randn(64, 64)),
+            ]
+
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor, exclude_key_regex=r"exclude.*")
+
+            # shared_experts should be mapped to shared_expert
+            assert len(result) == 1
+            assert result[0][0] == "model.layers.0.mlp.shared_expert.gate_proj.weight"
+            assert "exclude_me.weight" not in [k for k, _ in result]

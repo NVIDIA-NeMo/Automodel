@@ -283,8 +283,8 @@ class TestToHfWSplitExperts:
             down_key = f"model.layers.2.mlp.experts.{expert_id}.down_proj.weight"
             assert down_key in result
 
-    @patch("nemo_automodel.components.moe.state_dict_mixin.validate_dtensor_expert_sharding")
-    @patch("nemo_automodel.components.moe.state_dict_mixin.is_dtensor")
+    @patch("nemo_automodel.components.moe.state_dict_utils.validate_dtensor_expert_sharding")
+    @patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor")
     def test_dtensor_validation(self, mock_is_dtensor, mock_validate):
         mock_is_dtensor.return_value = True
 
@@ -373,8 +373,8 @@ class TestToHfWSplitExperts:
             assert down_key in result
             assert result[down_key].shape == (1024, 512)  # [dim, inter_dim]
 
-    @patch("nemo_automodel.components.moe.state_dict_mixin.validate_dtensor_expert_sharding")
-    @patch("nemo_automodel.components.moe.state_dict_mixin.is_dtensor")
+    @patch("nemo_automodel.components.moe.state_dict_utils.validate_dtensor_expert_sharding")
+    @patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor")
     def test_dtensor_validation_n2(self, mock_is_dtensor, mock_validate):
         mock_is_dtensor.return_value = True
 
@@ -576,3 +576,106 @@ class TestFromHfWMergedExperts:
 
 
     # Tests merged into TestFromHfWMergedExperts
+
+
+class TestConvertSingleMergedExpertToHfSplitExperts:
+    @patch("nemo_automodel.components.moe.state_dict_mixin.is_dtensor")
+    def test_gate_and_up_projs_conversion(self, mock_is_dtensor):
+        mock_is_dtensor.return_value = False
+
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
+
+        # Create gate_and_up_projs tensor [n_experts, dim, 2*inter_dim]
+        tensor = torch.randn(2, 1024, 1024)
+        fqn = "model.layers.0.mlp.experts.gate_and_up_projs"
+
+        result = mixin._convert_single_merged_expert_to_hf_split_experts(fqn, tensor)
+
+        assert result is not None
+        assert len(result) == 4  # 2 experts * 2 projections (gate + up)
+
+        # Check gate_proj and up_proj for each expert
+        for expert_id in range(2):
+            gate_key = f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"
+            up_key = f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight"
+
+            gate_found = any(k == gate_key for k, _ in result)
+            up_found = any(k == up_key for k, _ in result)
+
+            assert gate_found, f"Expected {gate_key} in result"
+            assert up_found, f"Expected {up_key} in result"
+
+            # Check shapes
+            for k, v in result:
+                if k == gate_key or k == up_key:
+                    assert v.shape == (512, 1024)  # [inter_dim, dim]
+
+    @patch("nemo_automodel.components.moe.state_dict_mixin.is_dtensor")
+    def test_down_projs_conversion(self, mock_is_dtensor):
+        mock_is_dtensor.return_value = False
+
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
+
+        # Create down_projs tensor [n_experts, inter_dim, dim]
+        tensor = torch.randn(2, 512, 1024)
+        fqn = "model.layers.1.mlp.experts.down_projs"
+
+        result = mixin._convert_single_merged_expert_to_hf_split_experts(fqn, tensor)
+
+        assert result is not None
+        assert len(result) == 2  # 2 experts
+
+        for expert_id in range(2):
+            down_key = f"model.layers.1.mlp.experts.{expert_id}.down_proj.weight"
+            down_found = any(k == down_key for k, _ in result)
+            assert down_found, f"Expected {down_key} in result"
+
+            for k, v in result:
+                if k == down_key:
+                    assert v.shape == (1024, 512)  # [dim, inter_dim] - transposed
+
+    def test_non_expert_tensor_returns_none(self):
+        mixin = MockMoEStateDictMixin()
+
+        # Regular weight tensor
+        tensor = torch.randn(512, 512)
+        fqn = "model.layers.0.attention.weight"
+
+        result = mixin._convert_single_merged_expert_to_hf_split_experts(fqn, tensor)
+
+        assert result is None
+
+    def test_without_model_prefix(self):
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512, uses_model_prefix=False)
+
+        with patch("nemo_automodel.components.moe.state_dict_mixin.is_dtensor", return_value=False):
+            tensor = torch.randn(2, 1024, 1024)
+            fqn = "model.layers.0.mlp.experts.gate_and_up_projs"
+
+            result = mixin._convert_single_merged_expert_to_hf_split_experts(fqn, tensor)
+
+            assert result is not None
+            # Keys should not have "model." prefix
+            for key, _ in result:
+                assert key.startswith("layers."), f"Expected key to start with 'layers.', got {key}"
+                assert not key.startswith("model."), f"Key should not have 'model.' prefix: {key}"
+
+    @patch("nemo_automodel.components.moe.state_dict_utils.validate_dtensor_expert_sharding")
+    @patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor")
+    def test_dtensor_validation_called(self, mock_is_dtensor, mock_validate):
+        mock_is_dtensor.return_value = True
+
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
+
+        # Mock split to avoid depending on dtensor internals
+        weights = [torch.randn(1024, 1024) for _ in range(2)]
+        mixin._split_experts_weights = Mock(return_value=weights)
+        mixin._last_expert_ids = [0, 1]
+
+        mock_dtensor = Mock()
+        fqn = "model.layers.0.mlp.experts.gate_and_up_projs"
+
+        result = mixin._convert_single_merged_expert_to_hf_split_experts(fqn, mock_dtensor)
+
+        mock_validate.assert_called_once_with(mock_dtensor, 2, "gate_and_up_projs layer 0")
+        assert result is not None

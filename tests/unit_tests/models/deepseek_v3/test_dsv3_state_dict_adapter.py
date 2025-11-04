@@ -45,6 +45,8 @@ class TestDeepSeekV3StateDictAdapter:
     def create_mock_moe_config(self, **overrides):
         moe_config = Mock(spec=MoEConfig)
         moe_config.num_experts = 8
+        moe_config.n_routed_experts = 8
+        moe_config.moe_inter_dim = 512
         moe_config.topk = 2
 
         for key, value in overrides.items():
@@ -195,12 +197,12 @@ class TestDeepSeekV3StateDictAdapter:
 
         state_dict = {"test_key": torch.randn(10, 10)}
 
-        with patch.object(adapter, '_to_hf_w_split_experts') as mock_to_hf:
-            mock_to_hf.return_value = {"converted_key": torch.randn(10, 10)}
+        with patch.object(adapter, 'convert_single_tensor_to_hf') as mock_convert:
+            mock_convert.return_value = [("converted_key", torch.randn(10, 10))]
 
             result = adapter.to_hf(state_dict)
 
-            mock_to_hf.assert_called_once_with(state_dict)
+            mock_convert.assert_called_once()
             assert "converted_key" in result
 
     def test_to_hf_with_exclude_regex(self):
@@ -212,12 +214,11 @@ class TestDeepSeekV3StateDictAdapter:
 
         state_dict = {"test_key": torch.randn(10, 10)}
 
-        with patch.object(adapter, '_to_hf_w_split_experts') as mock_to_hf:
-            mock_to_hf.return_value = {
-                "keep_this": torch.randn(5, 5),
-                "exclude_this": torch.randn(5, 5),
-                "also_keep": torch.randn(5, 5)
-            }
+        with patch.object(adapter, 'convert_single_tensor_to_hf') as mock_convert:
+            mock_convert.return_value = [
+                ("keep_this", torch.randn(5, 5)),
+                ("also_keep", torch.randn(5, 5))
+            ]
 
             result = adapter.to_hf(state_dict, exclude_key_regex=r"exclude.*")
 
@@ -234,15 +235,12 @@ class TestDeepSeekV3StateDictAdapter:
 
         state_dict = {"test_key": torch.randn(10, 10)}
 
-        with patch.object(adapter, '_to_hf_w_split_experts') as mock_to_hf, \
-             patch.object(adapter, '_add_quantization_scale_inv_tensors') as mock_add_quant:
-
-            mock_to_hf.return_value = {"converted_key": torch.randn(10, 10)}
-            mock_add_quant.return_value = {"quantized_key": torch.randn(10, 10)}
+        with patch.object(adapter, 'convert_single_tensor_to_hf') as mock_convert:
+            mock_convert.return_value = [("quantized_key", torch.randn(10, 10))]
 
             result = adapter.to_hf(state_dict, quantization=True)
 
-            mock_add_quant.assert_called_once()
+            mock_convert.assert_called_once()
             assert "quantized_key" in result
 
     def test_to_hf_quantization_false(self):
@@ -252,17 +250,15 @@ class TestDeepSeekV3StateDictAdapter:
 
         adapter = DeepSeekV3StateDictAdapter(config, moe_config, backend)
 
-        state_dict = {"test_key": torch.randn(10, 10)}
+        weight = torch.randn(8, 8)
+        state_dict = {"test_key": weight}
 
-        with patch.object(adapter, '_to_hf_w_split_experts') as mock_to_hf, \
-             patch.object(adapter, '_add_quantization_scale_inv_tensors') as mock_add_quant:
-
-            weight = torch.randn(8, 8)
-            mock_to_hf.return_value = {"keep_key.weight": weight.clone()}
+        with patch.object(adapter, 'convert_single_tensor_to_hf') as mock_convert:
+            mock_convert.return_value = [("keep_key.weight", weight.clone())]
 
             result = adapter.to_hf(state_dict, quantization=False)
 
-            mock_add_quant.assert_not_called()
+            mock_convert.assert_called_once()
             assert "keep_key.weight" in result
             assert "keep_key.weight_scale_inv" not in result
             assert result["keep_key.weight"].dtype == weight.dtype
@@ -274,13 +270,13 @@ class TestDeepSeekV3StateDictAdapter:
 
         adapter = DeepSeekV3StateDictAdapter(config, moe_config, backend)
 
-        state_dict = {"test_key": torch.randn(10, 10)}
+        state_dict = {"test_key": torch.randn(16, 16)}
 
-        with patch.object(adapter, '_to_hf_w_split_experts') as mock_to_hf:
-            mock_to_hf.return_value = {
-                "keep_key.weight": torch.randn(16, 16),
-                "exclude_key.weight": torch.randn(16, 16),
-            }
+        with patch.object(adapter, 'convert_single_tensor_to_hf') as mock_convert:
+            mock_convert.return_value = [
+                ("keep_key.weight", torch.randn(16, 16).to(torch.float8_e4m3fn)),
+                ("keep_key.weight_scale_inv", torch.ones(1, 1))
+            ]
 
             result = adapter.to_hf(state_dict, exclude_key_regex=r"exclude.*", quantization=True)
 
@@ -500,3 +496,142 @@ class TestDequantizeFromFp8:
 
         assert result.dtype == torch.float32
         assert result.shape == (1, 1)
+
+
+class TestConvertSingleTensorToHf:
+    def create_mock_config(self, **overrides):
+        config = Mock(spec=DeepseekV3Config)
+        config.num_layers = 2
+        config.hidden_size = 1024
+        for key, value in overrides.items():
+            setattr(config, key, value)
+        return config
+
+    def create_mock_moe_config(self, **overrides):
+        moe_config = Mock(spec=MoEConfig)
+        moe_config.n_routed_experts = 2
+        moe_config.moe_inter_dim = 512
+        for key, value in overrides.items():
+            setattr(moe_config, key, value)
+        return moe_config
+
+    def create_mock_backend_config(self, **overrides):
+        backend = Mock(spec=BackendConfig)
+        backend.enable_deepep = False
+        for key, value in overrides.items():
+            setattr(backend, key, value)
+        return backend
+
+    def test_expert_tensor_conversion(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+
+        adapter = DeepSeekV3StateDictAdapter(config, moe_config, backend)
+
+        # Create gate_and_up_projs tensor
+        tensor = torch.randn(2, 1024, 1024)
+        fqn = "model.layers.0.mlp.experts.gate_and_up_projs"
+
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts') as mock_convert:
+            mock_convert.return_value = [
+                ("model.layers.0.mlp.experts.0.gate_proj.weight", torch.randn(512, 1024)),
+                ("model.layers.0.mlp.experts.0.up_proj.weight", torch.randn(512, 1024)),
+            ]
+
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor)
+
+            mock_convert.assert_called_once_with(fqn, tensor)
+            assert len(result) == 2
+
+    def test_non_expert_tensor_conversion(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+
+        adapter = DeepSeekV3StateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(512, 512)
+        fqn = "model.layers.0.attention.weight"
+
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts') as mock_convert:
+            mock_convert.return_value = None
+
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor)
+
+            assert len(result) == 1
+            assert result[0][0] == fqn
+            assert torch.equal(result[0][1], tensor)
+
+    def test_exclude_key_regex(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+
+        adapter = DeepSeekV3StateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(512, 512)
+        fqn = "exclude_this.weight"
+
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor, exclude_key_regex=r"exclude.*")
+
+            assert len(result) == 0
+
+    def test_quantization_adds_scale_inv(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+
+        adapter = DeepSeekV3StateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(256, 128)
+        fqn = "model.layers.0.self_attn.q_proj.weight"
+
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
+
+            assert len(result) == 2
+            assert result[0][0] == fqn
+            assert result[0][1].dtype == torch.float8_e4m3fn
+            assert result[1][0] == fqn + "_scale_inv"
+            assert result[1][1].dtype == torch.float32
+
+    def test_quantization_skips_non_quantized_keys(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+
+        adapter = DeepSeekV3StateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(256)
+        fqn = "model.layers.0.input_layernorm.weight"
+
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
+
+            assert len(result) == 1
+            assert result[0][0] == fqn
+            assert result[0][1].dtype == tensor.dtype  # Should not be quantized
+
+    def test_quantization_with_expert_tensors(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+
+        adapter = DeepSeekV3StateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(2, 1024, 1024)
+        fqn = "model.layers.0.mlp.experts.gate_and_up_projs"
+
+        expert_results = [
+            ("model.layers.0.mlp.experts.0.gate_proj.weight", torch.randn(512, 1024)),
+            ("model.layers.0.mlp.experts.0.up_proj.weight", torch.randn(512, 1024)),
+        ]
+
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=expert_results):
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
+
+            # Each expert weight should be quantized
+            assert len(result) == 4  # 2 weights * 2 (weight + scale_inv)
+            assert all("_scale_inv" in k or k.endswith(".weight") for k, _ in result)
