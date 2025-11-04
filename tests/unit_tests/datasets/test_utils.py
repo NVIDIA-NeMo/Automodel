@@ -90,6 +90,14 @@ def test_batchify_adds_batch_dimension() -> None:
     assert out.ndim == 2
     assert torch.equal(out, torch.tensor([[1, 2, 3]]))
 
+def test_batchify_adds_batch_dimension_default_tensor_cls() -> None:
+    """`batchify` must insert dim-0 in-place when given a 1-D tensor."""
+    vec = [1, 2, 3]
+    out = sftp.batchify(vec, default_tensor_cls=torch.LongTensor)
+    assert isinstance(out, torch.LongTensor)
+    assert out.ndim == 2
+    assert torch.equal(out, torch.tensor([[1, 2, 3]]))
+
 
 def test_batchify_noop_for_higher_dim() -> None:
     """Tensor with ndim>1 should be returned untouched."""

@@ -164,6 +164,37 @@ def test_instantiate_simple(tmp_module):
     assert isinstance(obj, mod.Point)
     assert (obj.x, obj.y) == (1, 2)
 
+@pytest.mark.parametrize(
+    "path, exists",
+    [
+        ("factory_mod", True),
+        ("NO_FACTORY_MOD", False),
+    ],
+)
+def test_instantiate_path_simple(tmp_module, path, exists):
+    """
+    Instantiate a simple object with scalar arguments supplied as strings
+    that must be translated to int.
+    """
+    mod = tmp_module(
+        "factory_mod",
+        """
+        class Point:
+            def __init__(self, x=0, y=0):
+                self.x = x
+                self.y = y
+        """,
+    )
+    cfg = ConfigNode(
+        {"factory_mod": {"_target_": "factory_mod.Point", "x": "1", "y": "2"}},
+    )
+    obj = cfg.instantiate_path(path)
+    if exists:
+        assert isinstance(obj, mod.Point)
+        assert (obj.x, obj.y) == (1, 2)
+    else:
+        assert obj is None
+
 
 def test_instantiate_simple_raises(tmp_module):
     """

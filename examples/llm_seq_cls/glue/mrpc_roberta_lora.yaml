@@ -1,0 +1,65 @@
+# GLUE MRPC with RoBERTa-large + LoRA
+
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 32
+  ckpt_every_steps: 200
+  val_every_steps: 100
+  num_epochs: 2
+  max_steps: 10
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 1
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForSequenceClassification.from_pretrained
+  pretrained_model_name_or_path: roberta-large
+  num_labels: 2
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors
+  save_consolidated: true
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: none
+  dp_replicate_size: 1
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules:
+  - "*.query"
+  - "*.value"
+  dim: 8
+  alpha: 16
+  dropout: 0.1
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.seq_cls.GLUE_MRPC
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.seq_cls.GLUE_MRPC
+  split: validation
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 3.0e-4
+  weight_decay: 0
+
