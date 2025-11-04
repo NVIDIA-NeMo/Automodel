@@ -33,6 +33,7 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: openai/gpt-oss-20b
+  is_meta_device: true
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
