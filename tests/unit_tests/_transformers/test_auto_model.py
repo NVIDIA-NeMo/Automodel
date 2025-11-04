@@ -87,6 +87,7 @@ class TestNeMoAutoModelForCausalLM:
         with (
             patch("nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained") as mock_cfg_from_pretrained,
             patch("nemo_automodel._transformers.auto_model.ModelRegistry") as mock_registry,
+            patch("nemo_automodel._transformers.auto_model.os.path.isdir", return_value=True),
             patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_hf_loader,
         ):
             # Prepare a fake config with architectures
@@ -130,6 +131,81 @@ class TestNeMoAutoModelForCausalLM:
             assert returned is custom_model_instance
             mock_hf_loader.assert_not_called()
             custom_cls.assert_called_with(cfg)
+
+    def test_from_pretrained_registry_downloads_checkpoint_files_rank0(self):
+        """When using a custom model implementation, ensure rank0 downloads weights and we barrier."""
+        with (
+            patch("nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained") as mock_cfg_from_pretrained,
+            patch("nemo_automodel._transformers.auto_model.ModelRegistry") as mock_registry,
+            patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_hf_loader,
+            patch("nemo_automodel._transformers.auto_model._get_resolved_checkpoint_files") as mock_get_files,
+            patch("nemo_automodel._transformers.auto_model.os.path.isdir", return_value=False),
+            patch("nemo_automodel._transformers.auto_model.dist.is_initialized", return_value=True),
+            patch("nemo_automodel._transformers.auto_model.dist.get_world_size", return_value=1),
+            patch("nemo_automodel._transformers.auto_model.dist.get_rank", return_value=0),
+            patch("nemo_automodel._transformers.auto_model.dist.barrier") as mock_barrier,
+        ):
+            # Prepare a fake config with architectures and commit hash
+            cfg = Mock()
+            cfg.architectures = ["CustomArch"]
+            cfg._commit_hash = "abc123"
+            mock_cfg_from_pretrained.return_value = cfg
+
+            # Prepare a fake custom model class and return value
+            custom_model_instance = Mock()
+            custom_cls = Mock(return_value=custom_model_instance)
+            mock_registry.model_arch_name_to_cls = {"CustomArch": custom_cls}
+
+            returned = NeMoAutoModelForCausalLM.from_pretrained("dummy/repo-id")
+
+            # Should have returned the custom model instance directly
+            assert returned is custom_model_instance
+            # HF path should not be invoked
+            mock_hf_loader.assert_not_called()
+            # Rank 0 should trigger a download
+            assert mock_get_files.call_count == 1
+            _, kwargs = mock_get_files.call_args
+            assert kwargs["pretrained_model_name_or_path"] == "dummy/repo-id"
+            assert kwargs["commit_hash"] == "abc123"
+            # Distributed barrier should be called when initialized
+            mock_barrier.assert_called_once()
+
+    def test_from_pretrained_registry_downloads_when_dist_uninitialized(self):
+        """When dist is not initialized, we still download but do not barrier."""
+        with (
+            patch("nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained") as mock_cfg_from_pretrained,
+            patch("nemo_automodel._transformers.auto_model.ModelRegistry") as mock_registry,
+            patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_hf_loader,
+            patch("nemo_automodel._transformers.auto_model._get_resolved_checkpoint_files") as mock_get_files,
+            patch("nemo_automodel._transformers.auto_model.os.path.isdir", return_value=False),
+            patch("nemo_automodel._transformers.auto_model.dist.is_initialized", return_value=False),
+            patch("nemo_automodel._transformers.auto_model.dist.get_world_size", return_value=1),
+            patch("nemo_automodel._transformers.auto_model.dist.barrier") as mock_barrier,
+        ):
+            # Prepare a fake config with architectures and commit hash
+            cfg = Mock()
+            cfg.architectures = ["CustomArch"]
+            cfg._commit_hash = "commit456"
+            mock_cfg_from_pretrained.return_value = cfg
+
+            # Prepare a fake custom model class and return value
+            custom_model_instance = Mock()
+            custom_cls = Mock(return_value=custom_model_instance)
+            mock_registry.model_arch_name_to_cls = {"CustomArch": custom_cls}
+
+            returned = NeMoAutoModelForCausalLM.from_pretrained("dummy/repo-id")
+
+            # Should have returned the custom model instance directly
+            assert returned is custom_model_instance
+            # HF path should not be invoked
+            mock_hf_loader.assert_not_called()
+            # Not initialized -> still downloads
+            assert mock_get_files.call_count == 1
+            _, kwargs = mock_get_files.call_args
+            assert kwargs["pretrained_model_name_or_path"] == "dummy/repo-id"
+            assert kwargs["commit_hash"] == "commit456"
+            # No barrier when dist not initialized
+            mock_barrier.assert_not_called()
 
     def test_from_config_happy_path(self):
         """Test the basic from_config functionality works."""

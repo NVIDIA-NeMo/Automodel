@@ -20,7 +20,7 @@ from typing import Any
 import pytest
 import torch
 
-import nemo_automodel.components.utils.sig_utils as sutils
+import nemo_automodel.components.training.signal_handler as sutils
 
 # ---------------------------------------------------------------------------
 # get_device

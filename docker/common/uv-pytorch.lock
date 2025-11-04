@@ -2010,7 +2010,7 @@ requires-dist = [
     { name = "megatron-fsdp" },
     { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'" },
     { name = "numba", marker = "extra == 'vlm'" },
-    { name = "numpy", marker = "extra == 'vlm'", specifier = "<2" },
+    { name = "numpy", marker = "extra == 'vlm'" },
     { name = "opencv-python-headless", specifier = "==4.10.0.84" },
     { name = "pillow", marker = "extra == 'vlm'" },
     { name = "pybind11" },
@@ -2025,7 +2025,7 @@ requires-dist = [
     { name = "torchdata" },
     { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'moe'", specifier = "==2.8.0" },
     { name = "transformers", specifier = "<=4.57.1" },
-    { name = "transformers", marker = "extra == 'vlm'", specifier = "==4.57.1" },
+    { name = "transformers", marker = "extra == 'vlm'", specifier = "<=4.57.1" },
     { name = "wandb" },
 ]
 provides-extras = ["vlm", "fa", "moe"]
