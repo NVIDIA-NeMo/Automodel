@@ -803,18 +803,16 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(nn.Module, MoEFSDPSyncMixin):
             rope_deltas = rope_deltas - delta0
             self.rope_deltas = rope_deltas
 
-        # 4. Forward through text model (with DeepStack visual features if available)
+        # 4. Forward through text model
         hidden = self.model(
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
             attention_mask=attention_mask,
             padding_mask=padding_mask,
+            deepstack_visual_embeds=visual_embeds_multiscale,
+            visual_pos_masks=visual_pos_masks,
             **attn_kwargs,
         )
-        
-        # Note: DeepStack visual embedding integration would go here in full implementation
-        # For now, visual_embeds_multiscale and visual_pos_masks are computed but not used
-        # They would be integrated in the text model's forward pass for layers < len(deepstack_visual_embeds)
         
         logits = self.lm_head(hidden) if self.lm_head else hidden
         
