@@ -35,11 +35,11 @@ def _pad_to_seq_length(sample, pad_token_id, seq_length):
 def _add_pad_token(tokenizer):
     """Add pad token to tokenizer if not present."""
     pad_token_id = None
-    if not hasattr(tokenizer, "pad_token_id"):
+    if getattr(tokenizer, "pad_token_id", None) is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     else:
         pad_token_id = tokenizer.pad_token_id
-    if not hasattr(tokenizer, "pad_token") and hasattr(tokenizer, "eos_token"):
+    if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
         tokenizer.pad_token = tokenizer.eos_token
     return pad_token_id
 
