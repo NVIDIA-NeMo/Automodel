@@ -72,8 +72,8 @@ def make_squad_dataset(
     fp8=False,
     split="train",
     dataset_name="squad",
-    padding=None,
-    truncation=None,
+    padding=False,
+    truncation=False,
 ):
     """
     Load and preprocess a SQuAD-style QA dataset for model fine-tuning.
