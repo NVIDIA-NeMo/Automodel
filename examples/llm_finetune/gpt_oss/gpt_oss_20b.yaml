@@ -33,7 +33,7 @@ parallelizer:
   activation_checkpointing: false
 
 model:
-  _target_:  nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: openai/gpt-oss-20b
   is_meta_device: true
   # Customize this backend for fine grained control
