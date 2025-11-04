@@ -1,4 +1,4 @@
-## Recipes and E2E Examples overview 
+## Recipes and E2E Examples
 
 NeMo AutoModel is organized using recipes and components.
 
