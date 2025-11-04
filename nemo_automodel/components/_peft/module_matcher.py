@@ -17,11 +17,15 @@ from dataclasses import dataclass, field
 from typing import List
 
 import torch.nn as nn
+
 from nemo_automodel.shared.import_utils import safe_import
+
 HAS_TE, transformer_engine = safe_import("transformer_engine")
+
 
 def _is_linear_module(module):
     return isinstance(module, nn.Linear) or (HAS_TE and isinstance(module, transformer_engine.pytorch.Linear))
+
 
 def wildcard_match(pattern, key):
     """
