@@ -260,6 +260,7 @@ class Checkpointer:
         optimizer_state = OptimizerState(model, optimizer, scheduler)
         state_dict = optimizer_state.state_dict()
         self._do_load(state_dict, os.path.join(weights_path, "optim"))
+        optimizer_state.load_state_dict(state_dict)
 
     def load_model(
         self,
