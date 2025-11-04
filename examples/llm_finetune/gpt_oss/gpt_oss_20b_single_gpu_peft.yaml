@@ -29,10 +29,8 @@ rng:
   ranked: true
 
 model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
-  config:
-    _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: openai/gpt-oss-20b
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: openai/gpt-oss-20b
   is_meta_device: true
   backend:
     _target_: nemo_automodel.components.moe.utils.BackendConfig
