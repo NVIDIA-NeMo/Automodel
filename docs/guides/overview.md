@@ -1,6 +1,6 @@
 ## Recipes and E2E Examples
 
-NeMo AutoModel is organized using recipes and components.
+NeMo Automodel is organized around two key concepts: recipes and components.
 
 A recipe is a runnable scipt, configured with YAML files, that owns its train/val loop. It wires the loop via `step_scheduler` and specifies model, data, loss, optimizer/scheduler, checkpointing, and distributed settings—so a single command trains end‑to‑end.
 
