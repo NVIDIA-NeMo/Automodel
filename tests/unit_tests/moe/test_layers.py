@@ -19,17 +19,15 @@ import torch
 import torch.nn.functional as F
 
 from nemo_automodel.components.moe.layers import (
+    MLP,
     FakeBalancedGate,
     Gate,
     GroupedExperts,
     GroupedExpertsDeepEP,
-    MLP,
     MoE,
     MoEConfig,
     get_expert_activation,
     get_expert_activation_for_deepep,
-    quick_geglu,
-    quick_geglu_deepep,
     swiglu,
 )
 from nemo_automodel.components.moe.utils import BackendConfig
@@ -113,11 +111,10 @@ class TestActivationFunctions:
             gate_and_up_proj=gate_and_up_proj,
             down_proj=down_proj,
             gate_up_proj_bias=gate_up_proj_bias,
-            down_proj_bias=down_proj_bias
+            down_proj_bias=down_proj_bias,
         )
 
         assert result.shape == (batch_size, seq_len, dim)
-
 
     def test_get_expert_activation_swiglu(self, moe_config):
         """Test getting swiglu activation function."""
@@ -515,6 +512,317 @@ class TestGate:
         # Weight should have changed
         assert not torch.equal(gate.weight.detach(), original_weight)
 
+    def test_gate_init_with_precision(self, moe_config):
+        """Test Gate initialization with gate_precision set."""
+        moe_config.gate_precision = torch.float32
+        gate = Gate(moe_config)
+
+        assert gate.gate_precision == torch.float32
+
+        moe_config.gate_precision = torch.float64
+        gate = Gate(moe_config)
+
+        assert gate.gate_precision == torch.float64
+
+    def test_gate_init_default_precision(self, moe_config):
+        """Test Gate initialization with default precision (None)."""
+        moe_config.gate_precision = None
+        gate = Gate(moe_config)
+
+        assert gate.gate_precision is None
+
+    def test_gate_forward_with_fp32_precision(self, moe_config, device):
+        """Test Gate forward pass with fp32 precision."""
+        moe_config.gate_precision = torch.float32
+        moe_config.score_func = "softmax"
+        gate = Gate(moe_config)
+        gate = gate.to(device)
+
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
+
+        assert weights.shape == (num_tokens, moe_config.n_activated_experts)
+        assert indices.shape == (num_tokens, moe_config.n_activated_experts)
+        assert weights.dtype == torch.bfloat16
+
+    def test_gate_forward_with_fp64_precision(self, moe_config, device):
+        """Test Gate forward pass with fp64 precision."""
+        moe_config.gate_precision = torch.float64
+        moe_config.score_func = "softmax"
+        gate = Gate(moe_config)
+        gate = gate.to(device)
+
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
+
+        assert weights.shape == (num_tokens, moe_config.n_activated_experts)
+        assert indices.shape == (num_tokens, moe_config.n_activated_experts)
+        assert weights.dtype == torch.bfloat16
+
+    def test_gate_precision_output_dtype_matches_input(self, moe_config, device):
+        """Test that output dtype matches input dtype regardless of gate_precision."""
+        moe_config.score_func = "softmax"
+
+        for input_dtype in [torch.float32, torch.float16, torch.bfloat16]:
+            for gate_precision in [None, torch.float32, torch.float64]:
+                moe_config.gate_precision = gate_precision
+                gate = Gate(moe_config)
+                gate = gate.to(device)
+
+                with torch.no_grad():
+                    gate.weight.normal_(0, 0.02)
+
+                num_tokens = 8
+                x = torch.randn(num_tokens, moe_config.dim, dtype=input_dtype, device=device)
+                token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+                weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
+
+                assert weights.dtype == input_dtype, (
+                    f"Expected output dtype {input_dtype} but got {weights.dtype} "
+                    f"with gate_precision={gate_precision}"
+                )
+
+    def test_gate_precision_with_sigmoid(self, moe_config, device):
+        """Test Gate precision with sigmoid score function."""
+        moe_config.gate_precision = torch.float32
+        moe_config.score_func = "sigmoid"
+        gate = Gate(moe_config)
+        gate = gate.to(device)
+
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
+
+        assert weights.shape == (num_tokens, moe_config.n_activated_experts)
+        assert weights.dtype == torch.bfloat16
+        weights_detached = weights.detach()
+        assert (weights_detached >= 0).all() and (weights_detached <= 1).all()
+
+    def test_gate_precision_with_correction_bias(self, moe_config, device):
+        """Test Gate precision with correction bias enabled."""
+        moe_config.gate_precision = torch.float32
+        moe_config.score_func = "sigmoid"
+        moe_config.gate_bias_update_factor = 0.1
+        gate = Gate(moe_config)
+        gate = gate.to(device)
+
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
+
+        assert weights.shape == (num_tokens, moe_config.n_activated_experts)
+        assert weights.dtype == torch.bfloat16
+
+    def test_gate_precision_with_norm_topk_prob(self, moe_config, device):
+        """Test Gate precision with norm_topk_prob enabled."""
+        moe_config.gate_precision = torch.float32
+        moe_config.score_func = "softmax"
+        moe_config.norm_topk_prob = True
+        gate = Gate(moe_config)
+        gate = gate.to(device)
+
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
+
+        assert weights.shape == (num_tokens, moe_config.n_activated_experts)
+        assert weights.dtype == torch.bfloat16
+
+    def test_gate_precision_with_softmax_before_topk(self, moe_config, device):
+        """Test Gate precision with softmax_before_topk enabled."""
+        moe_config.gate_precision = torch.float32
+        moe_config.score_func = "softmax"
+        moe_config.softmax_before_topk = True
+        gate = Gate(moe_config)
+        gate = gate.to(device)
+
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
+
+        assert weights.shape == (num_tokens, moe_config.n_activated_experts)
+        assert weights.dtype == torch.bfloat16
+
+    def test_gate_precision_consistency_across_calls(self, moe_config, device):
+        """Test that Gate with precision produces consistent results across calls."""
+        moe_config.gate_precision = torch.float32
+        moe_config.score_func = "softmax"
+        gate = Gate(moe_config)
+        gate = gate.to(device)
+        gate.eval()
+
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        with torch.no_grad():
+            weights1, indices1, _ = gate(x, token_mask, cp_mesh=None)
+            weights2, indices2, _ = gate(x, token_mask, cp_mesh=None)
+
+        torch.testing.assert_close(weights1, weights2)
+        torch.testing.assert_close(indices1, indices2)
+
+    def test_gate_precision_string_input_fp32(self):
+        """Test that gate_precision accepts string input and converts to torch.dtype."""
+        config = MoEConfig(
+            n_routed_experts=8,
+            n_shared_experts=0,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=False,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="softmax",
+            route_scale=1.0,
+            dim=128,
+            inter_dim=256,
+            moe_inter_dim=256,
+            norm_topk_prob=False,
+            gate_precision="torch.float32",
+        )
+
+        assert config.gate_precision == torch.float32
+
+    def test_gate_precision_string_input_fp64(self):
+        """Test that gate_precision accepts fp64 string input."""
+        config = MoEConfig(
+            n_routed_experts=8,
+            n_shared_experts=0,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=False,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="softmax",
+            route_scale=1.0,
+            dim=128,
+            inter_dim=256,
+            moe_inter_dim=256,
+            norm_topk_prob=False,
+            gate_precision="torch.float64",
+        )
+
+        assert config.gate_precision == torch.float64
+
+    def test_gate_precision_string_input_short_form(self):
+        """Test that gate_precision accepts short form string input."""
+        config = MoEConfig(
+            n_routed_experts=8,
+            n_shared_experts=0,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=False,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="softmax",
+            route_scale=1.0,
+            dim=128,
+            inter_dim=256,
+            moe_inter_dim=256,
+            norm_topk_prob=False,
+            gate_precision="float32",
+        )
+
+        assert config.gate_precision == torch.float32
+
+    def test_dtype_string_input(self):
+        """Test that dtype field accepts string input and converts to torch.dtype."""
+        config = MoEConfig(
+            n_routed_experts=8,
+            n_shared_experts=0,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=False,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="softmax",
+            route_scale=1.0,
+            dim=128,
+            inter_dim=256,
+            moe_inter_dim=256,
+            norm_topk_prob=False,
+            dtype="torch.float16",
+        )
+
+        assert config.dtype == torch.float16
+
+    def test_gate_forward_with_string_precision(self, device):
+        """Test Gate forward pass with string precision input."""
+        config = MoEConfig(
+            n_routed_experts=8,
+            n_shared_experts=0,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=False,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="softmax",
+            route_scale=1.0,
+            dim=128,
+            inter_dim=256,
+            moe_inter_dim=256,
+            norm_topk_prob=False,
+            gate_precision="float32",
+            dtype="bfloat16",
+        )
+
+        gate = Gate(config)
+        gate = gate.to(device)
+
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
+
+        assert weights.shape == (num_tokens, config.n_activated_experts)
+        assert weights.dtype == torch.bfloat16
+        assert gate.gate_precision == torch.float32
+
 
 class TestGroupedExperts:
     """Test GroupedExperts module."""
@@ -550,7 +858,9 @@ class TestGroupedExperts:
         x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
         token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
         weights = torch.rand(num_tokens, moe_config.n_activated_experts, dtype=torch.bfloat16, device=device)
-        indices = torch.randint(0, moe_config.n_routed_experts, (num_tokens, moe_config.n_activated_experts), device=device)
+        indices = torch.randint(
+            0, moe_config.n_routed_experts, (num_tokens, moe_config.n_activated_experts), device=device
+        )
 
         output = experts(x, token_mask, weights, indices)
 
@@ -568,7 +878,9 @@ class TestGroupedExperts:
         x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
         token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
         weights = torch.rand(num_tokens, moe_config.n_activated_experts, dtype=torch.bfloat16, device=device)
-        indices = torch.randint(0, moe_config.n_routed_experts, (num_tokens, moe_config.n_activated_experts), device=device)
+        indices = torch.randint(
+            0, moe_config.n_routed_experts, (num_tokens, moe_config.n_activated_experts), device=device
+        )
 
         try:
             output = experts(x, token_mask, weights, indices)
@@ -649,7 +961,9 @@ class TestGroupedExpertsDeepEP:
         # But looking at the code, it seems like permuted_probs should be per-token, not per-feature
         permuted_probs = torch.randn(4, 8)  # 4 tokens, 8 features each to match bias shape
 
-        result = experts._apply_bias(value, bias=bias, tokens_per_expert=tokens_per_expert, permuted_probs=permuted_probs)
+        result = experts._apply_bias(
+            value, bias=bias, tokens_per_expert=tokens_per_expert, permuted_probs=permuted_probs
+        )
 
         assert result.shape == value.shape
 
@@ -697,14 +1011,17 @@ class TestMoE:
         batch_size, seq_len = 2, 8
         x = torch.randn(batch_size, seq_len, moe_config.dim, device=device)
 
-        with patch.object(moe.gate, "forward") as mock_gate, \
-             patch.object(moe.experts, "forward") as mock_experts:
-
+        with patch.object(moe.gate, "forward") as mock_gate, patch.object(moe.experts, "forward") as mock_experts:
             # Mock gate outputs
             mock_gate.return_value = (
                 torch.rand(batch_size * seq_len, moe_config.n_activated_experts, device=device),
-                torch.randint(0, moe_config.n_routed_experts, (batch_size * seq_len, moe_config.n_activated_experts), device=device),
-                None
+                torch.randint(
+                    0,
+                    moe_config.n_routed_experts,
+                    (batch_size * seq_len, moe_config.n_activated_experts),
+                    device=device,
+                ),
+                None,
             )
 
             # Mock expert outputs
@@ -724,24 +1041,31 @@ class TestMoE:
         batch_size, seq_len = 2, 8
         x = torch.randn(batch_size, seq_len, moe_config.dim, device=device)
 
-        with patch.object(moe.gate, "forward") as mock_gate, \
-             patch.object(moe.experts, "forward") as mock_experts, \
-             patch.object(moe.shared_experts, "forward") as mock_shared:
-
+        with (
+            patch.object(moe.gate, "forward") as mock_gate,
+            patch.object(moe.experts, "forward") as mock_experts,
+            patch.object(moe.shared_experts, "forward") as mock_shared,
+        ):
             mock_gate.return_value = (
                 torch.rand(batch_size * seq_len, moe_config.n_activated_experts, device=device),
-                torch.randint(0, moe_config.n_routed_experts, (batch_size * seq_len, moe_config.n_activated_experts), device=device),
-                None
+                torch.randint(
+                    0,
+                    moe_config.n_routed_experts,
+                    (batch_size * seq_len, moe_config.n_activated_experts),
+                    device=device,
+                ),
+                None,
             )
 
             mock_experts.return_value = torch.randn(batch_size * seq_len, moe_config.dim, device=device)
             mock_shared.return_value = torch.randn(batch_size * seq_len, moe_config.dim, device=device)
 
             # Patch at the module level to avoid CUDA stream issues on CPU
-            with patch("torch.cuda.Stream") as mock_stream_class, \
-                 patch("torch.cuda.current_stream") as mock_current_stream, \
-                 patch("torch.cuda.stream") as mock_stream_context:
-
+            with (
+                patch("torch.cuda.Stream") as mock_stream_class,
+                patch("torch.cuda.current_stream") as mock_current_stream,
+                patch("torch.cuda.stream") as mock_stream_context,
+            ):
                 mock_stream = Mock()
                 mock_stream.wait_stream = Mock()
                 mock_stream_class.return_value = mock_stream
@@ -769,13 +1093,16 @@ class TestMoE:
         padding_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
         padding_mask[:, -2:] = True  # Mask last 2 tokens
 
-        with patch.object(moe.gate, "forward") as mock_gate, \
-             patch.object(moe.experts, "forward") as mock_experts:
-
+        with patch.object(moe.gate, "forward") as mock_gate, patch.object(moe.experts, "forward") as mock_experts:
             mock_gate.return_value = (
                 torch.rand(batch_size * seq_len, moe_config.n_activated_experts, device=device),
-                torch.randint(0, moe_config.n_routed_experts, (batch_size * seq_len, moe_config.n_activated_experts), device=device),
-                None
+                torch.randint(
+                    0,
+                    moe_config.n_routed_experts,
+                    (batch_size * seq_len, moe_config.n_activated_experts),
+                    device=device,
+                ),
+                None,
             )
 
             mock_experts.return_value = torch.randn(batch_size * seq_len, moe_config.dim, device=device)
@@ -799,14 +1126,17 @@ class TestMoE:
         batch_size, seq_len = 2, 8
         x = torch.randn(batch_size, seq_len, moe_config.dim, device=device)
 
-        with patch.object(moe.gate, "forward") as mock_gate, \
-             patch.object(moe.experts, "forward") as mock_experts:
-
+        with patch.object(moe.gate, "forward") as mock_gate, patch.object(moe.experts, "forward") as mock_experts:
             aux_loss = torch.tensor(0.01, device=device)
             mock_gate.return_value = (
                 torch.rand(batch_size * seq_len, moe_config.n_activated_experts, device=device),
-                torch.randint(0, moe_config.n_routed_experts, (batch_size * seq_len, moe_config.n_activated_experts), device=device),
-                aux_loss
+                torch.randint(
+                    0,
+                    moe_config.n_routed_experts,
+                    (batch_size * seq_len, moe_config.n_activated_experts),
+                    device=device,
+                ),
+                aux_loss,
             )
 
             mock_experts.return_value = torch.randn(batch_size * seq_len, moe_config.dim, device=device)

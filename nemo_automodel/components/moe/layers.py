@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module
+from nemo_automodel.shared.utils import dtype_from_str
 
 try:
     from torch.distributed.device_mesh import DeviceMesh
@@ -65,9 +66,16 @@ class MoEConfig:
     activation_alpha: float = 1.702
     activation_limit: float = 7.0
     softmax_before_topk: bool = False
-    dtype: torch.dtype = torch.bfloat16
+    dtype: str | torch.dtype = torch.bfloat16
     shared_expert_gate: bool = False
     shared_expert_inter_dim: int | None = None
+    gate_precision: str | torch.dtype | None = None
+
+    def __post_init__(self):
+        if isinstance(self.dtype, str):
+            self.dtype = dtype_from_str(self.dtype, default=torch.bfloat16)
+        if isinstance(self.gate_precision, str):
+            self.gate_precision = dtype_from_str(self.gate_precision, default=None)
 
 
 class MLP(nn.Module):
@@ -595,6 +603,7 @@ class Gate(nn.Module):
         self.bias_update_factor = config.gate_bias_update_factor
         self.aux_loss_coeff = config.aux_loss_coeff
         self.norm_topk_prob = config.norm_topk_prob
+        self.gate_precision = config.gate_precision
 
         if self.bias_update_factor > 0:
             assert self.train_gate, "Require train_gate to be set to True to apply the bias update"
@@ -640,17 +649,28 @@ class Gate(nn.Module):
             indices (torch.Tensor): Indices of the selected experts.
             aux_loss (Optional[torch.Tensor]): Auxiliary loss for load balancing.
         """
-        scores = F.linear(x, self.weight, bias=self.bias)
+        original_dtype = x.dtype
+
+        if self.gate_precision is not None:
+            x_compute = x.to(dtype=self.gate_precision)
+            weight = self.weight.to(dtype=self.gate_precision)
+            bias = self.bias.to(dtype=self.gate_precision) if self.bias is not None else None
+        else:
+            x_compute = x
+            weight = self.weight.to(dtype=x.dtype)
+            bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
+
+        scores = F.linear(x_compute, weight, bias=bias)
 
         if self.score_func == "softmax":
             if self.softmax_before_topk:
-                scores = scores.softmax(dim=-1, dtype=torch.float32)
+                scores = scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
                 original_scores = scores
                 indices = torch.topk(scores, k=self.topk, dim=-1)[1]
                 weights = scores.gather(1, indices)
             else:
                 values, indices = torch.topk(scores, k=self.topk, dim=-1)
-                weights = values.softmax(dim=1, dtype=torch.float32)
+                weights = values.softmax(dim=1, dtype=self.gate_precision or torch.float32)
                 original_scores = scores
         else:
             scores = scores.sigmoid()
@@ -658,7 +678,8 @@ class Gate(nn.Module):
 
             # Add correction bias to balance tokens across gates.
             if self.e_score_correction_bias is not None:
-                scores = scores + self.e_score_correction_bias
+                correction_bias = self.e_score_correction_bias
+                scores = scores + correction_bias
 
             if self.n_groups > 1:
                 scores = scores.view(x.size(0), self.n_groups, -1)
@@ -675,13 +696,16 @@ class Gate(nn.Module):
             weights = original_scores.gather(1, indices)
 
         if self.norm_topk_prob and self.topk > 1:
-            # Use out-of-place division to keep autograd versions intact.
             denom_w = weights.sum(dim=-1, keepdim=True) + 1e-20
             denom_s = original_scores.sum(dim=-1, keepdim=True) + 1e-20
             weights = weights / denom_w
             original_scores = original_scores / denom_s
 
         weights = weights * self.route_scale
+
+        if self.gate_precision is not None:
+            weights = weights.to(dtype=original_dtype)
+            original_scores = original_scores.to(dtype=original_dtype)
 
         if self.bias_update_factor > 0 or self.aux_loss_coeff > 0:
             expert_load = self._compute_expert_load(indices, token_mask)
