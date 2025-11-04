@@ -32,6 +32,7 @@ from nemo_automodel.shared.utils import dtype_from_str
 HAS_BNB, bitsandbytes = safe_import("bitsandbytes")
 HAS_TE, transformer_engine = safe_import("transformer_engine")
 
+
 @dataclass
 class PeftConfig:
     target_modules: list = field(default_factory=list)
@@ -301,9 +302,7 @@ def patch_linear_module(
     assert not hasattr(orig_linear, "super_fwd"), orig_linear.super_fwd
 
     linear_lora_cls = TritonLinearLoRA if use_triton else LinearLoRA
-    linear_lora_cls._init_adapter(
-        orig_linear, dim, alpha, dropout, dropout_position, lora_A_init_method, lora_dtype
-    )
+    linear_lora_cls._init_adapter(orig_linear, dim, alpha, dropout, dropout_position, lora_A_init_method, lora_dtype)
     cls = orig_linear.__class__
     new_cls = type("PatchedLinearLoRA", (linear_lora_cls, cls), {})
 
@@ -313,7 +312,9 @@ def patch_linear_module(
         and orig_linear.quant_state.__class__ == bitsandbytes.functional.QuantState
     ):
         if HAS_TE:
-            assert not isinstance(orig_linear, transformer_engine.pytorch.Linear), "quant_state is not supported with transformer_engine.pytorch.Linear"
+            assert not isinstance(orig_linear, transformer_engine.pytorch.Linear), (
+                "quant_state is not supported with transformer_engine.pytorch.Linear"
+            )
         orig_linear.super_fwd = orig_linear.forward
 
     orig_linear.__class__ = new_cls
