@@ -514,28 +514,24 @@ class TestGate:
 
     def test_gate_init_with_precision(self, moe_config):
         """Test Gate initialization with gate_precision set."""
-        moe_config.gate_precision = torch.float32
-        gate = Gate(moe_config)
-
+        gate = Gate(moe_config, gate_precision=torch.float32)
         assert gate.gate_precision == torch.float32
 
-        moe_config.gate_precision = torch.float64
-        gate = Gate(moe_config)
-
+        gate = Gate(moe_config, gate_precision=torch.float64)
         assert gate.gate_precision == torch.float64
 
     def test_gate_init_default_precision(self, moe_config):
         """Test Gate initialization with default precision (None)."""
-        moe_config.gate_precision = None
-        gate = Gate(moe_config)
+        gate = Gate(moe_config, gate_precision=None)
+        assert gate.gate_precision is None
 
+        gate = Gate(moe_config)
         assert gate.gate_precision is None
 
     def test_gate_forward_with_fp32_precision(self, moe_config, device):
         """Test Gate forward pass with fp32 precision."""
-        moe_config.gate_precision = torch.float32
         moe_config.score_func = "softmax"
-        gate = Gate(moe_config)
+        gate = Gate(moe_config, gate_precision=torch.float32)
         gate = gate.to(device)
 
         with torch.no_grad():
@@ -553,9 +549,8 @@ class TestGate:
 
     def test_gate_forward_with_fp64_precision(self, moe_config, device):
         """Test Gate forward pass with fp64 precision."""
-        moe_config.gate_precision = torch.float64
         moe_config.score_func = "softmax"
-        gate = Gate(moe_config)
+        gate = Gate(moe_config, gate_precision=torch.float64)
         gate = gate.to(device)
 
         with torch.no_grad():
@@ -577,8 +572,7 @@ class TestGate:
 
         for input_dtype in [torch.float32, torch.float16, torch.bfloat16]:
             for gate_precision in [None, torch.float32, torch.float64]:
-                moe_config.gate_precision = gate_precision
-                gate = Gate(moe_config)
+                gate = Gate(moe_config, gate_precision=gate_precision)
                 gate = gate.to(device)
 
                 with torch.no_grad():
@@ -597,9 +591,8 @@ class TestGate:
 
     def test_gate_precision_with_sigmoid(self, moe_config, device):
         """Test Gate precision with sigmoid score function."""
-        moe_config.gate_precision = torch.float32
         moe_config.score_func = "sigmoid"
-        gate = Gate(moe_config)
+        gate = Gate(moe_config, gate_precision=torch.float32)
         gate = gate.to(device)
 
         with torch.no_grad():
@@ -618,10 +611,9 @@ class TestGate:
 
     def test_gate_precision_with_correction_bias(self, moe_config, device):
         """Test Gate precision with correction bias enabled."""
-        moe_config.gate_precision = torch.float32
         moe_config.score_func = "sigmoid"
         moe_config.gate_bias_update_factor = 0.1
-        gate = Gate(moe_config)
+        gate = Gate(moe_config, gate_precision=torch.float32)
         gate = gate.to(device)
 
         with torch.no_grad():
@@ -638,10 +630,9 @@ class TestGate:
 
     def test_gate_precision_with_norm_topk_prob(self, moe_config, device):
         """Test Gate precision with norm_topk_prob enabled."""
-        moe_config.gate_precision = torch.float32
         moe_config.score_func = "softmax"
         moe_config.norm_topk_prob = True
-        gate = Gate(moe_config)
+        gate = Gate(moe_config, gate_precision=torch.float32)
         gate = gate.to(device)
 
         with torch.no_grad():
@@ -658,10 +649,9 @@ class TestGate:
 
     def test_gate_precision_with_softmax_before_topk(self, moe_config, device):
         """Test Gate precision with softmax_before_topk enabled."""
-        moe_config.gate_precision = torch.float32
         moe_config.score_func = "softmax"
         moe_config.softmax_before_topk = True
-        gate = Gate(moe_config)
+        gate = Gate(moe_config, gate_precision=torch.float32)
         gate = gate.to(device)
 
         with torch.no_grad():
@@ -678,9 +668,8 @@ class TestGate:
 
     def test_gate_precision_consistency_across_calls(self, moe_config, device):
         """Test that Gate with precision produces consistent results across calls."""
-        moe_config.gate_precision = torch.float32
         moe_config.score_func = "softmax"
-        gate = Gate(moe_config)
+        gate = Gate(moe_config, gate_precision=torch.float32)
         gate = gate.to(device)
         gate.eval()
 
@@ -698,71 +687,20 @@ class TestGate:
         torch.testing.assert_close(weights1, weights2)
         torch.testing.assert_close(indices1, indices2)
 
-    def test_gate_precision_string_input_fp32(self):
-        """Test that gate_precision accepts string input and converts to torch.dtype."""
-        config = MoEConfig(
-            n_routed_experts=8,
-            n_shared_experts=0,
-            n_activated_experts=2,
-            n_expert_groups=1,
-            n_limited_groups=1,
-            train_gate=False,
-            gate_bias_update_factor=0.0,
-            aux_loss_coeff=0.0,
-            score_func="softmax",
-            route_scale=1.0,
-            dim=128,
-            inter_dim=256,
-            moe_inter_dim=256,
-            norm_topk_prob=False,
-            gate_precision="torch.float32",
-        )
+    def test_backend_config_gate_precision_string_input_fp32(self):
+        """Test that BackendConfig gate_precision accepts string input and converts to torch.dtype."""
+        backend_config = BackendConfig(gate_precision="torch.float32")
+        assert backend_config.gate_precision == torch.float32
 
-        assert config.gate_precision == torch.float32
+    def test_backend_config_gate_precision_string_input_fp64(self):
+        """Test that BackendConfig gate_precision accepts fp64 string input."""
+        backend_config = BackendConfig(gate_precision="torch.float64")
+        assert backend_config.gate_precision == torch.float64
 
-    def test_gate_precision_string_input_fp64(self):
-        """Test that gate_precision accepts fp64 string input."""
-        config = MoEConfig(
-            n_routed_experts=8,
-            n_shared_experts=0,
-            n_activated_experts=2,
-            n_expert_groups=1,
-            n_limited_groups=1,
-            train_gate=False,
-            gate_bias_update_factor=0.0,
-            aux_loss_coeff=0.0,
-            score_func="softmax",
-            route_scale=1.0,
-            dim=128,
-            inter_dim=256,
-            moe_inter_dim=256,
-            norm_topk_prob=False,
-            gate_precision="torch.float64",
-        )
-
-        assert config.gate_precision == torch.float64
-
-    def test_gate_precision_string_input_short_form(self):
-        """Test that gate_precision accepts short form string input."""
-        config = MoEConfig(
-            n_routed_experts=8,
-            n_shared_experts=0,
-            n_activated_experts=2,
-            n_expert_groups=1,
-            n_limited_groups=1,
-            train_gate=False,
-            gate_bias_update_factor=0.0,
-            aux_loss_coeff=0.0,
-            score_func="softmax",
-            route_scale=1.0,
-            dim=128,
-            inter_dim=256,
-            moe_inter_dim=256,
-            norm_topk_prob=False,
-            gate_precision="float32",
-        )
-
-        assert config.gate_precision == torch.float32
+    def test_backend_config_gate_precision_string_input_short_form(self):
+        """Test that BackendConfig gate_precision accepts short form string input."""
+        backend_config = BackendConfig(gate_precision="float32")
+        assert backend_config.gate_precision == torch.float32
 
     def test_dtype_string_input(self):
         """Test that dtype field accepts string input and converts to torch.dtype."""
@@ -786,8 +724,8 @@ class TestGate:
 
         assert config.dtype == torch.float16
 
-    def test_gate_forward_with_string_precision(self, device):
-        """Test Gate forward pass with string precision input."""
+    def test_gate_forward_with_string_precision_via_backend(self, device):
+        """Test Gate forward pass with string precision input via BackendConfig."""
         config = MoEConfig(
             n_routed_experts=8,
             n_shared_experts=0,
@@ -803,11 +741,13 @@ class TestGate:
             inter_dim=256,
             moe_inter_dim=256,
             norm_topk_prob=False,
-            gate_precision="float32",
             dtype="bfloat16",
         )
 
-        gate = Gate(config)
+        backend_config = BackendConfig(gate_precision="float32")
+        assert backend_config.gate_precision == torch.float32
+
+        gate = Gate(config, gate_precision=backend_config.gate_precision)
         gate = gate.to(device)
 
         with torch.no_grad():

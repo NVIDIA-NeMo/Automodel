@@ -69,13 +69,10 @@ class MoEConfig:
     dtype: str | torch.dtype = torch.bfloat16
     shared_expert_gate: bool = False
     shared_expert_inter_dim: int | None = None
-    gate_precision: str | torch.dtype | None = None
 
     def __post_init__(self):
         if isinstance(self.dtype, str):
             self.dtype = dtype_from_str(self.dtype, default=torch.bfloat16)
-        if isinstance(self.gate_precision, str):
-            self.gate_precision = dtype_from_str(self.gate_precision, default=None)
 
 
 class MLP(nn.Module):
@@ -583,12 +580,13 @@ class Gate(nn.Module):
         bias (Optional[torch.nn.Parameter]): Optional bias term for the gate.
     """
 
-    def __init__(self, config: MoEConfig):
+    def __init__(self, config: MoEConfig, gate_precision: torch.dtype | None = None):
         """
         Initializes the Gate module.
 
         Args:
-            args (MoEArgs): Model arguments containing gating parameters.
+            config (MoEConfig): Model configuration containing gating parameters.
+            gate_precision (torch.dtype | None): Precision for gate computations (linear, softmax/sigmoid).
         """
         super().__init__()
         self.dim = config.dim
@@ -603,7 +601,7 @@ class Gate(nn.Module):
         self.bias_update_factor = config.gate_bias_update_factor
         self.aux_loss_coeff = config.aux_loss_coeff
         self.norm_topk_prob = config.norm_topk_prob
-        self.gate_precision = config.gate_precision
+        self.gate_precision = gate_precision
 
         if self.bias_update_factor > 0:
             assert self.train_gate, "Require train_gate to be set to True to apply the bias update"
@@ -892,7 +890,7 @@ class MoE(nn.Module):
         if backend.fake_balanced_gate:
             self.gate = FakeBalancedGate(config)
         else:
-            self.gate = Gate(config)
+            self.gate = Gate(config, gate_precision=backend.gate_precision)
         if backend.enable_deepep:
             self.experts = GroupedExpertsDeepEP(config)
         else:
