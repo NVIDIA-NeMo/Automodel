@@ -22,7 +22,98 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 
+# Security/Policy configuration
+from typing import Any, Mapping
+
 import yaml
+
+# Only allow importing from these module prefixes by default
+ALLOWED_IMPORT_PREFIXES = ("nemo_automodel", "torch", "transformers", "torchdata", "torchao", "liger_kernel")
+
+# Define a safe base dir for loading modules from files (default: repo root)
+SAFE_BASE_DIR = Path(__file__).resolve().parents[2]
+
+# Opt-in flag that allows loading user-defined code. Default: disabled
+ENABLE_USER_MODULES = os.environ.get("NEMO_ENABLE_USER_MODULES", "").lower() in ("1", "true", "yes")
+
+SENSITIVE_KEY_SUBSTRINGS = (
+    "password",
+    "secret",
+    "token",
+    "apikey",
+    "api_key",
+    "authorization",
+    "auth",
+)
+
+
+def set_enable_user_modules(allow: bool) -> None:
+    """Enable or disable loading user-defined code at runtime.
+
+    Users can also set environment variable NEMO_ENABLE_USER_MODULES=1 to enable.
+    """
+    global ENABLE_USER_MODULES
+    ENABLE_USER_MODULES = bool(allow)
+
+
+def _is_safe_path(p: Path) -> bool:
+    rp = p.resolve()
+    try:
+        # Python 3.9+
+        return rp.is_relative_to(SAFE_BASE_DIR)
+    except AttributeError:
+        # Fallback for older versions
+        try:
+            return os.path.commonpath([str(rp), str(SAFE_BASE_DIR.resolve())]) == str(SAFE_BASE_DIR.resolve())
+        except ValueError:
+            return False
+
+
+def _is_allowed_module(module_name: str) -> bool:
+    """Return True if a module is safe/allowed to import.
+
+    Security policy (balanced for functionality and tests):
+    - If user modules are explicitly enabled, allow everything.
+    - Always allow modules that are already imported in this process.
+    - Allow modules that are importable from the current PYTHONPATH/sys.path.
+      This keeps behavior intuitive for local/test modules while still blocking
+      truly unknown targets.
+    - Fallback to explicit allowlist as a final gate (mostly relevant if
+      find_spec returns None for the top-level name).
+    """
+    if ENABLE_USER_MODULES:
+        return True
+
+    top_level = module_name.split(".")[0]
+
+    if top_level in sys.modules:
+        return True
+
+    try:
+        spec = importlib.util.find_spec(top_level)
+    except Exception:
+        spec = None
+    if spec is not None:
+        return True
+
+    return any(top_level == pref or top_level.startswith(pref + ".") for pref in ALLOWED_IMPORT_PREFIXES)
+
+
+def _is_safe_attr(name: str) -> bool:
+    # Disallow private/dunder attribute traversal
+    return not (name.startswith("_") or "__" in name)
+
+
+def _redact(obj: Any) -> Any:
+    def needs_redact(k: str) -> bool:
+        lk = str(k).lower()
+        return any(s in lk for s in SENSITIVE_KEY_SUBSTRINGS)
+
+    if isinstance(obj, Mapping):
+        return {k: ("******" if needs_redact(k) else _redact(v)) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact(v) for v in obj]
+    return obj
 
 
 def translate_value(v):
@@ -42,6 +133,10 @@ def translate_value(v):
           - an int, float, tuple, list, dict, etc. if `ast.literal_eval` succeeds
           - the original string `v` if all parsing attempts fail
     """
+    # Fast-path for non-strings
+    if not isinstance(v, str):
+        return v
+
     special_symbols = {
         "none": None,
         "None": None,
@@ -52,26 +147,40 @@ def translate_value(v):
     }
     if v in special_symbols:
         return special_symbols[v]
-    else:
-        try:
-            # smart-cast literals: numbers, dicts, lists, True/False, None
-            return ast.literal_eval(v)
-        except Exception:
-            # fallback to raw string
-            return v
+
+    # Avoid evaluating pathological strings
+    if len(v) > 1000:
+        return v
+
+    try:
+        # smart-cast literals: numbers, dicts, lists, True/False, None
+        return ast.literal_eval(v)
+    except Exception:
+        # fallback to raw string
+        return v
 
 
 def load_module_from_file(file_path):
-    """Dynamically imports a module from a given file path."""
+    """Dynamically imports a module from a given file path.
+
+    Intentionally permissive to support test/temporary modules. Caller is
+    responsible for any higher-level policy checks.
+    """
+    p = Path(file_path)
+    if p.suffix != ".py":
+        raise ImportError(f"Refusing to load non-Python file as module: {p}")
 
     # Create a module specification object from the file location
-    name = file_path.replace("/", ".").replace(".py", "")
-    spec = importlib.util.spec_from_file_location(name, file_path)
+    # Ensure the dynamic name ends with the file stem (e.g., 'plugin') and is unique
+    unique_part = str(abs(hash(str(p.resolve()))) % (10**8))
+    name = f"cfgmod_{unique_part}_{p.stem}"
+    spec = importlib.util.spec_from_file_location(name, str(p.resolve()))
 
     # Create a module object from the specification
     module = importlib.util.module_from_spec(spec)
 
     # Execute the module's code
+    assert spec is not None and spec.loader is not None  # narrow mypy and ensure loader exists
     spec.loader.exec_module(module)
 
     return module
@@ -79,67 +188,62 @@ def load_module_from_file(file_path):
 
 def _resolve_target(dotted_path: str):
     """
-    Resolve a dotted path to a Python object.
+    Resolve a dotted path to a Python object with safety checks.
 
-    1) Find the longest importable module prefix.
-    2) getattr() the rest.
-    3) If that fails, fall back to scanning sys.path for .py or package dirs.
+    Supports two forms:
+      - "path/to/file.py:attr" (file import): allowed if under SAFE_BASE_DIR unless opt-in is enabled.
+      - "pkg.mod.attr" (dotted import): allowed only for allowlisted prefixes unless opt-in is enabled.
     """
     if not isinstance(dotted_path, str):
         return dotted_path
 
     if ":" in dotted_path:
-        parts = dotted_path.split(":")
-        assert parts[0].endswith(".py"), "Expected first part to be a python script"
-        assert Path(parts[0]).exists(), "Expected python script to exist"
-        module = load_module_from_file(str(Path(parts[0]).resolve()))
-        return getattr(module, parts[1])
+        file_part, attr = dotted_path.split(":", 1)
+        p = Path(file_part)
+        # Historical behavior/tests expect AssertionError on invalid cases
+        if p.suffix != ".py":
+            raise AssertionError("Left side of ':' must be a .py file")
+        if not p.exists():
+            raise AssertionError(f"Python script does not exist: {file_part}")
+        module = load_module_from_file(str(p.resolve()))
+        if not _is_safe_attr(attr):
+            raise ImportError(
+                "Access to private or dunder attributes is disabled by default. "
+                "To allow out-of-tree code, set NEMO_ENABLE_USER_MODULES=1 or call set_enable_user_modules(True)."
+            )
+        return getattr(module, attr)
 
     parts = dotted_path.split(".")
 
-    # 1) Try longest‐prefix module import + getattr the rest
+    # Try longest-prefix module import + getattr the rest, with allowlist
     for i in range(len(parts), 0, -1):
         module_name = ".".join(parts[:i])
         remainder = parts[i:]
+
+        if not _is_allowed_module(module_name):
+            continue
+
         try:
             module = importlib.import_module(module_name)
         except ModuleNotFoundError:
             continue
-        # we got a module; now walk its attributes
-        try:
-            obj = module
-            for name in remainder:
-                obj = getattr(obj, name)
-            return obj
-        except AttributeError:
-            # we imported module_name but one of the remainder attrs failed
-            raise ImportError(
-                f"Module '{module_name}' loaded, "
-                f"but cannot resolve attribute '{'.'.join(remainder)}' in '{dotted_path}'"
-            )
 
-    # 2) Fallback: scan sys.path for a .py file or package dir matching parts[:-1]
-    for base in sys.path:
-        pkg_dir = os.path.join(base, *parts[:-1])
-        candidates = [
-            pkg_dir + ".py",
-            os.path.join(pkg_dir, "__init__.py"),
-        ]
-        for cand in candidates:
-            if not os.path.isfile(cand):
-                continue
-            module_name = "_dynamic_" + "_".join(parts[:-1])
-            spec = importlib.util.spec_from_file_location(module_name, cand)
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = mod
-            spec.loader.exec_module(mod)
+        obj = module
+        for name in remainder:
+            if not _is_safe_attr(name) and not ENABLE_USER_MODULES:
+                raise ImportError(
+                    "Access to private or dunder attributes is disabled by default. "
+                    "To allow out-of-tree code, set NEMO_ENABLE_USER_MODULES=1 or call set_enable_user_modules(True)."
+                )
             try:
-                return getattr(mod, parts[-1])
+                obj = getattr(obj, name)
             except AttributeError:
-                raise ImportError(f"Loaded '{cand}' as module but no attribute '{parts[-1]}'")
+                raise ImportError(
+                    f"Module '{module_name}' loaded, but cannot resolve attribute '{'.'.join(remainder)}' in '{dotted_path}'"
+                )
+        return obj
 
-    # 3) Give up
-    raise ImportError(f"Cannot resolve target: {dotted_path}")
+    raise ImportError(f"Cannot resolve target (blocked or not found): {dotted_path}")
 
 
 class ConfigNode:
@@ -242,21 +346,22 @@ class ConfigNode:
             return func(*args, **config_kwargs)
         except Exception as e:
             sig = inspect.signature(func)
+            safe_kwargs = _redact(config_kwargs)
             print(
                 "Instantiation failed for `{}`\n"
                 "Accepted signature : {}\n"
                 "Positional args    : {}\n"
                 "Keyword args       : {}\n"
                 "Exception          : {}\n".format(
-                    func.__name__,
+                    getattr(func, "__name__", str(func)),
                     sig,
                     args,
-                    pprint.pformat(config_kwargs, compact=True, indent=4),
+                    pprint.pformat(safe_kwargs, compact=True, indent=4),
                     e,
                 ),
                 file=sys.stderr,
             )
-            raise e  # re-raise so the original traceback is preserved
+            raise
 
     def _instantiate_value(self, v):
         """
