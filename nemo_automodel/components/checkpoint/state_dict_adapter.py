@@ -58,3 +58,18 @@ class StateDictAdapter(ABC):
             The converted native model state dict
         """
         pass
+
+    @abstractmethod
+    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+        """Convert a single tensor from native format to HuggingFace format.
+
+        Args:
+            fqn: Fully qualified name of the tensor in native format
+            tensor: The tensor to convert
+            **kwargs: Additional arguments for conversion
+
+        Returns:
+            List of (fqn, tensor) tuples in HuggingFace format.
+            Returns a list because some native tensors may split into multiple HF tensors.
+        """
+        pass
