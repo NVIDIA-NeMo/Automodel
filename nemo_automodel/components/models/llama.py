@@ -93,7 +93,7 @@ class LlamaAttention(nn.Module):
             self.q_proj = nn.Linear(config.hidden_size, self.q_size, bias=config.attention_bias)
             self.k_proj = nn.Linear(config.hidden_size, self.kv_size, bias=config.attention_bias)
             self.v_proj = nn.Linear(config.hidden_size, self.kv_size, bias=config.attention_bias)
-        
+
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
@@ -124,7 +124,7 @@ class LlamaAttention(nn.Module):
             q = self.q_proj(hidden_states)
             k = self.k_proj(hidden_states)
             v = self.v_proj(hidden_states)
-        
+
         query_states = q.view(hidden_shape).transpose(1, 2)
         key_states = k.view(hidden_shape).transpose(1, 2)
         value_states = v.view(hidden_shape).transpose(1, 2)
@@ -153,7 +153,7 @@ class LlamaAttention(nn.Module):
             scaling=self.scaling,
             **kwargs,
         )
-        
+
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
@@ -161,7 +161,7 @@ class LlamaAttention(nn.Module):
 
 class FusedLlamaMLP(nn.Module):
     """SwiGLU MLP with fused gate_up projection for efficiency.
-    
+
     This is an experimental optimization that fuses gate_proj and up_proj into a single projection.
     Note: May not always be faster than separate projections due to split overhead.
     """
@@ -171,15 +171,12 @@ class FusedLlamaMLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        
+
         # Fused gate and up projections
-        self.gate_up_proj = nn.Linear(
-            self.hidden_size, 
-            2 * self.intermediate_size, 
-            bias=config.mlp_bias
-        )
+        self.gate_up_proj = nn.Linear(self.hidden_size, 2 * self.intermediate_size, bias=config.mlp_bias)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         from transformers.activations import ACT2FN
+
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -189,13 +186,13 @@ class FusedLlamaMLP(nn.Module):
         gate_up_size = gate_up.shape[-1]
         local_intermediate_size = gate_up_size // 2
         gate, up = gate_up.split([local_intermediate_size, local_intermediate_size], dim=-1)
-        
+
         return self.down_proj(self.act_fn(gate) * up)
 
 
 class LlamaDecoderLayer(GradientCheckpointingLayer):
     """Single Llama decoder layer with RMSNorm, attention, and MLP.
-    
+
     Inherits from GradientCheckpointingLayer for efficient activation checkpointing.
     """
 
@@ -214,13 +211,13 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
             layer_idx=layer_idx,
             use_fused_qkv=use_fused_qkv,
         )
-        
+
         # Use HuggingFace's standard MLP or our fused version
         if use_fused_gate_up:
             self.mlp = FusedLlamaMLP(config=config)
         else:
             self.mlp = HFLlamaMLP(config=config)
-        
+
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -263,6 +260,7 @@ class LlamaPreTrainedModel(PreTrainedModel):
     An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
     models.
     """
+
     config_class = LlamaConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
@@ -374,7 +372,7 @@ class LlamaModel(LlamaPreTrainedModel):
             )
 
         hidden_states = self.norm(hidden_states)
-        
+
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
@@ -383,6 +381,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
 class LlamaForCausalLM(LlamaPreTrainedModel):
     """Llama model with causal language modeling head."""
+
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
@@ -439,7 +438,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
     ) -> CausalLMOutputWithPast:
         """
         Forward pass returning CausalLMOutputWithPast.
-        
+
         Args:
             input_ids: (batch_size, seq_len)
             attention_mask: Optional attention mask
@@ -450,7 +449,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             use_cache: Whether to use KV caching
             cache_position: Position in cache
             logits_to_keep: Number of final logits to compute (0=all, N=last N tokens)
-            
+
         Returns:
             CausalLMOutputWithPast with loss, logits, past_key_values
         """
@@ -466,7 +465,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         )
 
         hidden_states = outputs.last_hidden_state
-        
+
         # Only compute necessary logits (optimization for training and generation)
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
@@ -484,7 +483,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
 
 def build_llama_model(pretrained_model_name_or_path: str, **kwargs: Any) -> nn.Module:
     """Build a custom Llama model with optional fused projections.
-    
+
     This function loads the config from a HuggingFace model card and builds
     a custom Llama model with optional fused QKV and gate_up projections for efficiency.
 
@@ -508,80 +507,80 @@ def build_llama_model(pretrained_model_name_or_path: str, **kwargs: Any) -> nn.M
 
     Returns:
         LlamaForCausalLM model instance
-        
+
     Example:
         # Load with fused projections (efficient)
-        model = build_llama_model("meta-llama/Meta-Llama-3-70B", 
-                                   use_fused_qkv=True, 
+        model = build_llama_model("meta-llama/Meta-Llama-3-70B",
+                                   use_fused_qkv=True,
                                    use_fused_gate_up=True)
-        
+
         # Load with separate projections (matches HuggingFace exactly)
-        model = build_llama_model("meta-llama/Meta-Llama-3-70B", 
-                                   use_fused_qkv=False, 
+        model = build_llama_model("meta-llama/Meta-Llama-3-70B",
+                                   use_fused_qkv=False,
                                    use_fused_gate_up=False)
-        
+
         # Use SDPA for faster attention
-        model = build_llama_model("meta-llama/Meta-Llama-3-70B", 
+        model = build_llama_model("meta-llama/Meta-Llama-3-70B",
                                    attn_implementation="sdpa",
                                    use_fused_gate_up=True)
-        
+
         # Override for testing with fewer layers
         model = build_llama_model("meta-llama/Meta-Llama-3-70B", num_hidden_layers=4)
     """
     # Extract fusion options (not part of HuggingFace config)
-    use_fused_qkv = kwargs.pop('use_fused_qkv', False)
-    use_fused_gate_up = kwargs.pop('use_fused_gate_up', False)
-    
+    use_fused_qkv = kwargs.pop("use_fused_qkv", False)
+    use_fused_gate_up = kwargs.pop("use_fused_gate_up", False)
+
     # Extract and convert torch_dtype
-    torch_dtype = kwargs.pop('torch_dtype', None)
+    torch_dtype = kwargs.pop("torch_dtype", None)
     if torch_dtype is not None and isinstance(torch_dtype, str):
         torch_dtype = dtype_from_str(torch_dtype)
     elif torch_dtype is None:
         torch_dtype = torch.bfloat16  # Default to bf16
-    
+
     # Extract attention implementation if specified, otherwise auto-detect
     # This matches nemo_automodel/_transformers/auto_model.py approach
-    attn_implementation = kwargs.pop('attn_implementation', None)
-    
+    attn_implementation = kwargs.pop("attn_implementation", None)
+
     # Load config from HuggingFace (with any overrides from kwargs)
     config = LlamaConfig.from_pretrained(pretrained_model_name_or_path, **kwargs)
-    
+
     # Ensure architectures is set for LoRA compatibility
-    if not hasattr(config, 'architectures') or config.architectures is None:
+    if not hasattr(config, "architectures") or config.architectures is None:
         config.architectures = ["LlamaForCausalLM"]
-    
+
     # Set attention implementation with auto-detection
     # Priority: user-specified > existing in config > auto-detect (flash_attention_2 > sdpa > eager)
     # This matches the logic in nemo_automodel/_transformers/auto_model.py
     if attn_implementation is not None:
         config._attn_implementation = attn_implementation
-    elif not hasattr(config, '_attn_implementation') or config._attn_implementation is None:
+    elif not hasattr(config, "_attn_implementation") or config._attn_implementation is None:
         # Auto-detect best available implementation (same as nemo_automodel default)
         try:
             # Try flash_attention_2 first (fastest)
             config._attn_implementation = "flash_attention_2"
         except (ImportError, ModuleNotFoundError):
             # Fall back to SDPA if available (PyTorch 2.0+)
-            if hasattr(F, 'scaled_dot_product_attention'):
+            if hasattr(F, "scaled_dot_product_attention"):
                 config._attn_implementation = "sdpa"
             else:
                 # Final fallback to eager
                 config._attn_implementation = "eager"
-    
+
     if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
         print(f"[build_llama_model] Attention implementation: {config._attn_implementation}")
         print(f"[build_llama_model] Use fused QKV: {use_fused_qkv}")
         print(f"[build_llama_model] Use fused gate_up: {use_fused_gate_up}")
         print(f"[build_llama_model] torch_dtype: {torch_dtype}")
-    
+
     # Create model with specified dtype
     model = LlamaForCausalLM(
         config=config,
         use_fused_qkv=use_fused_qkv,
         use_fused_gate_up=use_fused_gate_up,
     )
-    
+
     # need to convert model manually since LlamaForCausalLM does not support to(dtype=...)
     model = model.to(dtype=torch_dtype)
-    
+
     return model

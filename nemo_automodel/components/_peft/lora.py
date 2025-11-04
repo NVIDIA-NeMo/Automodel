@@ -206,7 +206,7 @@ class LinearLoRA(nn.Linear):
 
         if self.dropout_position == "pre":
             x = F.dropout(x, p=self.dropout_p, training=self.training)
-        
+
         # Apply scale before lora_B to keep lora_res as a Partial tensor.
         # This allows both res and lora_res to remain Partial, so only one reduce-scatter is needed after addition.
         # Multiplying after lora_B would convert Partial to Replicate, causing an extra reduce-scatter operation.

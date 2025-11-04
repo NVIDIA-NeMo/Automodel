@@ -53,15 +53,13 @@ class SequenceParallelAllGatherActivation(SequenceParallel):
         if isinstance(outputs, DTensor):
             if any(isinstance(p, Shard) for p in outputs.placements):
                 # Redistribute to replicated placement (performs all-gather)
-                outputs = outputs.redistribute(
-                    device_mesh=device_mesh,
-                    placements=[Replicate()]
-                )
+                outputs = outputs.redistribute(device_mesh=device_mesh, placements=[Replicate()])
         else:
             raise ValueError(f"Expected output to be a DTensor, but got {type(outputs)}")
 
         # Call the parent's prepare_output_fn to handle use_local_output
         return SequenceParallel._prepare_output_fn(use_local_output, mod, outputs, device_mesh)
+
 
 class RotaryEmbedParallel(SequenceParallel):
     """Custom SequenceParallel class for Qwen2 / Gemma3 rotary embeddings because the input is a tuple."""
