@@ -23,7 +23,8 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeAudioEncoder,
     Qwen3OmniMoeVisionEncoder,
-    Qwen3OmniMoeThinkerTextRotaryEmbedding
+    Qwen3OmniMoeThinkerTextRotaryEmbedding,
+    _get_feat_extract_output_lengths
 )
 
 from nemo_automodel.components.models.qwen3_moe.model import Block
@@ -34,17 +35,6 @@ from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
-
-# Copied from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe._get_feat_extract_output_lengths
-def _get_feat_extract_output_lengths(input_lengths):
-    """
-    Computes the output length of the convolutional layers and the output length of the audio encoder
-    """
-
-    input_lengths_leave = input_lengths % 100
-    feat_lengths = (input_lengths_leave - 1) // 2 + 1
-    output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
-    return output_lengths
 
 class Qwen3OmniMoeThinkerTextModel(nn.Module):  #corresponding to qwen3_moe/model.py Qwen3MoeModel, diff: use MRopeRotaryEmbedding instead of RotaryEmbedding
     """Qwen3OmniMoe Thinker Text Model with MRoPE and sparse MoE layers."""
@@ -703,10 +693,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(nn.Module, MoEFSDPSyncMixin):
         padding_mask: torch.Tensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
-        use_cache: bool | None = None,
         output_router_logits: bool | None = None,
         use_audio_in_video: bool | None = None,
-        cache_position: torch.LongTensor | None = None,
         video_second_per_grid: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor | dict:
@@ -726,10 +714,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(nn.Module, MoEFSDPSyncMixin):
             padding_mask: Padding mask
             inputs_embeds: Optional pre-computed input embeddings
             labels: Labels for loss computation
-            use_cache: Whether to use KV cache
             output_router_logits: Whether to output router logits
             use_audio_in_video: Whether audio is in video
-            cache_position: Cache position for generation
             video_second_per_grid: Seconds per grid for videos
             **attn_kwargs: Additional attention arguments
             
@@ -804,30 +790,18 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(nn.Module, MoEFSDPSyncMixin):
             audio_feature_lengths = None
 
         if attention_mask is not None and position_ids is None:
-            if (
-                cache_position is None
-                or (cache_position is not None and cache_position[0] == 0)
-                or self.rope_deltas is None
-            ):
-                delta0 = (1 - attention_mask).sum(dim=-1).unsqueeze(1)
-                position_ids, rope_deltas = self.get_rope_index(
-                    input_ids,
-                    image_grid_thw,
-                    video_grid_thw,
-                    attention_mask,
-                    use_audio_in_video,
-                    audio_feature_lengths,
-                    video_second_per_grid,
-                )
-                rope_deltas = rope_deltas - delta0
-                self.rope_deltas = rope_deltas
-            else:
-                batch_size, seq_length = input_ids.shape
-                delta = cache_position[0] + self.rope_deltas if cache_position is not None else 0
-                position_ids = torch.arange(seq_length, device=input_ids.device)
-                position_ids = position_ids.view(1, -1).expand(batch_size, -1)
-                position_ids = position_ids.add(delta)
-                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+            delta0 = (1 - attention_mask).sum(dim=-1).unsqueeze(1)
+            position_ids, rope_deltas = self.get_rope_index(
+                input_ids,
+                image_grid_thw,
+                video_grid_thw,
+                attention_mask,
+                use_audio_in_video,
+                audio_feature_lengths,
+                video_second_per_grid,
+            )
+            rope_deltas = rope_deltas - delta0
+            self.rope_deltas = rope_deltas
 
         # 4. Forward through text model (with DeepStack visual features if available)
         hidden = self.model(
