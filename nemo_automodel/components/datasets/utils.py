@@ -93,13 +93,15 @@ def find_last_non_pad_token(lst: list[int], value: int) -> int | None:
     return None
 
 
-def get_pad_token_from_key(val: str, pad_token_ids: Optional[dict[str, int]] = {}) -> int | None:
+def get_pad_token_from_key(val: str, pad_token_ids: Optional[dict[str, int]] = None) -> int | None:
     PAD_TOKEN_IDS = {
         "labels": -100,
         "attention_mask": 0,
         "loss_mask": 0,
         "input_ids": 0,
     }
+    if pad_token_ids is None:
+        pad_token_ids = {}
     ans = pad_token_ids.get(val, PAD_TOKEN_IDS.get(val, None))
     return ans
 
