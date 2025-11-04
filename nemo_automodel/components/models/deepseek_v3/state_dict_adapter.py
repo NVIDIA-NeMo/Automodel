@@ -96,15 +96,15 @@ class DeepSeekV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         """Convert from native model state dict to HuggingFace format.
         Automatically detects format based on backend.enable_deepep configuration.
         """
-        hf_state_dict = self._to_hf_w_split_experts(state_dict)
+        hf_state_dict = {}
+        for fqn, tensor in state_dict.items():
+            converted_tensors = self.convert_single_tensor_to_hf(
+                fqn, tensor, exclude_key_regex=exclude_key_regex, quantization=quantization, **kwargs
+            )
+            for key, value in converted_tensors:
+                hf_state_dict[key] = value
 
-        if exclude_key_regex:
-            hf_state_dict = {k: v for k, v in hf_state_dict.items() if not re.match(exclude_key_regex, k)}
-
-        if quantization:
-            return self._add_quantization_scale_inv_tensors(hf_state_dict)
-        else:
-            return hf_state_dict
+        return hf_state_dict
 
     def from_hf(
         self,
@@ -123,6 +123,54 @@ class DeepSeekV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
 
         hf_state_dict = self._dequantize(hf_state_dict)
         return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
+
+    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+        """Convert a single tensor from native format to HuggingFace format.
+
+        Args:
+            fqn: Fully qualified name of the tensor in native format
+            tensor: The tensor to convert
+            **kwargs: Additional arguments for conversion
+
+        Returns:
+            List of (fqn, tensor) tuples in HuggingFace format
+        """
+        quantization = kwargs.get("quantization", False)
+        exclude_key_regex = kwargs.get("exclude_key_regex", None)
+
+        expert_result = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
+        if expert_result is not None:
+            result = expert_result
+        else:
+            result = [(fqn, tensor)]
+
+        if exclude_key_regex:
+            result = [(k, v) for k, v in result if not re.match(exclude_key_regex, k)]
+
+        if quantization:
+            quantized_result = []
+            for key, value in result:
+                if key.endswith(".weight") and not any(
+                    non_quantized_key in key
+                    for non_quantized_key in [
+                        "input_layernorm.weight",
+                        "post_attention_layernorm.weight",
+                        "norm.weight",
+                        "lm_head.weight",
+                        "embed_tokens.weight",
+                        "mlp.gate.weight",
+                    ]
+                ):
+                    value = value.to(dtype=torch.float8_e4m3fn)
+                    expected_scale_shape = calculate_scale_shape(value)
+                    weight_scale_inv = torch.ones(expected_scale_shape, dtype=torch.float32, device=value.device)
+                    quantized_result.append((key, value))
+                    quantized_result.append((key + "_scale_inv", weight_scale_inv))
+                else:
+                    quantized_result.append((key, value))
+            return quantized_result
+
+        return result
 
 
 def calculate_scale_shape(weight: torch.Tensor, BLOCK_SIZE: int = BLOCK_SIZE) -> torch.Size:

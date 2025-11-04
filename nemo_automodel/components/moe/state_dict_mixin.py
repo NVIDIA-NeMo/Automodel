@@ -25,7 +25,6 @@ from nemo_automodel.components.moe.state_dict_utils import (
     is_dtensor,
     should_load_expert_for_rank,
     split_experts_weights_dtensor_aware,
-    validate_dtensor_expert_sharding,
 )
 
 
@@ -165,55 +164,15 @@ class MoESplitExpertsStateDictMixin:
         """Convert DeepEP format to HuggingFace format.
         Handles: gate_and_up_projs, down_projs -> individual expert weights
         """
-
-        n_experts = self.moe_config.n_routed_experts
-        inter_dim = self.moe_config.moe_inter_dim
         hf_state_dict: dict[str, Any] = {}
 
-        for key, value in list(state_dict.items()):
-            if ".mlp.experts.gate_and_up_projs" in key and key.endswith(".gate_and_up_projs"):
-                # DeepEP: [n_experts, dim, 2*inter_dim] -> per-expert gate_proj/up_proj [inter_dim, dim]
-                layer_num = re.search(r"layers\.(\d+)", key).group(1)
-
-                if is_dtensor(value):
-                    validate_dtensor_expert_sharding(value, n_experts, f"gate_and_up_projs layer {layer_num}")
-
-                splits = self._split_experts_weights(value, n_experts)
-                for i, w in enumerate(splits):
-                    expert_id = self._last_expert_ids[i]
-                    # Split concat along last dim and transpose to [inter_dim, dim]
-                    w_gate = w[:, :inter_dim].transpose(0, 1).contiguous()
-                    w_up = w[:, inter_dim:].transpose(0, 1).contiguous()
-                    prefix = "model." if self._uses_model_prefix else ""
-                    hf_state_dict[f"{prefix}layers.{layer_num}.mlp.experts.{expert_id}.gate_proj.weight"] = w_gate
-                    hf_state_dict[f"{prefix}layers.{layer_num}.mlp.experts.{expert_id}.up_proj.weight"] = w_up
-                continue
-
-            if (
-                ".mlp.experts.down_projs" in key
-                and key.endswith(".down_projs")
-                and value.ndim == 3
-                and value.shape[1] == inter_dim
-            ):
-                # DeepEP down: [n_experts, inter_dim, dim] -> per-expert down_proj [dim, inter_dim]
-                layer_num = re.search(r"layers\.(\d+)", key).group(1)
-
-                if is_dtensor(value):
-                    validate_dtensor_expert_sharding(value, n_experts, f"down_projs (DeepEP) layer {layer_num}")
-
-                splits = self._split_experts_weights(value, n_experts)
-                for i, w in enumerate(splits):
-                    expert_id = self._last_expert_ids[i]
-                    prefix = "model." if self._uses_model_prefix else ""
-                    hf_state_dict[f"{prefix}layers.{layer_num}.mlp.experts.{expert_id}.down_proj.weight"] = w.transpose(
-                        0, 1
-                    ).contiguous()
-                continue
-
-        for key, value in state_dict.items():
-            if ".mlp.experts." in key and (key.endswith(".gate_and_up_projs") or key.endswith(".down_projs")):
-                continue
-            hf_state_dict[key] = value
+        for fqn, tensor in state_dict.items():
+            converted = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor)
+            if converted is not None:
+                for key, value in converted:
+                    hf_state_dict[key] = value
+            else:
+                hf_state_dict[fqn] = tensor
 
         return hf_state_dict
 
@@ -337,3 +296,70 @@ class MoESplitExpertsStateDictMixin:
                     state_dict[key] = value
 
         return state_dict
+
+    def _convert_single_merged_expert_to_hf_split_experts(
+        self, fqn: str, tensor: torch.Tensor, **kwargs
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Convert a single merged expert tensor from native format to split HuggingFace format.
+
+        Args:
+            fqn: Fully qualified name of the tensor in native format
+            tensor: The tensor to convert
+
+        Returns:
+            List of (fqn, tensor) tuples in HuggingFace format, or None if not an expert tensor
+        """
+        n_experts = self.moe_config.n_routed_experts
+        inter_dim = self.moe_config.moe_inter_dim
+        prefix = "model." if self._uses_model_prefix else ""
+
+        if ".mlp.experts.gate_and_up_projs" in fqn and fqn.endswith(".gate_and_up_projs"):
+            layer_num = re.search(r"layers\.(\d+)", fqn).group(1)
+
+            from nemo_automodel.components.moe.state_dict_utils import (
+                is_dtensor,
+                validate_dtensor_expert_sharding,
+            )
+
+            if is_dtensor(tensor):
+                validate_dtensor_expert_sharding(tensor, n_experts, f"gate_and_up_projs layer {layer_num}")
+
+            splits = self._split_experts_weights(tensor, n_experts)
+            result = []
+            for i, w in enumerate(splits):
+                expert_id = self._last_expert_ids[i]
+                w_gate = w[:, :inter_dim].transpose(0, 1).contiguous()
+                w_up = w[:, inter_dim:].transpose(0, 1).contiguous()
+                result.append((f"{prefix}layers.{layer_num}.mlp.experts.{expert_id}.gate_proj.weight", w_gate))
+                result.append((f"{prefix}layers.{layer_num}.mlp.experts.{expert_id}.up_proj.weight", w_up))
+            return result
+
+        elif (
+            ".mlp.experts.down_projs" in fqn
+            and fqn.endswith(".down_projs")
+            and tensor.ndim == 3
+            and tensor.shape[1] == inter_dim
+        ):
+            layer_num = re.search(r"layers\.(\d+)", fqn).group(1)
+
+            from nemo_automodel.components.moe.state_dict_utils import (
+                is_dtensor,
+                validate_dtensor_expert_sharding,
+            )
+
+            if is_dtensor(tensor):
+                validate_dtensor_expert_sharding(tensor, n_experts, f"down_projs (DeepEP) layer {layer_num}")
+
+            splits = self._split_experts_weights(tensor, n_experts)
+            result = []
+            for i, w in enumerate(splits):
+                expert_id = self._last_expert_ids[i]
+                result.append(
+                    (
+                        f"{prefix}layers.{layer_num}.mlp.experts.{expert_id}.down_proj.weight",
+                        w.transpose(0, 1).contiguous(),
+                    )
+                )
+            return result
+
+        return None
