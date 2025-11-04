@@ -125,7 +125,7 @@ class StepScheduler(Stateful):
                 yield batch_buffer
                 self.step += 1
                 batch_buffer = []
-                if self.step >= self.max_steps or self.sigterm_received:
+                if self.step >= self.max_steps or self.sigterm_flag:
                     return
         if batch_buffer:
             yield batch_buffer
@@ -146,7 +146,7 @@ class StepScheduler(Stateful):
         Returns whether this step needs to call the validation.
         """
         is_val = False
-        if self.val_every_steps and self.val_every_steps > 0 and not self.sigterm_received:
+        if self.val_every_steps and self.val_every_steps > 0 and not self.sigterm_flag:
             is_val = self.step % self.val_every_steps == self.val_every_steps - 1
         return is_val
 
