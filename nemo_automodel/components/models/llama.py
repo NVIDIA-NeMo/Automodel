@@ -530,8 +530,8 @@ def build_llama_model(pretrained_model_name_or_path: str, **kwargs: Any) -> nn.M
         model = build_llama_model("meta-llama/Meta-Llama-3-70B", num_hidden_layers=4)
     """
     # Extract fusion options (not part of HuggingFace config)
-    use_fused_qkv = kwargs.pop('use_fused_qkv', True)
-    use_fused_gate_up = kwargs.pop('use_fused_gate_up', True)
+    use_fused_qkv = kwargs.pop('use_fused_qkv', False)
+    use_fused_gate_up = kwargs.pop('use_fused_gate_up', False)
     
     # Extract and convert torch_dtype
     torch_dtype = kwargs.pop('torch_dtype', None)
