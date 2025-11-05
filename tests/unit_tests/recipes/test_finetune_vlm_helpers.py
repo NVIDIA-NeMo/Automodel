@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 from unittest.mock import Mock, patch, MagicMock
 
-from nemo_automodel.recipes.vlm.finetune import _freeze_model, _build_optimizer, build_model_and_optimizer
+from nemo_automodel.recipes.vlm.finetune import _freeze_model, build_model_and_optimizer
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
 
@@ -55,8 +55,7 @@ class DummyOptConfig:
 
     def __init__(self, lr: float = 0.01):
         self.lr = lr
-        self.foreach = None  # will be modified by _build_optimizer when tp_size > 1
-
+        self.foreach = None 
     def instantiate(self, params):
         # Always return an SGD optimizer for the given params
         return torch.optim.SGD(params, lr=self.lr)
@@ -101,41 +100,6 @@ def test_freeze_model_with_config(monkeypatch):
     # embedding remains trainable, language_model is frozen
     assert model.embedding.weight.requires_grad
     assert not model.language_model.weight.requires_grad
-
-
-# -----------------------------------------------------------------------------
-# _build_optimizer
-# -----------------------------------------------------------------------------
-
-def _count_trainable(p):
-    return sum(x.numel() for x in p if x.requires_grad)
-
-
-def test_build_optimizer_single_tp():
-    model = DummyModel()
-    cfg_opt = DummyOptConfig(lr=0.05)
-
-    optim = _build_optimizer(model, cfg_opt, tp_size=1)
-
-    # Optimizer should be torch.optim.Optimizer subclass with correct LR
-    assert isinstance(optim, torch.optim.Optimizer)
-    assert pytest.approx(optim.param_groups[0]["lr"], rel=1e-6) == 0.05
-
-    # cfg_opt.foreach should remain untouched (None)
-    assert cfg_opt.foreach is None
-
-
-def test_build_optimizer_multi_tp():
-    model = DummyModel()
-    cfg_opt = DummyOptConfig(lr=0.02)
-
-    optim = _build_optimizer(model, cfg_opt, tp_size=2)
-
-    # Optimizer still constructed
-    assert isinstance(optim, torch.optim.Optimizer)
-
-    # tp_size > 1 must disable foreach behaviour
-    assert cfg_opt.foreach in (False, None)
 
 
 # -----------------------------------------------------------------------------
