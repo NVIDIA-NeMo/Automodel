@@ -177,6 +177,7 @@ def apply_fsdp(
     if lm_head is not None:
         fully_shard_default(lm_head)
 
+    # TODO: properly handle all possible multimodal component names
     if hasattr(model, "audio_tower") and model.audio_tower is not None:
         if any(param.requires_grad for param in model.audio_tower.parameters()):
             fully_shard_default(model.audio_tower)
