@@ -16,6 +16,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 from nemo_automodel.components.attention.utils import (
     initialize_attn_module_and_func,
@@ -28,7 +29,6 @@ from nemo_automodel.components.moe.utils import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
-from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 
 class Qwen3MoeAttention(nn.Module):

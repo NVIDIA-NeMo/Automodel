@@ -25,6 +25,11 @@ import torch.nn as nn
 import wandb
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
+from transformers import AutoProcessor
+from transformers.integrations.accelerate import init_empty_weights
+from transformers.modeling_utils import no_init_weights
+from transformers.processing_utils import ProcessorMixin
+from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
 from wandb import Settings
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
@@ -62,11 +67,6 @@ from nemo_automodel.components.utils.model_utils import (
     print_trainable_parameters,
 )
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from transformers import AutoProcessor
-from transformers.integrations.accelerate import init_empty_weights
-from transformers.modeling_utils import no_init_weights
-from transformers.processing_utils import ProcessorMixin
-from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
