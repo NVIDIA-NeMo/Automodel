@@ -84,8 +84,7 @@ dependencies = [
     "transformers<=4.57.1",
     "wandb",
     "torchao",
-    "mlflow>=3.5.1",
-    "psutil>=7.1.1",
+    "mlflow",
 ]
 
 [project.optional-dependencies]
