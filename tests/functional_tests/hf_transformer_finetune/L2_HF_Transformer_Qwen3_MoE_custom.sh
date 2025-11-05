@@ -31,7 +31,9 @@ examples/llm_finetune/finetune.py \
     --validation_dataset.dataset_name $HF_CACHE/squad/ \
     --dataset.limit_dataset_samples 1000 \
     --dataset.seq_length 512 \
+    --dataset.padding true \
     --validation_dataset.seq_length 512 \
+    --validation_dataset.padding true \
     --dataset.limit_dataset_samples 8 \
     --validation_dataset.limit_dataset_samples 8 \
     --model.is_meta_device true \
