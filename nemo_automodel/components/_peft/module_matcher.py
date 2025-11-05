@@ -18,6 +18,14 @@ from typing import List
 
 import torch.nn as nn
 
+from nemo_automodel.shared.import_utils import safe_import
+
+HAS_TE, transformer_engine = safe_import("transformer_engine")
+
+
+def _is_linear_module(module):
+    return isinstance(module, nn.Linear) or (HAS_TE and isinstance(module, transformer_engine.pytorch.Linear))
+
 
 def wildcard_match(pattern, key):
     """
@@ -92,7 +100,7 @@ class ModuleMatcher:
                 return False
 
         # 1. matching by layer type takes absolute precedence
-        if self.match_all_linear and isinstance(m, nn.Linear):
+        if self.match_all_linear and _is_linear_module(m):
             return True
 
         # 2. target_modules is the next most-specific rule set
@@ -107,5 +115,5 @@ class ModuleMatcher:
             return (
                 name not in self.exclude_modules
                 and not any(wildcard_match(pattern, full_name) for pattern in self.exclude_modules)
-                and isinstance(m, nn.Linear)
+                and _is_linear_module(m)
             )
