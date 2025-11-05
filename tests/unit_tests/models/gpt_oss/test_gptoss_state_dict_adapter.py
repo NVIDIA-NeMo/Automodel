@@ -23,7 +23,9 @@ from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSSt
 
 class TestApplyKeyMapping:
     def _make_adapter(self):
-        return GPTOSSStateDictAdapter(config=object(), moe_config=object(), backend=object(), dtype=torch.float32)
+        backend = Mock(spec=BackendConfig)
+        backend.attn = "flex"
+        return GPTOSSStateDictAdapter(config=object(), moe_config=object(), backend=backend, dtype=torch.float32)
 
     def test_exact_suffix_replacement(self):
         adapter = self._make_adapter()
@@ -169,6 +171,39 @@ class TestGPTOSSStateDictAdapter:
         assert len(adapter.hf_to_internal_map) == 4
         assert len(adapter.internal_to_hf_map) == 4
 
+    def test_initialization_with_te_backend(self):
+        """Test that TE backend adds sinks mapping to adapter."""
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config(attn="te")
+
+        adapter = GPTOSSStateDictAdapter(config=config, moe_config=moe_config, backend=backend, dtype=torch.float16)
+
+        # With TE backend, we should have 5 mappings (4 base + 1 sinks mapping)
+        assert len(adapter.hf_to_internal_map) == 5
+        assert len(adapter.internal_to_hf_map) == 5
+
+        # Verify the sinks mapping exists
+        assert "self_attn.sinks" in adapter.hf_to_internal_map
+        assert adapter.hf_to_internal_map["self_attn.sinks"] == "self_attn.attn_module.softmax_offset"
+        assert "self_attn.attn_module.softmax_offset" in adapter.internal_to_hf_map
+        assert adapter.internal_to_hf_map["self_attn.attn_module.softmax_offset"] == "self_attn.sinks"
+
+    def test_initialization_with_flex_backend(self):
+        """Test that Flex backend does not add sinks mapping."""
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config(attn="flex")
+
+        adapter = GPTOSSStateDictAdapter(config=config, moe_config=moe_config, backend=backend, dtype=torch.float16)
+
+        # With Flex backend, we should have 4 base mappings only
+        assert len(adapter.hf_to_internal_map) == 4
+        assert len(adapter.internal_to_hf_map) == 4
+
+        # Verify the sinks mapping does not exist
+        assert "self_attn.sinks" not in adapter.hf_to_internal_map
+
     def test_to_hf_applies_mapping_and_exclude(self):
         config = self.create_mock_config()
         moe_config = self.create_mock_moe_config()
@@ -207,11 +242,11 @@ class TestGPTOSSStateDictAdapter:
             "model.layers.0.mlp.gate.weight": torch.randn(3, 3),
         }
 
-        with patch.object(adapter, "_add_quantization_block_scale_tensors") as mock_add:
-            mock_add.return_value = {"quantized": torch.randn(1)}
+        with patch.object(adapter, "convert_single_tensor_to_hf") as mock_convert:
+            mock_convert.return_value = [("quantized", torch.randn(1))]
             out = adapter.to_hf(state_dict, quantization=True)
 
-        mock_add.assert_called_once()
+        mock_convert.assert_called_once()
         assert "quantized" in out
 
     def test_add_quantization_block_scale_tensors_creates_expected_keys(self):
@@ -350,10 +385,54 @@ class TestGPTOSSStateDictAdapter:
         assert "layers.0.mlp.router.weight" not in out
         assert "layers.0.mlp.router.bias" not in out
 
+    def test_from_hf_with_te_backend_sinks_mapping(self):
+        """Test from_hf applies sinks mapping with TE backend."""
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config(attn="te")
+        adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
+
+        hf_state = {
+            "model.layers.0.self_attn.sinks": torch.randn(8),
+            "model.layers.0.mlp.router.weight": torch.randn(2, 2),
+        }
+
+        out = adapter.from_hf(hf_state)
+
+        # Sinks should be mapped to softmax_offset
+        assert "model.layers.0.self_attn.attn_module.softmax_offset" in out
+        assert "model.layers.0.self_attn.sinks" not in out
+
+        # Router mapping should still work
+        assert "model.layers.0.mlp.gate.weight" in out
+
+    def test_to_hf_with_te_backend_sinks_mapping(self):
+        """Test to_hf applies sinks mapping with TE backend."""
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config(attn="te")
+        adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
+
+        state_dict = {
+            "model.layers.0.self_attn.attn_module.softmax_offset": torch.randn(8),
+            "model.layers.0.mlp.gate.weight": torch.randn(2, 2),
+        }
+
+        out = adapter.to_hf(state_dict, quantization=False)
+
+        # softmax_offset should be mapped to sinks
+        assert "model.layers.0.self_attn.sinks" in out
+        assert "model.layers.0.self_attn.attn_module.softmax_offset" not in out
+
+        # Gate mapping should still work
+        assert "model.layers.0.mlp.router.weight" in out
+
 
 class TestConvertMoePackedTensors:
     def _make_adapter(self):
-        return GPTOSSStateDictAdapter(config=object(), moe_config=object(), backend=object(), dtype=torch.float32)
+        backend = Mock(spec=BackendConfig)
+        backend.attn = "flex"
+        return GPTOSSStateDictAdapter(config=object(), moe_config=object(), backend=backend, dtype=torch.float32)
 
     def test_convert_basic_nibble_decode_and_shape(self):
         adapter = self._make_adapter()
@@ -518,7 +597,9 @@ class TestConvertMoePackedTensors:
 
 class TestSingleGPUScenarios:
     def _make_adapter(self):
-        return GPTOSSStateDictAdapter(config=object(), moe_config=object(), backend=object(), dtype=torch.float32)
+        backend = Mock(spec=BackendConfig)
+        backend.attn = "flex"
+        return GPTOSSStateDictAdapter(config=object(), moe_config=object(), backend=backend, dtype=torch.float32)
 
     def test_convert_single_gpu_stays_on_cpu(self):
         adapter = self._make_adapter()
@@ -594,9 +675,89 @@ class TestSingleGPUScenarios:
         assert d_blocks.dtype == torch.uint8 and d_scales.dtype == torch.uint8
 
 
+class TestConvertSingleTensorToHf:
+    def create_mock_config(self):
+        config = Mock()
+        config.num_layers = 2
+        config.hidden_size = 64
+        return config
+
+    def create_mock_moe_config(self):
+        moe_config = Mock()
+        moe_config.num_experts = 4
+        moe_config.n_routed_experts = 4
+        moe_config.moe_inter_dim = 64
+        return moe_config
+
+    def create_mock_backend_config(self):
+        backend = Mock()
+        backend.enable_deepep = False
+        return backend
+
+    def test_applies_key_mapping(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+        adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(64, 64)
+        fqn = "model.layers.0.mlp.gate.weight"
+
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor)
+
+        assert len(result) == 1
+        assert result[0][0] == "model.layers.0.mlp.router.weight"
+        assert torch.equal(result[0][1], tensor)
+
+    def test_exclude_key_regex(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+        adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(64, 64)
+        fqn = "exclude_this.weight"
+
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor, exclude_key_regex=r"exclude.*")
+
+        assert len(result) == 0
+
+    def test_quantization_for_expert_weights(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+        adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(4, 64, 128)
+        fqn = "model.layers.0.mlp.experts.gate_and_up_projs"
+
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
+
+        # Should create blocks and scales tensors
+        assert len(result) == 2
+        assert result[0][0].endswith("_blocks")
+        assert result[1][0].endswith("_scales")
+
+    def test_no_quantization_for_non_expert_weights(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+        adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(64, 64)
+        fqn = "model.layers.0.self_attn.q_proj.weight"
+
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
+
+        assert len(result) == 1
+        assert result[0][0] == "model.layers.0.self_attn.q_proj.weight"
+
+
 class TestDTensorPaths:
     def _make_adapter(self):
-        return GPTOSSStateDictAdapter(config=object(), moe_config=object(), backend=object(), dtype=torch.float32)
+        backend = Mock(spec=BackendConfig)
+        backend.attn = "flex"
+        return GPTOSSStateDictAdapter(config=object(), moe_config=object(), backend=backend, dtype=torch.float32)
 
     def test_add_quantization_block_scale_tensors_dtensor_path(self):
         adapter = self._make_adapter()

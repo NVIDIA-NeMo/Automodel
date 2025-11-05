@@ -16,10 +16,12 @@ import functools
 import gc
 import inspect
 import logging
+import os
 import types
 from typing import List, Optional, Union
 
 import torch
+import torch.distributed as dist
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import (
     AutoConfig,
@@ -29,6 +31,7 @@ from transformers import (
     AutoModelForTextToWaveform,
     PreTrainedModel,
 )
+from transformers.modeling_utils import _get_resolved_checkpoint_files
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
 from nemo_automodel import __version__
@@ -181,6 +184,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         torch_dtype="auto",
         attn_implementation: str = "flash_attention_2",
         quantization_config=None,
+        force_hf: bool = False,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -210,6 +214,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             quantization_config (optional): BitsAndBytesConfig configuration object that
                 specifies all quantization settings. If provided, quantization
                 will be applied to the model.
+            force_hf (bool, default=False): If `True`, force the use of HF model implementation.
+                If `False`, the model will be loaded using the custom model implementation if available.
             **kwargs: Additional keyword arguments forwarded verbatim to
                 `AutoModelForCausalLM.from_pretrained`.
 
@@ -254,17 +260,53 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             name = cls.__name__
             if name.startswith("NeMo"):
                 cls.__name__ = name[4:]
-            try:
-                config = AutoConfig.from_pretrained(
-                    pretrained_model_name_or_path, trust_remote_code=bool(kwargs.get("trust_remote_code", False))
-                )
-                # if we have a custom model implementation available, we prioritize that over HF
-                if config.architectures[0] in ModelRegistry.model_arch_name_to_cls:
-                    model = ModelRegistry.model_arch_name_to_cls[config.architectures[0]](config, *model_args, **kwargs)
-                    logger.info(f"Using custom model implementation for {config.architectures[0]}")
-                    return model
-            except Exception as e:
-                logger.error(f"Failed to use custom model implementation with error: {e}")
+            if not force_hf:
+                try:
+                    config = AutoConfig.from_pretrained(
+                        pretrained_model_name_or_path, trust_remote_code=bool(kwargs.get("trust_remote_code", False))
+                    )
+                    # if we have a custom model implementation available, we prioritize that over HF
+                    if config.architectures[0] in ModelRegistry.model_arch_name_to_cls:
+                        model = ModelRegistry.model_arch_name_to_cls[config.architectures[0]](
+                            config, *model_args, **kwargs
+                        )
+                        # if we are able to init the custom model, we will now download the model weights on local rank 0
+                        if (
+                            not dist.is_initialized() or int(os.environ.get("LOCAL_RANK", "0")) == 0
+                        ) and not os.path.isdir(pretrained_model_name_or_path):
+                            num_nodes = (
+                                dist.get_world_size() % int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+                            ) + 1  # 1-indexed
+                            if num_nodes > 1:
+                                logging.info(
+                                    f"""Downloading model weights on {num_nodes} nodes. This incurs high storage usage. 
+                                    It is recommended to download once with `hf download` and pass in the downloaded path to the `pretrained_model_name_or_path` argument."""
+                                )
+                            _get_resolved_checkpoint_files(
+                                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                                subfolder="",
+                                variant=None,
+                                gguf_file=None,
+                                from_tf=False,
+                                from_flax=False,
+                                use_safetensors=None,
+                                cache_dir=None,
+                                force_download=False,
+                                proxies=None,
+                                local_files_only=False,
+                                token=None,
+                                user_agent={"file_type": "model", "framework": "pytorch", "from_auto_class": False},
+                                revision="main",
+                                commit_hash=getattr(config, "_commit_hash", None),
+                                is_remote_code=False,
+                                transformers_explicit_filename=None,
+                            )
+                        if dist.is_initialized():
+                            dist.barrier()
+                        logger.info(f"Using custom model implementation for {config.architectures[0]}")
+                        return model
+                except Exception as e:
+                    logger.error(f"Failed to use custom model implementation with error: {e}")
 
             if quantization_config is not None:
                 kwargs["quantization_config"] = quantization_config
@@ -317,6 +359,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         torch_dtype: Union[str, torch.dtype] = "auto",
         attn_implementation: str = "flash_attention_2",
         quantization_config=None,
+        force_hf: bool = False,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -344,6 +387,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 ``"flash_attention_2"``, ``"eager"``). Only applied when the
                 base model supports this kwarg. Defaults to
                 ``"flash_attention_2"``.
+            force_hf (bool, default=False): If `True`, force the use of HF model implementation.
+                If `False`, the model will be loaded using the custom model implementation if available.
             **kwargs:
                 Additional keyword arguments forwarded to the superclass
                 constructor and underlying ``from_config`` logic.
@@ -382,14 +427,17 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             name = cls.__name__
             if name.startswith("NeMo"):
                 cls.__name__ = name[4:]
-            try:
-                # if we have a custom model implementation available, we prioritize that over HF
-                if config.architectures[0] in ModelRegistry.model_arch_name_to_cls:
-                    model = ModelRegistry.model_arch_name_to_cls[config.architectures[0]](config, *model_args, **kwargs)
-                    logger.info(f"Using custom model implementation for {config.architectures[0]}")
-                    return model
-            except Exception as e:
-                logger.error(f"Failed to use custom model implementation with error: {e}")
+            if not force_hf:
+                try:
+                    # if we have a custom model implementation available, we prioritize that over HF
+                    if config.architectures[0] in ModelRegistry.model_arch_name_to_cls:
+                        model = ModelRegistry.model_arch_name_to_cls[config.architectures[0]](
+                            config, *model_args, **kwargs
+                        )
+                        logger.info(f"Using custom model implementation for {config.architectures[0]}")
+                        return model
+                except Exception as e:
+                    logger.error(f"Failed to use custom model implementation with error: {e}")
 
             if quantization_config is not None:
                 kwargs["quantization_config"] = quantization_config

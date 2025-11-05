@@ -14,7 +14,7 @@
 
 import logging
 import re
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -35,11 +35,11 @@ def _pad_to_seq_length(sample, pad_token_id, seq_length):
 def _add_pad_token(tokenizer):
     """Add pad token to tokenizer if not present."""
     pad_token_id = None
-    if not hasattr(tokenizer, "pad_token_id"):
+    if getattr(tokenizer, "pad_token_id", None) is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     else:
         pad_token_id = tokenizer.pad_token_id
-    if not hasattr(tokenizer, "pad_token") and hasattr(tokenizer, "eos_token"):
+    if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
         tokenizer.pad_token = tokenizer.eos_token
     return pad_token_id
 
@@ -66,6 +66,8 @@ def _package_tokenized_example(
     eos_token_id,
     pad_token_id,
     seq_length,
+    truncation="do_not_truncate",
+    padding="do_not_pad",
 ):
     """
     Package a tokenized example with proper masking and padding.
@@ -77,7 +79,8 @@ def _package_tokenized_example(
         eos_token_id: The end-of-sequence token id.
         pad_token_id: The padding token id.
         seq_length: Optional sequence length for padding.
-
+        truncation: Optional truncation strategy.
+        padding: Optional padding strategy.
     Returns:
         A dictionary with input_ids, labels, and attention_mask.
     """
@@ -86,6 +89,8 @@ def _package_tokenized_example(
     if not _has_chat_template(tokenizer) and eos_token_id != input_ids[-1]:
         input_ids += [eos_token_id]
         assistant_masks += [1]
+    if not _has_chat_template(tokenizer) and pad_token_id is not None:
+        assistant_masks += [pad_token_id]
 
     labels = input_ids.copy()
     input_ids = input_ids[:-1]
@@ -95,12 +100,12 @@ def _package_tokenized_example(
     labels[:] = [label if bool(m) else -100 for label, m in zip(labels, assistant_masks)]
     # remove BOS
     labels = labels[1:]
-    if not _has_chat_template(tokenizer):
+    if not _has_chat_template(tokenizer) and truncation is None:
         assert labels[-1] == eos_token_id, f"labels[-1]={labels[-1]} != eos_token_id={eos_token_id}"
         assert input_ids[-1] != eos_token_id, f"input_ids[-1]={input_ids[-1]} == eos_token_id={eos_token_id}"
     assert len(input_ids) == len(labels), f"len(input_ids)={len(input_ids)} != len(labels)={len(labels)}"
 
-    if isinstance(seq_length, int):
+    if isinstance(seq_length, int) and padding not in [None, "do_not_pad", False]:
         input_ids = _pad_to_seq_length(input_ids, pad_token_id, seq_length)
         labels = _pad_to_seq_length(labels, -100, seq_length)
 
@@ -125,6 +130,8 @@ def format_prompt_completion(
     eos_token_id: int,
     pad_token_id: int,
     seq_length: Optional[int] = None,
+    padding: Union[str, bool] = "do_not_pad",
+    truncation: Union[str, bool] = "do_not_truncate",
     answer_only_loss_mask: bool = True,
 ) -> Dict[str, List[int]]:
     """
@@ -150,7 +157,7 @@ def format_prompt_completion(
     else:
         len_prompt_ids = 0
     # Tokenize full text
-    input_ids = tokenizer(full_text)["input_ids"]
+    input_ids = tokenizer(full_text, padding=padding, truncation=truncation, max_length=seq_length)["input_ids"]
 
     # Create assistant_masks: 0 for prompt tokens, 1 for answer tokens
     assistant_masks = [0] * len_prompt_ids + [1] * (len(input_ids) - len_prompt_ids)
@@ -162,6 +169,8 @@ def format_prompt_completion(
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
         seq_length=seq_length,
+        truncation=truncation,
+        padding=padding,
     )
 
 
@@ -171,6 +180,8 @@ def format_chat_template(
     eos_token_id: int,
     pad_token_id: int,
     seq_length: Optional[int] = None,
+    padding: Union[str, bool] = "do_not_pad",
+    truncation: Union[str, bool] = "do_not_truncate",
     tools: Optional[List[Dict]] = None,
 ) -> Dict[str, List[int]]:
     """
@@ -199,6 +210,9 @@ def format_chat_template(
         tokenize=True,
         return_dict=True,
         return_assistant_tokens_mask=template_has_generation_kwd,
+        padding=padding,
+        truncation=truncation,
+        max_length=seq_length,
     )
 
     # Choose the last conversation as answer other history are context by finding the last masked token
@@ -220,4 +234,6 @@ def format_chat_template(
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
         seq_length=seq_length,
+        truncation=truncation,
+        padding=padding,
     )

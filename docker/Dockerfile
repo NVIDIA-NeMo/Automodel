@@ -60,15 +60,19 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
     git checkout FETCH_HEAD && \
     git submodule init && git submodule update && \
     pip install nvidia-mathdx==25.1.1 && \
-    env NVTE_CUDA_ARCHS="80;90;100;120" NVTE_BUILD_THREADS_PER_JOB=8 pip install --no-cache-dir --no-build-isolation -v .; \
+    env NVTE_CUDA_ARCHS="80;90;100;120" NVTE_BUILD_THREADS_PER_JOB=8 pip install --no-cache-dir --no-build-isolation -v . && \
+    rm -rf TransformerEngine; \
     fi
 
 FROM update_base_container AS automodel_dep
 
+# Install Grouped Gemm
+RUN pip install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
+
 # Install Deepep
 COPY docker/common/deepep.patch /opt/deepep.patch
 ARG INSTALL_DEEPEP=False
-ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
+ARG DEEPEP_COMMIT=ef73fd9a4c098e09929e48dfd696505ddc8e2043
 RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     git clone https://github.com/deepseek-ai/DeepEP.git && \
     cd DeepEP && \
@@ -76,24 +80,24 @@ RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     git fetch origin $DEEPEP_COMMIT && \
     git checkout FETCH_HEAD && \
     patch -p1 < /opt/deepep.patch && \
-    rm -rf /opt/deepep.patch; fi
+    pip install --no-cache-dir nvidia-nvshmem-cu13 && \
+    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install --no-cache-dir --no-build-isolation -v . && \
+    rm -rf /opt/deepep.patch && \
+    rm -rf DeepEP; \
+    fi
 
 FROM automodel_dep as automodel_final
 
 # Install Automodel
 ARG BASE_IMAGE=cuda
-ARG AUTOMODEL_INSTALL=dev
+ARG AUTOMODEL_INSTALL=vlm
 COPY . /opt/Automodel
 RUN cd /opt/Automodel && \
     if [ "$BASE_IMAGE" = "pytorch" ]; then \
         sed -i '/\[tool\.uv\]/r /opt/Automodel/docker/common/uv-pytorch.toml' pyproject.toml && \
         mv /opt/Automodel/docker/common/uv-pytorch.lock /opt/Automodel/uv.lock; \
     fi && \
-    uv sync --locked --extra $AUTOMODEL_INSTALL --all-groups && \
-    if [ "$INSTALL_DEEPEP" = "True" ]; then \
-        TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" \
-        uv add --no-build-isolation -v /opt/DeepEP; \
-    fi
+    uv sync --locked --extra $AUTOMODEL_INSTALL --all-groups
 
 COPY <<EOF /opt/venv/env.sh
 export UV_PROJECT_ENVIRONMENT=/opt/venv

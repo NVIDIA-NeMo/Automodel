@@ -175,3 +175,71 @@ class TestFromHF:
 
         assert "model.layers.0.mlp.experts.gate_up_proj_blocks" in out
         assert "model.layers.0.mlp.experts.gate_up_proj_scales" in out
+
+
+class TestConvertSingleTensorToHf:
+    def test_expert_tensor_conversion(self, adapter):
+        tensor = torch.randn(4, 64, 128)
+        fqn = "model.layers.0.mlp.experts.gate_and_up_projs"
+
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts') as mock_convert:
+            mock_convert.return_value = [
+                ("model.layers.0.mlp.experts.0.gate_proj.weight", torch.randn(64, 64)),
+                ("model.layers.0.mlp.experts.0.up_proj.weight", torch.randn(64, 64)),
+            ]
+
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor)
+
+            mock_convert.assert_called_once_with(fqn, tensor)
+            assert len(result) == 2
+            assert result[0][0] == "model.layers.0.mlp.experts.0.gate_proj.weight"
+            assert result[1][0] == "model.layers.0.mlp.experts.0.up_proj.weight"
+
+    def test_non_expert_tensor_conversion(self, adapter):
+        tensor = torch.randn(64, 64)
+        fqn = "model.layers.0.attention.weight"
+
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts') as mock_convert:
+            mock_convert.return_value = None
+
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor)
+
+            assert len(result) == 1
+            assert result[0][0] == fqn
+            assert torch.equal(result[0][1], tensor)
+
+    def test_exclude_key_regex(self, adapter):
+        tensor = torch.randn(64, 64)
+        fqn = "exclude_this.weight"
+
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor, exclude_key_regex=r"exclude.*")
+
+            assert len(result) == 0
+
+    def test_expert_tensor_with_exclude_regex(self, adapter):
+        tensor = torch.randn(4, 64, 128)
+        fqn = "model.layers.0.mlp.experts.gate_and_up_projs"
+
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts') as mock_convert:
+            mock_convert.return_value = [
+                ("model.layers.0.mlp.experts.0.gate_proj.weight", torch.randn(64, 64)),
+                ("exclude_me.weight", torch.randn(64, 64)),
+            ]
+
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor, exclude_key_regex=r"exclude.*")
+
+            assert len(result) == 1
+            assert result[0][0] == "model.layers.0.mlp.experts.0.gate_proj.weight"
+            assert "exclude_me.weight" not in [k for k, _ in result]
+
+    def test_preserves_tensor_identity_for_non_experts(self, adapter):
+        tensor = torch.randn(64, 64)
+        fqn = "model.layers.0.self_attn.q_proj.weight"
+
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor)
+
+            assert len(result) == 1
+            assert result[0][0] == fqn
+            assert result[0][1] is tensor

@@ -1783,7 +1783,7 @@ def test_hf_peft_checkpoint(use_triton=False):
     """
     expected_model_keys, expected_optim_keys = get_test_hf_peft_checkpoint_expected_keys()
     expected_config = {
-        "base_model_name_or_path": "/home/TestData/akoumparouli/hf_mixtral_2l/",
+        "base_model_name_or_path": f"{os.environ['TEST_DATA_DIR']}/hf_mixtral_2l/",
         "bias": "none",
         "lora_alpha": 32,
         "peft_type": "LORA",
@@ -1962,7 +1962,7 @@ def test_hf_peft_checkpoint(use_triton=False):
     _compare_dicts(expected_automodel_peft_config, restored_automodel_peft_config)
 
     # check if new model and current model give the same CE loss
-    val_batch = next(iter(trainer.val_dataloader))
+    val_batch = next(iter(trainer.val_dataloaders['default']))
     restored_model = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     restored_model.setup()
     restored_model = restored_model.model_parts[0]

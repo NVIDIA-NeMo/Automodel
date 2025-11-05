@@ -104,8 +104,8 @@ class Qwen3MoeModel(nn.Module):
             n_routed_experts=getattr(config, "num_experts", 0),
             n_shared_experts=0,
             n_activated_experts=getattr(config, "num_experts_per_tok", 1),
-            n_expert_groups=1,
-            n_limited_groups=1,
+            n_expert_groups=0,
+            n_limited_groups=0,
             train_gate=True,
             gate_bias_update_factor=0.0,
             score_func="softmax",  # Qwen3 uses softmax topk routing

@@ -830,6 +830,11 @@ def test_hf_sharded_checkpoint():
         "rng/rng_dp_rank_1.pt",
         "model/shard-00001-model-00001-of-00001.safetensors",
         "model/shard-00002-model-00001-of-00001.safetensors",
+        "model/.hf_metadata/config.json",
+        "model/.hf_metadata/tokenizer_config.json",
+        "model/.hf_metadata/tokenizer.json",
+        "model/.hf_metadata/special_tokens_map.json",
+        "model/.hf_metadata/generation_config.json",
         "optim/__0_0.distcp",
         "optim/__1_0.distcp",
         "optim/.metadata",
@@ -880,7 +885,7 @@ def test_hf_sharded_checkpoint():
     )
 
     # check if new model and current model give the same CE loss
-    val_batch = next(iter(trainer.val_dataloader))
+    val_batch = next(iter(trainer.val_dataloaders['default']))
     restored_model = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     restored_model.setup()
     source_model_loss = get_validation_loss(trainer.model_parts, val_batch, trainer.loss_fn, trainer.dist_env.device, trainer.pp_enabled, trainer.pp)

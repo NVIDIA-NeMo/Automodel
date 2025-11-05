@@ -19,7 +19,7 @@ import torch
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
 
-def batchify(tensor):
+def batchify(tensor, default_tensor_cls=torch.LongTensor):
     """
     Ensures that the input tensor has at least two dimensions by adding an extra batch dimension if necessary.
 
@@ -30,6 +30,8 @@ def batchify(tensor):
         torch.Tensor:  The tensor with an extra dimension added if it was originally 1-dimensional.
         Otherwise, the tensor is returned as-is.
     """
+    if not isinstance(tensor, torch.Tensor):
+        tensor = default_tensor_cls(tensor)
     if tensor.ndim == 1:
         return tensor.unsqueeze_(0)
     return tensor
@@ -96,10 +98,12 @@ def get_pad_token_from_key(val: str, pad_token_ids: Optional[dict[str, int]] = N
         "labels": -100,
         "attention_mask": 0,
         "loss_mask": 0,
+        "input_ids": 0,
     }
-    if pad_token_ids is not None and val in pad_token_ids:
-        return pad_token_ids[val]
-    return PAD_TOKEN_IDS.get(val, None)
+    if pad_token_ids is None:
+        pad_token_ids = {}
+    ans = pad_token_ids.get(val, PAD_TOKEN_IDS.get(val, None))
+    return ans
 
 
 def make_attention_mask_from_labels(ids: list[int], ignore_token: int = -100) -> list[int]:
@@ -425,7 +429,7 @@ class SFTSingleTurnPreprocessor:
         if not hasattr(self.tokenizer, "pad_token") and hasattr(self.tokenizer, "bos_token"):
             self.tokenizer.pad_token = self.tokenizer.bos_token
 
-        # 1. tokenise ----------------------------------------------------------------
+        # 1. tokenise
         tokenized = raw_dataset.map(
             lambda x: self._tokenize_function(x, dataset=ds),
             batched=True,
@@ -435,7 +439,7 @@ class SFTSingleTurnPreprocessor:
             desc="Running tokenizer on dataset",
         )
 
-        # 2. pad (optional) ----------------------------------------------------------
+        # 2. pad (optional)
         if self.pad_to_max_length:
             # 2a. compute global max len
             max_len = self._compute_dataset_max_len(tokenized)

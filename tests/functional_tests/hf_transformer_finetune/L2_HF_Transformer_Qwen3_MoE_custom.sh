@@ -25,13 +25,15 @@ examples/llm_finetune/finetune.py \
     --step_scheduler.global_batch_size 8 \
     --step_scheduler.local_batch_size 4 \
     --step_scheduler.val_every_steps 1 \
-    --dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
-    --validation_dataset.tokenizer.pretrained_model_name_or_path /home/TestData/akoumparouli/hf_mixtral_2l/ \
-    --dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
-    --validation_dataset.dataset_name /home/TestData/lite/hf_cache/squad/ \
+    --dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
+    --validation_dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
+    --dataset.dataset_name $HF_CACHE/squad/ \
+    --validation_dataset.dataset_name $HF_CACHE/squad/ \
     --dataset.limit_dataset_samples 1000 \
     --dataset.seq_length 512 \
+    --dataset.padding true \
     --validation_dataset.seq_length 512 \
+    --validation_dataset.padding true \
     --dataset.limit_dataset_samples 8 \
     --validation_dataset.limit_dataset_samples 8 \
     --model.is_meta_device true \

@@ -152,7 +152,7 @@ class Checkpointer:
             self._optim_ctx.process_group = torch.distributed.new_group(backend="gloo")
 
         self._addons = []
-        if self._should_write_consolidated():
+        if self._should_write_hf_metadata():
             self._addons.append(ConsolidatedHFAddon())
         if self.config.is_peft:
             self._addons.append(PeftAddon())
@@ -181,15 +181,23 @@ class Checkpointer:
         """
         # Create the model directories
         model_dir = os.path.join(weights_path, "model")
-        consolidated_dir = os.path.join(model_dir, "consolidated") if self._should_write_consolidated() else None
-        _ensure_dirs(model_dir, consolidated_dir)
+        consolidated_dir = (
+            os.path.join(model_dir, "consolidated") if self._should_write_consolidated_safetensors() else None
+        )
+        hf_metadata_dir = os.path.join(model_dir, ".hf_metadata") if self._should_write_hf_metadata() else None
+        _ensure_dirs(model_dir, consolidated_dir, hf_metadata_dir)
 
         # Because this call lies outside of the dcp save call, we need to consolidate on all ranks on the main process
         # of all ranks, which lies on the critical path. Therefore, we can only do this outside of async mode.
-        consolidate_on_all_ranks = self._should_write_consolidated() and not self.config.is_async
+        consolidate_on_all_ranks = self._should_write_consolidated_safetensors() and not self.config.is_async
 
         model_state = ModelState(model, self.config.is_peft)
         state_dict = model_state.state_dict()
+
+        # Convert to HF format if using custom model implementations
+        state_dict = _maybe_adapt_state_dict_to_hf(model_state.model[0], state_dict, quantization=False)
+        # Build the consolidated model.safetensors.index.json if needed
+        fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
 
         # Run pre-saves for addons e.g., PEFT or consolidated HF safetensors
         for addon in self._addons:
@@ -197,19 +205,19 @@ class Checkpointer:
                 model_state=model_state,
                 model_path=model_dir,
                 consolidated_path=consolidated_dir,
+                hf_metadata_dir=hf_metadata_dir,
                 tokenizer=tokenizer,
                 peft_config=peft_config,
+                fqn_to_file_index_mapping=fqn_to_file_index_mapping,
             )
-
-        # Convert to HF format if using custom model implementations
-        state_dict = _maybe_adapt_state_dict_to_hf(model_state.model[0], state_dict, quantization=False)
-        # Build the consolidated model.safetensors.index.json if needed
-        fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
 
         storage_writer = self._get_storage_writer(
             consolidated_dir, fqn_to_file_index_mapping, model_dir, consolidate_on_all_ranks
         )
         self._model_ctx.future = self._do_save(state_dict, model_dir, storage_writer)
+
+        for addon in self._addons:
+            addon.post_save(consolidated_path=consolidated_dir, hf_metadata_path=hf_metadata_dir)
 
         if consolidate_on_all_ranks:
             consolidate_safetensors_files_on_every_rank(
@@ -252,6 +260,7 @@ class Checkpointer:
         optimizer_state = OptimizerState(model, optimizer, scheduler)
         state_dict = optimizer_state.state_dict()
         self._do_load(state_dict, os.path.join(weights_path, "optim"))
+        optimizer_state.load_state_dict(state_dict)
 
     def load_model(
         self,
@@ -495,17 +504,19 @@ class Checkpointer:
             dcp.save(state_dict, checkpoint_id=path, storage_writer=storage_writer, planner=planner)
         return ret
 
-    def _should_write_consolidated(self) -> bool:
+    def _should_write_consolidated_safetensors(self) -> bool:
         """
-        Whether to emit consolidated HF artifacts along with sharded weights.
+        Whether to output consolidated HF weights along with sharded weights.
 
         Returns True only for non-PEFT safetensors when consolidation is enabled.
         """
-        return (
-            self.config.save_consolidated
-            and self.config.model_save_format == SerializationFormat.SAFETENSORS
-            and not self.config.is_peft
-        )
+        return self.config.save_consolidated and self._should_write_hf_metadata()
+
+    def _should_write_hf_metadata(self) -> bool:
+        """
+        Whether to write the HF artifacts.
+        """
+        return self.config.model_save_format == SerializationFormat.SAFETENSORS and not self.config.is_peft
 
     def _maybe_build_consolidated_index(
         self, model_state: ModelState, state_dict: dict[str, torch.Tensor]
@@ -523,7 +534,7 @@ class Checkpointer:
         Returns:
             Mapping from FQN to shard index, or None when not consolidating.
         """
-        if not self._should_write_consolidated():
+        if not self._should_write_hf_metadata():
             return None
         model = model_state.model[0]
         # we first need to find the FQN -> .safetensors mapping
@@ -540,8 +551,10 @@ class Checkpointer:
             # however, HF initializes buffers with persistent=False, so we need to make sure these
             # buffer keys are not saved during checkpointing
             keys_to_remove = list(set(fqn_to_file_index_mapping.keys()) - set(self.config.model_state_dict_keys))
+            if model_state.is_tied_lm_head:
+                keys_to_remove.append(model_state.lm_head_param_name)
             for key in keys_to_remove:
-                fqn_to_file_index_mapping.pop(key)
+                fqn_to_file_index_mapping.pop(key, None)
         else:
             fqn_to_file_index_mapping = {k: 1 for k in state_dict.keys()}
 

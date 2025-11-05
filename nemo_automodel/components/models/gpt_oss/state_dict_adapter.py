@@ -70,6 +70,8 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
             "mlp.experts.gate_up_proj": "mlp.experts.gate_and_up_projs",
             "mlp.experts.down_proj": "mlp.experts.down_projs",
         }
+        if self.backend.attn == "te":
+            self.hf_to_internal_map["self_attn.sinks"] = "self_attn.attn_module.softmax_offset"
 
         # Reverse mapping for to_hf conversion
         self.internal_to_hf_map = {v: k for k, v in self.hf_to_internal_map.items() if v is not None}
@@ -210,15 +212,14 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
     ) -> dict[str, Any]:
         """Convert from native model state dict to HuggingFace format."""
-        hf_state_dict = dict(state_dict)
-        hf_state_dict = self._apply_key_mapping(hf_state_dict, self.internal_to_hf_map)
+        hf_state_dict = {}
+        for fqn, tensor in state_dict.items():
+            converted_tensors = self.convert_single_tensor_to_hf(
+                fqn, tensor, exclude_key_regex=exclude_key_regex, quantization=quantization, **kwargs
+            )
+            for key, value in converted_tensors:
+                hf_state_dict[key] = value
 
-        # Apply exclude regex if provided
-        if exclude_key_regex:
-            hf_state_dict = {k: v for k, v in hf_state_dict.items() if not re.match(exclude_key_regex, k)}
-
-        if quantization:
-            hf_state_dict = self._add_quantization_block_scale_tensors(hf_state_dict)
         return hf_state_dict
 
     def from_hf(
@@ -242,3 +243,51 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         native_state_dict = self._apply_key_mapping(native_state_dict, self.hf_to_internal_map)
 
         return native_state_dict
+
+    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+        """Convert a single tensor from native format to HuggingFace format.
+
+        Args:
+            fqn: Fully qualified name of the tensor in native format
+            tensor: The tensor to convert
+            **kwargs: Additional arguments for conversion
+
+        Returns:
+            List of (fqn, tensor) tuples in HuggingFace format
+        """
+        quantization = kwargs.get("quantization", False)
+        exclude_key_regex = kwargs.get("exclude_key_regex", None)
+
+        hf_fqn = fqn
+        for pattern, replacement in self.internal_to_hf_map.items():
+            if fqn.endswith(pattern):
+                hf_fqn = fqn[: -len(pattern)] + replacement
+                break
+
+        if exclude_key_regex:
+            if re.match(exclude_key_regex, hf_fqn):
+                return []
+
+        if quantization:
+            if hf_fqn.endswith("gate_up_proj") or hf_fqn.endswith("down_proj"):
+                layer_name, projection_type = hf_fqn.rsplit(".", 1)
+                n_experts, _, dim = tensor.shape
+
+                if isinstance(tensor, torch.distributed.tensor.DTensor):
+                    placements, device_mesh = tensor.placements, tensor.device_mesh
+                    blocks_tensors = torch.distributed.tensor.ones(
+                        (n_experts, dim, 90, 16), placements=placements, device_mesh=device_mesh, dtype=torch.uint8
+                    )
+                    scales_tensors = torch.distributed.tensor.ones(
+                        (n_experts, dim, 90), placements=placements, device_mesh=device_mesh, dtype=torch.uint8
+                    )
+                else:
+                    blocks_tensors = torch.ones((n_experts, dim, 90, 16), dtype=torch.uint8)
+                    scales_tensors = torch.ones((n_experts, dim, 90), dtype=torch.uint8)
+
+                return [
+                    (f"{layer_name}.{projection_type}_blocks", blocks_tensors),
+                    (f"{layer_name}.{projection_type}_scales", scales_tensors),
+                ]
+
+        return [(hf_fqn, tensor)]

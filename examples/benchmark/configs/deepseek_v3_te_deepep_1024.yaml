@@ -16,11 +16,13 @@
 
 seed: 1234
 
-profiling:
+benchmark:
+  warmup_steps: 10
+  peak_tflops: 989  # H100 peak TFLOPs
   nsys_start: -1
   nsys_end: -1
-
-peak_tflops: 989  # H100 peak TFLOPs
+  nsys_ranks: []
+  num_nodes: 128
 
 step_scheduler:
   global_batch_size: 8192
@@ -29,7 +31,6 @@ step_scheduler:
   val_every_steps: 1000
   num_epochs: 1
   max_steps: 30
-  warmup_steps: 10
 
 dist_env:
   backend: nccl

@@ -7,7 +7,8 @@
 :hidden:
 repository-structure.md
 guides/installation.md
-environment/local-workstation.md
+launcher/local-workstation.md
+launcher/cluster.md
 ```
 
 <!--
@@ -30,6 +31,7 @@ guides/overview.md
 guides/llm/finetune.md
 guides/llm/mcore-pretraining.md
 guides/llm/pretraining.md
+guides/llm/sequence-classification.md
 guides/omni/gemma3-3n.md
 ```
 
