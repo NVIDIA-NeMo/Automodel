@@ -50,6 +50,7 @@ from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricLoggerDist, MetricsSample
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
@@ -62,7 +63,7 @@ from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
     compile_model,
 )
-from nemo_automodel.components.utils.model_utils import apply_parameter_freezing, print_trainable_parameters
+from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep, apply_parameter_freezing, print_trainable_parameters
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
@@ -105,26 +106,6 @@ def _freeze_model(model: nn.Module, cfg_freeze: Optional[Dict[str, Any]] = None,
                 m.weight.requires_grad = False
     return model
 
-
-def _build_optimizer(model: nn.Module, cfg_opt: Dict[str, Any], tp_size: int):
-    """
-    Build the optimizer.
-
-    Args:
-        model: The model to build the optimizer for.
-        cfg_opt: The configuration for the optimizer.
-        tp_size: The tensor parallel size.
-
-    Returns:
-        torch.optim.Optimizer: The optimizer.
-    """
-    trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
-    assert len(trainable_params) > 0, "trainable_params cannot be empty"
-    if tp_size > 1 and cfg_opt.get("foreach", False):
-        cfg_opt.foreach = False
-    return cfg_opt.instantiate(params=trainable_params)
-
-
 def build_model_and_optimizer(
     device,
     cfg_model,
@@ -135,9 +116,11 @@ def build_model_and_optimizer(
     seed,
     checkpointer: Checkpointer,
     tp_size=1,
+    cp_size=1,
     freeze_embeddings=True,
     cfg_fp8=None,
     cfg_compile=None,
+    loss_fn=None,
     parallelize_fn=None,
     load_base_model=True,
 ) -> tuple[nn.Module, list[str], "Optimizer"]:  # noqa: F821
@@ -162,6 +145,7 @@ def build_model_and_optimizer(
     Returns:
         The instantiated model on the specified device, the state dict keys before any parallelization, and the optimizer.
     """
+    is_hf_model = cfg_model.get("pretrained_model_name_or_path", None) is not None
     is_meta_device = False
     if hasattr(cfg_model, "is_meta_device"):
         is_meta_device = cfg_model.is_meta_device
@@ -175,10 +159,21 @@ def build_model_and_optimizer(
 
         # Instantiate the model in meta device to avoid OOM
         with init_ctx:
+            if is_hf_model and (tp_size > 1 or cp_size > 1):
+                logger.info("Disabling Liger kernel with TP ({}) or CP ({})".format(tp_size, cp_size))
+                kwargs["use_liger_kernel"] = False
             model = cfg_model.instantiate(**kwargs)
             model = _freeze_model(model, cfg_freeze, freeze_embeddings)
+
+            if cp_size > 1 and is_hf_model and hasattr(model, "_supports_sdpa"):
+                if model._supports_sdpa is False:
+                    raise ValueError("Model does not support SDPA required for context parallelism")
+            
             # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
             if cfg_peft is not None:
+                if tp_size > 1:
+                    logger.info("Disabling Triton with TP ({})".format(tp_size))
+                    cfg_peft.use_triton = False
                 apply_lora_to_linear_modules(model, cfg_peft)
 
             if cfg_fp8 is not None:
@@ -189,6 +184,10 @@ def build_model_and_optimizer(
 
         # hold a copy of the model state dict keys before any parallelization
         state_dict_keys = model.state_dict().keys()
+
+        if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
+            logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
+            loss_fn = MaskedCrossEntropy()
 
         load_weights = False
         if parallelize_fn is not None and get_world_size_safe() > 1:
@@ -234,12 +233,19 @@ def build_model_and_optimizer(
             )
 
         model = model.to(device)
-        optimizer = _build_optimizer(model, cfg_opt, tp_size)
 
         # Apply torch.compile if configured
         if cfg_compile is not None:
             compile_config = build_compile_config(cfg_compile)
             model = compile_model(model, compile_config)
+        
+        if tp_size > 1:
+            # TP does not support foreach
+            cfg_opt.foreach = False
+        
+        trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
+        assert len(trainable_params) > 0, "trainable_params cannot be empty"
+        optimizer = cfg_opt.instantiate(params=trainable_params)
 
         return model, state_dict_keys, optimizer
 
@@ -498,9 +504,6 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
     loss_fn_kwargs = {"num_label_tokens": kwargs.pop("num_label_tokens", None)}
     if isinstance(loss_fn, FusedLinearCrossEntropy):
         model = kwargs.pop("model")
-
-        # Replace labels with -100 where mask is 0 (don't compute loss for these positions)
-        # -100 is the default ignore index in PyTorch's cross entropy loss
         labels = kwargs.pop("labels")
 
         # find the lm_head in the model
@@ -590,7 +593,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.peft_config = None
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
-
+        self.loss_fn = build_loss_fn(self.cfg.loss_fn)
         parallelize_fn = getattr(self.cfg.get("parallelizer", None), "instantiate", None)
 
         # Build checkpoint config
@@ -619,14 +622,17 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.model_wrapper,
             seed=self.cfg.get("seed", 42),
             tp_size=self.cfg.get("distributed.tp_size", 1),
+            cp_size=self.cfg.get("distributed.cp_size", 1),
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
+            loss_fn=self.loss_fn,
             parallelize_fn=parallelize_fn,
+            load_base_model=self.cfg.get("checkpoint.load_base_model", True),
             checkpointer=self.checkpointer,
         )
         self.checkpointer.config.model_state_dict_keys = model_state_dict_keys
 
-        self.loss_fn = build_loss_fn(self.cfg.loss_fn)
+        
         self.dataloader, self.processor = build_dataloader(
             self.cfg.dataset,
             self.cfg.dataloader,
@@ -649,10 +655,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 seed=self.cfg.get("seed", 42),
                 local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
             )
-
-        # Initialize metrics required for calculating loss
-        self.total_local_num_loss_tokens = torch.zeros([], dtype=torch.int, device="cuda")
-        self.forward_data_store = []
 
         # Scheduler
         self.step_scheduler = build_step_scheduler(
@@ -693,10 +695,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         """
         self.model.train()
         self.timestamp = time.perf_counter()
-        self.num_nonpad_tokens = 0
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
-            self.model.train()
             for batch_idx, batches in enumerate(self.step_scheduler):
                 log_data = self._run_train_optim_step(batches, 1.0)
                 if self.lr_scheduler is not None:
@@ -818,7 +818,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         time_delta = t - self.timestamp
         self.timestamp = t
         tps = num_tokens_in_batch / time_delta
-        reporting_loss = torch.sum(torch.stack(loss_buffer)).item()
+        reporting_loss = torch.sum(torch.stack(loss_buffer))
+        reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True).item()
         # fix reporting_loss, tps across ranks
 
         return MetricsSample(
@@ -848,7 +849,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             for batch in val_dataloader:
                 batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
                 labels = batch.pop("labels")
-                num_label_tokens = (labels != -100).sum()
+                num_label_tokens = (labels != -100).sum().item()
 
                 if (
                     self.device_mesh
@@ -867,20 +868,23 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         out = self.model(**batch)
                     local_loss = calculate_loss(
                         self.loss_fn,
-                        logits=out.logits,
+                        logits=getattr(out, "logits", out),
                         labels=labels,
                         model=self.model,
-                        hidden_states=out.hidden_states[-1] if "hidden_states" in out else None,
+                        hidden_states=out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None else None,
                         num_label_tokens=num_label_tokens,
                     )
                     total_num_label_tokens += num_label_tokens
 
-                total_loss += local_loss.item()
+                total_loss += local_loss.item() * num_label_tokens
+                total_tokens += num_label_tokens
 
         # Aggregate across ranks if distributed is initialized
         total_loss = self._dp_allreduce(torch.FloatTensor([total_loss]), include_cp=True).item()
         total_tokens = self._dp_allreduce(torch.LongTensor([total_tokens]), include_cp=True).item()
-        total_num_label_tokens = self._dp_allreduce(torch.tensor(total_num_label_tokens, dtype=torch.long)).item()
+        total_num_label_tokens = (
+            self._dp_allreduce(torch.LongTensor([total_num_label_tokens])).item()
+        )
 
         val_loss = total_loss / max(total_tokens, 1e-8)
 
