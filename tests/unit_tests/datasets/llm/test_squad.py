@@ -157,7 +157,7 @@ def test_sequence_padding():
     """
     tok = DummyTokenizer()
     pad_len = 32
-    ds = make_squad_dataset(tok, seq_length=pad_len)
+    ds = make_squad_dataset(tok, seq_length=pad_len, padding="max_length")
     for row in ds:
         for key, val in row.items():
             if key == "___PAD_TOKEN_IDS___":
