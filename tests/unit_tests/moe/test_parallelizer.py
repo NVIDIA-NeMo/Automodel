@@ -767,3 +767,89 @@ def test_parallelize_model_passes_lm_head_precision_to_apply_fsdp(monkeypatch):
     apply_fsdp_mock.assert_called_once()
     _, kwargs = apply_fsdp_mock.call_args
     assert kwargs.get("lm_head_precision") == torch_stub.float32
+
+
+def test_apply_fsdp_with_lm_head_precision_string_input(monkeypatch):
+    """Test that apply_fsdp accepts string input for lm_head_precision and converts to torch.dtype."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    fully_shard_mock = MagicMock()
+    mp_policy_mock = MagicMock(return_value="MP_POLICY")
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", mp_policy_mock)
+
+    torch_stub = sys.modules["torch"]
+
+    # Mock dtype_from_str to convert string to torch.float32
+    def mock_dtype_from_str(val, default=None):
+        if val == "float32" or val == "torch.float32":
+            return torch_stub.float32
+        return default
+
+    monkeypatch.setattr(P, "dtype_from_str", mock_dtype_from_str)
+
+    block = DummyBlock(mlp=DummyMoE())
+    lm = object()
+    model = DummyModel([block], lm_head=lm)
+    fsdp_mesh = object()
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=fsdp_mesh,
+        pp_enabled=False,
+        ep_enabled=False,
+        ep_shard_enabled=False,
+        lm_head_precision="float32",
+    )
+
+    # Find the lm_head call
+    lm_call = _find_call_by_first_arg(fully_shard_mock, lm)
+    assert lm_call is not None
+
+    # Verify custom MixedPrecisionPolicy was created with fp32 for all dtypes
+    assert mp_policy_mock.call_count >= 2  # default + lm_head
+    # Find the call for lm_head's custom policy
+    fp32_policy_calls = [
+        call for call in mp_policy_mock.call_args_list
+        if call[1].get("param_dtype") == torch_stub.float32
+        and call[1].get("reduce_dtype") == torch_stub.float32
+        and call[1].get("output_dtype") == torch_stub.float32
+    ]
+    assert len(fp32_policy_calls) == 1
+
+
+def test_parallelize_model_with_lm_head_precision_string_input(monkeypatch):
+    """Test that parallelize_model accepts string input for lm_head_precision."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    apply_fsdp_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_fsdp", apply_fsdp_mock)
+    monkeypatch.setattr(P, "apply_ep", MagicMock())
+    monkeypatch.setattr(P, "apply_ac", MagicMock())
+
+    world_mesh = FakeWorldMesh({("dp",): 2}, mesh_dim_names=["dp"])
+    moe_mesh = None
+
+    class Inner:
+        def __init__(self):
+            self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+
+    class Outer:
+        def __init__(self):
+            self.model = Inner()
+
+    model = Outer()
+
+    P.parallelize_model(
+        model=model,
+        world_mesh=world_mesh,
+        moe_mesh=moe_mesh,
+        pp_enabled=False,
+        dp_axis_names=("dp",),
+        lm_head_precision="float32",
+    )
+
+    # Verify apply_fsdp was called with lm_head_precision as a string
+    apply_fsdp_mock.assert_called_once()
+    _, kwargs = apply_fsdp_mock.call_args
+    assert kwargs.get("lm_head_precision") == "float32"

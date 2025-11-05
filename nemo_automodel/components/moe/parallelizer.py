@@ -34,7 +34,7 @@ from nemo_automodel.components.moe.layers import (
     GroupedExpertsDeepEP,
     MoE,
 )
-from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
 _CP_STREAM = None
@@ -130,9 +130,11 @@ def apply_fsdp(
     mp_policy: MixedPrecisionPolicy | None = None,
     offload_policy: OffloadPolicy | None = None,
     reshard_after_forward: bool = False,
-    backend_config: BackendConfig | None = None,
-    lm_head_precision: torch.dtype | None = None,
+    lm_head_precision: str | torch.dtype | None = None,
 ):
+    if isinstance(lm_head_precision, str):
+        lm_head_precision = dtype_from_str(lm_head_precision, default=None)
+
     if mp_policy is None:
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16, reduce_dtype=torch.float32, output_dtype=torch.bfloat16
@@ -232,8 +234,7 @@ def parallelize_model(
     ep_shard_axis_names: tuple[str, ...] | None = None,
     activation_checkpointing: bool = False,
     reshard_after_forward: bool = False,
-    backend_config: BackendConfig | None = None,
-    lm_head_precision: torch.dtype | None = None,
+    lm_head_precision: str | torch.dtype | None = None,
 ):
     assert tp_axis_name is None or world_mesh[tp_axis_name].size() == 1, (
         "Tensor parallelism not supported for custom MoE models"
@@ -271,6 +272,5 @@ def parallelize_model(
             ep_shard_enabled=ep_shard_mesh is not None and ep_shard_mesh.size() > 1,
             ep_shard_mesh=ep_shard_mesh,
             reshard_after_forward=reshard_after_forward,
-            backend_config=backend_config,
             lm_head_precision=lm_head_precision,
         )
