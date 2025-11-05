@@ -100,6 +100,39 @@ class DummyDefaultProcessor:
         return {"input_ids": input_ids, "pixel_values": pixel_values}
 
 
+class DummyQwen3OmniProcessor:
+    """
+    Mimics the public API used by qwen3_omni_collate_fn:
+      • apply_chat_template(add_generation_prompt=False, tokenize=False)
+      • __call__(text, return_tensors="pt", padding=True, optional multimodal kwargs)
+    """
+
+    def __init__(self):
+        self.tokenizer = DummyTokenizer(pad_token_id=0)
+        self.call_kwargs_list = []
+
+    def apply_chat_template(
+        self, conversation, *, add_generation_prompt: bool, tokenize: bool, **kwargs
+    ):
+        assert add_generation_prompt is False
+        assert tokenize is False
+        # Produce deterministic string based on user content for observability
+        user_content = conversation[0]["content"]
+        return f"chat:{user_content}"
+
+    def __call__(self, *, text, return_tensors, padding, **kwargs):
+        assert return_tensors == "pt"
+        assert padding is True
+        self.call_kwargs_list.append(dict(kwargs))
+
+        bs = len(text)
+        # Deterministic sequence containing SKIP_TOKEN and a start marker (100)
+        seq = torch.tensor([5, 100, SKIP_TOKEN, 7, 8])
+        input_ids = seq.unsqueeze(0).repeat(bs, 1)
+
+        return {"input_ids": input_ids}
+
+
 @pytest.fixture()
 def collate_mod():
     """
@@ -198,10 +231,11 @@ def test_default_collate_happy_path(collate_mod, patch_skipped, monkeypatch):
     assert torch.all(batch["labels"][:, 1] == -100)
 
 
-@pytest.mark.parametrize("fn_name", ["qwen2_5_collate_fn", "default_collate_fn"])
+@pytest.mark.parametrize("fn_name", ["qwen2_5_collate_fn", "default_collate_fn", "qwen3_omni_collate_fn"])
 def test_import_error_when_qwen_utils_missing(collate_mod, fn_name, monkeypatch):
     # Simulate missing qwen_vl_utils
     monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", False, raising=True)
+    monkeypatch.setattr(collate_mod, "HAVE_QWEN_OMNI_UTILS", False, raising=True)
     func = getattr(collate_mod, fn_name)
 
     with pytest.raises(ImportError):
@@ -420,6 +454,85 @@ class TestCollateFunctionIntegration:
         )
 
         assert torch.equal(result, expected)
+
+    def test_qwen3_omni_collate_fn_modalities_and_masks(self, collate_mod, patch_skipped, monkeypatch):
+        monkeypatch.setattr(collate_mod, "HAVE_QWEN_OMNI_UTILS", True, raising=True)
+
+        examples = [
+            {
+                "conversation": [
+                    {"role": "user", "content": "user-0"},
+                    {"role": "assistant", "content": "assistant-0"},
+                ]
+            },
+            {
+                "conversation": [
+                    {"role": "user", "content": "user-1"},
+                    {"role": "assistant", "content": "assistant-1"},
+                ]
+            },
+        ]
+
+        call_mode = {"returns_data": True}
+        call_records = []
+
+        def _fake_process_mm_info(conversation, use_audio_in_video):
+            call_records.append(use_audio_in_video)
+            if call_mode["returns_data"]:
+                user_token = conversation[0]["content"]
+                return (
+                    [f"{user_token}_audio"],
+                    [f"{user_token}_image"],
+                    [f"{user_token}_video"],
+                )
+            return ([], [], [])
+
+        monkeypatch.setattr(collate_mod, "process_mm_info", _fake_process_mm_info, raising=True)
+
+        processor_with_modalities = DummyQwen3OmniProcessor()
+        batch = collate_mod.qwen3_omni_collate_fn(
+            examples,
+            processor_with_modalities,
+            start_of_response_token="<start_of_turn>",
+            use_audio_in_video=True,
+        )
+
+        assert call_records == [True, True]
+        first_call_kwargs = processor_with_modalities.call_kwargs_list[-1]
+        assert set(first_call_kwargs.keys()) == {"audio", "images", "videos"}
+        assert first_call_kwargs["audio"] == [["user-0_audio"], ["user-1_audio"]]
+        assert first_call_kwargs["images"] == [["user-0_image"], ["user-1_image"]]
+        assert first_call_kwargs["videos"] == [["user-0_video"], ["user-1_video"]]
+
+        expected_labels = torch.tensor([100, -100, 7, 8, -100])
+        expected_loss_mask = torch.tensor([0, 1, 1, 1, 1], dtype=torch.float)
+
+        assert torch.equal(batch["labels"][0], expected_labels)
+        assert torch.equal(batch["loss_mask"][0], expected_loss_mask)
+        assert batch["loss_mask"].dtype == torch.float
+        assert batch["loss_mask"].shape == batch["input_ids"].shape
+        assert batch["loss_mask"].device == batch["input_ids"].device
+        assert batch["labels"].shape == batch["input_ids"].shape
+
+        call_mode["returns_data"] = False
+        call_records.clear()
+
+        processor_without_modalities = DummyQwen3OmniProcessor()
+        batch_empty = collate_mod.qwen3_omni_collate_fn(
+            examples,
+            processor_without_modalities,
+            start_of_response_token="<start_of_turn>",
+            use_audio_in_video=False,
+        )
+
+        assert call_records == [False, False]
+        second_call_kwargs = processor_without_modalities.call_kwargs_list[-1]
+        assert second_call_kwargs == {}
+
+        assert torch.equal(batch_empty["labels"][0], expected_labels)
+        assert torch.equal(batch_empty["loss_mask"][0], expected_loss_mask)
+        assert batch_empty["loss_mask"].shape == batch_empty["input_ids"].shape
+        assert batch_empty["loss_mask"].device == batch_empty["input_ids"].device
 
 
 class DummyPhi4Processor:
