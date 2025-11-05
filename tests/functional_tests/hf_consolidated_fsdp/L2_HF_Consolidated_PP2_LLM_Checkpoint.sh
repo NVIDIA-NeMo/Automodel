@@ -29,7 +29,9 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --validation_dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
     --dataset.dataset_name $HF_CACHE/squad/ \
     --validation_dataset.dataset_name $HF_CACHE/squad/ \
+    --validation_dataset.padding true \
     --dataset.limit_dataset_samples 1000 \
+    --dataset.padding true \
     --dataset.seq_length 512 \
     --validation_dataset.seq_length 512 \
     --step_scheduler.ckpt_every_steps 10 \

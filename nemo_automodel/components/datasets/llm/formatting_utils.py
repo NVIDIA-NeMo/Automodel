@@ -35,11 +35,11 @@ def _pad_to_seq_length(sample, pad_token_id, seq_length):
 def _add_pad_token(tokenizer):
     """Add pad token to tokenizer if not present."""
     pad_token_id = None
-    if not hasattr(tokenizer, "pad_token_id"):
+    if getattr(tokenizer, "pad_token_id", None) is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     else:
         pad_token_id = tokenizer.pad_token_id
-    if not hasattr(tokenizer, "pad_token") and hasattr(tokenizer, "eos_token"):
+    if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
         tokenizer.pad_token = tokenizer.eos_token
     return pad_token_id
 
@@ -66,7 +66,8 @@ def _package_tokenized_example(
     eos_token_id,
     pad_token_id,
     seq_length,
-    truncation=None,
+    truncation="do_not_truncate",
+    padding="do_not_pad",
 ):
     """
     Package a tokenized example with proper masking and padding.
@@ -79,6 +80,7 @@ def _package_tokenized_example(
         pad_token_id: The padding token id.
         seq_length: Optional sequence length for padding.
         truncation: Optional truncation strategy.
+        padding: Optional padding strategy.
     Returns:
         A dictionary with input_ids, labels, and attention_mask.
     """
@@ -103,7 +105,7 @@ def _package_tokenized_example(
         assert input_ids[-1] != eos_token_id, f"input_ids[-1]={input_ids[-1]} == eos_token_id={eos_token_id}"
     assert len(input_ids) == len(labels), f"len(input_ids)={len(input_ids)} != len(labels)={len(labels)}"
 
-    if isinstance(seq_length, int):
+    if isinstance(seq_length, int) and padding not in [None, "do_not_pad", False]:
         input_ids = _pad_to_seq_length(input_ids, pad_token_id, seq_length)
         labels = _pad_to_seq_length(labels, -100, seq_length)
 
@@ -168,6 +170,7 @@ def format_prompt_completion(
         pad_token_id=pad_token_id,
         seq_length=seq_length,
         truncation=truncation,
+        padding=padding,
     )
 
 
@@ -231,4 +234,6 @@ def format_chat_template(
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
         seq_length=seq_length,
+        truncation=truncation,
+        padding=padding,
     )

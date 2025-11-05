@@ -22,7 +22,9 @@ from nemo_automodel.components.datasets.llm.formatting_utils import (
 )
 
 
-def _formatting_prompts_func(example, tokenizer, eos_token_id, pad_token_id, seq_length=None):
+def _formatting_prompts_func(
+    example, tokenizer, eos_token_id, pad_token_id, seq_length=None, padding=None, truncation=None
+):
     question = example["question"]
     context = example["context"]
     answer = example["answers"]["text"][0].strip() if example["answers"]["text"] else ""
@@ -35,10 +37,14 @@ def _formatting_prompts_func(example, tokenizer, eos_token_id, pad_token_id, seq
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
         seq_length=seq_length,
+        padding=padding,
+        truncation=truncation,
     )
 
 
-def _formatting_prompts_func_with_chat_template(example, tokenizer, eos_token_id, pad_token_id, seq_length=None):
+def _formatting_prompts_func_with_chat_template(
+    example, tokenizer, eos_token_id, pad_token_id, seq_length=None, padding=None, truncation=None
+):
     context = example.get("context", None) or ""
     question = example.get("question", None) or ""
     answer = example["answers"]["text"][0].strip()
@@ -54,6 +60,8 @@ def _formatting_prompts_func_with_chat_template(example, tokenizer, eos_token_id
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
         seq_length=seq_length,
+        padding=padding,
+        truncation=truncation,
     )
 
 
@@ -64,6 +72,8 @@ def make_squad_dataset(
     fp8=False,
     split="train",
     dataset_name="squad",
+    padding=False,
+    truncation=False,
 ):
     """
     Load and preprocess a SQuAD-style QA dataset for model fine-tuning.
@@ -88,6 +98,8 @@ def make_squad_dataset(
             'validation').
         dataset_name (str): Identifier for the Hugging Face dataset
             (default "rajpurkar/squad").
+        padding (Optional[str|bool]): Optional padding strategy.
+        truncation (Optional[str|bool]): Optional truncation strategy.
 
     Returns:
         A Hugginggth Face Dataset where each example is a dict with keys:
@@ -112,10 +124,12 @@ def make_squad_dataset(
     pad_token_id = _add_pad_token(tokenizer) or eos_token_id
 
     if chat_template is None:
-        fmt_fn = lambda x: _formatting_prompts_func(x, tokenizer, eos_token_id, pad_token_id, seq_length)
+        fmt_fn = lambda x: _formatting_prompts_func(
+            x, tokenizer, eos_token_id, pad_token_id, seq_length, padding, truncation
+        )
     else:
         fmt_fn = lambda x: _formatting_prompts_func_with_chat_template(
-            x, tokenizer, eos_token_id, pad_token_id, seq_length
+            x, tokenizer, eos_token_id, pad_token_id, seq_length, padding, truncation
         )  # noqa: E731
 
     # map the dataset
