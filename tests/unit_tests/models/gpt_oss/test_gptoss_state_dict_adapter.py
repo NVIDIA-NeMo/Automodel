@@ -242,11 +242,11 @@ class TestGPTOSSStateDictAdapter:
             "model.layers.0.mlp.gate.weight": torch.randn(3, 3),
         }
 
-        with patch.object(adapter, "_add_quantization_block_scale_tensors") as mock_add:
-            mock_add.return_value = {"quantized": torch.randn(1)}
+        with patch.object(adapter, "convert_single_tensor_to_hf") as mock_convert:
+            mock_convert.return_value = [("quantized", torch.randn(1))]
             out = adapter.to_hf(state_dict, quantization=True)
 
-        mock_add.assert_called_once()
+        mock_convert.assert_called_once()
         assert "quantized" in out
 
     def test_add_quantization_block_scale_tensors_creates_expected_keys(self):
@@ -673,6 +673,84 @@ class TestSingleGPUScenarios:
         assert d_scales.shape == (2, 256, 90)
         assert g_blocks.dtype == torch.uint8 and g_scales.dtype == torch.uint8
         assert d_blocks.dtype == torch.uint8 and d_scales.dtype == torch.uint8
+
+
+class TestConvertSingleTensorToHf:
+    def create_mock_config(self):
+        config = Mock()
+        config.num_layers = 2
+        config.hidden_size = 64
+        return config
+
+    def create_mock_moe_config(self):
+        moe_config = Mock()
+        moe_config.num_experts = 4
+        moe_config.n_routed_experts = 4
+        moe_config.moe_inter_dim = 64
+        return moe_config
+
+    def create_mock_backend_config(self):
+        backend = Mock()
+        backend.enable_deepep = False
+        return backend
+
+    def test_applies_key_mapping(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+        adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(64, 64)
+        fqn = "model.layers.0.mlp.gate.weight"
+
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor)
+
+        assert len(result) == 1
+        assert result[0][0] == "model.layers.0.mlp.router.weight"
+        assert torch.equal(result[0][1], tensor)
+
+    def test_exclude_key_regex(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+        adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(64, 64)
+        fqn = "exclude_this.weight"
+
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor, exclude_key_regex=r"exclude.*")
+
+        assert len(result) == 0
+
+    def test_quantization_for_expert_weights(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+        adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(4, 64, 128)
+        fqn = "model.layers.0.mlp.experts.gate_and_up_projs"
+
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
+
+        # Should create blocks and scales tensors
+        assert len(result) == 2
+        assert result[0][0].endswith("_blocks")
+        assert result[1][0].endswith("_scales")
+
+    def test_no_quantization_for_non_expert_weights(self):
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+        adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(64, 64)
+        fqn = "model.layers.0.self_attn.q_proj.weight"
+
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
+
+        assert len(result) == 1
+        assert result[0][0] == "model.layers.0.self_attn.q_proj.weight"
 
 
 class TestDTensorPaths:
