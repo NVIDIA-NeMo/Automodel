@@ -756,18 +756,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         raise ValueError(
                             "FusedLinearCrossEntropy requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
                         )
-                    logits = out["logits"]
-                    hidden_states = out["hidden_states"]
                 else:
                     out = self.model(**batch)
-                    hidden_states = None
 
                 local_loss = calculate_loss(
                     self.loss_fn,
                     logits=getattr(out, "logits", out),
                     labels=labels,
                     model=self.model,
-                    hidden_states=hidden_states[-1] if hidden_states is not None else None,
+                    hidden_states=out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None else None,
                     num_label_tokens=num_label_tokens,
                 )
                 loss_buffer.append(local_loss.clone().detach())
