@@ -69,14 +69,6 @@ freeze_config:
   freeze_vision_tower: false
   freeze_audio_tower: true
   freeze_language_model: false
-# autopipeline:
-#   _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
-#   pp_schedule: interleaved1f1b
-#   pp_microbatch_size: 8
-#   round_virtual_stages_to_pp_multiple: up
-#   scale_grads_in_schedule: false
-#   patch_inner_model: false
-#   patch_causal_lm_model: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
