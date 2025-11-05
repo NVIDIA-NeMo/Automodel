@@ -184,6 +184,17 @@ def _install_torch_and_layers_stubs(monkeypatch):
     # ops.aten.mm.default sentinel
     aten = types.SimpleNamespace(mm=types.SimpleNamespace(default=object()))
     torch_stub.ops = types.SimpleNamespace(aten=aten)
+
+    # dtype and device classes for type annotations
+    class dtype:
+        pass
+
+    class device:
+        pass
+
+    torch_stub.dtype = dtype
+    torch_stub.device = device
+
     # common dtypes referenced by code
     torch_stub.bfloat16 = object()
     torch_stub.float32 = object()
@@ -644,3 +655,115 @@ def test_parallelize_model_asserts_on_invalid_tp_cp_and_ep_divisibility(monkeypa
             ep_shard_axis_names=None,
             activation_checkpointing=False,
         )
+
+
+def test_apply_fsdp_with_lm_head_precision_fp32(monkeypatch):
+    """Test that apply_fsdp applies custom MixedPrecisionPolicy to lm_head when lm_head_precision is fp32."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    fully_shard_mock = MagicMock()
+    mp_policy_mock = MagicMock(return_value="MP_POLICY")
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", mp_policy_mock)
+
+    torch_stub = sys.modules["torch"]
+    block = DummyBlock(mlp=DummyMoE())
+    lm = object()
+    model = DummyModel([block], lm_head=lm)
+    fsdp_mesh = object()
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=fsdp_mesh,
+        pp_enabled=False,
+        ep_enabled=False,
+        ep_shard_enabled=False,
+        lm_head_precision=torch_stub.float32,
+    )
+
+    # Find the lm_head call
+    lm_call = _find_call_by_first_arg(fully_shard_mock, lm)
+    assert lm_call is not None
+    _, lm_kwargs = lm_call
+
+    # Verify custom MixedPrecisionPolicy was created with fp32 for all dtypes
+    assert mp_policy_mock.call_count >= 2  # default + lm_head
+    # Find the call for lm_head's custom policy
+    fp32_policy_calls = [
+        call for call in mp_policy_mock.call_args_list
+        if call[1].get("param_dtype") == torch_stub.float32
+        and call[1].get("reduce_dtype") == torch_stub.float32
+        and call[1].get("output_dtype") == torch_stub.float32
+    ]
+    assert len(fp32_policy_calls) == 1
+
+
+def test_apply_fsdp_without_lm_head_precision_uses_default_policy(monkeypatch):
+    """Test that apply_fsdp uses default MixedPrecisionPolicy for lm_head when lm_head_precision is None."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    fully_shard_mock = MagicMock()
+    mp_policy_mock = MagicMock(return_value="MP_POLICY")
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", mp_policy_mock)
+
+    block = DummyBlock(mlp=DummyMoE())
+    lm = object()
+    model = DummyModel([block], lm_head=lm)
+    fsdp_mesh = object()
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=fsdp_mesh,
+        pp_enabled=False,
+        ep_enabled=False,
+        ep_shard_enabled=False,
+        lm_head_precision=None,
+    )
+
+    # Find the lm_head call
+    lm_call = _find_call_by_first_arg(fully_shard_mock, lm)
+    assert lm_call is not None
+
+    # Should only have one MixedPrecisionPolicy call (the default one)
+    assert mp_policy_mock.call_count == 1
+
+
+def test_parallelize_model_passes_lm_head_precision_to_apply_fsdp(monkeypatch):
+    """Test that parallelize_model passes lm_head_precision to apply_fsdp."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    apply_fsdp_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_fsdp", apply_fsdp_mock)
+    monkeypatch.setattr(P, "apply_ep", MagicMock())
+    monkeypatch.setattr(P, "apply_ac", MagicMock())
+
+    world_mesh = FakeWorldMesh({("dp",): 2}, mesh_dim_names=["dp"])
+    moe_mesh = None
+
+    torch_stub = sys.modules["torch"]
+
+    class Inner:
+        def __init__(self):
+            self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+
+    class Outer:
+        def __init__(self):
+            self.model = Inner()
+
+    model = Outer()
+
+    P.parallelize_model(
+        model=model,
+        world_mesh=world_mesh,
+        moe_mesh=moe_mesh,
+        pp_enabled=False,
+        dp_axis_names=("dp",),
+        lm_head_precision=torch_stub.float32,
+    )
+
+    # Verify apply_fsdp was called with lm_head_precision
+    apply_fsdp_mock.assert_called_once()
+    _, kwargs = apply_fsdp_mock.call_args
+    assert kwargs.get("lm_head_precision") == torch_stub.float32

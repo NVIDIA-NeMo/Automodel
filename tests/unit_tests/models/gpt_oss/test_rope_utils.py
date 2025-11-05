@@ -152,7 +152,7 @@ class TestApplyRotaryEmb:
             x[..., rotary_dim:],
             rtol=0,
             atol=0,
-            msg="Pass-through dimensions should be exactly preserved"
+            msg="Pass-through dimensions should be exactly preserved",
         )
 
     def test_partial_rotary_different_factors(self):
@@ -173,6 +173,135 @@ class TestApplyRotaryEmb:
             assert result.shape == x.shape
             # Verify pass-through is preserved
             torch.testing.assert_close(result[..., rotary_dim:], x_pass)
+
+    def test_float32_computation_with_fp16_input(self):
+        """Test that computation happens in float32 even with fp16 input"""
+        batch_size = 2
+        seq_len = 4
+        num_heads = 8
+        head_dim = 64
+
+        # Create fp16 input
+        x_fp16 = torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=torch.float16)
+        cos = torch.randn(seq_len, head_dim // 2)
+        sin = torch.randn(seq_len, head_dim // 2)
+
+        # Apply rotary embedding
+        result = apply_rotary_emb(x_fp16, cos, sin)
+
+        # Output should be fp16
+        assert result.dtype == torch.float16
+
+        # Compare with fp32 computation for numerical accuracy
+        x_fp32 = x_fp16.to(torch.float32)
+        result_fp32 = apply_rotary_emb(x_fp32, cos, sin)
+
+        # The fp16 result should be close to the fp32 result when cast to fp32
+        torch.testing.assert_close(result.to(torch.float32), result_fp32, rtol=1e-3, atol=1e-3)
+
+    def test_float32_computation_with_bfloat16_input(self):
+        """Test that computation happens in float32 even with bfloat16 input"""
+        batch_size = 2
+        seq_len = 4
+        num_heads = 8
+        head_dim = 64
+
+        # Create bfloat16 input
+        x_bf16 = torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=torch.bfloat16)
+        cos = torch.randn(seq_len, head_dim // 2)
+        sin = torch.randn(seq_len, head_dim // 2)
+
+        # Apply rotary embedding
+        result = apply_rotary_emb(x_bf16, cos, sin)
+
+        # Output should be bfloat16
+        assert result.dtype == torch.bfloat16
+
+        # Compare with fp32 computation for numerical accuracy
+        x_fp32 = x_bf16.to(torch.float32)
+        result_fp32 = apply_rotary_emb(x_fp32, cos, sin)
+
+        # The bf16 result should be close to the fp32 result when cast to fp32
+        torch.testing.assert_close(result.to(torch.float32), result_fp32, rtol=1e-2, atol=1e-2)
+
+    def test_cos_sin_dtype_independence(self):
+        """Test that cos/sin dtype doesn't affect output dtype"""
+        batch_size = 2
+        seq_len = 4
+        num_heads = 8
+        head_dim = 64
+
+        x = torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=torch.float16)
+
+        # Test with different cos/sin dtypes
+        for cos_sin_dtype in [torch.float32, torch.float16, torch.bfloat16]:
+            cos = torch.randn(seq_len, head_dim // 2, dtype=cos_sin_dtype)
+            sin = torch.randn(seq_len, head_dim // 2, dtype=cos_sin_dtype)
+
+            result = apply_rotary_emb(x, cos, sin)
+
+            # Output dtype should match input x dtype, not cos/sin dtype
+            assert result.dtype == x.dtype
+
+    def test_partial_rotary_float32_computation_with_fp16(self):
+        """Test that partial rotary also uses float32 computation with fp16 input"""
+        batch_size = 2
+        seq_len = 4
+        num_heads = 8
+        head_dim = 64
+        rotary_dim = 32  # Only rotate half the dimensions
+
+        # Create fp16 input
+        x_fp16 = torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=torch.float16)
+        cos = torch.randn(seq_len, rotary_dim // 2)
+        sin = torch.randn(seq_len, rotary_dim // 2)
+
+        # Store the pass-through part
+        x_pass_original = x_fp16[..., rotary_dim:].clone()
+
+        # Apply rotary embedding
+        result = apply_rotary_emb(x_fp16, cos, sin)
+
+        # Output should be fp16
+        assert result.dtype == torch.float16
+
+        # Pass-through dimensions should be exactly preserved (no dtype conversion artifacts)
+        torch.testing.assert_close(result[..., rotary_dim:], x_pass_original, rtol=0, atol=0)
+
+        # Compare with fp32 computation
+        x_fp32 = x_fp16.to(torch.float32)
+        result_fp32 = apply_rotary_emb(x_fp32, cos, sin)
+
+        # The rotated part should be close to fp32 computation
+        torch.testing.assert_close(
+            result[..., :rotary_dim].to(torch.float32), result_fp32[..., :rotary_dim], rtol=1e-3, atol=1e-3
+        )
+
+    def test_numerical_stability_with_mixed_dtypes(self):
+        """Test numerical stability when x, cos, sin have different dtypes"""
+        batch_size = 2
+        seq_len = 4
+        num_heads = 8
+        head_dim = 64
+
+        # Test various dtype combinations
+        dtype_combinations = [
+            (torch.float16, torch.float32),
+            (torch.bfloat16, torch.float32),
+            (torch.float32, torch.float16),
+        ]
+
+        for x_dtype, cos_sin_dtype in dtype_combinations:
+            x = torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=x_dtype)
+            cos = torch.randn(seq_len, head_dim // 2, dtype=cos_sin_dtype)
+            sin = torch.randn(seq_len, head_dim // 2, dtype=cos_sin_dtype)
+
+            # Should not raise any errors
+            result = apply_rotary_emb(x, cos, sin)
+
+            # Output should match input x dtype
+            assert result.dtype == x_dtype
+            assert result.shape == x.shape
 
 
 class TestRotaryEmbedding:
@@ -536,11 +665,13 @@ class TestPositionIdsToFreqsCis:
             dtype=torch.float32,
         )
 
-        position_ids = torch.tensor([
-            [0, 1, 2, 3],      # Sequential
-            [0, 0, 1, 1],      # Repeated
-            [10, 20, 30, 40],  # Large gaps
-        ])
+        position_ids = torch.tensor(
+            [
+                [0, 1, 2, 3],  # Sequential
+                [0, 0, 1, 1],  # Repeated
+                [10, 20, 30, 40],  # Large gaps
+            ]
+        )
 
         freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="bshd")
 
@@ -601,10 +732,7 @@ class TestPositionIdsToFreqsCisWithContextParallel:
             if len(indices) > 1:
                 # All tokens at this position should have identical freqs_cis
                 for i in range(1, len(indices)):
-                    torch.testing.assert_close(
-                        freqs_cis_rank[indices[0]],
-                        freqs_cis_rank[indices[i]]
-                    )
+                    torch.testing.assert_close(freqs_cis_rank[indices[0]], freqs_cis_rank[indices[i]])
 
     def test_freqs_cis_cp_with_variable_sequence_lengths(self):
         """Test freqs_cis with variable-length sequences and CP splitting"""
@@ -697,7 +825,7 @@ class TestIntegration:
         # Step 2: Extract cos and sin from freqs_cis
         # freqs_cis contains concatenated cos and sin
         cos = freqs_cis[..., :32]  # First half is cos
-        sin = freqs_cis[..., 32:]   # Second half is sin
+        sin = freqs_cis[..., 32:]  # Second half is sin
 
         # Step 3: Apply rotary embeddings
         x = torch.randn(batch_size, seq_len, num_heads, 64)

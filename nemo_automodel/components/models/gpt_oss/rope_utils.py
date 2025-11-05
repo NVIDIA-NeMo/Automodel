@@ -33,9 +33,10 @@ def apply_rotary_emb(
         cos: Cosine tensor (..., rotary_dim // 2)
         sin: Sine tensor (..., rotary_dim // 2)
     """
-    cos = cos.unsqueeze(-2).to(x.dtype)
-    sin = sin.unsqueeze(-2).to(x.dtype)
-
+    cos = cos.unsqueeze(-2)
+    sin = sin.unsqueeze(-2)
+    dtype = x.dtype
+    x = x.to(torch.float32)
     # Handle partial rotary embeddings
     # cos/sin have dimension rotary_dim//2, so full rotary_dim is cos.shape[-1] * 2
     rotary_dim = cos.shape[-1] * 2
@@ -45,13 +46,13 @@ def apply_rotary_emb(
         x1, x2 = torch.chunk(x_rot, 2, dim=-1)
         o1 = x1 * cos - x2 * sin
         o2 = x2 * cos + x1 * sin
-        return torch.cat((o1, o2, x_pass), dim=-1)
+        return torch.cat((o1, o2, x_pass), dim=-1).to(dtype)
     else:
         # Standard full rotary embeddings
         x1, x2 = torch.chunk(x, 2, dim=-1)
         o1 = x1 * cos - x2 * sin
         o2 = x2 * cos + x1 * sin
-        return torch.cat((o1, o2), dim=-1)
+        return torch.cat((o1, o2), dim=-1).to(dtype)
 
 
 class RotaryEmbedding(torch.nn.Module):
