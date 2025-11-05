@@ -23,24 +23,28 @@ from nemo_automodel.components.models.llama import build_llama_model
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
 
+# PRETRAINED_MODEL_NAME_OR_PATH = "meta-llama/Llama-3.2-1B"
+PRETRAINED_MODEL_NAME_OR_PATH = "/home/TestData/automodel/hf_llama3_2_1b_2l/"
+
+
 class TestLlamaModel:
     def test_model_matches_hf(self):
         llama_model_hf = (
             AutoModelForCausalLM.from_pretrained(
-                "meta-llama/Llama-3.2-1B", attn_implementation="eager", dtype=torch.bfloat16
+                PRETRAINED_MODEL_NAME_OR_PATH, attn_implementation="eager", dtype=torch.bfloat16
             )
             .to("cuda")
             .to(torch.bfloat16)
         )
         llama_model_custom = build_llama_model(
-            pretrained_model_name_or_path="meta-llama/Llama-3.2-1B",
+            pretrained_model_name_or_path=PRETRAINED_MODEL_NAME_OR_PATH,
             attn_implementation="eager",
             use_fused_qkv=False,
             use_fused_gate_up=False,
             dtype=torch.bfloat16,
         ).to("cuda")
         llama_model_custom_fused = build_llama_model(
-            pretrained_model_name_or_path="meta-llama/Llama-3.2-1B",
+            pretrained_model_name_or_path=PRETRAINED_MODEL_NAME_OR_PATH,
             attn_implementation="eager",
             use_fused_qkv=True,
             use_fused_gate_up=True,
