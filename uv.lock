@@ -2017,8 +2017,8 @@ requires-dist = [
     { name = "qwen-omni-utils", marker = "extra == 'vlm'" },
     { name = "qwen-vl-utils", extras = ["decord"], marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'vlm'" },
     { name = "timm", marker = "extra == 'vlm'", specifier = "==1.0.16" },
-    { name = "torch", marker = "sys_platform != 'darwin'", specifier = "<=2.8.0", index = "https://download.pytorch.org/whl/cu129" },
-    { name = "torch", marker = "sys_platform == 'darwin'", specifier = "<=2.8.0", index = "https://pypi.org/simple" },
+    { name = "torch", marker = "sys_platform != 'darwin'", specifier = "<=2.9.0", index = "https://download.pytorch.org/whl/cu129" },
+    { name = "torch", marker = "sys_platform == 'darwin'", specifier = "<=2.9.0", index = "https://pypi.org/simple" },
     { name = "torchao" },
     { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'vlm'" },
     { name = "torchdata" },
@@ -2032,8 +2032,8 @@ provides-extras = ["vlm", "fa", "moe"]
 [package.metadata.requires-dev]
 build = [
     { name = "setuptools" },
-    { name = "torch", marker = "sys_platform != 'darwin'", specifier = "<=2.8.0", index = "https://download.pytorch.org/whl/cu129" },
-    { name = "torch", marker = "sys_platform == 'darwin'", specifier = "<=2.8.0", index = "https://pypi.org/simple" },
+    { name = "torch", marker = "sys_platform != 'darwin'", specifier = "<=2.9.0", index = "https://download.pytorch.org/whl/cu129" },
+    { name = "torch", marker = "sys_platform == 'darwin'", specifier = "<=2.9.0", index = "https://pypi.org/simple" },
 ]
 dev = [{ name = "cut-cross-entropy", git = "https://github.com/apple/ml-cross-entropy.git?rev=87a86ab" }]
 docs = [
