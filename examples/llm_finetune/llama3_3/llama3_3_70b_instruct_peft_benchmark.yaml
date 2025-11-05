@@ -1,0 +1,76 @@
+# Based on your existing config, modified for benchmarking
+seed: 42
+# NEW: Add benchmark section
+benchmark:
+  warmup_steps: 5
+  peak_tflops: 989  # H100: 989, A100: 312
+  nsys_start: -1    # Set to step number to profile (e.g., 10)
+  nsys_end: -1      # Set to end step (e.g., 15)
+  nsys_ranks: []    # e.g., [0] to profile rank 0
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 2
+  ckpt_every_steps: 50
+  val_every_steps: 1000
+  max_steps: 10
+dist_env:
+  backend: nccl
+  timeout_minutes: 1
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
+  torch_dtype: bf16
+  trust_remote_code: true
+autopipeline:
+  _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
+  pp_schedule: interleaved1f1b
+  pp_microbatch_size: 1
+  layers_per_stage: 4
+  scale_grads_in_schedule: false
+  round_virtual_stages_to_pp_multiple: up
+  dtype: bf16
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: True
+  dim: 16
+  alpha: 32
+  use_triton: True
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors
+  save_consolidated: false
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: none
+  tp_size: 4
+  cp_size: 1
+  pp_size: 2
+  sequence_parallel: false
+  activation_checkpointing: false  # true needed to walk around OOM
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+# Use MockIterableDataset for benchmarking (faster, no I/O)
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+  vocab_size: 100
+  seq_len: 4096
+  num_samples: 1000000
+  batch_size: 2
+dataloader:
+  _target_: torch.utils.data.DataLoader
+  batch_size: null  # Dataset already yields batches
+  # Note: model_config will be auto-injected by train_ft.py for PP models
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 1.0e-6 
