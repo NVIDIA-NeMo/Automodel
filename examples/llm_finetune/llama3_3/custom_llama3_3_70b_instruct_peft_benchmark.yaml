@@ -67,7 +67,7 @@ dataset:
   vocab_size: 100
   seq_len: 4096
   num_samples: 1000000
-  batch_size: 4  # Must match local_batch_size
+  batch_size: 32
 
 dataloader:
   _target_: torch.utils.data.DataLoader
