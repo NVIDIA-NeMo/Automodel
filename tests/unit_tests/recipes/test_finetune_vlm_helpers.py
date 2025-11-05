@@ -14,11 +14,15 @@
 import pytest
 import torch
 import torch.nn as nn
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import patch, MagicMock
 
 from nemo_automodel.recipes.vlm.finetune import _freeze_model, build_model_and_optimizer
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
+
+
+def _count_trainable(parameters):
+    return sum(p.numel() for p in parameters if getattr(p, "requires_grad", False))
 
 @pytest.fixture(autouse=True)
 def _mock_missing_cuda(monkeypatch):
@@ -68,6 +72,9 @@ class DummyModelConfig:
 
     def instantiate(self):
         return DummyModel()
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
 
 
 # -----------------------------------------------------------------------------
@@ -161,11 +168,10 @@ def test_autoprocessor_success():
     with patch('transformers.AutoProcessor') as mock_auto_processor:
         mock_processor = MagicMock()
         mock_auto_processor.from_pretrained.return_value = mock_processor
-        
-        cfg_model = MagicMock()
-        cfg_model.pretrained_model_name_or_path = "test/model"
-        
-        processor = mock_auto_processor.from_pretrained(cfg_model.pretrained_model_name_or_path)
+
+        model_id = "test/model"
+
+        processor = mock_auto_processor.from_pretrained(model_id)
         
         assert processor is mock_processor
         mock_auto_processor.from_pretrained.assert_called_once_with("test/model")
@@ -193,13 +199,10 @@ def test_autoprocessor_exception_handling(caplog):
         cfg_dl.get.return_value = None  # No custom settings
         cfg_dl.instantiate.return_value = MagicMock()
         
-        cfg_model = MagicMock()
-        cfg_model.pretrained_model_name_or_path = "test/model"
-        
         cfg_processor = None  # This triggers the exception path
         
         with caplog.at_level(logging.WARNING):
-            dataloader, processor = build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, None, 123, 1)
+            dataloader, processor = build_dataloader(cfg_ds, cfg_dl, "test/model", cfg_processor, None, 123, 1)
         
         # Verify the results
         assert processor is None
@@ -234,13 +237,10 @@ def test_autoprocessor_with_processor_kwargs(caplog):
         cfg_dl.get.return_value = None  # No custom settings
         cfg_dl.instantiate.return_value = MagicMock()
         
-        cfg_model = MagicMock()
-        cfg_model.pretrained_model_name_or_path = "test/model"
-        
         cfg_processor = ProcessorConfig()  # This has to_dict but no instantiate
         
         with caplog.at_level(logging.WARNING):
-            dataloader, processor = build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, None, 123, 1)
+            dataloader, processor = build_dataloader(cfg_ds, cfg_dl, "test/model", cfg_processor, None, 123, 1)
         
         # Verify the results
         assert processor is None
