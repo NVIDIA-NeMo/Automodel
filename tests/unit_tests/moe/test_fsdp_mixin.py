@@ -187,6 +187,25 @@ class TestIterFSDPModules:
         assert len(modules) == 3
         assert model in modules
 
+    @patch('nemo_automodel.components.moe.fsdp_mixin.isinstance')
+    def test_iterates_multimodal_components(self, mock_isinstance):
+        def isinstance_side_effect(obj, cls):
+            if cls.__name__ == 'FSDPModule':
+                return isinstance(obj, MockFSDPModule)
+            return isinstance(obj, cls)
+
+        mock_isinstance.side_effect = isinstance_side_effect
+
+        model = MockFSDPModule()
+        moe_model = MockMoEModel(MockBackend(), model)
+        moe_model.audio_tower = MockFSDPModule()
+        moe_model.visual = MockFSDPModule()
+
+        modules = list(_iter_fsdp_modules(moe_model))
+
+        assert moe_model.audio_tower in modules
+        assert moe_model.visual in modules
+
 
 class TestPrepareForGradAccumulation:
     """Test prepare_for_grad_accumulation method."""

@@ -58,10 +58,12 @@ class LayerContainer:
 
 
 class DummyModel:
-    def __init__(self, blocks, embed_tokens=None, lm_head=None):
+    def __init__(self, blocks, embed_tokens=None, lm_head=None, audio_tower=None, visual=None):
         self.layers = LayerContainer(blocks)
         self.embed_tokens = embed_tokens
         self.lm_head = lm_head
+        self.audio_tower = audio_tower
+        self.visual = visual
 
 
 def _install_torch_and_layers_stubs(monkeypatch):
@@ -515,6 +517,55 @@ def test_apply_fsdp_without_ep_enabled_has_no_ignored_params(monkeypatch):
     _, block_kwargs = block_call
     assert block_kwargs["mesh"] is fsdp_mesh
     assert block_kwargs.get("ignored_params") is None
+
+
+@pytest.mark.parametrize(
+    "audio_trainable, visual_trainable",
+    [
+        (True, True),
+        (False, False),
+    ],
+)
+def test_apply_fsdp_handles_multimodal_components(monkeypatch, audio_trainable, visual_trainable):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    logging_mock = MagicMock()
+    monkeypatch.setattr(P.logging, "info", logging_mock)
+
+    class Tower:
+        def __init__(self, requires_grad):
+            self._params = [types.SimpleNamespace(requires_grad=requires_grad)]
+
+        def parameters(self):
+            return iter(self._params)
+
+    audio_tower = Tower(audio_trainable)
+    visual_tower = Tower(visual_trainable)
+
+    model = DummyModel([DummyBlock()], audio_tower=audio_tower, visual=visual_tower)
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=object(),
+        pp_enabled=False,
+        ep_enabled=False,
+        ep_shard_enabled=False,
+        ep_shard_mesh=None,
+    )
+
+    audio_call = _find_call_by_first_arg(fully_shard_mock, audio_tower)
+    visual_call = _find_call_by_first_arg(fully_shard_mock, visual_tower)
+    assert (audio_call is not None) == audio_trainable
+    assert (visual_call is not None) == visual_trainable
+
+    if not audio_trainable:
+        logging_mock.assert_any_call("Skipping FSDP wrap for frozen audio tower")
+    if not visual_trainable:
+        logging_mock.assert_any_call("Skipping FSDP wrap for frozen visual tower")
 
 
 class MeshView:

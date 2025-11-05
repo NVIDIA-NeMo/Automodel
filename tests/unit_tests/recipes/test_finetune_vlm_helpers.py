@@ -15,8 +15,32 @@ import pytest
 import torch
 import torch.nn as nn
 from unittest.mock import patch, MagicMock
+from types import SimpleNamespace
 
-from nemo_automodel.recipes.vlm.finetune import _freeze_model, build_model_and_optimizer
+from contextlib import nullcontext
+
+from nemo_automodel.components.loggers.metric_logger import MetricsSample
+from nemo_automodel.recipes.vlm.finetune import (
+    FinetuneRecipeForVLM,
+    _freeze_model,
+    _get_model_name,
+    build_model_and_optimizer,
+)
+
+
+class _Cfg(SimpleNamespace):
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+def test_get_model_name_prefers_pretrained_path():
+    cfg = _Cfg(pretrained_model_name_or_path="org/model")
+    assert _get_model_name(cfg) == "org/model"
+
+    cfg = _Cfg(config={"pretrained_model_name_or_path": "nested/model"})
+    assert _get_model_name(cfg) == "nested/model"
+
+    assert _get_model_name(_Cfg()) is None
+
+
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
 
@@ -156,6 +180,93 @@ def test_build_model_and_optimizer_basic():
     trainable_param_count = _count_trainable(model.parameters())
     optim_param_count = sum(p.numel() for group in optim.param_groups for p in group["params"])
     assert trainable_param_count == optim_param_count
+
+
+# -----------------------------------------------------------------------------
+# FinetuneRecipeForVLM helpers
+# -----------------------------------------------------------------------------
+
+
+class _DummyOptimizer:
+    def __init__(self):
+        self.param_groups = [{"lr": 0.01}]
+        self.step_called = False
+        self.zero_grad_called = False
+
+    def step(self):
+        self.step_called = True
+
+    def zero_grad(self, set_to_none=True):
+        self.zero_grad_called = True
+
+
+class _TensorModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, **batch):
+        return torch.zeros((), requires_grad=True)
+
+
+@pytest.mark.cuda(False)
+def test_run_train_step_supports_tensor_outputs(monkeypatch):
+    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.device_mesh = None
+    recipe.moe_mesh = None
+    recipe.loss_fn = object()
+    recipe.model = _TensorModel()
+    recipe.optimizer = _DummyOptimizer()
+    recipe.step_scheduler = SimpleNamespace(step=0, epoch=0)
+    recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
+    recipe.cfg = _Cfg(fp8=None)
+    recipe.lr_scheduler = None
+    recipe.timestamp = 0.0
+
+    recipe._dp_allreduce = lambda tensor, include_cp=False: tensor
+    recipe._get_dp_group_size = lambda include_cp=True: 1
+
+    batches = [
+        {
+            "labels": torch.tensor([[1, -100]]),
+            "input_ids": torch.tensor([[1, 2]]),
+        }
+    ]
+
+    logits_seen = {}
+
+    def fake_calculate_loss(*args, **kwargs):
+        logits_seen["value"] = kwargs["logits"]
+        return torch.tensor(1.0, requires_grad=True)
+
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
+        lambda device_mesh, batch, labels: (lambda: nullcontext(), batch),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.get_sync_ctx",
+        lambda model, is_last: nullcontext(),
+    )
+
+    calculate_mock = MagicMock(side_effect=fake_calculate_loss)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.calculate_loss", calculate_mock)
+
+    grad_clip_mock = MagicMock(return_value=2.5)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.scale_grads_and_clip_grad_norm",
+        grad_clip_mock,
+    )
+
+    metrics = recipe._run_train_optim_step(batches, max_grad_norm=1.0)
+
+    assert isinstance(metrics, MetricsSample)
+    assert logits_seen["value"].requires_grad
+    grad_clip_mock.assert_called_once()
+    assert calculate_mock.call_args.kwargs["num_label_tokens"] == 1
+    assert metrics.metrics["grad_norm"] == 2.5
+    assert recipe.optimizer.step_called
+    assert recipe.optimizer.zero_grad_called
 
 
 # -----------------------------------------------------------------------------
