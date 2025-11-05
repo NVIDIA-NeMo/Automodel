@@ -32,6 +32,7 @@ from torch import Tensor
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers import PreTrainedModel
 from transformers.cache_utils import Cache, DynamicCache
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     ModelOutput,
@@ -43,23 +44,44 @@ from transformers.models.llama.modeling_llama import (
     LlamaModel,
 )
 from transformers.utils import auto_docstring, can_return_tuple, logging
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-
 
 logger = logging.get_logger(__name__)
 
 
-def pool(last_hidden_states: torch.Tensor,
-         attention_mask: torch.Tensor,
-         pool_type: str) -> torch.Tensor:
+def contrastive_scores_and_labels(
+    query: torch.Tensor, key: torch.Tensor, current_train_n_passages: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute contrastive scores and labels without in-batch negatives.
+
+    Args:
+        query: Query embeddings [batch_size, hidden_dim]
+        key: Key/passage embeddings [batch_size * n_passages, hidden_dim]
+        current_train_n_passages: Number of passages per query
+
+    Returns:
+        Tuple of (scores, labels) where scores is [batch_size, n_passages]
+        and labels is [batch_size] of zeros (positive is first passage)
+    """
+    assert key.shape[0] % query.shape[0] == 0, "{} % {} > 0".format(key.shape[0], query.shape[0])
+    query_shape = query.shape
+    repeated_query = query.repeat(1, 1, current_train_n_passages).reshape(
+        query_shape[0] * current_train_n_passages, query_shape[1]
+    )
+    qk = torch.sum(repeated_query * key, dim=-1).reshape(query_shape[0], current_train_n_passages)
+    labels = torch.zeros(query_shape[0], dtype=torch.long, device=query.device)
+    return qk, labels
+
+
+def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_type: str) -> torch.Tensor:
     """
     Pool hidden states using the specified pooling method.
-    
+
     Args:
         last_hidden_states: Hidden states from the model [batch_size, seq_len, hidden_size]
         attention_mask: Attention mask [batch_size, seq_len]
         pool_type: Type of pooling to apply
-        
+
     Returns:
         Pooled embeddings [batch_size, hidden_size]
     """
@@ -72,7 +94,7 @@ def pool(last_hidden_states: torch.Tensor,
     elif pool_type == "cls":
         emb = last_hidden[:, 0]
     elif pool_type == "last":
-        left_padding = (attention_mask[:, -1].sum() == attention_mask.shape[0])
+        left_padding = attention_mask[:, -1].sum() == attention_mask.shape[0]
         if left_padding:
             emb = last_hidden[:, -1]
         else:
@@ -92,21 +114,22 @@ def pool(last_hidden_states: torch.Tensor,
 class LlamaBidirectionalConfig(LlamaConfig):
     """
     Configuration class for LlamaBidirectionalModel.
-    
+
     Extends LlamaConfig with additional parameters for bidirectional attention
     and pooling configurations.
     """
+
     model_type = "llama_bidirec"
 
     def __init__(
-        self, 
-        pooling: str = "avg", 
-        temperature: float = 1.0, 
+        self,
+        pooling: str = "avg",
+        temperature: float = 1.0,
         **kwargs,
     ):
         """
         Initialize LlamaBidirectionalConfig.
-        
+
         Args:
             pooling: Pooling strategy ('avg', 'cls', 'last', etc.)
             temperature: Temperature for scaling logits
@@ -120,17 +143,18 @@ class LlamaBidirectionalConfig(LlamaConfig):
 class LlamaBidirectionalModel(LlamaModel):
     """
     Llama Model with bidirectional attention.
-    
+
     This model removes causal masking from all attention layers, allowing tokens
     to attend to all other tokens in the sequence. This is useful for embedding
     and retrieval tasks where bidirectional context is beneficial.
     """
+
     config_class = LlamaBidirectionalConfig
 
     def __init__(self, config: LlamaConfig):
         """
         Initialize LlamaBidirectionalModel.
-        
+
         Args:
             config: Model configuration
         """
@@ -142,10 +166,9 @@ class LlamaBidirectionalModel(LlamaModel):
     def _update_causal_mask(
         self,
         attention_mask: torch.Tensor,
-        dtype,
     ):
         if attention_mask is not None and (attention_mask == 0.0).any():
-            return attention_mask.to(dtype)
+            return attention_mask
         return None
 
     @can_return_tuple
@@ -197,7 +220,7 @@ class LlamaBidirectionalModel(LlamaModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = self._update_causal_mask(attention_mask=attention_mask, dtype=inputs_embeds.dtype)
+        causal_mask = self._update_causal_mask(attention_mask=attention_mask)
 
         hidden_states = inputs_embeds
 
@@ -242,19 +265,21 @@ class LlamaBidirectionalModel(LlamaModel):
             attentions=all_self_attns,
         )
 
+
 class LlamaBidirectionalForSequenceClassification(LlamaForSequenceClassification):
     """
     Llama Bidirectional Model with a sequence classification/regression head.
-    
+
     This model adds a classification head on top of the bidirectional Llama model
     and includes configurable pooling strategies.
     """
+
     config_class = LlamaBidirectionalConfig
 
     def __init__(self, config):
         """
         Initialize LlamaBidirectionalForSequenceClassification.
-        
+
         Args:
             config: Model configuration
         """
@@ -283,7 +308,7 @@ class LlamaBidirectionalForSequenceClassification(LlamaForSequenceClassification
     ) -> Union[Tuple, SequenceClassifierOutputWithPast]:
         """
         Forward pass for sequence classification.
-        
+
         Args:
             input_ids: Input token IDs
             attention_mask: Attention mask
@@ -295,13 +320,11 @@ class LlamaBidirectionalForSequenceClassification(LlamaForSequenceClassification
             output_attentions: Whether to output attentions
             output_hidden_states: Whether to output hidden states
             return_dict: Whether to return a dict
-            
+
         Returns:
             SequenceClassifierOutputWithPast with loss, logits, and optional outputs
         """
-        return_dict = (
-            return_dict if return_dict is not None else self.config.use_return_dict
-        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         transformer_outputs = self.model(
             input_ids,
@@ -333,9 +356,7 @@ class LlamaBidirectionalForSequenceClassification(LlamaForSequenceClassification
             if self.config.problem_type is None:
                 if self.num_labels == 1:
                     self.config.problem_type = "regression"
-                elif self.num_labels > 1 and (
-                    labels.dtype == torch.long or labels.dtype == torch.int
-                ):
+                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
                     self.config.problem_type = "single_label_classification"
                 else:
                     self.config.problem_type = "multi_label_classification"
@@ -348,13 +369,11 @@ class LlamaBidirectionalForSequenceClassification(LlamaForSequenceClassification
                     loss = loss_fct(pooled_logits, labels)
             elif self.config.problem_type == "single_label_classification":
                 loss_fct = CrossEntropyLoss()
-                loss = loss_fct(
-                    pooled_logits.view(-1, self.num_labels), labels.view(-1)
-                )
+                loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
             elif self.config.problem_type == "multi_label_classification":
                 loss_fct = BCEWithLogitsLoss()
                 loss = loss_fct(pooled_logits, labels)
-                
+
         if not return_dict:
             output = (pooled_logits,) + transformer_outputs[1:]
             return ((loss,) + output) if loss is not None else output
@@ -371,6 +390,7 @@ class LlamaBidirectionalForSequenceClassification(LlamaForSequenceClassification
 @dataclass
 class BiencoderOutput(ModelOutput):
     """Output dataclass for biencoder model."""
+
     q_reps: Optional[Tensor] = None
     p_reps: Optional[Tensor] = None
     loss: Optional[Tensor] = None
@@ -381,10 +401,10 @@ class BiencoderOutput(ModelOutput):
 class BiencoderModel(nn.Module):
     """
     Biencoder Model with essential functions for training.
-    
+
     This model encodes queries and passages separately and computes contrastive loss.
     """
-    
+
     def __init__(
         self,
         args,
@@ -400,118 +420,110 @@ class BiencoderModel(nn.Module):
         self.linear_pooler = linear_pooler if linear_pooler is not None else nn.Identity()
         self.config = self.lm_q.config
         self.trainer = None
-        
-    def forward(
-        self, 
-        query: Dict[str, Tensor] = None, 
-        passage: Dict[str, Tensor] = None
-    ):
+
+    def forward(self, query: Dict[str, Tensor] = None, passage: Dict[str, Tensor] = None):
         """Forward pass for training."""
-        
+
         # Get current number of passages per query
         if self.training:
             current_train_n_passages = self.args.train_n_passages
         else:
             current_train_n_passages = self.args.eval_negative_size + 1
-            
-        # Encode query and passage
-        q_reps = self._encode(self.lm_q, query)
-        p_reps = self._encode(self.lm_p, passage)
-        
-        # Compute scores and loss
-        scores, labels = self._compute_scores(q_reps, p_reps, current_train_n_passages)
+
+        # Compute scores (encoding happens inside _compute_scores)
+        scores, labels, q_reps, p_reps = self._compute_scores(
+            query=query,
+            passage=passage,
+            current_train_n_passages=current_train_n_passages,
+        )
         loss = self.cross_entropy(scores, labels)
-        
+
+        # Adding Dummy Gradients for vlm-based models
+        if hasattr(self.lm_q, "module") and hasattr(self.lm_q.module, "post_loss"):
+            loss = self.lm_q.module.post_loss(loss, passage)
+        elif hasattr(self.lm_q, "post_loss"):
+            # Not tested this branch
+            loss = self.lm_q.post_loss(loss, passage)
+
         return BiencoderOutput(
             loss=loss,
             q_reps=q_reps,
             p_reps=p_reps,
-            labels=labels,
+            labels=labels.contiguous(),
             scores=scores,
         )
-    
-    def _encode(
-        self, 
-        encoder: PreTrainedModel, 
-        input_dict: dict
-    ) -> Optional[torch.Tensor]:
+
+    def _encode(self, encoder: PreTrainedModel, input_dict: dict) -> Optional[torch.Tensor]:
         """Encode input using the encoder."""
         if not input_dict:
             return None
-            
+
         import inspect
-        
+
         # Remove token_type_ids if encoder doesn't support it
         if (
             "token_type_ids" not in inspect.getfullargspec(encoder.forward).args
             and "token_type_ids" in input_dict.keys()
         ):
             input_dict = {k: v for k, v in input_dict.items() if k != "token_type_ids"}
-            
+
         # Get encoder outputs
         outputs = encoder(
             **{k: v for k, v in input_dict.items() if k not in ["kd_labels"]},
             return_dict=True,
             output_hidden_states=True,
         )
-        
+
         # Extract hidden states
         if hasattr(outputs, "last_hidden_state"):
             hidden_state = outputs.last_hidden_state
         else:
             hidden_state = outputs.hidden_states[-1]
-            
+
         # Pool the representations
         embeds = pool(
             last_hidden_states=hidden_state,
             attention_mask=input_dict["attention_mask"],
             pool_type=self.args.pooling,
         )
-        
+
         # Apply linear pooler
         embeds = self.linear_pooler(embeds)
-        
+
         # L2 normalize if required
         if self.args.l2_normalize:
             embeds = F.normalize(embeds, dim=-1)
-            
+
         return embeds.contiguous()
-    
+
     def _compute_scores(
         self,
-        q_reps: torch.Tensor,
-        p_reps: torch.Tensor,
         current_train_n_passages: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        query: Dict[str, Tensor] = None,
+        passage: Dict[str, Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute similarity scores and labels."""
-        
-        # Reshape passage representations
-        # p_reps: (batch_size * n_passages, hidden_dim)
-        # q_reps: (batch_size, hidden_dim)
-        batch_size = q_reps.shape[0]
-        
-        # Compute similarity scores
-        scores = torch.matmul(q_reps, p_reps.transpose(0, 1))
-        
-        # Create labels (first passage for each query is positive)
-        labels = torch.arange(
-            start=0,
-            end=batch_size * current_train_n_passages,
-            step=current_train_n_passages,
-            dtype=torch.long,
-            device=scores.device
+
+        # Encode query and passage
+        q_reps = self._encode(self.lm_q, query)
+        p_reps = self._encode(self.lm_p, passage)
+
+        # Compute similarity scores using contrastive_scores_and_labels
+        scores, labels = contrastive_scores_and_labels(
+            query=q_reps,
+            key=p_reps,
+            current_train_n_passages=current_train_n_passages,
         )
-        
-        # Apply temperature scaling if l2_normalize is enabled
+
         if self.args.l2_normalize:
             scores = scores / self.args.t
-            
-        return scores, labels
-    
+
+        return scores, labels, q_reps, p_reps
+
     @classmethod
     def build(cls, args, **hf_kwargs):
         """Build biencoder model from pretrained."""
-        
+
         logger.info(f"Building BiencoderModel from {args.model_name_or_path}")
 
         # Select model class based on base_model
@@ -520,45 +532,41 @@ class BiencoderModel(nn.Module):
             logger.info("Using LlamaBidirectionalModel for bidirc_llama3")
         else:
             raise ValueError(f"Unsupported base model: {args.base_model}")
-        
+
         # Load model locally or from hub using selected model class
         if os.path.isdir(args.model_name_or_path):
             if args.share_encoder:
-                lm_q = ModelClass.from_pretrained(
-                    args.model_name_or_path, 
-                    trust_remote_code=True, 
-                    **hf_kwargs
-                )
+                lm_q = ModelClass.from_pretrained(args.model_name_or_path, trust_remote_code=True, **hf_kwargs)
                 lm_p = lm_q
             else:
                 _qry_model_path = os.path.join(args.model_name_or_path, "query_model")
                 _psg_model_path = os.path.join(args.model_name_or_path, "passage_model")
-                
+
                 if not os.path.exists(_qry_model_path):
                     _qry_model_path = args.model_name_or_path
                     _psg_model_path = args.model_name_or_path
-                    
+
                 lm_q = ModelClass.from_pretrained(_qry_model_path, trust_remote_code=True, **hf_kwargs)
                 lm_p = ModelClass.from_pretrained(_psg_model_path, trust_remote_code=True, **hf_kwargs)
         else:
             # Load from hub
             lm_q = ModelClass.from_pretrained(args.model_name_or_path, **hf_kwargs)
-            
+
             if args.share_encoder:
                 lm_p = lm_q
             else:
                 lm_p = copy.deepcopy(lm_q)
-            
+
         # Enable gradient checkpointing if requested
         if args.do_gradient_checkpointing:
             lm_q.gradient_checkpointing_enable()
             if lm_p is not lm_q:
                 lm_p.gradient_checkpointing_enable()
-        
+
         # Create linear pooler if needed
         if args.add_linear_pooler:
             linear_pooler = nn.Linear(lm_q.config.hidden_size, args.out_dimension)
-            
+
             pooler_path = os.path.join(args.model_name_or_path, "pooler.pt")
             if os.path.exists(pooler_path):
                 logger.info("Loading pooler weights from local files")
@@ -566,15 +574,15 @@ class BiencoderModel(nn.Module):
                 linear_pooler.load_state_dict(state_dict)
         else:
             linear_pooler = nn.Identity()
-            
+
         model = cls(args=args, lm_q=lm_q, lm_p=lm_p, linear_pooler=linear_pooler)
         return model
-    
+
     def save(self, output_dir: str):
         """Save model to output directory."""
-        
+
         logger.info(f"Saving BiencoderModel to {output_dir}")
-        
+
         # Save the model
         if self.args.share_encoder:
             self.lm_q.save_pretrained(output_dir)
@@ -583,10 +591,9 @@ class BiencoderModel(nn.Module):
             os.makedirs(os.path.join(output_dir, "passage_model"), exist_ok=True)
             self.lm_q.save_pretrained(os.path.join(output_dir, "query_model"))
             self.lm_p.save_pretrained(os.path.join(output_dir, "passage_model"))
-        
+
         # Save linear pooler if exists
         if self.args.add_linear_pooler:
             pooler_path = os.path.join(output_dir, "pooler.pt")
             logger.info(f"Saving linear pooler to {pooler_path}")
             torch.save(self.linear_pooler.state_dict(), pooler_path)
-

@@ -24,8 +24,8 @@ from .llama_bidirectional_model import (  # noqa: F401
     BiencoderModel,
     BiencoderOutput,
     LlamaBidirectionalConfig,
-    LlamaBidirectionalModel,
     LlamaBidirectionalForSequenceClassification,
+    LlamaBidirectionalModel,
 )
 
 __all__ = [
@@ -36,4 +36,3 @@ __all__ = [
     "LlamaBidirectionalModel",
     "LlamaBidirectionalForSequenceClassification",
 ]
-

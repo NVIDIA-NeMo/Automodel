@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Union
 
 import torch
 from transformers import PreTrainedTokenizerBase
@@ -55,7 +55,7 @@ class RetrievalBiencoderCollator:
         p_max_len: int = 512,
         query_prefix: str = "",
         passage_prefix: str = "",
-        padding: str = "longest",
+        padding: Union[bool, str, PaddingStrategy] = True,
         pad_to_multiple_of: int = None,
     ):
         """
