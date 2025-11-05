@@ -27,24 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 class Qwen3OmniMoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
-    """Converts between HF Qwen3OmniMoe checkpoints and our grouped-experts native format.
-
-    Qwen3OmniMoe Thinker HF experts use keys:
-      thinker.model.layers.{L}.mlp.experts.{E}.gate_proj.weight
-      thinker.model.layers.{L}.mlp.experts.{E}.up_proj.weight
-      thinker.model.layers.{L}.mlp.experts.{E}.down_proj.weight
-
-    Our native format groups them into:
-      model.layers.{L}.mlp.experts.gate_and_up_projs  # [n_experts, dim, 2*moe_inter_dim]
-      model.layers.{L}.mlp.experts.down_projs         # [n_experts, moe_inter_dim, dim]
-    
-    Note: This adapter focuses on the Thinker text model component.
-    For full multimodal Qwen3OmniMoe, additional adapters would be needed for:
-    - Audio encoder
-    - Vision encoder  
-    - Talker model
-    - Code2Wav
-    """
+    """Converts between HF Qwen3OmniMoe checkpoints and grouped-experts native format."""
 
     def __init__(
         self,
@@ -64,21 +47,14 @@ class Qwen3OmniMoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
     ) -> dict[str, Any]:
         hf_state_dict = self._to_hf_w_split_experts(state_dict)
-        
-        # Add thinker prefix for HF format if needed
+
         if self._uses_thinker_prefix:
             hf_state_dict_with_prefix = {}
             for key, value in hf_state_dict.items():
-                # Add "thinker." prefix to all thinker components:
-                # - model.layers -> thinker.model.layers
-                # - lm_head -> thinker.lm_head
-                # - audio_tower -> thinker.audio_tower
-                # - visual -> thinker.visual
-                # (code2wav and talker are separate models, not part of Thinker)
                 new_key = "thinker." + key
                 hf_state_dict_with_prefix[new_key] = value
             hf_state_dict = hf_state_dict_with_prefix
-        
+
         if exclude_key_regex:
             import re
 
@@ -91,42 +67,21 @@ class Qwen3OmniMoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         device_mesh: Optional["DeviceMesh"] = None,
         **kwargs,
     ) -> dict[str, Any]:
-        # Detect whether HF checkpoints use the "thinker.model." prefix
         for key in hf_state_dict.keys():
             if ".mlp.experts." in key and key.endswith(".weight"):
                 self._uses_thinker_prefix = key.startswith("thinker.")
                 self._uses_model_prefix = "model." in key
                 break
-        
+
         # Remove thinker prefix if present to match our internal format
         if self._uses_thinker_prefix:
             hf_state_dict_no_prefix = {}
             for key, value in hf_state_dict.items():
                 if key.startswith("thinker."):
-                    # Remove "thinker." prefix for all thinker components:
-                    # - thinker.model.layers -> model.layers
-                    # - thinker.lm_head -> lm_head
-                    # - thinker.audio_tower -> audio_tower
-                    # - thinker.visual -> visual
-                    new_key = key[len("thinker."):]
+                    new_key = key[len("thinker.") :]
                     hf_state_dict_no_prefix[new_key] = value
                 else:
                     hf_state_dict_no_prefix[key] = value
             hf_state_dict = hf_state_dict_no_prefix
-        
+
         return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

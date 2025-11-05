@@ -182,7 +182,7 @@ def apply_fsdp(
             fully_shard_default(model.audio_tower)
         else:
             logging.info("Skipping FSDP wrap for frozen audio tower")
-    
+
     if hasattr(model, "visual") and model.visual is not None:
         if any(param.requires_grad for param in model.visual.parameters()):
             fully_shard_default(model.visual)
@@ -190,7 +190,7 @@ def apply_fsdp(
             logging.info("Skipping FSDP wrap for frozen visual tower")
 
     fully_shard_default(_model)
-    
+
     # If model has a nested structure (outer model wrapping inner _model), wrap the outer model too
     if model != _model:
         fully_shard_default(model)

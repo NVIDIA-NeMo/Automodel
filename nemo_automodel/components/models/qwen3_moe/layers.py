@@ -16,7 +16,6 @@ from typing import Any
 
 import torch
 from torch import nn
-from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 from nemo_automodel.components.attention.utils import (
     initialize_attn_module_and_func,
@@ -29,6 +28,7 @@ from nemo_automodel.components.moe.utils import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
+from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 
 class Qwen3MoeAttention(nn.Module):
@@ -50,7 +50,7 @@ class Qwen3MoeAttention(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = getattr(config, "head_dim", config.hidden_size // self.num_heads)
 
-        attention_bias = getattr(config, 'attention_bias', False)
+        attention_bias = getattr(config, "attention_bias", False)
 
         self.q_proj = initialize_linear_module(
             backend.linear, config.hidden_size, self.num_heads * self.head_dim, attention_bias
@@ -132,7 +132,7 @@ class Qwen3MoeAttention(nn.Module):
         linear_list = [self.q_proj, self.k_proj, self.v_proj, self.o_proj]
         for linear in linear_list:
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
-            if hasattr(linear, 'bias') and linear.bias is not None:
+            if hasattr(linear, "bias") and linear.bias is not None:
                 nn.init.zeros_(linear.bias)
         for norm in (self.q_norm, self.k_norm):
             norm.reset_parameters()

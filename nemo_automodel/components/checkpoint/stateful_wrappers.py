@@ -89,7 +89,7 @@ class ModelState:
 
         if isinstance(self.model[0], Qwen3OmniMoeThinkerForConditionalGeneration):
             self.is_tied_lm_head = False
-        
+
         if self.is_tied_lm_head:
             _, lm_head_param_name = _get_lm_head_weight_and_name(self.model[0])
             self.lm_head_param_name = lm_head_param_name

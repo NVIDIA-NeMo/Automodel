@@ -59,7 +59,7 @@ def _iter_fsdp_modules(module: torch.nn.Module) -> Iterator[FSDPModule]:
     # TODO: cover all possible multimodal component names
     if hasattr(module, "audio_tower") and isinstance(module.audio_tower, FSDPModule):
         yield module.audio_tower
-    
+
     if hasattr(module, "visual") and isinstance(module.visual, FSDPModule):
         yield module.visual
 

@@ -18,19 +18,13 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 import torch.nn as nn
 import wandb
-from torch.distributed.device_mesh import DeviceMesh
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
-from transformers import AutoProcessor
-from transformers.integrations.accelerate import init_empty_weights
-from transformers.modeling_utils import no_init_weights
-from transformers.processing_utils import ProcessorMixin
-from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
 from wandb import Settings
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
@@ -40,7 +34,6 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import (
-    get_rank_safe,
     get_world_size_safe,
     initialize_distributed,
 )
@@ -63,8 +56,17 @@ from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
     compile_model,
 )
-from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep, apply_parameter_freezing, print_trainable_parameters
+from nemo_automodel.components.utils.model_utils import (
+    _supports_logits_to_keep,
+    apply_parameter_freezing,
+    print_trainable_parameters,
+)
 from nemo_automodel.recipes.base_recipe import BaseRecipe
+from transformers import AutoProcessor
+from transformers.integrations.accelerate import init_empty_weights
+from transformers.modeling_utils import no_init_weights
+from transformers.processing_utils import ProcessorMixin
+from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -77,6 +79,7 @@ logger = logging.getLogger(__name__)
 #  Stateless helper functions
 # ---------------------------
 
+
 def _get_model_name(cfg_model):
     if cfg_model.get("pretrained_model_name_or_path", None) is not None:
         return cfg_model.pretrained_model_name_or_path
@@ -84,6 +87,7 @@ def _get_model_name(cfg_model):
         return cfg_model.config.get("pretrained_model_name_or_path", None)
     else:
         return None
+
 
 def _freeze_model(model: nn.Module, cfg_freeze: Optional[Dict[str, Any]] = None, freeze_embeddings: bool = True):
     """
@@ -105,6 +109,7 @@ def _freeze_model(model: nn.Module, cfg_freeze: Optional[Dict[str, Any]] = None,
             if isinstance(m, nn.Embedding):
                 m.weight.requires_grad = False
     return model
+
 
 def build_model_and_optimizer(
     device,
@@ -168,7 +173,7 @@ def build_model_and_optimizer(
             if cp_size > 1 and is_hf_model and hasattr(model, "_supports_sdpa"):
                 if model._supports_sdpa is False:
                     raise ValueError("Model does not support SDPA required for context parallelism")
-            
+
             # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
             if cfg_peft is not None:
                 if tp_size > 1:
@@ -238,11 +243,11 @@ def build_model_and_optimizer(
         if cfg_compile is not None:
             compile_config = build_compile_config(cfg_compile)
             model = compile_model(model, compile_config)
-        
+
         if tp_size > 1:
             # TP does not support foreach
             cfg_opt.foreach = False
-        
+
         trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         optimizer = cfg_opt.instantiate(params=trainable_params)
@@ -610,7 +615,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             dp_rank=self._get_dp_rank(include_cp=True),
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),
-            moe_mesh=self.moe_mesh
+            moe_mesh=self.moe_mesh,
         )
 
         self.model, model_state_dict_keys, self.optimizer = build_model_and_optimizer(
@@ -632,7 +637,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
         self.checkpointer.config.model_state_dict_keys = model_state_dict_keys
 
-        
         self.dataloader, self.processor = build_dataloader(
             self.cfg.dataset,
             self.cfg.dataloader,
@@ -871,7 +875,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         logits=getattr(out, "logits", out),
                         labels=labels,
                         model=self.model,
-                        hidden_states=out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None else None,
+                        hidden_states=out.hidden_states[-1]
+                        if getattr(out, "hidden_states", None) is not None
+                        else None,
                         num_label_tokens=num_label_tokens,
                     )
                     total_num_label_tokens += num_label_tokens
@@ -882,9 +888,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Aggregate across ranks if distributed is initialized
         total_loss = self._dp_allreduce(torch.FloatTensor([total_loss]), include_cp=True).item()
         total_tokens = self._dp_allreduce(torch.LongTensor([total_tokens]), include_cp=True).item()
-        total_num_label_tokens = (
-            self._dp_allreduce(torch.LongTensor([total_num_label_tokens])).item()
-        )
+        total_num_label_tokens = self._dp_allreduce(torch.LongTensor([total_num_label_tokens])).item()
 
         val_loss = total_loss / max(total_tokens, 1e-8)
 

@@ -16,17 +16,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
-    Qwen3OmniMoeTextConfig,
-    Qwen3OmniMoeThinkerConfig,
-)
-from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-    Qwen3OmniMoeAudioEncoder,
-    Qwen3OmniMoeVisionEncoder,
-    Qwen3OmniMoeThinkerTextRotaryEmbedding,
-    Qwen3OmniMoeThinkerForConditionalGeneration as HFQwen3OmniMoeThinkerForConditionalGeneration,
-    _get_feat_extract_output_lengths,
-)
 
 from nemo_automodel.components.models.qwen3_moe.model import Block
 from nemo_automodel.components.models.qwen3_omni_moe.state_dict_adapter import Qwen3OmniMoeStateDictAdapter
@@ -35,9 +24,21 @@ from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+    Qwen3OmniMoeTextConfig,
+    Qwen3OmniMoeThinkerConfig,
+)
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    Qwen3OmniMoeThinkerForConditionalGeneration as HFQwen3OmniMoeThinkerForConditionalGeneration,
+)
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    Qwen3OmniMoeThinkerTextRotaryEmbedding,
+)
 
 
-class Qwen3OmniMoeThinkerTextModel(nn.Module):  #corresponding to qwen3_moe/model.py Qwen3MoeModel, diff: use MRopeRotaryEmbedding instead of RotaryEmbedding
+class Qwen3OmniMoeThinkerTextModel(
+    nn.Module
+):  # corresponding to qwen3_moe/model.py Qwen3MoeModel, diff: use MRopeRotaryEmbedding instead of RotaryEmbedding
     """Qwen3OmniMoe Thinker Text Model with MRoPE and sparse MoE layers."""
 
     def __init__(self, config: Qwen3OmniMoeTextConfig, backend: BackendConfig, *, moe_config: MoEConfig | None = None):
@@ -69,15 +70,13 @@ class Qwen3OmniMoeThinkerTextModel(nn.Module):  #corresponding to qwen3_moe/mode
             softmax_before_topk=True,
         )
 
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, self.padding_idx
-        )
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
             [Block(layer_id, config, self.moe_config, backend) for layer_id in range(config.num_hidden_layers)]
         )
         self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3OmniMoeThinkerTextRotaryEmbedding(config)
-        
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -108,16 +107,15 @@ class Qwen3OmniMoeThinkerTextModel(nn.Module):  #corresponding to qwen3_moe/mode
         # the hard coded `3` is for temporal, height and width.
         if position_ids is None:
             seq_length = inputs_embeds.shape[1]
-            position_ids = torch.arange(seq_length, device=inputs_embeds.device).unsqueeze(0).expand(inputs_embeds.shape[0], -1)
+            position_ids = (
+                torch.arange(seq_length, device=inputs_embeds.device).unsqueeze(0).expand(inputs_embeds.shape[0], -1)
+            )
             position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
         elif position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
         if position_ids.ndim == 3 and position_ids.shape[0] == 4:
-            text_position_ids = position_ids[0]
             position_ids = position_ids[1:]
-        else:
-            text_position_ids = position_ids[0]
 
         hidden_states = inputs_embeds
 
@@ -173,9 +171,7 @@ class Qwen3OmniMoeThinkerTextModel(nn.Module):  #corresponding to qwen3_moe/mode
                 layer.init_weights(buffer_device=buffer_device)
 
 
-class Qwen3OmniMoeThinkerForConditionalGeneration(
-    HFQwen3OmniMoeThinkerForConditionalGeneration, MoEFSDPSyncMixin
-):
+class Qwen3OmniMoeThinkerForConditionalGeneration(HFQwen3OmniMoeThinkerForConditionalGeneration, MoEFSDPSyncMixin):
     """Qwen3OmniMoe Thinker for Conditional Generation with multimodal support."""
 
     @classmethod
@@ -263,7 +259,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         **attn_kwargs: Any,
     ) -> torch.Tensor | dict:
         """Forward pass with multimodal fusion.
-        
+
         Args:
             input_ids: Input token IDs
             input_features: Audio input features
@@ -282,7 +278,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             use_audio_in_video: Whether audio is in video
             video_second_per_grid: Seconds per grid for videos
             **attn_kwargs: Additional attention arguments
-            
+
         Returns:
             Logits tensor or dict with loss/aux_loss if labels provided
         """
@@ -298,7 +294,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
         visual_embeds_multiscale = None
         visual_pos_masks = None
-        
+
         # 2. Merge multimodal features
         # Audio
         if input_features is not None:
@@ -377,9 +373,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             visual_pos_masks=visual_pos_masks,
             **attn_kwargs,
         )
-        
+
         logits = self.lm_head(hidden) if self.lm_head else hidden
-        
+
         if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
             logits = logits.unsqueeze(0)
 
@@ -413,8 +409,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self, buffer_device: torch.device | None = None, dtype: torch.dtype = torch.bfloat16
     ) -> None:
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
-        text_config = self.config.text_config if hasattr(self.config, 'text_config') else self.config
-        
+        text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
+
         with buffer_device:
             self.model.init_weights(buffer_device=buffer_device)
             final_out_std = text_config.hidden_size**-0.5
