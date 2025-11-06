@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import math
 from typing import Iterable
 
@@ -299,3 +300,28 @@ def scale_grads_and_clip_grad_norm(
         pp_axis_name=pp_axis_name,
         foreach=foreach,
     )
+
+
+def move_to_device(model, device):
+    # FSDP modules do not move buffers to the device automatically
+    for v in model.buffers():
+        v.data = v.data.to(device)
+    model.to(device)
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+class ScopedModuleOffloading:
+    def __init__(self, model, enabled=False):
+        self.model = model
+        self.enabled = enabled
+
+    def __enter__(self):
+        if self.enabled:
+            move_to_device(self.model, "cuda")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.enabled:
+            move_to_device(self.model, "cpu")
+        return False  # Re-raise exceptions by default
