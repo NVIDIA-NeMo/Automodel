@@ -378,6 +378,29 @@ def get_parallelization_strategy(model: nn.Module) -> ParallelizationStrategy:
     return PARALLELIZATION_STRATEGIES.get(model_name, _DEFAULT_STRATEGY)
 
 
+def register_parallel_strategy(arg=None, *, name: Optional[str] = None):
+    """Decorator to register out-of-tree parallelism strategies.
+
+    Supports:
+    - @register_parallel_strategy(name="CustomModelName")
+    """
+
+    def _register(cls):
+        # The decorator receives a class, not an instance.
+        assert isinstance(cls, type) and issubclass(cls, ParallelizationStrategy), (
+            f"cls must be a subclass of ParallelizationStrategy, but got {type(cls)} {cls}"
+        )
+        assert name is not None, "name is required"
+        assert name not in PARALLELIZATION_STRATEGIES, f"name {name} already registered"
+        PARALLELIZATION_STRATEGIES[name] = cls()
+        return cls
+
+    if name is None:
+        raise ValueError("name is required")
+    # If used with parentheses (possibly with arguments)
+    return _register
+
+
 def apply_fsdp2_sharding_recursively(
     module: nn.Module,
     mesh: DeviceMesh,
@@ -392,6 +415,10 @@ def apply_fsdp2_sharding_recursively(
     it applies an optimization where the last layer doesn't reshard after forward
     since FSDP2 will prefetch it immediately.
 
+    Handles both single-level and nested ModuleList structures. If a ModuleList
+    contains other ModuleLists, it will recurse into them instead of trying to
+    wrap them (since ModuleList doesn't have a forward method).
+
     Args:
         module (nn.Module): The module to apply FSDP sharding to.
         mesh (DeviceMesh): The device mesh for FSDP sharding.
@@ -404,18 +431,23 @@ def apply_fsdp2_sharding_recursively(
         FSDP2-subclassed versions.
     """
     if isinstance(module, nn.ModuleList):
-        for layer_id, transformer_block in enumerate(module):
-            # As an optimization, do not reshard after forward for the last
-            # transformer block since FSDP would prefetch it immediately
-            reshard_after_forward = int(layer_id) < len(module) - 1
-            fully_shard(
-                transformer_block,
-                mesh=mesh,
-                mp_policy=mp_policy,
-                reshard_after_forward=reshard_after_forward,
-                offload_policy=offload_policy,
-            )
-            module[layer_id] = transformer_block
+        for layer_id, child_module in enumerate(module):
+            # If child is also a ModuleList (nested structure), recurse instead of wrapping
+            # since ModuleList doesn't have a forward() method required by fully_shard
+            if isinstance(child_module, nn.ModuleList):
+                apply_fsdp2_sharding_recursively(child_module, mesh, mp_policy, offload_policy)
+            else:
+                # As an optimization, do not reshard after forward for the last
+                # transformer block since FSDP would prefetch it immediately
+                reshard_after_forward = int(layer_id) < len(module) - 1
+                fully_shard(
+                    child_module,
+                    mesh=mesh,
+                    mp_policy=mp_policy,
+                    reshard_after_forward=reshard_after_forward,
+                    offload_policy=offload_policy,
+                )
+                module[layer_id] = child_module
     else:
         for name, sub_module in module.named_children():
             apply_fsdp2_sharding_recursively(sub_module, mesh, mp_policy, offload_policy)
