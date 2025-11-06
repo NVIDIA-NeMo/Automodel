@@ -732,7 +732,6 @@ class TestAutoPipelineIntegration:
         assert ap.patch_inner_model is True
         assert ap.patch_causal_lm_model is True
         assert ap.scale_grads_in_schedule is False
-        assert ap.visualization_font_size_offset == 0
 
     def test_autopipeline_with_all_optional_fields(self):
         """Test AutoPipeline with all optional fields set."""
@@ -760,7 +759,6 @@ class TestAutoPipelineIntegration:
             device=torch.device("cuda:1"),
             dtype=torch.float16,
             scale_grads_in_schedule=True,
-            visualization_font_size_offset=2,
         )
 
         # Verify all fields are set correctly
@@ -784,4 +782,3 @@ class TestAutoPipelineIntegration:
         assert ap._device == torch.device("cuda:1")
         assert ap.dtype == torch.float16
         assert ap.scale_grads_in_schedule is True
-        assert ap.visualization_font_size_offset == 2
