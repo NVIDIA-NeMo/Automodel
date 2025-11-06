@@ -13,13 +13,10 @@
 # limitations under the License.
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any, Optional, TYPE_CHECKING
 
-try:
+if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
-except ImportError:
-    DeviceMesh = None
-
 
 class StateDictAdapter(ABC):
     """Abstract base class for state dict transformations.
