@@ -322,8 +322,6 @@ class Checkpointer:
             peft_init_method: Initialization method used for PEFT adapters
             load_base_model: If True, restore from HF base checkpoint
         """
-        from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
-
         to_empty_parameters_only(model, device=device)
 
         # HF models set _is_hf_initialized to True after initialization.
@@ -334,7 +332,12 @@ class Checkpointer:
         # doesn't support initialize_weights when the model is sharded. This is because Gemma's
         # initialize_weights method requires setting a row to zeros in the embedding matrix.
         # This index selection op is not supported for DTensors in the pinned torch version.
-        if not isinstance(model, Gemma3ForConditionalGeneration):
+        config = getattr(model, "config", None)
+        if config is not None:
+            model_class = getattr(config, "architectures", [""])[0]
+        else:
+            model_class = ""
+        if model_class not in ["Gemma3ForConditionalGeneration", "NemotronHForCausalLM"]:
             for _, module in model.named_modules():
                 if hasattr(module, "_is_hf_initialized"):
                     module._is_hf_initialized = False
