@@ -85,3 +85,20 @@ class Qwen3OmniMoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
             hf_state_dict = hf_state_dict_no_prefix
 
         return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
+
+    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+        exclude_key_regex = kwargs.get("exclude_key_regex", None)
+
+        converted = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
+        if converted is None:
+            converted = [(fqn, tensor)]
+
+        if self._uses_thinker_prefix:
+            converted = [(f"thinker.{key}", value) for key, value in converted]
+
+        if exclude_key_regex:
+            import re
+
+            converted = [(key, value) for key, value in converted if not re.match(exclude_key_regex, key)]
+
+        return converted
