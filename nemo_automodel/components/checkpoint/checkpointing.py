@@ -332,10 +332,9 @@ class Checkpointer:
         # doesn't support initialize_weights when the model is sharded. This is because Gemma's
         # initialize_weights method requires setting a row to zeros in the embedding matrix.
         # This index selection op is not supported for DTensors in the pinned torch version.
-        config = getattr(model, "config", None)
-        if config is not None:
-            model_class = getattr(config, "architectures", [""])[0]
-        else:
+        try:
+            model_class = model.config.architectures[0]
+        except:
             model_class = ""
         if model_class not in ["Gemma3ForConditionalGeneration", "NemotronHForCausalLM"]:
             for _, module in model.named_modules():
