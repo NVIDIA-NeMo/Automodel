@@ -34,7 +34,7 @@ parallelizer:
   activation_checkpointing: false
 
 model:
-  _target_: nemo_automodel.NeMoAutoModelForTextToWaveform.from_config
+  _target_: nemo_automodel.components.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerForConditionalGeneration.from_config
   config:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
