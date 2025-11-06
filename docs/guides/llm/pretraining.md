@@ -4,7 +4,7 @@ This guide covers **FineWeb** data preparation, **defining** a [NanoGPT‑style]
 
 In particular, it will show you how to:
 1. [Install NeMo AutoModel from git](#set-up-your-environment).
-2. [Pre-process and tokenize the FineWeb dataset](#pre-process-the-fineWweb-dataset).
+2. [Pre-process and tokenize the FineWeb dataset](#pre-process-the-fineweb-dataset).
 3. [Introduction to the NeMo AutoModel training workflow](#understand-the-nemo-automodel-training-workflow).
 4. [Define your own model architecture](#define-your-own-model-architecture).
 5. [Inspect and adjust the YAML configuration](#inspect-and-adjust-the-yaml-configuration).
