@@ -262,7 +262,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 cls.__name__ = name[4:]
             if not force_hf:
                 try:
-                    config = AutoConfig.from_pretrained(
+                    config = kwargs.pop("config", None) or AutoConfig.from_pretrained(
                         pretrained_model_name_or_path, trust_remote_code=bool(kwargs.get("trust_remote_code", False))
                     )
                     # if we have a custom model implementation available, we prioritize that over HF
