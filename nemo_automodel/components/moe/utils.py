@@ -19,6 +19,8 @@ from typing import Literal
 import torch
 from torch import nn
 
+from nemo_automodel.shared.utils import dtype_from_str
+
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
 HAVE_DEEP_EP = importlib.util.find_spec("deep_ep") is not None
 
@@ -32,6 +34,11 @@ class BackendConfig:
     fake_balanced_gate: bool = False
     enable_hf_state_dict_adapter: bool = True
     enable_fsdp_optimizations: bool = False
+    gate_precision: str | torch.dtype | None = None
+
+    def __post_init__(self):
+        if isinstance(self.gate_precision, str):
+            self.gate_precision = dtype_from_str(self.gate_precision, default=None)
 
 
 def initialize_rms_norm_module(

@@ -73,8 +73,6 @@ class AutoPipeline:
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
         scale_grads_in_schedule: bool = False,
-        # Visualization
-        visualization_font_size_offset: int = 0,
     ):
         # Validation
         if pp_schedule_csv is None and pp_schedule is None:
@@ -106,7 +104,6 @@ class AutoPipeline:
         self._device: torch.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = dtype
         self.scale_grads_in_schedule = scale_grads_in_schedule
-        self.visualization_font_size_offset = visualization_font_size_offset
 
         self.pp_mesh: DeviceMesh = self.world_mesh[pp_axis_name]
 
