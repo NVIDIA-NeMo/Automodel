@@ -22,6 +22,7 @@ benchmark:
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []
+  num_nodes: 32
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
