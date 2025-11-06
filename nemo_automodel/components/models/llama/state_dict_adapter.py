@@ -26,7 +26,6 @@ import torch
 from torch.distributed.tensor import DTensor
 from transformers import LlamaConfig
 
-from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.moe.state_dict_utils import is_dtensor
 
 logger = logging.getLogger(__name__)
@@ -111,8 +110,9 @@ def _safe_concat(tensors: list[torch.Tensor], dim: int = 0) -> torch.Tensor:
         # Regular tensors: normal concat
         return torch.cat(tensors, dim=dim)
 
-
-class LlamaStateDictAdapter(StateDictAdapter):
+# -from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+# LlamaStateDictAdapter should be a subclass of StateDictAdapter, but import-linter complains about it.
+class LlamaStateDictAdapter:
     """Adapter for converting between HF and custom Llama formats.
 
     Handles conversion of:
