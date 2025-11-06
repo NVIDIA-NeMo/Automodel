@@ -176,7 +176,10 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         sync_ctx = get_sync_ctx(model, idx == num_batches - 1) if is_train else nullcontext()
         with train_ctx(), sync_ctx:
             # No grad for teacher forward
-            with ScopedModuleOffloading(self.teacher_model, enabled=self._offload_teacher_model), torch.inference_mode():
+            with (
+                ScopedModuleOffloading(self.teacher_model, enabled=self._offload_teacher_model),
+                torch.inference_mode(),
+            ):
                 teacher_logits = self.teacher_model(**batch)
                 teacher_logits = getattr(teacher_logits, "logits", teacher_logits).detach().clone()
 
