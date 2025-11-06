@@ -1,8 +1,8 @@
-# LLM Pre-Training with NeMo AutoModel
+# LLM Pre-Training with NeMo Automodel
 
-This guide covers **FineWeb** data preparation, **defining** a [NanoGPT‑style](https://github.com/KellerJordan/modded-nanogpt) model, and **launching and monitoring** a NeMo AutoModel pre‑training run.
+This guide covers **FineWeb** data preparation, **defining** a [NanoGPT‑style](https://github.com/KellerJordan/modded-nanogpt) model, and **launching and monitoring** a NeMo Automodel pre‑training run.
 
-In particular, it will show you how to: 
+In particular, it will show you how to:
 1. [Install NeMo AutoModel from git](#1-environment-setup).
 2. [Pre-process and tokenize the FineWeb dataset](#2-pre-process-the-fineweb-dataset).
 3. [Introduction to the NeMo AutoModel training workflow](#3-introduction-to-the-nemo-automodel-training-workflow).
@@ -13,16 +13,16 @@ In particular, it will show you how to:
 
 ---
 
-## 1. Environment setup
+## Set Up Your Environment
 
-In this guide we will use an interactive environment, to install NeMo AutoModel from git. You can always install NeMo AutoModel from pypi or use our bi-monthly docker container.
+In this guide, we will use an interactive environment to install NeMo Automodel from Git. You can also install NeMo Automodel from PyPI or use our bi-monthly Docker container.
 
 ```bash
-# clone / install AutoModel (editable for local hacks)
+# clone / install Automodel (editable for local hacks)
 cd /path/to/workspace/ # specify to your path as needed.
 git clone git@github.com:NVIDIA-NeMo/AutoModel.git
 cd AutoModel/
-pip install -e .[all]    # installs NeMo AutoModel + optional extras
+pip install -e .[all]    # installs NeMo Automodel + optional extras
 ```
 
 :::note
@@ -35,10 +35,10 @@ You can run this guide with a single GPU by changing the config.
 
 ---
 
-## 2. Pre-process the FineWeb dataset
+## Pre-process the FineWeb Dataset
 
-### Quick intro to the FineWeb dataset
-The 🍷 [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) dataset consists of more than 18.5T tokens (originally 15T tokens) of cleaned and deduplicated english web data from [CommonCrawl](https://commoncrawl.org/). The data processing pipeline is optimized for LLM performance and ran on the 🏭 datatrove library, our large scale data processing library.
+### Quick Intro to the FineWeb Dataset
+The [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) dataset consists of more than 18.5T tokens (originally 15T tokens) of cleaned and deduplicated English web data from [CommonCrawl](https://commoncrawl.org/). The data processing pipeline is optimized for LLM performance and runs on the datatrove library, our large-scale data processing library.
 
 Briefly, FineWeb is built by extracting main text from CommonCrawl WARC HTML, keeping English pages via fastText language scoring, applying multiple quality filters (e.g., Gopher repetition/quality checks, C4-style rules, and custom heuristics for list-like or repeated/poorly formatted lines), and then MinHash-deduplicating each crawl independently (5-gram shingling with 14×8 hash functions). Basic PII normalization is applied (e.g., anonymizing emails and public IPs). The result is released per-crawl (and convenient sampled subsets), ready for high-throughput streaming.
 
@@ -71,11 +71,11 @@ Consider the following options:
 
 ---
 
-## 3. Introduction to the NeMo AutoModel training workflow
+## Understand the NeMo Automodel Training Workflow
 
-NeMo AutoModel follows a simple but powerful flow for training:
+NeMo Automodel follows a simple but powerful flow for training:
 
-1. A Python recipe script (for example, [`examples/llm_pretrain/pretrain.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/pretrain.py)) is the entry point. It contains the trainign recipe. For configuration, it reads a YAML file and options can be overriden via CLI arguments (e.g., `--model.name abc`). The recipe wires up all training components.
+1. A Python recipe script (for example, [`examples/llm_pretrain/pretrain.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/pretrain.py)) serves as the entry point that wires up all training components based on a YAML configuration file. Any configuration option can be overridden via CLI arguments (e.g., `--model.name abc`).
 2. The YAML file describes each component of the training job (such as `model`, `dataset`, `optimizer`, `distributed`, `checkpoint`, and optional `wandb`).
 3. Each component is constructed from its `_target_`, which points to a Python callable (function or class constructor) to instantiate. The remaining keys in that YAML block become keyword arguments for that callable.
 
@@ -88,9 +88,9 @@ Nested objects can also specify their own `_target_` (common when building Huggi
 
 With this context, let’s define a model via `_target_`, then point the dataset at your preprocessed shards, and finally review the full YAML.
 
-## 4. Define your own model architecture
+## Define Your Own Model Architecture
 
-NeMo AutoModel relies on a YAML-driven configuration to build every training component. In particular, the `model._target_` must reference a callable that returns an `nn.Module` (or a compatible Hugging Face model). You can point `_target_` at:
+NeMo Automodel relies on a YAML-driven configuration to build every training component. In particular, the `model._target_` must reference a callable that returns an `nn.Module` (or a compatible Hugging Face model). You can point `_target_` at:
 
 - An import path to a Python object.
 - A local Python file plus the object name using `path.py:object_name`.
@@ -98,7 +98,7 @@ NeMo AutoModel relies on a YAML-driven configuration to build every training com
 
 Below are examples for each pattern.
 
-### 4.1 NanoGPT source and file-path `_target_`
+### NanoGPT Source and File-Path `_target_`
 
 Below is the minimal GPT‑2 [implementation](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/models/gpt2.py) used for this NanoGPT‑style pretraining flow.
 It is a pure‑PyTorch model with tied embeddings and standard transformer blocks:
@@ -310,7 +310,7 @@ model:
 
 This loads the file on disk and calls `build_gpt2_model(...)` with the remaining keys as keyword arguments.
 
-### 4.2 Import path to a callable (function or class)
+### Import Path to a Callable (Function or Class)
 
 Instead of a file path, you can reference the callable via its import path:
 
@@ -325,9 +325,9 @@ model:
   n_head: 12
 ```
 
-### 4.3 Hugging Face models via `from_config`
+### Hugging Face Models via `from_config` Function
 
-You can instantiate any Hugging Face causal LM with a config-first flow by targeting a `from_config` callable and providing a nested `config` node. The nested node is itself resolved via `_target_`, so you can compose HF configs directly in YAML.
+You can instantiate any Hugging Face causal LM with a config-first flow by targeting a `from_config` callable and providing a nested `config` node. The nested node is itself resolved via `_target_`, so you can compose Hugging Face configs directly in YAML.
 
 ```yaml
 model:
@@ -362,7 +362,7 @@ Notes:
 
 ---
 
-## 5. Inspect and adjust the YAML configuration
+## Inspect and Adjust the YAML Configuration
 
 [`examples/llm_pretrain/nanogpt_pretrain.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/nanogpt_pretrain.yaml) is a complete configuration that:
 * Defines a GPT-2 model via the `build_gpt2_model` shorthand (easy to scale up).
@@ -406,24 +406,24 @@ Scale **width/depth**, `batch_size`, or `seq_len` as needed - the recipe is mode
 
 ---
 
-## 6. Launch training
+## Launch Training
 
 ```bash
 # Single-GPU run (good for local testing)
 python examples/llm_pretrain/pretrain.py \
   --config examples/llm_pretrain/nanogpt_pretrain.yaml
 
-# Multi-GPU (e.g. 8x H100)
+# Multi-GPU (e.g., 8x H100)
 torchrun --standalone --nproc-per-node 8 \
   examples/llm_pretrain/pretrain.py \
   --config examples/llm_pretrain/nanogpt_pretrain.yaml
 
-# Using the AutoModel CLI:
+# Using the automodel CLI:
 # single-GPU
-AutoModel pretrain llm -c examples/llm_pretrain/nanogpt_pretrain.yaml
+automodel pretrain llm -c examples/llm_pretrain/nanogpt_pretrain.yaml
 
-# multi-GPU (AutoModel CLI + torchrun on 8 GPUs)
-AutoModel --nproc-per-node 8 \
+# multi-GPU (automodel CLI + torchrun on 8 GPUs)
+automodel --nproc-per-node 8 \
   $(which AutoModel) pretrain llm \
   -c examples/llm_pretrain/nanogpt_pretrain.yaml
 ```
@@ -440,9 +440,9 @@ Checkpoints are written under `checkpoints/` by default as `safetensors` or `tor
 
 ---
 
-## 7. Monitoring and evaluation
+## Monitor and Evaluate Training
 
-* **TPS** (tokens per second), **gradient norm** and **loss** statistics print every optimization step.
+* **TPS** (tokens per second), **gradient norm**, and **loss** statistics print every optimization step.
 * Enable `wandb` in the YAML for dashboards (`wandb.project`, `wandb.entity`, etc.).
 * Periodic checkpoints can be loaded via `TrainFinetuneRecipeForNextTokenPrediction.load_checkpoint()`.
 
@@ -456,9 +456,9 @@ wandb:
 
 ---
 
-## 8. Further work
+## Explore Further Work
 
-1. **Scaling up** - swap the GPT-2 config for `LlamaForCausalLM`, `Qwen2`, or any HF-compatible causal model; increase `n_layer`, `n_embd`, etc.
+1. **Scaling up**: Swap the GPT-2 config for `LlamaForCausalLM`, `Qwen2`, or any Hugging Face-compatible causal model; increase `n_layer`, `n_embd`, etc.
 2. **Mixed precision** - FSDP2 + `bfloat16` (`dtype: bfloat16` in distributed config) for memory savings.
 3. **Sequence packing** - set `packed_sequence.packed_sequence_size` > 0 to pack variable-length contexts and boost utilization.
 4. **Custom datasets** - implement your own `IterableDataset` or convert existing corpora to the `.bin` format using `tools/nanogpt_data_processor.py` as a template.
