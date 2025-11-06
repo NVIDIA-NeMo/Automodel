@@ -3,13 +3,13 @@
 This guide covers **FineWeb** data preparation, **defining** a [NanoGPT‑style](https://github.com/KellerJordan/modded-nanogpt) model, and **launching and monitoring** a NeMo Automodel pre‑training run.
 
 In particular, it will show you how to:
-1. [Install NeMo AutoModel from git](#1-environment-setup).
-2. [Pre-process and tokenize the FineWeb dataset](#2-pre-process-the-fineweb-dataset).
-3. [Introduction to the NeMo AutoModel training workflow](#3-introduction-to-the-nemo-automodel-training-workflow).
-4. [Define your own model architecture](#4-define-your-own-model-architecture).
-5. [Inspect and adjust the YAML configuration](#5-inspect-and-adjust-the-yaml-configuration).
-6. [Launch training](#6-launch-training).
-7. [Monitoring and evaluation](#7-monitoring-and-evaluation).
+1. [Install NeMo AutoModel from git](#set-up-your-environment).
+2. [Pre-process and tokenize the FineWeb dataset](#pre-process-the-fineWweb-dataset).
+3. [Introduction to the NeMo AutoModel training workflow](#understand-the-nemo-automodel-training-workflow).
+4. [Define your own model architecture](#define-your-own-model-architecture).
+5. [Inspect and adjust the YAML configuration](#inspect-and-adjust-the-yaml-configuration).
+6. [Launch training](#launch-training).
+7. [Monitoring and evaluation](#monitor-and-evaluate-training).
 
 ---
 
