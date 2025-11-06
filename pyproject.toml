@@ -83,7 +83,7 @@ dependencies = [
     "torchdata",
     "transformers<=4.57.1",
     "wandb",
-    "torchao"
+    "torchao>=0.14.1"
 ]
 
 [project.optional-dependencies]
