@@ -100,6 +100,10 @@ class FSDP2Manager:
         default=False,
         metadata={"help": "Use Hugging Face TP plan if True."},
     )
+    custom_tp_plan: Optional[dict] = field(
+        default=None,
+        metadata={"help": "Custom TP plan for FSDP2."},
+    )
     mp_policy: Optional[MixedPrecisionPolicy] = field(
         default=MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
@@ -291,7 +295,7 @@ class FSDP2Manager:
             tp_shard_plan = _get_parallel_plan(
                 model,
                 sequence_parallel=bool(self.sequence_parallel),
-                tp_shard_plan=None,
+                tp_shard_plan=self.custom_tp_plan,
                 use_hf_tp_plan=self.use_hf_tp_plan,
             )
         else:
