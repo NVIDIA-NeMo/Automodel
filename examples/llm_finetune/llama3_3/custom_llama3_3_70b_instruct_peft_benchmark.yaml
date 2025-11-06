@@ -27,11 +27,9 @@ rng:
   ranked: true
 
 model:
-  _target_: nemo_automodel.components.models.llama.build_llama_model
+  _target_: nemo_automodel.components.models.llama.model.build_llama_model
   pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
   torch_dtype: bf16
-  use_fused_qkv: true   # Enable fused QKV projection
-  use_fused_gate_up: true  # Enable fused gate_up projection
   is_meta_device: true  # Use meta device to avoid OOM during initialization
 
 peft:
@@ -43,7 +41,6 @@ peft:
 
 checkpoint:
   enabled: false
-  load_base_model: false
   checkpoint_dir: checkpoints/
   model_save_format: safetensors
   save_consolidated: false

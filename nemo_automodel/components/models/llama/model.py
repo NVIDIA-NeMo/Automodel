@@ -14,20 +14,21 @@
 
 """Custom Llama model implementation for NeMo Automodel.
 
-This module provides a self-contained Llama implementation with combined QKV/gate_up projections.
-Following HuggingFace's implementation.
+This module provides a self-contained Llama implementation with combined QKV and gate_up projections
+for improved efficiency. Following HuggingFace's implementation with optimizations.
 
 Example (YAML):
 
 ```yaml
 model:
-  _target_: nemo_automodel.components.models.llama.build_llama_model
+  _target_: nemo_automodel.components.models.llama.model.build_llama_model
   pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
 ```
 """
 
 from __future__ import annotations
 
+import os
 from typing import Any, Callable, Optional, Union
 
 import torch
@@ -39,9 +40,6 @@ from transformers.masking_utils import create_causal_mask
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.models.llama.modeling_llama import (
-    LlamaMLP as HFLlamaMLP,  # HuggingFace's standard MLP
-)
 
 # Import HuggingFace's Llama components directly to ensure exact same behavior
 from transformers.models.llama.modeling_llama import (
@@ -54,19 +52,20 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.generic import check_model_inputs
 
+from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
+from nemo_automodel.components.moe.utils import BackendConfig
 from nemo_automodel.shared.utils import dtype_from_str
 
 __all__ = ["build_llama_model", "LlamaForCausalLM"]
 
 
 class LlamaAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper with optional fused QKV."""
+    """Multi-headed attention from 'Attention Is All You Need' paper with combined QKV projection."""
 
     def __init__(
         self,
         config: LlamaConfig,
         layer_idx: int,
-        use_fused_qkv: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -76,23 +75,16 @@ class LlamaAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
-        self.use_fused_qkv = use_fused_qkv
 
         self.q_size = config.num_attention_heads * self.head_dim
         self.kv_size = config.num_key_value_heads * self.head_dim
 
-        if use_fused_qkv:
-            # Combined QKV projection for improved efficiency
-            self.qkv_proj = nn.Linear(
-                config.hidden_size,
-                (config.num_attention_heads + 2 * config.num_key_value_heads) * self.head_dim,
-                bias=config.attention_bias,
-            )
-        else:
-            # Separate Q, K, V projections (standard HuggingFace)
-            self.q_proj = nn.Linear(config.hidden_size, self.q_size, bias=config.attention_bias)
-            self.k_proj = nn.Linear(config.hidden_size, self.kv_size, bias=config.attention_bias)
-            self.v_proj = nn.Linear(config.hidden_size, self.kv_size, bias=config.attention_bias)
+        # Combined QKV projection for improved efficiency
+        self.qkv_proj = nn.Linear(
+            config.hidden_size,
+            (config.num_attention_heads + 2 * config.num_key_value_heads) * self.head_dim,
+            bias=config.attention_bias,
+        )
 
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
@@ -110,20 +102,14 @@ class LlamaAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        if self.use_fused_qkv:
-            # Combined QKV projection and split
-            qkv = self.qkv_proj(hidden_states)
-            # Compute split sizes based on actual tensor size (handles TP sharding)
-            qkv_size = qkv.shape[-1]
-            total_size = self.q_size + 2 * self.kv_size
-            local_q_size = (self.q_size * qkv_size) // total_size
-            local_kv_size = (self.kv_size * qkv_size) // total_size
-            q, k, v = qkv.split([local_q_size, local_kv_size, local_kv_size], dim=-1)
-        else:
-            # Separate Q, K, V projections
-            q = self.q_proj(hidden_states)
-            k = self.k_proj(hidden_states)
-            v = self.v_proj(hidden_states)
+        # Combined QKV projection and split
+        qkv = self.qkv_proj(hidden_states)
+        # Compute split sizes based on actual tensor size (handles TP sharding)
+        qkv_size = qkv.shape[-1]
+        total_size = self.q_size + 2 * self.kv_size
+        local_q_size = (self.q_size * qkv_size) // total_size
+        local_kv_size = (self.kv_size * qkv_size) // total_size
+        q, k, v = qkv.split([local_q_size, local_kv_size, local_kv_size], dim=-1)
 
         query_states = q.view(hidden_shape).transpose(1, 2)
         key_states = k.view(hidden_shape).transpose(1, 2)
@@ -159,12 +145,8 @@ class LlamaAttention(nn.Module):
         return attn_output, attn_weights
 
 
-class FusedLlamaMLP(nn.Module):
-    """SwiGLU MLP with fused gate_up projection for efficiency.
-
-    This is an experimental optimization that fuses gate_proj and up_proj into a single projection.
-    Note: May not always be faster than separate projections due to split overhead.
-    """
+class LlamaMLP(nn.Module):
+    """SwiGLU MLP with combined gate_up projection for efficiency."""
 
     def __init__(self, config: LlamaConfig):
         super().__init__()
@@ -172,7 +154,7 @@ class FusedLlamaMLP(nn.Module):
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
 
-        # Fused gate and up projections
+        # Combined gate and up projections
         self.gate_up_proj = nn.Linear(self.hidden_size, 2 * self.intermediate_size, bias=config.mlp_bias)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         from transformers.activations import ACT2FN
@@ -200,8 +182,6 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         self,
         config: LlamaConfig,
         layer_idx: int,
-        use_fused_qkv: bool = False,
-        use_fused_gate_up: bool = False,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -209,14 +189,9 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         self.self_attn = LlamaAttention(
             config=config,
             layer_idx=layer_idx,
-            use_fused_qkv=use_fused_qkv,
         )
 
-        # Use HuggingFace's standard MLP or our fused version
-        if use_fused_gate_up:
-            self.mlp = FusedLlamaMLP(config=config)
-        else:
-            self.mlp = HFLlamaMLP(config=config)
+        self.mlp = LlamaMLP(config=config)
 
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -284,8 +259,6 @@ class LlamaModel(LlamaPreTrainedModel):
     def __init__(
         self,
         config: LlamaConfig,
-        use_fused_qkv: bool = False,
-        use_fused_gate_up: bool = False,
     ):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
@@ -297,8 +270,6 @@ class LlamaModel(LlamaPreTrainedModel):
                 LlamaDecoderLayer(
                     config=config,
                     layer_idx=layer_idx,
-                    use_fused_qkv=use_fused_qkv,
-                    use_fused_gate_up=use_fused_gate_up,
                 )
                 for layer_idx in range(config.num_hidden_layers)
             ]
@@ -389,20 +360,58 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
     def __init__(
         self,
         config: LlamaConfig,
-        use_fused_qkv: bool = False,
-        use_fused_gate_up: bool = False,
+        backend: Optional[BackendConfig] = None,
     ):
         super().__init__(config)
-        self.model = LlamaModel(
-            config=config,
-            use_fused_qkv=use_fused_qkv,
-            use_fused_gate_up=use_fused_gate_up,
-        )
+        self.config = config
+        self.backend = backend or BackendConfig()
+        self.model = LlamaModel(config=config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+        # Create state_dict_adapter if enabled
+        if self.backend.enable_hf_state_dict_adapter:
+            self.state_dict_adapter = LlamaStateDictAdapter(config=self.config)
+
         # Initialize weights and apply final processing
         self.post_init()
+
+    def save_pretrained_hf_format(self, save_directory: str, **kwargs):
+        """Save model in HuggingFace-compatible format by converting combined projections.
+
+        This method converts the custom model's combined projections (qkv_proj, gate_up_proj)
+        back to HuggingFace's separate projections format before saving, making the checkpoint
+        loadable with AutoModelForCausalLM.from_pretrained().
+
+        Args:
+            save_directory: Directory where the model will be saved
+            **kwargs: Additional arguments passed to config.save_pretrained and save_file
+        """
+        from safetensors.torch import save_file
+
+        os.makedirs(save_directory, exist_ok=True)
+
+        # Save config
+        self.config.save_pretrained(save_directory)
+
+        # Convert state dict to HF format
+        if hasattr(self, "state_dict_adapter"):
+            custom_state_dict = self.state_dict()
+            hf_state_dict = self.state_dict_adapter.to_hf(custom_state_dict)
+        else:
+            hf_state_dict = self.state_dict()
+
+        # Handle tied weights: remove duplicate tied weights before saving
+        # In Llama, lm_head.weight is tied to model.embed_tokens.weight
+        # HuggingFace expects only model.embed_tokens.weight to be saved
+        if "lm_head.weight" in hf_state_dict and "model.embed_tokens.weight" in hf_state_dict:
+            # Check if they actually share memory
+            if hf_state_dict["lm_head.weight"].data_ptr() == hf_state_dict["model.embed_tokens.weight"].data_ptr():
+                # Remove lm_head.weight as it's tied to embed_tokens
+                hf_state_dict = {k: v for k, v in hf_state_dict.items() if k != "lm_head.weight"}
+
+        # Save weights
+        save_file(hf_state_dict, os.path.join(save_directory, "model.safetensors"))
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -482,10 +491,10 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
 
 
 def build_llama_model(pretrained_model_name_or_path: str, **kwargs: Any) -> nn.Module:
-    """Build a custom Llama model with optional fused projections.
+    """Build a custom Llama model with combined projections for efficiency.
 
     This function loads the config from a HuggingFace model card and builds
-    a custom Llama model with optional fused QKV and gate_up projections for efficiency.
+    a custom Llama model with combined QKV and gate_up projections for improved efficiency.
 
     Args:
         pretrained_model_name_or_path: HuggingFace model card name (e.g., "meta-llama/Meta-Llama-3-70B")
@@ -502,35 +511,22 @@ def build_llama_model(pretrained_model_name_or_path: str, **kwargs: Any) -> nn.M
                   - attention_dropout: Attention dropout probability
                   - pad_token_id: Padding token ID
                   - attn_implementation: Attention backend ("eager", "sdpa", "flash_attention_2")
-                  - use_fused_qkv: Whether to use fused QKV projection (default: True)
-                  - use_fused_gate_up: Whether to use fused gate_up projection (default: True)
+                  - torch_dtype: Model dtype (default: bfloat16)
 
     Returns:
-        LlamaForCausalLM model instance
+        LlamaForCausalLM model instance with combined projections
 
     Example:
-        # Load with fused projections (efficient)
-        model = build_llama_model("meta-llama/Meta-Llama-3-70B",
-                                   use_fused_qkv=True,
-                                   use_fused_gate_up=True)
-
-        # Load with separate projections (matches HuggingFace exactly)
-        model = build_llama_model("meta-llama/Meta-Llama-3-70B",
-                                   use_fused_qkv=False,
-                                   use_fused_gate_up=False)
+        # Load with default settings (combined projections, bfloat16)
+        model = build_llama_model("meta-llama/Meta-Llama-3-70B")
 
         # Use SDPA for faster attention
         model = build_llama_model("meta-llama/Meta-Llama-3-70B",
-                                   attn_implementation="sdpa",
-                                   use_fused_gate_up=True)
+                                   attn_implementation="sdpa")
 
         # Override for testing with fewer layers
         model = build_llama_model("meta-llama/Meta-Llama-3-70B", num_hidden_layers=4)
     """
-    # Extract fusion options (not part of HuggingFace config)
-    use_fused_qkv = kwargs.pop("use_fused_qkv", False)
-    use_fused_gate_up = kwargs.pop("use_fused_gate_up", False)
-
     # Extract and convert torch_dtype
     torch_dtype = kwargs.pop("torch_dtype", None)
     if torch_dtype is not None and isinstance(torch_dtype, str):
@@ -569,16 +565,13 @@ def build_llama_model(pretrained_model_name_or_path: str, **kwargs: Any) -> nn.M
 
     if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
         print(f"[build_llama_model] Attention implementation: {config._attn_implementation}")
-        print(f"[build_llama_model] Use fused QKV: {use_fused_qkv}")
-        print(f"[build_llama_model] Use fused gate_up: {use_fused_gate_up}")
         print(f"[build_llama_model] torch_dtype: {torch_dtype}")
 
-    # Create model with specified dtype
-    model = LlamaForCausalLM(
-        config=config,
-        use_fused_qkv=use_fused_qkv,
-        use_fused_gate_up=use_fused_gate_up,
-    )
+    # Create backend config with HF state dict adapter enabled
+    backend = BackendConfig(enable_hf_state_dict_adapter=True)
+
+    # Create model with combined projections
+    model = LlamaForCausalLM(config=config, backend=backend)
 
     # need to convert model manually since LlamaForCausalLM does not support to(dtype=...)
     model = model.to(dtype=torch_dtype)
