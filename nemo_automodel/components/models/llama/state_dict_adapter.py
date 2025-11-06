@@ -110,6 +110,7 @@ def _safe_concat(tensors: list[torch.Tensor], dim: int = 0) -> torch.Tensor:
         # Regular tensors: normal concat
         return torch.cat(tensors, dim=dim)
 
+
 # -from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 # LlamaStateDictAdapter should be a subclass of StateDictAdapter, but import-linter complains about it.
 class LlamaStateDictAdapter:
