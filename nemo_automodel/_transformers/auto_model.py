@@ -269,6 +269,69 @@ def _move_module_to_device(module: torch.nn.Module, device: torch.device, torch_
     else:
         module.to(device=device)
 
+def _get_arch_name_from_config(pretrained_model_name_or_path, trust_remote_code: bool) -> str | None:
+    try:
+        config = AutoConfig.from_pretrained(
+            pretrained_model_name_or_path, trust_remote_code=trust_remote_code,
+        )
+        return config.architectures[0], config
+    except Exception:
+        return None, None
+
+def _get_model_from_nemo_registry(pretrained_model_name_or_path, model_args, kwargs) -> PreTrainedModel | None:
+    try:
+        arch_name, config = _get_arch_name_from_config(
+            pretrained_model_name_or_path, bool(kwargs.get("trust_remote_code", False))
+        )
+        # if we have a custom model implementation available, we prioritize that over HF
+        model_cls = ModelRegistry.model_arch_name_to_cls.get(arch_name, None)
+        if model_cls is None:
+            return None
+        # if we are able to init the custom model, we will now download the model weights on local rank 0
+        if (
+            not dist.is_initialized() or int(os.environ.get("LOCAL_RANK", "0")) == 0
+        ) and not os.path.isdir(pretrained_model_name_or_path):
+            num_nodes = (
+                dist.get_world_size() % int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+            ) + 1  # 1-indexed
+            if num_nodes > 1:
+                logging.info(
+                    f"""Downloading model weights on {num_nodes} nodes. This incurs high storage usage. 
+                    It is recommended to download once with `hf download` and pass in the downloaded path to the `pretrained_model_name_or_path` argument."""
+                )
+            _get_resolved_checkpoint_files(
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                subfolder="",
+                variant=None,
+                gguf_file=None,
+                from_tf=False,
+                from_flax=False,
+                use_safetensors=None,
+                cache_dir=None,
+                force_download=False,
+                proxies=None,
+                local_files_only=False,
+                token=None,
+                user_agent={"file_type": "model", "framework": "pytorch", "from_auto_class": False},
+                revision="main",
+                commit_hash=getattr(config, "_commit_hash", None),
+                is_remote_code=False,
+                transformers_explicit_filename=None,
+            )
+        if dist.is_initialized():
+            dist.barrier()
+        logger.info(f"Using custom model implementation for {config.architectures[0]}")
+        return model_cls(config, *model_args, **kwargs)
+    except Exception as e:
+        logger.error(f"Failed to use custom model implementation with error: {e}")
+        return None
+
+def _is_distributed_model_init(device_mesh, distributed) -> bool:
+    if isinstance(device_mesh, DeviceMesh) and device_mesh.size() > 1:
+        return True
+    if isinstance(distributed, dict) and len(distributed) > 0:
+        return True
+    return False
 
 def _download_model_weights(hf_config, pretrained_model_name_or_path):
     if not os.path.isdir(pretrained_model_name_or_path):
@@ -441,6 +504,20 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
+                **kwargs,
+            )
+
+        if _is_distributed_model_init(device_mesh, distributed):
+            return cls.from_pretrained_distributed(
+                pretrained_model_name_or_path,
+                *model_args,
+                use_liger_kernel=use_liger_kernel,
+                use_sdpa_patching=use_sdpa_patching,
+                sdpa_method=sdpa_method,
+                torch_dtype=torch_dtype,
+                attn_implementation=attn_implementation,
+                quantization_config=quantization_config,
+                force_hf=force_hf,
                 device_mesh=device_mesh,
                 distributed=distributed,
                 device=device,
@@ -489,6 +566,123 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 logging.warning("Falling back to {} attention.".format(attn_implementation))
                 return _retry(attn_implementation=attn_implementation)
             raise e
+
+        # Kernel patching
+        try:
+            if use_liger_kernel:
+                model = _patch_liger_kernel(model)
+        except RuntimeError:
+            logging.warning("Retrying without Liger kernels.")
+            del model
+            gc.collect()
+            return _retry(use_liger_kernel=False)
+
+        # Patch sdpa attention
+        try:
+            if use_sdpa_patching:
+                model = _patch_attention(model, sdpa_method)  # noqa: F821
+        except:
+            logging.warning("Retrying without SDPA patching.")
+            return _retry(use_sdpa_patching=False)
+
+        model.config.update({"nemo_version": __version__})
+        return model
+
+    @classmethod
+    def from_pretrained_distributed(
+        cls,
+        pretrained_model_name_or_path,
+        *model_args,
+        use_liger_kernel,
+        use_sdpa_patching,
+        sdpa_method,
+        torch_dtype,
+        attn_implementation,
+        quantization_config,
+        force_hf,
+        device_mesh,
+        distributed,
+        device,
+        move_to_device,
+        **kwargs,
+    ) -> PreTrainedModel:
+        assert _is_distributed_model_init(device_mesh, distributed), "Distributed model initialization requires a device_mesh and distributed dictionary"
+
+        torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
+        
+        # Determine if this is an HF model
+        kwargs_copy = kwargs.copy()
+        kwargs_copy["trust_remote_code"] = kwargs_copy.get(
+            "trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path)
+        )
+        try:
+            hf_config = AutoConfig.from_pretrained(
+                pretrained_model_name_or_path, trust_remote_code=kwargs_copy["trust_remote_code"]
+            )
+            architectures = getattr(hf_config, "architectures", None) or []
+            is_hf_model = (not architectures or architectures[0] not in ModelRegistry.model_arch_name_to_cls) or force_hf
+        except Exception:
+            is_hf_model = True
+        
+        # Extract cp_size from distributed config
+        cp_size = 1
+        if distributed is not None and isinstance(distributed, dict):
+            cp_size = int(distributed.get("cp_size", 1))
+
+        def _retry(**override):
+            """Internal helper to re-enter this function with patched args."""
+            kwargs["quantization_config"] = quantization_config
+            if "quantization_config" in override:
+                if override["quantization_config"] is None:
+                    kwargs.pop("quantization_config")
+                else:
+                    kwargs["quantization_config"] = override["quantization_config"]
+
+            return cls.from_pretrained(
+                pretrained_model_name_or_path,
+                *model_args,
+                torch_dtype=torch_dtype,
+                attn_implementation=override.get("attn_implementation", attn_implementation),
+                use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
+                use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
+                sdpa_method=sdpa_method,
+                device_mesh=device_mesh,
+                distributed=distributed,
+                device=device,
+                move_to_device=move_to_device,
+                **kwargs,
+            )
+
+        # load model
+        # First try to load from the NeMo registry
+        model = None
+        if not force_hf:
+            model = _get_model_from_nemo_registry(pretrained_model_name_or_path, model_args, kwargs)
+        
+        # If not found in the NeMo registry, load from the HF registry
+        if model is None:
+            try:
+                name = cls.__name__
+                if name.startswith("NeMo"):
+                    cls.__name__ = name[4:]
+                if quantization_config is not None:
+                    kwargs["quantization_config"] = quantization_config
+                model = super().from_pretrained(
+                    pretrained_model_name_or_path,
+                    *model_args,
+                    torch_dtype=torch_dtype,
+                    attn_implementation=attn_implementation,
+                    **kwargs,
+                )
+                cls.__name__ = name
+            except ValueError as e:
+                if "does not support" in str(e):
+                    if model is not None:
+                        del model
+                    attn_implementation = _get_next_fallback_attn(attn_implementation)
+                    logging.warning("Falling back to {} attention.".format(attn_implementation))
+                    return _retry(attn_implementation=attn_implementation)
+                raise e
 
         # Copy state dict keys before any parallelization (used by checkpointing)
         try:
