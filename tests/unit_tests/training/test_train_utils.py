@@ -17,6 +17,11 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+import pytest
+import torch
+import torch.nn as nn
+
+from nemo_automodel.components.training.utils import move_to_device, ScopedModuleOffloading
 from nemo_automodel.components.training.utils import clip_grad_norm, count_tail_padding
 
 
@@ -127,3 +132,70 @@ def test_clip_grad_norm_returns_zero_when_max_grad_norm_is_none():
     )
 
     assert grad_norm == 0
+
+
+class _TinyModule(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(4, 2, bias=False)
+        self.register_buffer("scale", torch.ones(1))
+
+
+def _all_tensors_on_device(module: nn.Module, device_type: str) -> bool:
+    for p in module.parameters():
+        if p.device.type != device_type:
+            return False
+    for b in module.buffers():
+        if b.device.type != device_type:
+            return False
+    return True
+
+
+def test_move_to_device_cpu():
+    model = _TinyModule()
+    # Ensure starts on CPU
+    assert _all_tensors_on_device(model, "cpu")
+
+    # Move to CPU (idempotent)
+    move_to_device(model, "cpu")
+    assert _all_tensors_on_device(model, "cpu")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_move_to_device_cuda():
+    model = _TinyModule()
+    # Move to CUDA
+    move_to_device(model, "cuda")
+    assert _all_tensors_on_device(model, "cuda")
+
+    # Move back to CPU to leave environment clean
+    move_to_device(model, "cpu")
+    assert _all_tensors_on_device(model, "cpu")
+
+
+def test_scoped_offloading_disabled_noop_and_reraises():
+    model = _TinyModule()
+    assert _all_tensors_on_device(model, "cpu")
+
+    with pytest.raises(ValueError):
+        with ScopedModuleOffloading(model, enabled=False):
+            # Should not move devices and should re-raise exceptions
+            assert _all_tensors_on_device(model, "cpu")
+            raise ValueError("boom")
+
+    # After context, still on CPU
+    assert _all_tensors_on_device(model, "cpu")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_scoped_offloading_enabled_moves_and_reraises():
+    model = _TinyModule()
+    assert _all_tensors_on_device(model, "cpu")
+
+    # Enter moves to CUDA, exit moves back to CPU and re-raises exceptions
+    with pytest.raises(RuntimeError):
+        with ScopedModuleOffloading(model, enabled=True):
+            assert _all_tensors_on_device(model, "cuda")
+            raise RuntimeError("fail inside context")
+
+    assert _all_tensors_on_device(model, "cpu")
