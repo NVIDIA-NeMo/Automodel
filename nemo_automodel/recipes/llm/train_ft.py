@@ -839,6 +839,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             run = build_wandb(self.cfg)
             logging.info("🚀 View run at {}".format(run.url))
 
+        self.mlflow_logger = None
         if self.dist_env.is_main and hasattr(self.cfg, "mlflow"):
             self.mlflow_logger = build_mlflow(self.cfg)
             self.mlflow_logger.log_params(self.cfg.to_dict())
