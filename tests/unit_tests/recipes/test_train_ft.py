@@ -15,11 +15,46 @@
 import logging
 from unittest.mock import MagicMock, Mock, patch
 import pytest
-from nemo_automodel.recipes.llm.train_ft import _get_packed_sequence_config, build_validation_dataloader, build_model_and_optimizer
+from nemo_automodel.recipes.llm.train_ft import _get_packed_sequence_config, build_validation_dataloader, build_dataloader, build_model_and_optimizer
 from nemo_automodel.components.config.loader import ConfigNode
 from unittest.mock import patch
+import importlib
 import torch
 import torch.nn as nn
+from torch.utils.data import IterableDataset
+
+
+class DummyIterableDataset(IterableDataset):  # noqa: D401
+    """Minimal iterable dataset with shard/shuffle hooks for testing build_dataloader."""
+
+    def __init__(self, items=None, num_shards=1, tokenizer=None, **kwargs):
+        super().__init__()
+        self.items = items or list(range(10))
+        self.num_shards = num_shards
+        self._shard = None
+        self._shuffle_calls = []
+        self.dataset = self.items  # mimic underlying HF dataset holder
+
+    def __iter__(self):  # pragma: no cover - iteration not needed in these tests
+        it = self.items
+        if self._shard is not None:
+            n, idx = self._shard
+            it = [x for i, x in enumerate(it) if i % n == idx]
+        for x in it:
+            yield x
+
+    def shard(self, num_shards, index):
+        self._shard = (num_shards, index)
+        return self
+
+    def shuffle(self, buffer_size: int, seed: int):
+        self._shuffle_calls.append((buffer_size, seed))
+        return self
+
+
+def dl_factory_capture(**kwargs):  # returns a sentinel while exposing passed kwargs via attribute
+    dl_factory_capture.captured = kwargs
+    return "dl"
 
 
 @pytest.mark.parametrize(
@@ -282,3 +317,59 @@ def test_peft_with_tp_disables_triton(caplog):
 
                     # Verify the TP log message was generated
                     assert "Disabling Triton with TP" in caplog.text
+
+
+def test_build_dataloader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatch):
+    # cfg_ds: target resolves to this test module dataset class
+    cfg_ds = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.DummyIterableDataset",
+            "tokenizer": None,
+            "num_shards": 4,
+        }
+    )
+    # cfg_dl: target captures kwargs and returns sentinel
+    cfg_dl = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture",
+            "shuffle": True,
+            "shuffle_buffer_size": 8,
+            "num_workers": 0,
+        }
+    )
+    cfg_model = ConfigNode({})
+    cfg_ps = ConfigNode({})
+
+    dl, tok = build_dataloader(
+        cfg_ds=cfg_ds,
+        cfg_dl=cfg_dl,
+        cfg_model=cfg_model,
+        cfg_ps=cfg_ps,
+        seed=123,
+        local_batch_size=2,
+        global_batch_size=4,
+        max_steps=None,
+        val_check_interval=None,
+        dp_rank=1,
+        dp_world_size=2,
+        pp_enabled=False,
+        supports_seq_lens=True,
+        cp_size=1,
+    )
+
+    assert dl == "dl"
+    assert tok is None
+    mod = importlib.import_module("tests.unit_tests.recipes.test_train_ft")
+    captured = getattr(mod.dl_factory_capture, "captured")
+    # Ensure shuffle-related keys are not forwarded to DataLoader instantiation
+    assert "shuffle" not in captured and "shuffle_buffer_size" not in captured
+    ds = captured["dataset"]
+    # Avoid fragile identity issues from re-imports; validate by name and interface
+    assert ds.__class__.__name__ == "DummyIterableDataset"
+    # Shard path used when num_shards >= dp_world_size
+    assert ds._shard == (2, 1)
+    # Shuffle called with buffer size and seed
+    assert ds._shuffle_calls and ds._shuffle_calls[-1] == (8, 123)
+
+
+    
