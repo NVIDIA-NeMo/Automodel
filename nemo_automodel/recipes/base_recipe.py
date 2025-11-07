@@ -435,6 +435,11 @@ class BaseRecipe:
         dp_group = self._get_dp_group(include_cp=include_cp)
         return 1 if dp_group is None else dp_group.size()
 
+    def _get_cp_group_size(self):
+        if not self.device_mesh or self.device_mesh["cp"].size() == 1:
+            return 1
+        return self.device_mesh["cp"].size()
+
     def _get_dp_rank(self, include_cp: bool = False):
         if not self.device_mesh:
             return 0
