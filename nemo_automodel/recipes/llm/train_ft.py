@@ -232,8 +232,8 @@ def build_model_and_optimizer(
 
     print_trainable_parameters(model)
 
-    # hold a copy of the model state dict keys before any parallelization
-    state_dict_keys = model.state_dict().keys()
+    # hold a list copy of the model state dict keys before any parallelization
+    state_dict_keys = list(model.state_dict().keys())
 
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")

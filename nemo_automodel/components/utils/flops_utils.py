@@ -180,7 +180,9 @@ def qwen3_flops(config, gbs=1, seq_len=None):
     attention_heads = config.num_attention_heads
     query_groups = config.num_key_value_heads if hasattr(config, "num_key_value_heads") else attention_heads
     vocab_size = config.vocab_size
-    query_projection_to_hidden_size_ratio = (config.head_dim * attention_heads) / hs
+    # Calculate head_dim if not present (for Qwen2) or use directly (for Qwen3)
+    head_dim = config.head_dim if hasattr(config, "head_dim") else (hs // attention_heads)
+    query_projection_to_hidden_size_ratio = (head_dim * attention_heads) / hs
 
     # MoE fields - Qwen3 uses "moe_topk" if present, else dense (1)
     moe_router_topk = config.num_experts_per_tok if hasattr(config, "num_experts_per_tok") else 1

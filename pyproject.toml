@@ -242,3 +242,6 @@ modules = [
     "nemo_automodel.components.training",
     "nemo_automodel.components.utils",
 ]
+ignore_imports = [
+    "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.llama.model",
+]

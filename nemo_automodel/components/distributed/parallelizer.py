@@ -886,7 +886,9 @@ def _get_parallel_plan(
             "model.layers.*.self_attn.q_proj": ColwiseParallel(),
             "model.layers.*.self_attn.k_proj": ColwiseParallel(),
             "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),  # Combined QKV projection
             "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+            "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),  # Fused gate and up projection
             "model.layers.*.mlp.up_proj": ColwiseParallel(),
             "model.layers.*.mlp.gate_proj": ColwiseParallel(),
             "model.layers.*.mlp.down_proj": RowwiseParallel(),

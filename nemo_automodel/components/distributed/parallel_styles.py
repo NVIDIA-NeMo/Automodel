@@ -56,6 +56,16 @@ class ColwiseParallelLora(ColwiseParallel):
             _module, _name = _get_module_and_name(module, name)
             _distribute_param(_module, _name, device_mesh, self.src_data_rank, [Shard(0)])
 
+        # Register forward hook on lora_A to all-gather its low rank output
+        def lora_a_output_hook(module, input, output):
+            if isinstance(output, DTensor):
+                if any(isinstance(p, Shard) for p in output.placements):
+                    output = output.redistribute(device_mesh=output.device_mesh, placements=[Replicate()])
+            return output
+
+        if hasattr(module, "lora_A"):
+            module.lora_A.register_forward_hook(lora_a_output_hook)
+
     def _partition_embedding_fn(self, name, module, device_mesh):
         # colwise shard embedding.weight is straight forward as Shard(1)
         for name, param in module.named_parameters():
