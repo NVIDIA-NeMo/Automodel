@@ -21,6 +21,8 @@ from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict
 
 import torch
+from torch.utils.data import IterableDataset
+from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers.utils.hub import TRANSFORMERS_CACHE
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
@@ -29,11 +31,12 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
+from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricLoggerDist, MetricsSample
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
-from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
@@ -50,9 +53,6 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------
-#  Stateless helper functions
-# ---------------------------
 def _unpack_qp(inputs: Dict[str, torch.Tensor]) -> tuple:
     """Unpack query and passage inputs from batch dictionary.
 
@@ -183,7 +183,7 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamSch
     default_kwargs = dict(
         lr_warmup_steps=min(1000, total_steps // 10),  # 10% warmup or max 1000 steps
         lr_decay_steps=total_steps,
-        lr_decay_style="cosine",
+        lr_decay_style="linear",
         wd_incr_steps=total_steps,
         wd_incr_style="constant",
     )
@@ -196,9 +196,9 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamSch
         default_kwargs.update(
             dict(
                 optimizer=opt,
-                init_lr=base_lr * 0.1,  # Start warmup at 10% of base LR
+                init_lr=0.0,
                 max_lr=base_lr,
-                min_lr=base_lr * 0.01,  # End at 1% of base LR
+                min_lr=0.0,
                 start_wd=opt.param_groups[0].get("weight_decay", 0.0),
                 end_wd=opt.param_groups[0].get("weight_decay", 0.0),
             )
@@ -242,6 +242,59 @@ def get_sync_ctx(model, sync_this_step):
     if hasattr(model, "no_sync") and not sync_this_step:
         return model.no_sync()
     return nullcontext()
+
+
+def build_dataloader(cfg_dl, tokenizer, seed, batch_size=None, dp_rank=0, dp_world_size=1):
+    """Build a DataLoader for biencoder training.
+
+    Args:
+        cfg_dl: DataLoader configuration.
+        tokenizer: The tokenizer to use for collate_fn.
+        seed: Random seed.
+        batch_size: Batch size for the dataloader. Optional.
+        dp_rank: Data parallel rank.
+        dp_world_size: Data parallel world size.
+
+    Returns:
+        The instantiated DataLoader.
+    """
+    with ScopedRNG(seed=seed, ranked=True):
+        # Build dataset
+        with FirstRankPerNode():
+            dataset = cfg_dl.dataset.instantiate()
+
+        # Build collate_fn if it's a ConfigNode with _target_
+        collate_fn = None
+        if hasattr(cfg_dl, "collate_fn") and hasattr(cfg_dl.collate_fn, "_target_"):
+            collate_fn = cfg_dl.collate_fn.instantiate(tokenizer=tokenizer)
+
+        # Build dataloader with instantiated components
+        if not isinstance(dataset, IterableDataset):
+            shuffle = cfg_dl.get("shuffle", True)
+            if "shuffle" in cfg_dl:
+                del cfg_dl.shuffle
+
+            dist_sampler_kwargs = {
+                "num_replicas": dp_world_size,
+                "rank": dp_rank,
+                "shuffle": shuffle,
+            }
+            sampler = StatefulDistributedSampler(
+                dataset,
+                seed=seed,
+                drop_last=True,
+                **dist_sampler_kwargs,
+            )
+            dl_kwargs = {"sampler": sampler, "batch_size": batch_size}
+        else:
+            logging.info("Using IterableDataset; skipping sampler.")
+            dl_kwargs = {"dataset": dataset, "batch_size": batch_size}
+
+        dl_kwargs["dataset"] = dataset
+        if collate_fn is not None:
+            dl_kwargs["collate_fn"] = collate_fn
+
+        return cfg_dl.instantiate(**dl_kwargs)
 
 
 class TrainBiencoderRecipe(BaseRecipe):
@@ -372,6 +425,9 @@ class TrainBiencoderRecipe(BaseRecipe):
         if self.model_wrapper is not None:
             model = self.model_wrapper.parallelize(model)
 
+        # Ensure the model is on the correct device
+        model = model.to(self.dist_env.device)
+
         # Setup model_parts for consistency with train_ft.py
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
@@ -386,18 +442,40 @@ class TrainBiencoderRecipe(BaseRecipe):
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         self.optimizer = [self.cfg.optimizer.instantiate(params=trainable_params)]
 
-        # Build dataloader
-        logger.info("Building dataloader...")
-        self.dataloader = self.cfg.dataloader.instantiate()
-
         # Build tokenizer
         self.tokenizer = self.cfg.tokenizer.instantiate()
+
+        # Set up padding token if not present
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.padding_side = "left"
+
+        # Build dataloader
+        logger.info("Building dataloader...")
+        self.dataloader = build_dataloader(
+            self.cfg.dataloader,
+            self.tokenizer,
+            seed=self.cfg.get("seed", 42),
+            batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+            dp_rank=self._get_dp_rank(),
+            dp_world_size=self._get_dp_group_size(),
+        )
 
         # Build validation dataloader if provided
         self.val_dataloader = None
         if "validation_dataloader" in self.cfg:
             logger.info("Building validation dataloader...")
-            self.val_dataloader = self.cfg.validation_dataloader.instantiate()
+            val_batch_size = self.cfg.get(
+                "validation_dataloader.batch_size", self.cfg.get("step_scheduler.local_batch_size", 1)
+            )
+            self.val_dataloader = build_dataloader(
+                self.cfg.validation_dataloader,
+                self.tokenizer,
+                seed=self.cfg.get("seed", 42),
+                batch_size=val_batch_size,
+                dp_rank=self._get_dp_rank(),
+                dp_world_size=self._get_dp_group_size(),
+            )
 
         # Build step scheduler
         self.step_scheduler = build_step_scheduler(
@@ -555,63 +633,64 @@ class TrainBiencoderRecipe(BaseRecipe):
         Returns:
             MetricsSample with validation metrics
         """
-        for mp in self.model_parts:
-            mp.eval()
-        loss_buffer = []
+        with ScopedRNG(seed=1, ranked=True):
+            for mp in self.model_parts:
+                mp.eval()
+            loss_buffer = []
 
-        # Metrics buffers
-        all_scores = []
-        all_labels = []
+            # Metrics buffers
+            all_scores = []
+            all_labels = []
 
-        with torch.no_grad():
-            for batch in val_dataloader:
-                # Move batch to device
-                batch = {
-                    k: v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
-                    for k, v in batch.items()
-                }
+            with torch.no_grad():
+                for batch in val_dataloader:
+                    # Move batch to device
+                    batch = {
+                        k: v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                        for k, v in batch.items()
+                    }
 
-                # Unpack query and passage inputs using the same logic as biencoder_trainer.py
-                query, passage = _unpack_qp(batch)
+                    # Unpack query and passage inputs using the same logic as biencoder_trainer.py
+                    query, passage = _unpack_qp(batch)
 
-                # Forward pass
-                outputs = self.model_parts[0](query=query, passage=passage)
-                loss_buffer.append(outputs.loss.clone().detach())
+                    # Forward pass
+                    outputs = self.model_parts[0](query=query, passage=passage)
+                    loss_buffer.append(outputs.loss.clone().detach())
 
-                # Store scores and labels for metrics
-                all_scores.append(outputs.scores.detach().cpu())
-                all_labels.append(outputs.labels.detach().cpu())
+                    # Store scores and labels for metrics
+                    all_scores.append(outputs.scores.detach().cpu())
+                    all_labels.append(outputs.labels.detach().cpu())
 
-        # Compute average loss
-        avg_loss = torch.stack(loss_buffer).mean()
-        if torch.distributed.is_initialized():
-            avg_loss = self._dp_allreduce(avg_loss, include_cp=True)
+            # Compute average loss
+            avg_loss = torch.stack(loss_buffer).mean()
+            if torch.distributed.is_initialized():
+                avg_loss = self._dp_allreduce(avg_loss, include_cp=True)
 
-        # Compute accuracy and MRR
-        scores = torch.cat(all_scores, dim=0)
-        labels = torch.cat(all_labels, dim=0)
+            # Compute accuracy and MRR
+            scores = torch.cat(all_scores, dim=0)
+            labels = torch.cat(all_labels, dim=0)
 
-        # Accuracy@1
-        _, predicted_indices = torch.topk(scores, k=1, dim=1)
-        correct = (predicted_indices.squeeze(-1) == labels).float()
-        acc1 = correct.mean().item()
+            # Accuracy@1
+            _, predicted_indices = torch.topk(scores, k=1, dim=1)
+            correct = (predicted_indices.squeeze(-1) == labels).float()
+            acc1 = correct.mean().item()
 
-        # MRR
-        _, sorted_indices = torch.sort(scores, dim=1, descending=True)
-        ranks = (sorted_indices == labels.unsqueeze(1)).nonzero(as_tuple=True)[1] + 1
-        mrr = (1.0 / ranks.float()).mean().item()
+            # MRR
+            _, sorted_indices = torch.sort(scores, dim=1, descending=True)
+            ranks = (sorted_indices == labels.unsqueeze(1)).nonzero(as_tuple=True)[1] + 1
+            mrr = (1.0 / ranks.float()).mean().item()
 
-        metrics = {
-            "val_loss": avg_loss.item(),
-            "val_acc1": acc1,
-            "val_mrr": mrr,
-        }
+            metrics = {
+                "val_loss": avg_loss.item(),
+                "val_acc1": acc1,
+                "val_mrr": mrr,
+            }
 
-        return MetricsSample(
-            step=self.step_scheduler.step,
-            epoch=self.step_scheduler.epoch,
-            metrics=metrics,
-        )
+            return MetricsSample(
+                step=self.step_scheduler.step,
+                epoch=self.step_scheduler.epoch,
+                metrics=metrics,
+            )
 
     def log_train_metrics(self, log_data: MetricsSample):
         """Log training metrics.

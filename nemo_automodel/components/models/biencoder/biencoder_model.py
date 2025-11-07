@@ -44,11 +44,15 @@ class NeMoAutoModelBiencoder(_BaseNeMoAutoModelClass):
     def from_pretrained(
         cls,
         pretrained_model_name_or_path,
-        args=None,
         share_encoder=True,
         add_linear_pooler=False,
         out_dimension=None,
         do_gradient_checkpointing=False,
+        train_n_passages: int = 1,
+        eval_negative_size: int = 0,
+        pooling: str = "avg",
+        l2_normalize: bool = True,
+        t: float = 1.0,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
         sdpa_method: Optional[List[SDPBackend]] = None,
@@ -64,11 +68,15 @@ class NeMoAutoModelBiencoder(_BaseNeMoAutoModelClass):
 
         Args:
             pretrained_model_name_or_path: Path to pretrained model or model identifier
-            args: Training arguments object (optional, for compatibility)
             share_encoder: Whether to share encoder weights between query and passage
             add_linear_pooler: Whether to add a linear pooler layer
             out_dimension: Output dimension for linear pooler
             do_gradient_checkpointing: Whether to enable gradient checkpointing
+            train_n_passages: Number of passages per query during training
+            eval_negative_size: Number of negative samples during evaluation
+            pooling: Pooling strategy ('avg', 'cls', 'last', etc.)
+            l2_normalize: Whether to L2 normalize embeddings
+            t: Temperature for scaling similarity scores
             use_liger_kernel: Whether to apply Liger kernel optimizations
             use_sdpa_patching: Whether to apply SDPA patching
             sdpa_method: SDPA backend methods to use
@@ -85,39 +93,42 @@ class NeMoAutoModelBiencoder(_BaseNeMoAutoModelClass):
         logger.info(f"Loading NeMoAutoModelBiencoder from {pretrained_model_name_or_path}")
 
         def _retry(**override):
-            """Internal helper to re-enter this function with patched args."""
+            """Internal helper to re-enter this function with patched parameters."""
             return cls.from_pretrained(
                 pretrained_model_name_or_path,
-                args=args,
                 share_encoder=share_encoder,
                 add_linear_pooler=add_linear_pooler,
                 out_dimension=out_dimension,
                 do_gradient_checkpointing=do_gradient_checkpointing,
+                train_n_passages=train_n_passages,
+                eval_negative_size=eval_negative_size,
+                pooling=pooling,
+                l2_normalize=l2_normalize,
+                t=t,
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
                 **kwargs,
             )
 
-        # Step 1: Create args object if not provided
-        if args is None:
-
-            class Args:
-                pass
-
-            args = Args()
-            args.model_name_or_path = pretrained_model_name_or_path
-            args.share_encoder = share_encoder
-            args.add_linear_pooler = add_linear_pooler
-            args.out_dimension = out_dimension if out_dimension is not None else 768
-            args.do_gradient_checkpointing = do_gradient_checkpointing
-
-        # Step 2: Use BiencoderModel.build to initialize model with base encoders
+        # Use BiencoderModel.build to initialize model with base encoders
         hf_kwargs = {"attn_implementation": "flash_attention_2"}
         kwargs.update(hf_kwargs)
-        model = BiencoderModel.build(args=args, **kwargs)
+        model = BiencoderModel.build(
+            model_name_or_path=pretrained_model_name_or_path,
+            share_encoder=share_encoder,
+            add_linear_pooler=add_linear_pooler,
+            out_dimension=out_dimension if out_dimension is not None else 768,
+            do_gradient_checkpointing=do_gradient_checkpointing,
+            train_n_passages=train_n_passages,
+            eval_negative_size=eval_negative_size,
+            pooling=pooling,
+            l2_normalize=l2_normalize,
+            t=t,
+            **kwargs,
+        )
 
-        # Step 3: Apply kernel patching from parent class
+        # Apply kernel patching from parent class
         try:
             if use_liger_kernel:
                 logger.info("Applying Liger kernel patching to query encoder")

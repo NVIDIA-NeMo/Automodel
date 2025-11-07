@@ -407,15 +407,27 @@ class BiencoderModel(nn.Module):
 
     def __init__(
         self,
-        args,
         lm_q: PreTrainedModel,
         lm_p: PreTrainedModel,
         linear_pooler: nn.Module = None,
+        train_n_passages: int = 1,
+        eval_negative_size: int = 0,
+        pooling: str = "avg",
+        l2_normalize: bool = True,
+        t: float = 1.0,
+        share_encoder: bool = True,
+        add_linear_pooler: bool = False,
     ):
         super().__init__()
-        self.args = args
         self.lm_q = lm_q
         self.lm_p = lm_p
+        self.train_n_passages = train_n_passages
+        self.eval_negative_size = eval_negative_size
+        self.pooling = pooling
+        self.l2_normalize = l2_normalize
+        self.t = t
+        self.share_encoder = share_encoder
+        self.add_linear_pooler = add_linear_pooler
         self.cross_entropy = nn.CrossEntropyLoss(reduction="mean")
         self.linear_pooler = linear_pooler if linear_pooler is not None else nn.Identity()
         self.config = self.lm_q.config
@@ -426,9 +438,9 @@ class BiencoderModel(nn.Module):
 
         # Get current number of passages per query
         if self.training:
-            current_train_n_passages = self.args.train_n_passages
+            current_train_n_passages = self.train_n_passages
         else:
-            current_train_n_passages = self.args.eval_negative_size + 1
+            current_train_n_passages = self.eval_negative_size + 1
 
         # Compute scores (encoding happens inside _compute_scores)
         scores, labels, q_reps, p_reps = self._compute_scores(
@@ -484,14 +496,14 @@ class BiencoderModel(nn.Module):
         embeds = pool(
             last_hidden_states=hidden_state,
             attention_mask=input_dict["attention_mask"],
-            pool_type=self.args.pooling,
+            pool_type=self.pooling,
         )
 
         # Apply linear pooler
         embeds = self.linear_pooler(embeds)
 
         # L2 normalize if required
-        if self.args.l2_normalize:
+        if self.l2_normalize:
             embeds = F.normalize(embeds, dim=-1)
 
         return embeds.contiguous()
@@ -515,59 +527,103 @@ class BiencoderModel(nn.Module):
             current_train_n_passages=current_train_n_passages,
         )
 
-        if self.args.l2_normalize:
-            scores = scores / self.args.t
+        if self.l2_normalize:
+            scores = scores / self.t
 
         return scores, labels, q_reps, p_reps
 
     @classmethod
-    def build(cls, args, **hf_kwargs):
-        """Build biencoder model from pretrained."""
+    def build(
+        cls,
+        model_name_or_path: str,
+        share_encoder: bool = True,
+        add_linear_pooler: bool = False,
+        out_dimension: int = 768,
+        do_gradient_checkpointing: bool = False,
+        train_n_passages: int = 1,
+        eval_negative_size: int = 0,
+        pooling: str = "avg",
+        l2_normalize: bool = True,
+        t: float = 1.0,
+        **hf_kwargs,
+    ):
+        """
+        Build biencoder model from pretrained.
 
-        logger.info(f"Building BiencoderModel from {args.model_name_or_path}")
+        Args:
+            model_name_or_path: Path to pretrained model or model identifier
+            share_encoder: Whether to share encoder weights between query and passage
+            add_linear_pooler: Whether to add a linear pooler layer
+            out_dimension: Output dimension for linear pooler
+            do_gradient_checkpointing: Whether to enable gradient checkpointing
+            train_n_passages: Number of passages per query during training
+            eval_negative_size: Number of negative samples during evaluation
+            pooling: Pooling strategy ('avg', 'cls', 'last', etc.)
+            l2_normalize: Whether to L2 normalize embeddings
+            t: Temperature for scaling similarity scores
+            **hf_kwargs: Additional arguments passed to model loading
+        """
 
-        # Select model class based on base_model
-        if args.base_model == "bidirc_llama3":
-            ModelClass = LlamaBidirectionalModel
-            logger.info("Using LlamaBidirectionalModel for bidirc_llama3")
+        logger.info(f"Building BiencoderModel from {model_name_or_path}")
+
+        # Infer model class from model_name_or_path
+        # Check config.json if it exists
+        config_path = os.path.join(model_name_or_path, "config.json") if os.path.isdir(model_name_or_path) else None
+
+        if config_path and os.path.exists(config_path):
+            import json
+
+            with open(config_path, "r") as f:
+                config = json.load(f)
+                model_type = config.get("model_type", "")
         else:
-            raise ValueError(f"Unsupported base model: {args.base_model}")
+            # If no config, infer from model name
+            model_type = ""
+
+        # Select model class based on model type
+        if model_type == "llama" or "llama" in model_name_or_path.lower():
+            ModelClass = LlamaBidirectionalModel
+            logger.info("Using LlamaBidirectionalModel")
+        else:
+            raise ValueError(
+                f"Unsupported model type: {model_type}. Cannot infer model class from {model_name_or_path}"
+            )
 
         # Load model locally or from hub using selected model class
-        if os.path.isdir(args.model_name_or_path):
-            if args.share_encoder:
-                lm_q = ModelClass.from_pretrained(args.model_name_or_path, trust_remote_code=True, **hf_kwargs)
+        if os.path.isdir(model_name_or_path):
+            if share_encoder:
+                lm_q = ModelClass.from_pretrained(model_name_or_path, trust_remote_code=True, **hf_kwargs)
                 lm_p = lm_q
             else:
-                _qry_model_path = os.path.join(args.model_name_or_path, "query_model")
-                _psg_model_path = os.path.join(args.model_name_or_path, "passage_model")
+                _qry_model_path = os.path.join(model_name_or_path, "query_model")
+                _psg_model_path = os.path.join(model_name_or_path, "passage_model")
 
                 if not os.path.exists(_qry_model_path):
-                    _qry_model_path = args.model_name_or_path
-                    _psg_model_path = args.model_name_or_path
+                    _qry_model_path = model_name_or_path
+                    _psg_model_path = model_name_or_path
 
                 lm_q = ModelClass.from_pretrained(_qry_model_path, trust_remote_code=True, **hf_kwargs)
                 lm_p = ModelClass.from_pretrained(_psg_model_path, trust_remote_code=True, **hf_kwargs)
         else:
             # Load from hub
-            lm_q = ModelClass.from_pretrained(args.model_name_or_path, **hf_kwargs)
+            lm_q = ModelClass.from_pretrained(model_name_or_path, **hf_kwargs)
 
-            if args.share_encoder:
+            if share_encoder:
                 lm_p = lm_q
             else:
                 lm_p = copy.deepcopy(lm_q)
 
         # Enable gradient checkpointing if requested
-        if args.do_gradient_checkpointing:
+        if do_gradient_checkpointing:
             lm_q.gradient_checkpointing_enable()
             if lm_p is not lm_q:
                 lm_p.gradient_checkpointing_enable()
 
         # Create linear pooler if needed
-        if args.add_linear_pooler:
-            linear_pooler = nn.Linear(lm_q.config.hidden_size, args.out_dimension)
+        if add_linear_pooler:
+            linear_pooler = nn.Linear(lm_q.config.hidden_size, out_dimension)
 
-            pooler_path = os.path.join(args.model_name_or_path, "pooler.pt")
+            pooler_path = os.path.join(model_name_or_path, "pooler.pt")
             if os.path.exists(pooler_path):
                 logger.info("Loading pooler weights from local files")
                 state_dict = torch.load(pooler_path, map_location="cpu")
@@ -575,7 +631,18 @@ class BiencoderModel(nn.Module):
         else:
             linear_pooler = nn.Identity()
 
-        model = cls(args=args, lm_q=lm_q, lm_p=lm_p, linear_pooler=linear_pooler)
+        model = cls(
+            lm_q=lm_q,
+            lm_p=lm_p,
+            linear_pooler=linear_pooler,
+            train_n_passages=train_n_passages,
+            eval_negative_size=eval_negative_size,
+            pooling=pooling,
+            l2_normalize=l2_normalize,
+            t=t,
+            share_encoder=share_encoder,
+            add_linear_pooler=add_linear_pooler,
+        )
         return model
 
     def save(self, output_dir: str):
@@ -584,7 +651,7 @@ class BiencoderModel(nn.Module):
         logger.info(f"Saving BiencoderModel to {output_dir}")
 
         # Save the model
-        if self.args.share_encoder:
+        if self.share_encoder:
             self.lm_q.save_pretrained(output_dir)
         else:
             os.makedirs(os.path.join(output_dir, "query_model"), exist_ok=True)
@@ -593,7 +660,7 @@ class BiencoderModel(nn.Module):
             self.lm_p.save_pretrained(os.path.join(output_dir, "passage_model"))
 
         # Save linear pooler if exists
-        if self.args.add_linear_pooler:
+        if self.add_linear_pooler:
             pooler_path = os.path.join(output_dir, "pooler.pt")
             logger.info(f"Saving linear pooler to {pooler_path}")
             torch.save(self.linear_pooler.state_dict(), pooler_path)
