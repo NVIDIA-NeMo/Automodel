@@ -48,6 +48,7 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
         truncation: Union[str, bool] = "do_not_truncate",
         start_of_turn_token: Optional[str] = None,
         limit_dataset_samples: Optional[int] = None,
+        repeat_on_exhaustion: bool = True,
     ) -> None:
         if tokenizer is None:
             raise ValueError("Tokenizer is required")
@@ -81,6 +82,9 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
         self.seq_length = seq_length
         self.padding = padding
         self.truncation = truncation
+        self.num_shards = getattr(self, "num_shards", 1)
+        self._current_epoch_for_repeat = 0
+        self.repeat_on_exhaustion = bool(repeat_on_exhaustion)
 
         # Always load in streaming mode
         ds = _load_dataset(path_or_dataset_id, split=split, streaming=True, name=name)
@@ -93,18 +97,28 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
         self.dataset = ds
 
     def __iter__(self) -> Iterator[Dict[str, List[int]]]:
-        for row in self.dataset:
-            mapped = {dest: row[src] for dest, src in self.column_mapping.items() if src in row}
-            # Skip rows missing required fields
-            if ColumnTypes.Answer.value not in mapped:
-                continue
-            tokenized = self._apply_tokenizer(mapped)  # provided by ColumnMappedTextInstructionDataset
-            # Skip samples with no valid labels (aligns with non-iterable behavior)
-            if not any(label != -100 for label in tokenized.get("labels", [])):
-                continue
-            if not _check_all_values_equal_length(tokenized):
-                continue
-            yield tokenized
+        while True:
+            for row in self.dataset:
+                mapped = {dest: row[src] for dest, src in self.column_mapping.items() if src in row}
+                # Skip rows missing required fields
+                if ColumnTypes.Answer.value not in mapped:
+                    continue
+                tokenized = self._apply_tokenizer(mapped)  # provided by ColumnMappedTextInstructionDataset
+                # Skip samples with no valid labels (aligns with non-iterable behavior)
+                if not any(label != -100 for label in tokenized.get("labels", [])):
+                    continue
+                if not _check_all_values_equal_length(tokenized):
+                    continue
+                yield tokenized
+
+            if not self.repeat_on_exhaustion:
+                return
+            # Wrap-around: advance epoch for deterministic reshuffle if supported and iterate again
+            try:
+                self._current_epoch_for_repeat += 1
+                self.set_epoch(self._current_epoch_for_repeat)
+            except Exception:
+                pass
 
     def set_epoch(self, epoch: int) -> None:
         ds = getattr(self, "dataset", None)
@@ -122,5 +136,3 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
         if ds is not None and hasattr(ds, "shuffle"):
             self.dataset = ds.shuffle(buffer_size=buffer_size, seed=seed)
         return self
-
-
