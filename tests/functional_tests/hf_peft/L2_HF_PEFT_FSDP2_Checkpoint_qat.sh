@@ -20,7 +20,7 @@ export CUDA_VISIBLE_DEVICES="0,1"
 
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run \
 --master-port=29503 --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace  \
--m pytest tests/functional_tests/checkpoint/test_peft.py \
+nemo_automodel/recipes/llm/train_ft.py \
     --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --model.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
     --step_scheduler.max_steps 10 \
