@@ -199,7 +199,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
         self.tokenizer = tokenizer
         if getattr(self.tokenizer, "pad_token", None) is None:
             if hasattr(self.tokenizer, "eos_token"):
-                self.tokenizer.pad_token = self.tokenizer
+                self.tokenizer.pad_token = self.tokenizer.eos_token
             else:
                 logger.warning("Setting tokenizer pad_token to ' '. tokenizer does not have `eos_token`.")
                 self.tokenizer.pad_token = " "

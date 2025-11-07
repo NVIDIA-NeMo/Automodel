@@ -459,6 +459,14 @@ def build_dataloader(
             with FirstRankPerNode():
                 ds = cfg_ds.instantiate(**kwargs)
 
+        # If using an IterableDataset, per-rank sharding for unique samples
+        if isinstance(ds, IterableDataset) and hasattr(ds, "shard"):
+            try:
+                ds = ds.shard(dp_world_size, dp_rank)
+                logging.info(f"Sharded IterableDataset across ranks: world_size={dp_world_size}, rank={dp_rank}")
+            except Exception as e:
+                logging.warning(f"IterableDataset sharding skipped due to error: {e}")
+
         packed_sequence_size = getattr(cfg_ps, "packed_sequence_size", 0)
         # check if packed sequence is supported
         if packed_sequence_size > 0 and not supports_seq_lens:
@@ -515,6 +523,22 @@ def build_dataloader(
                 dl_kwargs["drop_last"] = True
         else:
             logging.info("Using IterableDataset; skipping sampler.")
+            # Optional shuffle for streaming IterableDataset (uses HF dataset shuffle if available)
+            shuffle = cfg_dl.get("shuffle", False)
+            shuffle_buffer_size = cfg_dl.get("shuffle_buffer_size", 10000)
+            # Do not pass shuffle-related kwargs to the DataLoader when using IterableDataset
+            # But leave them in dl config to be consistent
+            if hasattr(cfg_dl, "shuffle"):
+                del cfg_dl.shuffle
+            if hasattr(cfg_dl, "shuffle_buffer_size"):
+                del cfg_dl.shuffle_buffer_size
+
+            if shuffle and hasattr(ds, "shuffle"):
+                try:
+                    ds = ds.shuffle(buffer_size=shuffle_buffer_size, seed=seed)
+                    logging.info(f"Shuffling IterableDataset with buffer_size={shuffle_buffer_size}, seed={seed}")
+                except Exception as e:
+                    logging.warning(f"IterableDataset shuffle skipped due to error: {e}")
             dl_kwargs = {}
 
         # Handle collate_fn with optional mask precomputation for pipeline parallelism
