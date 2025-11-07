@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# run with torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config tests/functional_tests/gt_metrics/gpt_oss_20b_te_deepep.yaml
+
 step_scheduler:
   global_batch_size: 512
   local_batch_size: 32
   ckpt_every_steps: 500
   val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 2
+  max_steps: 100
 
 dist_env:
   backend: nccl
