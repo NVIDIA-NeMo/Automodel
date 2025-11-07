@@ -40,6 +40,26 @@ from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
+from nemo_automodel.components.models.llama.model import LlamaForCausalLM as CustomLlamaForCausalLM
+
+
+class SequenceParallelAllGatherActivation(SequenceParallel):
+    """SequenceParallel that all-gathers activations for sequence parallelism."""
+
+    @staticmethod
+    def _prepare_output_fn(use_local_output, mod, outputs, device_mesh):
+        """Prepare outputs by redistributing sharded DTensors to replicated placement."""
+        # If output is a DTensor with Shard placement, redistribute to Replicate
+        if isinstance(outputs, DTensor):
+            if any(isinstance(p, Shard) for p in outputs.placements):
+                # Redistribute to replicated placement (performs all-gather)
+                outputs = outputs.redistribute(device_mesh=device_mesh, placements=[Replicate()])
+        else:
+            raise ValueError(f"Expected output to be a DTensor, but got {type(outputs)}")
+
+        # Call the parent's prepare_output_fn to handle use_local_output
+        return SequenceParallel._prepare_output_fn(use_local_output, mod, outputs, device_mesh)
+
 
 class RotaryEmbedParallel(SequenceParallel):
     """Custom SequenceParallel class for Qwen2 / Gemma3 rotary embeddings because the input is a tuple."""
@@ -132,6 +152,8 @@ def _parallelize_llama(
         "model.layers.*.self_attn.q_proj": ColwiseParallel(),
         "model.layers.*.self_attn.k_proj": ColwiseParallel(),
         "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),  # Combined QKV projection
+        "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),  # Fused gate and up projection
         "model.layers.*.self_attn.o_proj": RowwiseParallel(),
         "model.layers.*.mlp.up_proj": ColwiseParallel(),
         "model.layers.*.mlp.gate_proj": ColwiseParallel(),
@@ -142,9 +164,9 @@ def _parallelize_llama(
     base_model_sp_plan = {
         "model.embed_tokens": RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1)),
         "model.norm": SequenceParallel(),
-        "model.layers.*.input_layernorm": SequenceParallel(),
+        "model.layers.*.input_layernorm": SequenceParallelAllGatherActivation(use_local_output=False),
         "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
-        "model.layers.*.post_attention_layernorm": SequenceParallel(),
+        "model.layers.*.post_attention_layernorm": SequenceParallelAllGatherActivation(use_local_output=False),
         "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
         "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False),
     }
@@ -284,4 +306,5 @@ PARALLELIZE_FUNCTIONS: Dict[type, Callable[..., Dict[str, ParallelStyle]]] = {
     # The larger gemma models use Gemma3ForConditionalGeneration, which are for text-image input
     Gemma3ForConditionalGeneration: _parallelize_gemma3,
     Phi3ForCausalLM: _parallelize_phi3,
+    CustomLlamaForCausalLM: _parallelize_llama,
 }
