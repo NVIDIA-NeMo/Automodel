@@ -83,7 +83,8 @@ dependencies = [
     "torchdata",
     "transformers<=4.57.1",
     "wandb",
-    "torchao"
+    "torchao",
+    "mlflow"
 ]
 
 [project.optional-dependencies]
