@@ -4,6 +4,7 @@ from typing import List, Tuple
 
 import torch
 
+
 def _read_losses_from_jsonl(file_path: Path) -> List[float]:
     """Read a JSONL file and extract the 'loss' values from each record.
 
@@ -33,19 +34,14 @@ def test_log_compare_losses_with_ground_truth(jsonl_paths: Tuple[Path, Path]) ->
     """
     ground_truth_jsonl_path, compare_jsonl_path = jsonl_paths
 
-    assert ground_truth_jsonl_path.exists(), (
-        f"Ground truth file not found: {ground_truth_jsonl_path}"
-    )
-    assert compare_jsonl_path.exists(), (
-        f"Comparison file not found: {compare_jsonl_path}"
-    )
+    assert ground_truth_jsonl_path.exists(), f"Ground truth file not found: {ground_truth_jsonl_path}"
+    assert compare_jsonl_path.exists(), f"Comparison file not found: {compare_jsonl_path}"
 
     gt_losses = _read_losses_from_jsonl(ground_truth_jsonl_path)
     cmp_losses = _read_losses_from_jsonl(compare_jsonl_path)
 
     assert len(gt_losses) == len(cmp_losses), (
-        "Files have different number of records: "
-        f"ground-truth={len(gt_losses)} vs compare={len(cmp_losses)}"
+        f"Files have different number of records: ground-truth={len(gt_losses)} vs compare={len(cmp_losses)}"
     )
 
     mismatches: List[str] = []
@@ -53,15 +49,11 @@ def test_log_compare_losses_with_ground_truth(jsonl_paths: Tuple[Path, Path]) ->
         gt_tensor = torch.tensor(gt_loss, dtype=torch.float32)
         cmp_tensor = torch.tensor(cmp_loss, dtype=torch.float32)
         if not torch.allclose(gt_tensor, cmp_tensor):
-            mismatches.append(
-                f"idx={index}: gt_loss={gt_loss:.9f} cmp_loss={cmp_loss:.9f}"
-            )
+            mismatches.append(f"idx={index}: gt_loss={gt_loss:.9f} cmp_loss={cmp_loss:.9f}")
             # Keep collecting all mismatches to show a helpful summary
 
     assert not mismatches, (
-        "Loss values differ (torch.allclose == False) for the following records:\n" +
-        "\n".join(mismatches[:20]) +
-        ("\n..." if len(mismatches) > 20 else "")
+        "Loss values differ (torch.allclose == False) for the following records:\n"
+        + "\n".join(mismatches[:20])
+        + ("\n..." if len(mismatches) > 20 else "")
     )
-
-
