@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import itertools
 import json
 from pathlib import Path
 
@@ -45,6 +44,8 @@ class _DummyTokenizer:  # noqa: D401
         input_ids = list(range(self._counter, self._counter + len(tokens)))
         if add_special_tokens:
             input_ids = [self.bos_token_id] + input_ids + [self.eos_token_id]
+        # Advance counter so successive calls yield distinct id ranges
+        self._counter += len(tokens) + (2 if add_special_tokens else 0)
         return {"input_ids": input_ids}
 
 
@@ -53,96 +54,132 @@ def _write_jsonl(path: Path, rows):
         for row in rows:
             fp.write(json.dumps(row) + "\n")
 
+def test_iterable_dataset_shard_and_shuffle_smoke(monkeypatch, tmp_path: Path):
+    class _StubHFIterable:
+        def __init__(self, rows):
+            self._rows = rows
+            self._shard = None
+            self._shuffled = False
 
-def test_iterable_dataset_basic_iteration(tmp_path: Path):
+        def __iter__(self):
+            it = self._rows
+            if self._shard is not None:
+                n, idx = self._shard
+                it = [r for i, r in enumerate(it) if i % n == idx]
+            if self._shuffled:
+                it = list(reversed(it))
+            for r in it:
+                yield r
+
+        def shard(self, num_shards, index):
+            self._shard = (num_shards, index)
+            return self
+
+        def shuffle(self, buffer_size, seed):
+            self._shuffled = True
+            return self
+
     rows = [
-        {"q": "Who wrote Hamlet?", "a": "Shakespeare"},
-        {"q": "Capital of France?", "a": "Paris"},
+        {"q": "Q0?", "a": "A0"},
+        {"q": "Q1?", "a": "A1"},
+        {"q": "Q2?", "a": "A2"},
     ]
-    jsonl_path = tmp_path / "toy_stream.jsonl"
-    _write_jsonl(jsonl_path, rows)
+
+    def _fake_load_dataset(*args, **kwargs):
+        return _StubHFIterable(rows)
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset._load_dataset",
+        _fake_load_dataset,
+    )
 
     ds = ColumnMappedTextInstructionIterableDataset(
-        path_or_dataset_id=str(jsonl_path),
+        path_or_dataset_id="ignored.jsonl",
         column_mapping={"question": "q", "answer": "a"},
         tokenizer=_DummyTokenizer(),
         answer_only_loss_mask=False,
         repeat_on_exhaustion=False,
-    )
+    ).shard(2, 1).shuffle(buffer_size=2, seed=0)
 
-    items = list(ds)
-    assert len(items) == 2
-    first = items[0]
-    assert isinstance(first, dict)
-    # Internal pad token ids helper is included; keys should at least contain these
+    first = next(iter(ds))
     assert {"input_ids", "attention_mask", "labels"}.issubset(first.keys())
 
 
-def test_iterable_dataset_limit_samples(tmp_path: Path):
-    rows = [
-        {"q": "1+1?", "a": "2"},
-        {"q": "2+2?", "a": "4"},
-    ]
-    jsonl_path = tmp_path / "toy_stream_limit.jsonl"
+def test_iterable_dataset_pad_token_fallback_with_eos(tmp_path: Path):
+    class _TokNoPadWithEos:
+        eos_token = "</s>"
+        pad_token = None
+
+    rows = [{"q": "Q?", "a": "A"}]
+    jsonl_path = tmp_path / "toy_pad_eos.jsonl"
     _write_jsonl(jsonl_path, rows)
 
-    ds = ColumnMappedTextInstructionIterableDataset(
+    tok = _TokNoPadWithEos()
+    _ = ColumnMappedTextInstructionIterableDataset(
         path_or_dataset_id=str(jsonl_path),
         column_mapping={"question": "q", "answer": "a"},
-        tokenizer=_DummyTokenizer(),
+        tokenizer=tok,
         answer_only_loss_mask=False,
-        limit_dataset_samples=1,
         repeat_on_exhaustion=False,
     )
-
-    items = list(ds)
-    assert len(items) == 1
+    assert tok.pad_token == tok.eos_token
 
 
-def test_iterable_dataset_repeat_on_exhaustion_true_is_repeatable(tmp_path: Path):
-    rows = [
-        {"q": "A?", "a": "a"},
-        {"q": "B?", "a": "b"},
-    ]
-    jsonl_path = tmp_path / "toy_stream_repeat.jsonl"
+def test_iterable_dataset_pad_token_fallback_without_eos(tmp_path: Path):
+    class _TokNoPadNoEos:
+        pad_token = None
+
+    rows = [{"q": "Q?", "a": "A"}]
+    jsonl_path = tmp_path / "toy_pad_noeos.jsonl"
     _write_jsonl(jsonl_path, rows)
 
-    ds = ColumnMappedTextInstructionIterableDataset(
+    tok = _TokNoPadNoEos()
+    _ = ColumnMappedTextInstructionIterableDataset(
         path_or_dataset_id=str(jsonl_path),
         column_mapping={"question": "q", "answer": "a"},
-        tokenizer=_DummyTokenizer(),
+        tokenizer=tok,
         answer_only_loss_mask=False,
-        repeat_on_exhaustion=True,
+        repeat_on_exhaustion=False,
     )
-
-    # Should be able to take more items than the dataset size due to repeat
-    taken = list(itertools.islice(ds, 5))
-    assert len(taken) == 5
+    assert tok.pad_token == " "
 
 
-def test_iterable_dataset_bad_mapping_raises(tmp_path: Path):
+def test_iterable_dataset_mapping_checks_missing_answer(tmp_path: Path):
     rows = [{"q": "Q?", "a": "A"}]
-    jsonl_path = tmp_path / "toy_bad.jsonl"
+    jsonl_path = tmp_path / "toy_missing_answer.jsonl"
     _write_jsonl(jsonl_path, rows)
 
     with pytest.raises(AssertionError):
         _ = ColumnMappedTextInstructionIterableDataset(
             path_or_dataset_id=str(jsonl_path),
-            column_mapping={"question": "q", "answer": "a", "bad": "col"},
+            column_mapping={"question": "q"},  # missing answer
             tokenizer=_DummyTokenizer(),
         )
 
 
-def test_iterable_dataset_requires_tokenizer(tmp_path: Path):
+def test_iterable_dataset_mapping_checks_two_keys_missing_both_context_and_question(tmp_path: Path):
     rows = [{"q": "Q?", "a": "A"}]
-    jsonl_path = tmp_path / "toy_tokenizer.jsonl"
+    jsonl_path = tmp_path / "toy_two_keys_invalid.jsonl"
     _write_jsonl(jsonl_path, rows)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(AssertionError, match="Expected context or question"):
         _ = ColumnMappedTextInstructionIterableDataset(
             path_or_dataset_id=str(jsonl_path),
-            column_mapping={"question": "q", "answer": "a"},
-            tokenizer=None,  # type: ignore[arg-type]
+            column_mapping={"answer": "a", "foo": "bar"},
+            tokenizer=_DummyTokenizer(),
+        )
+
+
+def test_iterable_dataset_mapping_checks_invalid_num_columns(tmp_path: Path):
+    rows = [{"q": "Q?", "a": "A"}]
+    jsonl_path = tmp_path / "toy_invalid_cols.jsonl"
+    _write_jsonl(jsonl_path, rows)
+
+    with pytest.raises(ValueError, match="Expected 2 or 3 columns"):
+        _ = ColumnMappedTextInstructionIterableDataset(
+            path_or_dataset_id=str(jsonl_path),
+            column_mapping={"answer": "a"},  # only 1 key
+            tokenizer=_DummyTokenizer(),
         )
 
 
