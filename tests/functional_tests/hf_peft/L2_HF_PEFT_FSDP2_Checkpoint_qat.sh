@@ -47,4 +47,4 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run \
     --qat.fake_quant_after_n_steps 1 \
     --qat.enabled True \
     --qat.quantizer._target_ torchao.quantization.qat.Int8DynActInt4WeightQATQuantizer \
-    --qat.quantizer.groupsize 256
+    --qat.quantizer.groupsize 32
