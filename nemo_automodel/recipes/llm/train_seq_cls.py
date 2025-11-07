@@ -81,7 +81,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             self.cfg.get("checkpoint", None),
             self.cfg.get("model.cache_dir", None),
             self.cfg.model.pretrained_model_name_or_path,
-            False,
+            True if self.cfg.get("peft", None) else False,
         )
 
         from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
