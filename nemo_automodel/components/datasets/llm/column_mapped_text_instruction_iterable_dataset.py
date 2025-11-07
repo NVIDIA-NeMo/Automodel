@@ -68,10 +68,7 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
             if ColumnTypes.Question.value not in column_mapping:
                 raise AssertionError(("Expected question to be in column_mapping", column_mapping))
         elif len(column_mapping) == 2:
-            if (
-                ColumnTypes.Context.value not in column_mapping
-                and ColumnTypes.Question.value not in column_mapping
-            ):
+            if ColumnTypes.Context.value not in column_mapping and ColumnTypes.Question.value not in column_mapping:
                 raise AssertionError(("Expected context or question to be in column_mapping", column_mapping))
         else:
             raise ValueError(f"Expected 2 or 3 columns in column_mapping, got {len(column_mapping)}")
@@ -93,7 +90,7 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
                 ds = ds.take(limit_dataset_samples)
             except Exception as e:
                 logger.warning("limit_dataset_samples ignored; 'take' not supported on this dataset: %s", e)
-        
+
         self.dataset = ds
 
     def __iter__(self) -> Iterator[Dict[str, List[int]]]:

@@ -37,8 +37,6 @@ from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
 from transformers.utils.hub import TRANSFORMERS_CACHE
 from wandb import Settings
 
-from datasets.distributed import split_dataset_by_node
-
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
@@ -471,10 +469,9 @@ def build_dataloader(
                     )
                 else:
                     from datasets.distributed import split_dataset_by_node
+
                     ds.dataset = split_dataset_by_node(ds.dataset, world_size=dp_world_size, rank=dp_rank)
-                    logging.info(
-                        f"Sharded dataset via split_dataset_by_node: world_size={dp_world_size}"
-                    )
+                    logging.info(f"Sharded dataset via split_dataset_by_node: world_size={dp_world_size}")
             except Exception as e:
                 logging.warning(f"IterableDataset sharding skipped due to error: {e}")
 
