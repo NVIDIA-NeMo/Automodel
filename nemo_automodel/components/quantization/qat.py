@@ -140,8 +140,6 @@ def _attach_qat_to_lora_linear(
         raise ImportError("QAT helpers require torchao>=0.7.0") from err
 
     # Basic validity checks
-    if getattr(linear, "bias", None) is not None:
-        raise ValueError("Bias is not supported in QAT + LoRA yet")
     if getattr(linear, "quant_state", None) is not None:
         raise ValueError("QLoRA base quantization is not compatible with QAT + LoRA")
 
