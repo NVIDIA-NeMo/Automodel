@@ -104,8 +104,6 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
                 continue
             if not _check_all_values_equal_length(tokenized):
                 continue
-            import torch
-            print(f"[RANK {torch.distributed.get_rank()}] tokenized: {len(tokenized['input_ids'])}")
             yield tokenized
 
     def set_epoch(self, epoch: int) -> None:
