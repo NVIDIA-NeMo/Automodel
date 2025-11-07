@@ -226,7 +226,10 @@ def build_model_and_optimizer(
                 if tp_size > 1:
                     logger.info("Disabling Triton with TP ({})".format(tp_size))
                     cfg_peft.use_triton = False
-                assert autopipeline is None, "PEFT is not supported with AutoPipeline"
+                if autopipeline is not None:
+                    logger.info("Enabling PEFT with Pipeline Parallelism")
+                    logger.info("Disabling Triton with Pipeline Parallelism Enabled.")
+                    cfg_peft.use_triton = False
                 apply_lora_to_linear_modules(
                     model, cfg_peft, quantization_config=kwargs.get("quantization_config", None)
                 )
@@ -1311,7 +1314,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 "lr": self.optimizer[0].param_groups[0]["lr"],
                 "mem": torch.cuda.max_memory_allocated() / 1024**3,
                 "tps": tps,
-                "tps_per_gpu": tps / max(self._get_dp_group_size(), 1),
+                "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
                 "num_tokens_per_step": num_tokens_in_batch,
                 "num_label_tokens": num_label_tokens,
             },
