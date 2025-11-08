@@ -116,7 +116,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             tflops_multiplier = (1 + 1 + param_ratio) / 3
             self.tflops *= tflops_multiplier
             if self.dist_env.is_main:
-                logger.info(f"PEFT params - lora_params: {lora_params:,}, param_without_lora: {param_without_lora:,}, trainable params ratio: {param_ratio:.4f}")
+                logger.info(
+                    f"PEFT params - lora_params: {lora_params:,}, param_without_lora: {param_without_lora:,}, trainable params ratio: {param_ratio:.4f}"
+                )
                 logger.info(f"TFLOPS multiplier for PEFT: (1 + 1 + {param_ratio:.4f}) / 3 = {tflops_multiplier:.4f}")
 
         if self.dist_env.is_main:
