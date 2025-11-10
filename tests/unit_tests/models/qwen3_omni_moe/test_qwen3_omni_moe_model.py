@@ -135,7 +135,8 @@ def test_text_model_forward_expands_position_ids(rotary_cls, text_config, backen
     input_ids = torch.randint(0, text_config.vocab_size, (batch, seq_len), device=device)
     position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
 
-    out = model(input_ids=input_ids, position_ids=position_ids)
+    attention_mask = torch.ones_like(input_ids)
+    out = model(input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask)
 
     assert out.shape == (batch, seq_len, text_config.hidden_size)
     rotary_cls.return_value.assert_called_once()
