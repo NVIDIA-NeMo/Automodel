@@ -1,12 +1,12 @@
 # Run on Your Local Workstation
 
-NeMo AutoModel supports running training/finetuning job from a single node with a single GPU to multiple multi-GPU nodes.
+NeMo Automodel supports training and fine-tuning jobs on configurations ranging from single-GPU workstations to multi-node, multi-GPU clusters.
 Use this guide for local, single-node workflows. For setup details, refer to our [Installation Guide](../guides/installation.md).
 For executing distributed multi-node jobs, please refer to our [Run on a Cluster](./cluster.md) guide.
 
 NeMo Automodel uses recipes to run end-to-end workflows. If you're new to recipes, see the [Repository Structure](../repository-structure.md) guide.
 
-## Quick start: Choose your job launch option
+## Quick Start: Choose Your Job Launch Option
 
 - **CLI (recommended)**
   ```bash
@@ -25,7 +25,7 @@ NeMo Automodel uses recipes to run end-to-end workflows. If you're new to recipe
 
 ## Run with Automodel CLI (Single Node)
 
-The AutoModel CLI is the preferred method for most users. It offers a unified interface to launch training jobs on your workstation without requiring deep knowledge of the underlying distributed setup.
+The Automodel CLI is the preferred method for most users. It offers a unified interface to launch training scaling from a local workstation (this guide) to large clusters (see our [cluster guide](./cluster.md)).
 
 ### Basic Usage
 
@@ -78,7 +78,7 @@ For multi-GPU single-node training, use `torchrun` directly:
 uv run torchrun --nproc-per-node=2 nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
-### Why use uv?
+### Why Use uv?
 
 uv provides several advantages for development and experimentation:
 
