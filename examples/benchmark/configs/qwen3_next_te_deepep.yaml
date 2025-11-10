@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Benchmarking config for Gptoss 20B Te Deepep
+# Benchmarking config for Qwen3 Next Te Deepep
 
 seed: 1234
 
@@ -22,11 +22,11 @@ benchmark:
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []
-  num_nodes: 1
+  num_nodes: 8
 
 step_scheduler:
-  global_batch_size: 256
-  local_batch_size: 2
+  global_batch_size: 512
+  local_batch_size: 1
   ckpt_every_steps: 1000
   val_every_steps: 1000
   num_epochs: 1
@@ -38,7 +38,7 @@ distributed:
   cp_size: 1
   pp_size: 1
   dp_replicate_size: 1
-  ep_size: 8
+  ep_size: 64
   sequence_parallel: false
 
 autopipeline:
@@ -58,22 +58,24 @@ dist_env:
 parallelizer:
   _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
   activation_checkpointing: false
+  reshard_after_forward: false
 
 model:
-  _target_: nemo_automodel.components.models.gpt_oss.model.GptOssForCausalLM.from_config
+  _target_: nemo_automodel.components.models.qwen3_next.model.Qwen3NextForCausalLM.from_config
   config:
     _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: openai/gpt-oss-20b
+    pretrained_model_name_or_path: Qwen/Qwen3-Next-80B-A3B-Instruct
   trust_remote_code: true
   is_meta_device: true
   backend:
     _target_: nemo_automodel.components.moe.utils.BackendConfig
-    attn: flex
+    attn: te
     linear: te
     rms_norm: te
     enable_deepep: true
     fake_balanced_gate: true
-    enable_hf_state_dict_adapter: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
 
 checkpoint:
   enabled: false
