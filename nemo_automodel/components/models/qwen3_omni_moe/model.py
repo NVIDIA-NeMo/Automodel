@@ -16,6 +16,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from transformers.masking_utils import create_causal_mask
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeTextConfig,
     Qwen3OmniMoeThinkerConfig,
@@ -115,7 +116,20 @@ class Qwen3OmniMoeThinkerTextModel(
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
         if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+            text_position_ids = position_ids[0]
             position_ids = position_ids[1:]
+        else:
+            text_position_ids = position_ids[0]
+
+        padding_mask = attention_mask.bool().logical_not()
+        attention_mask = create_causal_mask(
+            config=self.config,
+            input_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            cache_position=torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device),
+            past_key_values=None,
+            position_ids=text_position_ids,
+        )
 
         hidden_states = inputs_embeds
 

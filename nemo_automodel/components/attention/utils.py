@@ -142,6 +142,7 @@ def preprocess_args_and_kwargs_for_attn(
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
         attn_kwargs["is_causal"] = True
+        attn_kwargs["attn_mask"] = attention_mask
 
     return q, k, v, attn_kwargs
 
