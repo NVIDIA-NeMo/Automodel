@@ -1,6 +1,6 @@
 # Run on a Cluster (Slurm / Multi-node)
 
-In this guide you will learn how to submit distributed training jobs on Slurm clusters (single- or multi-node). For single-node workstation usage, see [Run on Your Local Workstation](./local-workstation.md). For setup details, refer to our [Installation Guide](../guides/installation.md).
+In this guide, you will learn how to submit distributed training jobs on Slurm clusters (single- or multi-node). For single-node workstation usage, see [Run on Your Local Workstation](./local-workstation.md). For setup details, refer to our [Installation Guide](../guides/installation.md).
 
 NeMo Automodel uses recipes to run end-to-end workflows. If you're new to recipes, see the [Repository Structure](../repository-structure.md) guide.
 
@@ -12,10 +12,10 @@ Kubernetes support is coming soon.
 ## Quick start: Choose your job launch option
 
 Slurm jobs support two modes of execution: `batch` and `interactive`. In `batch` mode, the job is submitted to the cluster queue and
-is executed without any other input from the user (e.g., no keyboard input), while the `interactive` mode, as the name implies, enables keyboard input.
+is executed without any other input from the user (e.g., no keyboard input), whereas the `interactive` mode, as the name implies, enables keyboard input.
 
 - **CLI (recommended for Slurm)**
-  This only requires to configure the `slurm` section in the YAML file, and the launcher will render the SBATCH script.
+This only requires you to configure the `slurm` section in the YAML file, and the launcher will render the SBATCH script.
   ```bash
   automodel finetune llm -c your_config_with_slurm.yaml
   ```
@@ -78,10 +78,8 @@ Then submit the job:
 automodel finetune llm -c your_config_with_slurm.yaml
 ```
 
-The AutoModel CLI is the preferred method for most users. It provides a unified interface to submit Slurm batch jobs without deep knowledge of cluster specifics.
-The CLI will automatically submit the job to Slurm and handle the distributed setup.
-The above example launches one node with eight workers per node inside torchrun (`--nproc_per_node=8`).
-The Slurm script itself uses `#SBATCH --ntasks-per-node 1`, and when `gpus_per_node` is set, it adds `#SBATCH --gpus-per-node=8` as well.
+The Automodel CLI is the preferred method for most users. It provides a unified interface for running jobs, from local environments (e.g., [workstation](./local-workstation.md)) to large clusters (e.g., Slurm batch jobs). The CLI will automatically submit the job to Slurm and handle the distributed setup. The above example launches one node with eight workers per node using torchrun (`--nproc_per_node=8`). The Slurm script itself uses `#SBATCH --ntasks-per-node 1`, and when `gpus_per_node` is set, it adds `#SBATCH --gpus-per-node=8` as well.
+
 
 The CLI follows this format:
 ```bash
@@ -106,7 +104,7 @@ automodel finetune llm -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml 
 
 This will launch the job using the source code in the `automodel_test_repo` directory instead of the version bundled in the Docker image.
 
-## Standalone Slurm Script (advanced)
+## Standalone Slurm Script (Advanced)
 
 If you prefer to submit with your own Slurm script, here is a standalone bash script adapted from the Automodel launcher template. See the upstream template for the authoritative reference: [Automodel Slurm template](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/launcher/slurm/template.py).
 
@@ -115,7 +113,7 @@ If you prefer to submit with your own Slurm script, here is a standalone bash sc
 #SBATCH -A <account>
 #SBATCH -p <partition>
 #SBATCH -N <nodes>
-#SBATCH --ntasks-per-node 1<gpus_per_node_directive>
+#SBATCH --ntasks-per-node 1 <gpus_per_node_directive>
 #SBATCH --time <HH:MM:SS>
 #SBATCH --mail-type=FAIL
 #SBATCH --exclusive
@@ -156,7 +154,7 @@ srun \
     bash -c "$CMD"
 ```
 
-Replace bracketed placeholders (e.g., `<account>`, `<container_image>`, `<command>`) with your values. For multi-node training, ensure your `<command>` uses `torchrun` with `--nnodes=$SLURM_NNODES --nproc-per-node=$NUM_GPUS --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT` or rely on the Automodel CLI which configures this for you.
+Replace bracketed placeholders (e.g., `<account>`, `<container_image>`, `<command>`) with your values. For multi-node training, ensure your `<command>` uses `torchrun` with `--nnodes=$SLURM_NNODES --nproc-per-node=$NUM_GPUS --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT` or rely on the Automodel CLI, which configures this for you.
 
 ## Run with uv (Development Mode)
 
@@ -164,7 +162,7 @@ When developing on clusters, you can use `uv` to prepare and test scripts locall
 
 For Slurm-based execution, rely on the `slurm` section in your YAML and submit with the CLI.
 
-### Why use uv?
+### Why Use uv?
 
 uv provides several advantages for development and experimentation:
 
@@ -178,7 +176,7 @@ uv provides several advantages for development and experimentation:
 
 For cluster usage, prefer submitting via the CLI with `slurm` configuration. Direct `torchrun` is recommended for single-node development; see [Run on Your Local Workstation](./local-workstation.md).
 
-### Standard PyTorch multi-node example
+### Standard PyTorch Multi-Node Example
 
 If you need a straightforward reference for manual multi-node launching with PyTorch (outside of Slurm helpers), use the pattern below. Run this on each node, updating `NODE_RANK` per node and adjusting `--nnodes`/`--nproc-per-node` as needed for your setup.
 
