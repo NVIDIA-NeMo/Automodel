@@ -34,6 +34,7 @@ from nemo_automodel.components.moe.layers import (
     GroupedExpertsDeepEP,
     MoE,
 )
+from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
 _CP_STREAM = None
@@ -129,7 +130,11 @@ def apply_fsdp(
     mp_policy: MixedPrecisionPolicy | None = None,
     offload_policy: OffloadPolicy | None = None,
     reshard_after_forward: bool = False,
+    lm_head_precision: str | torch.dtype | None = None,
 ):
+    if isinstance(lm_head_precision, str):
+        lm_head_precision = dtype_from_str(lm_head_precision, default=None)
+
     if mp_policy is None:
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16, reduce_dtype=torch.float32, output_dtype=torch.bfloat16
@@ -175,7 +180,22 @@ def apply_fsdp(
 
     lm_head = getattr(_model, "lm_head", None) or getattr(model, "lm_head", None)
     if lm_head is not None:
-        fully_shard_default(lm_head)
+        # Use custom mixed precision policy for lm_head if lm_head_precision is specified
+        if lm_head_precision == torch.float32:
+            lm_head_mp_policy = MixedPrecisionPolicy(
+                param_dtype=torch.float32,
+                reduce_dtype=torch.float32,
+                output_dtype=torch.float32,
+            )
+            fully_shard(
+                lm_head,
+                mesh=fsdp_mesh,
+                reshard_after_forward=reshard_after_forward,
+                mp_policy=lm_head_mp_policy,
+                offload_policy=offload_policy,
+            )
+        else:
+            fully_shard_default(lm_head)
 
     # TODO: properly handle all possible multimodal component names
     if hasattr(model, "audio_tower") and model.audio_tower is not None:
@@ -231,6 +251,7 @@ def parallelize_model(
     ep_shard_axis_names: tuple[str, ...] | None = None,
     activation_checkpointing: bool = False,
     reshard_after_forward: bool = False,
+    lm_head_precision: str | torch.dtype | None = None,
 ):
     assert tp_axis_name is None or world_mesh[tp_axis_name].size() == 1, (
         "Tensor parallelism not supported for custom MoE models"
@@ -268,4 +289,5 @@ def parallelize_model(
             ep_shard_enabled=ep_shard_mesh is not None and ep_shard_mesh.size() > 1,
             ep_shard_mesh=ep_shard_mesh,
             reshard_after_forward=reshard_after_forward,
+            lm_head_precision=lm_head_precision,
         )

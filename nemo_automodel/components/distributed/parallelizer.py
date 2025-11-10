@@ -378,6 +378,29 @@ def get_parallelization_strategy(model: nn.Module) -> ParallelizationStrategy:
     return PARALLELIZATION_STRATEGIES.get(model_name, _DEFAULT_STRATEGY)
 
 
+def register_parallel_strategy(arg=None, *, name: Optional[str] = None):
+    """Decorator to register out-of-tree parallelism strategies.
+
+    Supports:
+    - @register_parallel_strategy(name="CustomModelName")
+    """
+
+    def _register(cls):
+        # The decorator receives a class, not an instance.
+        assert isinstance(cls, type) and issubclass(cls, ParallelizationStrategy), (
+            f"cls must be a subclass of ParallelizationStrategy, but got {type(cls)} {cls}"
+        )
+        assert name is not None, "name is required"
+        assert name not in PARALLELIZATION_STRATEGIES, f"name {name} already registered"
+        PARALLELIZATION_STRATEGIES[name] = cls()
+        return cls
+
+    if name is None:
+        raise ValueError("name is required")
+    # If used with parentheses (possibly with arguments)
+    return _register
+
+
 def apply_fsdp2_sharding_recursively(
     module: nn.Module,
     mesh: DeviceMesh,
@@ -863,7 +886,9 @@ def _get_parallel_plan(
             "model.layers.*.self_attn.q_proj": ColwiseParallel(),
             "model.layers.*.self_attn.k_proj": ColwiseParallel(),
             "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),  # Combined QKV projection
             "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+            "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),  # Fused gate and up projection
             "model.layers.*.mlp.up_proj": ColwiseParallel(),
             "model.layers.*.mlp.gate_proj": ColwiseParallel(),
             "model.layers.*.mlp.down_proj": RowwiseParallel(),
