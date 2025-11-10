@@ -379,16 +379,19 @@ class TestNemotronHParallelizationStrategy:
                 sequence_parallel=True,
             )
 
-    def test_custom_tp_plan_not_supported(self, strategy, mock_device_mesh, nemotron_model, monkeypatch, mock_distributed_env):
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
+    @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
+    def test_custom_tp_plan_not_supported(self, fully_shard, fully_shard_by_dtype, strategy, mock_device_mesh, nemotron_model, monkeypatch, mock_distributed_env):
         """Test that passing a custom plan logs info and proceeds (no exception)."""
         mesh, _, _, _ = mock_device_mesh
-
+        fully_shard.side_effect = lambda model, **kwargs: model
+        fully_shard_by_dtype.side_effect = lambda model, **kwargs: model
         # Ensure logger is enabled; capture logs
         import logging
         from nemo_automodel.components.distributed import parallelizer as parallelizer_mod
         logger = parallelizer_mod.logging.getLogger(parallelizer_mod.__name__)
         old_level = logger.level
-        logger.setLevel(logging.INFO)
+        logger.setLevel(logging.DEBUG)
         try:
             result = strategy.parallelize(
                 model=nemotron_model,
@@ -402,11 +405,13 @@ class TestNemotronHParallelizationStrategy:
     @pytest.mark.parametrize("tp_size", [1, 2])
     @patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
-    def test_nemotron_specific_parallelization(self, mock_fully_shard, mock_parallelize_module,
+    @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
+    def test_nemotron_specific_parallelization(self, fully_shard, fully_shard_by_dtype, mock_parallelize_module,
                                              strategy, mock_device_mesh, nemotron_model, tp_size):
         """Test NemotronH-specific parallelization logic for tp_size 1 and 2."""
         mesh, _, dp_shard_mesh, tp_mesh = mock_device_mesh
-        mock_fully_shard.side_effect = lambda model, **kwargs: model
+        fully_shard.side_effect = lambda model, **kwargs: model
+        fully_shard_by_dtype.side_effect = lambda model, **kwargs: model
         tp_mesh.size.return_value = tp_size
 
         result = strategy.parallelize(
@@ -425,16 +430,18 @@ class TestNemotronHParallelizationStrategy:
 
         # Should call fully_shard for each layer and the root model regardless of TP size
         expected_fully_shard_calls = len(nemotron_model.backbone.layers) + 1  # +1 for root
-        assert mock_fully_shard.call_count == expected_fully_shard_calls
+        assert fully_shard_by_dtype.call_count + fully_shard.call_count == expected_fully_shard_calls
 
     @patch("nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper")
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
+    @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
     @patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
-    def test_activation_checkpointing(self, mock_parallelize, mock_fully_shard, mock_checkpoint,
+    def test_activation_checkpointing(self, mock_parallelize, mock_fully_shard, mock_fully_shard_by_dtype, mock_checkpoint,
                                     strategy, mock_device_mesh, nemotron_model):
         """Test activation checkpointing for NemotronH models."""
         mesh, _, dp_shard_mesh, tp_mesh = mock_device_mesh
         mock_fully_shard.side_effect = lambda model, **kwargs: model
+        mock_fully_shard_by_dtype.side_effect = lambda model, **kwargs: model
         mock_checkpoint.side_effect = lambda x: x
 
         # Add a mamba layer to test mamba checkpointing
@@ -674,7 +681,10 @@ class TestFsdp2StrategyParallelizeIntegration:
         # Verify that default strategy functions were called
         mock_distributed_env["extract_layers"].assert_called_once_with(model)
 
-    def test_delegates_to_nemotron_strategy(self, mock_device_mesh):
+    @patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
+    @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
+    def test_delegates_to_nemotron_strategy(self, fully_shard, fully_shard_by_dtype, mock_parallelize_module, mock_device_mesh):
         """Test that fsdp2_strategy_parallelize uses NemotronH strategy for NemotronH models."""
         mesh, _, _, _ = mock_device_mesh
 
