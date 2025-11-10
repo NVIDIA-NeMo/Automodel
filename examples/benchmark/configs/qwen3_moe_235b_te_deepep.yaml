@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Benchmarking config for Gptoss 20B Te Deepep
+# Benchmarking config for Qwen3 Moe 30B Te Deepep
 
 seed: 1234
 
@@ -22,34 +22,34 @@ benchmark:
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []
-  num_nodes: 1
-
-step_scheduler:
-  global_batch_size: 256
-  local_batch_size: 2
-  ckpt_every_steps: 1000
-  val_every_steps: 1000
-  num_epochs: 1
-  max_steps: 30
+  num_nodes: 32
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   tp_size: 1
   cp_size: 1
-  pp_size: 1
+  pp_size: 4
   dp_replicate_size: 1
-  ep_size: 8
+  ep_size: 32
   sequence_parallel: false
 
 autopipeline:
   _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
   pp_schedule: interleaved1f1b
-  pp_microbatch_size: 2
-  round_virtual_stages_to_pp_multiple: down
+  pp_microbatch_size: 1
+  round_virtual_stages_to_pp_multiple: up
   scale_grads_in_schedule: false
   patch_inner_model: false
   patch_causal_lm_model: false
   layers_per_stage: 2
+
+step_scheduler:
+  global_batch_size: 2048
+  local_batch_size: 8
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  num_epochs: 1
+  max_steps: 30
 
 dist_env:
   backend: nccl
@@ -57,23 +57,26 @@ dist_env:
 
 parallelizer:
   _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
-  activation_checkpointing: false
+  activation_checkpointing: true
+  reshard_after_forward: false
 
 model:
-  _target_: nemo_automodel.components.models.gpt_oss.model.GptOssForCausalLM.from_config
+  _target_: nemo_automodel.components.models.qwen3_moe.model.Qwen3MoeForCausalLM.from_config
   config:
     _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: openai/gpt-oss-20b
+    pretrained_model_name_or_path: Qwen/Qwen3-235B-A22B
   trust_remote_code: true
   is_meta_device: true
   backend:
     _target_: nemo_automodel.components.moe.utils.BackendConfig
-    attn: flex
+    attn: te
     linear: te
     rms_norm: te
     enable_deepep: true
     fake_balanced_gate: true
-    enable_hf_state_dict_adapter: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
 
 checkpoint:
   enabled: false
