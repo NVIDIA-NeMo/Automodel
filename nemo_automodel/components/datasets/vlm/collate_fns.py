@@ -215,14 +215,20 @@ def qwen3_omni_collate_fn(
     labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
 
     labels[torch.isin(labels, skipped_tokens)] = -100
-    batch["labels"] = labels
 
     # Create loss masks to only compute loss on assistant responses
     loss_masks = [
         create_loss_mask_with_start_of_response_token(input_ids, processor, start_of_response_token)
         for input_ids in batch["input_ids"]
     ]
-    batch["loss_mask"] = torch.tensor(loss_masks, dtype=torch.float, device=batch["input_ids"].device)
+    loss_mask_tensor = torch.tensor(loss_masks, dtype=torch.float, device=batch["input_ids"].device)
+    label_mask = torch.cat(
+        (loss_mask_tensor[:, 1:], torch.zeros_like(loss_mask_tensor[:, :1])),
+        dim=1,
+    )
+    labels = labels.masked_fill(label_mask == 0, -100)
+    batch["loss_mask"] = loss_mask_tensor
+    batch["labels"] = labels
     return batch
 
 
