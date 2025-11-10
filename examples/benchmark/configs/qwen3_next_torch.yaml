@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Benchmarking config for Gptoss 20B Torch
+# Benchmarking config for Qwen3 Next Torch
 
 seed: 1234
 
@@ -22,7 +22,6 @@ benchmark:
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []
-  num_nodes: 1
 
 generation:
   # Text prompt for generation
@@ -49,7 +48,7 @@ generation:
 
 step_scheduler:
   global_batch_size: 256
-  local_batch_size: 2
+  local_batch_size: 4
   ckpt_every_steps: 1000
   val_every_steps: 1000
   num_epochs: 1
@@ -80,17 +79,18 @@ dist_env:
 
 parallelizer:
   _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
-  activation_checkpointing: false
+  activation_checkpointing: true
 
 model:
-  _target_: nemo_automodel.components.models.gpt_oss.model.GptOssForCausalLM.from_config
+  _target_: nemo_automodel.components.models.qwen3_next.model.Qwen3NextForCausalLM.from_config
   config:
     _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: openai/gpt-oss-20b
+    pretrained_model_name_or_path: Qwen/Qwen3-Next
   trust_remote_code: true
+  is_meta_device: true
   backend:
     _target_: nemo_automodel.components.moe.utils.BackendConfig
-    attn: flex
+    attn: sdpa
     linear: torch
     rms_norm: torch
     enable_deepep: false
