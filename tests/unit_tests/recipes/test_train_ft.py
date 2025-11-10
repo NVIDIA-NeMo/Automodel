@@ -22,6 +22,7 @@ import importlib
 import torch
 import torch.nn as nn
 from torch.utils.data import IterableDataset
+from transformers import PretrainedConfig
 
 
 class DummyIterableDataset(IterableDataset):  # noqa: D401
@@ -193,7 +194,7 @@ class DummyModelConfig:
         return DummyModel()
 
     def get(self, key, default=None):
-        return default
+        return getattr(self, key, default)
 
 
 def test_peft_with_pipeline_parallelism_enabled(caplog):
@@ -372,4 +373,215 @@ def test_build_dataloader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatc
     assert ds._shuffle_calls and ds._shuffle_calls[-1] == (8, 123)
 
 
-    
+class TestIsHfModelLogic:
+    """Test suite for the is_hf_model logic in build_model_and_optimizer"""
+
+    def test_is_hf_model_when_no_pretrained_path(self):
+        """Test that is_hf_model is False when pretrained_model_name_or_path is None"""
+        device = torch.device("cpu")
+        cfg_model = DummyModelConfig()
+        cfg_model.pretrained_model_name_or_path = None
+        cfg_opt = DummyOptConfig()
+
+        mock_checkpointer = MagicMock()
+        mock_checkpointer.load_base_model = MagicMock()
+
+        with patch('nemo_automodel.recipes.llm.train_ft.apply_lora_to_linear_modules'):
+            with patch('nemo_automodel.recipes.llm.train_ft.print_trainable_parameters'):
+                with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
+                    with patch('nemo_automodel.recipes.llm.train_ft._get_packed_sequence_config') as mock_get_config:
+                        mock_get_config.return_value = {}
+
+                        model, _, _, _ = build_model_and_optimizer(
+                            device=device,
+                            cfg_model=cfg_model,
+                            cfg_opt=cfg_opt,
+                            cfg_peft=None,
+                            model_wrapper=None,
+                            seed=42,
+                            checkpointer=mock_checkpointer,
+                            has_packed_sequence=False,
+                            autopipeline=None,
+                            loss_fn=None,
+                        )
+
+                        # Verify _get_packed_sequence_config was called with is_hf_model=False
+                        call_args = mock_get_config.call_args
+                        assert call_args[0][1] == False, "is_hf_model should be False when no pretrained path"
+
+    def test_is_hf_model_when_custom_model_in_registry(self):
+        """Test that is_hf_model is False when model architecture is in ModelRegistry"""
+        device = torch.device("cpu")
+        cfg_model = DummyModelConfig()
+        cfg_model.pretrained_model_name_or_path = "custom/model"
+        cfg_opt = DummyOptConfig()
+
+        mock_checkpointer = MagicMock()
+        mock_checkpointer.load_base_model = MagicMock()
+
+        # Mock AutoConfig to return a custom model architecture that's in ModelRegistry
+        mock_config = Mock(spec=PretrainedConfig)
+        mock_config.architectures = ["Qwen3MoeForCausalLM"]  # This is in ModelRegistry
+
+        with patch('nemo_automodel.recipes.llm.train_ft.AutoConfig') as mock_autoconfig:
+            mock_autoconfig.from_pretrained.return_value = mock_config
+            with patch('nemo_automodel.recipes.llm.train_ft.apply_lora_to_linear_modules'):
+                with patch('nemo_automodel.recipes.llm.train_ft.print_trainable_parameters'):
+                    with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
+                        with patch('nemo_automodel.recipes.llm.train_ft._get_packed_sequence_config') as mock_get_config:
+                            mock_get_config.return_value = {}
+
+                            model, _, _, _ = build_model_and_optimizer(
+                                device=device,
+                                cfg_model=cfg_model,
+                                cfg_opt=cfg_opt,
+                                cfg_peft=None,
+                                model_wrapper=None,
+                                seed=42,
+                                checkpointer=mock_checkpointer,
+                                has_packed_sequence=False,
+                                autopipeline=None,
+                                loss_fn=None,
+                            )
+
+                            # Verify AutoConfig.from_pretrained was called
+                            mock_autoconfig.from_pretrained.assert_called_once_with(
+                                "custom/model", trust_remote_code=False
+                            )
+
+                            # Verify _get_packed_sequence_config was called with is_hf_model=False
+                            call_args = mock_get_config.call_args
+                            assert call_args[0][1] == False, "is_hf_model should be False for custom model in registry"
+
+    def test_is_hf_model_when_true_hf_model(self):
+        """Test that is_hf_model is True when model architecture is NOT in ModelRegistry"""
+        device = torch.device("cpu")
+        cfg_model = DummyModelConfig()
+        cfg_model.pretrained_model_name_or_path = "meta-llama/Llama-3-8B"
+        cfg_opt = DummyOptConfig()
+
+        mock_checkpointer = MagicMock()
+        mock_checkpointer.load_base_model = MagicMock()
+
+        # Mock AutoConfig to return a standard HF model architecture NOT in ModelRegistry
+        mock_config = Mock(spec=PretrainedConfig)
+        mock_config.architectures = ["LlamaForCausalLM"]  # Standard HF model, not in ModelRegistry
+
+        with patch('nemo_automodel.recipes.llm.train_ft.AutoConfig') as mock_autoconfig:
+            mock_autoconfig.from_pretrained.return_value = mock_config
+            with patch('nemo_automodel.recipes.llm.train_ft.apply_lora_to_linear_modules'):
+                with patch('nemo_automodel.recipes.llm.train_ft.print_trainable_parameters'):
+                    with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
+                        with patch('nemo_automodel.recipes.llm.train_ft._get_packed_sequence_config') as mock_get_config:
+                            mock_get_config.return_value = {}
+
+                            model, _, _, _ = build_model_and_optimizer(
+                                device=device,
+                                cfg_model=cfg_model,
+                                cfg_opt=cfg_opt,
+                                cfg_peft=None,
+                                model_wrapper=None,
+                                seed=42,
+                                checkpointer=mock_checkpointer,
+                                has_packed_sequence=False,
+                                autopipeline=None,
+                                loss_fn=None,
+                            )
+
+                            # Verify AutoConfig.from_pretrained was called
+                            mock_autoconfig.from_pretrained.assert_called_once_with(
+                                "meta-llama/Llama-3-8B", trust_remote_code=False
+                            )
+
+                            # Verify _get_packed_sequence_config was called with is_hf_model=True
+                            call_args = mock_get_config.call_args
+                            assert call_args[0][1] == True, "is_hf_model should be True for standard HF model"
+
+    def test_is_hf_model_with_trust_remote_code(self):
+        """Test that trust_remote_code is correctly passed to AutoConfig.from_pretrained"""
+        device = torch.device("cpu")
+        cfg_model = DummyModelConfig()
+        cfg_model.pretrained_model_name_or_path = "custom/model"
+        cfg_model.trust_remote_code = True  # This will be picked up by getattr in the get() method
+        cfg_opt = DummyOptConfig()
+
+        mock_checkpointer = MagicMock()
+        mock_checkpointer.load_base_model = MagicMock()
+
+        # Mock AutoConfig to return a model architecture
+        mock_config = Mock(spec=PretrainedConfig)
+        mock_config.architectures = ["CustomModelForCausalLM"]
+
+        with patch('nemo_automodel.recipes.llm.train_ft.AutoConfig') as mock_autoconfig:
+            mock_autoconfig.from_pretrained.return_value = mock_config
+            with patch('nemo_automodel.recipes.llm.train_ft.apply_lora_to_linear_modules'):
+                with patch('nemo_automodel.recipes.llm.train_ft.print_trainable_parameters'):
+                    with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
+                        with patch('nemo_automodel.recipes.llm.train_ft._get_packed_sequence_config') as mock_get_config:
+                            mock_get_config.return_value = {}
+
+                            model, _, _, _ = build_model_and_optimizer(
+                                device=device,
+                                cfg_model=cfg_model,
+                                cfg_opt=cfg_opt,
+                                cfg_peft=None,
+                                model_wrapper=None,
+                                seed=42,
+                                checkpointer=mock_checkpointer,
+                                has_packed_sequence=False,
+                                autopipeline=None,
+                                loss_fn=None,
+                            )
+
+                            # Verify AutoConfig.from_pretrained was called with trust_remote_code=True
+                            mock_autoconfig.from_pretrained.assert_called_once_with(
+                                "custom/model", trust_remote_code=True
+                            )
+
+    def test_is_hf_model_multiple_registered_models(self):
+        """Test that is_hf_model correctly identifies various custom models in registry"""
+        device = torch.device("cpu")
+        cfg_opt = DummyOptConfig()
+        mock_checkpointer = MagicMock()
+        mock_checkpointer.load_base_model = MagicMock()
+
+        # Test multiple custom models that are in ModelRegistry
+        custom_models = [
+            "Qwen3MoeForCausalLM",
+            "Qwen3NextForCausalLM",
+            "GptOssForCausalLM",
+            "DeepseekV3ForCausalLM",
+            "Glm4MoeForCausalLM",
+        ]
+
+        for model_arch in custom_models:
+            cfg_model = DummyModelConfig()
+            cfg_model.pretrained_model_name_or_path = f"some/path/{model_arch}"
+
+            mock_config = Mock(spec=PretrainedConfig)
+            mock_config.architectures = [model_arch]
+
+            with patch('nemo_automodel.recipes.llm.train_ft.AutoConfig') as mock_autoconfig:
+                mock_autoconfig.from_pretrained.return_value = mock_config
+                with patch('nemo_automodel.recipes.llm.train_ft.apply_lora_to_linear_modules'):
+                    with patch('nemo_automodel.recipes.llm.train_ft.print_trainable_parameters'):
+                        with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
+                            with patch('nemo_automodel.recipes.llm.train_ft._get_packed_sequence_config') as mock_get_config:
+                                mock_get_config.return_value = {}
+
+                                model, _, _, _ = build_model_and_optimizer(
+                                    device=device,
+                                    cfg_model=cfg_model,
+                                    cfg_opt=cfg_opt,
+                                    cfg_peft=None,
+                                    model_wrapper=None,
+                                    seed=42,
+                                    checkpointer=mock_checkpointer,
+                                    has_packed_sequence=False,
+                                    autopipeline=None,
+                                    loss_fn=None,
+                                )
+
+                                # Verify _get_packed_sequence_config was called with is_hf_model=False
+                                call_args = mock_get_config.call_args
+                                assert call_args[0][1] == False, f"is_hf_model should be False for {model_arch}"
