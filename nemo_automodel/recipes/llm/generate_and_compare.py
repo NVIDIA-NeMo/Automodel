@@ -123,8 +123,8 @@ def compare_and_print_logits(
     ),
 ) -> None:
     # Apply log_softmax to convert logits to log probabilities
-    hf_logits = torch.log_softmax(hf_logits.float(), dim=-1)
-    automodel_logits = torch.log_softmax(automodel_logits.float(), dim=-1)
+    hf_logits = torch.log_softmax(hf_logits.float(), dim=-1, dtype=torch.float32)
+    automodel_logits = torch.log_softmax(automodel_logits.float(), dim=-1, dtype=torch.float32)
 
     diff = torch.abs(automodel_logits - hf_logits)
     max_abs = float(torch.max(diff))
@@ -173,7 +173,7 @@ def compare_and_print_logits(
 
     # Print comparison results
     print("\n" + "=" * 70)
-    print("LOGITS COMPARISON")
+    print("LOGPROBS COMPARISON")
     print("=" * 70)
     print(f"Max abs diff:    {max_abs:.6f}")
     print(f"Mean abs diff:   {mean_abs:.6f}")
