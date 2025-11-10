@@ -38,17 +38,14 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
+from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.init_utils import DistInfo
 
-try:
-    import wandb
-    from wandb import Settings
-except ImportError:
-    wandb = None
-    Settings = None
+import wandb
+from wandb import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -516,7 +513,7 @@ class TrainBiencoderRecipe(BaseRecipe):
             self.step_scheduler.set_epoch(epoch)
             # The step scheduler yields a list of batches for gradient accumulation
             for batches in self.step_scheduler:
-                train_log_data = self._run_train_optim_step(batches)
+                train_log_data = self._run_train_optim_step(batches, 1.0)
 
                 # Log metrics
                 self.log_train_metrics(train_log_data)
@@ -568,14 +565,17 @@ class TrainBiencoderRecipe(BaseRecipe):
             loss_buffer.append(loss.clone().detach())
 
             if is_train:
-                # Scale loss by DP group size for proper gradient accumulation (include CP as in train_ft.py)
-                (loss * self._get_dp_group_size(include_cp=True)).backward()
+                # Scale loss by number of gradient accumulation steps to get correct average gradients
+                # FSDP/DDP will handle averaging across DP ranks automatically
+                scaled_loss = loss / num_batches
+                scaled_loss.backward()
 
-    def _run_train_optim_step(self, batches):
+    def _run_train_optim_step(self, batches, max_grad_norm=None):
         """Run one optimization step with gradient accumulation.
 
         Args:
             batches: List of batches for gradient accumulation
+            max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
 
         Returns:
             MetricsSample with training metrics
@@ -585,6 +585,20 @@ class TrainBiencoderRecipe(BaseRecipe):
         # Gradient accumulation
         for idx, batch in enumerate(batches):
             self._forward_backward_step(idx, batch, loss_buffer=loss_buffer, num_batches=len(batches), is_train=True)
+
+        grad_norm = scale_grads_and_clip_grad_norm(
+            max_grad_norm,
+            self.model_parts,
+            norm_type=2.0,
+            pp_enabled=self.pp_enabled,
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
+            pp_axis_name="pp" if self.pp_enabled else None,
+            foreach=True,
+            num_label_tokens=None,  # Not applicable for biencoder
+            dp_group_size=self._get_dp_group_size(include_cp=True),
+        )
 
         # Optimizer step
         for opt in self.optimizer:
@@ -596,10 +610,13 @@ class TrainBiencoderRecipe(BaseRecipe):
             for scheduler in self.lr_scheduler:
                 scheduler.step(1)
 
-        # Compute average loss
-        avg_loss = torch.stack(loss_buffer).mean()
+        # Compute average loss across gradient accumulation and DP ranks
+        reporting_loss = torch.sum(torch.stack(loss_buffer))
         if torch.distributed.is_initialized():
-            avg_loss = self._dp_allreduce(avg_loss, include_cp=True)
+            reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
+            # Divide by DP group size to get average across all ranks
+            reporting_loss = reporting_loss / self._get_dp_group_size(include_cp=True)
+        reporting_loss = reporting_loss.cpu().item()
 
         # Get current learning rate
         lr = self.optimizer[0].param_groups[0]["lr"]
@@ -612,7 +629,8 @@ class TrainBiencoderRecipe(BaseRecipe):
         mem_allocated = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
 
         metrics = {
-            "loss": avg_loss.item(),
+            "loss": reporting_loss,
+            "grad_norm": grad_norm,
             "lr": lr,
             "mem": mem_allocated,
             "time_per_step": elapsed,
@@ -701,17 +719,18 @@ class TrainBiencoderRecipe(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        if wandb is not None and wandb.run is not None:
+        if wandb.run is not None:
             wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
 
         # JSONL training log
         self.metric_logger_train.log(log_data)
 
         logging.info(
-            "step {} | epoch {} | loss {:.4f} | lr {:.2e} | mem {:.2f} GiB | time {:.2f}s".format(
+            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | time {:.2f}s".format(
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["loss"],
+                log_data.metrics["grad_norm"],
                 log_data.metrics["lr"],
                 log_data.metrics["mem"],
                 log_data.metrics["time_per_step"],
@@ -729,7 +748,7 @@ class TrainBiencoderRecipe(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        if wandb is not None and wandb.run is not None:
+        if wandb.run is not None:
             wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
 
         # JSONL validation log
