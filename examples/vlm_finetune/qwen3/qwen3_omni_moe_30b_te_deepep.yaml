@@ -18,7 +18,7 @@ step_scheduler:
   ckpt_every_steps: 500
   val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 2
-  # max_steps: 5
+  # max_steps: 200
 
 dist_env:
   backend: nccl
@@ -40,7 +40,7 @@ model:
     pretrained_model_name_or_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
   backend:
     _target_: nemo_automodel.components.moe.utils.BackendConfig
-    attn: te
+    attn: sdpa
     linear: te
     rms_norm: te
     enable_deepep: true
