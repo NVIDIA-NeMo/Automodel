@@ -55,6 +55,7 @@ from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricLoggerDist, MetricsSample
+from nemo_automodel.components.loggers.mlflow_utils import build_mlflow
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
@@ -870,6 +871,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             run = build_wandb(self.cfg)
             logging.info("🚀 View run at {}".format(run.url))
 
+        self.mlflow_logger = None
+        if self.dist_env.is_main and hasattr(self.cfg, "mlflow"):
+            self.mlflow_logger = build_mlflow(self.cfg)
+            self.mlflow_logger.log_params(self.cfg.to_dict())
+            logging.info("MLflow experiment tracking enabled")
+
         # Log experiment details on main rank
         self._log_experiment_details()
         self._log_library_versions()
@@ -1318,7 +1325,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
 
     def log_val_metrics(self, val_name, log_data, metric_logger=None):
-        """Log metrics to wandb and other loggers
+        """Log metrics to wandb, MLflow and other loggers
         Args:
             log_data: MetricsSample object, containing:
                 step: int, the current step.
@@ -1336,6 +1343,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         if wandb.run is not None:
             wandb.log(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
+
+        if self.mlflow_logger is not None:
+            self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         # JSONL validation log
         if not metric_logger is None:
@@ -1373,6 +1383,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         if wandb.run is not None:
             wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+
+        if self.mlflow_logger is not None:
+            self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
+
         # JSONL training log
         self.metric_logger_train.log(log_data)
         logging.info(
