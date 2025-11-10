@@ -102,7 +102,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         flops = flops_formula(self.model_parts[0].config, gbs=global_batch_size, seq_len=seq_len)
         self.tflops = flops / (10**12)
 
-        if "peft" in self.cfg:
+        if hasattr(self.cfg, "peft"):
             # Calculate trainable vs non-trainable parameters without lora
             lora_params = sum(p.numel() for p in self.model_parts[0].parameters() if p.requires_grad)
             total_params = sum(p.numel() for p in self.model_parts[0].parameters())
