@@ -1,23 +1,23 @@
 # Overview
 
-NeMo AutoModel integrates with Hugging Face `transformers`. As a result, any LLM or VLM that can be instantiated through `transformers` can also be used via NeMo AutoModel, subject to runtime, third-party software dependencies and feature compatibility.
+NeMo Automodel integrates with Hugging Face `transformers`. As a result, any LLM or VLM that can be instantiated through `transformers` can also be used via NeMo Automodel, subject to runtime, third-party software dependencies, and feature compatibility.
 
-## Version compatibility and Day‑0 support
+## Version Compatibility and Day-0 Support
 
-- AutoModel closely tracks the latest `transformers` version and updates its dependency on a regular basis.
+- NeMo Automodel closely tracks the latest `transformers` version and updates its dependency on a regular basis.
 - New models released on the Hugging Face Hub may require the latest `transformers` version, necessitating a package upgrade.
 - We are working on introducing a continuous integration (CI) pipeline that will automatically bump the supported `transformers` version as soon as a new release is detected. This will enable even faster support for the newest Hugging Face models.
 
-**Note:** To use newly released models, you may need to upgrade your NeMo AutoModel installation. This process is similar to upgrading `transformers` itself to access the latest model support. In practice, the upgrade behavior and familiar `Auto*` APIs mirror `transformers`, with AutoModel additionally providing optional performance accelerations and distributed training features.
+**Note:** To use newly released models, you may need to upgrade your NeMo Automodel installation—just as you would upgrade `transformers` to access the latest models. Automodel mirrors the familiar `transformers` `Auto*` APIs and upgrade behavior while adding optional performance accelerations and distributed training features.
 
-## Extended model support with NeMo AutoModel's custom model registry
+## Extended Model Support with NeMo Automodel's Custom Model Registry
 
-NeMo AutoModel includes a custom model registry that allows teams to:
+NeMo Automodel includes a custom model registry that allows teams to:
 
 - Add custom implementations to extend support to models not yet covered upstream.
-- Provide optimized, extended or faster implementations for specific models while retaining the same AutoModel interface.
+- Provide optimized, extended or faster implementations for specific models while retaining the same Automodel interface.
 
-## Supported Hugging Face Auto classes
+## Supported Hugging Face Auto Classes
 
 | Auto class                          | Task                     | Status     | Notes                                     |
 |-------------------------------------|--------------------------|------------|-------------------------------------------|
@@ -26,9 +26,9 @@ NeMo AutoModel includes a custom model registry that allows teams to:
 | `AutoModelForSequenceClassification`| Sequence Classification  | WIP        | Early support; interfaces may change.     |
 
 
-## When a model listed on Hugging Face Hub may not be supported
+## Troubleshooting Unsupported Models
 
-Sometimes a model listed on the Hugging Face Hub may not support finetuning in NeMo AutoModel.
+Sometimes a model listed on the Hugging Face Hub may not support fine-tuning in NeMo Automodel.
 If you encounter any such model, please open a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues) requesting support by sharing the model-id of interest as well as any stack trace you see. We summarize here some cases (non-exhaustive):
 
 | Issue                              | Example Error Message    | Solution                                    |
@@ -38,10 +38,10 @@ If you encounter any such model, please open a [GitHub issue](https://github.com
 | Model upper-bounds transformer version, requiring older version | — | Open a new GitHub issue. |
 | Unsupported checkpoint format | OSError: `meta-llama/Llama-2-70b` does not appear to have a file named pytorch_model.bin, model.safetensors, tf_model.h5, model.ckpt or flax_model.msgpack. | Open a new GitHub issue or request from the model publisher to share a safetensors checkpoint. |
 
-These cases typically stem from upstream packaging or dependency constraints and would surface similarly when using `transformers` directly. AutoModel mirrors the familiar load/finetune semantics.
+These cases typically stem from upstream packaging or dependency constraints. You would encounter the same issues when using `transformers` directly, as Automodel mirrors the familiar load and fine-tune semantics.
 
 If you encounter any issue, you can try:
 
-- Upgrade to a NeMo AutoModel release that supports the required `transformers` version.
+- Upgrade to a NeMo Automodel release that supports the required `transformers` version.
 - If the model uses custom code, set `trust_remote_code=True` when loading.
 - Open a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues) with the model-id and error for us to prioritize support or add a registry-backed implementation.
