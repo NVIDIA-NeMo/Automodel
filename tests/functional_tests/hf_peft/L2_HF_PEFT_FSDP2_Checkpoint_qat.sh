@@ -18,6 +18,7 @@ set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1"
 
+TORCH_NCCL_TRACE_BUFFER_SIZE=1000 \
 TRANSFORMERS_OFFLINE=1 uv run --with '.[fa]' python -m torch.distributed.run \
 --master-port=29503 --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace  \
 nemo_automodel/recipes/llm/train_ft.py \
