@@ -40,8 +40,26 @@ def deepseek_v3_gate_process_fn(hf_tuple, auto_tuple) -> torch.Tensor:
     return hf_tuple, auto_tuple
 
 
+def qwen3_next_gate_process_fn(hf_tuple, auto_tuple) -> torch.Tensor:
+    router_logits = hf_tuple.to("cuda:0") if hf_tuple.device.type == "cpu" else hf_tuple
+    routing_weights = torch.nn.functional.softmax(router_logits, dim=1, dtype=torch.float)
+    routing_weights, selected_experts = torch.topk(routing_weights, 10, dim=-1)
+    routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+    sorted_selected_experts, sorted_indices = selected_experts.sort(dim=-1)
+    sorted_routing_weights = routing_weights.gather(dim=-1, index=sorted_indices)
+    hf_tuple = (sorted_selected_experts.to("cpu"), sorted_routing_weights.to("cpu"))
+
+    auto_tuple = (auto_tuple[1], auto_tuple[0])  # Swap to (indices, weights)
+    sorted_auto_indices, sorted_indices = auto_tuple[0].sort(dim=-1)
+    sorted_auto_weights = auto_tuple[1].gather(dim=-1, index=sorted_indices)
+    auto_tuple = (sorted_auto_indices.to("cpu"), sorted_auto_weights.to("cpu"))
+
+    return hf_tuple, auto_tuple
+
+
 GATE_PROCESS_FUNCTIONS = {
     "DeepseekV3ForCausalLM": deepseek_v3_gate_process_fn,
+    "Qwen3NextForCausalLM": qwen3_next_gate_process_fn,
 }
 # ============================================================================
 # Activation Recording
@@ -352,10 +370,6 @@ def _compare_single_activation(key: str, a: torch.Tensor, b: torch.Tensor, inden
 def _compare_gate_activation(
     key: str, auto_tuple: tuple, hf_tuple: tuple, gate_process_fn: Callable[[tuple, tuple], tuple], indent: str = "  "
 ) -> None:
-    if len(auto_tuple) != len(hf_tuple):
-        print(f"{indent}{key}: tuple length mismatch {len(auto_tuple)} vs {len(hf_tuple)}")
-        return
-
     hf_tuple, auto_tuple = gate_process_fn(hf_tuple, auto_tuple)
 
     # Color codes for highlighting issues
@@ -394,7 +408,7 @@ def _process_and_compare_activation(
     key: str, auto_act: torch.Tensor, hf_act: torch.Tensor, model_cls: str, indent: str = "  "
 ) -> None:
     # Handle tuple activations (e.g., from gate/router modules)
-    if isinstance(auto_act, tuple) and isinstance(hf_act, tuple):
+    if key.endswith("mlp.gate"):
         _compare_gate_activation(key, auto_act, hf_act, GATE_PROCESS_FUNCTIONS[model_cls], indent=indent)
     else:
         # Handle single tensor activations
