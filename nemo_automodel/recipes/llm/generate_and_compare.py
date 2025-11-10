@@ -41,9 +41,10 @@ def deepseek_v3_gate_process_fn(hf_tuple, auto_tuple) -> torch.Tensor:
 
 
 def qwen3_next_gate_process_fn(hf_tuple, auto_tuple) -> torch.Tensor:
+    top_k = auto_tuple[0].shape[-1]
     router_logits = hf_tuple.to("cuda:0") if hf_tuple.device.type == "cpu" else hf_tuple
-    routing_weights = torch.nn.functional.softmax(router_logits, dim=1, dtype=torch.float)
-    routing_weights, selected_experts = torch.topk(routing_weights, 10, dim=-1)
+    routing_weights = torch.nn.functional.softmax(router_logits, dim=1, dtype=torch.float64)
+    routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
     routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
     sorted_selected_experts, sorted_indices = selected_experts.sort(dim=-1)
     sorted_routing_weights = routing_weights.gather(dim=-1, index=sorted_indices)
@@ -60,6 +61,7 @@ def qwen3_next_gate_process_fn(hf_tuple, auto_tuple) -> torch.Tensor:
 GATE_PROCESS_FUNCTIONS = {
     "DeepseekV3ForCausalLM": deepseek_v3_gate_process_fn,
     "Qwen3NextForCausalLM": qwen3_next_gate_process_fn,
+    "Qwen3MoeForCausalLM": qwen3_next_gate_process_fn,
 }
 # ============================================================================
 # Activation Recording
@@ -669,6 +671,7 @@ class GenerationAndComparisonRecipeForCausalLM(BenchmarkingRecipeForNextTokenPre
                 trust_remote_code=True,
                 torch_dtype=dtype,
                 device_map="cpu",
+                attn_implementation="flash_attention_2",
             )
 
             # Optionally truncate HF to first N layers to save memory
