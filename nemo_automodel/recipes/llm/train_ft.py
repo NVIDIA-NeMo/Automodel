@@ -231,7 +231,11 @@ def build_model_and_optimizer(
                 fp8_config = build_fp8_config(cfg_fp8)
                 model = apply_fp8_to_model(model, config=fp8_config)
 
-    print_trainable_parameters(model)
+    trainable_params, total_params = print_trainable_parameters(model)
+    param_info = {
+        "trainable_params": trainable_params,
+        "total_params": total_params,
+    }
 
     # hold a list copy of the model state dict keys before any parallelization
     state_dict_keys = list(model.state_dict().keys())
@@ -338,7 +342,7 @@ def build_model_and_optimizer(
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         optimizer = [cfg_opt.instantiate(params=trainable_params)]
 
-    return model, state_dict_keys, optimizer, loss_fn
+    return model, state_dict_keys, optimizer, loss_fn, param_info
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
@@ -962,7 +966,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             moe_mesh=self.moe_mesh,
         )
 
-        model, model_state_dict_keys, self.optimizer, self.loss_fn = build_model_and_optimizer(
+        model, model_state_dict_keys, self.optimizer, self.loss_fn, self.param_info = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
             self.cfg.optimizer,
