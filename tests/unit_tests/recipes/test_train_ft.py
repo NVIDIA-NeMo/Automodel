@@ -15,13 +15,14 @@
 import logging
 from unittest.mock import MagicMock, Mock, patch
 import pytest
-from nemo_automodel.recipes.llm.train_ft import _get_packed_sequence_config, build_validation_dataloader, build_dataloader, build_model_and_optimizer
+from nemo_automodel.recipes.llm.train_ft import _get_packed_sequence_config, build_validation_dataloader, build_dataloader, build_model_and_optimizer, _is_hf_model
 from nemo_automodel.components.config.loader import ConfigNode
 from unittest.mock import patch
 import importlib
 import torch
 import torch.nn as nn
 from torch.utils.data import IterableDataset
+from transformers import PretrainedConfig
 
 
 class DummyIterableDataset(IterableDataset):  # noqa: D401
@@ -193,7 +194,7 @@ class DummyModelConfig:
         return DummyModel()
 
     def get(self, key, default=None):
-        return default
+        return getattr(self, key, default)
 
 
 def test_peft_with_pipeline_parallelism_enabled(caplog):
@@ -372,4 +373,102 @@ def test_build_dataloader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatc
     assert ds._shuffle_calls and ds._shuffle_calls[-1] == (8, 123)
 
 
-    
+class TestIsHfModelLogic:
+    """Test suite for the _is_hf_model private method"""
+
+    def test_is_hf_model_when_no_pretrained_path(self):
+        """Test that _is_hf_model returns False when pretrained_model_name_or_path is None"""
+        cfg_model = DummyModelConfig()
+        cfg_model.pretrained_model_name_or_path = None
+
+        result = _is_hf_model(cfg_model)
+
+        assert result == False, "_is_hf_model should return False when no pretrained path"
+
+    def test_is_hf_model_when_custom_model_in_registry(self):
+        """Test that _is_hf_model returns False when model architecture is in ModelRegistry"""
+        cfg_model = DummyModelConfig()
+        cfg_model.pretrained_model_name_or_path = "custom/model"
+
+        # Mock AutoConfig to return a custom model architecture that's in ModelRegistry
+        mock_config = Mock(spec=PretrainedConfig)
+        mock_config.architectures = ["Qwen3MoeForCausalLM"]
+
+        with patch('nemo_automodel.recipes.llm.train_ft.AutoConfig') as mock_autoconfig:
+            mock_autoconfig.from_pretrained.return_value = mock_config
+
+            result = _is_hf_model(cfg_model)
+
+            # Verify AutoConfig.from_pretrained was called
+            mock_autoconfig.from_pretrained.assert_called_once_with(
+                "custom/model", trust_remote_code=False
+            )
+
+            assert result == False, "_is_hf_model should return False for custom model in registry"
+
+    def test_is_hf_model_when_true_hf_model(self):
+        """Test that _is_hf_model returns True when model architecture is NOT in ModelRegistry"""
+        cfg_model = DummyModelConfig()
+        cfg_model.pretrained_model_name_or_path = "meta-llama/Llama-3-8B"
+
+        # Mock AutoConfig to return a standard HF model architecture NOT in ModelRegistry
+        mock_config = Mock(spec=PretrainedConfig)
+        mock_config.architectures = ["LlamaForCausalLM"]
+
+        with patch('nemo_automodel.recipes.llm.train_ft.AutoConfig') as mock_autoconfig:
+            mock_autoconfig.from_pretrained.return_value = mock_config
+
+            result = _is_hf_model(cfg_model)
+
+            # Verify AutoConfig.from_pretrained was called
+            mock_autoconfig.from_pretrained.assert_called_once_with(
+                "meta-llama/Llama-3-8B", trust_remote_code=False
+            )
+
+            assert result == True, "_is_hf_model should return True for standard HF model"
+
+    def test_is_hf_model_with_trust_remote_code(self):
+        """Test that trust_remote_code is correctly passed to AutoConfig.from_pretrained"""
+        cfg_model = DummyModelConfig()
+        cfg_model.pretrained_model_name_or_path = "custom/model"
+        cfg_model.trust_remote_code = True
+
+        # Mock AutoConfig to return a model architecture
+        mock_config = Mock(spec=PretrainedConfig)
+        mock_config.architectures = ["CustomModelForCausalLM"]
+
+        with patch('nemo_automodel.recipes.llm.train_ft.AutoConfig') as mock_autoconfig:
+            mock_autoconfig.from_pretrained.return_value = mock_config
+
+            result = _is_hf_model(cfg_model)
+
+            # Verify AutoConfig.from_pretrained was called with trust_remote_code=True
+            mock_autoconfig.from_pretrained.assert_called_once_with(
+                "custom/model", trust_remote_code=True
+            )
+
+            assert result == True, "_is_hf_model should return True for non-registered model"
+
+    def test_is_hf_model_multiple_registered_models(self):
+        """Test that _is_hf_model correctly identifies various custom models in registry"""
+        custom_models = [
+            "Qwen3MoeForCausalLM",
+            "Qwen3NextForCausalLM",
+            "GptOssForCausalLM",
+            "DeepseekV3ForCausalLM",
+            "Glm4MoeForCausalLM",
+        ]
+
+        for model_arch in custom_models:
+            cfg_model = DummyModelConfig()
+            cfg_model.pretrained_model_name_or_path = f"some/path/{model_arch}"
+
+            mock_config = Mock(spec=PretrainedConfig)
+            mock_config.architectures = [model_arch]
+
+            with patch('nemo_automodel.recipes.llm.train_ft.AutoConfig') as mock_autoconfig:
+                mock_autoconfig.from_pretrained.return_value = mock_config
+
+                result = _is_hf_model(cfg_model)
+
+                assert result == False, f"_is_hf_model should return False for {model_arch}"
