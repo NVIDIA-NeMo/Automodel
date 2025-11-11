@@ -197,7 +197,24 @@ def apply_fsdp(
         else:
             fully_shard_default(lm_head)
 
+    # TODO: properly handle all possible multimodal component names
+    if hasattr(model, "audio_tower") and model.audio_tower is not None:
+        if any(param.requires_grad for param in model.audio_tower.parameters()):
+            fully_shard_default(model.audio_tower)
+        else:
+            logging.info("Skipping FSDP wrap for frozen audio tower")
+
+    if hasattr(model, "visual") and model.visual is not None:
+        if any(param.requires_grad for param in model.visual.parameters()):
+            fully_shard_default(model.visual)
+        else:
+            logging.info("Skipping FSDP wrap for frozen visual tower")
+
     fully_shard_default(_model)
+
+    # If model has a nested structure (outer model wrapping inner _model), wrap the outer model too
+    if model != _model:
+        fully_shard_default(model)
 
 
 def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p2p"):

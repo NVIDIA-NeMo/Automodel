@@ -82,3 +82,12 @@ def get_registry():
 
 
 ModelRegistry = get_registry()
+
+# Currently applying manual overrides for specific architecture name mappings
+from nemo_automodel.components.models.qwen3_omni_moe.model import (
+    Qwen3OmniMoeThinkerForConditionalGeneration,
+)
+
+ModelRegistry.model_arch_name_to_cls["Qwen3OmniMoeForConditionalGeneration"] = (
+    Qwen3OmniMoeThinkerForConditionalGeneration
+)

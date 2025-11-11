@@ -84,6 +84,10 @@ class ModelState:
         """
         self.model = [model] if isinstance(model, torch.nn.Module) else model
         self.is_tied_lm_head = getattr(getattr(self.model[0], "config", {}), "tie_word_embeddings", False)
+
+        if "Qwen3OmniMoeThinkerForConditionalGeneration" in getattr(type(self.model[0]), "__name__", ""):
+            self.is_tied_lm_head = False
+
         if self.is_tied_lm_head:
             _, lm_head_param_name = _get_lm_head_weight_and_name(self.model[0])
             self.lm_head_param_name = lm_head_param_name
