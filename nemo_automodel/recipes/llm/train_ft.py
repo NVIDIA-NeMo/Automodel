@@ -240,6 +240,8 @@ def build_model_and_optimizer(
 
         # Apply QAT if configured (torchao QAT)
         if cfg_qat is not None and cfg_qat.get("enabled", False):
+            if cfg_peft is not None:
+                raise ValueError("QAT with PEFT is not supported in 25.11")
             if not HAVE_TORCHAO_QAT:
                 raise ImportError("QAT requested but torchao QAT is unavailable. Install torchao>=0.7.0")
             quantizer_cfg = cfg_qat.quantizer
