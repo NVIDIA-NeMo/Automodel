@@ -37,6 +37,7 @@ from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
 from transformers.utils.hub import TRANSFORMERS_CACHE
 from wandb import Settings
 
+from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
@@ -142,6 +143,18 @@ def _get_packed_sequence_config(has_packed_sequence, is_hf_model, cp_size):
     return kwargs
 
 
+def _is_hf_model(cfg_model):
+    pretrained_path = cfg_model.get("pretrained_model_name_or_path", None)
+    if pretrained_path is None:
+        return False
+
+    trust_remote_code = bool(cfg_model.get("trust_remote_code", False))
+    config = AutoConfig.from_pretrained(pretrained_path, trust_remote_code=trust_remote_code)
+    architecture = config.architectures[0]
+
+    return architecture not in ModelRegistry.model_arch_name_to_cls
+
+
 def build_model_and_optimizer(
     device,
     cfg_model,
@@ -181,7 +194,8 @@ def build_model_and_optimizer(
     Returns:
         The instantiated model on the specified device, the state dict keys before any parallelization, the optimizer, and the loss function.
     """
-    is_hf_model = cfg_model.get("pretrained_model_name_or_path", None) is not None
+
+    is_hf_model = _is_hf_model(cfg_model)
     is_meta_device = False
     if hasattr(cfg_model, "is_meta_device"):
         is_meta_device = cfg_model.is_meta_device
