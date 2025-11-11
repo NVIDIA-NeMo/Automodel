@@ -159,7 +159,10 @@ def calculate_virtual_stages(
     if layers_per_stage is not None:
         # Calculate number of virtual stages needed (using ceiling division)
         # This allows for unequal distribution where stages can differ by at most 1 layer
-        num_virtual_stages = math.ceil(num_layers / layers_per_stage) + 1
+        if num_layers % layers_per_stage == 0:
+            num_virtual_stages = num_layers // layers_per_stage
+        else:
+            num_virtual_stages = math.ceil(num_layers / layers_per_stage) + 1
 
         # Validation: check stages per rank based on schedule type
         # Common error message components to reduce duplication
