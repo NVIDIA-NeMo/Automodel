@@ -19,7 +19,7 @@ export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1"
 
 TORCH_NCCL_TRACE_BUFFER_SIZE=1000 \
-TRANSFORMERS_OFFLINE=1 uv run --with '.[fa]' python -m torch.distributed.run \
+TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run \
 --master-port=29503 --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace  \
 nemo_automodel/recipes/llm/train_ft.py \
     --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
@@ -35,11 +35,6 @@ nemo_automodel/recipes/llm/train_ft.py \
     --step_scheduler.ckpt_every_steps 10 \
     --checkpoint.enabled true \
     --checkpoint.checkpoint_dir checkpoints/ \
-    --peft.match_all_linear true \
-    --peft.dim 8 \
-    --peft.alpha 32 \
-    --peft.use_triton false \
-    --peft._target_ nemo_automodel.components._peft.lora.PeftConfig \
     --distributed._target_ nemo_automodel.components.distributed.fsdp2.FSDP2Manager \
     --distributed.dp_size none \
     --distributed.tp_size 1 \
@@ -48,4 +43,5 @@ nemo_automodel/recipes/llm/train_ft.py \
     --qat.fake_quant_after_n_steps 1 \
     --qat.enabled True \
     --qat.quantizer._target_ torchao.quantization.qat.Int8DynActInt4WeightQATQuantizer \
-    --qat.quantizer.groupsize 32
+    --qat.quantizer.groupsize 32 \
+    --qat.quantizer.use_bias false
