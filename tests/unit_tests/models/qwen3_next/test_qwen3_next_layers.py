@@ -156,7 +156,9 @@ class TestPreprocessForAttn:
         assert q_out.shape == (2, 3, 5, 6)
         assert k_out.shape == (2, 3, 5, 6)
         assert v_out.shape == (2, 3, 5, 6)
-        assert kwargs == {"is_causal": True}
+        assert kwargs["is_causal"] is True
+        assert kwargs.get("attn_mask") is None
+        assert set(kwargs.keys()) <= {"is_causal", "attn_mask"}
 
 
 class TestPostprocessFromAttn:
