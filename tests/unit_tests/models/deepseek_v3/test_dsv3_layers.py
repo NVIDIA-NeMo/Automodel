@@ -121,7 +121,7 @@ class TestPreprocessArgsAndKwargsForAttn:
         assert torch.equal(k_out, k.transpose(1, 2))
         assert torch.equal(v_out, v.transpose(1, 2))
 
-        assert attn_kwargs == {"is_causal": True, "attn_mask": None}
+        assert attn_kwargs == {"is_causal": True}
 
     def test_sdpa_backend_with_attention_mask(self):
         q = torch.randn(2, 8, 16, 64)
@@ -144,6 +144,19 @@ class TestPreprocessArgsAndKwargsForAttn:
         assert set(attn_kwargs.keys()) == expected_keys
         assert attn_kwargs["is_causal"] == True
         assert torch.equal(attn_kwargs["attn_mask"], attention_mask)
+
+    def test_sdpa_backend_with_integer_attention_mask(self):
+        q = torch.randn(2, 8, 16, 64)
+        k = torch.randn(2, 8, 16, 64)
+        v = torch.randn(2, 8, 16, 64)
+        attention_mask = torch.ones(2, 16, dtype=torch.long)
+        backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
+
+        _, _, _, attn_kwargs = preprocess_args_and_kwargs_for_attn(
+            q, k, v, attention_mask, attn_impl=backend.attn
+        )
+
+        assert attn_kwargs == {"is_causal": True}
 
 class TestPostprocessOutputForAttn:
     def test_te_backend_no_change(self):
