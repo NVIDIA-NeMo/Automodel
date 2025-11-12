@@ -71,7 +71,6 @@ dataset:
 
 packed_sequence:
   packed_sequence_size: 0
-  split_across_pack: false
 
 # StatefulDataLoader with default collate
 dataloader:
