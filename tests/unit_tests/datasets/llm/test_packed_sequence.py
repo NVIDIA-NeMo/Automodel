@@ -32,7 +32,7 @@ def base_dataset():
 def test_basic_packing(base_dataset):
     """Test basic packing without splitting across packs"""
     packed_ds = pack_dataset(
-        base_dataset, split="train", packed_sequence_size=10, split_across_pack=False, max_packs=None
+        base_dataset, split="train", packed_sequence_size=10, max_packs=None
     )
 
     assert len(packed_ds) == 2
@@ -51,16 +51,16 @@ def test_basic_packing(base_dataset):
 
 
 @pytest.mark.parametrize(
-    "split_across_pack,max_packs,expected",
+    "max_packs,expected",
     [
-        (True, 2, 2),
-        (False, 3, 3),
+        (2, 2),
+        (3, 3),
     ],
 )
-def test_split_across_pack(base_dataset, split_across_pack, max_packs, expected):
-    """Test splitting sequences across packs with different configurations"""
+def test_packing_respects_max_packs(base_dataset, max_packs, expected):
+    """Test packing with different max_packs configurations"""
     packed_ds = pack_dataset(
-        base_dataset, split="train", packed_sequence_size=5, split_across_pack=split_across_pack, max_packs=max_packs
+        base_dataset, split="train", packed_sequence_size=5, max_packs=max_packs
     )
     assert len(packed_ds) == expected
 
@@ -72,7 +72,7 @@ def test_loss_mask_handling():
     )
 
     packed_ds = pack_dataset(
-        ds_with_mask, split="train", packed_sequence_size=5, split_across_pack=False, max_packs=None
+        ds_with_mask, split="train", packed_sequence_size=5, max_packs=None
     )
     assert packed_ds[0]["labels"][-3:] == [-100] * 3
     assert packed_ds[0]["labels"][:2] != [-100] * 2
@@ -83,7 +83,7 @@ def test_loss_mask_handling():
 def test_position_id_wrapping(base_dataset):
     """Test position ID generation with wrapping"""
     packed_ds = pack_dataset(
-        base_dataset, split="train", packed_sequence_size=5, split_across_pack=False, max_packs=None
+        base_dataset, split="train", packed_sequence_size=5, max_packs=None
     )
     assert packed_ds[0]["position_ids"] == [0, 1, 2, 3, 4]
 
@@ -93,7 +93,7 @@ def test_exact_fit():
     exact_fit_ds = Dataset.from_dict({"input_ids": [[1, 2, 3, 4, 5]], "labels": [[1, 2, 3, 4, 5]]})
 
     packed_ds = pack_dataset(
-        exact_fit_ds, split="train", packed_sequence_size=5, split_across_pack=False, max_packs=None
+        exact_fit_ds, split="train", packed_sequence_size=5, max_packs=None
     )
     assert len(packed_ds) == 1
     assert packed_ds[0]["input_ids"] == [1, 2, 3, 4, 5]
@@ -104,7 +104,7 @@ def test_error_on_oversized_sequence():
     oversized_ds = Dataset.from_dict({"input_ids": [[1, 2, 3, 4, 5, 6]], "labels": [[1, 2, 3, 4, 5, 6]]})
 
     with pytest.raises(ValueError):
-        pack_dataset(oversized_ds, split="train", packed_sequence_size=5, split_across_pack=False, max_packs=None)
+        pack_dataset(oversized_ds, split="train", packed_sequence_size=5, max_packs=None)
 
 
 def test_seq_lens_padded():
@@ -134,7 +134,6 @@ def test_seq_lens_padded():
         ds,
         split="train",
         packed_sequence_size=13,
-        split_across_pack=False,
         max_packs=None,
         padding_idx=0,
     )
@@ -161,8 +160,8 @@ def test_seq_lens_padded():
     assert input_ids == [1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 0, 0, 0]
 
 
-def test_seq_lens_padded_with_split():
-    """Test seq_lens_padded when splitting across packs"""
+def test_seq_lens_padded_multiple_packs():
+    """Test seq_lens_padded across multiple packs"""
     ds = Dataset.from_dict(
         {
             "input_ids": [[1, 2, 3], [4, 5, 6, 7, 8]],
@@ -174,7 +173,6 @@ def test_seq_lens_padded_with_split():
         ds,
         split="train",
         packed_sequence_size=7,
-        split_across_pack=True,
         max_packs=None,
         padding_idx=0,
     )
@@ -206,7 +204,6 @@ def test_seq_lens_padded_always_present(base_dataset):
         base_dataset,
         split="train",
         packed_sequence_size=10,
-        split_across_pack=False,
         max_packs=None,
     )
 
@@ -249,7 +246,6 @@ def test_seq_lens_padded_exact_fit():
         exact_fit_ds,
         split="train",
         packed_sequence_size=5,
-        split_across_pack=False,
         max_packs=None,
     )
 
@@ -281,7 +277,6 @@ def test_seq_lens_padded_multiple_packs():
         ds,
         split="train",
         packed_sequence_size=5,
-        split_across_pack=False,
         max_packs=None,
     )
 
@@ -326,7 +321,6 @@ def test_seq_lens_padded_sum():
         ds,
         split="train",
         packed_sequence_size=packed_sequence_size,
-        split_across_pack=False,
         max_packs=None,
     )
 
@@ -359,7 +353,6 @@ def test_cp_aware_packing_basic():
         ds,
         split="train",
         packed_sequence_size=16,
-        split_across_pack=False,
         max_packs=None,
         cp_size=2,
     )
@@ -452,17 +445,12 @@ def test_cp_aware_packing_no_cp():
     assert seq_lens == [3, 2]
 
 
-def test_cp_aware_packing_with_split():
-    """Test CP-aware packing with split_across_pack=True
-
-    Note: When sequences are split across packs, the split fragments may not
-    maintain CP alignment (divisibility by 2*cp_size). This is expected behavior
-    since we're splitting CP-padded sequences in the middle.
-    """
+def test_cp_aware_packing_multiple_packs():
+    """Test CP-aware packing across multiple packs"""
     ds = Dataset.from_dict(
         {
-            "input_ids": [[1, 2, 3, 4, 5], [6, 7, 8]],  # lengths: 5, 3
-            "labels": [[1, 2, 3, 4, 5], [6, 7, 8]],
+            "input_ids": [[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]],  # lengths: 5, 5
+            "labels": [[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]],
         }
     )
 
@@ -470,13 +458,12 @@ def test_cp_aware_packing_with_split():
         ds,
         split="train",
         packed_sequence_size=10,
-        split_across_pack=True,
         cp_size=2,
     )
 
     import torch
-    # Should create at least 1 pack
-    assert len(packed_ds) >= 1
+    # Should create at least 2 packs
+    assert len(packed_ds) >= 2
 
     # Verify that seq_lens exists
     seq_lens_0 = packed_ds[0]["seq_lens"]

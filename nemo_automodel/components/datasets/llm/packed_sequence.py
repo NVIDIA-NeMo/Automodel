@@ -153,26 +153,9 @@ def _should_stop_packing(max_packs: int, packs: list[PACK_TYPE]) -> bool:
     return False
 
 
-def _calculate_leftover_seq_len(
-    current_pack: PACK_TYPE, split_across_pack, previous_sample_boundary, packed_sequence_size
-) -> int:
-    if split_across_pack:
-        boundary = packed_sequence_size
-        # The last elem in ``seq_lens`` ensures that ``sum(seq_lens) == packed_sequence_size``
-        leftover_seq_len = packed_sequence_size - sum(current_pack["seq_lens"][:-1])
-        seq_len_padding = [leftover_seq_len] if leftover_seq_len > 0 else []
-    else:
-        boundary = previous_sample_boundary
-        # If we aren't splitting across packs, we leave out the last sample b/c
-        # it will go into the next pack
-        seq_len_padding = []
-    return boundary, seq_len_padding
-
-
 def _split_and_add_pack(
     current_pack: PACK_TYPE,
     packs: list[PACK_TYPE],
-    split_across_pack: bool,
     previous_sample_boundary: int,
     packed_sequence_size: int,
     padding_idx: int,
@@ -186,18 +169,11 @@ def _split_and_add_pack(
 
     TODO(@akoumparouli): refactor.
     """
-    boundary, seq_len_padding = _calculate_leftover_seq_len(
-        current_pack,
-        split_across_pack,
-        previous_sample_boundary,
-        packed_sequence_size,
-    )
-
     pack = {
-        "input_ids": current_pack["input_ids"][:boundary],
-        "labels": current_pack["labels"][:boundary],
-        "position_ids": current_pack["position_ids"][:boundary],
-        "seq_lens": current_pack["seq_lens"][:-1] + seq_len_padding,
+        "input_ids": current_pack["input_ids"][:previous_sample_boundary],
+        "labels": current_pack["labels"][:previous_sample_boundary],
+        "position_ids": current_pack["position_ids"][:previous_sample_boundary],
+        "seq_lens": current_pack["seq_lens"][:-1],
     }
 
     # Process and add the pack
@@ -211,14 +187,13 @@ def _split_and_add_pack(
         )
     )
 
-    # Return the length of the first sample in next pack if we are splitting across packs,
-    # otherwise return the length of the last sample in the current pack
-    next_seq_len = len(current_pack["input_ids"][boundary:]) if split_across_pack else current_pack["seq_lens"][-1]
+    # Return the length of the last sample in the current pack
+    next_seq_len = current_pack["seq_lens"][-1]
 
     output_dict = {
-        "input_ids": current_pack["input_ids"][boundary:],
-        "labels": current_pack["labels"][boundary:],
-        "position_ids": current_pack["position_ids"][boundary:],
+        "input_ids": current_pack["input_ids"][previous_sample_boundary:],
+        "labels": current_pack["labels"][previous_sample_boundary:],
+        "position_ids": current_pack["position_ids"][previous_sample_boundary:],
         "seq_lens": [next_seq_len],
     }
     return output_dict
@@ -228,7 +203,6 @@ def pack_dataset(
     dataset,
     split,
     packed_sequence_size,
-    split_across_pack=False,
     max_packs=None,
     padding_idx=0,
     drop_long_samples=False,
@@ -245,9 +219,6 @@ def pack_dataset(
         dataset: Actual dataset (can be 'train', 'val' or 'test')
         split (str): Whether the dataset is 'train', 'val' or 'test'
         packed_sequence_size (int): Number of tokens in a pack
-        split_across_pack (bool): If the last sample in a pack does not fit in
-            ``packed_sequence_size``, split the sample into the next pack, or move it entirely
-            to the beginning of the next pack. Default: False
         max_packs (int): Maximum number of packs. Default: None
         drop_long_samples (bool): If True, drop samples that are longer than packed_sequence_size.
         cp_size (int): Context parallel size. When > 1, each sequence will be padded to be
@@ -284,10 +255,10 @@ def pack_dataset(
         if drop_long_samples and seq_len > packed_sequence_size:
             continue
 
-        if seq_len > packed_sequence_size and not split_across_pack:
+        if seq_len > packed_sequence_size:
             raise ValueError(
                 f"Dataset sample is too long ({seq_len} > {packed_sequence_size}). "
-                "Please set `split_across_pack=True` or increase `packed_sequence_size`.",
+                "Please increase `packed_sequence_size`.",
             )
 
         # Apply CP padding if needed
@@ -316,7 +287,6 @@ def pack_dataset(
             current_pack = _split_and_add_pack(
                 current_pack,
                 packs=packs,
-                split_across_pack=split_across_pack,
                 previous_sample_boundary=previous_sample_boundary,
                 packed_sequence_size=packed_sequence_size,
                 padding_idx=padding_idx,
