@@ -254,6 +254,7 @@ def build_model_and_optimizer(
                 HAVE_TORCHAO_QAT,
                 prepare_qat_model,
             )
+
             if not HAVE_TORCHAO_QAT:
                 raise ImportError("QAT requested but torchao QAT is unavailable. Install torchao>=0.7.0")
             quantizer = cfg_qat.quantizer.instantiate()
@@ -1082,6 +1083,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
         if not cfg.get("qat.enabled", False):
             return None, None, None
+        from nemo_automodel.components.quantization.qat import (
+            get_disable_fake_quant_fn,
+            get_enable_fake_quant_fn,
+        )
+
         qat_cfg = cfg.qat
         _qat_enable_after = qat_cfg.get("fake_quant_after_n_steps", 0)
         # Collect mode from any model part that has it
