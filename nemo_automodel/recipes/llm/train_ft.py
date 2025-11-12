@@ -37,6 +37,7 @@ from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
 from transformers.utils.hub import TRANSFORMERS_CACHE
 from wandb import Settings
 
+from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
@@ -55,6 +56,7 @@ from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricLoggerDist, MetricsSample
+from nemo_automodel.components.loggers.mlflow_utils import build_mlflow
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
@@ -141,6 +143,18 @@ def _get_packed_sequence_config(has_packed_sequence, is_hf_model, cp_size):
     return kwargs
 
 
+def _is_hf_model(cfg_model):
+    pretrained_path = cfg_model.get("pretrained_model_name_or_path", None)
+    if pretrained_path is None:
+        return False
+
+    trust_remote_code = bool(cfg_model.get("trust_remote_code", False))
+    config = AutoConfig.from_pretrained(pretrained_path, trust_remote_code=trust_remote_code)
+    architecture = config.architectures[0]
+
+    return architecture not in ModelRegistry.model_arch_name_to_cls
+
+
 def build_model_and_optimizer(
     device,
     cfg_model,
@@ -181,7 +195,8 @@ def build_model_and_optimizer(
     Returns:
         The instantiated model on the specified device, the state dict keys before any parallelization, the optimizer, and the loss function.
     """
-    is_hf_model = cfg_model.get("pretrained_model_name_or_path", None) is not None
+
+    is_hf_model = _is_hf_model(cfg_model)
     is_meta_device = False
     if hasattr(cfg_model, "is_meta_device"):
         is_meta_device = cfg_model.is_meta_device
@@ -248,8 +263,8 @@ def build_model_and_optimizer(
 
     print_trainable_parameters(model)
 
-    # hold a copy of the model state dict keys before any parallelization
-    state_dict_keys = model.state_dict().keys()
+    # hold a list copy of the model state dict keys before any parallelization
+    state_dict_keys = list(model.state_dict().keys())
 
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
@@ -478,6 +493,22 @@ def build_dataloader(
             with FirstRankPerNode():
                 ds = cfg_ds.instantiate(**kwargs)
 
+        # If using an IterableDataset, per-rank sharding for unique samples
+        if isinstance(ds, IterableDataset):
+            try:
+                if ds.num_shards >= dp_world_size:
+                    ds = ds.shard(dp_world_size, dp_rank)
+                    logging.info(
+                        f"Sharded IterableDataset via dataset.shard: world_size={dp_world_size}, rank={dp_rank}"
+                    )
+                else:
+                    from datasets.distributed import split_dataset_by_node
+
+                    ds.dataset = split_dataset_by_node(ds.dataset, world_size=dp_world_size, rank=dp_rank)
+                    logging.info(f"Sharded dataset via split_dataset_by_node: world_size={dp_world_size}")
+            except Exception as e:
+                logging.warning(f"IterableDataset sharding skipped due to error: {e}")
+
         packed_sequence_size = getattr(cfg_ps, "packed_sequence_size", 0)
         # check if packed sequence is supported
         if packed_sequence_size > 0 and not supports_seq_lens:
@@ -534,6 +565,22 @@ def build_dataloader(
                 dl_kwargs["drop_last"] = True
         else:
             logging.info("Using IterableDataset; skipping sampler.")
+            # Optional shuffle for streaming IterableDataset (uses HF dataset shuffle if available)
+            shuffle = cfg_dl.get("shuffle", False)
+            shuffle_buffer_size = cfg_dl.get("shuffle_buffer_size", 10000)
+            # Do not pass shuffle-related kwargs to the DataLoader when using IterableDataset
+            # But leave them in dl config to be consistent
+            if hasattr(cfg_dl, "shuffle"):
+                del cfg_dl.shuffle
+            if hasattr(cfg_dl, "shuffle_buffer_size"):
+                del cfg_dl.shuffle_buffer_size
+
+            if shuffle and hasattr(ds, "shuffle"):
+                try:
+                    ds = ds.shuffle(buffer_size=shuffle_buffer_size, seed=seed)
+                    logging.info(f"Shuffling IterableDataset with buffer_size={shuffle_buffer_size}, seed={seed}")
+                except Exception as e:
+                    logging.warning(f"IterableDataset shuffle skipped due to error: {e}")
             dl_kwargs = {}
 
         # Handle collate_fn with optional mask precomputation for pipeline parallelism
@@ -853,6 +900,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             suppress_wandb_log_messages()
             run = build_wandb(self.cfg)
             logging.info("🚀 View run at {}".format(run.url))
+
+        self.mlflow_logger = None
+        if self.dist_env.is_main and hasattr(self.cfg, "mlflow"):
+            self.mlflow_logger = build_mlflow(self.cfg)
+            self.mlflow_logger.log_params(self.cfg.to_dict())
+            logging.info("MLflow experiment tracking enabled")
 
         # Log experiment details on main rank
         self._log_experiment_details()
@@ -1347,7 +1400,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
 
     def log_val_metrics(self, val_name, log_data, metric_logger=None):
-        """Log metrics to wandb and other loggers
+        """Log metrics to wandb, MLflow and other loggers
         Args:
             log_data: MetricsSample object, containing:
                 step: int, the current step.
@@ -1365,6 +1418,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         if wandb.run is not None:
             wandb.log(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
+
+        if self.mlflow_logger is not None:
+            self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         # JSONL validation log
         if not metric_logger is None:
@@ -1402,6 +1458,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         if wandb.run is not None:
             wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+
+        if self.mlflow_logger is not None:
+            self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
+
         # JSONL training log
         self.metric_logger_train.log(log_data)
         logging.info(

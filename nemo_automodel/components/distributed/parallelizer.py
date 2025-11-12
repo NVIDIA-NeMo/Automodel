@@ -66,7 +66,6 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 )
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
 
-# Import model-specific tensor parallel plans from the dedicated module
 from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE_FUNCTIONS
 from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
 
@@ -78,6 +77,9 @@ try:
     HAVE_MEGATRON_FSDP = True
 except:
     pass
+
+# Import as module so tests can patch nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype
+import nemo_automodel.components.distributed.parallelizer_utils as parallelizer_utils
 
 logger = logging.getLogger(__name__)
 
@@ -253,7 +255,9 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         dp_mesh = device_mesh[dp_mesh_dim_names]
 
         for layer in layers:
-            fully_shard(layer, mesh=dp_mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+            parallelizer_utils.fully_shard_by_dtype(
+                layer, mesh=dp_mesh, mp_policy=mp_policy, offload_policy=offload_policy
+            )
 
         # do not reshard after forward for root model
         # because its parameters will be used in backward immediately
@@ -886,7 +890,9 @@ def _get_parallel_plan(
             "model.layers.*.self_attn.q_proj": ColwiseParallel(),
             "model.layers.*.self_attn.k_proj": ColwiseParallel(),
             "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),  # Combined QKV projection
             "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+            "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),  # Fused gate and up projection
             "model.layers.*.mlp.up_proj": ColwiseParallel(),
             "model.layers.*.mlp.gate_proj": ColwiseParallel(),
             "model.layers.*.mlp.down_proj": RowwiseParallel(),
