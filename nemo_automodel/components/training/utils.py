@@ -53,89 +53,90 @@ def count_tail_padding(labels, ignore_label=-100):
 
 
 @torch.no_grad()
-def clip_grad_norm_with_ep(
-    parameters: torch.Tensor | Iterable[torch.Tensor],
-    max_norm: float,
-    norm_type: float,
-    error_if_nonfinite: bool,
-    foreach: bool | None,
-    pp_mesh: DeviceMesh | None,
-    ep_axis_name: str,
-) -> torch.Tensor:
-    ep_params = []
-    non_ep_params = []
-    ep_grads = []
-    non_ep_grads = []
-
-    for p in parameters:
-        if p.grad is None:
-            continue
-        assert isinstance(p, DTensor) and isinstance(p.grad, DTensor)
-        if ep_axis_name not in p.device_mesh.mesh_dim_names:
-            non_ep_params.append(p)
-            non_ep_grads.append(p.grad)
-        else:
-            ep_params.append(p)
-            ep_grads.append(p.grad)
-    ep_grads_total_norm = torch.nn.utils.get_total_norm(ep_grads, norm_type, error_if_nonfinite, foreach).full_tensor()
-    non_ep_grads_total_norm = torch.nn.utils.get_total_norm(
-        non_ep_grads, norm_type, error_if_nonfinite, foreach
-    ).full_tensor()
-
-    if math.isinf(norm_type):
-        total_norm = torch.maximum(ep_grads_total_norm, non_ep_grads_total_norm)
-    else:
-        total_norm = ep_grads_total_norm**norm_type + non_ep_grads_total_norm**norm_type
-        total_norm **= 1.0 / norm_type
-
-    if pp_mesh is not None:
-        if math.isinf(norm_type):
-            torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.MAX, group=pp_mesh.get_group())
-        else:
-            total_norm **= norm_type
-            torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.SUM, group=pp_mesh.get_group())
-            total_norm **= 1.0 / norm_type
-
-    torch.nn.utils.clip_grads_with_norm_(ep_params, max_norm, total_norm, foreach)
-    torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_norm, total_norm, foreach)
-
-    return total_norm
-
-
-@torch.no_grad()
-def clip_grad_norm_with_pp(
+def _clip_grad_norm_impl(
     parameters: torch.Tensor | Iterable[torch.Tensor],
     max_norm: float,
     norm_type: float = 2.0,
     error_if_nonfinite: bool = False,
     foreach: bool | None = None,
     pp_mesh: DeviceMesh | None = None,
-    ep_axis_name: str | None = None,
 ) -> torch.Tensor:
-    if ep_axis_name:
-        return clip_grad_norm_with_ep(
-            parameters, max_norm, norm_type, error_if_nonfinite, foreach, pp_mesh, ep_axis_name
-        )
-
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
     else:
         parameters = list(parameters)
-    grads = [p.grad for p in parameters if p.grad is not None]
-    total_norm = torch.nn.utils.get_total_norm(grads, norm_type, error_if_nonfinite, foreach)
 
-    if isinstance(total_norm, DTensor):
-        total_norm = total_norm.full_tensor()
+    # Group parameters by their sharding pattern
+    # Key: (device_mesh_id, tuple of placements)
+    sharding_groups = {}
 
+    for p in parameters:
+        if p.grad is None:
+            continue
+
+        if isinstance(p, DTensor):
+            # Create a hashable key from device_mesh and placements
+            mesh_id = id(p.device_mesh)
+            placements_tuple = tuple(str(placement) for placement in p.placements)
+            key = (mesh_id, placements_tuple)
+        else:
+            # Regular tensor - group separately
+            key = ("regular", "regular")
+
+        if key not in sharding_groups:
+            sharding_groups[key] = []
+        sharding_groups[key].append(p)
+
+    # Compute norm for each sharding group
+    group_norms = []
+    for group_params in sharding_groups.values():
+        grads = [p.grad for p in group_params]
+        group_norm = torch.nn.utils.get_total_norm(grads, norm_type, error_if_nonfinite, foreach)
+
+        # Convert DTensor norms to regular tensors and ensure they're on the same device
+        if isinstance(group_norm, DTensor):
+            group_norm = group_norm.full_tensor()
+
+        # Ensure the norm is a regular tensor by cloning and detaching
+        # This removes any DTensor metadata that might cause issues
+        group_norm = group_norm.clone().detach()
+
+        group_norms.append(group_norm)
+
+    # Combine norms across groups
+    if len(group_norms) == 0:
+        total_norm = torch.tensor(0.0)
+    elif len(group_norms) == 1:
+        total_norm = group_norms[0]
+    else:
+        # Ensure all group norms are on the same device (use the first one's device)
+        target_device = group_norms[0].device
+        group_norms = [gn.to(target_device) if gn.device != target_device else gn for gn in group_norms]
+
+        if math.isinf(norm_type):
+            # For inf norm, take the maximum across groups
+            total_norm = torch.stack(group_norms).max()
+        else:
+            # For p-norm, combine as (sum of p-th powers)^(1/p)
+            total_norm = torch.tensor(0.0, device=target_device)
+            for gn in group_norms:
+                total_norm += gn**norm_type
+            total_norm = total_norm ** (1.0 / norm_type)
+
+    # Reduce across pipeline parallel mesh if provided
     if pp_mesh is not None:
         if math.isinf(norm_type):
             torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.MAX, group=pp_mesh.get_group())
         else:
-            total_norm **= norm_type
+            total_norm = total_norm**norm_type
             torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.SUM, group=pp_mesh.get_group())
-            total_norm **= 1.0 / norm_type
+            total_norm = total_norm ** (1.0 / norm_type)
 
-    torch.nn.utils.clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
+    # Clip gradients for each sharding group separately
+    # This is necessary because clip_grads_with_norm_ doesn't support mixing tensors from different device meshes
+    for group_params in sharding_groups.values():
+        torch.nn.utils.clip_grads_with_norm_(group_params, max_norm, total_norm, foreach)
+
     return total_norm
 
 
@@ -147,56 +148,61 @@ def clip_grad_norm(
     norm_type: float = 2.0,
     pp_enabled: bool = False,
     device_mesh: DeviceMesh | None = None,
-    moe_mesh: DeviceMesh | None = None,
-    ep_axis_name: str | None = None,
     pp_axis_name: str | None = None,
     foreach: bool = True,
 ):
     """Common gradient clipping helper.
 
-    Handles both pipeline-parallel and single-model clipping paths. Returns a float grad norm when available,
-    otherwise 0.0 if clipping is skipped due to constraints.
+    Handles all parallelism strategies (TP, PP, EP/MoE) with automatic sharding-aware grouping.
+    Returns the gradient norm as a float, or 0.0 if clipping is skipped.
+
+    This function automatically:
+    - Groups parameters by sharding pattern (device mesh + placements)
+    - Computes norms correctly across different sharding strategies
+    - Handles MoE with separate DP/EP meshes
+    - Reduces norms across pipeline parallel stages when enabled
+
+    Args:
+        max_grad_norm: Maximum gradient norm. If None, skips clipping.
+        model_parts: List of model modules to clip.
+        norm_type: Type of norm to use (default: 2.0 for L2).
+        pp_enabled: Whether pipeline parallelism is enabled.
+        device_mesh: Device mesh for parallelism.
+        moe_mesh: MoE-specific device mesh (unused, kept for API compatibility).
+        ep_axis_name: Expert parallel axis name (unused, kept for API compatibility).
+        pp_axis_name: Pipeline parallel axis name.
+        foreach: Whether to use foreach implementation for clipping.
+
+    Returns:
+        Total gradient norm as a float.
     """
-    grad_norm = 0
     if max_grad_norm is None:
-        return grad_norm
+        return 0.0
 
-    if pp_enabled and device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
-        return grad_norm
+    # Collect all parameters
+    parameters = [p for m in model_parts for p in m.parameters() if p.requires_grad]
 
+    # Determine pp_mesh if PP is enabled
+    pp_mesh = None
     if pp_enabled:
         assert pp_axis_name is not None, "pp_axis_name must be provided when pp_enabled is True"
-        pp_mesh = device_mesh[pp_axis_name]
-        grad_norm = clip_grad_norm_with_pp(
-            [p for m in model_parts for p in m.parameters()],
-            max_norm=max_grad_norm,
-            norm_type=norm_type,
-            error_if_nonfinite=False,
-            foreach=foreach,
-            pp_mesh=pp_mesh,
-            ep_axis_name=ep_axis_name,
-        )
-    else:
-        # MoE present without PP: handle expert-parallel aware clipping
-        if moe_mesh is not None:
-            assert ep_axis_name is not None, "ep_axis_name must be provided when moe_mesh is not None"
-            grad_norm = clip_grad_norm_with_ep(
-                [p for p in model_parts[0].parameters() if p.requires_grad],
-                max_norm=max_grad_norm,
-                norm_type=norm_type,
-                error_if_nonfinite=False,
-                foreach=foreach,
-                pp_mesh=None,
-                ep_axis_name=ep_axis_name,
-            )
-        # Only clip locally if no MoE and either no device_mesh or TP size is 1
-        elif moe_mesh is None and (not device_mesh or device_mesh["tp"].size() == 1):
-            params = [p for p in model_parts[0].parameters() if p.requires_grad]
-            grad_norm = torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
-            if hasattr(grad_norm, "full_tensor"):
-                grad_norm = grad_norm.full_tensor()  # collect the summed grad norm across ranks
-        else:
-            return 0
+        pp_mesh = device_mesh[pp_axis_name] if device_mesh is not None else None
+
+    # Use the new sharding-aware implementation
+    grad_norm = _clip_grad_norm_impl(
+        parameters=parameters,
+        max_norm=max_grad_norm,
+        norm_type=norm_type,
+        error_if_nonfinite=False,
+        foreach=foreach,
+        pp_mesh=pp_mesh,
+    )
+
+    # Convert to float for API compatibility
+    if isinstance(grad_norm, torch.Tensor):
+        grad_norm = grad_norm.item() if grad_norm.numel() == 1 else grad_norm
+        if hasattr(grad_norm, "full_tensor"):
+            grad_norm = grad_norm.full_tensor()
 
     return grad_norm
 
@@ -295,8 +301,6 @@ def scale_grads_and_clip_grad_norm(
         norm_type=norm_type,
         pp_enabled=pp_enabled,
         device_mesh=device_mesh,
-        moe_mesh=moe_mesh,
-        ep_axis_name=ep_axis_name,
         pp_axis_name=pp_axis_name,
         foreach=foreach,
     )
