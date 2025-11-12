@@ -160,7 +160,7 @@ def build_model_and_optimizer(
     loss_fn=None,
     parallelize_fn=None,
     load_base_model=True,
-) -> tuple[nn.Module | AutoPipeline, list[str], list["Optimizer"], nn.Module]:  # noqa: F821
+) -> tuple[nn.Module | AutoPipeline, list[str], list["Optimizer"], nn.Module, dict]:  # noqa: F821
     """
     Build and initialize a model and optimizer.
 
@@ -179,7 +179,7 @@ def build_model_and_optimizer(
         cfg_compile: Configuration for torch.compile.
 
     Returns:
-        The instantiated model on the specified device, the state dict keys before any parallelization, the optimizer, and the loss function.
+        The instantiated model on the specified device, the state dict keys before any parallelization, the optimizer, the loss function, and param_info dict.
     """
     is_hf_model = cfg_model.get("pretrained_model_name_or_path", None) is not None
     is_meta_device = False
@@ -302,7 +302,7 @@ def build_model_and_optimizer(
 
                 model, optimizer = model_wrapper.parallelize(model, optimizer)
 
-                return model, state_dict_keys, [optimizer], loss_fn
+                return model, state_dict_keys, [optimizer], loss_fn, param_info
 
             else:
                 load_weights = True
