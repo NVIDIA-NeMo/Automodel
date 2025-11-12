@@ -60,13 +60,6 @@ from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
-from nemo_automodel.components.quantization.qat import (
-    HAVE_TORCHAO_QAT,
-    get_disable_fake_quant_fn,
-    get_enable_fake_quant_fn,
-    prepare_qat_model,
-    swap_lora_linear_with_qat,
-)
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
@@ -242,30 +235,16 @@ def build_model_and_optimizer(
         if cfg_qat is not None and cfg_qat.get("enabled", False):
             if cfg_peft is not None:
                 raise ValueError("QAT with PEFT is not supported in 25.11")
+            from nemo_automodel.components.quantization.qat import (
+                HAVE_TORCHAO_QAT,
+                prepare_qat_model,
+            )
             if not HAVE_TORCHAO_QAT:
                 raise ImportError("QAT requested but torchao QAT is unavailable. Install torchao>=0.7.0")
-            quantizer_cfg = cfg_qat.quantizer
-
-            # If PEFT is enabled, use QAT+LoRA module swap instead of global prepare()
-            if cfg_peft is not None:
-                try:
-                    import torch
-                    from torchao.quantization.qat.api import FakeQuantizeConfig  # type: ignore
-                except Exception as err:
-                    raise ImportError("QAT+LoRA requires torchao>=0.7.0") from err
-
-                groupsize = getattr(quantizer_cfg, "groupsize", None)
-                # torchao defaults: int8 per-token activations (asymmetric), int4 grouped symmetric weights
-                act_cfg = FakeQuantizeConfig(dtype=torch.int8, granularity="per_token", is_symmetric=False)
-                w_cfg = FakeQuantizeConfig(dtype=torch.int4, group_size=groupsize, is_symmetric=True)
-                swap_lora_linear_with_qat(model, activation_qat_config=act_cfg, weight_qat_config=w_cfg)
-                # No global qat_mode/toggling for this path; fake-quant is local to LoRA base path
-                model._qat_mode = None  # type: ignore[attr-defined]
-            else:
-                quantizer = quantizer_cfg.instantiate()
-                model, qat_mode = prepare_qat_model(model, quantizer)
-                # Attach helpers for delayed fake-quant toggling if desired
-                model._qat_mode = qat_mode  # type: ignore[attr-defined]
+            quantizer = cfg_qat.quantizer.instantiate()
+            model, qat_mode = prepare_qat_model(model, quantizer)
+            # Attach helpers for delayed fake-quant toggling if desired
+            model._qat_mode = qat_mode  # type: ignore[attr-defined]
 
     print_trainable_parameters(model)
 
