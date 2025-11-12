@@ -43,5 +43,4 @@ nemo_automodel/recipes/llm/train_ft.py \
     --qat.fake_quant_after_n_steps 1 \
     --qat.enabled True \
     --qat.quantizer._target_ torchao.quantization.qat.Int8DynActInt4WeightQATQuantizer \
-    --qat.quantizer.groupsize 32 \
-    --qat.quantizer.use_bias false
+    --qat.quantizer.groupsize 32
