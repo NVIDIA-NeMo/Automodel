@@ -215,11 +215,11 @@ def test_peft_with_pipeline_parallelism_enabled(caplog):
 
     # Mock the apply_lora_to_linear_modules function
     with patch('nemo_automodel.recipes.llm.train_ft.apply_lora_to_linear_modules') as mock_apply_lora:
-        with patch('nemo_automodel.recipes.llm.train_ft.print_trainable_parameters'):
+        with patch('nemo_automodel.recipes.llm.train_ft.print_trainable_parameters', return_value=(100, 1000)):
             with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
                 with caplog.at_level(logging.INFO):
                     # This should NOT raise an assertion error
-                    model, state_dict_keys, optimizer, loss_fn = build_model_and_optimizer(
+                    model, state_dict_keys, optimizer, loss_fn, param_info = build_model_and_optimizer(
                         device=device,
                         cfg_model=cfg_model,
                         cfg_opt=cfg_opt,
@@ -240,6 +240,9 @@ def test_peft_with_pipeline_parallelism_enabled(caplog):
                     # Verify the log message was generated
                     assert "Enabling PEFT with Pipeline Parallelism" in caplog.text
 
+                    # Verify that the param_info is correct
+                    assert param_info == {"trainable_params": 100, "total_params": 1000}
+
 
 def test_peft_without_pipeline_parallelism(caplog):
     """Test that PEFT works correctly without pipeline parallelism"""
@@ -256,11 +259,11 @@ def test_peft_without_pipeline_parallelism(caplog):
 
     # Mock the apply_lora_to_linear_modules function
     with patch('nemo_automodel.recipes.llm.train_ft.apply_lora_to_linear_modules') as mock_apply_lora:
-        with patch('nemo_automodel.recipes.llm.train_ft.print_trainable_parameters'):
+        with patch('nemo_automodel.recipes.llm.train_ft.print_trainable_parameters', return_value=(100, 1000)):
             with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
                 with caplog.at_level(logging.INFO):
                     # This should work fine without PP
-                    model, state_dict_keys, optimizer, loss_fn = build_model_and_optimizer(
+                    model, state_dict_keys, optimizer, loss_fn, param_info = build_model_and_optimizer(
                         device=device,
                         cfg_model=cfg_model,
                         cfg_opt=cfg_opt,
@@ -279,6 +282,9 @@ def test_peft_without_pipeline_parallelism(caplog):
                     # The PP-specific log should not appear
                     assert "Enabling PEFT with Pipeline Parallelism" not in caplog.text
 
+                    # Verify that the param_info is correct
+                    assert param_info == {"trainable_params": 100, "total_params": 1000}
+
 
 def test_peft_with_tp_disables_triton(caplog):
     """Test that PEFT with tensor parallelism disables triton"""
@@ -295,11 +301,11 @@ def test_peft_with_tp_disables_triton(caplog):
 
     # Mock the apply_lora_to_linear_modules function
     with patch('nemo_automodel.recipes.llm.train_ft.apply_lora_to_linear_modules') as mock_apply_lora:
-        with patch('nemo_automodel.recipes.llm.train_ft.print_trainable_parameters'):
+        with patch('nemo_automodel.recipes.llm.train_ft.print_trainable_parameters', return_value=(100, 1000)):
             with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
                 with caplog.at_level(logging.INFO):
                     # Test with TP > 1
-                    model, state_dict_keys, optimizer, loss_fn = build_model_and_optimizer(
+                    model, state_dict_keys, optimizer, loss_fn, param_info = build_model_and_optimizer(
                         device=device,
                         cfg_model=cfg_model,
                         cfg_opt=cfg_opt,
@@ -317,6 +323,9 @@ def test_peft_with_tp_disables_triton(caplog):
 
                     # Verify the TP log message was generated
                     assert "Disabling Triton with TP" in caplog.text
+
+                    # Verify that the param_info is correct
+                    assert param_info == {"trainable_params": 100, "total_params": 1000}
 
 
 def test_build_dataloader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatch):
