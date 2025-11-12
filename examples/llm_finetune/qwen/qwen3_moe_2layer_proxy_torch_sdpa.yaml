@@ -104,7 +104,6 @@ dataset:
 
 packed_sequence:
   packed_sequence_size: 0
-  split_across_pack: false
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

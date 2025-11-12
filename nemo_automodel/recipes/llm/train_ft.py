@@ -508,7 +508,6 @@ def build_dataloader(
                 ds,
                 split=cfg_ds.split,  # Assumes split is defined in dataset config
                 packed_sequence_size=packed_sequence_size,
-                split_across_pack=getattr(cfg_ps, "split_across_pack", False),
                 max_packs=getattr(cfg_ps, "max_packs", None),
                 padding_idx=getattr(tokenizer, "pad_token_id", 0),
                 cp_size=cp_size,
