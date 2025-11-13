@@ -435,7 +435,7 @@ class TestSplittingEdgeCases:
             pp_schedule="1f1b",
             device=device,
             module_names_per_stage=module_fqns,
-            layers_per_stage=8,  # Use layers_per_stage=8 to get 1+1=2 stages total (1 per rank)
+            layers_per_stage=4,  # Use layers_per_stage=4 to get ceil(8/4)=2 stages total (1 per rank)
         )
 
         # Single-stage schedule: 1 stage per rank
@@ -495,7 +495,7 @@ class TestSplittingEdgeCases:
             pp_axis_name="pp",
             pp_schedule="PipelineScheduleSingle",
             device=device,
-            layers_per_stage=8,  # 8 layers / 8 = 1 stage + 1 = 2 stages total, perfect for pp_size=2
+            layers_per_stage=4,  # ceil(8/4) = 2 stages total, perfect for pp_size=2 (1 per rank)
         )
 
         # Single stage schedule: 1 stage per rank
@@ -518,11 +518,11 @@ class TestSplittingEdgeCases:
             pp_axis_name="pp",
             pp_schedule="PipelineScheduleMulti",  # Explicit multi-stage schedule
             device=device,
-            layers_per_stage=2,  # 8 layers / 2 = 4 stages + 1 = 5 stages, round up to 6
+            layers_per_stage=2,  # ceil(8/2) = 4 stages (already divisible by pp_size=2)
             round_to_pp_multiple="up",
         )
 
         # Multi-stage schedule: at least 2 stages per rank
-        # With 6 total stages and pp_size=2, each rank gets 3 stages
-        assert len(stages) == 3  # rank 0 gets 3 stages
-        assert len(model_parts) == 3
+        # With 4 total stages and pp_size=2, each rank gets 2 stages
+        assert len(stages) == 2  # rank 0 gets 2 stages
+        assert len(model_parts) == 2

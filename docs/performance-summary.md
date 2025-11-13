@@ -19,6 +19,14 @@ The table below shows training performance for full sequences with no padding ac
 
 ---
 
+## Finetuning (LoRA) Performance
+
+The table below shows finetuning (LoRA) performance for full sequences with no padding across different model architectures and scales.
+
+| Model | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec/GPU |
+|-------|------:|----:|----:|----:|---:|-----------:|---:|---:|---:|---:|---:|-----:|---------|-------------------------:|---------------------:|---------------:|
+| Llama3 70B | 8 | 32 | 1 | 4 | 4 | 4096 | 2 | 4 | 1 | - | 10 | 1 | - | 26.92 | 176 | 608.42 |
+
 ## Glossary
 
 - **MFU**: Model FLOPs Utilization - ratio of achieved compute to peak hardware capability
@@ -46,6 +54,7 @@ All benchmark configurations are available in [`examples/benchmark/configs/`](ht
 - [`qwen3_moe_30b_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/benchmark/configs/qwen3_moe_30b_te_deepep.yaml) - Qwen3 MoE with TE + DeepEP
 - [`gptoss_20b_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/benchmark/configs/gptoss_20b_te_deepep.yaml) - GPT-OSS 20B with optimizations
 - [`gptoss_120b_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/benchmark/configs/gptoss_120b_te_deepep.yaml) - GPT-OSS 120B optimized
+- [`Llama_70b_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark.yaml) - Llama-70B Finetuning (LoRA) optimized
 
 ---
 
