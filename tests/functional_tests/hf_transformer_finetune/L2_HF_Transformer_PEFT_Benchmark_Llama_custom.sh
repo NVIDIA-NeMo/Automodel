@@ -24,6 +24,7 @@ nemo_automodel/recipes/llm/benchmark.py \
     --config examples/llm_finetune/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark.yaml \
     --model.pretrained_model_name_or_path=meta-llama/Llama-3.2-1B \
     --distributed.tp_size=2 \
+    --distributed.pp_size=1 \
     --distributed.sequence_parallel=False \
     --benchmark.warmup_steps=2 \
     --step_scheduler.max_steps=4

@@ -173,7 +173,7 @@ def build_model_and_optimizer(
     loss_fn=None,
     parallelize_fn=None,
     load_base_model=True,
-) -> tuple[nn.Module | AutoPipeline, list[str], list["Optimizer"], nn.Module]:  # noqa: F821
+) -> tuple[nn.Module | AutoPipeline, list[str], list["Optimizer"], nn.Module, dict]:  # noqa: F821
     """
     Build and initialize a model and optimizer.
 
@@ -192,7 +192,7 @@ def build_model_and_optimizer(
         cfg_compile: Configuration for torch.compile.
 
     Returns:
-        The instantiated model on the specified device, the state dict keys before any parallelization, the optimizer, and the loss function.
+        The instantiated model on the specified device, the state dict keys before any parallelization, the optimizer, the loss function, and param_info dict.
     """
 
     is_hf_model = _is_hf_model(cfg_model)
@@ -245,7 +245,11 @@ def build_model_and_optimizer(
                 fp8_config = build_fp8_config(cfg_fp8)
                 model = apply_fp8_to_model(model, config=fp8_config)
 
-    print_trainable_parameters(model)
+    trainable_params, total_params = print_trainable_parameters(model)
+    param_info = {
+        "trainable_params": trainable_params,
+        "total_params": total_params,
+    }
 
     # hold a list copy of the model state dict keys before any parallelization
     state_dict_keys = list(model.state_dict().keys())
@@ -312,7 +316,7 @@ def build_model_and_optimizer(
 
                 model, optimizer = model_wrapper.parallelize(model, optimizer)
 
-                return model, state_dict_keys, [optimizer], loss_fn
+                return model, state_dict_keys, [optimizer], loss_fn, param_info
 
             else:
                 load_weights = True
@@ -352,7 +356,7 @@ def build_model_and_optimizer(
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         optimizer = [cfg_opt.instantiate(params=trainable_params)]
 
-    return model, state_dict_keys, optimizer, loss_fn
+    return model, state_dict_keys, optimizer, loss_fn, param_info
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
@@ -975,7 +979,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             moe_mesh=self.moe_mesh,
         )
 
-        model, model_state_dict_keys, self.optimizer, self.loss_fn = build_model_and_optimizer(
+        model, model_state_dict_keys, self.optimizer, self.loss_fn, self.param_info = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
             self.cfg.optimizer,

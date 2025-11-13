@@ -112,22 +112,26 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
         if hasattr(self.cfg, "peft"):
             # Calculate trainable vs non-trainable parameters without lora
-            lora_params = sum(p.numel() for p in self.model_parts[0].parameters() if p.requires_grad)
-            total_params = sum(p.numel() for p in self.model_parts[0].parameters())
-            param_without_lora = total_params - lora_params
-            param_ratio = lora_params / param_without_lora
+            lora_params = self.param_info["trainable_params"]
+            total_params = self.param_info["total_params"]
+            frozen_params = total_params - lora_params
 
-            # Adjust full trainable parameters TFLOPS for PEFT: training computation has 3 roughly equal parts:
-            # 1) forward pass, 2) backward to inputs, 3) backward to parameters (gradients)
-            # Parts 1&2 process all parameters, but part 3 only processes trainable parameters.
-            # Since the base TFLOPS assumes all parameters are trainable, we scale by (1 + 1 + param_ratio) / 3
-            tflops_multiplier = (1 + 1 + param_ratio) / 3
+            # Adjust TFLOPS for PEFT: training has 3 computational phases:
+            # 1) Forward pass: processes all parameters (frozen + LoRA)
+            # 2) Backward to inputs: processes all parameters
+            # 3) Backward to parameters: linear in size of trainable weights (lora params)
+            #    - For full fine-tuning: phases 1, 2, 3 are roughly equal (1/3 each)
+            #    - For LoRA: phases 1, 2 are the same, but phase 3 scales with lora/frozen ratio
+            # Since base TFLOPS assumes all params trainable, we scale by:
+            # (2 * frozen_flops + lora_flops) / (3 * frozen_flops) = (2 + lora/frozen) / 3
+            param_ratio = lora_params / frozen_params
+            tflops_multiplier = (2 + param_ratio) / 3
             self.tflops *= tflops_multiplier
             if self.dist_env.is_main:
                 logger.info(
-                    f"PEFT params - lora_params: {lora_params:,}, param_without_lora: {param_without_lora:,}, trainable params ratio: {param_ratio:.4f}"
+                    f"PEFT params - lora_params: {lora_params:,}, frozen_params: {frozen_params:,}, param_ratio (lora/frozen): {param_ratio:.4f}"
                 )
-                logger.info(f"TFLOPS multiplier for PEFT: (1 + 1 + {param_ratio:.4f}) / 3 = {tflops_multiplier:.4f}")
+                logger.info(f"TFLOPS multiplier for PEFT: (2 + {param_ratio:.4f}) / 3 = {tflops_multiplier:.4f}")
 
         if self.dist_env.is_main:
             logger.info(f"TFLOPs/GPU: {self.tflops:.6f}")
