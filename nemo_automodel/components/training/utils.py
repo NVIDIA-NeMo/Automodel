@@ -61,6 +61,13 @@ def _clip_grad_norm_impl(
     foreach: bool | None = None,
     pp_mesh: DeviceMesh | None = None,
 ) -> torch.Tensor:
+    # Determine target device for all tensor operations
+    # Use current CUDA device if available, otherwise use CPU
+    if torch.cuda.is_available():
+        target_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    else:
+        target_device = torch.device("cpu")
+
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
     else:
@@ -92,6 +99,7 @@ def _clip_grad_norm_impl(
     for group_params in sharding_groups.values():
         grads = [p.grad for p in group_params]
         group_norm = torch.nn.utils.get_total_norm(grads, norm_type, error_if_nonfinite, foreach)
+        group_norm = group_norm.to(target_device)
 
         # Convert DTensor norms to regular tensors and ensure they're on the same device
         if isinstance(group_norm, DTensor):
@@ -105,12 +113,11 @@ def _clip_grad_norm_impl(
 
     # Combine norms across groups
     if len(group_norms) == 0:
-        total_norm = torch.tensor(0.0)
+        total_norm = torch.tensor(0.0, device=target_device)
     elif len(group_norms) == 1:
         total_norm = group_norms[0]
     else:
         # Ensure all group norms are on the same device (use the first one's device)
-        target_device = group_norms[0].device
         group_norms = [gn.to(target_device) if gn.device != target_device else gn for gn in group_norms]
 
         if math.isinf(norm_type):
