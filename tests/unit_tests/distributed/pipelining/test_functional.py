@@ -161,7 +161,7 @@ class TestCalculateVirtualStages:
             is_single_stage_schedule=True,
             round_to_pp_multiple="up",
         )
-        assert num_virtual == 4  # ceil(32/32) + 1 = 2, rounded up to 4
+        assert num_virtual == 4  # ceil(32/32) = 1, rounded up to 4
         assert stages_per_rank == 1
 
     def test_with_layers_per_stage_multi_schedule(self):
@@ -173,7 +173,7 @@ class TestCalculateVirtualStages:
             is_single_stage_schedule=False,
             round_to_pp_multiple="down",
         )
-        assert num_virtual == 8  # ceil(32/4) + 1 = 9, rounded down to 8
+        assert num_virtual == 8  # ceil(32/4) = 8 (already divisible, no rounding needed)
         assert stages_per_rank == 2
 
     def test_round_up(self):
@@ -185,7 +185,7 @@ class TestCalculateVirtualStages:
             is_single_stage_schedule=False,
             round_to_pp_multiple="up",
         )
-        assert num_virtual == 8  # ceil(32/5) + 1 = 8
+        assert num_virtual == 8  # ceil(32/5) = 7, rounded up to 8
         assert stages_per_rank == 2
 
     def test_round_down(self):
@@ -197,14 +197,14 @@ class TestCalculateVirtualStages:
             is_single_stage_schedule=False,
             round_to_pp_multiple="down",
         )
-        assert num_virtual == 12  # ceil(32/3) + 1 = 12
-        assert stages_per_rank == 3
+        assert num_virtual == 8  # ceil(32/3) = 11, rounded down to 8
+        assert stages_per_rank == 2
 
     def test_invalid_round_option(self):
         with pytest.raises(ValueError, match="Invalid value for round_to_pp_multiple"):
             calculate_virtual_stages(
                 num_layers=32,
-                layers_per_stage=7,  # This gives 6 stages which is not divisible by 4
+                layers_per_stage=7,  # ceil(32/7) = 5, not divisible by 4
                 pp_size=4,
                 is_single_stage_schedule=False,
                 round_to_pp_multiple="invalid",  # Invalid option should trigger error
@@ -214,7 +214,7 @@ class TestCalculateVirtualStages:
         with pytest.raises(ValueError, match="must be divisible by"):
             calculate_virtual_stages(
                 num_layers=32,
-                layers_per_stage=7,  # ceil(32/7) + 1 = 6, not divisible by 4
+                layers_per_stage=7,  # ceil(32/7) = 5, not divisible by 4
                 pp_size=4,
                 is_single_stage_schedule=False,
                 round_to_pp_multiple=None,  # Explicitly set to None to ensure error is raised
@@ -224,17 +224,17 @@ class TestCalculateVirtualStages:
         with pytest.raises(ValueError, match="Single stage schedule requires exactly 1 stage"):
             calculate_virtual_stages(
                 num_layers=32,
-                layers_per_stage=8,  # This gives 5 stages total (ceil(32/8) + 1 = 5)
+                layers_per_stage=6,  # This gives 6 stages total (ceil(32/6) = 6)
                 pp_size=4,
                 is_single_stage_schedule=True,
-                round_to_pp_multiple="up",  # Round 5 up to 8, giving 2 stages per rank
+                round_to_pp_multiple="up",  # Round 6 up to 8, giving 2 stages per rank
             )
 
     def test_multi_schedule_single_stage_error(self):
         with pytest.raises(ValueError, match="Multi-stage schedule requires at least 2 stages"):
             calculate_virtual_stages(
                 num_layers=32,
-                layers_per_stage=32,  # This gives 2 stages total (ceil(32/32) + 1 = 2)
+                layers_per_stage=16,  # This gives 2 stages total (ceil(32/16) = 2)
                 pp_size=2,  # With 2 PP ranks, that's 1 stage per rank
                 is_single_stage_schedule=False,
             )
