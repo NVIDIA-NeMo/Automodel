@@ -211,16 +211,18 @@ def _parallelize_qwen(
             ),
             "model.rotary_emb": RotaryEmbedParallel(),
             "model.norm": SequenceParallel(),
-            "model.layers.*.input_layernorm": SequenceParallel(),
+            "model.layers.*.input_layernorm": SequenceParallelAllGatherActivation(),
             "model.layers.*.self_attn.q_proj": ColwiseParallel(use_local_output=False),
             "model.layers.*.self_attn.k_proj": ColwiseParallel(use_local_output=False),
             "model.layers.*.self_attn.v_proj": ColwiseParallel(use_local_output=False),
+            "model.layers.*.self_attn.qkv_proj": ColwiseParallel(use_local_output=False),
             "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
             "model.layers.*.self_attn.q_norm": Qwen3QKNorm(),
             "model.layers.*.self_attn.k_norm": Qwen3QKNorm(),
-            "model.layers.*.post_attention_layernorm": SequenceParallel(),
+            "model.layers.*.post_attention_layernorm": SequenceParallelAllGatherActivation(),
             "model.layers.*.mlp.up_proj": ColwiseParallel(),
             "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+            "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),
             "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
         }
 
@@ -233,9 +235,11 @@ def _parallelize_qwen(
             "model.layers.*.self_attn.q_proj": ColwiseParallel(),
             "model.layers.*.self_attn.k_proj": ColwiseParallel(),
             "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),
             "model.layers.*.self_attn.o_proj": RowwiseParallel(),
             "model.layers.*.mlp.up_proj": ColwiseParallel(),
             "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+            "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),
             "model.layers.*.mlp.down_proj": RowwiseParallel(),
         }
 

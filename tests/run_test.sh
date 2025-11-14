@@ -15,7 +15,7 @@
 #!/bin/bash
 set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
-UNIT_TEST=false
+UNIT_TEST=true
 CPU=false
 TEST_DIR="tests/"
 TEST_NAME=""
@@ -38,7 +38,8 @@ else
 fi
 
 if [[ "$UNIT_TEST" == "true" ]]; then
-    export TEST_DIR="tests/unit_tests"
+    # export TEST_DIR="tests/unit_tests/models/llama/test_llama_custom_model.py"
+    export TEST_DIR="tests/unit_tests/models/qwen2/test_qwen2_custom_model.py"
 else
     export TEST_DIR="tests/functional_tests/$TEST_NAME"
 fi
