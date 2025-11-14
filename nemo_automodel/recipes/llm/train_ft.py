@@ -217,6 +217,13 @@ def build_model_and_optimizer(
                 kwargs["use_liger_kernel"] = False
             model = cfg_model.instantiate(**kwargs)
 
+            if checkpointer.config.dequantize_base_checkpoint is None:
+                # try to infer whether the base weights are quantized
+                try:
+                    checkpointer.config.dequantize_base_checkpoint = hasattr(model.config, "quantization_config")
+                except:
+                    checkpointer.config.dequantize_base_checkpoint = False
+
             # Check if the model supports SDPA and raise an error if it doesn't
             if cp_size > 1 and is_hf_model and hasattr(model, "_supports_sdpa"):
                 if model._supports_sdpa is False:
