@@ -30,7 +30,6 @@ from torch.utils.data import DataLoader, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoConfig, AutoTokenizer
-from transformers.integrations.accelerate import init_empty_weights
 from transformers.modeling_utils import no_init_weights
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
@@ -76,6 +75,7 @@ from nemo_automodel.components.utils.compile_utils import (
 )
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
+    init_empty_weights,
     print_trainable_parameters,
 )
 from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -196,14 +196,7 @@ def build_model_and_optimizer(
     """
 
     is_hf_model = _is_hf_model(cfg_model)
-    is_meta_device = False
-    if hasattr(cfg_model, "is_meta_device"):
-        is_meta_device = cfg_model.is_meta_device
-        if is_meta_device and isinstance(model_wrapper, MegatronFSDPManager):
-            raise ValueError("Meta device initialization is not supported with MegatronFSDPManager")
-        del cfg_model.is_meta_device
-    if autopipeline is not None:
-        is_meta_device = True
+    is_meta_device = not isinstance(model_wrapper, MegatronFSDPManager)
 
     init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
     with ScopedRNG(seed=seed, ranked=True):
