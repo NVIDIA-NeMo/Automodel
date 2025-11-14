@@ -87,7 +87,7 @@ class CheckpointingConfig:
     is_peft: bool
     model_state_dict_keys: list[str] = None  # copy of the model state dict keys before any parallelization
     is_async: bool = False
-    dequantize_base_checkpoint: bool = False
+    dequantize_base_checkpoint: bool | None = None
 
     def __post_init__(self):
         """
