@@ -247,7 +247,7 @@ def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, se
 
 # taken and edited from https://github.com/huggingface/transformers/blob/32a58e31463e238c967207bf73772490c353551a/src/transformers/integrations/accelerate.py#L53-L158
 @contextmanager
-def init_empty_weights(device: "torch.device" = torch.device("meta")):
+def init_empty_weights():
     """
     A context manager under which models are initialized with all parameters on the specified device.
 
@@ -265,6 +265,7 @@ def init_empty_weights(device: "torch.device" = torch.device("meta")):
         tst = nn.Linear(100, 100)  # on `cuda` device
     ```
     """
+    device = torch.device("meta")
     fp8_parameter_mapping = {
         "_linear_mm_config": "linear_mm_config",
         "_dtype": "dtype",
