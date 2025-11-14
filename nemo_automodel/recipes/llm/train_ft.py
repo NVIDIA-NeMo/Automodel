@@ -45,6 +45,7 @@ from nemo_automodel.components.datasets.llm.megatron.sampler import create_megat
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
 from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.ddp import DDPManager
 from nemo_automodel.components.distributed.init_utils import (
     get_rank_safe,
     get_world_size_safe,
@@ -196,7 +197,7 @@ def build_model_and_optimizer(
     """
 
     is_hf_model = _is_hf_model(cfg_model)
-    is_meta_device = not isinstance(model_wrapper, MegatronFSDPManager)
+    is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager))
 
     init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
     with ScopedRNG(seed=seed, ranked=True):

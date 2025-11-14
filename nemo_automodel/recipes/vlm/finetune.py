@@ -37,6 +37,7 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, Che
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.ddp import DDPManager
 from nemo_automodel.components.distributed.init_utils import (
     get_world_size_safe,
     initialize_distributed,
@@ -151,7 +152,7 @@ def build_model_and_optimizer(
         The instantiated model on the specified device, the state dict keys before any parallelization, and the optimizer.
     """
     is_hf_model = cfg_model.get("pretrained_model_name_or_path", None) is not None
-    is_meta_device = not isinstance(model_wrapper, MegatronFSDPManager)
+    is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager))
 
     init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
     with ScopedRNG(seed=seed, ranked=True):
