@@ -99,9 +99,12 @@ dataloader:
 #   num_workers: 0
 
 optimizer:
-  _target_: torch.optim.AdamW
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
   lr: 5.0e-6
   weight_decay: 0.01
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
 
 # Learning rate scheduler
 lr_scheduler:
