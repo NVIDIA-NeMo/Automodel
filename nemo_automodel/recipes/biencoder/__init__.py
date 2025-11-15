@@ -12,18 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .chat_dataset import ChatDataset  # noqa: F401
-from .column_mapped_text_instruction_dataset import ColumnMappedTextInstructionDataset  # noqa: F401
-from .nanogpt_dataset import NanogptDataset  # noqa: F401
-from .retrieval_collator import RetrievalBiencoderCollator  # noqa: F401
-from .retrieval_dataset import make_retrieval_dataset  # noqa: F401
-from .squad import make_squad_dataset  # noqa: F401
+from .train_biencoder import TrainBiencoderRecipe
 
-__all__ = [
-    "NanogptDataset",
-    "make_squad_dataset",
-    "make_retrieval_dataset",
-    "RetrievalBiencoderCollator",
-    "ColumnMappedTextInstructionDataset",
-    "ChatDataset",
-]
+__all__ = ["TrainBiencoderRecipe"]
