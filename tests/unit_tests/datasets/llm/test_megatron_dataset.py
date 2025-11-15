@@ -16,7 +16,7 @@ import json
 
 import pytest
 
-from nemo_automodel.components.datasets.llm.megatron_dataset import try_load_blend_from_json
+from nemo_automodel.components.datasets.llm.megatron_dataset import try_load_blend_from_json, get_list_of_files
 
 
 def test_try_load_blend_from_json_success(tmp_path):
@@ -73,5 +73,12 @@ def test_try_load_blend_from_json_wrong_type(tmp_path):
         try_load_blend_from_json(json_file)
 
 
+
+def test_get_list_of_files_raises_for_empty_glob(tmp_path):
+    """Test that get_list_of_files raises when a glob pattern matches no files."""
+    # Create a glob pattern that matches nothing in the tmp directory
+    pattern = str(tmp_path / "no_match_*.bin")
+    with pytest.raises(ValueError, match="No files matching glob"):
+        get_list_of_files(pattern)
 
 
