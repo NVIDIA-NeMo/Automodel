@@ -347,6 +347,8 @@ def get_list_of_files(path: str):
     if not glob.has_magic(path):
         return [path]
     paths = glob.glob(path)
+    if not paths:
+        raise ValueError(f"No files matching glob {path} found")
     unique_paths = set()
     for path in paths:
         assert path.endswith(".bin") or path.endswith(".idx"), f"Expected {path} to be a .bin or .idx file."
