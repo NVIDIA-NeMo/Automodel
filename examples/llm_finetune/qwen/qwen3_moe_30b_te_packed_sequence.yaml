@@ -51,7 +51,6 @@ model:
     enable_deepep: true
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
-  is_meta_device: true
 
 autopipeline:
   _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline

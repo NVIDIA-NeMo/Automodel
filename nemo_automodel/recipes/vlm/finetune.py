@@ -26,7 +26,6 @@ import wandb
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoProcessor
-from transformers.integrations.accelerate import init_empty_weights
 from transformers.modeling_utils import no_init_weights
 from transformers.processing_utils import ProcessorMixin
 from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
@@ -38,6 +37,7 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, Che
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.ddp import DDPManager
 from nemo_automodel.components.distributed.init_utils import (
     get_world_size_safe,
     initialize_distributed,
@@ -64,6 +64,7 @@ from nemo_automodel.components.utils.compile_utils import (
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     apply_parameter_freezing,
+    init_empty_weights,
     print_trainable_parameters,
 )
 from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -151,12 +152,7 @@ def build_model_and_optimizer(
         The instantiated model on the specified device, the state dict keys before any parallelization, and the optimizer.
     """
     is_hf_model = cfg_model.get("pretrained_model_name_or_path", None) is not None
-    is_meta_device = False
-    if hasattr(cfg_model, "is_meta_device"):
-        is_meta_device = cfg_model.is_meta_device
-        if is_meta_device and isinstance(model_wrapper, MegatronFSDPManager):
-            raise ValueError("Meta device initialization is not supported with MegatronFSDPManager")
-        del cfg_model.is_meta_device
+    is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager))
 
     init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
     with ScopedRNG(seed=seed, ranked=True):
