@@ -124,7 +124,7 @@ class TestNeMoAutoModelForCausalLM:
             cfg = Mock()
             cfg.architectures = ["CustomArch"]
             # Provide a concrete path string to avoid Mock flowing into os.path.isdir
-            cfg.pretrained_model_name_or_path = "custom/model"
+            cfg.name_or_path = "custom/model"
 
             # Registry provides a custom class
             custom_model_instance = Mock()
