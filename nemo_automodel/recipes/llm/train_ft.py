@@ -363,8 +363,6 @@ def build_model_and_optimizer(
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         optimizer = [cfg_opt.instantiate(params=trainable_params)]
 
-    breakpoint()
-
     return model, state_dict_keys, optimizer, loss_fn, param_info
 
 
