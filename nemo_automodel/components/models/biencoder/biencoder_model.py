@@ -151,4 +151,3 @@ class NeMoAutoModelBiencoder(_BaseNeMoAutoModelClass):
             del model
             gc.collect()
             return _retry(use_sdpa_patching=False)
-
