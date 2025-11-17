@@ -55,7 +55,7 @@ from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPMana
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.components.loggers.metric_logger import build_metric_logger, MetricsSample
+from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.mlflow_utils import build_mlflow
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy

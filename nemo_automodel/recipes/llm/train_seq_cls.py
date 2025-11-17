@@ -23,7 +23,7 @@ import wandb
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.components.loggers.metric_logger import build_metric_logger, MetricsSample
+from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes.base_recipe import BaseRecipe
