@@ -35,7 +35,6 @@ parallelizer:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: openai/gpt-oss-120b
-  is_meta_device: true
 
 checkpoint:
   enabled: false

@@ -153,18 +153,23 @@ def test_build_model_and_optimizer_basic():
         is_peft=False,
     )
     checkpointer = Checkpointer(config=ckpt_cfg, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
-    model, _, optim = build_model_and_optimizer(
-        device=device,
-        cfg_model=cfg_model,
-        cfg_opt=cfg_opt,
-        cfg_freeze=None,
-        cfg_peft=None,
-        model_wrapper=None,
-        seed=123,
-        checkpointer=checkpointer,
-        tp_size=1,
-        freeze_embeddings=True,
-    )
+    # Ensure meta init path is exercised and weights are materialized via checkpointer
+    def _load_base_model_stub(model, device, *args, **kwargs):
+        if hasattr(model, "to_empty"):
+            model.to_empty(device=device)
+    with patch.object(checkpointer, 'load_base_model', new=_load_base_model_stub):
+        model, _, optim = build_model_and_optimizer(
+            device=device,
+            cfg_model=cfg_model,
+            cfg_opt=cfg_opt,
+            cfg_freeze=None,
+            cfg_peft=None,
+            model_wrapper=SimpleNamespace(parallelize=lambda m: m),
+            seed=123,
+            checkpointer=checkpointer,
+            tp_size=1,
+            freeze_embeddings=True,
+        )
 
     # Check returned objects and their properties
     assert isinstance(model, DummyModel)

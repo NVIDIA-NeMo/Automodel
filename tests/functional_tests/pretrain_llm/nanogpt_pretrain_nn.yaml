@@ -23,6 +23,10 @@ model:
   bos_token_id: 50256
   eos_token_id: 50256
 
+checkpoint:
+  enabled: false
+  load_base_model: false
+
 # Dataset
 # Point this to the location where your *.bin shards live.
 # The pattern below matches the sample shards included in *modded-nanogpt*.

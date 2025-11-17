@@ -17,6 +17,8 @@
 
 from pathlib import Path
 import sys
+from contextlib import nullcontext
+from unittest.mock import patch
 
 import torch
 import torch.distributed.tensor
@@ -70,13 +72,19 @@ def test_consolidated_llm_checkpoint():
     else:
         raise ValueError(f"Unable to infer trainer from config path: {cfg_path}")
 
-    cfg = parse_args_and_load_config(default_cfg_path)
-    cfg.model.is_meta_device = False
-    trainer = recipe_cls(cfg)
-    trainer.setup()
+    recipe_module_path = (
+        "nemo_automodel.recipes.llm.train_ft" if recipe_cls is TrainFinetuneRecipeForNextTokenPrediction else "nemo_automodel.recipes.vlm.finetune"
+    )
 
-    cfg.model.is_meta_device = True
-    meta_trainer = recipe_cls(cfg)
+    # Build a trainer that uses non-meta initialization by patching ContextManagers to no-op.
+    cfg_non_meta = parse_args_and_load_config(default_cfg_path)
+    with patch(f"{recipe_module_path}.ContextManagers", new=lambda *_args, **_kwargs: nullcontext()):
+        trainer = recipe_cls(cfg_non_meta)
+        trainer.setup()
+
+    # Build a trainer that uses meta initialization (default path)
+    cfg_meta = parse_args_and_load_config(default_cfg_path)
+    meta_trainer = recipe_cls(cfg_meta)
     meta_trainer.setup()
 
     trainer_model_parts = trainer.model_parts if hasattr(trainer, "model_parts") else [trainer.model]
