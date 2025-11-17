@@ -26,6 +26,7 @@ from packaging.version import parse
 from safetensors.torch import load_file, save_file
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
+from transformers.utils import TRANSFORMERS_CACHE
 
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
@@ -88,6 +89,7 @@ class CheckpointingConfig:
     model_state_dict_keys: list[str] = None  # copy of the model state dict keys before any parallelization
     is_async: bool = False
     dequantize_base_checkpoint: bool | None = None
+    original_model_root_dir: str | None = None
 
     def __post_init__(self):
         """
@@ -209,6 +211,7 @@ class Checkpointer:
                 tokenizer=tokenizer,
                 peft_config=peft_config,
                 fqn_to_file_index_mapping=fqn_to_file_index_mapping,
+                original_model_path=self._get_original_model_path(model_state),
             )
 
         storage_writer = self._get_storage_writer(
@@ -364,6 +367,7 @@ class Checkpointer:
             )
 
         is_tied_lm_head = getattr(getattr(model, "config", {}), "tie_word_embeddings", False)
+        self.config.original_model_root_dir = root_dir
         if hasattr(model, "tie_weights") and is_tied_lm_head:
             model.tie_weights()
 
@@ -613,6 +617,17 @@ class Checkpointer:
         # If loading the model from the base checkpoint, we need to read the base model from the Hugging Face checkpoint
         if self.config.model_save_format == SerializationFormat.SAFETENSORS or is_init_step:
             return _HuggingFaceStorageReader(path=model_path, key_mapping=key_mapping)
+
+    def _get_original_model_path(self, model_state: ModelState) -> str | None:
+        """
+        Get the path to the original model from the Hugging Face checkpoint.
+        """
+        if not hasattr(model_state.model[0], "name_or_path"):
+            return None
+        pretrained_model_name_or_path = getattr(model_state.model[0], "name_or_path")
+        return get_safetensors_index_path(
+            getattr(self.config, "original_model_root_dir", TRANSFORMERS_CACHE), pretrained_model_name_or_path
+        )
 
 
 def get_safetensors_index_path(cache_dir: str, repo_id: str | None) -> str | None:

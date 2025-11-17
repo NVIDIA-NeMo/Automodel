@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import glob
 import json
 import os
 import shutil
@@ -58,9 +59,12 @@ class ConsolidatedHFAddon:
         fqn_to_file_index_mapping = kwargs["fqn_to_file_index_mapping"]
         tokenizer = kwargs.get("tokenizer", None)
         model_part = model_state.model[0]  # ModelState already converts to list if needed
+        original_model_path = kwargs["original_model_path"]
 
         # Perform save operations on rank 0
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            # if the HF model has custom model code, we need to save it as part of the checkpoint
+            _maybe_save_custom_model_code(original_model_path, hf_metadata_dir)
             # save the config.json file
             if hasattr(model_part, "config"):
                 with open(os.path.join(hf_metadata_dir, "config.json"), "w") as f:
@@ -133,9 +137,12 @@ class PeftAddon:
         tokenizer = kwargs.get("tokenizer", None)
         model_state = kwargs["model_state"]
         peft_config = kwargs["peft_config"]
+        original_model_path = kwargs["original_model_path"]
         hf_peft_config = _get_hf_peft_config(peft_config, model_state)
         automodel_peft_metadata = _get_automodel_peft_metadata(peft_config)
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            # if the HF model has custom model code, we need to save it as part of the checkpoint
+            _maybe_save_custom_model_code(original_model_path, model_path)
             # save the tokenizer
             if tokenizer is not None:
                 tokenizer.save_pretrained(model_path)
@@ -238,3 +245,20 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
                 target_name = target_name[len("_orig_mod.") :]
             final_target_modules.add(target_name)
     return sorted(list(final_target_modules))
+
+
+def _maybe_save_custom_model_code(original_model_path: str | None, hf_metadata_dir: str) -> None:
+    """
+    Save the custom model code if it exists. This function preserves the original directory structure.
+    """
+    if original_model_path is None:
+        return
+    if not os.path.isdir(original_model_path):
+        return
+    pattern = os.path.join(original_model_path, "**", "*.py")
+    for src_path in glob.glob(pattern, recursive=True):
+        # Skip any .hidden paths
+        rel_path = os.path.relpath(src_path, original_model_path)
+        dst_path = os.path.join(hf_metadata_dir, rel_path)
+        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+        shutil.copy2(src_path, dst_path)
