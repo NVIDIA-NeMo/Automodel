@@ -47,10 +47,10 @@ def _resolve_trust_remote_code(pretrained_model_name_or_path):
     """
     Whitelist NVIDIA models to allow remote code execution.
     """
+    if not pretrained_model_name_or_path:
+        return False
     # pretrained_model_name_or_path can be something like nvidia/NVIDIA-Nemotron-Nano-9B-v2
-    if not os.path.isdir(pretrained_model_name_or_path) and pretrained_model_name_or_path.startswith("nvidia/"):
-        return True
-    return False
+    return not os.path.isdir(pretrained_model_name_or_path) and pretrained_model_name_or_path.startswith("nvidia/")
 
 
 def _assert_same_signature(original, patched):
@@ -171,7 +171,8 @@ def _prepare_hf_config_and_flag(pretrained_model_name_or_path, force_hf, kwargs)
     hf_config = kwargs.pop("config", None) or AutoConfig.from_pretrained(
         pretrained_model_name_or_path, trust_remote_code=kwargs["trust_remote_code"]
     )
-    is_hf_model = (hf_config.architectures[0] not in ModelRegistry.model_arch_name_to_cls) or force_hf
+    architectures = getattr(hf_config, "architectures", None) or []
+    is_hf_model = (not architectures or architectures[0] not in ModelRegistry.model_arch_name_to_cls) or force_hf
     return hf_config, is_hf_model
 
 
@@ -185,21 +186,21 @@ def _pop_tp_cp_has_packed(kwargs):
     return tp_size, cp_size, has_packed_sequence
 
 
-def _apply_preload_overrides(kwargs, is_hf_model, tp_size, cp_size, has_packed_sequence):
+def _apply_preload_overrides(is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel):
     """
-    Apply overrides to kwargs based on TP/CP and packed sequence constraints.
+    Compute final attention implementation and liger-kernel flag based on TP/CP and packed sequence constraints.
     """
     if is_hf_model and (tp_size > 1 or cp_size > 1):
         logger.info("Disabling Liger kernel with TP ({}) or CP ({})".format(tp_size, cp_size))
-        kwargs["use_liger_kernel"] = False
+        use_liger_kernel = False
 
     if cp_size > 1 and is_hf_model:
-        kwargs["attn_implementation"] = "sdpa"
+        attn_implementation = "sdpa"
         logger.warning("Packed sequence is supported only with SDPA. Setting model's attn_implementation to sdpa")
 
     if has_packed_sequence and is_hf_model:
         if cp_size == 1:
-            kwargs["attn_implementation"] = "flash_attention_2"
+            attn_implementation = "flash_attention_2"
             logger.warning(
                 "Packed sequence is supported only with Flash Attention. "
                 "Setting model's attn_implementation to flash_attention_2"
@@ -207,6 +208,7 @@ def _apply_preload_overrides(kwargs, is_hf_model, tp_size, cp_size, has_packed_s
         else:
             # TODO: support packed sequence with CP size > 1
             raise ValueError("Packed sequence is only supported with CP size 1")
+    return attn_implementation, use_liger_kernel
 
 
 def _verify_sdpa_support(model, is_hf_model, cp_size):
@@ -302,7 +304,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
         hf_config, is_hf_model = _prepare_hf_config_and_flag(pretrained_model_name_or_path, force_hf, kwargs)
         tp_size, cp_size, has_packed_sequence = _pop_tp_cp_has_packed(kwargs)
-        _apply_preload_overrides(kwargs, is_hf_model, tp_size, cp_size, has_packed_sequence)
+        attn_implementation, use_liger_kernel = _apply_preload_overrides(
+            is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel
+        )
 
         def _retry(**override):
             """Internal helper to re-enter this function with patched args."""
@@ -473,12 +477,15 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         """
         torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch.bfloat16
         kwargs["trust_remote_code"] = kwargs.get(
-            "trust_remote_code", _resolve_trust_remote_code(config.pretrained_model_name_or_path)
+            "trust_remote_code", _resolve_trust_remote_code(getattr(config, "pretrained_model_name_or_path", None))
         )
 
-        is_hf_model = (config.architectures[0] not in ModelRegistry.model_arch_name_to_cls) or force_hf
+        architectures = getattr(config, "architectures", None) or []
+        is_hf_model = (not architectures or architectures[0] not in ModelRegistry.model_arch_name_to_cls) or force_hf
         tp_size, cp_size, has_packed_sequence = _pop_tp_cp_has_packed(kwargs)
-        _apply_preload_overrides(kwargs, is_hf_model, tp_size, cp_size, has_packed_sequence)
+        attn_implementation, use_liger_kernel = _apply_preload_overrides(
+            is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel
+        )
 
         def _retry(**override):
             """Internal helper to re-enter this function with patched args."""
