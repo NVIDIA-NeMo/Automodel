@@ -626,7 +626,7 @@ class Checkpointer:
             return None
         pretrained_model_name_or_path = getattr(model_state.model[0], "name_or_path")
         return get_safetensors_index_path(
-            getattr(self.config, "original_model_root_dir", TRANSFORMERS_CACHE), pretrained_model_name_or_path
+            getattr(self.config, "original_model_root_dir", None) or TRANSFORMERS_CACHE, pretrained_model_name_or_path
         )
 
 
