@@ -156,6 +156,7 @@ class MetricLoggerDist(MetricLogger):
             self.__enter__ = lambda: None
             self.__exit__ = lambda: None
 
+
 def build_metric_logger(filepath: str, *, flush: bool = False, append: bool = True) -> MetricLogger:
     if dist.is_initialized():
         return MetricLoggerDist(filepath, flush=flush, append=append)
