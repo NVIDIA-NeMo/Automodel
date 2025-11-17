@@ -55,7 +55,7 @@ from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPMana
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.components.loggers.metric_logger import MetricLoggerDist, MetricsSample
+from nemo_automodel.components.loggers.metric_logger import build_metric_logger, MetricsSample
 from nemo_automodel.components.loggers.mlflow_utils import build_mlflow
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
@@ -1046,11 +1046,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         restore_from = self.cfg.get("checkpoint.restore_from", None)
         # Initialize JSONL loggers
-        self.metric_logger_train = MetricLoggerDist(
+        self.metric_logger_train = build_metric_logger(
             pathlib.Path(self.checkpointer.config.checkpoint_dir) / "training.jsonl"
         )
         self.metric_logger_valid = {
-            name: MetricLoggerDist(
+            name: build_metric_logger(
                 pathlib.Path(self.checkpointer.config.checkpoint_dir)
                 / (f"validation_{name}.jsonl" if name != "default" else "validation.jsonl")
             )

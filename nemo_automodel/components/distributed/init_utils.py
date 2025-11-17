@@ -105,6 +105,14 @@ def initialize_distributed(
         if device_count > 0:
             device = torch.cuda.current_device()
     else:
+        # Single process case (e.g., torchrun --nproc-per-node=1)
+        if get_world_size_safe() == 1:
+            if device_count > 0:
+                device = torch.cuda.current_device()
+            else:
+                device = torch.device("cpu")
+            return DistInfo(backend, 0, 1, device, True)
+
         if get_rank_safe() == 0:
             print("> initializing torch distributed with {} workers.".format(get_world_size_safe()), flush=True)
 

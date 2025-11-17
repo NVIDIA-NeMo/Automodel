@@ -23,7 +23,7 @@ import wandb
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.components.loggers.metric_logger import MetricLoggerDist, MetricsSample
+from nemo_automodel.components.loggers.metric_logger import build_metric_logger, MetricsSample
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -164,10 +164,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
 
         restore_from = self.cfg.get("checkpoint.restore_from", None)
-        self.metric_logger_train = MetricLoggerDist(
+        self.metric_logger_train = build_metric_logger(
             pathlib.Path(self.checkpointer.config.checkpoint_dir) / "training.jsonl"
         )
-        self.metric_logger_valid = MetricLoggerDist(
+        self.metric_logger_valid = build_metric_logger(
             pathlib.Path(self.checkpointer.config.checkpoint_dir) / "validation.jsonl"
         )
         self.load_checkpoint(restore_from)
