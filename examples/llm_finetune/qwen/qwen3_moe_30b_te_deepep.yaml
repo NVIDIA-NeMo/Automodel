@@ -38,7 +38,6 @@ model:
   config:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
-  is_meta_device: true
 
 checkpoint:
   enabled: false
