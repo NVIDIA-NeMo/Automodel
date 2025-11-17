@@ -69,6 +69,22 @@ FROM update_base_container AS automodel_dep
 # Install Grouped Gemm
 RUN pip install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
 
+# Install causal-conv1d
+RUN git clone https://github.com/Dao-AILab/causal-conv1d.git && \
+    cd causal-conv1d && \
+    git checkout v1.5.3 && \
+    CAUSAL_CONV1D_FORCE_BUILD=TRUE pip install --no-build-isolation -v . && \
+    cd ../ && rm -rf causal-conv1d
+
+# Install mamba
+RUN git clone https://github.com/state-spaces/mamba.git && \
+    cd mamba && \
+    git checkout 6b32be06d026e170b3fdaf3ae6282c5a6ff57b06 && \
+    sed -i "/triton/d" setup.py && \
+    sed -i "/triton/d" pyproject.toml && \
+    pip install --no-build-isolation -v . && \
+    cd ../ && rm -rf mamba
+
 # Install Deepep
 COPY docker/common/deepep.patch /opt/deepep.patch
 ARG INSTALL_DEEPEP=False
