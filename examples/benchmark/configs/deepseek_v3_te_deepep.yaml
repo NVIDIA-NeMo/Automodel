@@ -66,7 +66,6 @@ model:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
   trust_remote_code: true
-  is_meta_device: true
   backend:
     _target_: nemo_automodel.components.moe.utils.BackendConfig
     attn: te
