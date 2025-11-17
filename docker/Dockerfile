@@ -61,7 +61,7 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
     git submodule init && git submodule update && \
     pip install nvidia-mathdx==25.1.1 && \
     env NVTE_CUDA_ARCHS="80;90;100;120" NVTE_BUILD_THREADS_PER_JOB=8 pip install --no-cache-dir --no-build-isolation -v . && \
-    rm -rf TransformerEngine; \
+    cd ../ && rm -rf TransformerEngine; \
     fi
 
 FROM update_base_container AS automodel_dep
@@ -69,21 +69,23 @@ FROM update_base_container AS automodel_dep
 # Install Grouped Gemm
 RUN pip install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
 
-# Install causal-conv1d
-RUN git clone https://github.com/Dao-AILab/causal-conv1d.git && \
+# Install Mamba
+ARG INSTALL_MAMBA=False
+ARG MAMBA_COMMIT=6b32be06d026e170b3fdaf3ae6282c5a6ff57b06
+RUN if [ "$INSTALL_MAMBA" = "True" ]; then \
+    git clone https://github.com/Dao-AILab/causal-conv1d.git && \
     cd causal-conv1d && \
     git checkout v1.5.3 && \
     CAUSAL_CONV1D_FORCE_BUILD=TRUE pip install --no-build-isolation -v . && \
-    cd ../ && rm -rf causal-conv1d
-
-# Install mamba
-RUN git clone https://github.com/state-spaces/mamba.git && \
+    cd ../ && rm -rf causal-conv1d && \
+    git clone https://github.com/state-spaces/mamba.git && \
     cd mamba && \
-    git checkout 6b32be06d026e170b3fdaf3ae6282c5a6ff57b06 && \
+    git checkout $MAMBA_COMMIT && \
     sed -i "/triton/d" setup.py && \
     sed -i "/triton/d" pyproject.toml && \
     pip install --no-build-isolation -v . && \
-    cd ../ && rm -rf mamba
+    cd ../ && rm -rf mamba; \
+    fi
 
 # Install Deepep
 COPY docker/common/deepep.patch /opt/deepep.patch
