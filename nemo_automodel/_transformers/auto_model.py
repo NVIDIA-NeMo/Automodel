@@ -477,7 +477,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         """
         torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch.bfloat16
         kwargs["trust_remote_code"] = kwargs.get(
-            "trust_remote_code", _resolve_trust_remote_code(getattr(config, "pretrained_model_name_or_path", None))
+            "trust_remote_code", _resolve_trust_remote_code(getattr(config, "name_or_path", None))
         )
 
         architectures = getattr(config, "architectures", None) or []
