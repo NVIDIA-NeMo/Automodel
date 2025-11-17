@@ -23,7 +23,7 @@ this version can attend to all tokens bidirectionally.
 import copy
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union, Unpack
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -184,7 +184,7 @@ class LlamaBidirectionalModel(LlamaModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
+        **flash_attn_kwargs,
     ) -> BaseModelOutputWithPast:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
