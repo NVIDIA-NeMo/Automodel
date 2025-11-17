@@ -18,6 +18,7 @@ from typing import List, Optional
 
 from torch.nn.attention import SDPBackend
 
+from nemo_automodel import __version__
 from nemo_automodel._transformers.auto_model import (
     _BaseNeMoAutoModelClass,
     _patch_attention,
@@ -142,11 +143,12 @@ class NeMoAutoModelBiencoder(_BaseNeMoAutoModelClass):
         try:
             if use_sdpa_patching:
                 logger.info("Applying SDPA patching to BiencoderModel")
-                model = _patch_attention(model, sdpa_method)
+                model = _patch_attention(model, sdpa_method)  # noqa: F821
+            model.config.update({"nemo_version": __version__})
+            return model
         except Exception:
             logger.warning("Retrying without SDPA patching.")
             del model
             gc.collect()
             return _retry(use_sdpa_patching=False)
 
-        return model
