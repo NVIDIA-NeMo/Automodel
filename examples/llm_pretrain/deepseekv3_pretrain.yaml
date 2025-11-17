@@ -50,7 +50,6 @@ model:
   config:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
-  is_meta_device: true
 
 # Option 2 - more fine-grained builder
 # model:
@@ -58,7 +57,6 @@ model:
 #   config:
 #     _target_: transformers.AutoConfig.from_pretrained
 #     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
-#   is_meta_device: true
 #   backend:
 #     _target_: nemo_automodel.components.moe.utils.BackendConfig
 #     attn: te
