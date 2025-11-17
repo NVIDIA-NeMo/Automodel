@@ -18,6 +18,7 @@ import torch
 QWEN_TOKENS = [
     "<|im_start|>",
     "<|im_end|>",
+    "<|endoftext|>",
     "<|vision_start|>",
     "<|vision_end|>",
     "<|vision_pad|>",
