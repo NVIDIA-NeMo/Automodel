@@ -124,21 +124,16 @@ def initialize_distributed(
             torch.cuda.set_device(device)
 
         if get_world_size_safe() == 1:
-            import socket
-
-            def find_free_port():
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.bind(("", 0))
-                    return s.getsockname()[1]
-
-            free_port = find_free_port()
             init_pg_kwargs["world_size"] = 1
             init_pg_kwargs["rank"] = 0
-            init_pg_kwargs["init_method"] = f"tcp://localhost:{free_port}"
+            init_pg_kwargs["backend"] = "gloo"
+            init_pg_kwargs["store"] = torch.distributed.HashStore()
 
         torch.distributed.init_process_group(**init_pg_kwargs)
         atexit.register(destroy_global_state)
-        torch.distributed.barrier(device_ids=[get_local_rank_preinit()])
+        # Skip barrier in single process case (e.g., torchrun --nproc-per-node=1)
+        if get_world_size_safe() > 1:
+            torch.distributed.barrier(device_ids=[get_local_rank_preinit()])
 
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
