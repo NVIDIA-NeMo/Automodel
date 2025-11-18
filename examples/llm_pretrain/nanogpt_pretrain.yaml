@@ -6,6 +6,7 @@ step_scheduler:
   local_batch_size: 2
   ckpt_every_steps: 2000
   num_epochs: 1
+  max_steps: 9500
 
 dist_env:
   backend: nccl
