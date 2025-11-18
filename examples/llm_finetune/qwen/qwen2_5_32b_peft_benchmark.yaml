@@ -1,8 +1,10 @@
-# Based on your existing config, modified for benchmarking
+# Custom Qwen2.5-72B with combined projections for benchmarking
+# Based on Qwen2_72B_peft_benchmark.yaml but using custom model implementation
+# Similar to custom_llama3_3_70b_instruct_peft_benchmark.yaml
 
 seed: 42
 
-# NEW: Add benchmark section
+# Benchmark section
 benchmark:
   warmup_steps: 5
   peak_tflops: 989  # H100: 989, A100: 312
@@ -12,7 +14,7 @@ benchmark:
 
 step_scheduler:
   global_batch_size: 32
-  local_batch_size: 4
+  local_batch_size: 8
   ckpt_every_steps: 50
   val_every_steps: 1000
   max_steps: 10
@@ -27,8 +29,8 @@ rng:
   ranked: true
 
 model:
-  _target_: nemo_automodel.components.models.llama.model.build_llama_model
-  pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen2.5-32B-Instruct
   torch_dtype: bf16
 
 peft:
@@ -47,7 +49,7 @@ checkpoint:
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: none
-  tp_size: 2
+  tp_size: 1
   cp_size: 1
   pp_size: 4
   sequence_parallel: false
@@ -86,4 +88,4 @@ optimizer:
 
 lr_scheduler:
   lr_decay_style: cosine
-  min_lr: 1.0e-6 
+  min_lr: 1.0e-6
