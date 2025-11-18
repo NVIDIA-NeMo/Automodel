@@ -36,7 +36,6 @@ from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
 from transformers.utils.hub import TRANSFORMERS_CACHE
 from wandb import Settings
 
-from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
@@ -78,6 +77,7 @@ from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     init_empty_weights,
     print_trainable_parameters,
+    resolve_trust_remote_code,
 )
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
@@ -125,37 +125,6 @@ def _get_num_thd_chunks(pp_enabled, cfg):
     return 1
 
 
-def _get_packed_sequence_config(has_packed_sequence, is_hf_model, cp_size):
-    kwargs = {}
-    if has_packed_sequence and is_hf_model:
-        if cp_size == 1:
-            kwargs["attn_implementation"] = "flash_attention_2"
-            logger.warning(
-                "Packed sequence is supported only with Flash Attention. "
-                "Setting model's attn_implementation to flash_attention_2"
-            )
-        else:
-            # TODO: support packed sequence with CP size > 1
-            raise ValueError("Packed sequence is only supported with CP size 1")
-    if cp_size > 1 and is_hf_model:
-        kwargs["attn_implementation"] = "sdpa"
-        logger.warning("Packed sequence is supported only with SDPA. Setting model's attn_implementation to sdpa")
-
-    return kwargs
-
-
-def _is_hf_model(cfg_model):
-    pretrained_path = cfg_model.get("pretrained_model_name_or_path", None)
-    if pretrained_path is None:
-        return False
-
-    trust_remote_code = bool(cfg_model.get("trust_remote_code", False))
-    config = AutoConfig.from_pretrained(pretrained_path, trust_remote_code=trust_remote_code)
-    architecture = config.architectures[0]
-
-    return architecture not in ModelRegistry.model_arch_name_to_cls
-
-
 def build_model_and_optimizer(
     device,
     cfg_model,
@@ -195,14 +164,11 @@ def build_model_and_optimizer(
     Returns:
         The instantiated model on the specified device, the state dict keys before any parallelization, the optimizer, the loss function, and param_info dict.
     """
-
-    is_hf_model = _is_hf_model(cfg_model)
     is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager))
 
     init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
     with ScopedRNG(seed=seed, ranked=True):
-        kwargs = {}
-        kwargs.update(_get_packed_sequence_config(has_packed_sequence, is_hf_model, cp_size))
+        kwargs = {"tp_size": tp_size, "cp_size": cp_size, "has_packed_sequence": has_packed_sequence}
 
         if cfg_quantization is not None:
             logger.info("Model weight quantization enabled with BitsAndBytes")
@@ -212,9 +178,6 @@ def build_model_and_optimizer(
 
         # Instantiate the model in meta device to avoid OOM
         with init_ctx:
-            if is_hf_model and (tp_size > 1 or cp_size > 1):
-                logger.info("Disabling Liger kernel with TP ({}) or CP ({})".format(tp_size, cp_size))
-                kwargs["use_liger_kernel"] = False
             model = cfg_model.instantiate(**kwargs)
 
             if checkpointer.config.dequantize_base_checkpoint is None:
@@ -223,11 +186,6 @@ def build_model_and_optimizer(
                     checkpointer.config.dequantize_base_checkpoint = hasattr(model.config, "quantization_config")
                 except:
                     checkpointer.config.dequantize_base_checkpoint = False
-
-            # Check if the model supports SDPA and raise an error if it doesn't
-            if cp_size > 1 and is_hf_model and hasattr(model, "_supports_sdpa"):
-                if model._supports_sdpa is False:
-                    raise ValueError("Model does not support SDPA required for context parallelism")
 
             # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
             if cfg_peft is not None:
@@ -409,17 +367,25 @@ def build_loss_fn(cfg_loss):
 
 
 def _build_tokenizer(cfg_model, cfg_ds):
+    def compute_trust_remote_code():
+        if hasattr(cfg_model, "trust_remote_code"):
+            return getattr(cfg_model, "trust_remote_code")
+        return resolve_trust_remote_code(_get_model_name(cfg_model))
+
+    trust_remote_code = compute_trust_remote_code()
     # if tokenizer is not provided, use the model config to instantiate it
     if "tokenizer" not in cfg_ds and _get_model_name(cfg_model) is not None:
         logging.info("Using model config to instantiate tokenizer")
-        trust_remote_code = getattr(cfg_model, "trust_remote_code", False)
         tokenizer = AutoTokenizer.from_pretrained(_get_model_name(cfg_model), trust_remote_code=trust_remote_code)
     elif cfg_ds.get("tokenizer", None) is None:
         tokenizer = None
     elif "_target_" not in cfg_ds.tokenizer:
-        tokenizer = AutoTokenizer.from_pretrained(**cfg_ds.tokenizer.to_dict())
+        tokenizer_dict = cfg_ds.tokenizer.to_dict()
+        trust_remote_code = tokenizer_dict.pop("trust_remote_code", trust_remote_code)
+        tokenizer = AutoTokenizer.from_pretrained(**tokenizer_dict, trust_remote_code=trust_remote_code)
     else:
-        tokenizer = cfg_ds.tokenizer.instantiate()
+        trust_remote_code = cfg_ds.tokenizer.to_dict().pop("trust_remote_code", trust_remote_code)
+        tokenizer = cfg_ds.tokenizer.instantiate(trust_remote_code=trust_remote_code)
 
     # Finally, check if the dataset target accepts a tokenizer parameter
     kwargs = {}
