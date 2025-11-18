@@ -21,6 +21,7 @@ import importlib
 import torch
 import torch.nn as nn
 from torch.utils.data import IterableDataset
+from types import SimpleNamespace
 
 
 class DummyIterableDataset(IterableDataset):  # noqa: D401
@@ -236,23 +237,29 @@ def test_peft_without_pipeline_parallelism(caplog):
     mock_checkpointer = MagicMock()
     mock_checkpointer.load_base_model = MagicMock()
 
+    # Stub: move from meta to device inside load_base_model
+    def _load_base_model_stub(model, device, *args, **kwargs):
+        if hasattr(model, "to_empty"):
+            model.to_empty(device=device)
+    mock_checkpointer.load_base_model = _load_base_model_stub
+
     # Mock the apply_lora_to_linear_modules function
     with patch('nemo_automodel.recipes.llm.train_ft.apply_lora_to_linear_modules') as mock_apply_lora:
         with patch('nemo_automodel.recipes.llm.train_ft.print_trainable_parameters', return_value=(100, 1000)):
             with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-                with caplog.at_level(logging.INFO):
-                    # This should work fine without PP
-                    model, state_dict_keys, optimizer, loss_fn, param_info = build_model_and_optimizer(
-                        device=device,
-                        cfg_model=cfg_model,
-                        cfg_opt=cfg_opt,
-                        cfg_peft=cfg_peft,
-                        model_wrapper=None,
-                        seed=42,
-                        checkpointer=mock_checkpointer,
-                        autopipeline=None,  # No pipeline parallelism
-                        loss_fn=None,
-                    )
+                    with caplog.at_level(logging.INFO):
+                        # This should work fine without PP
+                        model, state_dict_keys, optimizer, loss_fn, param_info = build_model_and_optimizer(
+                            device=device,
+                            cfg_model=cfg_model,
+                            cfg_opt=cfg_opt,
+                            cfg_peft=cfg_peft,
+                            model_wrapper=SimpleNamespace(parallelize=lambda m: m),
+                            seed=42,
+                            checkpointer=mock_checkpointer,
+                            autopipeline=None,  # No pipeline parallelism
+                            loss_fn=None,
+                        )
 
                     # Verify that apply_lora was called
                     assert mock_apply_lora.called, "apply_lora_to_linear_modules should be called"
@@ -278,24 +285,30 @@ def test_peft_with_tp_disables_triton(caplog):
     mock_checkpointer = MagicMock()
     mock_checkpointer.load_base_model = MagicMock()
 
+    # Stub: move from meta to device inside load_base_model
+    def _load_base_model_stub(model, device, *args, **kwargs):
+        if hasattr(model, "to_empty"):
+            model.to_empty(device=device)
+    mock_checkpointer.load_base_model = _load_base_model_stub
+
     # Mock the apply_lora_to_linear_modules function
     with patch('nemo_automodel.recipes.llm.train_ft.apply_lora_to_linear_modules') as mock_apply_lora:
         with patch('nemo_automodel.recipes.llm.train_ft.print_trainable_parameters', return_value=(100, 1000)):
             with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-                with caplog.at_level(logging.INFO):
-                    # Test with TP > 1
-                    model, state_dict_keys, optimizer, loss_fn, param_info = build_model_and_optimizer(
-                        device=device,
-                        cfg_model=cfg_model,
-                        cfg_opt=cfg_opt,
-                        cfg_peft=cfg_peft,
-                        model_wrapper=None,
-                        seed=42,
-                        checkpointer=mock_checkpointer,
-                        tp_size=2,  # Enable TP
-                        autopipeline=None,
-                        loss_fn=None,
-                    )
+                    with caplog.at_level(logging.INFO):
+                        # Test with TP > 1
+                        model, state_dict_keys, optimizer, loss_fn, param_info = build_model_and_optimizer(
+                            device=device,
+                            cfg_model=cfg_model,
+                            cfg_opt=cfg_opt,
+                            cfg_peft=cfg_peft,
+                            model_wrapper=SimpleNamespace(parallelize=lambda m: m),
+                            seed=42,
+                            checkpointer=mock_checkpointer,
+                            tp_size=2,  # Enable TP
+                            autopipeline=None,
+                            loss_fn=None,
+                        )
 
                     # Verify that use_triton was disabled
                     assert cfg_peft.use_triton == False, "use_triton should be disabled for TP"
