@@ -62,7 +62,7 @@ __all__ = ["build_llama_model", "LlamaForCausalLM"]
 
 class LlamaAttention(CombinedQKVAttentionMixin, nn.Module):
     """Multi-headed attention with combined QKV projection.
-    
+
     Uses CombinedQKVAttentionMixin - ALWAYS uses combined QKV for efficiency.
     """
 
@@ -223,7 +223,7 @@ class LlamaPreTrainedModel(PreTrainedModel):
 
 class LlamaModel(LlamaPreTrainedModel):
     """Llama transformer model (embeddings + decoder layers + norm).
-    
+
     ALWAYS uses combined QKV and gate_up projections for efficiency.
     """
 
@@ -323,7 +323,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
 class LlamaForCausalLM(LlamaPreTrainedModel):
     """Llama model with causal language modeling head.
-    
+
     ALWAYS uses combined QKV and gate_up projections for efficiency.
     """
 
@@ -498,7 +498,7 @@ def build_llama_model(pretrained_model_name_or_path: str, **kwargs: Any) -> nn.M
 
     if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
         print(f"[build_llama_model] Attention implementation: {config._attn_implementation}")
-        print(f"[build_llama_model] Custom implementation with COMBINED QKV and gate_up projections")
+        print("[build_llama_model] Custom implementation with COMBINED QKV and gate_up projections")
         print(f"[build_llama_model] torch_dtype: {torch_dtype}")
 
     # Create model with combined projections (ALWAYS)
