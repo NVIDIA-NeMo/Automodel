@@ -151,25 +151,16 @@ def build_model_and_optimizer(
     Returns:
         The instantiated model on the specified device, the state dict keys before any parallelization, and the optimizer.
     """
-    is_hf_model = cfg_model.get("pretrained_model_name_or_path", None) is not None
     is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager))
 
     init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
     with ScopedRNG(seed=seed, ranked=True):
-        kwargs = {}
+        kwargs = {"tp_size": tp_size, "cp_size": cp_size}
 
         # Instantiate the model in meta device to avoid OOM
         with init_ctx:
-            if is_hf_model and (tp_size > 1 or cp_size > 1):
-                logger.info("Disabling Liger kernel with TP ({}) or CP ({})".format(tp_size, cp_size))
-                kwargs["use_liger_kernel"] = False
             model = cfg_model.instantiate(**kwargs)
             model = _freeze_model(model, cfg_freeze, freeze_embeddings)
-
-            if cp_size > 1 and is_hf_model and hasattr(model, "_supports_sdpa"):
-                if model._supports_sdpa is False:
-                    raise ValueError("Model does not support SDPA required for context parallelism")
-
             # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
             if cfg_peft is not None:
                 if tp_size > 1:

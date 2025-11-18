@@ -14,6 +14,7 @@
 
 import inspect
 import logging
+import os
 from contextlib import contextmanager
 
 from nemo_automodel.shared.import_utils import safe_import
@@ -78,6 +79,22 @@ def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
         except Exception:
             pass
     return total_params, trainable_params, local_sq_norm
+
+
+def resolve_trust_remote_code(pretrained_model_name_or_path):
+    """
+    Whitelist NVIDIA models to allow remote code execution.
+
+    Args:
+        pretrained_model_name_or_path (str): The name or path of the pretrained model.
+
+    Returns:
+        bool: True if the model should be loaded with trust_remote_code, False otherwise.
+    """
+    if not pretrained_model_name_or_path:
+        return False
+    # pretrained_model_name_or_path can be something like nvidia/NVIDIA-Nemotron-Nano-9B-v2
+    return not os.path.isdir(pretrained_model_name_or_path) and pretrained_model_name_or_path.startswith("nvidia/")
 
 
 def print_trainable_parameters(model: nn.Module) -> tuple[int, int]:

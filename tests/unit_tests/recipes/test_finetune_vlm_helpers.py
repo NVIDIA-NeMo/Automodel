@@ -94,7 +94,7 @@ class DummyOptConfig:
 class DummyModelConfig:
     """Mimics the Hydra/OmegaConf model config with an *instantiate* method."""
 
-    def instantiate(self):
+    def instantiate(self, **kwargs):
         return DummyModel()
 
     def get(self, key, default=None):
