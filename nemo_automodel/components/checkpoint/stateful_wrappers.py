@@ -86,8 +86,8 @@ class ModelState:
         self.is_tied_lm_head = getattr(getattr(self.model[0], "config", {}), "tie_word_embeddings", False)
 
         non_tied_lm_head_models = {
-            "Qwen3OmniMoeThinkerForConditionalGeneration", # complicated config structure
-            "InternVLForConditionalGeneration", # even tho config says tie_word_embeddings=True, it's not 
+            "Qwen3OmniMoeThinkerForConditionalGeneration",  # complicated config structure
+            "InternVLForConditionalGeneration",  # even tho config says tie_word_embeddings=True, it's not
         }
         for m in non_tied_lm_head_models:
             if m in type(self.model[0]).__name__:
