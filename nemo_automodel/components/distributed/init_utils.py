@@ -126,8 +126,8 @@ def initialize_distributed(
         if get_world_size_safe() == 1:
             init_pg_kwargs["world_size"] = 1
             init_pg_kwargs["rank"] = 0
-            init_pg_kwargs["backend"] =  'gloo'
-            init_pg_kwargs['store'] = torch.distributed.HashStore()
+            init_pg_kwargs["backend"] = "gloo"
+            init_pg_kwargs["store"] = torch.distributed.HashStore()
 
         torch.distributed.init_process_group(**init_pg_kwargs)
         atexit.register(destroy_global_state)
