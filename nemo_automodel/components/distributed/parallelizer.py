@@ -646,7 +646,7 @@ def validate_tp_mesh(model, tp_mesh):
             model_arch = None
 
     if model_cls == Phi3ForCausalLM:
-        # Phi4 has replicated attention heads -> validate check not applicable
+        # Phi4 has replicated attention heads -> validation check not applicable
         return
     elif model_cls in [
         Qwen2_5_VLForConditionalGeneration,
