@@ -58,6 +58,7 @@ from transformers.models.llava_onevision.modeling_llava_onevision import (
 from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3ForConditionalGeneration,
 )
+from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLForConditionalGeneration,
 )
@@ -644,7 +645,10 @@ def validate_tp_mesh(model, tp_mesh):
         except Exception:
             model_arch = None
 
-    if model_cls in [
+    if model_cls == Phi3ForCausalLM:
+        # Phi4 has replicated attention heads -> validate check not applicable
+        return
+    elif model_cls in [
         Qwen2_5_VLForConditionalGeneration,
         Qwen2VLForConditionalGeneration,
     ]:
