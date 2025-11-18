@@ -19,7 +19,7 @@ Uses the generic CombinedProjectionStateDictAdapter from common/.
 
 from transformers import LlamaConfig
 
-from nemo_automodel.components.models.common.state_dict_adapter import CombinedProjectionStateDictAdapter
+from nemo_automodel.components.models.common.combined_projection.state_dict_adapter import CombinedProjectionStateDictAdapter
 
 
 class LlamaStateDictAdapter(CombinedProjectionStateDictAdapter):
