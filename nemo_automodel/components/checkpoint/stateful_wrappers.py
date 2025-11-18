@@ -85,8 +85,14 @@ class ModelState:
         self.model = [model] if isinstance(model, torch.nn.Module) else model
         self.is_tied_lm_head = getattr(getattr(self.model[0], "config", {}), "tie_word_embeddings", False)
 
-        if "Qwen3OmniMoeThinkerForConditionalGeneration" in getattr(type(self.model[0]), "__name__", ""):
-            self.is_tied_lm_head = False
+        non_tied_lm_head_models = {
+            "Qwen3OmniMoeThinkerForConditionalGeneration", # complicated config structure
+            "InternVLForConditionalGeneration", # even tho config says tie_word_embeddings=True, it's not 
+        }
+        for m in non_tied_lm_head_models:
+            if m in type(self.model[0]).__name__:
+                self.is_tied_lm_head = False
+                break
 
         if self.is_tied_lm_head:
             _, lm_head_param_name = _get_lm_head_weight_and_name(self.model[0])

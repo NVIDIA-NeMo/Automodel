@@ -161,8 +161,9 @@ def build_model_and_optimizer(
         # Instantiate the model in meta device to avoid OOM
         with init_ctx:
             if is_hf_model and (tp_size > 1 or cp_size > 1):
-                logger.info("Disabling Liger kernel with TP ({}) or CP ({})".format(tp_size, cp_size))
-                kwargs["use_liger_kernel"] = False
+                if cfg_model.get("use_liger_kernel", False):
+                    logger.info("Disabling Liger kernel with TP ({}) or CP ({})".format(tp_size, cp_size))
+                    kwargs["use_liger_kernel"] = False
             model = cfg_model.instantiate(**kwargs)
             model = _freeze_model(model, cfg_freeze, freeze_embeddings)
 
