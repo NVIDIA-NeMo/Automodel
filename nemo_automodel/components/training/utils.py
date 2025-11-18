@@ -99,7 +99,7 @@ def _clip_grad_norm_impl(
     for group_params in sharding_groups.values():
         grads = [p.grad for p in group_params]
         group_norm = torch.nn.utils.get_total_norm(grads, norm_type, error_if_nonfinite, foreach)
-        group_norm = group_norm.to(target_device)
+        group_norm = group_norm.float().to(target_device)
 
         # Convert DTensor norms to regular tensors and ensure they're on the same device
         if isinstance(group_norm, DTensor):
@@ -130,6 +130,7 @@ def _clip_grad_norm_impl(
                 total_norm += gn**norm_type
             total_norm = total_norm ** (1.0 / norm_type)
 
+    total_norm = total_norm.float().to(target_device)
     # Reduce across pipeline parallel mesh if provided
     if pp_mesh is not None:
         if math.isinf(norm_type):
