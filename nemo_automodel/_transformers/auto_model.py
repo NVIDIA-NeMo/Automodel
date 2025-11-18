@@ -36,6 +36,7 @@ from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
 from nemo_automodel import __version__
 from nemo_automodel._transformers.registry import ModelRegistry
+from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code
 from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -151,6 +152,65 @@ def _get_next_fallback_attn(attn_implementation: str) -> str:
         return priorities[0]
 
 
+def _prepare_hf_config_and_flag(pretrained_model_name_or_path, force_hf, kwargs):
+    """
+    Resolve trust_remote_code default, fetch HF config and determine if model is HF-based.
+    """
+    kwargs["trust_remote_code"] = kwargs.get(
+        "trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path)
+    )
+    hf_config = kwargs.pop("config", None) or AutoConfig.from_pretrained(
+        pretrained_model_name_or_path, trust_remote_code=kwargs["trust_remote_code"]
+    )
+    architectures = getattr(hf_config, "architectures", None) or []
+    is_hf_model = (not architectures or architectures[0] not in ModelRegistry.model_arch_name_to_cls) or force_hf
+    return hf_config, is_hf_model
+
+
+def _pop_tp_cp_has_packed(kwargs):
+    """
+    Extract and remove TP/CP/packed flags from kwargs.
+    """
+    tp_size = kwargs.pop("tp_size", 1)
+    cp_size = kwargs.pop("cp_size", 1)
+    has_packed_sequence = kwargs.pop("has_packed_sequence", False)
+    return tp_size, cp_size, has_packed_sequence
+
+
+def _apply_preload_overrides(is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel):
+    """
+    Compute final attention implementation and liger-kernel flag based on TP/CP and packed sequence constraints.
+    """
+    if is_hf_model and (tp_size > 1 or cp_size > 1):
+        logger.info("Disabling Liger kernel with TP ({}) or CP ({})".format(tp_size, cp_size))
+        use_liger_kernel = False
+
+    if cp_size > 1 and is_hf_model:
+        attn_implementation = "sdpa"
+        logger.warning("Packed sequence is supported only with SDPA. Setting model's attn_implementation to sdpa")
+
+    if has_packed_sequence and is_hf_model:
+        if cp_size == 1:
+            attn_implementation = "flash_attention_2"
+            logger.warning(
+                "Packed sequence is supported only with Flash Attention. "
+                "Setting model's attn_implementation to flash_attention_2"
+            )
+        else:
+            # TODO: support packed sequence with CP size > 1
+            raise ValueError("Packed sequence is only supported with CP size 1")
+    return attn_implementation, use_liger_kernel
+
+
+def _verify_sdpa_support(model, is_hf_model, cp_size):
+    """
+    Validate SDPA support when CP is enabled for HF models.
+    """
+    if cp_size > 1 and is_hf_model and hasattr(model, "_supports_sdpa"):
+        if model._supports_sdpa is False:
+            raise ValueError("Model does not support SDPA required for context parallelism")
+
+
 class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
     """
     Drop-in replacement for ``_BaseAutoModelClass`` that includes custom-kernels.
@@ -233,6 +293,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
               `use_liger_kernel=False` or `use_sdpa_patching=False`
         """
         torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
+        hf_config, is_hf_model = _prepare_hf_config_and_flag(pretrained_model_name_or_path, force_hf, kwargs)
+        tp_size, cp_size, has_packed_sequence = _pop_tp_cp_has_packed(kwargs)
+        attn_implementation, use_liger_kernel = _apply_preload_overrides(
+            is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel
+        )
 
         def _retry(**override):
             """Internal helper to re-enter this function with patched args."""
@@ -262,13 +327,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 cls.__name__ = name[4:]
             if not force_hf:
                 try:
-                    config = kwargs.pop("config", None) or AutoConfig.from_pretrained(
-                        pretrained_model_name_or_path, trust_remote_code=bool(kwargs.get("trust_remote_code", False))
-                    )
                     # if we have a custom model implementation available, we prioritize that over HF
-                    if config.architectures[0] in ModelRegistry.model_arch_name_to_cls:
-                        model = ModelRegistry.model_arch_name_to_cls[config.architectures[0]](
-                            config, *model_args, **kwargs
+                    if hf_config.architectures[0] in ModelRegistry.model_arch_name_to_cls:
+                        model = ModelRegistry.model_arch_name_to_cls[hf_config.architectures[0]](
+                            hf_config, *model_args, **kwargs
                         )
                         # if we are able to init the custom model, we will now download the model weights on local rank 0
                         if (
@@ -297,13 +359,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                                 token=None,
                                 user_agent={"file_type": "model", "framework": "pytorch", "from_auto_class": False},
                                 revision="main",
-                                commit_hash=getattr(config, "_commit_hash", None),
+                                commit_hash=getattr(hf_config, "_commit_hash", None),
                                 is_remote_code=False,
                                 transformers_explicit_filename=None,
                             )
                         if dist.is_initialized():
                             dist.barrier()
-                        logger.info(f"Using custom model implementation for {config.architectures[0]}")
+                        logger.info(f"Using custom model implementation for {hf_config.architectures[0]}")
                         return model
                 except Exception as e:
                     logger.error(f"Failed to use custom model implementation with error: {e}")
@@ -344,6 +406,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         except:
             logging.warning("Retrying without SDPA patching.")
             return _retry(use_sdpa_patching=False)
+
+        _verify_sdpa_support(model, is_hf_model, cp_size)
 
         model.config.update({"nemo_version": __version__})
         return model
@@ -403,6 +467,16 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
               `use_liger_kernel=False` or `use_sdpa_patching=False`
         """
         torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch.bfloat16
+        kwargs["trust_remote_code"] = kwargs.get(
+            "trust_remote_code", resolve_trust_remote_code(getattr(config, "name_or_path", None))
+        )
+
+        architectures = getattr(config, "architectures", None) or []
+        is_hf_model = (not architectures or architectures[0] not in ModelRegistry.model_arch_name_to_cls) or force_hf
+        tp_size, cp_size, has_packed_sequence = _pop_tp_cp_has_packed(kwargs)
+        attn_implementation, use_liger_kernel = _apply_preload_overrides(
+            is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel
+        )
 
         def _retry(**override):
             """Internal helper to re-enter this function with patched args."""
@@ -472,6 +546,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         except:
             logging.warning("Retrying without SDPA patching.")
             return _retry(use_sdpa_patching=False)
+
+        _verify_sdpa_support(model, is_hf_model, cp_size)
 
         model.config.update({"nemo_version": __version__})
         return model

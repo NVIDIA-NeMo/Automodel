@@ -42,10 +42,14 @@ class TestNeMoAutoModelForCausalLM:
     def test_from_pretrained_liger_kernel_not_available(self, caplog):
         """Test warning when Liger kernel is not available."""
         with (
+            patch("nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained") as mock_cfg_from_pretrained,
             patch("nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL", False),
             patch("nemo_automodel._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
             patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_from_pretrained,
         ):
+            cfg = Mock()
+            cfg.architectures = ["HFArch"]
+            mock_cfg_from_pretrained.return_value = cfg
             mock_model = MagicMock()
             mock_model.config = {}
             mock_from_pretrained.return_value = mock_model
@@ -119,6 +123,8 @@ class TestNeMoAutoModelForCausalLM:
             # Fake config with architectures attribute
             cfg = Mock()
             cfg.architectures = ["CustomArch"]
+            # Provide a concrete path string to avoid Mock flowing into os.path.isdir
+            cfg.name_or_path = "custom/model"
 
             # Registry provides a custom class
             custom_model_instance = Mock()
@@ -130,7 +136,9 @@ class TestNeMoAutoModelForCausalLM:
             # Should return custom model instance
             assert returned is custom_model_instance
             mock_hf_loader.assert_not_called()
-            custom_cls.assert_called_with(cfg)
+            custom_cls.assert_called()
+            args, _ = custom_cls.call_args
+            assert args == (cfg,)
 
     def test_from_pretrained_registry_downloads_checkpoint_files_rank0(self):
         """When using a custom model implementation, ensure rank0 downloads weights and we barrier."""
@@ -474,6 +482,116 @@ class TestNeMoAutoModelForCausalLM:
         assert call_args_list[0][1]["attn_implementation"] == "flash_attention_2"
         assert call_args_list[1][1]["attn_implementation"] == "eager"
 
+    @pytest.mark.parametrize(
+        "has_packed_sequence,is_hf_model,cp_size,expected_attn,expect_raises",
+        [
+            (True, True, 1, "flash_attention_2", None),
+            (True, True, 2, None, ValueError),
+            (True, False, 1, None, None),
+            (True, False, 2, None, None),
+            (False, True, 1, "flash_attention_2", None),
+            (False, True, 2, "sdpa", None),
+            (False, False, 1, None, None),
+            (False, False, 2, None, None),
+        ],
+    )
+    def test_packed_sequence_and_cp_overrides_from_pretrained(
+        self, has_packed_sequence, is_hf_model, cp_size, expected_attn, expect_raises
+    ):
+        with (
+            patch("nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained") as mock_cfg_from_pretrained,
+            patch("nemo_automodel._transformers.auto_model.ModelRegistry") as mock_registry,
+            patch("nemo_automodel._transformers.auto_model.os.path.isdir", return_value=True),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", lambda obj: obj),
+            patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_hf_loader,
+        ):
+            cfg = Mock()
+            cfg.architectures = ["HFArch"] if is_hf_model else ["CustomArch"]
+            mock_cfg_from_pretrained.return_value = cfg
+
+            if is_hf_model:
+                mock_registry.model_arch_name_to_cls = {}
+            else:
+                custom_model_instance = Mock()
+                custom_cls = Mock(return_value=custom_model_instance)
+                mock_registry.model_arch_name_to_cls = {"CustomArch": custom_cls}
+
+            mock_hf_loader.return_value = MagicMock(config={})
+
+            def do_call():
+                return NeMoAutoModelForCausalLM.from_pretrained(
+                    "dummy/model",
+                    cp_size=cp_size,
+                    has_packed_sequence=has_packed_sequence,
+                )
+
+            if expect_raises:
+                with pytest.raises(expect_raises):
+                    do_call()
+                assert mock_hf_loader.call_count == 0
+                if not is_hf_model:
+                    custom_cls = mock_registry.model_arch_name_to_cls["CustomArch"]
+                    assert custom_cls.call_count == 0
+                return
+
+            model = do_call()
+            assert hasattr(model, "config")
+
+            if is_hf_model:
+                assert mock_hf_loader.call_count == 1
+                _, kwargs = mock_hf_loader.call_args
+                if expected_attn is None:
+                    assert "attn_implementation" not in kwargs
+                else:
+                    assert kwargs["attn_implementation"] == expected_attn
+            else:
+                assert mock_hf_loader.call_count == 0
+                custom_cls = mock_registry.model_arch_name_to_cls["CustomArch"]
+                assert custom_cls.call_count == 1
+                _, kwargs = custom_cls.call_args
+                assert "attn_implementation" not in kwargs
+
+    def test_trust_remote_code_whitelist_nvidia_from_pretrained(self):
+        with (
+            patch("nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained") as mock_cfg_from_pretrained,
+            patch("nemo_automodel._transformers.auto_model.ModelRegistry") as mock_registry,
+            patch("nemo_automodel._transformers.auto_model.os.path.isdir", return_value=False),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", lambda obj: obj),
+            patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_hf_loader,
+        ):
+            mock_registry.model_arch_name_to_cls = {}
+            cfg = Mock()
+            cfg.architectures = ["HFArch"]
+            mock_cfg_from_pretrained.return_value = cfg
+            mock_hf_loader.return_value = MagicMock(config={})
+
+            NeMoAutoModelForCausalLM.from_pretrained("nvidia/NVIDIA-Nemotron-Nano-9B-v2")
+
+            _, kwargs = mock_cfg_from_pretrained.call_args
+            assert kwargs["trust_remote_code"] is True
+
+    def test_trust_remote_code_respects_explicit_kwarg_from_pretrained(self):
+        with (
+            patch("nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained") as mock_cfg_from_pretrained,
+            patch("nemo_automodel._transformers.auto_model.ModelRegistry") as mock_registry,
+            patch("nemo_automodel._transformers.auto_model.os.path.isdir", return_value=False),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", lambda obj: obj),
+            patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_hf_loader,
+        ):
+            mock_registry.model_arch_name_to_cls = {}
+            cfg = Mock()
+            cfg.architectures = ["HFArch"]
+            mock_cfg_from_pretrained.return_value = cfg
+            mock_hf_loader.return_value = MagicMock(config={})
+
+            NeMoAutoModelForCausalLM.from_pretrained("custom/model", trust_remote_code=False)
+
+            _, kwargs = mock_cfg_from_pretrained.call_args
+            assert kwargs["trust_remote_code"] is False
+
 
 class TestNeMoAutoModelForImageTextToText:
     """Test cases for NeMoAutoModelForImageTextToText class."""
@@ -483,8 +601,12 @@ class TestNeMoAutoModelForImageTextToText:
         with (
             patch("nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL", False),
             patch("nemo_automodel._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch("nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained") as mock_cfg_from_pretrained,
             patch.object(transformers.AutoModelForImageTextToText, "from_pretrained") as mock_from_pretrained,
         ):
+            cfg = Mock()
+            cfg.architectures = ["HFArch"]
+            mock_cfg_from_pretrained.return_value = cfg
             mock_model = Mock()
             mock_model.config = {}
             mock_from_pretrained.return_value = mock_model
@@ -536,12 +658,16 @@ class TestNeMoAutoModelForImageTextToText:
             patch("nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL", True),
             patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", new=fake__patch_liger_kernel),
             patch("nemo_automodel._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch("nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained") as mock_cfg_from_pretrained,
             patch.object(
                 transformers.AutoModelForImageTextToText,
                 "from_pretrained",
                 side_effect=[model1, model2],  # first, then retry
             ) as mock_from_pretrained,
         ):
+            cfg = Mock()
+            cfg.architectures = ["HFArch"]
+            mock_cfg_from_pretrained.return_value = cfg
             returned = NeMoAutoModelForImageTextToText.from_pretrained("dummy_model")
             assert returned.config["nemo_version"] == __version__
 
@@ -571,12 +697,16 @@ class TestNeMoAutoModelForImageTextToText:
             patch("nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL", True),
             patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", lambda x: x),
             patch("nemo_automodel._transformers.auto_model._patch_attention", fake__patch_attention),
+            patch("nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained") as mock_cfg_from_pretrained,
             patch.object(
                 transformers.AutoModelForImageTextToText,
                 "from_pretrained",
                 side_effect=[model1, model2],  # first, then retry
             ) as mock_from_pretrained,
         ):
+            cfg = Mock()
+            cfg.architectures = ["HFArch"]
+            mock_cfg_from_pretrained.return_value = cfg
             returned = NeMoAutoModelForImageTextToText.from_pretrained("dummy_model")
             assert returned.config["nemo_version"] == __version__
 
