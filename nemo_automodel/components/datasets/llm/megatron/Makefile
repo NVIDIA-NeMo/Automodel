@@ -10,4 +10,4 @@ SRC = helpers.cpp
 default: $(OUT)
 
 $(OUT): $(SRC)
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $< -o $@ -undefined dynamic_lookup
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $< -o $@
