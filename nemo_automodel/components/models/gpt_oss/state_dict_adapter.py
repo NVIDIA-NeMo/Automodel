@@ -93,36 +93,6 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
             del state_dict[key]
         return new_state_dict
 
-    def _add_quantization_block_scale_tensors(self, state_dict: dict[str, Any]) -> dict[str, Any]:
-        for key, value in list(state_dict.items()):
-            if key.endswith("gate_up_proj") or key.endswith("down_proj"):
-                # gpt-oss has blocks/scales for the down_proj and gate_up_proj weights
-                # we need to add the blocks and scales tensors in a shard-aware manner
-                layer_name, projection_type = key.rsplit(".", 1)
-                n_experts, _, dim = value.shape
-                if isinstance(value, torch.distributed.tensor.DTensor):
-                    placements, device_mesh = value.placements, value.device_mesh
-                    blocks_tensors = torch.distributed.tensor.ones(
-                        (n_experts, dim, 90, 16), placements=placements, device_mesh=device_mesh, dtype=torch.uint8
-                    )
-                    scales_tensors = torch.distributed.tensor.ones(
-                        (n_experts, dim, 90), placements=placements, device_mesh=device_mesh, dtype=torch.uint8
-                    )
-                else:
-                    blocks_tensors = torch.ones((n_experts, dim, 90, 16), dtype=torch.uint8)
-                    scales_tensors = torch.ones((n_experts, dim, 90), dtype=torch.uint8)
-                state_dict[f"{layer_name}.{projection_type}_blocks"] = blocks_tensors
-                state_dict[f"{layer_name}.{projection_type}_scales"] = scales_tensors
-
-                # in addition, the custom model has the post-dequantized gate_up_proj and down_proj weights
-                # these need to be deleted at the time of loading from the HF checkpoint (since they are not in the HF checkpoint)
-                del state_dict[key]
-
-        # clean up the memory
-        torch.cuda.empty_cache()
-        gc.collect()
-        return state_dict
-
     def _dequantize_block_scale_tensors(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         layer_name_to_quantized_weights = defaultdict(dict)
 
@@ -206,7 +176,23 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
 
         out = out.reshape(*prefix_shape, G, B * 2).view(*prefix_shape, G * B * 2)
         del blocks, scales, lut
-        return out.transpose(1, 2).contiguous()
+
+        # Final logical layout is (n_experts, 2880, hidden_dim) after transpose.
+        out = out.transpose(1, 2).contiguous()
+        # Restore desired DTensor sharding: shard experts (dim 0) by 'ep' and hidden dim (dim 2) by 'ep_shard'.
+        if isinstance(out, torch.distributed.tensor.DTensor):
+            placements = []
+            mesh_dim_names = out.device_mesh.mesh_dim_names
+            for dim_name in mesh_dim_names:
+                if dim_name == "ep":
+                    placements.append(torch.distributed.tensor.Shard(0))
+                elif dim_name == "ep_shard":
+                    placements.append(torch.distributed.tensor.Shard(2))
+                else:
+                    raise ValueError(f"Unexpected dimension name: {dim_name}")
+            if placements != out.placements:
+                out = out.redistribute(placements=tuple(placements))
+        return out
 
     def to_hf(
         self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
@@ -274,12 +260,31 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
                 n_experts, _, dim = tensor.shape
 
                 if isinstance(tensor, torch.distributed.tensor.DTensor):
-                    placements, device_mesh = tensor.placements, tensor.device_mesh
+                    device_mesh = tensor.device_mesh
+                    # Ensure quantized tensors shard only along dim 0 for safe flattening in conversion
+                    orig_placements = tensor.placements
+                    safe_placements = []
+                    found_shard_dim0 = False
+                    for p in orig_placements:
+                        if isinstance(p, torch.distributed.tensor.Shard):
+                            if p.dim == 0 and not found_shard_dim0:
+                                safe_placements.append(p)
+                                found_shard_dim0 = True
+                            else:
+                                safe_placements.append(torch.distributed.tensor.Replicate())
+                        else:
+                            safe_placements.append(p)
                     blocks_tensors = torch.distributed.tensor.ones(
-                        (n_experts, dim, 90, 16), placements=placements, device_mesh=device_mesh, dtype=torch.uint8
+                        (n_experts, dim, 90, 16),
+                        placements=tuple(safe_placements),
+                        device_mesh=device_mesh,
+                        dtype=torch.uint8,
                     )
                     scales_tensors = torch.distributed.tensor.ones(
-                        (n_experts, dim, 90), placements=placements, device_mesh=device_mesh, dtype=torch.uint8
+                        (n_experts, dim, 90),
+                        placements=tuple(safe_placements),
+                        device_mesh=device_mesh,
+                        dtype=torch.uint8,
                     )
                 else:
                     blocks_tensors = torch.ones((n_experts, dim, 90, 16), dtype=torch.uint8)

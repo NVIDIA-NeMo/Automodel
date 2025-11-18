@@ -249,50 +249,18 @@ class TestGPTOSSStateDictAdapter:
         mock_convert.assert_called_once()
         assert "quantized" in out
 
-    def test_add_quantization_block_scale_tensors_creates_expected_keys(self):
+    def test_to_hf_quantization_shapes_cpu(self):
         config = self.create_mock_config()
         moe_config = self.create_mock_moe_config()
         backend = self.create_mock_backend_config()
         adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
 
-        class FakeDTensor:
-            def __init__(self, shape, placements="P", device_mesh="M"):
-                self.shape = shape
-                self.placements = placements
-                self.device_mesh = device_mesh
-                self.is_cuda = False
-
-        # HF-style keys expected by _add_quantization_block_scale_tensors
-        state_dict = {
-            "model.layers.0.mlp.experts.gate_up_proj": FakeDTensor((2, 64, 128)),
-            "model.layers.0.mlp.experts.down_proj": FakeDTensor((2, 32, 256)),
-            # non-matching suffix should be ignored
-            "model.layers.0.mlp.experts.up_proj": torch.randn(2, 2),
-        }
-
-        def fake_ones(shape, placements=None, device_mesh=None, dtype=None):
-            return FakeDTensor(shape, placements=placements, device_mesh=device_mesh)
-
-        with patch("torch.distributed.tensor.ones", create=True, side_effect=fake_ones):
-            out = adapter._add_quantization_block_scale_tensors(state_dict)
-
-        # Original keys removed
-        assert "model.layers.0.mlp.experts.gate_up_proj" not in out
-        assert "model.layers.0.mlp.experts.down_proj" not in out
-
-        # New quantization keys exist with expected shapes
-        g_blocks = out["model.layers.0.mlp.experts.gate_up_proj_blocks"]
-        g_scales = out["model.layers.0.mlp.experts.gate_up_proj_scales"]
-        d_blocks = out["model.layers.0.mlp.experts.down_proj_blocks"]
-        d_scales = out["model.layers.0.mlp.experts.down_proj_scales"]
-
-        assert g_blocks.shape == (2, 128, 90, 16)
-        assert g_scales.shape == (2, 128, 90)
-        assert d_blocks.shape == (2, 256, 90, 16)
-        assert d_scales.shape == (2, 256, 90)
-
-        # Irrelevant key preserved
-        assert "model.layers.0.mlp.experts.up_proj" in out
+        fqn = "model.layers.0.mlp.experts.gate_and_up_projs"
+        tensor = torch.randn(2, 64, 128)
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
+        out = dict(result)
+        assert out["model.layers.0.mlp.experts.gate_up_proj_blocks"].shape == (2, 128, 90, 16)
+        assert out["model.layers.0.mlp.experts.gate_up_proj_scales"].shape == (2, 128, 90)
 
     def test_dequantize_block_scale_tensors_merges_pairs(self):
         config = self.create_mock_config()
@@ -647,32 +615,14 @@ class TestSingleGPUScenarios:
         # No block/scale artifacts remain
         assert not any(k.endswith("_blocks") or k.endswith("_scales") for k in out)
 
-    def test_add_quantization_block_scale_tensors_cpu_path_creates_expected_keys(self):
+    def test_to_hf_quantization_blocks_scales_cpu_dtype(self):
         adapter = self._make_adapter()
-
-        state_dict = {
-            "model.layers.0.mlp.experts.gate_up_proj": torch.randn(2, 64, 128),
-            "model.layers.0.mlp.experts.down_proj": torch.randn(2, 32, 256),
-        }
-
-        out = adapter._add_quantization_block_scale_tensors(state_dict)
-
-        # Originals removed
-        assert "model.layers.0.mlp.experts.gate_up_proj" not in out
-        assert "model.layers.0.mlp.experts.down_proj" not in out
-
-        # CPU path uses torch.ones producing uint8 blocks/scales with expected shapes
-        g_blocks = out["model.layers.0.mlp.experts.gate_up_proj_blocks"]
-        g_scales = out["model.layers.0.mlp.experts.gate_up_proj_scales"]
-        d_blocks = out["model.layers.0.mlp.experts.down_proj_blocks"]
-        d_scales = out["model.layers.0.mlp.experts.down_proj_scales"]
-
-        assert g_blocks.shape == (2, 128, 90, 16)
-        assert g_scales.shape == (2, 128, 90)
-        assert d_blocks.shape == (2, 256, 90, 16)
-        assert d_scales.shape == (2, 256, 90)
-        assert g_blocks.dtype == torch.uint8 and g_scales.dtype == torch.uint8
-        assert d_blocks.dtype == torch.uint8 and d_scales.dtype == torch.uint8
+        fqn = "model.layers.0.mlp.experts.down_projs"
+        tensor = torch.randn(2, 32, 256)
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
+        out = dict(result)
+        assert out["model.layers.0.mlp.experts.down_proj_blocks"].dtype == torch.uint8
+        assert out["model.layers.0.mlp.experts.down_proj_scales"].dtype == torch.uint8
 
 
 class TestConvertSingleTensorToHf:
@@ -759,56 +709,48 @@ class TestDTensorPaths:
         backend.attn = "flex"
         return GPTOSSStateDictAdapter(config=object(), moe_config=object(), backend=backend, dtype=torch.float32)
 
-    def test_add_quantization_block_scale_tensors_dtensor_path(self):
+    def test_convert_single_tensor_to_hf_dtensor_normalizes_placements(self):
         adapter = self._make_adapter()
 
+        class FakeShard:
+            def __init__(self, dim): self.dim = dim
+        class FakeReplicate:
+            pass
+        class Mesh:
+            def __init__(self, names): self.mesh_dim_names = names
         class FakeDTensor:
-            def __init__(self, shape, placements="P", device_mesh="M"):
-                self.shape = shape
-                self.placements = placements
-                self.device_mesh = device_mesh
-                self.is_cuda = False
+            def __init__(self, shape, placements, device_mesh):
+                self._shape = shape; self.placements = placements; self.device_mesh = device_mesh
+            @property
+            def shape(self): return self._shape
 
-        # HF-style keys, with values that are DTensor-like
-        state_dict = {
-            "model.layers.0.mlp.experts.gate_up_proj": FakeDTensor((2, 64, 128), placements="Pg", device_mesh="Mg"),
-            "model.layers.0.mlp.experts.down_proj": FakeDTensor((3, 32, 256), placements="Pd", device_mesh="Md"),
-        }
+        fqn = "model.layers.0.mlp.experts.gate_and_up_projs"
+        tensor = FakeDTensor((2, 64, 128), placements=(FakeShard(1), FakeReplicate()), device_mesh=Mesh(("ep", "ep_shard")))
 
         def fake_ones(shape, placements=None, device_mesh=None, dtype=None):
-            # Ensure dtype is the expected uint8
-            assert dtype == torch.uint8
             return FakeDTensor(shape, placements=placements, device_mesh=device_mesh)
 
         with patch("torch.distributed.tensor.DTensor", new=FakeDTensor, create=True), \
+             patch("torch.distributed.tensor.Shard", new=FakeShard, create=True), \
+             patch("torch.distributed.tensor.Replicate", new=FakeReplicate, create=True), \
              patch("torch.distributed.tensor.ones", create=True, side_effect=fake_ones):
-            out = adapter._add_quantization_block_scale_tensors(state_dict)
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
 
-        # Originals removed
-        assert "model.layers.0.mlp.experts.gate_up_proj" not in out
-        assert "model.layers.0.mlp.experts.down_proj" not in out
-
-        # New DTensor-shaped blocks/scales created preserving placements and mesh
-        g_blocks = out["model.layers.0.mlp.experts.gate_up_proj_blocks"]
-        g_scales = out["model.layers.0.mlp.experts.gate_up_proj_scales"]
-        d_blocks = out["model.layers.0.mlp.experts.down_proj_blocks"]
-        d_scales = out["model.layers.0.mlp.experts.down_proj_scales"]
-
-        assert isinstance(g_blocks, FakeDTensor)
-        assert isinstance(g_scales, FakeDTensor)
-        assert isinstance(d_blocks, FakeDTensor)
-        assert isinstance(d_scales, FakeDTensor)
-
-        assert g_blocks.shape == (2, 128, 90, 16)
-        assert g_scales.shape == (2, 128, 90)
-        assert d_blocks.shape == (3, 256, 90, 16)
-        assert d_scales.shape == (3, 256, 90)
+        out = dict(result)
+        blocks = out["model.layers.0.mlp.experts.gate_up_proj_blocks"]
+        scales = out["model.layers.0.mlp.experts.gate_up_proj_scales"]
+        shard_dims_blocks = [p.dim for p in blocks.placements if isinstance(p, FakeShard)]
+        shard_dims_scales = [p.dim for p in scales.placements if isinstance(p, FakeShard)]
+        assert shard_dims_blocks == shard_dims_scales
+        assert len(shard_dims_blocks) <= 1
+        if len(shard_dims_blocks) == 1:
+            assert shard_dims_blocks[0] == 0
 
     def test_convert_moe_packed_tensors_dtensor_path_with_simulated_cuda_move(self):
         adapter = self._make_adapter()
 
         class FakeDTensor:
-            def __init__(self, tensor, placements="P", device_mesh="M"):
+            def __init__(self, tensor, placements, device_mesh):
                 self.tensor = tensor
                 self.placements = placements
                 self.device_mesh = device_mesh
@@ -848,6 +790,8 @@ class TestDTensorPaths:
 
             def to_local(self):
                 return self.tensor
+            def redistribute(self, placements=None):
+                return FakeDTensor(self.tensor, placements or self.placements, self.device_mesh)
 
             def __getitem__(self, item):
                 return FakeDTensor(self.tensor.__getitem__(item), self.placements, self.device_mesh)
@@ -863,8 +807,9 @@ class TestDTensorPaths:
                 return FakeDTensor(other - self.tensor, self.placements, self.device_mesh)
 
         # blocks nibble 0x12 -> [1.0, 0.5], exponent 127 -> 0
-        blocks = FakeDTensor(torch.tensor([[[[0x12]]]], dtype=torch.uint8), placements="Pb", device_mesh="Mb")
-        scales = FakeDTensor(torch.tensor([[[127]]], dtype=torch.uint8), placements="Ps", device_mesh="Ms")
+        mesh = type("Mesh", (), {"mesh_dim_names": ("ep_shard", "ep")})
+        blocks = FakeDTensor(torch.tensor([[[[0x12]]]], dtype=torch.uint8), placements=("Pr", ("Shard", 0)), device_mesh=mesh)
+        scales = FakeDTensor(torch.tensor([[[127]]], dtype=torch.uint8), placements=("Pr", ("Shard", 0)), device_mesh=mesh)
 
         def fake_empty(shape, placements=None, device_mesh=None, dtype=None):
             # Must allocate a DTensor-like container preserving placements and mesh
@@ -872,6 +817,8 @@ class TestDTensorPaths:
 
         with patch("torch.distributed.tensor.DTensor", new=FakeDTensor, create=True), \
              patch("torch.distributed.tensor.empty", create=True, side_effect=fake_empty), \
+             patch("torch.distributed.tensor.Shard", new=lambda dim: ("Shard", dim), create=True), \
+             patch("torch.distributed.tensor.Replicate", new=lambda: "Pr", create=True), \
              patch("torch.cuda.is_available", return_value=True), \
              patch("torch.distributed.get_world_size", return_value=2):
             out = adapter._convert_moe_packed_tensors(blocks, scales, dtype=torch.float32, rows_per_chunk=4)
@@ -885,3 +832,6 @@ class TestDTensorPaths:
         assert out_local.shape == (1, 2, 1)
         torch.testing.assert_close(out_local[0, 0, 0], torch.tensor(1.0, dtype=torch.float32))
         torch.testing.assert_close(out_local[0, 1, 0], torch.tensor(0.5, dtype=torch.float32))
+        # placements match ('ep_shard','ep') -> (Shard(2), Shard(0))
+        assert out.placements[0] == ("Shard", 2)
+        assert out.placements[1] == ("Shard", 0)
