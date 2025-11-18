@@ -36,21 +36,12 @@ from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
 from nemo_automodel import __version__
 from nemo_automodel._transformers.registry import ModelRegistry
+from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code
 from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
 
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 logger = logging.getLogger(__name__)
-
-
-def _resolve_trust_remote_code(pretrained_model_name_or_path):
-    """
-    Whitelist NVIDIA models to allow remote code execution.
-    """
-    if not pretrained_model_name_or_path:
-        return False
-    # pretrained_model_name_or_path can be something like nvidia/NVIDIA-Nemotron-Nano-9B-v2
-    return not os.path.isdir(pretrained_model_name_or_path) and pretrained_model_name_or_path.startswith("nvidia/")
 
 
 def _assert_same_signature(original, patched):
@@ -166,7 +157,7 @@ def _prepare_hf_config_and_flag(pretrained_model_name_or_path, force_hf, kwargs)
     Resolve trust_remote_code default, fetch HF config and determine if model is HF-based.
     """
     kwargs["trust_remote_code"] = kwargs.get(
-        "trust_remote_code", _resolve_trust_remote_code(pretrained_model_name_or_path)
+        "trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path)
     )
     hf_config = kwargs.pop("config", None) or AutoConfig.from_pretrained(
         pretrained_model_name_or_path, trust_remote_code=kwargs["trust_remote_code"]
@@ -477,7 +468,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         """
         torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch.bfloat16
         kwargs["trust_remote_code"] = kwargs.get(
-            "trust_remote_code", _resolve_trust_remote_code(getattr(config, "name_or_path", None))
+            "trust_remote_code", resolve_trust_remote_code(getattr(config, "name_or_path", None))
         )
 
         architectures = getattr(config, "architectures", None) or []
