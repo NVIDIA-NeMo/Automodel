@@ -183,6 +183,7 @@ def format_chat_template(
     padding: Union[str, bool] = "do_not_pad",
     truncation: Union[str, bool] = "do_not_truncate",
     tools: Optional[List[Dict]] = None,
+    answer_only_loss_mask: bool = True,
 ) -> Dict[str, List[int]]:
     """
     Format a chat template style example.
@@ -194,6 +195,7 @@ def format_chat_template(
         pad_token_id: The padding token id.
         seq_length: Optional sequence length for padding.
         tools: Optional list of tool definitions for function calling.
+        answer_only_loss_mask: Whether to compute the loss mask only on the answer tokens.
 
     Returns:
         A dictionary with the formatted example.
@@ -220,6 +222,22 @@ def format_chat_template(
     input_ids = tokenized_chat.get("input_ids")
     if template_has_generation_kwd:
         mask = tokenized_chat["assistant_masks"]
+    elif not template_has_generation_kwd and answer_only_loss_mask:
+        # in this case we need to manually split up the formatted_text. Only the final assistant turn should be considered as answer.
+        answer_text = formatted_text.pop()
+        assert answer_text["role"] == "assistant", "The last message in the formatted_text must be an assistant message"
+        tokenized_prompt = tokenizer.apply_chat_template(
+            formatted_text,
+            tools=tools,
+            tokenize=True,
+            return_dict=True,
+            return_assistant_tokens_mask=template_has_generation_kwd,
+            padding=padding,
+            truncation=truncation,
+            max_length=seq_length,
+        )
+        len_prompt_ids = len(tokenized_prompt.get("input_ids", []))
+        mask = [0] * len_prompt_ids + [1] * (len(input_ids) - len_prompt_ids)
     else:
         mask = [1] * len(input_ids)
 
