@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import pathlib
+import time
 
 import torch
 import wandb
@@ -177,6 +178,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
     def run_train_validation_loop(self):
         for mp in self.model_parts:
             mp.train()
+        self.timestamp = time.perf_counter()
 
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
@@ -202,6 +204,13 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         losses = []
         all_preds = []
         all_labels = []
+        
+        # Count input tokens for throughput calculation
+        num_tokens_in_batch = torch.tensor(
+            sum(batch["input_ids"].numel() for batch in batches),
+            dtype=torch.long,
+        )
+        num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
         
         for batch in batches:
             batch = {
@@ -249,6 +258,12 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             for scheduler in self.lr_scheduler:
                 scheduler.step(1)
 
+        # Calculate throughput (tokens per second)
+        t = time.perf_counter()
+        time_delta = t - self.timestamp
+        self.timestamp = t
+        tps = num_tokens_in_batch / time_delta
+        
         total_loss = torch.sum(torch.stack(losses))
         total_loss = self._dp_allreduce(total_loss, include_cp=True).detach()
         loss = total_loss / len(batches)
@@ -262,6 +277,8 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 "grad_norm": grad_norm,
                 "lr": self.optimizer[0].param_groups[0]["lr"],
                 "mem": torch.cuda.max_memory_allocated() / 1024**3,
+                "tps": tps,
+                "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
             },
         )
 
@@ -365,6 +382,8 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                     "grad_norm": Gradient norm from the training step.
                     "lr": Learning rate.
                     "mem": Memory allocated.
+                    "tps": Tokens per second (throughput).
+                    "tps_per_gpu": Tokens per second per GPU.
         """
         if not self.dist_env.is_main:
             return
@@ -375,7 +394,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         # JSONL training log
         self.metric_logger_train.log(log_data)
         logging.info(
-            "step {} | epoch {} | loss {:.4f} | accuracy {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB".format(
+            "step {} | epoch {} | loss {:.4f} | accuracy {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu)".format(
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["loss"],
@@ -383,6 +402,8 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 log_data.metrics["grad_norm"],
                 log_data.metrics["lr"],
                 log_data.metrics["mem"],
+                log_data.metrics["tps"],
+                log_data.metrics["tps_per_gpu"],
             )
         )
         torch.cuda.reset_peak_memory_stats()
