@@ -647,6 +647,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
             )
 
+        self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         # Scheduler
         self.step_scheduler = build_step_scheduler(
             self.cfg.get("step_scheduler", None),
@@ -709,6 +710,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         self.step_scheduler.step,
                         log_data.metrics["loss"],
                         val_loss,
+                        best_metric_key=self.best_metric_key,
                     )
 
         # Close JSONL loggers after training loop completes

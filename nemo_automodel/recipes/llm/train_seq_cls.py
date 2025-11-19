@@ -152,6 +152,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 pp_enabled=False,
             )
 
+        self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         self.step_scheduler = build_step_scheduler(
             self.cfg.get("step_scheduler", None),
             self.dataloader,
@@ -197,6 +198,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                         self.step_scheduler.step,
                         train_log_data.metrics["loss"],
                         val_loss,
+                        best_metric_key=self.best_metric_key,
                     )
 
         self.metric_logger_train.close()

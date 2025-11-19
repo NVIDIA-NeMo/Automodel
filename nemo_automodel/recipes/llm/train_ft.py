@@ -996,6 +996,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self._get_dp_rank(),
             self.pp_enabled,
         )
+        self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         # Scheduler
         self.step_scheduler = build_step_scheduler(
             self.cfg.get("step_scheduler", None),
@@ -1070,6 +1071,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         self.step_scheduler.step,
                         train_log_data.metrics["loss"],
                         val_losses,
+                        best_metric_key=self.best_metric_key,
                     )
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
