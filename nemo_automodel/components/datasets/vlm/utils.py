@@ -24,6 +24,9 @@ QWEN_TOKENS = [
     "<|vision_pad|>",
     "<|image_pad|>",
     "<|video_pad|>",
+    "<img>",
+    "</img>",
+    "<IMG_CONTEXT>",
 ]
 LLAVA_TOKENS = ["<image>", "<pad>"]
 LLAMA_TOKENS = [
