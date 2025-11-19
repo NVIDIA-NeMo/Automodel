@@ -14,7 +14,10 @@
 
 import os
 
+import torch
+
 from nemo_automodel.components.checkpoint.addons import _maybe_save_custom_model_code
+from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
 
 
 def _write(path: str, content: str) -> None:
@@ -66,5 +69,32 @@ def test_maybe_save_custom_model_code_noop_for_none_or_non_dir(tmp_path):
     some_file.write_text("hello")
     _maybe_save_custom_model_code(str(some_file), str(dst_root))
     assert list(dst_root.rglob("*.py")) == []
+
+
+def test_model_state_disables_tied_embeddings_for_non_tied_models():
+    """
+    Ensure ModelState explicitly disables tied embeddings for models listed in
+    the non_tied_lm_head_models filter (e.g., Qwen3 Omni Moe Thinker).
+    """
+
+    class _DummyConfig:
+        tie_word_embeddings = True
+
+    class _DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = _DummyConfig()
+            self.lm_head = torch.nn.Linear(2, 2, bias=False)
+
+    _DummyModel.__name__ = "Qwen3OmniMoeThinkerForConditionalGeneration"
+
+    model = _DummyModel()
+    state = ModelState(model)
+
+    assert state.is_tied_lm_head is False
+    assert not hasattr(state, "lm_head_param_name")
+
+    state_dict = state.state_dict()
+    assert "lm_head.weight" in state_dict
 
 
