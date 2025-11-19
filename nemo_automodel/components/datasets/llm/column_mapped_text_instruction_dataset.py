@@ -169,7 +169,6 @@ class ColumnMappedTextInstructionDataset(Dataset):
         seq_length: Optional[int] = None,
         padding: Union[str, bool] = "do_not_pad",
         truncation: Union[str, bool] = "do_not_truncate",
-        start_of_turn_token: Optional[str] = None,
         limit_dataset_samples: Optional[int] = None,
     ) -> None:
         """
@@ -183,17 +182,14 @@ class ColumnMappedTextInstructionDataset(Dataset):
             name: The name of the dataset configuration/subset to load
             answer_only_loss_mask: Whether to compute the loss mask only on the answer tokens.
             seq_length: The sequence length to use for padding.
-            start_of_turn_token: The token to use to indicate the start of a turn.
             limit_dataset_samples: The number of samples to load from the dataset.
         """
 
         if _has_chat_template(tokenizer):
             if not answer_only_loss_mask:
                 logging.warning(
-                    "answer_only_loss_mask=False but tokenizer has chat template. Consider providing `answer_only_loss_mask` and `start_of_turn_token`."
+                    "answer_only_loss_mask=False but tokenizer has chat template. Consider providing `answer_only_loss_mask`."
                 )
-            elif start_of_turn_token is None:
-                raise ValueError("start_of_turn_token must be provided when answer_only_loss_mask=True")
 
         assert tokenizer is not None, "Tokenizer is required"
         self.tokenizer = tokenizer
@@ -234,7 +230,6 @@ class ColumnMappedTextInstructionDataset(Dataset):
         self.column_mapping = column_mapping
 
         self.answer_only_loss_mask = answer_only_loss_mask
-        self.start_of_turn_token = start_of_turn_token
         self.seq_length = seq_length
         self.padding = padding
         self.truncation = truncation
@@ -309,6 +304,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
                 seq_length=self.seq_length,
                 padding=self.padding,
                 truncation=self.truncation,
+                answer_only_loss_mask=self.answer_only_loss_mask,
             )
         else:
             prompt = " ".join(filter(lambda x: x is not None, (context, question, "")))
