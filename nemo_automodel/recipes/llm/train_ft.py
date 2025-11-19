@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import inspect
 import logging
-import os
 import pathlib
 import time
 from contextlib import nullcontext
@@ -1061,24 +1060,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         val_log_data = self._run_validation_epoch(val_dataloader)
                         val_losses[val_name] = val_log_data.metrics["val_loss"]
                         self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
-
-                        # Update LOWEST_VAL symlink if this validation has the lowest loss
-                        if val_log_data and hasattr(self, '_update_best_symlink'):
-                            val_loss = val_log_data.metrics.get("val_loss")
-                            if val_loss is not None:
-                                # Find the most recent checkpoint that was saved
-                                ckpt_root = self.checkpointer.config.checkpoint_dir
-                                latest_link = os.path.join(ckpt_root, "LATEST")
-                                
-                                if os.path.exists(latest_link) and os.path.islink(latest_link):
-                                    ckpt_dir = os.path.realpath(latest_link)
-                                    is_dist_initialized = torch.distributed.is_initialized()
-                                    is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
-                                    
-                                    if is_rank_0:
-                                        self._update_best_symlink(ckpt_dir, val_loss)
-                                    if is_dist_initialized:
-                                        torch.distributed.barrier()
                     for mp in self.model_parts:
                         mp.train()
 
