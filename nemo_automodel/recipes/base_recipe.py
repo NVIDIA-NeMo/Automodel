@@ -141,12 +141,12 @@ class BaseRecipe:
             raise ValueError("cannot set __state_tracked")
         if "__state_tracked" not in self.__dict__:
             self.__dict__["__state_tracked"] = set()
-        
+
         # Initialize best checkpoint tracking
         if "_best_val_loss" not in self.__dict__:
-            self.__dict__["_best_val_loss"] = float('inf')
+            self.__dict__["_best_val_loss"] = float("inf")
             self.__dict__["_best_checkpoint_path"] = None
-        
+
         # Track stateful objects unless they are validation/eval components.
         should_track = (
             is_model(value)
@@ -280,7 +280,7 @@ class BaseRecipe:
         if val_loss < self._best_val_loss:
             self._best_val_loss = val_loss
             self._best_checkpoint_path = target_dir
-            
+
             ckpt_root = self.checkpointer.config.checkpoint_dir
             link_path = os.path.join(ckpt_root, "LOWEST_VAL")
             if os.path.lexists(link_path):
@@ -290,7 +290,10 @@ class BaseRecipe:
             target_abs = os.path.abspath(target_dir)
             relative_target = os.path.relpath(target_abs, start=ckpt_root_abs)
             os.symlink(relative_target, link_path)
-            print(f"Updated LOWEST_VAL checkpoint symlink to {os.path.basename(target_dir)} (val_loss={val_loss:.4f})", flush=True)
+            print(
+                f"Updated LOWEST_VAL checkpoint symlink to {os.path.basename(target_dir)} (val_loss={val_loss:.4f})",
+                flush=True,
+            )
 
     def load_checkpoint(self, restore_from: str | None = None):
         """
