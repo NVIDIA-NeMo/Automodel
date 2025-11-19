@@ -210,7 +210,10 @@ class BaseRecipe:
 
         path = self.checkpointer.config.checkpoint_dir
         path = os.path.join(path, f"epoch_{epoch}_step_{step}")
-        best_val_metric = val_loss[best_metric_key] if val_loss else None
+
+        best_val_metric = (
+            val_loss[next(iter(val_loss.keys()) if len(val_loss) == 1 else best_metric_key)] if val_loss else None
+        )
 
         if is_rank_0:
             assert not os.path.exists(path), f"Checkpoint directory {path} already exists"
