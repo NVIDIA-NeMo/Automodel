@@ -26,6 +26,7 @@ from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import (
     build_checkpoint_config,
@@ -219,13 +220,14 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             
             (loss * self._get_dp_group_size(include_cp=True)).backward()
         
-        # Calculate gradient norm
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            [p for p in model.parameters() if p.requires_grad],
-            max_norm=float('inf')  # Just measure, don't clip
+        # Calculate gradient norm (distributed-aware)
+        grad_norm = clip_grad_norm(
+            max_grad_norm=1e9,  # Effectively no clipping (measure only)
+            model_parts=self.model_parts,
+            norm_type=2.0,
+            pp_enabled=self._get_pp_rank() != 0 if hasattr(self, '_get_pp_rank') else False,
+            device_mesh=self.device_mesh,
         )
-        if isinstance(grad_norm, torch.Tensor):
-            grad_norm = grad_norm.item()
         
         # Calculate accuracy
         all_preds = torch.cat(all_preds)
