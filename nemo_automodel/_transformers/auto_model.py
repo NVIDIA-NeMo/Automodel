@@ -36,6 +36,11 @@ from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
 from nemo_automodel import __version__
 from nemo_automodel._transformers.registry import ModelRegistry
+from nemo_automodel.components.distributed.init_utils import (
+    get_local_rank_preinit,
+    get_local_world_size_preinit,
+    get_world_size_safe,
+)
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code
 from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
@@ -333,12 +338,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                             hf_config, *model_args, **kwargs
                         )
                         # if we are able to init the custom model, we will now download the model weights on local rank 0
-                        if (
-                            not dist.is_initialized() or int(os.environ.get("LOCAL_RANK", "0")) == 0
-                        ) and not os.path.isdir(pretrained_model_name_or_path):
-                            num_nodes = (
-                                dist.get_world_size() % int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
-                            ) + 1  # 1-indexed
+                        if (not dist.is_initialized() or get_local_rank_preinit() == 0) and not os.path.isdir(
+                            pretrained_model_name_or_path
+                        ):
+                            num_nodes = (get_world_size_safe() % get_local_world_size_preinit()) + 1  # 1-indexed
                             if num_nodes > 1:
                                 logging.info(
                                     f"""Downloading model weights on {num_nodes} nodes. This incurs high storage usage. 
