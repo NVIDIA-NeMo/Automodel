@@ -21,7 +21,7 @@ Example (YAML):
 
 ```yaml
 model:
-  _target_: nemo_automodel.components.models.llama.model.build_llama_model
+  _target_: nemo_automodel.components.models.llama.build_llama_model
   pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
 ```
 """
@@ -52,6 +52,10 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.generic import check_model_inputs
 
+from nemo_automodel.components.models.common.combined_projection import (
+    CombinedGateUpMLP,
+    CombinedQKVAttentionMixin,
+)
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 from nemo_automodel.components.moe.utils import BackendConfig
 from nemo_automodel.shared.utils import dtype_from_str
@@ -59,7 +63,7 @@ from nemo_automodel.shared.utils import dtype_from_str
 __all__ = ["build_llama_model", "LlamaForCausalLM"]
 
 
-class LlamaAttention(nn.Module):
+class LlamaAttention(CombinedQKVAttentionMixin, nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper with combined QKV projection."""
 
     def __init__(
@@ -76,13 +80,12 @@ class LlamaAttention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
 
-        self.q_size = config.num_attention_heads * self.head_dim
-        self.kv_size = config.num_key_value_heads * self.head_dim
-
         # Combined QKV projection for improved efficiency
-        self.qkv_proj = nn.Linear(
-            config.hidden_size,
-            (config.num_attention_heads + 2 * config.num_key_value_heads) * self.head_dim,
+        self.setup_qkv_projection(
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            head_dim=self.head_dim,
             bias=config.attention_bias,
         )
 
@@ -102,14 +105,8 @@ class LlamaAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        # Combined QKV projection and split
-        qkv = self.qkv_proj(hidden_states)
-        # Compute split sizes based on actual tensor size (handles TP sharding)
-        qkv_size = qkv.shape[-1]
-        total_size = self.q_size + 2 * self.kv_size
-        local_q_size = (self.q_size * qkv_size) // total_size
-        local_kv_size = (self.kv_size * qkv_size) // total_size
-        q, k, v = qkv.split([local_q_size, local_kv_size, local_kv_size], dim=-1)
+        # Compute Q, K, V using mixin (handles fused or separate projection)
+        q, k, v = self.compute_qkv(hidden_states)
 
         query_states = q.view(hidden_shape).transpose(1, 2)
         key_states = k.view(hidden_shape).transpose(1, 2)
@@ -191,7 +188,8 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
             layer_idx=layer_idx,
         )
 
-        self.mlp = LlamaMLP(config=config)
+        # ALWAYS use combined gate_up MLP for efficiency
+        self.mlp = CombinedGateUpMLP(config=config)
 
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)

@@ -1,6 +1,4 @@
-# Custom Qwen2.5-72B with combined projections for benchmarking
-# Based on Qwen2_72B_peft_benchmark.yaml but using custom model implementation
-# Similar to custom_llama3_3_70b_instruct_peft_benchmark.yaml
+# Based on your existing config, modified for benchmarking
 
 seed: 42
 
