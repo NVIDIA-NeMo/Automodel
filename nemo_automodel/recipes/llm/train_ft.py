@@ -1051,13 +1051,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 self.log_train_metrics(train_log_data)
 
                 # Run validation every val_every_steps
-                val_log_data = None
+                val_losses = {}
                 if self.step_scheduler.is_val_step:
                     if self.pp_enabled:
                         logger.warning("Validation is not supported for pipeline parallelism")
                         continue
                     for val_name, val_dataloader in self.val_dataloaders.items():
                         val_log_data = self._run_validation_epoch(val_dataloader)
+                        val_losses[val_name] = val_log_data.metrics["val_loss"]
                         self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
                     for mp in self.model_parts:
                         mp.train()
@@ -1068,7 +1069,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         epoch,
                         self.step_scheduler.step,
                         train_log_data.metrics["loss"],
-                        val_log_data.metrics["val_loss"] if val_log_data is not None else None,
+                        val_losses,
                     )
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()

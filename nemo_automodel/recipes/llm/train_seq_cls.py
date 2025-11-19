@@ -183,9 +183,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 train_log_data = self._run_train_optim_step(batches)
                 self.log_train_metrics(train_log_data)
 
-                val_log_data = None
+                val_loss = {}
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     val_log_data = self._validate_one_epoch(self.val_dataloader)
+                    val_loss["val_loss"] = val_log_data.metrics["val_loss"]
                     self.log_val_metrics(val_log_data)
                     for mp in self.model_parts:
                         mp.train()
@@ -195,7 +196,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                         epoch,
                         self.step_scheduler.step,
                         train_log_data.metrics["loss"],
-                        val_log_data.metrics["val_loss"] if val_log_data is not None else None,
+                        val_loss,
                     )
 
         self.metric_logger_train.close()
