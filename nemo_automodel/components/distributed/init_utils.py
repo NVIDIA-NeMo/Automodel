@@ -58,6 +58,16 @@ def get_local_rank_preinit() -> int:
     return int(os.getenv("LOCAL_RANK", "0"))
 
 
+def get_local_world_size_preinit() -> int:
+    """
+    Get the local world size from the environment variable, intended for use before full init.
+
+    Returns:
+        The local world size of the current process.
+    """
+    return int(os.getenv("LOCAL_WORLD_SIZE", "1"))
+
+
 @dataclass
 class DistInfo:
     """Holds information about the distributed training environment.
