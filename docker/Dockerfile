@@ -132,7 +132,7 @@ LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 ARG NVIDIA_BUILD_REF
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
-ARG RC_DATE
+ARG RC_DATE=00.00
 ARG TARGETARCH
 # NOTICES.txt file points to where the OSS source code is archived
 RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-automodel/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
