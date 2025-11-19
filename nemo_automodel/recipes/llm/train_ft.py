@@ -1051,17 +1051,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # log
                 self.log_train_metrics(train_log_data)
 
-                # Save the checkpoint every ckpt_every_steps
-                if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(epoch, self.step_scheduler.step)
-
                 # Run validation every val_every_steps
+                val_losses = {}
                 if self.step_scheduler.is_val_step:
                     if self.pp_enabled:
                         logger.warning("Validation is not supported for pipeline parallelism")
                         continue
                     for val_name, val_dataloader in self.val_dataloaders.items():
                         val_log_data = self._run_validation_epoch(val_dataloader)
+                        val_losses[val_name] = val_log_data.metrics["val_loss"]
                         self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
 
                         # Update LOWEST_VAL symlink if this validation has the lowest loss
@@ -1083,6 +1081,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                                         torch.distributed.barrier()
                     for mp in self.model_parts:
                         mp.train()
+
+                # Save the checkpoint every ckpt_every_steps
+                if self.step_scheduler.is_ckpt_step:
+                    self.save_checkpoint(
+                        epoch,
+                        self.step_scheduler.step,
+                        train_log_data.metrics["loss"],
+                        val_losses,
+                    )
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
         for v in self.metric_logger_valid.values():

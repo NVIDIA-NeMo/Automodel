@@ -696,13 +696,21 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 # log
                 self.log_train_metrics(log_data)
 
-                if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(epoch, self.step_scheduler.step)
-
+                val_loss = {}
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                    log_data = self._run_validation_epoch(self.val_dataloader)
-                    self.log_val_metrics(log_data)
+                    val_log_data = self._run_validation_epoch(self.val_dataloader)
+                    val_loss["val_loss"] = val_log_data.metrics["val_loss"]
+                    self.log_val_metrics(val_log_data)
                     self.model.train()
+
+                if self.step_scheduler.is_ckpt_step:
+                    self.save_checkpoint(
+                        epoch,
+                        self.step_scheduler.step,
+                        log_data.metrics["loss"],
+                        val_loss,
+                    )
+
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
         self.metric_logger_valid.close()
