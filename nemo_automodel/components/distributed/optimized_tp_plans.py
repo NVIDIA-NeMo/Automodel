@@ -41,6 +41,7 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM as CustomLlamaForCausalLM
+from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
 
 
 class SequenceParallelAllGatherActivation(SequenceParallel):
@@ -209,13 +210,12 @@ def _parallelize_qwen(
                 input_layouts=Replicate(),
                 output_layouts=Shard(1),
             ),
-            "model.rotary_emb": RotaryEmbedParallel(),
             "model.norm": SequenceParallel(),
             "model.layers.*.input_layernorm": SequenceParallelAllGatherActivation(),
-            "model.layers.*.self_attn.q_proj": ColwiseParallel(use_local_output=False),
-            "model.layers.*.self_attn.k_proj": ColwiseParallel(use_local_output=False),
-            "model.layers.*.self_attn.v_proj": ColwiseParallel(use_local_output=False),
-            "model.layers.*.self_attn.qkv_proj": ColwiseParallel(use_local_output=False),
+            "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),
             "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
             "model.layers.*.self_attn.q_norm": Qwen3QKNorm(),
             "model.layers.*.self_attn.k_norm": Qwen3QKNorm(),
@@ -311,4 +311,5 @@ PARALLELIZE_FUNCTIONS: Dict[type, Callable[..., Dict[str, ParallelStyle]]] = {
     Gemma3ForConditionalGeneration: _parallelize_gemma3,
     Phi3ForCausalLM: _parallelize_phi3,
     CustomLlamaForCausalLM: _parallelize_llama,
+    CustomQwen2ForCausalLM: _parallelize_qwen,
 }
