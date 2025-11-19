@@ -95,7 +95,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
 
         self.peft_config = self.cfg.instantiate_path("peft")
-        model, model_state_dict_keys, self.optimizer, _ = build_model_and_optimizer(
+        model, model_state_dict_keys, self.optimizer, _, _ = build_model_and_optimizer(
             device=self.dist_env.device,
             cfg_model=self.cfg.model,
             cfg_opt=self.cfg.optimizer,
@@ -199,6 +199,9 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
     def _run_train_optim_step(self, batches):
         model = self.model_parts[0]
         losses = []
+        all_preds = []
+        all_labels = []
+        
         for batch in batches:
             batch = {
                 k: (v.to(self.dist_env.device, non_blocking=True) if v is not None else None) for k, v in batch.items()
@@ -208,28 +211,55 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             logits = getattr(out, "logits", out)
             loss = self.loss_fn(logits, labels.view(-1))
             losses.append(loss.detach().clone())
+            
+            # Collect predictions for accuracy calculation
+            preds = torch.argmax(logits, dim=-1)
+            all_preds.append(preds.detach())
+            all_labels.append(labels.view(-1).detach())
+            
             (loss * self._get_dp_group_size(include_cp=True)).backward()
-            for opt in self.optimizer:
-                opt.step()
-                opt.zero_grad()
-            if self.lr_scheduler is not None:
-                for scheduler in self.lr_scheduler:
-                    scheduler.step(1)
+        
+        # Calculate gradient norm
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            [p for p in model.parameters() if p.requires_grad],
+            max_norm=float('inf')  # Just measure, don't clip
+        )
+        if isinstance(grad_norm, torch.Tensor):
+            grad_norm = grad_norm.item()
+        
+        # Calculate accuracy
+        all_preds = torch.cat(all_preds)
+        all_labels = torch.cat(all_labels)
+        correct = (all_preds == all_labels).sum()
+        total = all_labels.numel()
+        accuracy = correct.float() / total
+        
+        # Sync accuracy across distributed ranks if needed
+        if self._get_dp_group_size(include_cp=True) > 1:
+            correct = self._dp_allreduce(correct.float(), include_cp=True)
+            total_across_ranks = self._dp_allreduce(torch.tensor(total, device=correct.device, dtype=torch.float), include_cp=True)
+            accuracy = correct / total_across_ranks
+        
+        for opt in self.optimizer:
+            opt.step()
+            opt.zero_grad()
+        if self.lr_scheduler is not None:
+            for scheduler in self.lr_scheduler:
+                scheduler.step(1)
 
         total_loss = torch.sum(torch.stack(losses))
         total_loss = self._dp_allreduce(total_loss, include_cp=True).detach()
         loss = total_loss / len(batches)
+        
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
             metrics={
                 "loss": loss,
+                "accuracy": accuracy.item() if isinstance(accuracy, torch.Tensor) else accuracy,
+                "grad_norm": grad_norm,
                 "lr": self.optimizer[0].param_groups[0]["lr"],
                 "mem": torch.cuda.max_memory_allocated() / 1024**3,
-                "tps": 0.0,
-                "tps_per_gpu": 0.0,
-                "num_tokens_per_step": 0,
-                "num_label_tokens": 0,
             },
         )
 
@@ -238,7 +268,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         model = self.model_parts[0]
         model.eval()
         total_loss = 0.0
+        all_preds = []
+        all_labels = []
         count = 0
+        
         for batch in dataloader:
             batch = {
                 k: (v.to(self.dist_env.device, non_blocking=True) if v is not None else None) for k, v in batch.items()
@@ -248,15 +281,38 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             logits = getattr(out, "logits", out)
             loss = self.loss_fn(logits, labels.view(-1))
             total_loss += loss.detach()
+            
+            # Collect predictions for accuracy
+            preds = torch.argmax(logits, dim=-1)
+            all_preds.append(preds)
+            all_labels.append(labels.view(-1))
             count += 1
+        
         total_loss = total_loss if count == 0 else total_loss / count
+        
+        # Calculate accuracy
+        if len(all_preds) > 0:
+            all_preds = torch.cat(all_preds)
+            all_labels = torch.cat(all_labels)
+            correct = (all_preds == all_labels).sum()
+            total = all_labels.numel()
+            accuracy = correct.float() / total
+            
+            # Sync across distributed ranks if needed
+            if self._get_dp_group_size(include_cp=True) > 1:
+                correct = self._dp_allreduce(correct.float(), include_cp=True)
+                total_across_ranks = self._dp_allreduce(torch.tensor(total, device=correct.device, dtype=torch.float), include_cp=True)
+                accuracy = correct / total_across_ranks
+        else:
+            accuracy = 0.0
+        
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
             metrics={
                 "val_loss": total_loss,
+                "val_accuracy": accuracy.item() if isinstance(accuracy, torch.Tensor) else accuracy,
                 "lr": self.optimizer[0].param_groups[0]["lr"],
-                "num_label_tokens": 0,
                 "mem": torch.cuda.max_memory_allocated() / 1024**3,
             },
         )
@@ -285,12 +341,12 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         self.metric_logger_valid.log(log_data)
 
         logging.info(
-            "[val] step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
+            "[val] step {} | epoch {} | loss {:.4f} | accuracy {:.4f} | lr {:.2e}".format(
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["val_loss"],
+                log_data.metrics["val_accuracy"],
                 log_data.metrics["lr"],
-                log_data.metrics["num_label_tokens"],
             )
         )
 
@@ -303,12 +359,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 epoch: int, the current epoch.
                 metrics: Dict[str, float], containing:
                     "loss": Training loss.
-                    "grad_norm": Grad norm from the training step.
+                    "accuracy": Training accuracy.
+                    "grad_norm": Gradient norm from the training step.
                     "lr": Learning rate.
                     "mem": Memory allocated.
-                    "tps": Tokens per second.
-                    "tps_per_gpu": Tokens per second per GPU.
-                    "num_label_tokens": Number of label tokens.
         """
         if not self.dist_env.is_main:
             return
@@ -319,17 +373,14 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         # JSONL training log
         self.metric_logger_train.log(log_data)
         logging.info(
-            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
+            "step {} | epoch {} | loss {:.4f} | accuracy {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB".format(
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["loss"],
-                0,
-                # log_data.metrics["grad_norm"],
+                log_data.metrics["accuracy"],
+                log_data.metrics["grad_norm"],
                 log_data.metrics["lr"],
                 log_data.metrics["mem"],
-                log_data.metrics["tps"],
-                log_data.metrics["tps_per_gpu"],
-                log_data.metrics["num_label_tokens"],
             )
         )
         torch.cuda.reset_peak_memory_stats()
