@@ -18,4 +18,3 @@ from nemo_automodel.components.models.common.combined_projection.combined_mlp im
 from nemo_automodel.components.models.common.combined_projection.combined_qkv import CombinedQKVAttentionMixin
 
 __all__ = ["CombinedQKVAttentionMixin", "CombinedGateUpMLP"]
-

@@ -43,23 +43,23 @@ def tiny_qwen2_checkpoint():
             rms_norm_eps=1e-6,
             tie_word_embeddings=True,
         )
-        
+
         # Save config
         config.save_pretrained(tmpdir)
-        
+
         # Create model with random weights
         model = AutoModelForCausalLM.from_config(config)
-        
+
         # Save model
         model.save_pretrained(tmpdir)
-        
+
         yield tmpdir
 
 
 class TestQwen2Model:
     def test_model_matches_hf_with_adapter_bidirectional(self, tiny_qwen2_checkpoint):
         """Test bidirectional conversion between HF and custom models produces identical outputs.
-        
+
         The custom Qwen2 model ALWAYS uses combined QKV and gate_up projections for efficiency.
         The state dict adapter handles conversion between HF (separate) and custom (combined) formats.
         """
@@ -139,7 +139,7 @@ class TestQwen2Model:
 
     def test_state_dict_adapter_from_hf_combined_projections(self, tiny_qwen2_checkpoint):
         """Test converting HF state dict to custom format with combined QKV and gate_up projections.
-        
+
         This test verifies that the adapter correctly combines HF's separate q/k/v projections
         into qkv_proj, and gate/up projections into gate_up_proj for the custom model.
         """
@@ -168,7 +168,7 @@ class TestQwen2Model:
 
     def test_state_dict_adapter_to_hf(self, tiny_qwen2_checkpoint):
         """Test converting custom model state dict back to HF format.
-        
+
         This test verifies that the custom model (built with build_qwen2_model) has combined
         projections by default, and that these are the only projection keys present.
         """
@@ -193,7 +193,7 @@ class TestQwen2Model:
 
     def test_export_custom_to_hf_checkpoint(self, tiny_qwen2_checkpoint):
         """Test exporting custom model to HF-compatible checkpoint format.
-        
+
         This test verifies that a custom model with combined projections can be exported
         to a HuggingFace-compatible format (with separate projections) and loaded back
         with AutoModelForCausalLM, producing identical outputs.

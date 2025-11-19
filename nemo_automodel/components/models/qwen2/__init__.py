@@ -17,4 +17,3 @@
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM, build_qwen2_model
 
 __all__ = ["Qwen2ForCausalLM", "build_qwen2_model"]
-
