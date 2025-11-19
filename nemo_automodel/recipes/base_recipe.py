@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import getpass
+import json
 import logging
 import os
 import re
@@ -156,7 +157,7 @@ class BaseRecipe:
             self.__dict__["__state_tracked"].add(key)
         super().__setattr__(key, value)
 
-    def save_checkpoint(self, epoch: int, step: int):
+    def save_checkpoint(self, epoch: int, step: int, train_loss: float, val_loss: float | None = None):
         """
         Save the current training state as a checkpoint.
 
@@ -191,6 +192,10 @@ class BaseRecipe:
             assert not os.path.exists(path), f"Checkpoint directory {path} already exists"
             os.makedirs(path, exist_ok=True)
             print(f"Saving checkpoint to {path}", flush=True)
+
+            # dump the train and val loss to a json file
+            with open(os.path.join(path, "losses.json"), "w") as f:
+                json.dump({"train_loss": train_loss, "val_loss": val_loss}, f)
         if is_dist_initialized:
             torch.distributed.barrier()
         # TODO(@adil-a): Change this when we create a LR scheduler class
