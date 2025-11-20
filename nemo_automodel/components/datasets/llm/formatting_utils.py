@@ -86,7 +86,9 @@ def _package_tokenized_example(
     """
     # llama3 tokenizer does not add eos token
     # see: https://github.com/huggingface/transformers/issues/22794
-    if not _has_chat_template(tokenizer) and eos_token_id != input_ids[-1]:
+    # if not _has_chat_template(tokenizer) and eos_token_id != input_ids[-1]:
+
+    if eos_token_id != input_ids[-1]:
         input_ids += [eos_token_id]
         assistant_masks += [1]
     if not _has_chat_template(tokenizer) and pad_token_id is not None:
@@ -158,6 +160,12 @@ def format_prompt_completion(
         len_prompt_ids = 0
     # Tokenize full text
     input_ids = tokenizer(full_text, padding=padding, truncation=truncation, max_length=seq_length)["input_ids"]
+
+    # Some tokenizers don't add BOS token by default
+    # Manually prepend BOS token if tokenizer has one but didn't add it
+    # if tokenizer.bos_token_id is not None and input_ids[0] != tokenizer.bos_token_id:
+    #     input_ids = [tokenizer.bos_token_id] + input_ids
+    #     len_prompt_ids += 1
 
     # Create assistant_masks: 0 for prompt tokens, 1 for answer tokens
     assistant_masks = [0] * len_prompt_ids + [1] * (len(input_ids) - len_prompt_ids)
