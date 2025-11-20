@@ -90,14 +90,10 @@ class Qwen3VLMoeStateDictAdapter(StateDictAdapter):
         **kwargs,
     ) -> dict[str, Any]:
         expert_keys = [
-            key
-            for key in hf_state_dict.keys()
-            if ".mlp.experts.gate_up_proj" in key or ".mlp.experts.down_proj" in key
+            key for key in hf_state_dict.keys() if ".mlp.experts.gate_up_proj" in key or ".mlp.experts.down_proj" in key
         ]
         if not expert_keys:
-            raise RuntimeError(
-                "Expected aggregated expert weights (gate_up_proj / down_proj) in the checkpoint."
-            )
+            raise RuntimeError("Expected aggregated expert weights (gate_up_proj / down_proj) in the checkpoint.")
 
         self._uses_model_prefix = any(key.startswith("model.") for key in expert_keys)
         model_prefix = "model." if self._uses_model_prefix else ""
@@ -161,4 +157,3 @@ class Qwen3VLMoeStateDictAdapter(StateDictAdapter):
             return [(key, tensor.to(self.dtype))]
 
         return [(fqn, tensor)]
-

@@ -20,7 +20,11 @@ from transformers.masking_utils import create_causal_mask
 from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
 from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration as HFQwen3VLMoeForConditionalGeneration,
+)
+from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeModel as HFQwen3VLMoeModel,
+)
+from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeModelOutputWithPast,
     Qwen3VLMoeTextRotaryEmbedding,
     Qwen3VLMoeVisionRotaryEmbedding,
@@ -309,6 +313,7 @@ class Qwen3VLMoeForConditionalGeneration(HFQwen3VLMoeForConditionalGeneration, M
         *,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         cache_position: torch.Tensor | None = None,
         **kwargs: Any,
@@ -320,8 +325,6 @@ class Qwen3VLMoeForConditionalGeneration(HFQwen3VLMoeForConditionalGeneration, M
             attention_mask = None
             if padding_mask is not None:
                 kwargs["padding_mask"] = padding_mask
-        elif "padding_mask" in kwargs and kwargs["padding_mask"] is None:
-            kwargs.pop("padding_mask")
 
         return super().forward(
             input_ids=input_ids,
@@ -361,4 +364,3 @@ class Qwen3VLMoeForConditionalGeneration(HFQwen3VLMoeForConditionalGeneration, M
 
 
 ModelClass = Qwen3VLMoeForConditionalGeneration
-
