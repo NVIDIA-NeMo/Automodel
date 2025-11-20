@@ -117,6 +117,13 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             checkpointer=self.checkpointer,
         )
 
+        # Unfreeze classifier head for full fine-tuning (not LoRA)
+        # The classifier is randomly initialized and needs to learn from scratch
+        if self.peft_config is not None and hasattr(model, "classifier"):
+            for param in model.classifier.parameters():
+                param.requires_grad_(True)
+            logging.info("Unfroze classifier head for full fine-tuning")
+
         self.checkpointer.config.model_state_dict_keys = model_state_dict_keys
 
         self.model_parts = [model]

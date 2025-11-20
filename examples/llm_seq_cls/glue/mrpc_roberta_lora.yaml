@@ -22,8 +22,9 @@ checkpoint:
   checkpoint_dir: checkpoints/
   model_save_format: safetensors
   save_consolidated: true
+  load_base_model: true
   # Skip classifier head when loading base roberta-large (it doesn't have these layers)
-  skip_task_head_prefixes: ["classifier."]
+  skip_task_head_prefixes_for_base_model: ["classifier."]
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
@@ -38,6 +39,7 @@ peft:
   target_modules:
   - "*.query"
   - "*.value"
+  # Note: classifier head is fully trained (not LoRA), unfrozen automatically in train_seq_cls.py
   dim: 8
   alpha: 16
   dropout: 0.1
