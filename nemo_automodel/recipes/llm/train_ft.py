@@ -250,13 +250,8 @@ def build_model_and_optimizer(
         if cfg_qat is not None and cfg_qat.get("enabled", False):
             if cfg_peft is not None:
                 raise ValueError("QAT with PEFT is not supported in 25.11")
-            from nemo_automodel.components.quantization.qat import (
-                HAVE_TORCHAO_QAT,
-                prepare_qat_model,
-            )
+            from nemo_automodel.components.quantization.qat import prepare_qat_model
 
-            if not HAVE_TORCHAO_QAT:
-                raise ImportError("QAT requested but torchao QAT is unavailable. Install torchao>=0.7.0")
             quantizer = cfg_qat.quantizer.instantiate()
             model, qat_mode = prepare_qat_model(model, quantizer)
             # Attach helpers for delayed fake-quant toggling if desired
