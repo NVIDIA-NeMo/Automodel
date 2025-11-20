@@ -9,6 +9,7 @@ benchmark:
   nsys_start: -1    # Set to step number to profile (e.g., 10)
   nsys_end: -1      # Set to end step (e.g., 15)
   nsys_ranks: []    # e.g., [0] to profile rank 0
+  num_nodes: 1
 
 step_scheduler:
   global_batch_size: 32
