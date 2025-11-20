@@ -381,8 +381,16 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         )
 
         hidden_states = outputs.last_hidden_state
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        
+        # DTensor compatibility with pytorch 2.9.0: when logits_to_keep=0, slice(0, None, None) would select all elements
+        # but DTensor cannot handle sliced DTensor, which will raise error message:
+        # NotImplementedError: Operator aten.alias.default does not have a sharding strategy registered.
+        # Solution: Skip slicing entirely when logits_to_keep=0 to avoid DTensor issues in TP with sequence parallel.
+        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
+            logits = self.lm_head(hidden_states)
+        else:
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
         if labels is not None:
