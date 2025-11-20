@@ -227,25 +227,6 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             preds = torch.argmax(logits, dim=-1)
             all_preds.append(preds.detach())
             all_labels.append(labels.view(-1).detach())
-            
-            # Debug: Log prediction distribution every 10 steps
-            if self.step_scheduler.step % 10 == 0 and self._get_dp_rank() == 0:
-                pred_dist = torch.bincount(preds, minlength=2).cpu().tolist()
-                label_dist = torch.bincount(labels.view(-1), minlength=2).cpu().tolist()
-                logging.info(f"[Debug] Step {self.step_scheduler.step}: Preds {pred_dist} | Labels {label_dist}")
-                
-                # Deep debug: Check inputs
-                if self.step_scheduler.step == 0:
-                    logging.info(f"[Debug Input] Input IDs shape: {batch.get('input_ids').shape}")
-                    logging.info(f"[Debug Input] Input Sample: {batch.get('input_ids')[0, :20]}")
-                    
-                    # Check for separator token (2 for RoBERTa)
-                    sep_indices = (batch.get('input_ids')[0] == 2).nonzero(as_tuple=True)[0]
-                    logging.info(f"[Debug Input] Separator Indices (ID=2): {sep_indices.tolist()}")
-                    
-                    logging.info(f"[Debug Input] Attention Mask Sample: {batch.get('attention_mask', torch.tensor([]))[0, :20]}")
-                    logging.info(f"[Debug Input] Label Sample: {labels.view(-1)[:10]}")
-
             (loss * self._get_dp_group_size(include_cp=True)).backward()
         
         # Calculate gradient norm (distributed-aware)
@@ -324,13 +305,6 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             preds = torch.argmax(logits, dim=-1)
             all_preds.append(preds)
             all_labels.append(labels.view(-1))
-            
-            # Debug: Log prediction distribution for first batch of validation
-            if count == 0 and self._get_dp_rank() == 0:
-                pred_dist = torch.bincount(preds, minlength=2).cpu().tolist()
-                label_dist = torch.bincount(labels.view(-1), minlength=2).cpu().tolist()
-                logging.info(f"[Debug] Val Batch 0: Preds {pred_dist} | Labels {label_dist}")
-                
             count += 1
         
         total_loss = total_loss if count == 0 else total_loss / count
