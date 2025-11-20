@@ -87,6 +87,23 @@ RUN if [ "$INSTALL_MAMBA" = "True" ]; then \
     cd ../ && rm -rf mamba; \
     fi
 
+# Install Bitsandbytes
+ARG INSTALL_BITSANDBYTES=False
+ARG BITSANDBYTES_COMMIT=0.48.2
+RUN if [ $INSTALL_BITSANDBYTES = "True" ]; then \
+    git clone https://github.com/bitsandbytes-foundation/bitsandbytes.git && \
+    cd bitsandbytes && \
+    git pull && \
+    git fetch origin $DEEPEP_COMMIT && \
+    git checkout FETCH_HEAD && \
+    cmake -DCOMPUTE_BACKEND=cuda -DCOMPUTE_CAPABILITY="80;86;90;100;110" -S . && \
+    make && \
+    cmake -DCOMPUTE_BACKEND=cpu -S . && \
+    make && \
+    pip install . && \
+    cd ../ && rm -rf bitsandbytes; \
+    fi
+
 # Install Deepep
 COPY docker/common/deepep.patch /opt/deepep.patch
 ARG INSTALL_DEEPEP=False
@@ -131,3 +148,9 @@ ENV NVIDIA_BUILD_ID=${NVIDIA_BUILD_ID:-<unknown>}
 LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 ARG NVIDIA_BUILD_REF
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
+
+ARG RC_DATE=00.00
+ARG TARGETARCH
+# NOTICES.txt file points to where the OSS source code is archived
+RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-automodel/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
+    echo "For further inquiries or assistance, contact us at oss-requests@nvidia.com" >> NOTICES.txt
