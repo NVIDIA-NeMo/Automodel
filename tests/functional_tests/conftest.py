@@ -66,6 +66,10 @@ _OVERRIDES = [
     "dataset.seq_length",
     "validation_dataset.seq_length",
     "freeze_config.freeze_language_model",
+    "qat.fake_quant_after_n_steps",
+    "qat.enabled",
+    "qat.quantizer._target_",
+    "qat.quantizer.groupsize",
 ]
 
 
