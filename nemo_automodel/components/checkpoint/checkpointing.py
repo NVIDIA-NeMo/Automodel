@@ -90,6 +90,7 @@ class CheckpointingConfig:
     is_async: bool = False
     dequantize_base_checkpoint: bool | None = None
     original_model_root_dir: str | None = None
+    skip_task_head_prefixes: list[str] | None = None  # Parameter prefixes to skip when loading base model
 
     def __post_init__(self):
         """
@@ -291,7 +292,12 @@ class Checkpointer:
         # Validate checkpoint directory
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model path {model_path} does not exist")
-        model_state = ModelState(model, is_peft=self.config.is_peft, is_init_step=is_init_step)
+        model_state = ModelState(
+            model,
+            is_peft=self.config.is_peft,
+            is_init_step=is_init_step,
+            skip_task_head_prefixes=getattr(self.config, "skip_task_head_prefixes", None),
+        )
         state_dict = model_state.state_dict()
         storage_reader = self._get_storage_reader(model_path, key_mapping, is_init_step=is_init_step)
 
