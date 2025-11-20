@@ -205,9 +205,9 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         all_preds = []
         all_labels = []
         
-        # Count input tokens for throughput calculation
+        # Count input tokens for throughput calculation (excluding padding)
         num_tokens_in_batch = torch.tensor(
-            sum(batch["input_ids"].numel() for batch in batches),
+            sum(batch["attention_mask"].sum().item() for batch in batches),
             dtype=torch.long,
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
