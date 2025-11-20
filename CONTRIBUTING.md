@@ -1,27 +1,60 @@
 # Contributing To NeMo-Automodel
 
-## Building a NeMo-Automodel container
+## Building Automodel container
 
-* Run the following command to build your container:
+* Testing and validation occurs through the Automodel container. This is the primary and recommended path for development. Container can be built using the following command:
 
 ```bash
 # Set build arguments
-export AUTOMODEL_INSTALL=dev #[all, dev, deepep, fa, moe, vlm]
-export BASE_IMAGE=cuda #[cuda, pytorch]
-export INSTALL_DEEPEP=False #[True, False]
+export AUTOMODEL_INSTALL=vlm #[fa, moe, vlm]
+export BASE_IMAGE=pytorch #[cuda, pytorch]
+
+# Dependency install options [True, False]
+export INSTALL_BITSANDBYTES=True
+export INSTALL_DEEPEP=True
+export INSTALL_MAMBA=True
+export INSTALL_TE=True
 
 docker build -f docker/Dockerfile \
---build-arg AUTOMODEL_INSTALL=$AUTOMODEL_INSTALL \
---build-arg BASE_IMAGE=$BASE_IMAGE \
---build-arg INSTALL_DEEPEP=$INSTALL_DEEPEP \
--t automodel --target=automodel_final .
+    --build-arg AUTOMODEL_INSTALL=$AUTOMODEL_INSTALL \
+    --build-arg BASE_IMAGE=$BASE_IMAGE \
+    --build-arg INSTALL_BITSANDBYTES=$INSTALL_BITSANDBYTES \
+    --build-arg INSTALL_DEEPEP=$INSTALL_DEEPEP \
+    --build-arg INSTALL_MAMBA=$INSTALL_MAMBA \
+    --build-arg INSTALL_TE=$INSTALL_TE \
+    -t automodel --target=automodel_final .
 ```
+
+* All testing is currently executed with PyTorch base image. This is the recommended installation path.
 
 * Run the following command to start your container:
 
 ```bash
 docker run --rm -it --entrypoint bash --runtime nvidia --gpus all automodel
 ```
+
+## Mounting Automodel repository into the container
+
+* When mounting Automodel repo onto an existing container built with `BASE_IMAGE=pytorch`, execute the following additional steps:
+
+```bash
+sed -i '/\[tool\.uv\]/r <path_to_Automodel>/docker/common/uv-pytorch.toml' pyproject.toml && \
+mv <path_to_Automodel>/docker/common/uv-pytorch.lock <path_to_Automodel>/uv.lock; \
+```
+
+* Limitations of uv require injection of additional configuration to skip `torch` installation and replace existing uv.lock.
+
+## Installing dependencies from source
+
+* The follow list of dependencies are dependent on underlying CUDA version and may require source installation:
+  * bitsandbytes
+  * causal-conv1d
+  * DeepEP
+  * grouped_gemm
+  * mamba
+  * TransformerEngine
+
+* Please refer to the Automodel Dockerfile for source install steps: link <https://github.com/NVIDIA-NeMo/Automodel/blob/main/docker/Dockerfile#L53-L122>
 
 ## Development Dependencies
 
