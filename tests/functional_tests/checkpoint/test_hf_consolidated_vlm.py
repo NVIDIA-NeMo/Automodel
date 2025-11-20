@@ -464,6 +464,7 @@ def test_consolidated_vlm_checkpoint():
         "optim/.metadata",
         "step_scheduler.pt",
         "config.yaml",
+        "losses.json",
     ]
 
     for file in output_files:

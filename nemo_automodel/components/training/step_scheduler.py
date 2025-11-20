@@ -146,9 +146,9 @@ class StepScheduler(Stateful):
         Returns whether this step needs to call the validation.
         """
         is_val = False
-        if self.val_every_steps and self.val_every_steps > 0 and not self.sigterm_flag:
+        if self.val_every_steps and self.val_every_steps > 0:
             is_val = self.step % self.val_every_steps == self.val_every_steps - 1
-        return is_val
+        return (is_val or self.is_ckpt_step) and not self.sigterm_flag
 
     @property
     def is_ckpt_step(self):

@@ -152,6 +152,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 pp_enabled=False,
             )
 
+        self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         self.step_scheduler = build_step_scheduler(
             self.cfg.get("step_scheduler", None),
             self.dataloader,
@@ -183,14 +184,22 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 train_log_data = self._run_train_optim_step(batches)
                 self.log_train_metrics(train_log_data)
 
-                if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(epoch, self.step_scheduler.step)
-
+                val_loss = {}
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     val_log_data = self._validate_one_epoch(self.val_dataloader)
+                    val_loss["val_loss"] = val_log_data.metrics["val_loss"]
                     self.log_val_metrics(val_log_data)
                     for mp in self.model_parts:
                         mp.train()
+
+                if self.step_scheduler.is_ckpt_step:
+                    self.save_checkpoint(
+                        epoch,
+                        self.step_scheduler.step,
+                        train_log_data.metrics["loss"],
+                        val_loss,
+                        best_metric_key=self.best_metric_key,
+                    )
 
         self.metric_logger_train.close()
         self.metric_logger_valid.close()
