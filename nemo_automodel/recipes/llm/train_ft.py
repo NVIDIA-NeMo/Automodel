@@ -324,6 +324,9 @@ def build_model_and_optimizer(
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         optimizer = [cfg_opt.instantiate(params=trainable_params)]
 
+    # Print trainable parameters after loading weights
+    trainable_params, total_params = print_trainable_parameters(model)
+
     return model, state_dict_keys, optimizer, loss_fn, param_info
 
 
