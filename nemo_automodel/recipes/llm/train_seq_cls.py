@@ -233,6 +233,13 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 pred_dist = torch.bincount(preds, minlength=2).cpu().tolist()
                 label_dist = torch.bincount(labels.view(-1), minlength=2).cpu().tolist()
                 logging.info(f"[Debug] Step {self.step_scheduler.step}: Preds {pred_dist} | Labels {label_dist}")
+                
+                # Deep debug: Check inputs
+                if self.step_scheduler.step == 0:
+                    logging.info(f"[Debug Input] Input IDs shape: {batch.get('input_ids').shape}")
+                    logging.info(f"[Debug Input] Input Sample: {batch.get('input_ids')[0, :20]}")
+                    logging.info(f"[Debug Input] Attention Mask Sample: {batch.get('attention_mask', torch.tensor([]))[0, :20]}")
+                    logging.info(f"[Debug Input] Label Sample: {labels.view(-1)[:10]}")
 
             (loss * self._get_dp_group_size(include_cp=True)).backward()
         
