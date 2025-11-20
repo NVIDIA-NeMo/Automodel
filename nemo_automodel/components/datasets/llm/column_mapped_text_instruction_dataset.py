@@ -171,6 +171,8 @@ class ColumnMappedTextInstructionDataset(Dataset):
         truncation: Union[str, bool] = "do_not_truncate",
         limit_dataset_samples: Optional[int] = None,
         use_hf_chat_template: bool = False,
+        add_bos_token: bool = True,
+        add_eos_token: bool = True,
     ) -> None:
         """
         Initialize the dataset.
@@ -235,6 +237,8 @@ class ColumnMappedTextInstructionDataset(Dataset):
         self.padding = padding
         self.truncation = truncation
         self.use_hf_chat_template = use_hf_chat_template
+        self.add_bos_token = add_bos_token
+        self.add_eos_token = add_eos_token
 
     def __len__(self) -> int:  # noqa: D401
         """
@@ -321,4 +325,6 @@ class ColumnMappedTextInstructionDataset(Dataset):
                 padding=self.padding,
                 truncation=self.truncation,
                 answer_only_loss_mask=self.answer_only_loss_mask,
+                add_bos_token=self.add_bos_token,
+                add_eos_token=self.add_eos_token,
             )
