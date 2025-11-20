@@ -238,6 +238,11 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 if self.step_scheduler.step == 0:
                     logging.info(f"[Debug Input] Input IDs shape: {batch.get('input_ids').shape}")
                     logging.info(f"[Debug Input] Input Sample: {batch.get('input_ids')[0, :20]}")
+                    
+                    # Check for separator token (2 for RoBERTa)
+                    sep_indices = (batch.get('input_ids')[0] == 2).nonzero(as_tuple=True)[0]
+                    logging.info(f"[Debug Input] Separator Indices (ID=2): {sep_indices.tolist()}")
+                    
                     logging.info(f"[Debug Input] Attention Mask Sample: {batch.get('attention_mask', torch.tensor([]))[0, :20]}")
                     logging.info(f"[Debug Input] Label Sample: {labels.view(-1)[:10]}")
 
