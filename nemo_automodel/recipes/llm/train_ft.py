@@ -996,6 +996,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self._get_dp_rank(),
             self.pp_enabled,
         )
+        self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         # Scheduler
         self.step_scheduler = build_step_scheduler(
             self.cfg.get("step_scheduler", None),
@@ -1050,20 +1051,28 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # log
                 self.log_train_metrics(train_log_data)
 
-                # Save the checkpoint every ckpt_every_steps
-                if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(epoch, self.step_scheduler.step)
-
                 # Run validation every val_every_steps
+                val_losses = {}
                 if self.step_scheduler.is_val_step:
                     if self.pp_enabled:
                         logger.warning("Validation is not supported for pipeline parallelism")
-                        continue
-                    for val_name, val_dataloader in self.val_dataloaders.items():
-                        val_log_data = self._run_validation_epoch(val_dataloader)
-                        self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
+                    else:
+                        for val_name, val_dataloader in self.val_dataloaders.items():
+                            val_log_data = self._run_validation_epoch(val_dataloader)
+                            val_losses[val_name] = val_log_data.metrics["val_loss"]
+                            self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
                     for mp in self.model_parts:
                         mp.train()
+
+                # Save the checkpoint every ckpt_every_steps
+                if self.step_scheduler.is_ckpt_step:
+                    self.save_checkpoint(
+                        epoch,
+                        self.step_scheduler.step,
+                        train_log_data.metrics["loss"],
+                        val_losses,
+                        best_metric_key=self.best_metric_key,
+                    )
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
         for v in self.metric_logger_valid.values():
