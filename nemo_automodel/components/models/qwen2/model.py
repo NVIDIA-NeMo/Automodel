@@ -381,7 +381,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         )
 
         hidden_states = outputs.last_hidden_state
-        
+
         # DTensor compatibility with pytorch 2.9.0: when logits_to_keep=0, slice(0, None, None) would select all elements
         # but DTensor cannot handle sliced DTensor, which will raise error message:
         # NotImplementedError: Operator aten.alias.default does not have a sharding strategy registered.
