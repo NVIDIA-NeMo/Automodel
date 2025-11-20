@@ -996,6 +996,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self._get_dp_rank(),
             self.pp_enabled,
         )
+        self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         # Scheduler
         self.step_scheduler = build_step_scheduler(
             self.cfg.get("step_scheduler", None),
@@ -1050,21 +1051,28 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # log
                 self.log_train_metrics(train_log_data)
 
-                # Save the checkpoint every ckpt_every_steps
-                if self.step_scheduler.is_ckpt_step or self.step_scheduler.step == 89:
-                    self.save_checkpoint(epoch, self.step_scheduler.step)
-                    self._run_evaluation_step(epoch, self.step_scheduler.step)
-
                 # Run validation every val_every_steps
+                val_losses = {}
                 if self.step_scheduler.is_val_step:
                     if self.pp_enabled:
                         logger.warning("Validation is not supported for pipeline parallelism")
-                        continue
-                    for val_name, val_dataloader in self.val_dataloaders.items():
-                        val_log_data = self._run_validation_epoch(val_dataloader)
-                        self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
+                    else:
+                        for val_name, val_dataloader in self.val_dataloaders.items():
+                            val_log_data = self._run_validation_epoch(val_dataloader)
+                            val_losses[val_name] = val_log_data.metrics["val_loss"]
+                            self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
                     for mp in self.model_parts:
                         mp.train()
+
+                # Save the checkpoint every ckpt_every_steps
+                if self.step_scheduler.is_ckpt_step:
+                    self.save_checkpoint(
+                        epoch,
+                        self.step_scheduler.step,
+                        train_log_data.metrics["loss"],
+                        val_losses,
+                        best_metric_key=self.best_metric_key,
+                    )
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
         for v in self.metric_logger_valid.values():
@@ -1073,61 +1081,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.checkpointer.close()
 
     # ------------------ helpers ------------------
-    def _run_evaluation_step(self, epoch, step):
-        """Run an evaluation step."""
-        import json
-        import os
-
-        import evaluate
-        from transformers import GenerationConfig
-
-        logging.info("Running evaluation step")
-        eval_data_filepath = "/workspace/eval-data/email_eval_ms_test_sft.json"
-        output_path = os.path.join(
-            self.checkpointer.config.checkpoint_dir, f"epoch_{epoch}_step_{step}", "evaluation.jsonl"
-        )
-        eval_data = json.loads(open(eval_data_filepath).read())
-        rouge_script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rouge.py")
-        rouge = evaluate.load(rouge_script_path)
-        batch_size = 8
-        temp = 0.0001
-        top_k = 1
-        new_tokens = 200
-
-        prompts = [x["prompt"] for x in eval_data]
-        ideal_responses = [x["ideal_response"] for x in eval_data]
-        output_texts = []
-        with torch.no_grad():
-            for i in range(0, len(prompts), batch_size):
-                batch = prompts[i : i + batch_size]
-                inputs = self.tokenizer(batch, return_tensors="pt", padding=True, truncation=True)
-                inputs = {key: value.to(self.dist_env.device) for key, value in inputs.items()}
-                output_tokens = self.model_parts[0].generate(
-                    **inputs,
-                    generation_config=GenerationConfig(
-                        pad_token_id=self.tokenizer.eos_token_id,
-                        top_k=top_k,
-                        max_new_tokens=new_tokens,
-                        temperature=temp,
-                        do_sample=True,
-                    ),
-                )
-                output_tokens = output_tokens[:, inputs["input_ids"].shape[1] :]  # Trim off the prompt
-                output_texts.extend(
-                    [self.tokenizer.decode(output, skip_special_tokens=True) for output in output_tokens]
-                )
-
-        with open(output_path, "w") as output_file:
-            for prediction in output_texts:
-                output_file.write(json.dumps({"prediction": prediction}) + "\n")
-
-        trained_rouge_scores: dict[str, float] = rouge.compute(predictions=output_texts, references=ideal_responses)  # type: ignore
-        if not trained_rouge_scores:
-            trained_rouge_scores = {"rouge1": 0, "rouge2": 0, "rougeL": 0, "rougeLsum": 0}
-        logging.info(
-            f"Trained Rouge Scores: {trained_rouge_scores}. Main Rouge Score: {trained_rouge_scores['rougeLsum']}"
-        )
-
     def _forward_backward_step(
         self,
         idx,
