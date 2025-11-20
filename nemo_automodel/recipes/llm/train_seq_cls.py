@@ -115,20 +115,8 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             parallelize_fn=None,
             load_base_model=self.cfg.get("checkpoint.load_base_model", True),
             checkpointer=self.checkpointer,
+            unfreeze_modules=["classifier"] if self.peft_config is not None else None,
         )
-
-        # Unfreeze classifier head for full fine-tuning (not LoRA)
-        # The classifier is randomly initialized and needs to learn from scratch
-        if self.peft_config is not None and hasattr(model, "classifier"):
-            for param in model.classifier.parameters():
-                param.requires_grad_(True)
-            logging.info("Unfroze classifier head for full fine-tuning")
-
-            # Recreate optimizer to include the newly unfrozen parameters
-            # This is critical because the original optimizer was created BEFORE unfreezing
-            trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
-            self.optimizer = [self.cfg.optimizer.instantiate(params=trainable_params)]
-            logging.info(f"Recreated optimizer with {len(trainable_params)} trainable parameters groups")
 
         self.checkpointer.config.model_state_dict_keys = model_state_dict_keys
 
