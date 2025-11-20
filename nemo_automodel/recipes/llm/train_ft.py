@@ -1056,11 +1056,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 if self.step_scheduler.is_val_step:
                     if self.pp_enabled:
                         logger.warning("Validation is not supported for pipeline parallelism")
-                        continue
-                    for val_name, val_dataloader in self.val_dataloaders.items():
-                        val_log_data = self._run_validation_epoch(val_dataloader)
-                        val_losses[val_name] = val_log_data.metrics["val_loss"]
-                        self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
+                    else:
+                        for val_name, val_dataloader in self.val_dataloaders.items():
+                            val_log_data = self._run_validation_epoch(val_dataloader)
+                            val_losses[val_name] = val_log_data.metrics["val_loss"]
+                            self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
                     for mp in self.model_parts:
                         mp.train()
 
