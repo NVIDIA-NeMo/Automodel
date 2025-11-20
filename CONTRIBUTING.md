@@ -38,8 +38,8 @@ docker run --rm -it --entrypoint bash --runtime nvidia --gpus all automodel
 * When mounting Automodel repo onto an existing container built with `BASE_IMAGE=pytorch`, execute the following additional steps:
 
 ```bash
-sed -i '/\[tool\.uv\]/r <path_to_Automodel>/docker/common/uv-pytorch.toml' pyproject.toml && \
-mv <path_to_Automodel>/docker/common/uv-pytorch.lock <path_to_Automodel>/uv.lock; \
+sed -i '/\[tool\.uv\]/r <path_to_Automodel>/docker/common/uv-pytorch.toml' pyproject.toml
+mv <path_to_Automodel>/docker/common/uv-pytorch.lock <path_to_Automodel>/uv.lock
 ```
 
 * Limitations of uv require injection of additional configuration to skip `torch` installation and replace existing uv.lock.
