@@ -124,6 +124,12 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 param.requires_grad_(True)
             logging.info("Unfroze classifier head for full fine-tuning")
 
+            # Recreate optimizer to include the newly unfrozen parameters
+            # This is critical because the original optimizer was created BEFORE unfreezing
+            trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
+            self.optimizer = [self.cfg.optimizer.instantiate(params=trainable_params)]
+            logging.info(f"Recreated optimizer with {len(trainable_params)} trainable parameters groups")
+
         self.checkpointer.config.model_state_dict_keys = model_state_dict_keys
 
         self.model_parts = [model]
