@@ -14,12 +14,12 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc_per_node 8 
+# torchrun --nproc_per_node 8
 #     --nnodes $NNODES
-#     --master_addr $MASTER_ADDR 
+#     --master_addr $MASTER_ADDR
 #     --master_port 29400
-#     --node_rank $NODE_RANK 
-#     examples/llm_pretrain/pretrain.py 
+#     --node_rank $NODE_RANK
+#     examples/llm_pretrain/pretrain.py
 #     --config examples/llm_pretrain/deepseekv3_pretrain.yaml
 
 
@@ -41,7 +41,7 @@ rng:
   ranked: true
 
 parallelize_fn:
-  _target_: nemo_automodel.components.models.deepseek_v3.parallelizer.parallelize_model
+  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
   activation_checkpointing: false
 
 # Option 1 - shorthand builder w/ automatic optimized path
@@ -151,4 +151,4 @@ autopipeline:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir> 
+#   save_dir: <your_wandb_save_dir>
