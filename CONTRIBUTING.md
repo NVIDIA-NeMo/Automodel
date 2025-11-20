@@ -54,7 +54,7 @@ mv <path_to_Automodel>/docker/common/uv-pytorch.lock <path_to_Automodel>/uv.lock
   * mamba
   * TransformerEngine
 
-* Please refer to the Automodel Dockerfile for source install steps: link <https://github.com/NVIDIA-NeMo/Automodel/blob/main/docker/Dockerfile#L53-L122>
+* Please refer to the Automodel Dockerfile for source install steps: [link](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docker/Dockerfile#L53-L122)
 
 ## Development Dependencies
 
