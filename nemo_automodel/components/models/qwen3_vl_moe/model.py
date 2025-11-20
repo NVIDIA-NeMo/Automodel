@@ -23,6 +23,7 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeModel as HFQwen3VLMoeModel,
     Qwen3VLMoeModelOutputWithPast,
     Qwen3VLMoeTextRotaryEmbedding,
+    Qwen3VLMoeVisionRotaryEmbedding,
 )
 
 from nemo_automodel.components.models.qwen3_moe.model import Block
@@ -36,7 +37,7 @@ from .state_dict_adapter import Qwen3VLMoeStateDictAdapter
 
 
 class Fp32SafeQwen3VLMoeTextRotaryEmbedding(Qwen3VLMoeTextRotaryEmbedding):
-    """Ensure inv_freq stays in float32 while still following device moves."""
+    """Ensure inv_freq stays in float32"""
 
     def _apply(self, fn: Any, recurse: bool = True):
         # Keep an fp32 copy before super mutates the registered buffer
@@ -50,11 +51,19 @@ class Fp32SafeQwen3VLMoeTextRotaryEmbedding(Qwen3VLMoeTextRotaryEmbedding):
         )
         return result
 
-def save_tensor(tensor: torch.Tensor, path: str) -> None:
-    import pickle
-    if torch.distributed.get_rank() == 0:
-        with open("auto_" + path, "wb") as f:
-            pickle.dump(tensor, f)
+
+class Fp32SafeQwen3VLMoeVisionRotaryEmbedding(Qwen3VLMoeVisionRotaryEmbedding):
+    """Ensure the vision rotary inv_freq buffer remains float32."""
+
+    def _apply(self, fn: Any, recurse: bool = True):
+        inv_freq_fp32 = self.inv_freq.detach().clone().to(torch.float32)
+        result = super()._apply(fn, recurse=recurse)
+        self.register_buffer(
+            "inv_freq",
+            inv_freq_fp32.to(device=self.inv_freq.device),
+            persistent=False,
+        )
+        return result
 
 
 class Qwen3VLMoeModel(HFQwen3VLMoeModel):
@@ -166,10 +175,6 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
         cos, sin = self.rotary_emb(hidden_states, position_ids)
         head_dim = cos.shape[-1] // 2
         freqs_cis = torch.cat((cos[..., :head_dim], sin[..., :head_dim]), dim=-1)
-
-        save_tensor(text_position_ids, "text_position_ids.pkl")
-        save_tensor(freqs_cis, "freqs_cis.pkl")
-        save_tensor(hidden_states, "hidden_states_before_layers.pkl")
 
         for layer_idx, decoder_layer in enumerate(self.layers):
             hidden_states = decoder_layer(
@@ -285,6 +290,18 @@ class Qwen3VLMoeForConditionalGeneration(HFQwen3VLMoeForConditionalGeneration, M
                 self.backend,
                 dtype=get_dtype(text_config.torch_dtype, torch.bfloat16),
             )
+
+        vision_model = getattr(self.model, "visual")
+        rotary = vision_model.rotary_pos_emb
+        dim = rotary.inv_freq.shape[0] * 2
+        fp32_safe_rotary = Fp32SafeQwen3VLMoeVisionRotaryEmbedding(dim)
+        fp32_safe_rotary.register_buffer(
+            "inv_freq",
+            rotary.inv_freq.detach().clone().to(torch.float32, copy=True),
+            persistent=False,
+        )
+        fp32_safe_rotary.to(rotary.inv_freq.device)
+        vision_model.rotary_pos_emb = fp32_safe_rotary
 
     def forward(
         self,
