@@ -87,6 +87,23 @@ RUN if [ "$INSTALL_MAMBA" = "True" ]; then \
     cd ../ && rm -rf mamba; \
     fi
 
+# Install Bitsandbytes
+ARG INSTALL_BITSANDBYTES=False
+ARG BITSANDBYTES_COMMIT=0.48.2
+RUN if [ $INSTALL_BITSANDBYTES = "True" ]; then \
+    git clone https://github.com/bitsandbytes-foundation/bitsandbytes.git && \
+    cd bitsandbytes && \
+    git pull && \
+    git fetch origin $DEEPEP_COMMIT && \
+    git checkout FETCH_HEAD && \
+    cmake -DCOMPUTE_BACKEND=cuda -DCOMPUTE_CAPABILITY="80;86;90;100;110" -S . && \
+    make && \
+    cmake -DCOMPUTE_BACKEND=cpu -S . && \
+    make && \
+    pip install . && \
+    cd ../ && rm -rf bitsandbytes; \
+    fi
+
 # Install Deepep
 COPY docker/common/deepep.patch /opt/deepep.patch
 ARG INSTALL_DEEPEP=False
