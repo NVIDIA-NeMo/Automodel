@@ -66,23 +66,23 @@ After running for a few seconds, the standard output should be:
 The `checkpoints/` should have the following contents:
 ```
 checkpoints/
-└── epoch_0_step_20/
-    ├── model/
-    │   ├── consolidated/
-    │   │   ├── config.json
-    │   │   ├── model-00001-of-00001.safetensors
-    │   │   ├── model.safetensors.index.json
-    │   │   ├── special_tokens_map.json
-    │   │   ├── tokenizer_config.json
-    │   │   ├── tokenizer.json
-    │   │   └── generation_config.json
-    │   ├── shard-00001-model-00001-of-00002.safetensors
-    │   └── shard-00002-model-00001-of-00002.safetensors
-    └── optim/
-        ├── __0_0.distcp
-        ├── __1_0.distcp
-        └── .metadata
-    ...
+├── LATEST -> epoch_0_step_19
+└── epoch_0_step_19
+   ├── model
+   │   ├── consolidated
+   │   │   ├── config.json
+   │   │   ├── generation_config.json
+   │   │   ├── model-00001-of-00001.safetensors
+   │   │   ├── model.safetensors.index.json
+   │   │   ├── special_tokens_map.json
+   │   │   ├── tokenizer.json
+   │   │   └── tokenizer_config.json
+   │   ├── shard-00001-model-00001-of-00001.safetensors
+   │   └── shard-00002-model-00001-of-00001.safetensors
+   └── optim
+       ├── __0_0.distcp
+       └── __1_0.distcp
+...
 ```
 
 The `epoch_0_step_20/` directory stores the full training state from step `20` of the first epoch, including both the model and optimizer states.
@@ -129,19 +129,29 @@ After training, you'll get a compact, consolidated Safetensors checkpoint that c
 
 ```
 checkpoints/
-└── epoch_0_step_20/
-    ├── model/
-    │   ├── adapter_config.json
-    │   ├── adapter_model.safetensors
-    │   ├── automodel_peft_config.json
-    │   ├── special_tokens_map.json
-    │   ├── tokenizer_config.json
-    │   └── tokenizer.json
-    └── optim/
-        ├── __0_0.distcp
-        ├── __1_0.distcp
-        └── .metadata
-    ...
+├── LATEST -> epoch_0_step_19
+├── epoch_0_step_19
+│   ├── config.yaml
+│   ├── dataloader
+│   │   ├── dataloader_dp_rank_0.pt
+│   │   └── dataloader_dp_rank_1.pt
+│   ├── losses.json
+│   ├── model
+│   │   ├── adapter_config.json
+│   │   ├── adapter_model.safetensors
+│   │   ├── automodel_peft_config.json
+│   │   ├── special_tokens_map.json
+│   │   ├── tokenizer.json
+│   │   └── tokenizer_config.json
+│   ├── optim
+│   │   ├── __0_0.distcp
+│   │   └── __1_0.distcp
+│   ├── rng
+│   │   ├── rng_dp_rank_0.pt
+│   │   └── rng_dp_rank_1.pt
+│   └── step_scheduler.pt
+├── training.jsonl
+└── validation.jsonl
 ```
 
 The example below showcases the direct compatibility of NeMo AutoModel with Hugging Face and PEFT:
@@ -178,16 +188,20 @@ After 20 steps, the following checkpoint will be saved:
 
 ```
 checkpoints/
-└── epoch_0_step_20/
-    ├── model/
-    │   ├── __0_0.distcp
-    │   ├── __1_0.distcp
-    │   └── .metadata
-    └── optim/
-        ├── __0_0.distcp
-        ├── __1_0.distcp
-        └── .metadata
-        ...
+├── LATEST -> epoch_0_step_19
+└── epoch_0_step_19
+   ├── config.yaml
+   ├── dataloader
+   │   ├── dataloader_dp_rank_0.pt
+   │   └── dataloader_dp_rank_1.pt
+   ├── losses.json
+   ├── model
+   │   ├── __0_0.distcp
+   │   └── __1_0.distcp
+   └── optim
+       ├── __0_0.distcp
+       └── __1_0.distcp
+...
 ```
 
 If you rerun the script, NeMo AutoModel automatically detects and restores the most recent checkpoint.
@@ -217,25 +231,33 @@ You can also save additional states in NeMo AutoModel. By default, we also autom
 
 ```
 checkpoints/
-└── epoch_0_step_20/
-    ├── model/
-    │   ├── consolidated/
-    │   │   ├── config.json
-    │   │   ├── model-00001-of-00001.safetensors
-    │   │   ├── model.safetensors.index.json
-    │   │   ├── special_tokens_map.json
-    │   │   ├── tokenizer_config.json
-    │   │   └── tokenizer.json
-    │   ├── shard-00001-model-00001-of-00002.safetensors
-    │   └── shard-00002-model-00001-of-00002.safetensors
-    ├── optim/
-    │   ├── __0_0.distcp
-    │   ├── __1_0.distcp
-    │   └── .metadata
-    ├── config.yaml
-    ├── dataloader.pt
-    ├── rng.pt
-    └── step_scheduler.pt
+├── LATEST -> epoch_0_step_19
+├── epoch_0_step_19
+│   ├── config.yaml
+│   ├── dataloader
+│   │   ├── dataloader_dp_rank_0.pt
+│   │   └── dataloader_dp_rank_1.pt
+│   ├── losses.json
+│   ├── model
+│   │   ├── consolidated
+│   │   │   ├── config.json
+│   │   │   ├── generation_config.json
+│   │   │   ├── model-00001-of-00001.safetensors
+│   │   │   ├── model.safetensors.index.json
+│   │   │   ├── special_tokens_map.json
+│   │   │   ├── tokenizer.json
+│   │   │   └── tokenizer_config.json
+│   │   ├── shard-00001-model-00001-of-00001.safetensors
+│   │   └── shard-00002-model-00001-of-00001.safetensors
+│   ├── optim
+│   │   ├── __0_0.distcp
+│   │   └── __1_0.distcp
+│   ├── rng
+│   │   ├── rng_dp_rank_0.pt
+│   │   └── rng_dp_rank_1.pt
+│   └── step_scheduler.pt
+├── training.jsonl
+└── validation.jsonl
 ```
 
 If you want to define a new state to be checkpointed in the recipe, the easiest way is to create a new attribute in the recipe class (defined using `self.` inside the recipe). Just make sure that the new attribute uses both the `load_state_dict` and `state_dict` methods.

@@ -821,6 +821,7 @@ def test_dcp_checkpoint():
         "optim/.metadata",
         "step_scheduler.pt",
         "config.yaml",
+        "losses.json",
     ]
     if trainer._get_dp_group_size() > 1:
         output_files.append("dataloader/dataloader_dp_rank_1.pt")

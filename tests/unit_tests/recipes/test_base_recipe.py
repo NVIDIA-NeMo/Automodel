@@ -215,7 +215,7 @@ def test_save_and_load_roundtrip(tmp_path):
     foo_after_step = recipe_inst.custom_state.foo.clone()
 
     # Save checkpoint.
-    recipe_inst.save_checkpoint(epoch=0, step=0)
+    recipe_inst.save_checkpoint(epoch=0, step=0, train_loss=float(loss.item()))
 
     # Further modify everything so that restore must actually change data back.
     recipe_inst.model.weight.data.add_(42.0)
