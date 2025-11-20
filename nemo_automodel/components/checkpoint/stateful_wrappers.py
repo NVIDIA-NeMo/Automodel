@@ -165,11 +165,11 @@ class ModelState:
 
     def _get_base_model_state_dict(self) -> dict[str, Any]:
         model_state_dict = {k: v for sd in map(get_model_state_dict, self.model) for k, v in sd.items()}
-        
+
         if self.is_tied_lm_head:
             # PP models don't have tied embeddings. Safe to pass in model[0] here.
             model_state_dict.pop(self.lm_head_param_name, None)
-            
+
         if self.is_peft:
             keys_to_remove = [k for k in model_state_dict.keys() if "lora" in k]
             for k in keys_to_remove:
@@ -178,8 +178,11 @@ class ModelState:
         if self.skip_task_head_prefixes:
             # Remove task-specific heads when loading base model for fine-tuning
             # These layers don't exist in base pretrained models and will be randomly initialized
-            keys_to_remove = [k for k in model_state_dict.keys() 
-                             if any(k.startswith(prefix) for prefix in self.skip_task_head_prefixes)]
+            keys_to_remove = [
+                k
+                for k in model_state_dict.keys()
+                if any(k.startswith(prefix) for prefix in self.skip_task_head_prefixes)
+            ]
             for k in keys_to_remove:
                 model_state_dict.pop(k)
 

@@ -205,14 +205,14 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         losses = []
         all_preds = []
         all_labels = []
-        
+
         # Count input tokens for throughput calculation (excluding padding)
         num_tokens_in_batch = torch.tensor(
             sum(batch["attention_mask"].sum().item() for batch in batches),
             dtype=torch.long,
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
-        
+
         for batch in batches:
             batch = {
                 k: (v.to(self.dist_env.device, non_blocking=True) if v is not None else None) for k, v in batch.items()
@@ -222,35 +222,37 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             logits = getattr(out, "logits", out)
             loss = self.loss_fn(logits, labels.view(-1))
             losses.append(loss.detach().clone())
-            
+
             # Collect predictions for accuracy calculation
             preds = torch.argmax(logits, dim=-1)
             all_preds.append(preds.detach())
             all_labels.append(labels.view(-1).detach())
             (loss * self._get_dp_group_size(include_cp=True)).backward()
-        
+
         # Calculate gradient norm (distributed-aware)
         grad_norm = clip_grad_norm(
             max_grad_norm=1e9,  # Effectively no clipping (measure only)
             model_parts=self.model_parts,
             norm_type=2.0,
-            pp_enabled=self._get_pp_rank() != 0 if hasattr(self, '_get_pp_rank') else False,
+            pp_enabled=self._get_pp_rank() != 0 if hasattr(self, "_get_pp_rank") else False,
             device_mesh=self.device_mesh,
         )
-        
+
         # Calculate accuracy
         all_preds = torch.cat(all_preds)
         all_labels = torch.cat(all_labels)
         correct = (all_preds == all_labels).sum()
         total = all_labels.numel()
         accuracy = correct.float() / total
-        
+
         # Sync accuracy across distributed ranks if needed
         if self._get_dp_group_size(include_cp=True) > 1:
             correct = self._dp_allreduce(correct.float(), include_cp=True)
-            total_across_ranks = self._dp_allreduce(torch.tensor(total, device=correct.device, dtype=torch.float), include_cp=True)
+            total_across_ranks = self._dp_allreduce(
+                torch.tensor(total, device=correct.device, dtype=torch.float), include_cp=True
+            )
             accuracy = correct / total_across_ranks
-        
+
         for opt in self.optimizer:
             opt.step()
             opt.zero_grad()
@@ -263,11 +265,11 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         time_delta = t - self.timestamp
         self.timestamp = t
         tps = num_tokens_in_batch / time_delta
-        
+
         total_loss = torch.sum(torch.stack(losses))
         total_loss = self._dp_allreduce(total_loss, include_cp=True).detach()
         loss = total_loss / len(batches)
-        
+
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
@@ -290,7 +292,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         all_preds = []
         all_labels = []
         count = 0
-        
+
         for batch in dataloader:
             batch = {
                 k: (v.to(self.dist_env.device, non_blocking=True) if v is not None else None) for k, v in batch.items()
@@ -300,15 +302,15 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             logits = getattr(out, "logits", out)
             loss = self.loss_fn(logits, labels.view(-1))
             total_loss += loss.detach()
-            
+
             # Collect predictions for accuracy
             preds = torch.argmax(logits, dim=-1)
             all_preds.append(preds)
             all_labels.append(labels.view(-1))
             count += 1
-        
+
         total_loss = total_loss if count == 0 else total_loss / count
-        
+
         # Calculate accuracy
         if len(all_preds) > 0:
             all_preds = torch.cat(all_preds)
@@ -316,15 +318,17 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             correct = (all_preds == all_labels).sum()
             total = all_labels.numel()
             accuracy = correct.float() / total
-            
+
             # Sync across distributed ranks if needed
             if self._get_dp_group_size(include_cp=True) > 1:
                 correct = self._dp_allreduce(correct.float(), include_cp=True)
-                total_across_ranks = self._dp_allreduce(torch.tensor(total, device=correct.device, dtype=torch.float), include_cp=True)
+                total_across_ranks = self._dp_allreduce(
+                    torch.tensor(total, device=correct.device, dtype=torch.float), include_cp=True
+                )
                 accuracy = correct / total_across_ranks
         else:
             accuracy = 0.0
-        
+
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,

@@ -90,7 +90,9 @@ class CheckpointingConfig:
     is_async: bool = False
     dequantize_base_checkpoint: bool | None = None
     original_model_root_dir: str | None = None
-    skip_task_head_prefixes_for_base_model: list[str] | None = None  # Parameter prefixes to skip when loading base model
+    skip_task_head_prefixes_for_base_model: list[str] | None = (
+        None  # Parameter prefixes to skip when loading base model
+    )
 
     def __post_init__(self):
         """
