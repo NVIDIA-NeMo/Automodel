@@ -163,6 +163,15 @@ class ModelState:
             for k in keys_to_remove:
                 model_state_dict.pop(k)
 
+        # Remove task-specific heads when loading base model for fine-tuning
+        # These layers (classifier, score, qa_outputs, etc.) don't exist in base pretrained models
+        # and will be randomly initialized
+        task_head_prefixes = ["classifier.", "score.", "qa_outputs.", "seq_relationship."]
+        keys_to_remove = [k for k in model_state_dict.keys() 
+                         if any(k.startswith(prefix) for prefix in task_head_prefixes)]
+        for k in keys_to_remove:
+            model_state_dict.pop(k)
+
         return model_state_dict
 
     def _set_base_model_state_dict(self, state_dict: dict[str, Any]) -> None:
