@@ -19,13 +19,8 @@ import torch
 from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.moe import state_dict_utils
 from nemo_automodel.components.moe.layers import MoEConfig
-from nemo_automodel.components.moe.state_dict_utils import (
-    create_dtensor_from_local,
-    get_expert_range_for_rank_from_mesh,
-    get_submesh,
-    is_dtensor,
-)
 from nemo_automodel.components.moe.utils import BackendConfig
 
 
@@ -100,9 +95,9 @@ class Qwen3VLMoeStateDictAdapter(StateDictAdapter):
 
         n_experts = self.moe_config.n_routed_experts
         if device_mesh is not None:
-            start_expert, end_expert = get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
+            start_expert, end_expert = state_dict_utils.get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
             rank = (
-                get_submesh(device_mesh, ("ep",)).get_rank()
+                state_dict_utils.get_submesh(device_mesh, ("ep",)).get_rank()
                 if "ep" in device_mesh.mesh_dim_names
                 else device_mesh.get_rank()
             )
@@ -119,12 +114,12 @@ class Qwen3VLMoeStateDictAdapter(StateDictAdapter):
             if match:
                 _, layer_num, which = match.groups()
                 tensor = value
-                if is_dtensor(tensor):
+                if state_dict_utils.is_dtensor(tensor):
                     tensor = tensor.to_local()
                 local_tensor = tensor[start_expert:end_expert].to(self.dtype)
                 native_key = f"{model_prefix}language_model.layers.{layer_num}.mlp.experts."
                 native_key += "gate_and_up_projs" if which == "gate_up_proj" else "down_projs"
-                state_dict[native_key] = create_dtensor_from_local(local_tensor, device_mesh, rank)
+                state_dict[native_key] = state_dict_utils.create_dtensor_from_local(local_tensor, device_mesh, rank)
                 continue
 
             if key.endswith("_scale_inv"):
@@ -141,19 +136,24 @@ class Qwen3VLMoeStateDictAdapter(StateDictAdapter):
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         """Convert a single native tensor back to the aggregated HF format."""
         prefix = "model." if self._uses_model_prefix else ""
+        exclude_key_regex = kwargs.get("exclude_key_regex")
 
         if ".mlp.experts.gate_and_up_projs" in fqn:
             layer_num = re.search(r"layers\.(\d+)", fqn).group(1)
             key = f"{prefix}language_model.layers.{layer_num}.mlp.experts.gate_up_proj"
-            if is_dtensor(tensor):
+            if state_dict_utils.is_dtensor(tensor):
                 tensor = tensor.to_local()
-            return [(key, tensor.to(self.dtype))]
-
-        if ".mlp.experts.down_projs" in fqn:
+            result = [(key, tensor.to(self.dtype))]
+        elif ".mlp.experts.down_projs" in fqn:
             layer_num = re.search(r"layers\.(\d+)", fqn).group(1)
             key = f"{prefix}language_model.layers.{layer_num}.mlp.experts.down_proj"
-            if is_dtensor(tensor):
+            if state_dict_utils.is_dtensor(tensor):
                 tensor = tensor.to_local()
-            return [(key, tensor.to(self.dtype))]
+            result = [(key, tensor.to(self.dtype))]
+        else:
+            result = [(fqn, tensor)]
 
-        return [(fqn, tensor)]
+        if exclude_key_regex:
+            result = [(k, v) for k, v in result if not re.match(exclude_key_regex, k)]
+
+        return result

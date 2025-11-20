@@ -345,7 +345,11 @@ class Qwen3VLMoeForConditionalGeneration(HFQwen3VLMoeForConditionalGeneration, M
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
 
         with buffer_device:
-            self.model.language_model.init_weights(buffer_device=buffer_device)
+            language_model = self.model.language_model
+            try:
+                language_model.init_weights(buffer_device=buffer_device)
+            except TypeError:
+                language_model.init_weights()
             final_out_std = text_config.hidden_size**-0.5
             cutoff_factor = 3
             if self.lm_head is not None:
