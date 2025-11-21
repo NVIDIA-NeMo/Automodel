@@ -18,6 +18,7 @@ This module contains optimized tensor parallel plans for different model archite
 including LLaMA, Qwen, and Gemma3 models.
 """
 
+import logging
 from typing import Callable, Dict, Union, cast
 
 import torch
@@ -42,6 +43,8 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForS
 
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM as CustomLlamaForCausalLM
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
+
+logger = logging.getLogger(__name__)
 
 
 class SequenceParallelAllGatherActivation(SequenceParallel):
@@ -122,23 +125,24 @@ def _parallelize_gemma3(
         "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
     }
 
-    base_model_sp_plan = {
-        f"{model_prefix}.embed_tokens": RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1)),
-        f"{model_prefix}.rotary_emb": RotaryEmbedParallel(use_local_output=True),
-        f"{model_prefix}.rotary_emb_local": RotaryEmbedParallel(use_local_output=True),
-        f"{model_prefix}.layers.*.input_layernorm": SequenceParallel(),
-        f"{model_prefix}.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
-        f"{model_prefix}.layers.*.post_attention_layernorm": SequenceParallel(),
-        f"{model_prefix}.layers.*.pre_feedforward_layernorm": SequenceParallel(),
-        f"{model_prefix}.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
-        f"{model_prefix}.layers.*.post_feedforward_layernorm": SequenceParallel(),
-        f"{model_prefix}.norm": SequenceParallel(),
-        "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False),
-    }
+    #    base_model_sp_plan = {
+    #        f"{model_prefix}.embed_tokens": RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1)),
+    #        f"{model_prefix}.rotary_emb": RotaryEmbedParallel(use_local_output=True),
+    #        f"{model_prefix}.rotary_emb_local": RotaryEmbedParallel(use_local_output=True),
+    #        f"{model_prefix}.layers.*.input_layernorm": SequenceParallel(),
+    #        f"{model_prefix}.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
+    #        f"{model_prefix}.layers.*.post_attention_layernorm": SequenceParallel(),
+    #        f"{model_prefix}.layers.*.pre_feedforward_layernorm": SequenceParallel(),
+    #        f"{model_prefix}.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
+    #        f"{model_prefix}.layers.*.post_feedforward_layernorm": SequenceParallel(),
+    #        f"{model_prefix}.norm": SequenceParallel(),
+    #        "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False),
+    #    }
 
     if sequence_parallel:
-        # Enable sequence parallelism only if TP size > 1
-        base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
+        #     # Enable sequence parallelism only if TP size > 1
+        #     base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
+        logger.warning("Ignoring sequence parallelism for Qwen3. This is not supported in 25.11")
 
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
@@ -200,48 +204,48 @@ def _parallelize_qwen(
                 raise ValueError(f"expecting input of {mod} to be a torch.Tensor or DTensor, but got {input_tensor}")
 
     if sequence_parallel:
-        base_model_tp_plan = {
-            "lm_head": ColwiseParallel(
-                input_layouts=Shard(1),
-                output_layouts=Shard(-1),
-                use_local_output=False,
-            ),
-            "model.embed_tokens": RowwiseParallel(
-                input_layouts=Replicate(),
-                output_layouts=Shard(1),
-            ),
-            "model.norm": SequenceParallel(),
-            "model.layers.*.input_layernorm": SequenceParallelAllGatherActivation(),
-            "model.layers.*.self_attn.q_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.k_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.v_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
-            "model.layers.*.self_attn.q_norm": Qwen3QKNorm(),
-            "model.layers.*.self_attn.k_norm": Qwen3QKNorm(),
-            "model.layers.*.post_attention_layernorm": SequenceParallelAllGatherActivation(),
-            "model.layers.*.mlp.up_proj": ColwiseParallel(),
-            "model.layers.*.mlp.gate_proj": ColwiseParallel(),
-            "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),
-            "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
-        }
+        logger.warning("Ignoring sequence parallelism for Qwen3. This is not supported in 25.11")
+    #     base_model_tp_plan = {
+    #         "lm_head": ColwiseParallel(
+    #             input_layouts=Shard(1),
+    #             output_layouts=Shard(-1),
+    #             use_local_output=False,
+    #         ),
+    #         "model.embed_tokens": RowwiseParallel(
+    #             input_layouts=Replicate(),
+    #             output_layouts=Shard(1),
+    #         ),
+    #         "model.norm": SequenceParallel(),
+    #         "model.layers.*.input_layernorm": SequenceParallelAllGatherActivation(),
+    #         "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+    #         "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+    #         "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+    #         "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),
+    #         "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
+    #         "model.layers.*.self_attn.q_norm": Qwen3QKNorm(),
+    #         "model.layers.*.self_attn.k_norm": Qwen3QKNorm(),
+    #         "model.layers.*.post_attention_layernorm": SequenceParallelAllGatherActivation(),
+    #         "model.layers.*.mlp.up_proj": ColwiseParallel(),
+    #         "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+    #         "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),
+    #         "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
+    #     }
 
-    else:
-        base_model_tp_plan = {
-            "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
-            "model.embed_tokens": RowwiseParallel(
-                input_layouts=Replicate(),
-            ),
-            "model.layers.*.self_attn.q_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.k_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.v_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.o_proj": RowwiseParallel(),
-            "model.layers.*.mlp.up_proj": ColwiseParallel(),
-            "model.layers.*.mlp.gate_proj": ColwiseParallel(),
-            "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),
-            "model.layers.*.mlp.down_proj": RowwiseParallel(),
-        }
+    base_model_tp_plan = {
+        "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+        "model.embed_tokens": RowwiseParallel(
+            input_layouts=Replicate(),
+        ),
+        "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+        "model.layers.*.mlp.up_proj": ColwiseParallel(),
+        "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+        "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),
+        "model.layers.*.mlp.down_proj": RowwiseParallel(),
+    }
 
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
