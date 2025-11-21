@@ -12,29 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""State dict adapter for Llama model with combined projections.
+"""State dict adapter for Qwen2 model with combined projections.
 
 Uses the generic CombinedProjectionStateDictAdapter from common/.
 """
 
-from transformers import LlamaConfig
+from transformers import Qwen2Config
 
 from nemo_automodel.components.models.common.combined_projection.state_dict_adapter import (
     CombinedProjectionStateDictAdapter,
 )
 
 
-class LlamaStateDictAdapter(CombinedProjectionStateDictAdapter):
-    """State dict adapter for Llama models.
+class Qwen2StateDictAdapter(CombinedProjectionStateDictAdapter):
+    """State dict adapter for Qwen2 models.
 
     Inherits from the generic CombinedProjectionStateDictAdapter,
-    providing a clean interface specific to Llama.
+    providing a clean interface specific to Qwen2.
 
     Example:
-        from transformers import LlamaConfig
+        from transformers import Qwen2Config
 
-        config = LlamaConfig.from_pretrained("meta-llama/Llama-3-8B")
-        adapter = LlamaStateDictAdapter(config)
+        config = Qwen2Config.from_pretrained("Qwen/Qwen2.5-7B")
+        adapter = Qwen2StateDictAdapter(config)
 
         # Convert HF checkpoint to custom format
         custom_state_dict = adapter.from_hf(hf_state_dict)
@@ -43,6 +43,6 @@ class LlamaStateDictAdapter(CombinedProjectionStateDictAdapter):
         hf_state_dict = adapter.to_hf(custom_state_dict)
     """
 
-    def __init__(self, config: LlamaConfig):
-        """Initialize adapter with Llama config."""
+    def __init__(self, config: Qwen2Config):
+        """Initialize adapter with Qwen2 config."""
         super().__init__(config)

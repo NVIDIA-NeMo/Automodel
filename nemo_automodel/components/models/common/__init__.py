@@ -12,8 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Custom Llama model implementation for NeMo Automodel."""
+"""Common/shared components for model implementations."""
 
-from nemo_automodel.components.models.llama.model import LlamaForCausalLM, build_llama_model
+from nemo_automodel.components.models.common.combined_projection import (
+    CombinedGateUpMLP,
+    CombinedQKVAttentionMixin,
+)
+from nemo_automodel.components.models.common.combined_projection.state_dict_adapter import (
+    CombinedProjectionStateDictAdapter,
+)
 
-__all__ = ["LlamaForCausalLM", "build_llama_model"]
+__all__ = ["CombinedQKVAttentionMixin", "CombinedGateUpMLP", "CombinedProjectionStateDictAdapter"]
