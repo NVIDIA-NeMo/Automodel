@@ -116,7 +116,7 @@ moe = [
     # "flash-attn==2.7.4.post1",
     # "grouped_gemm",
 ]
-extra = ["fla"]
+extra = ["flash-linear-attention"]
 
 all = [
     "nemo_automodel[extra]",
