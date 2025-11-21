@@ -80,7 +80,7 @@ loss_fn:
 dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
     trust_remote_code: true
   path_or_dataset: rowan/hellaswag
@@ -99,7 +99,7 @@ dataloader:
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
     trust_remote_code: true
   path_or_dataset: rowan/hellaswag
