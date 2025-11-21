@@ -518,16 +518,23 @@ class TrainBiencoderRecipe(BaseRecipe):
                 # Log metrics
                 self.log_train_metrics(train_log_data)
 
-                # Save checkpoint every ckpt_every_steps
-                if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(epoch, self.step_scheduler.step)
-
                 # Run validation every val_every_steps
+                val_loss = None
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     val_log_data = self._run_validation_epoch(self.val_dataloader)
                     self.log_val_metrics(val_log_data)
+                    val_loss = {"val_loss": val_log_data.metrics["val_loss"]}
                     for mp in self.model_parts:
                         mp.train()
+
+                # Save checkpoint every ckpt_every_steps
+                if self.step_scheduler.is_ckpt_step:
+                    self.save_checkpoint(
+                        epoch,
+                        self.step_scheduler.step,
+                        train_loss=train_log_data.metrics["loss"],
+                        val_loss=val_loss,
+                    )
 
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
