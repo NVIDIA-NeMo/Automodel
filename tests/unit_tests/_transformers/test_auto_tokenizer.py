@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 from transformers.tokenization_utils_base import BatchEncoding
 
-from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
+from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer, _add_token
 
 
 class _StubHFTokenizer:
@@ -61,5 +61,55 @@ class TestNeMoAutoTokenizerFromPretrained:
             assert out["input_ids"] == [[5, 6]]
             assert out["attention_mask"] == [[1, 1]]
             assert tok.encode("x") == [5, 6]
+
+
+class TestAddTokenHelper:
+    def test_input_ids_single_sequence_no_duplicates(self):
+        enc = BatchEncoding({"input_ids": [5, 6]})
+        # prepend bos
+        out = _add_token(enc, 101, 0, "input_ids")
+        assert out["input_ids"] == [101, 5, 6]
+        # append eos
+        out = _add_token(out, 102, -1, "input_ids")
+        assert out["input_ids"] == [101, 5, 6, 102]
+        # no duplicate prepend
+        out = _add_token(out, 101, 0, "input_ids")
+        assert out["input_ids"] == [101, 5, 6, 102]
+        # no duplicate append
+        out = _add_token(out, 102, -1, "input_ids")
+        assert out["input_ids"] == [101, 5, 6, 102]
+
+    def test_masks_batched_always_extend(self):
+        enc = BatchEncoding({"attention_mask": [[1, 1], [1]]})
+        # always add on prepend
+        out = _add_token(enc, 1, 0, "attention_mask")
+        assert out["attention_mask"] == [[1, 1, 1], [1, 1]]
+        # always add on append
+        out = _add_token(out, 1, -1, "attention_mask")
+        assert out["attention_mask"] == [[1, 1, 1, 1], [1, 1, 1]]
+
+    def test_empty_sequences(self):
+        # input_ids empty
+        enc_ids = BatchEncoding({"input_ids": []})
+        out_ids = _add_token(enc_ids, 101, 0, "input_ids")
+        assert out_ids["input_ids"] == [101]
+        out_ids = _add_token(out_ids, 102, -1, "input_ids")
+        assert out_ids["input_ids"] == [101, 102]
+        # masks empty batched
+        enc_mask = BatchEncoding({"assistant_masks": [[]]})
+        out_mask = _add_token(enc_mask, 1, 0, "assistant_masks")
+        assert out_mask["assistant_masks"] == [[1]]
+        out_mask = _add_token(out_mask, 1, -1, "assistant_masks")
+        assert out_mask["assistant_masks"] == [[1, 1]]
+
+    def test_invalid_position_raises(self):
+        enc = BatchEncoding({"input_ids": [5, 6]})
+        with pytest.raises(ValueError):
+            _add_token(enc, 999, 1, "input_ids")
+
+    def test_invalid_sequence_type_raises(self):
+        enc = BatchEncoding({"input_ids": "not-a-list"})
+        with pytest.raises(ValueError):
+            _add_token(enc, 101, 0, "input_ids")
 
 
