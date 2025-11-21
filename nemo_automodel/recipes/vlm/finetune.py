@@ -172,8 +172,6 @@ def build_model_and_optimizer(
                 fp8_config = build_fp8_config(cfg_fp8)
                 model = apply_fp8_to_model(model, config=fp8_config)
 
-        print_trainable_parameters(model)
-
         # hold a copy of the model state dict keys before any parallelization
         state_dict_keys = model.state_dict().keys()
 
@@ -224,6 +222,7 @@ def build_model_and_optimizer(
                 load_base_model=load_base_model,
             )
 
+        print_trainable_parameters(model)
         model = model.to(device)
 
         # Apply torch.compile if configured
