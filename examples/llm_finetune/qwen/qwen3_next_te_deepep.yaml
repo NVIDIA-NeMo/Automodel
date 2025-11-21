@@ -34,10 +34,8 @@ parallelizer:
   activation_checkpointing: false
 
 model:
-  _target_: nemo_automodel.components.models.qwen3_next.model.Qwen3NextForCausalLM.from_config
-  config:
-    _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: Qwen/Qwen3-Next-80B-A3B-Instruct
+  _target_: nemo_automodel.components.models.qwen3_next.model.Qwen3NextForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-Next-80B-A3B-Instruct
 
 checkpoint:
   enabled: false
