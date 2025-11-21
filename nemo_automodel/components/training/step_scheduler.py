@@ -56,16 +56,16 @@ class StepScheduler(Stateful):
         Initialize the StepScheduler.
 
         Args:
-            global_batch_size (int): Number of steps for gradient accumulation.
-            local_batch_size (int): Number of steps for gradient accumulation.
-            dp_size (int): Number of steps for gradient accumulation.
+            global_batch_size (int): Total number of samples processed per optimizer step across all GPUs. This is the effective batch size for the entire training step.
+            local_batch_size (int): Number of samples per micro-batch per GPU. This is the batch size for a single forward/backward pass on one GPU.
+            dp_size (int): Number of GPUs for data parallelism.
+            dataloader: The training dataloader.
             ckpt_every_steps (Optional[int]): Frequency of checkpoint steps.
-            dataloader (Optional[int]): The training dataloader.
-            val_every_steps (int): Number of training steps between validation.
-            start_step (int): Initial global step.
-            start_epoch (int): Initial epoch.
-            num_epochs (int): Total number of epochs.
-            max_steps (int): Total number of steps to run. Default is 2^63-1.
+            val_every_steps (Optional[int]): Number of training steps between validation.
+            start_step (int): Initial global step. Used when resuming from checkpoint. Default: 0.
+            start_epoch (int): Initial epoch. Used when resuming from checkpoint. Default: 0.
+            num_epochs (int): Total number of epochs. Default: 10.
+            max_steps (Optional[int]): Maximum number of steps to run. If None, calculated from num_epochs.
         """
         assert global_batch_size % (local_batch_size * dp_size) == 0, (
             f"global_batch_size ({global_batch_size}) must be divisible by local_batch_size * dp_size ({local_batch_size} * {dp_size})"
