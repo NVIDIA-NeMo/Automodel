@@ -15,11 +15,9 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
-from typing import Iterable, List, Tuple
 
 import pytest
-from transformers import AutoTokenizer
+from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 
 from nemo_automodel.components.datasets.llm.formatting_utils import (
     _add_pad_token,
@@ -40,7 +38,7 @@ def test_format_prompt_completion_options(seq_length, padding, truncation):
     os.environ["HF_HUB_OFFLINE"] = "1"
     TOKENIZER_DIR = f"{os.environ['TEST_DATA_DIR']}/hf_mixtral_2l"
     assert os.path.exists(TOKENIZER_DIR), "Tokenizer directory does not exist"
-    tok = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
+    tok = NeMoAutoTokenizer.from_pretrained(TOKENIZER_DIR)
     # Only applicable when tokenizer lacks chat template
     assert getattr(tok, "chat_template", None) is None
 
@@ -121,7 +119,7 @@ def test_format_chat_template_options(seq_length, padding, truncation):
     os.environ["HF_HUB_OFFLINE"] = "1"
     TOKENIZER_DIR = f"{os.environ['TEST_DATA_DIR']}/qwen3_4b_instruct_2407"
     assert os.path.exists(TOKENIZER_DIR), "Tokenizer directory does not exist"
-    tok = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
+    tok = NeMoAutoTokenizer.from_pretrained(TOKENIZER_DIR)
     # Only applicable when tokenizer DOES define a chat template
     if not getattr(tok, "chat_template", None):
         pytest.skip(f"Tokenizer qwen3_4b_instruct_2407 has no chat_template; skipping chat-template tests.")
