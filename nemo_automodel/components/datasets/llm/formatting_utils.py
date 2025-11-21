@@ -84,14 +84,6 @@ def _package_tokenized_example(
     Returns:
         A dictionary with input_ids, labels, and attention_mask.
     """
-    # llama3 tokenizer does not add eos token
-    # see: https://github.com/huggingface/transformers/issues/22794
-    if not _has_chat_template(tokenizer) and eos_token_id != input_ids[-1]:
-        input_ids += [eos_token_id]
-        assistant_masks += [1]
-    if not _has_chat_template(tokenizer) and pad_token_id is not None:
-        assistant_masks += [pad_token_id]
-
     labels = input_ids.copy()
     input_ids = input_ids[:-1]
     # input_ids= [a, b] -> attention_mask = [1, 1]
@@ -152,12 +144,20 @@ def format_prompt_completion(
 
     # Tokenize separately to locate answer start
     if answer_only_loss_mask:
-        prompt_ids = tokenizer(prompt)["input_ids"]
+        # don't add eos token here. NOTE: this is only for calculating the length of the prompt.
+        # we are not modifying the prompt to be returned here.
+        prompt_ids = [tokenizer.bos_token_id] if tokenizer.add_bos_token else []
+        prompt_ids += tokenizer(prompt, add_special_tokens=False)["input_ids"]
         len_prompt_ids = len(prompt_ids)
     else:
         len_prompt_ids = 0
     # Tokenize full text
-    input_ids = tokenizer(full_text, padding=padding, truncation=truncation, max_length=seq_length)["input_ids"]
+    input_ids = tokenizer(
+        full_text,
+        padding=padding,
+        truncation=truncation,
+        max_length=seq_length,
+    )["input_ids"]
 
     # Create assistant_masks: 0 for prompt tokens, 1 for answer tokens
     assistant_masks = [0] * len_prompt_ids + [1] * (len(input_ids) - len_prompt_ids)

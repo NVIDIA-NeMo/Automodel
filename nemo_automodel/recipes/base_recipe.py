@@ -143,7 +143,8 @@ class BaseRecipe:
             self.__dict__["__state_tracked"] = set()
 
         # Initialize best checkpoint tracking
-        self.__dict__["_best_val_loss"] = float("inf")
+        if "_best_val_loss" not in self.__dict__:
+            self.__dict__["_best_val_loss"] = float("inf")
 
         # Track stateful objects unless they are validation/eval components.
         should_track = (

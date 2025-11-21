@@ -49,6 +49,7 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
         start_of_turn_token: Optional[str] = None,
         limit_dataset_samples: Optional[int] = None,
         repeat_on_exhaustion: bool = True,
+        use_hf_chat_template: bool = False,
     ) -> None:
         if tokenizer is None:
             raise ValueError("Tokenizer is required")
@@ -79,6 +80,7 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
         self.seq_length = seq_length
         self.padding = padding
         self.truncation = truncation
+        self.use_hf_chat_template = use_hf_chat_template
         self.num_shards = getattr(self, "num_shards", 1)
         self._current_epoch_for_repeat = 0
         self.repeat_on_exhaustion = bool(repeat_on_exhaustion)

@@ -36,6 +36,8 @@ class DummyTokenizer:
         self._vocab = {"<eos>": 0, "<bos>": 1, start_of_turn: 2}
         self.eos_token_id = 0
         self.bos_token_id = 1
+        # mimic HF tokenizer setting: add BOS when computing lengths/masks
+        self.add_bos_token = True
         if with_chat_template:
             # Set a chat template string with generation keyword for proper masking
             self.chat_template = "{{ messages }}{% generation %}"
@@ -163,8 +165,10 @@ def test_sequence_padding():
             if key == "___PAD_TOKEN_IDS___":
                 continue
             assert len(val) == pad_len
-        # last id in labels must equal eos
-        assert list(filter(lambda x: x != -100, row["labels"])) == [0]
+        # last non-padded label should be eos token
+        non_padded_labels = list(filter(lambda x: x != -100, row["labels"]))
+        assert len(non_padded_labels) > 0, "There should be at least one non-padded label"
+        assert non_padded_labels[-1] == 0, f"Last non-padded label should be eos (0), got {non_padded_labels[-1]}"
         if 'loss_mask' in row:
             # loss mask padding must be zeros
             assert row["loss_mask"][-1] == 0
