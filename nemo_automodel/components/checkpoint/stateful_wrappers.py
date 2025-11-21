@@ -66,7 +66,11 @@ class ModelState:
     """
 
     def __init__(
-        self, model: torch.nn.Module | list[torch.nn.Module], is_peft: bool = False, is_init_step: bool = False
+        self,
+        model: torch.nn.Module | list[torch.nn.Module],
+        is_peft: bool = False,
+        is_init_step: bool = False,
+        skip_task_head_prefixes: list[str] | None = None,
     ):
         """
         Initialize a ModelState instance for distributed checkpointing.
@@ -74,13 +78,18 @@ class ModelState:
         The constructor records the model reference, detects whether the model
         ties its language-model head to the input embeddings, and stores the
         desired serialization backend so that DCP can correctly save and restore
-        the model’s parameters and buffers.
+        the model's parameters and buffers.
 
         Args:
             model (torch.nn.Module): The PyTorch model whose state should be
                 captured during checkpointing.
             is_peft (bool): Whether the model is PEFT.
             is_init_step (bool): Whether the model is being initialized.
+            skip_task_head_prefixes (list[str] | None): List of parameter name prefixes to skip when loading from base model. If None or empty, loads all parameters.
+                Common examples:
+                - ["classifier."] for sequence/token classification
+                - ["qa_outputs."] for question answering
+                - ["score."] for some classification heads
         """
         self.model = [model] if isinstance(model, torch.nn.Module) else model
         self.is_tied_lm_head = getattr(getattr(self.model[0], "config", {}), "tie_word_embeddings", False)
@@ -99,6 +108,7 @@ class ModelState:
             self.lm_head_param_name = lm_head_param_name
         self.is_peft = is_peft
         self.is_init_step = is_init_step
+        self.skip_task_head_prefixes = skip_task_head_prefixes or []
 
     def state_dict(self) -> dict[str, Any]:
         """
@@ -161,11 +171,24 @@ class ModelState:
 
     def _get_base_model_state_dict(self) -> dict[str, Any]:
         model_state_dict = {k: v for sd in map(get_model_state_dict, self.model) for k, v in sd.items()}
+
         if self.is_tied_lm_head:
             # PP models don't have tied embeddings. Safe to pass in model[0] here.
             model_state_dict.pop(self.lm_head_param_name, None)
+
         if self.is_peft:
             keys_to_remove = [k for k in model_state_dict.keys() if "lora" in k]
+            for k in keys_to_remove:
+                model_state_dict.pop(k)
+
+        if self.skip_task_head_prefixes:
+            # Remove task-specific heads when loading base model for fine-tuning
+            # These layers don't exist in base pretrained models and will be randomly initialized
+            keys_to_remove = [
+                k
+                for k in model_state_dict.keys()
+                if any(k.startswith(prefix) for prefix in self.skip_task_head_prefixes)
+            ]
             for k in keys_to_remove:
                 model_state_dict.pop(k)
 

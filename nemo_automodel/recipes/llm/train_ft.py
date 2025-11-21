@@ -143,6 +143,7 @@ def build_model_and_optimizer(
     loss_fn=None,
     parallelize_fn=None,
     load_base_model=True,
+    unfreeze_modules: list[str] | None = None,
 ) -> tuple[nn.Module | AutoPipeline, list[str], list["Optimizer"], nn.Module, dict]:  # noqa: F821
     """
     Build and initialize a model and optimizer.
@@ -160,6 +161,7 @@ def build_model_and_optimizer(
         cp_size: Column parallel size.
         cfg_fp8: Configuration for FP8.
         cfg_compile: Configuration for torch.compile.
+        unfreeze_modules: List of module names/substrings to unfreeze (e.g. ["classifier"]). Applied after PEFT freezing but before optimizer creation.
 
     Returns:
         The instantiated model on the specified device, the state dict keys before any parallelization, the optimizer, the loss function, and param_info dict.
@@ -203,6 +205,13 @@ def build_model_and_optimizer(
             if cfg_fp8 is not None:
                 fp8_config = build_fp8_config(cfg_fp8)
                 model = apply_fp8_to_model(model, config=fp8_config)
+
+        # Explicitly unfreeze specified modules (e.g. task heads) that need full fine-tuning
+        if unfreeze_modules:
+            for name, param in model.named_parameters():
+                if any(module_name in name for module_name in unfreeze_modules):
+                    param.requires_grad_(True)
+            logging.info(f"Unfroze parameters matching: {unfreeze_modules}")
 
     trainable_params, total_params = print_trainable_parameters(model)
     param_info = {
