@@ -69,7 +69,7 @@ dataset:
   paths: /path/to/fineweb_edu/processed_data_*_text_document*  # REPLACE THIS
   index_mapping_dir: /path/to/fineweb_edu/mapping_dir  # REPLACE THIS
   tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
     trust_remote_code: true
   seq_length: 2048
@@ -86,7 +86,7 @@ validation_dataset:
   paths: /path/to/fineweb_edu/processed_data_*_text_document*  # REPLACE THIS
   index_mapping_dir: /path/to/fineweb_edu/mapping_dir  # REPLACE THIS
   tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
     trust_remote_code: true
   seq_length: 2048
