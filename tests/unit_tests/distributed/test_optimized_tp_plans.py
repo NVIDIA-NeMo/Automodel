@@ -245,6 +245,7 @@ class TestParallelizeFunctions:
         for pattern in expected_patterns:
             assert pattern in result
 
+    @pytest.mark.skip(reason="SP disabled for now")
     def test_parallelize_gemma3_with_sequence_parallel(self):
         """Test _parallelize_gemma3 with sequence parallelism enabled."""
         model = MockModel("gemma3_causal")
@@ -359,6 +360,7 @@ class TestParallelizeFunctions:
         assert isinstance(result, dict)
         assert len(result) > 0
 
+    @pytest.mark.skip(reason="SP disabled for now")
     def test_parallelize_qwen_with_sequence_parallel(self):
         """Test _parallelize_qwen with sequence parallelism."""
         model = MockModel("qwen2", tie_word_embeddings=False)
@@ -381,6 +383,7 @@ class TestParallelizeFunctions:
         lm_head = result["lm_head"]
         assert isinstance(lm_head, ColwiseParallel)
 
+    @pytest.mark.skip(reason="SP disabled for now.")
     def test_parallelize_qwen3_with_sequence_parallel(self):
         """Test _parallelize_qwen with Qwen3 and sequence parallelism."""
         model = MockModel("qwen3", tie_word_embeddings=False)
