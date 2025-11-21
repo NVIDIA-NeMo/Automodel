@@ -34,6 +34,7 @@ from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
+from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 
 try:
     import yaml as _yaml
@@ -81,7 +82,7 @@ def is_tokenizer(object):
     Returns:
         bool: returns True if object is a tokenizer or VLM processor.
     """
-    return isinstance(object, (PreTrainedTokenizerBase, ProcessorMixin))
+    return isinstance(object, (PreTrainedTokenizerBase, ProcessorMixin, NeMoAutoTokenizer))
 
 
 def is_lr_scheduler(object):
