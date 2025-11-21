@@ -43,7 +43,6 @@ from typing import Any, Dict, Optional
 import torch
 import wandb
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
-from transformers import AutoTokenizer
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
@@ -56,6 +55,7 @@ from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     calculate_loss,
 )
+from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -105,10 +105,10 @@ def _build_teacher_model(cfg_teacher, seed, has_packed_sequence, device, model_w
 def _verify_tokenizer_compatibility(student_cfg, teacher_cfg, trust_remote_code=True):
     if student_cfg is None or teacher_cfg is None:
         raise ValueError("Student and teacher model configs are required")
-    student_tokenizer = AutoTokenizer.from_pretrained(
+    student_tokenizer = NeMoAutoTokenizer.from_pretrained(
         student_cfg.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
     )
-    teacher_tokenizer = AutoTokenizer.from_pretrained(
+    teacher_tokenizer = NeMoAutoTokenizer.from_pretrained(
         teacher_cfg.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
     )
     if student_tokenizer.vocab_size != teacher_tokenizer.vocab_size:
