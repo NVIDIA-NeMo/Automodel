@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Custom Llama model implementation for NeMo Automodel."""
+"""Custom Qwen2 model implementation for NeMo Automodel."""
 
-from nemo_automodel.components.models.llama.model import LlamaForCausalLM, build_llama_model
+from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM, build_qwen2_model
 
-__all__ = ["LlamaForCausalLM", "build_llama_model"]
+__all__ = ["Qwen2ForCausalLM", "build_qwen2_model"]

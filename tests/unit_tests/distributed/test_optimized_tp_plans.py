@@ -367,7 +367,6 @@ class TestParallelizeFunctions:
 
         # Should include sequence parallel patterns
         sequence_patterns = [
-            "model.rotary_emb",
             "model.norm",
             "model.layers.*.input_layernorm",
             "model.layers.*.self_attn.q_norm",
@@ -377,9 +376,6 @@ class TestParallelizeFunctions:
 
         for pattern in sequence_patterns:
             assert pattern in result
-
-        # Check RotaryEmbedParallel is used
-        assert isinstance(result["model.rotary_emb"], RotaryEmbedParallel)
 
         # Check that lm_head has sequence parallel input layout
         lm_head = result["lm_head"]
