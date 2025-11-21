@@ -125,8 +125,6 @@ def format_prompt_completion(
     padding: Union[str, bool] = "do_not_pad",
     truncation: Union[str, bool] = "do_not_truncate",
     answer_only_loss_mask: bool = True,
-    add_bos_token: bool = True,
-    add_eos_token: bool = True,
 ) -> Dict[str, List[int]]:
     """
     Format a prompt-completion style example (without chat template).
@@ -138,8 +136,6 @@ def format_prompt_completion(
         eos_token_id: The end-of-sequence token id.
         pad_token_id: The padding token id.
         seq_length: Optional sequence length for padding.
-        add_bos_token: Whether to add the beginning-of-sequence token.
-        add_eos_token: Whether to add the end-of-sequence token.
 
     Returns:
         A dictionary with the formatted example.
@@ -148,29 +144,23 @@ def format_prompt_completion(
 
     # Tokenize separately to locate answer start
     if answer_only_loss_mask:
-        prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        # don't add eos token here. NOTE: this is only for calculating the length of the prompt.
+        # we are not modifying the prompt to be returned here.
+        prompt_ids = [tokenizer.bos_token_id] if tokenizer.add_bos_token else []
+        prompt_ids += tokenizer(prompt, add_special_tokens=False)["input_ids"]
         len_prompt_ids = len(prompt_ids)
     else:
         len_prompt_ids = 0
     # Tokenize full text
     input_ids = tokenizer(
-        full_text, add_special_tokens=False, padding=padding, truncation=truncation, max_length=seq_length
+        full_text,
+        padding=padding,
+        truncation=truncation,
+        max_length=seq_length,
     )["input_ids"]
-
-    if add_bos_token and input_ids[0] != tokenizer.bos_token_id:
-        assert tokenizer.bos_token_id is not None, "Tokenizer does not have a bos token"
-        input_ids = [tokenizer.bos_token_id] + input_ids
-        len_prompt_ids += 1
 
     # Create assistant_masks: 0 for prompt tokens, 1 for answer tokens
     assistant_masks = [0] * len_prompt_ids + [1] * (len(input_ids) - len_prompt_ids)
-
-    # llama3 tokenizer does not add eos token
-    # see: https://github.com/huggingface/transformers/issues/22794
-    if add_eos_token and eos_token_id != input_ids[-1]:
-        assert eos_token_id is not None, "Tokenizer does not have an eos token"
-        input_ids += [eos_token_id]
-        assistant_masks += [1]
 
     return _package_tokenized_example(
         tokenizer=tokenizer,
