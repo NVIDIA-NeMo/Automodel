@@ -12,65 +12,77 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokenizerBase
+from transformers import AutoTokenizer
+from transformers.tokenization_utils_base import BatchEncoding
 
 
-class NeMoAutoTokenizer(PreTrainedTokenizerBase):
+class NeMoAutoTokenizer:
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *args, force_hf=False, add_bos_token=True, add_eos_token=True, **kwargs):
+    def from_pretrained(
+        cls, pretrained_model_name_or_path, *args, force_hf=False, add_bos_token=True, add_eos_token=True, **kwargs
+    ):
         """
         Load the HF tokenizer class via AutoTokenizer and (optionally) wrap it to add BOS/EOS.
 
         There are pre-existing issues with some tokenizers (e.g. GPT2Tokenizer) where the BOS/EOS tokens are not added
         """
-        import types
-        from transformers import AutoTokenizer
-
         hf_tok = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
         if force_hf:
             return hf_tok
 
-        # Capture flags in closure (avoid mutating the tokenizer instance)
-        nemo_add_bos = bool(add_bos_token)
-        nemo_add_eos = bool(add_eos_token)
+        return cls(hf_tok, add_bos_token=add_bos_token, add_eos_token=add_eos_token)
 
-        original_call = hf_tok.__call__
-        original_encode = hf_tok.encode
+    def __init__(self, base_tokenizer, *, add_bos_token: bool, add_eos_token: bool):
+        self._base = base_tokenizer
+        self._add_bos = bool(add_bos_token)
+        self._add_eos = bool(add_eos_token)
 
-        def _patched_call(self, *c_args, **c_kwargs):
-            tokenized = original_call(*c_args, **c_kwargs)
-            if isinstance(tokenized, BatchEncoding):
-                _tokenized_keys = {"input_ids", "attention_mask", "assistant_masks"}
-                add_bos_ids = nemo_add_bos and (getattr(self, "bos_token_id", None) is not None)
-                add_eos_ids = nemo_add_eos and (getattr(self, "eos_token_id", None) is not None)
-                for key in _tokenized_keys:
-                    if key not in tokenized:
-                        continue
-                    if key == "input_ids":
-                        if add_bos_ids:
-                            _add_token(tokenized, self.bos_token_id, 0, key)
-                        if add_eos_ids:
-                            _add_token(tokenized, self.eos_token_id, -1, key)
-                    else:
-                        if add_bos_ids:
-                            _add_token(tokenized, 1, 0, key)
-                        if add_eos_ids:
-                            _add_token(tokenized, 1, -1, key)
+    @property
+    def add_bos_token(self):
+        return self._add_bos
+
+    @property
+    def add_eos_token(self):
+        return self._add_eos
+
+    def __getattr__(self, name):
+        # Delegate everything else to the underlying tokenizer
+        return getattr(self._base, name)
+
+    def __call__(self, *args, **kwargs):
+        tokenized = self._base(*args, **kwargs)
+        if not kwargs.get("add_special_tokens", True):
             return tokenized
+        if isinstance(tokenized, BatchEncoding):
+            _tokenized_keys = {"input_ids", "attention_mask", "assistant_masks"}
+            add_bos_ids = self._add_bos and (getattr(self, "bos_token_id", None) is not None)
+            add_eos_ids = self._add_eos and (getattr(self, "eos_token_id", None) is not None)
+            for key in _tokenized_keys:
+                if key not in tokenized:
+                    continue
+                if key == "input_ids":
+                    if add_bos_ids:
+                        _add_token(tokenized, self.bos_token_id, 0, key)
+                    if add_eos_ids:
+                        _add_token(tokenized, self.eos_token_id, -1, key)
+                else:
+                    if add_bos_ids:
+                        _add_token(tokenized, 1, 0, key)
+                    if add_eos_ids:
+                        _add_token(tokenized, 1, -1, key)
+        return tokenized
 
-        def _patched_encode(self, *e_args, **e_kwargs):
-            encoded = original_encode(*e_args, **e_kwargs)
-            if nemo_add_bos:
-                if encoded and (self.bos_token_id is not None) and encoded[0] != self.bos_token_id:
-                    encoded = [self.bos_token_id] + encoded
-            if nemo_add_eos:
-                if encoded and (self.eos_token_id is not None) and encoded[-1] != self.eos_token_id:
-                    encoded = encoded + [self.eos_token_id]
+    def encode(self, *args, **kwargs):
+        encoded = self._base.encode(*args, **kwargs)
+        if not kwargs.get("add_special_tokens", True):
             return encoded
-
-        hf_tok.__call__ = types.MethodType(_patched_call, hf_tok)
-        hf_tok.encode = types.MethodType(_patched_encode, hf_tok)
-        return hf_tok
+        if self._add_bos:
+            if encoded and (getattr(self, "bos_token_id", None) is not None) and encoded[0] != self.bos_token_id:
+                encoded = [self.bos_token_id] + encoded
+        if self._add_eos:
+            if encoded and (getattr(self, "eos_token_id", None) is not None) and encoded[-1] != self.eos_token_id:
+                encoded = encoded + [self.eos_token_id]
+        return encoded
 
 
 def _add_token(tokenized, value, position, key):

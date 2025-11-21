@@ -43,21 +43,30 @@ class TestNeMoAutoTokenizerFromPretrained:
         stub = _StubHFTokenizer()
         with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub):
             tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
-            out = tok.__call__(["x"], add_special_tokens=False)
+            out = tok(["x"])
             assert isinstance(out, BatchEncoding)
             assert out["input_ids"] == [[stub.bos_token_id, 5, 6, stub.eos_token_id]]
             assert out["attention_mask"] == [[1, 1, 1, 1]]
             assert out["assistant_masks"] == [[1, 0, 1, 1]]
 
+            out = tok(["x"], add_special_tokens=False)
+            assert isinstance(out, BatchEncoding)
+            assert out["input_ids"] == [[5, 6]]
+            assert out["attention_mask"] == [[1, 1]]
+            assert out["assistant_masks"] == [[0, 1]]
+
             enc = tok.encode("x")
             assert enc == [stub.bos_token_id, 5, 6, stub.eos_token_id]
+
+            enc = tok.encode("x", add_special_tokens=False)
+            assert enc == [5, 6]
 
     def test_force_hf_passthrough(self):
         stub = _StubHFTokenizer()
         with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub):
             tok = NeMoAutoTokenizer.from_pretrained("dummy/model", force_hf=True)
             # Should be the original stub and unmodified outputs
-            out = tok.__call__(["x"])
+            out = tok(["x"])
             assert out["input_ids"] == [[5, 6]]
             assert out["attention_mask"] == [[1, 1]]
             assert tok.encode("x") == [5, 6]
