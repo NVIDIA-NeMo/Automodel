@@ -213,6 +213,7 @@ def build_model_and_optimizer(
             if cfg_peft is not None:
                 raise ValueError("QAT with PEFT is not supported in 25.11")
             from nemo_automodel.components.quantization.qat import prepare_qat_model
+
             if any(map(lambda x: x.dtype != torch.bfloat16, model.parameters())):
                 logger.warning("QAT is only supported for bfloat16 models. Support will be added in future release.")
                 quit(code=0)
