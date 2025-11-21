@@ -44,6 +44,7 @@ import torch
 import wandb
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
+from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.utils import get_sync_ctx
@@ -55,7 +56,6 @@ from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     calculate_loss,
 )
-from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 
 logger = logging.getLogger(__name__)
 
