@@ -33,7 +33,7 @@ class NeMoAutoTokenizer:
         return cls(hf_tok, add_bos_token=add_bos_token, add_eos_token=add_eos_token)
 
     def __init__(self, base_tokenizer, *, add_bos_token: bool, add_eos_token: bool):
-        self._base = base_tokenizer
+        self._base_tokenizer = base_tokenizer
         self._add_bos = bool(add_bos_token)
         self._add_eos = bool(add_eos_token)
 
@@ -47,10 +47,20 @@ class NeMoAutoTokenizer:
 
     def __getattr__(self, name):
         # Delegate everything else to the underlying tokenizer
-        return getattr(self._base, name)
+        return getattr(self._base_tokenizer, name)
+
+    def __setattr__(self, name, value):
+        # Route writes to the underlying tokenizer when appropriate
+        internal_fields = {"_base_tokenizer", "_add_bos", "_add_eos"}
+        if name in internal_fields:
+            return object.__setattr__(self, name, value)
+        base = self.__dict__.get("_base_tokenizer", None)
+        if base is not None and hasattr(base, name):
+            return setattr(base, name, value)
+        return object.__setattr__(self, name, value)
 
     def __call__(self, *args, **kwargs):
-        tokenized = self._base(*args, **kwargs)
+        tokenized = self._base_tokenizer(*args, **kwargs)
         if not kwargs.get("add_special_tokens", True):
             return tokenized
         if isinstance(tokenized, BatchEncoding):
@@ -73,7 +83,7 @@ class NeMoAutoTokenizer:
         return tokenized
 
     def encode(self, *args, **kwargs):
-        encoded = self._base.encode(*args, **kwargs)
+        encoded = self._base_tokenizer.encode(*args, **kwargs)
         if not kwargs.get("add_special_tokens", True):
             return encoded
         if self._add_bos:
