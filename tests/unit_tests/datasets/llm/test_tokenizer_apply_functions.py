@@ -45,6 +45,8 @@ class _StubTokenizerPlain:  # noqa: D401 – minimal interface only
 
     bos_token_id = 1
     eos_token_id = 2
+    # Mirror HF behavior flag used by formatting utils when computing prompt length
+    add_bos_token = True
 
     def __init__(self) -> None:
         self._vocab: Dict[str, int] = {}
@@ -143,7 +145,8 @@ def testformat_prompt_completion_answer_only_mask():
 
     # Prompt/answer masking logic
     prompt_text = f"{context} {question} "
-    prompt_ids = tok(prompt_text)["input_ids"]
+    # The implementation tokenizes prompt without special tokens to calculate mask
+    prompt_ids_no_special = tok(prompt_text, add_special_tokens=False)["input_ids"]
     full_text = f"{context} {question} {answer}"
     # @akoumparouli: remove the eos token
     full_text_ids = tok(full_text)["input_ids"][:-1]
@@ -151,9 +154,10 @@ def testformat_prompt_completion_answer_only_mask():
     assert len(full_text_ids) == 4
     assert len(full_text_ids) == len(out["input_ids"])
 
-    # Exclude the eos token
-    expected_zeros = len(prompt_ids) - 1
-    expected_ones = len(full_text_ids) - expected_zeros
+    # The format_prompt_completion adds BOS to len_prompt_ids, then shifts labels by 1
+    # So expected masked tokens = len(prompt_ids_no_special) + 1 (BOS) - 1 (shift) = len(prompt_ids_no_special)
+    expected_zeros = len(prompt_ids_no_special)
+    expected_ones = len(out["labels"]) - expected_zeros
 
     num_ignore_labels = out["labels"].count(-100)
     assert num_ignore_labels == expected_zeros, (out, out["labels"][-4:], len(out["labels"]), num_ignore_labels)

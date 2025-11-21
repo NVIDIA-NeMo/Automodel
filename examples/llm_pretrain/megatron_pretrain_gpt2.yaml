@@ -63,7 +63,7 @@ dataset:
   paths: fineweb_edu/megatron_gpt2/processed_data_*_text_document*  # REPLACE THIS
   index_mapping_dir: fineweb_edu/megatron_gpt2/mapping_dir  # REPLACE THIS
   tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: openai-community/gpt2
   seq_length: 1024
   split: "0.99, 0.01, 0.00"  # train, validation, test
@@ -79,7 +79,7 @@ validation_dataset:
   paths: fineweb_edu/megatron_gpt2/processed_data_*_text_document*  # REPLACE THIS
   index_mapping_dir: fineweb_edu/megatron_gpt2/mapping_dir  # REPLACE THIS
   tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: openai-community/gpt2
   seq_length: 1024
   split: "0.99, 0.01, 0.00"  # train, validation, test

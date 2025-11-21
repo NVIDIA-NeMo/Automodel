@@ -170,6 +170,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
         padding: Union[str, bool] = "do_not_pad",
         truncation: Union[str, bool] = "do_not_truncate",
         limit_dataset_samples: Optional[int] = None,
+        use_hf_chat_template: bool = False,
     ) -> None:
         """
         Initialize the dataset.
@@ -185,7 +186,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
             limit_dataset_samples: The number of samples to load from the dataset.
         """
 
-        if _has_chat_template(tokenizer):
+        if use_hf_chat_template and _has_chat_template(tokenizer):
             if not answer_only_loss_mask:
                 logging.warning(
                     "answer_only_loss_mask=False but tokenizer has chat template. Consider providing `answer_only_loss_mask`."
@@ -233,6 +234,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
         self.seq_length = seq_length
         self.padding = padding
         self.truncation = truncation
+        self.use_hf_chat_template = use_hf_chat_template
 
     def __len__(self) -> int:  # noqa: D401
         """
@@ -290,7 +292,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
         eos_token_id = getattr(self.tokenizer, "eos_token_id", 0)
         pad_token_id = _add_pad_token(self.tokenizer) or eos_token_id
 
-        if _has_chat_template(self.tokenizer):
+        if self.use_hf_chat_template and _has_chat_template(self.tokenizer):
             formatted_text = [
                 {"role": "system", "content": context or ""},
                 {"role": "user", "content": question or ""},
