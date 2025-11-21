@@ -45,6 +45,8 @@ class _StubTokenizerPlain:  # noqa: D401 – minimal interface only
 
     bos_token_id = 1
     eos_token_id = 2
+    # Mirror HF behavior flag used by formatting utils when computing prompt length
+    add_bos_token = True
 
     def __init__(self) -> None:
         self._vocab: Dict[str, int] = {}
