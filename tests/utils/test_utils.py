@@ -25,11 +25,10 @@ def run_test_script(folder, test_filename):
     )
 
     try:
-        return_code = p.wait()
+        assert p.wait() == 0
     finally:
         # Kill the entire process group, not just p
         try:
             os.killpg(os.getpgid(p.pid), signal.SIGTERM)
         except ProcessLookupError:
             pass
-        assert return_code == 0
