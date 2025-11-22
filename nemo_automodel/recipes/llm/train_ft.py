@@ -214,7 +214,10 @@ def build_model_and_optimizer(
                 raise ValueError("QAT with PEFT is not supported in 25.11")
             from nemo_automodel.components.quantization.qat import prepare_qat_model
 
-            quantizer = cfg_qat.quantizer.instantiate()
+            if any(map(lambda x: x.dtype != torch.bfloat16, model.parameters())):
+                logger.warning("QAT is only supported for bfloat16 models. Support will be added in future release.")
+                quit(code=0)
+            quantizer = cfg_qat.quantizer.instantiate(precision=torch.bfloat16, scales_precision=torch.bfloat16)
             model, qat_mode = prepare_qat_model(model, quantizer)
             # Attach helpers for delayed fake-quant toggling if desired
             model._qat_mode = qat_mode  # type: ignore[attr-defined]
