@@ -36,10 +36,9 @@ parallelizer:
   activation_checkpointing: false
 
 model:
-  _target_: nemo_automodel.components.models.qwen3_vl_moe.model.Qwen3VLMoeForConditionalGeneration.from_config
-  config:
-    _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: Qwen/Qwen3-VL-30B-A3B-Instruct
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-VL-30B-A3B-Instruct
+  #set backend to sdpa
   backend:
     _target_: nemo_automodel.components.moe.utils.BackendConfig
     attn: sdpa
@@ -76,7 +75,7 @@ loss_fn:
 dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
   path_or_dataset: mmoukouba/MedPix-VQA
-  split: train[:1000]
+  split: train
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -101,6 +100,12 @@ optimizer:
   eps: 1e-7
   lr: 1.0e-4
   weight_decay: 0.0
+
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
 
 # Uncomment and configure for W&B logging
 # wandb:
