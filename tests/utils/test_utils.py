@@ -25,7 +25,7 @@ def run_test_script(folder, test_filename):
     )
 
     try:
-        p.wait()
+        assert p.wait() == 0
     finally:
         # Kill the entire process group, not just p
         try:
