@@ -39,6 +39,7 @@ from wandb import Settings
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
+from nemo_automodel.components.callbacks import CallbackRunner
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
@@ -81,7 +82,6 @@ from nemo_automodel.components.utils.model_utils import (
     resolve_trust_remote_code,
 )
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.components.callbacks import CallbackRunner
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -846,19 +846,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         Args:
             cfg: Configuration dictionary/object for training.
             callbacks: Optional list of Callback instances.
-                
-                Example usage:
-                    >>> from nemo_automodel.components.callbacks import Callback
-                    >>> 
-                    >>> class MyCallback(Callback):
-                    ...     def on_train_batch_end(self, recipe, **kwargs):
-                    ...         if recipe.step_scheduler.step % 100 == 0:
-                    ...             metrics = kwargs['train_log_data'].metrics
-                    ...             print(f"Step {recipe.step_scheduler.step}: Loss = {metrics['loss']:.4f}")
-                    >>> 
-                    >>> recipe = TrainFinetuneRecipeForNextTokenPrediction(
-                    ...     cfg, callbacks=[MyCallback()]
-                    ... )
         """
         self.cfg = cfg
         self.callbacks = callbacks or []
@@ -1163,7 +1150,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 if self.step_scheduler.is_ckpt_step:
                     step = self.step_scheduler.step
                     train_loss = train_log_data.metrics["loss"]
-                    
+
                     self.save_checkpoint(
                         epoch,
                         step,
@@ -1171,19 +1158,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         val_losses,
                         best_metric_key=self.best_metric_key,
                     )
-                    
+
                     # Prepare checkpoint info for callback
                     checkpoint_path = os.path.join(
-                        self.checkpointer.config.checkpoint_dir,
-                        f"epoch_{epoch}_step_{step}"
+                        self.checkpointer.config.checkpoint_dir, f"epoch_{epoch}_step_{step}"
                     )
                     checkpoint_info = {
-                        'epoch': epoch,
-                        'step': step,
-                        'train_loss': train_loss,
-                        'val_losses': val_losses,
-                        'checkpoint_path': checkpoint_path,
-                        'best_metric_key': self.best_metric_key,
+                        "epoch": epoch,
+                        "step": step,
+                        "train_loss": train_loss,
+                        "val_losses": val_losses,
+                        "checkpoint_path": checkpoint_path,
+                        "best_metric_key": self.best_metric_key,
                     }
                     self.callback_runner.on_save_checkpoint(self, checkpoint_info=checkpoint_info)
         # Close JSONL loggers after training loop completes
@@ -1192,7 +1178,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             v.close()
 
         self.checkpointer.close()
-        
+
         self.callback_runner.on_train_end(self)
 
     # ------------------ helpers ------------------

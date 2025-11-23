@@ -23,6 +23,7 @@ import torch
 import wandb
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
+from nemo_automodel.components.callbacks import CallbackRunner
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
@@ -30,7 +31,6 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.components.callbacks import CallbackRunner
 from nemo_automodel.recipes.llm.train_ft import (
     build_checkpoint_config,
     build_dataloader,
@@ -52,8 +52,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
         Args:
             cfg: Configuration dictionary/object for training.
-            callbacks: Optional list of Callback instances. See TrainFinetuneRecipeForNextTokenPrediction
-                for usage examples.
+            callbacks: Optional list of Callback instances.
         """
         self.cfg = cfg
         self.callbacks = callbacks or []
@@ -216,7 +215,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 if self.step_scheduler.is_ckpt_step:
                     step = self.step_scheduler.step
                     train_loss = train_log_data.metrics["loss"]
-                    
+
                     self.save_checkpoint(
                         epoch,
                         step,
@@ -224,26 +223,25 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                         val_loss,
                         best_metric_key=self.best_metric_key,
                     )
-                    
+
                     # Prepare checkpoint info for callback
                     checkpoint_path = os.path.join(
-                        self.checkpointer.config.checkpoint_dir,
-                        f"epoch_{epoch}_step_{step}"
+                        self.checkpointer.config.checkpoint_dir, f"epoch_{epoch}_step_{step}"
                     )
                     checkpoint_info = {
-                        'epoch': epoch,
-                        'step': step,
-                        'train_loss': train_loss,
-                        'val_losses': val_loss,
-                        'checkpoint_path': checkpoint_path,
-                        'best_metric_key': self.best_metric_key,
+                        "epoch": epoch,
+                        "step": step,
+                        "train_loss": train_loss,
+                        "val_losses": val_loss,
+                        "checkpoint_path": checkpoint_path,
+                        "best_metric_key": self.best_metric_key,
                     }
                     self.callback_runner.on_save_checkpoint(self, checkpoint_info=checkpoint_info)
 
         self.metric_logger_train.close()
         self.metric_logger_valid.close()
         self.checkpointer.close()
-        
+
         self.callback_runner.on_train_end(self)
 
     def _run_train_optim_step(self, batches):

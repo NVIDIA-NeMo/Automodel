@@ -232,7 +232,7 @@ def run_interactive(args):
     COMMAND_ALIASES = {"finetune": "train_ft", "pretrain": "train_ft"}
     # remap commands: finetune -> train_ft
     command = COMMAND_ALIASES.get(args.command, args.command)
-    
+
     # Special case for VLM finetune which uses finetune.py instead of train_ft.py
     if args.domain == "vlm" and args.command == "finetune":
         command = "finetune"
