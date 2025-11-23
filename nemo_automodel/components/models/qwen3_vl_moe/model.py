@@ -157,10 +157,7 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
         if position_ids.ndim == 3 and position_ids.shape[0] == 4:
-            text_position_ids = position_ids[0]
             position_ids = position_ids[1:]
-        else:
-            text_position_ids = position_ids[0]
 
         if padding_mask is None and attention_mask is not None:
             padding_mask = attention_mask.bool().logical_not()
