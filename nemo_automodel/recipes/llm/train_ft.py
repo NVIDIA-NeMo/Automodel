@@ -29,13 +29,14 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.utils.data import DataLoader, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig
 from transformers.modeling_utils import no_init_weights
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
 from transformers.utils.hub import TRANSFORMERS_CACHE
 from wandb import Settings
 
+from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
@@ -138,11 +139,13 @@ def build_model_and_optimizer(
     cp_size=1,
     cfg_fp8=None,
     cfg_compile=None,
+    cfg_qat=None,
     cfg_quantization=None,
     autopipeline: AutoPipeline | None = None,
     loss_fn=None,
     parallelize_fn=None,
     load_base_model=True,
+    unfreeze_modules: list[str] | None = None,
 ) -> tuple[nn.Module | AutoPipeline, list[str], list["Optimizer"], nn.Module, dict]:  # noqa: F821
     """
     Build and initialize a model and optimizer.
@@ -160,6 +163,7 @@ def build_model_and_optimizer(
         cp_size: Column parallel size.
         cfg_fp8: Configuration for FP8.
         cfg_compile: Configuration for torch.compile.
+        unfreeze_modules: List of module names/substrings to unfreeze (e.g. ["classifier"]). Applied after PEFT freezing but before optimizer creation.
 
     Returns:
         The instantiated model on the specified device, the state dict keys before any parallelization, the optimizer, the loss function, and param_info dict.
@@ -200,9 +204,30 @@ def build_model_and_optimizer(
                     model, cfg_peft, quantization_config=kwargs.get("quantization_config", None)
                 )
 
-            if cfg_fp8 is not None:
-                fp8_config = build_fp8_config(cfg_fp8)
-                model = apply_fp8_to_model(model, config=fp8_config)
+        if cfg_fp8 is not None:
+            fp8_config = build_fp8_config(cfg_fp8)
+            model = apply_fp8_to_model(model, config=fp8_config)
+
+        # Apply QAT if configured (torchao QAT)
+        if cfg_qat is not None and cfg_qat.get("enabled", False):
+            if cfg_peft is not None:
+                raise ValueError("QAT with PEFT is not supported in 25.11")
+            from nemo_automodel.components.quantization.qat import prepare_qat_model
+
+            if any(map(lambda x: x.dtype != torch.bfloat16, model.parameters())):
+                logger.warning("QAT is only supported for bfloat16 models. Support will be added in future release.")
+                quit(code=0)
+            quantizer = cfg_qat.quantizer.instantiate(precision=torch.bfloat16, scales_precision=torch.bfloat16)
+            model, qat_mode = prepare_qat_model(model, quantizer)
+            # Attach helpers for delayed fake-quant toggling if desired
+            model._qat_mode = qat_mode  # type: ignore[attr-defined]
+
+        # Explicitly unfreeze specified modules (e.g. task heads) that need full fine-tuning
+        if unfreeze_modules:
+            for name, param in model.named_parameters():
+                if any(module_name in name for module_name in unfreeze_modules):
+                    param.requires_grad_(True)
+            logging.info(f"Unfroze parameters matching: {unfreeze_modules}")
 
     trainable_params, total_params = print_trainable_parameters(model)
     param_info = {
@@ -376,13 +401,13 @@ def _build_tokenizer(cfg_model, cfg_ds):
     # if tokenizer is not provided, use the model config to instantiate it
     if "tokenizer" not in cfg_ds and _get_model_name(cfg_model) is not None:
         logging.info("Using model config to instantiate tokenizer")
-        tokenizer = AutoTokenizer.from_pretrained(_get_model_name(cfg_model), trust_remote_code=trust_remote_code)
+        tokenizer = NeMoAutoTokenizer.from_pretrained(_get_model_name(cfg_model), trust_remote_code=trust_remote_code)
     elif cfg_ds.get("tokenizer", None) is None:
         tokenizer = None
     elif "_target_" not in cfg_ds.tokenizer:
         tokenizer_dict = cfg_ds.tokenizer.to_dict()
         trust_remote_code = tokenizer_dict.pop("trust_remote_code", trust_remote_code)
-        tokenizer = AutoTokenizer.from_pretrained(**tokenizer_dict, trust_remote_code=trust_remote_code)
+        tokenizer = NeMoAutoTokenizer.from_pretrained(**tokenizer_dict, trust_remote_code=trust_remote_code)
     else:
         trust_remote_code = cfg_ds.tokenizer.to_dict().pop("trust_remote_code", trust_remote_code)
         tokenizer = cfg_ds.tokenizer.instantiate(trust_remote_code=trust_remote_code)
@@ -959,6 +984,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
             cfg_quantization=self.cfg.get("quantization", None),
+            cfg_qat=self.cfg.get("qat", None),
             autopipeline=autopipeline,
             loss_fn=self.loss_fn,
             parallelize_fn=parallelize_fn,
@@ -1011,6 +1037,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Log model, parameter counts, norms, optimizer and scheduler
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
 
+        # Handle delayed fake-quant toggling for QAT if configured
+        self._qat_disable_fn, self._qat_enable_fn, self._qat_enable_after = self._setup_qat(self.cfg, self.model_parts)
+
         restore_from = self.cfg.get("checkpoint.restore_from", None)
         # Initialize JSONL loggers
         self.metric_logger_train = build_metric_logger(
@@ -1030,6 +1059,50 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
 
+    def _setup_qat(self, cfg, model_parts: list[nn.Module]):
+        if not cfg.get("qat.enabled", False):
+            return None, None, None
+        from nemo_automodel.components.quantization.qat import (
+            get_disable_fake_quant_fn,
+            get_enable_fake_quant_fn,
+        )
+
+        qat_cfg = cfg.qat
+        _qat_enable_after = qat_cfg.get("fake_quant_after_n_steps", 0)
+        # Collect mode from any model part that has it
+        qat_mode = None
+        if hasattr(model_parts[0], "_qat_mode"):
+            qat_mode = getattr(model_parts[0], "_qat_mode")
+
+        if qat_mode is None:
+            return None, None, None
+
+        _qat_disable_fn = get_disable_fake_quant_fn(qat_mode)
+        _qat_enable_fn = get_enable_fake_quant_fn(qat_mode)
+        if _qat_disable_fn is not None and _qat_enable_after is not None:
+            try:
+                # start with fake-quant disabled, will enable later
+                for part in model_parts:
+                    _qat_disable_fn(part)
+                logger.info("QAT fake-quant disabled initially; will enable after %s steps", _qat_enable_after)
+            except Exception as e:
+                logger.warning("Failed to disable fake-quant at setup: %s", e)
+        return _qat_disable_fn, _qat_enable_fn, _qat_enable_after
+
+    def _enable_qat_if_delayed(self, step: int):
+        if getattr(self, "_qat_enable_after", None) is None:
+            return
+        if step < self._qat_enable_after or self._qat_enable_fn is None:
+            return
+        try:
+            for mp in self.model_parts:
+                self._qat_enable_fn(mp)
+            logger.info("Enabled QAT fake-quant after step %s", step)
+            # Enable one
+            self._qat_enable_after = None
+        except Exception as e:
+            logger.warning("Failed to enable fake-quant: %s", e)
+
     # ------------------ main loop ------------------
     def run_train_validation_loop(self):
         """Run the training loop over all epochs and batches.
@@ -1047,6 +1120,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # 1. len(batches) == grad_acc_steps
             # 2. len(batches[0]) == batch_size
             for batches in self.step_scheduler:
+                # If QAT delayed fake-quant is configured, enable after threshold
+                self._enable_qat_if_delayed(self.step_scheduler.step)
                 train_log_data = self._run_train_optim_step(batches, 1.0)
                 # log
                 self.log_train_metrics(train_log_data)

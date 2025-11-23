@@ -2,7 +2,7 @@
 
 seed: 42
 
-# NEW: Add benchmark section
+# Benchmark section
 benchmark:
   warmup_steps: 5
   peak_tflops: 989  # H100: 989, A100: 312
@@ -13,7 +13,7 @@ benchmark:
 
 step_scheduler:
   global_batch_size: 32
-  local_batch_size: 1
+  local_batch_size: 8
   ckpt_every_steps: 50
   val_every_steps: 1000
   max_steps: 10
@@ -28,10 +28,9 @@ rng:
   ranked: true
 
 model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
+  _target_: nemo_automodel.components.models.qwen2.build_qwen2_model
+  pretrained_model_name_or_path: Qwen/Qwen2.5-32B-Instruct
   torch_dtype: bf16
-  trust_remote_code: true
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
@@ -49,12 +48,20 @@ checkpoint:
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: none
-  tp_size: 8
+  tp_size: 1
   cp_size: 1
-  pp_size: 1
+  pp_size: 4
   sequence_parallel: false
-  activation_checkpointing: false
+  activation_checkpointing: true
 
+autopipeline:
+  _target_: nemo_automodel.components.distributed.pipelining.autopipeline.AutoPipeline
+  pp_schedule: interleaved1f1b
+  pp_microbatch_size: 1
+  layers_per_stage: 2
+  scale_grads_in_schedule: false
+  round_virtual_stages_to_pp_multiple: up
+  dtype: bf16
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -80,4 +87,4 @@ optimizer:
 
 lr_scheduler:
   lr_decay_style: cosine
-  min_lr: 1.0e-6 
+  min_lr: 1.0e-6

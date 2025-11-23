@@ -22,7 +22,6 @@ step_scheduler:
   global_batch_size: 32
   local_batch_size: 4
   ckpt_every_steps: 500
-  val_every_steps: 500  # will run every x number of gradient steps
   num_epochs: 2
 
 dist_env:
@@ -80,7 +79,7 @@ loss_fn:
 dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
     trust_remote_code: true
   path_or_dataset: rowan/hellaswag
@@ -99,7 +98,7 @@ dataloader:
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
     trust_remote_code: true
   path_or_dataset: rowan/hellaswag
