@@ -22,7 +22,6 @@ step_scheduler:
   global_batch_size: 32
   local_batch_size: 4
   ckpt_every_steps: 500
-  val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 2
 
 dist_env:
@@ -39,10 +38,8 @@ parallelizer:
   activation_checkpointing: false
 
 model:
-  _target_: nemo_automodel.components.models.qwen3_moe.model.Qwen3MoeForCausalLM.from_config
-  config:
-    _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
+  _target_: nemo_automodel.components.models.qwen3_moe.model.Qwen3MoeForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
   backend:
     _target_: nemo_automodel.components.moe.utils.BackendConfig
     attn: te
