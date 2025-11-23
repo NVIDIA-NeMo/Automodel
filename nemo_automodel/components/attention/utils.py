@@ -141,11 +141,7 @@ def preprocess_args_and_kwargs_for_attn(
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
-        if attention_mask is not None and (attention_mask.dtype == torch.bool or attention_mask.is_floating_point()):
-            attn_kwargs["attn_mask"] = attention_mask
-            attn_kwargs["is_causal"] = False
-        else:
-            attn_kwargs["is_causal"] = True
+        attn_kwargs["is_causal"] = True
 
     return q, k, v, attn_kwargs
 

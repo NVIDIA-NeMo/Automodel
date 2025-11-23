@@ -165,15 +165,6 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
         if padding_mask is None and attention_mask is not None:
             padding_mask = attention_mask.bool().logical_not()
 
-        attention_mask = create_causal_mask(
-            config=self.config,
-            input_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=None,
-            position_ids=text_position_ids,
-        )
-
         hidden_states = inputs_embeds
 
         cos, sin = self.rotary_emb(hidden_states, position_ids)
