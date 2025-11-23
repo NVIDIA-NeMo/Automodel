@@ -16,7 +16,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from transformers.masking_utils import create_causal_mask
 from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
 from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration as HFQwen3VLMoeForConditionalGeneration,
