@@ -169,9 +169,7 @@ class TestQwen3VLMoeTextModelBackend:
         for layer in model.layers:
             layer.forward = MagicMock(side_effect=lambda x, **_: x + 1)
 
-        with patch(
-            "nemo_automodel.components.models.qwen3_vl_moe.model.create_causal_mask", return_value=None
-        ), patch.object(model.rotary_emb, "forward", return_value=(cos, sin)):
+        with patch.object(model.rotary_emb, "forward", return_value=(cos, sin)):
             output = model(input_ids=input_ids)
 
         assert isinstance(output, Qwen3VLMoeModelOutputWithPast)
@@ -199,9 +197,7 @@ class TestQwen3VLMoeTextModelBackend:
         ]
         visual_pos_masks = torch.tensor([[True, False]], device=device)
 
-        with patch(
-            "nemo_automodel.components.models.qwen3_vl_moe.model.create_causal_mask", return_value=None
-        ), patch.object(model.rotary_emb, "forward", return_value=(cos, sin)), patch.object(
+        with patch.object(model.rotary_emb, "forward", return_value=(cos, sin)), patch.object(
             model, "_deepstack_process", side_effect=lambda hs, *_: hs
         ) as mock_deepstack:
             model(
