@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import IterableDataset
 from types import SimpleNamespace
+from contextlib import AbstractContextManager
 
 
 class DummyIterableDataset(IterableDataset):  # noqa: D401
@@ -371,3 +372,60 @@ def test_build_dataloader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatc
     assert ds._shard == (2, 1)
     # Shuffle called with buffer size and seed
     assert ds._shuffle_calls and ds._shuffle_calls[-1] == (8, 123)
+
+
+class _FlagCM(AbstractContextManager):
+    """Simple context manager that flips a flag on enter/exit."""
+    def __init__(self, flags, key):
+        self.flags = flags
+        self.key = key
+    def __enter__(self):
+        self.flags[self.key] = True
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+def test_force_hf_true_disables_meta_init(monkeypatch):
+    """When cfg_model.force_hf=True, meta-device init (init_empty_weights) should not be used."""
+    device = torch.device("cpu")
+    cfg_model = DummyModelConfig()
+    cfg_model.force_hf = True  # simulate YAML `force_hf: true`
+    cfg_opt = DummyOptConfig()
+    cfg_peft = None
+    mock_checkpointer = MagicMock()
+    mock_checkpointer.load_base_model = MagicMock()
+
+    # Track whether the meta init contexts were entered
+    flags = {"init_empty_entered": False, "no_init_entered": False}
+
+    # Patch context managers and barrier to no-op
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.init_empty_weights",
+        lambda: _FlagCM(flags, "init_empty_entered"),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.no_init_weights",
+        lambda: _FlagCM(flags, "no_init_entered"),
+    )
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.torch.distributed.barrier", lambda: None)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.print_trainable_parameters", lambda *a, **k: (1, 1))
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep", lambda *a, **k: True)
+
+    # Call under test
+    model, state_dict_keys, optimizer, loss_fn, param_info = build_model_and_optimizer(
+        device=device,
+        cfg_model=cfg_model,
+        cfg_opt=cfg_opt,
+        cfg_peft=cfg_peft,
+        model_wrapper=None,
+        seed=123,
+        checkpointer=mock_checkpointer,
+        autopipeline=None,
+        loss_fn=None,
+        parallelize_fn=None,
+    )
+
+    # Assert meta-init contexts were NOT entered
+    assert flags["init_empty_entered"] is False
+    assert flags["no_init_entered"] is False
