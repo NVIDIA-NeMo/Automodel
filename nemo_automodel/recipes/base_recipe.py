@@ -394,22 +394,32 @@ class BaseRecipe:
         # Resolved config
         try:
             cfg_obj = getattr(self, "cfg", None)
-            cfg_dict = (
-                cfg_obj.to_dict() if hasattr(cfg_obj, "to_dict") else (dict(cfg_obj) if cfg_obj is not None else {})
-            )
+            # Prefer YAML-ready dict that converts callables/classes to dotted paths and preserves typed scalars
+            if hasattr(cfg_obj, "to_yaml_dict"):
+                cfg_dict = cfg_obj.to_yaml_dict()
+            elif hasattr(cfg_obj, "to_dict"):
+                cfg_dict = cfg_obj.to_dict()
+            else:
+                cfg_dict = dict(cfg_obj) if cfg_obj is not None else {}
 
-            def rec_print(log_fn, cfg_dict: dict | None, indent: int = 2):
-                if cfg_dict is None:
-                    return
-                for k, v in cfg_dict.items():
-                    if isinstance(v, dict):
-                        log_fn(f"{' ' * indent}{k}:")
-                        rec_print(log_fn, v, indent + 2)
-                    else:
-                        log_fn(f"{' ' * indent}{k}: {v}")
+            # Print as clean YAML on stdout for easy copy/paste and readability
+            if _yaml is not None:
+                cfg_yaml = _yaml.safe_dump(cfg_dict, sort_keys=False, default_flow_style=False).strip()
+                print(cfg_yaml, flush=True)
+            else:
+                # Fallback structured print if yaml is unavailable
+                def rec_print(d: dict | None, indent: int = 0):
+                    if d is None:
+                        return
+                    pad = "  " * indent
+                    for k, v in d.items():
+                        if isinstance(v, dict):
+                            print(f"{pad}{k}:", flush=True)
+                            rec_print(v, indent + 1)
+                        else:
+                            print(f"{pad}{k}: {v}", flush=True)
 
-            logging.info("Recipe config:")
-            rec_print(logging.info, cfg_dict)
+                rec_print(cfg_dict, 0)
         except Exception:
             logging.info("Recipe config: <unavailable>")
 
