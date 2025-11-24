@@ -520,10 +520,14 @@ def pipeline_model(
 
     # Patch FSDP backward for MoE models if requested
     if patch_stage_backward_maybe_with_nosync:
-        from nemo_automodel.components.moe.fsdp_mixin import patched_backward_maybe_with_nosync
+        from nemo_automodel.components.moe.fsdp_mixin import (
+            patched_backward_maybe_with_nosync,
+            patched_perform_reduce_grad,
+        )
 
         for stage in stages:
             stage.backward_maybe_with_nosync = types.MethodType(patched_backward_maybe_with_nosync, stage)
+            stage.perform_reduce_grad = types.MethodType(patched_perform_reduce_grad, stage)
 
         logger.info("Patched pipeline stages with MoE-aware FSDP backward logic")
 

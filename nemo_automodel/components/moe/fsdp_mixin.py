@@ -198,7 +198,7 @@ def patched_backward_maybe_with_nosync(
     last_backward: bool = False,
 ) -> tuple[tuple[Optional[torch.Tensor], ...], Optional[list[dict[str, Any]]]]:
     """
-    Whether using PP with FSDP or DDP, there are some runtime differences between the last backward step and the
+    Whether using PP with FSDP, DDP, or replicate there are some runtime differences between the last backward step and the
     other steps.  Namely, we need to accumulate gradients on previous steps and reduce them on the last step, but
     there are additional state-variables and performance considerations depending on the data parallelism used.
     This helper should adapt any pipeline parallel schedule to work with common/supported data parallel libraries.
@@ -250,38 +250,58 @@ def patched_backward_maybe_with_nosync(
         else:
             with self.submod.no_sync():  # type: ignore[operator]
                 result = perform_backward(backward_type)()
-    # If submod is a FSDP module
+    # If submod is a FSDP or replicate module
     elif isinstance(self.submod, FSDPModule):
         self.submod.set_is_last_backward(False)
         self.submod.set_reshard_after_backward(False)
         self.submod.set_requires_gradient_sync(False)
         result = perform_backward(backward_type)()
-        if last_backward:
-            # Manually call post backward for FSDP
-            def run_post_backward(fsdp_module: FSDPModule) -> None:
-                fsdp_module.set_is_last_backward(True)
-                fsdp_module.set_reshard_after_backward(True)
-                fsdp_module.set_requires_gradient_sync(True)
-                fsdp_state = fully_shard.state(fsdp_module)  # type: ignore[attr-defined]
-                for state in fsdp_state._state_ctx.all_states:
-                    if state._fsdp_param_group:
-                        state._fsdp_param_group.post_backward()
-
-                # it would be much better if pipelining backward invoked .backward so autograd hooks
-                # worked and modules like DDP/FSDP behaved as expected.  Working around this for the time being,
-                # we need to call this too to ensure FSDP syncs its grad reduction ops back to the default stream.
-                fsdp_state._root_post_backward_final_callback()
-
-            run_post_backward(self.submod)
     # If submod is a MoEFSDPSyncMixin, use the MoE-specific FSDP functions
     elif isinstance(self.submod, MoEFSDPSyncMixin):
         _disable_fsdp_for_moe_module(self.submod)
         result = perform_backward(backward_type)()
-        if last_backward and get_is_optim_step():
-            _run_post_backward_for_moe_module(self.submod)
     else:
         # Non-DP submodule, regular backward
         result = perform_backward(backward_type)()
 
     grads, param_groups = result
     return grads, param_groups
+
+
+def patched_perform_reduce_grad(self, grad_scale_factor: int):
+    """
+    Called as a part of schedule IR.
+    REDUCE_GRAD action is scheduled after all microbatches W, B actions.
+
+    Currently contains "post_backward" functionality for FSDP.
+    We can try to extract post_backward in a separate IR action in future.
+    """
+    from torch.distributed._composable.replicate_with_fsdp import ReplicateModule, replicate
+
+    # Manually call post backward for FSDP
+    if isinstance(self.submod, MoEFSDPSyncMixin):
+        if get_is_optim_step():
+            _run_post_backward_for_moe_module(self.submod)
+    elif isinstance(self.submod, FSDPModule):
+        fsdp_module = self.submod
+        fsdp_module.set_is_last_backward(True)
+        fsdp_module.set_reshard_after_backward(True)
+        fsdp_module.set_requires_gradient_sync(True)
+
+        if isinstance(fsdp_module, ReplicateModule):
+            distributed_state = replicate.state(fsdp_module)  # type: ignore[arg-type]
+        else:
+            distributed_state = fully_shard.state(fsdp_module)  # type: ignore[attr-defined]
+
+        for state in distributed_state._state_ctx.all_states:
+            if state._fsdp_param_group:
+                state._fsdp_param_group.post_backward()
+
+        # it would be much better if pipelining backward invoked .backward so autograd hooks
+        # worked and modules like DDP/FSDP behaved as expected.  Working around this for the time being,
+        # we need to call this too to ensure FSDP syncs its grad reduction ops back to the default stream.
+        distributed_state._root_post_backward_final_callback()
+    # Call gradient scaling at the end of the backward pass
+    # NOTE: this must happen after FSDP post_backward is FSDP is enabled
+    if grad_scale_factor != 1:
+        self.scale_grads(grad_scale_factor)

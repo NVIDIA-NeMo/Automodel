@@ -212,10 +212,6 @@ def apply_fsdp(
 
     fully_shard_default(_model)
 
-    # If model has a nested structure (outer model wrapping inner _model), wrap the outer model too
-    if model != _model:
-        fully_shard_default(model)
-
 
 def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p2p"):
     from transformer_engine.pytorch.attention import DotProductAttention

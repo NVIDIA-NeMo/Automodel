@@ -49,7 +49,7 @@ autopipeline:
   scale_grads_in_schedule: false
   patch_inner_model: false
   patch_causal_lm_model: false
-  layers_per_stage: 2
+  layers_per_stage: 4
 
 dist_env:
   backend: nccl
