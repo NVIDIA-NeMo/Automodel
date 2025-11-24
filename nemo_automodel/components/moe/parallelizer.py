@@ -137,7 +137,7 @@ def apply_fsdp(
 
     if mp_policy is None:
         mp_policy = MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16, reduce_dtype=torch.float32, output_dtype=torch.bfloat16
+            param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16, output_dtype=torch.bfloat16
         )
 
     fully_shard_default = functools.partial(
@@ -211,10 +211,6 @@ def apply_fsdp(
             logging.info("Skipping FSDP wrap for frozen visual tower")
 
     fully_shard_default(_model)
-
-    # If model has a nested structure (outer model wrapping inner _model), wrap the outer model too
-    if model != _model:
-        fully_shard_default(model)
 
 
 def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p2p"):
