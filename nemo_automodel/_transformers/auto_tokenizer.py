@@ -67,19 +67,20 @@ class NeMoAutoTokenizer:
             _tokenized_keys = {"input_ids", "attention_mask", "assistant_masks"}
             add_bos_ids = self._add_bos and (getattr(self, "bos_token_id", None) is not None)
             add_eos_ids = self._add_eos and (getattr(self, "eos_token_id", None) is not None)
-            for key in _tokenized_keys:
+            if not "input_ids" in tokenized:
+                return tokenized
+            if add_bos_ids:
+                add_bos_ids = _add_token(tokenized, self.bos_token_id, 0, "input_ids")
+            if add_eos_ids:
+                add_eos_ids = _add_token(tokenized, self.eos_token_id, -1, "input_ids")
+
+            for key in {"attention_mask", "assistant_masks"}:
                 if key not in tokenized:
                     continue
-                if key == "input_ids":
-                    if add_bos_ids:
-                        _add_token(tokenized, self.bos_token_id, 0, key)
-                    if add_eos_ids:
-                        _add_token(tokenized, self.eos_token_id, -1, key)
-                else:
-                    if add_bos_ids:
-                        _add_token(tokenized, 1, 0, key)
-                    if add_eos_ids:
-                        _add_token(tokenized, 1, -1, key)
+                if add_bos_ids:
+                    _add_token(tokenized, 1, 0, key)
+                if add_eos_ids:
+                    _add_token(tokenized, 1, -1, key)
         return tokenized
 
     def encode(self, *args, **kwargs):
@@ -99,20 +100,24 @@ def _add_token(tokenized, value, position, key):
     def _extend_single(sequence, val, pos, always_add):
         if pos == 0:
             if always_add or not sequence or sequence[0] != val:
-                return [val] + sequence
-            return sequence
+                return [val] + sequence, True
+            return sequence, False
         if pos == -1:
             if always_add or not sequence or sequence[-1] != val:
-                return sequence + [val]
-            return sequence
+                return sequence + [val], True
+            return sequence, False
         raise ValueError(f"Invalid position: {pos}")
 
     sequences = tokenized[key]
     always_add = key != "input_ids"
     if isinstance(sequences, list) and sequences and isinstance(sequences[0], list):
-        tokenized[key] = [_extend_single(seq, value, position, always_add) for seq in sequences]
+        ans = [_extend_single(seq, value, position, always_add) for seq in sequences]
+        tokenized[key] = list(map(lambda x: x[0], ans))
+        return any(map(lambda x: x[1], ans))
     elif isinstance(sequences, list):
-        tokenized[key] = _extend_single(sequences, value, position, always_add)
+        ans = _extend_single(sequences, value, position, always_add)
+        tokenized[key] = ans[0]
+        return ans[1]
     else:
         raise ValueError(f"Invalid sequence type: {type(sequences)}")
-    return tokenized
+    return False
