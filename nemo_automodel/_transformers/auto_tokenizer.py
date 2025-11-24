@@ -46,8 +46,8 @@ class NeMoAutoTokenizer:
         return self._add_eos
 
     def __getattr__(self, name):
-        # Delegate everything else to the underlying tokenizer
-        return getattr(self._base_tokenizer, name)
+        base = object.__getattribute__(self, "_base_tokenizer")
+        return getattr(base, name)
 
     def __setattr__(self, name, value):
         # Route writes to the underlying tokenizer when appropriate
