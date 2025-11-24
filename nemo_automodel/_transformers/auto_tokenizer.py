@@ -67,7 +67,7 @@ class NeMoAutoTokenizer:
             _tokenized_keys = {"input_ids", "attention_mask", "assistant_masks"}
             add_bos_ids = self._add_bos and (getattr(self, "bos_token_id", None) is not None)
             add_eos_ids = self._add_eos and (getattr(self, "eos_token_id", None) is not None)
-            if not 'input_ids' in tokenized:
+            if not "input_ids" in tokenized:
                 return tokenized
             if add_bos_ids:
                 add_bos_ids = _add_token(tokenized, self.bos_token_id, 0, "input_ids")
