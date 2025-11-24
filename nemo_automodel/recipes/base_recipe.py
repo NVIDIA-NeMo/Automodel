@@ -234,7 +234,10 @@ class BaseRecipe:
                 key = next(iter(val_loss.keys()))
                 loss_dict["val_loss"] = val_loss.pop(key) if len(val_loss) == 1 else loss_dict.update(val_loss)
             with open(os.path.join(path, "losses.json"), "w") as f:
-                json.dump({k: to_item(v) for k, v in loss_dict.items()}, f)
+                try:
+                    json.dump({k: to_item(v) for k, v in loss_dict.items()}, f)
+                except:
+                    pass
 
         if is_dist_initialized:
             torch.distributed.barrier()
