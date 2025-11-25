@@ -222,6 +222,11 @@ class BaseRecipe:
             os.makedirs(path, exist_ok=True)
             print(f"Saving checkpoint to {path}", flush=True)
 
+            def to_item(x):
+                if isinstance(x, torch.Tensor):
+                    return x.item()
+                return x
+
             # dump the train and val loss to a json file
             loss_dict = {"train_loss": train_loss}
             if val_loss:
@@ -229,7 +234,10 @@ class BaseRecipe:
                 key = next(iter(val_loss.keys()))
                 loss_dict["val_loss"] = val_loss.pop(key) if len(val_loss) == 1 else loss_dict.update(val_loss)
             with open(os.path.join(path, "losses.json"), "w") as f:
-                json.dump(loss_dict, f)
+                try:
+                    json.dump({k: to_item(v) for k, v in loss_dict.items()}, f)
+                except:
+                    pass
 
         if is_dist_initialized:
             torch.distributed.barrier()
