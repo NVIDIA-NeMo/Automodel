@@ -172,8 +172,6 @@ def build_model_and_optimizer(
                 fp8_config = build_fp8_config(cfg_fp8)
                 model = apply_fp8_to_model(model, config=fp8_config)
 
-        print_trainable_parameters(model)
-
         # hold a copy of the model state dict keys before any parallelization
         state_dict_keys = model.state_dict().keys()
 
@@ -183,10 +181,15 @@ def build_model_and_optimizer(
 
         load_weights = False
         if parallelize_fn is not None and get_world_size_safe() > 1:
+            moe_mesh = getattr(model_wrapper, "moe_mesh", None)
+            ep_axis_name = "ep" if moe_mesh is not None and "ep" in moe_mesh.mesh_dim_names else None
+            ep_shard_axis_names = (
+                ("ep_shard",) if moe_mesh is not None and "ep_shard" in moe_mesh.mesh_dim_names else None
+            )
             parallelize_fn(
                 model,
                 world_mesh=model_wrapper.device_mesh,
-                moe_mesh=getattr(model_wrapper, "moe_mesh", None),
+                moe_mesh=moe_mesh,
                 pp_enabled=False,
                 dp_axis_names=(
                     ("dp_replicate", "dp_shard_cp")
@@ -196,8 +199,8 @@ def build_model_and_optimizer(
                 ),
                 cp_axis_name="cp",
                 tp_axis_name="tp",
-                ep_axis_name="ep",
-                ep_shard_axis_names=("ep_shard",),
+                ep_axis_name=ep_axis_name,
+                ep_shard_axis_names=ep_shard_axis_names,
             )
             load_weights = True
         elif callable(getattr(model_wrapper, "parallelize", None)):
@@ -224,6 +227,7 @@ def build_model_and_optimizer(
                 load_base_model=load_base_model,
             )
 
+        print_trainable_parameters(model)
         model = model.to(device)
 
         # Apply torch.compile if configured

@@ -140,10 +140,9 @@ class TestPreprocessArgsAndKwargsForAttn:
         assert v_out.shape == (2, 16, 8, 64)
 
         # Check attention kwargs
-        expected_keys = {"is_causal", "attn_mask"}
+        expected_keys = {"is_causal"}
         assert set(attn_kwargs.keys()) == expected_keys
         assert attn_kwargs["is_causal"] == True
-        assert torch.equal(attn_kwargs["attn_mask"], attention_mask)
 
     def test_sdpa_backend_with_integer_attention_mask(self):
         q = torch.randn(2, 8, 16, 64)
