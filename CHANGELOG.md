@@ -2,7 +2,7 @@
 
 ## NVIDIA NeMo-Automodel 0.2.0
 
-- Fast Model Implementations	
+- Fast Model Implementations
   - LLM
      - GPT-OSS 20B and 120B
      - Qwen3 next and Qwen3-235B
@@ -36,9 +36,9 @@
 - Known issues / limitations
   - Minor perf regression with DSv3
   - Sequence parallel plan incorrect for Qwen3
-  - Validation is not functional for custom models with TE when using packed sequence and pipeline parallel size of 1.
+  - Non-functional validation with MoE models utilizing TE, packed sequence and pipeline parallel size of 1
   - PEFT (LoRA) support is scheduled for follow-up release
-  - CP support may be impacted by edge cases.
+  - CP support may be impacted by edge cases
 
 
 ## NVIDIA NeMo-Automodel 0.1.1
