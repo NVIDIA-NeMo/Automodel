@@ -1,0 +1,122 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+# To run this recipe, please use the following command:
+# torchrun --nproc_per_node 8
+#     --nnodes $NNODES
+#     --master_addr $MASTER_ADDR
+#     --master_port 29400
+#     --node_rank $NODE_RANK
+#     examples/llm_pretrain/pretrain.py
+#     --config examples/llm_pretrain/llama3_70b_pretrain.yaml
+
+step_scheduler:
+  global_batch_size: 128
+  local_batch_size: 4
+  ckpt_every_steps: 2000
+  num_epochs: 1
+  max_steps: 60
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 1
+
+# Model
+# Option 1 – shorthand builder
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.1-70B
+  torch_dtype: bf16
+  trust_remote_code: True
+
+checkpoint:
+  enabled: False
+  checkpoint_dir: checkpoints/
+  model_save_format: torch_save
+  save_consolidated: False
+
+# Option 2 – explicit HF config (uncomment to use)
+# model:
+#   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+#   config:
+#     _target_: transformers.GPT2Config
+#     vocab_size: 50258
+#     n_positions: 2048
+#     n_ctx: 2048
+#     n_embd: 768
+#     n_layer: 12
+#     n_head: 12
+#     bos_token_id: 50256
+#     eos_token_id: 50256
+
+# Dataset
+# Point this to the location where your *.bin shards live.
+# The pattern below matches the sample shards included in *modded-nanogpt*.
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  shuffle: false
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+
+# Loss
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+# Optimizer
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 2.0e-5
+  betas: [0.9, 0.95]
+  weight_decay: 0.1
+
+# DDP / FSDP2 / etc
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: none
+  tp_size: 4
+  cp_size: 1  # Change to 2 once packed sequence is supported with CP
+  pp_size: 4
+  sequence_parallel: False
+  activation_checkpointing: true
+
+autopipeline:
+  _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
+  pp_schedule: interleaved1f1b
+  pp_microbatch_size: 1
+  layers_per_stage: 4
+  scale_grads_in_schedule: false
+  round_virtual_stages_to_pp_multiple: up
+  dtype: bf16
+
+packed_sequence:
+  # Set packed_sequence_size > 0 to run with packed sequences
+  packed_sequence_size: 4096
+  split_across_pack: False
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 1.0e-6 
+  lr_warmup_steps: 15
+
+# Uncomment and configure for W&B logging
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: <your_wandb_exp_name>
+#   save_dir: <your_wandb_save_dir>
