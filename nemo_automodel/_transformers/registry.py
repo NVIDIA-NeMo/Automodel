@@ -34,10 +34,12 @@ class _ModelRegistry:
     # Keyed by model_arch
     modeling_path: List[str] = field(default_factory=list)
     model_arch_name_to_cls: Dict[str, Union[Type[nn.Module], str]] = field(default_factory=dict)
+    naming_override: Dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
         for modeling_path in self.modeling_path:
             self._mapping_model_arch_name_to_cls(modeling_path)
+        self.naming_override["Qwen3OmniMoeThinkerForConditionalGeneration"] = "Qwen3OmniMoeForConditionalGeneration"
 
     @property
     def supported_models(self) -> Dict[str, Type[nn.Module]]:
@@ -65,15 +67,23 @@ class _ModelRegistry:
                     entry = module.ModelClass
                     if isinstance(entry, list):
                         for tmp in entry:
-                            assert tmp.__name__ not in self.model_arch_name_to_cls, (
-                                f"Duplicated model implementation for {tmp.__name__}"
+                            name = (
+                                tmp.__name__
+                                if tmp.__name__ not in self.naming_override
+                                else self.naming_override[tmp.__name__]
                             )
-                            self.model_arch_name_to_cls[tmp.__name__] = tmp
+                            assert name not in self.model_arch_name_to_cls, (
+                                f"Duplicated model implementation for {name}"
+                            )
+                            self.model_arch_name_to_cls[name] = tmp
                     else:
-                        assert entry.__name__ not in self.model_arch_name_to_cls, (
-                            f"Duplicated model implementation for {entry.__name__}"
+                        name = (
+                            entry.__name__
+                            if entry.__name__ not in self.naming_override
+                            else self.naming_override[entry.__name__]
                         )
-                        self.model_arch_name_to_cls[entry.__name__] = entry
+                        assert name not in self.model_arch_name_to_cls, f"Duplicated model implementation for {name}"
+                        self.model_arch_name_to_cls[name] = entry
 
 
 @lru_cache
@@ -82,12 +92,3 @@ def get_registry():
 
 
 ModelRegistry = get_registry()
-
-# Currently applying manual overrides for specific architecture name mappings
-from nemo_automodel.components.models.qwen3_omni_moe.model import (
-    Qwen3OmniMoeThinkerForConditionalGeneration,
-)
-
-ModelRegistry.model_arch_name_to_cls["Qwen3OmniMoeForConditionalGeneration"] = (
-    Qwen3OmniMoeThinkerForConditionalGeneration
-)
