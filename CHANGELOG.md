@@ -35,6 +35,19 @@
   - PEFT (LoRA) support is scheduled for follow-up release
   - CP support may be impacted by edge cases
 
+### NeMo-Automodel 25.11 Container
+
+The 0.2.0 release is also included the NeMo Automodel 25.11 container on NGC at https://registry.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel.
+Here are the major software components included in the container:
+
+| Software Component | Version     |
+| -------------------|-------------|
+| CUDA               | 13.0        |
+| cuDNN              | 9.13.0.50-1 |
+| Pytorch            | 2.9.0a0     |
+| NeMo-Automodel     | 0.2.0       |
+| Transformer Engine | 2.8.0       |
+| Transformers       | 4.57.1      |
 
 ## NVIDIA NeMo-Automodel 0.1.1
 
