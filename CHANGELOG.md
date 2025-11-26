@@ -1,5 +1,46 @@
 # Changelog
 
+## NVIDIA NeMo-Automodel 0.2.0
+
+- Fast Model Implementations	
+  - LLM
+     - GPT-OSS 20B and 120B
+     - Qwen3 next and Qwen3-235B
+     - GLM-4.5-344BA32B, GLM-4.6, GLM-4.5-Air
+  - VLM & OMNI
+     - Qwen3-vl
+     - Qwen2-5-vl
+     - Qwen3-omni-30b-a3b
+     - Intern-vl-4B (ootb)
+
+- Parallelism
+  - Improved support for CP and sequence packing with MoE models
+  - Optimized TP plan for LoRA
+
+- Dataset support for
+  - Single-turn tool calling
+  - Multi-turn tool calling
+  - Streaming dataset
+  - Chat dataset with OpenAI format
+  - Improved support for truncation/padding
+
+- Checkpointing & logging
+  - Support for asynchronous checkpointing with DCP
+  - Symbolic links (LATEST, LOWEST_VAL) pointing to the latest and lowest validation score checkpoints
+  - MLFlow support
+
+- Task support
+  - QAT for SFT
+  - Sequence classification
+
+- Known issues / limitations
+  - Minor perf regression with DSv3
+  - Sequence parallel plan incorrect for Qwen3
+  - Validation is not functional for custom models with TE when using packed sequence and pipeline parallel size of 1.
+  - PEFT (LoRA) support is scheduled for follow-up release
+  - CP support may be impacted by edge cases.
+
+
 ## NVIDIA NeMo-Automodel 0.1.1
 
 - Features:
