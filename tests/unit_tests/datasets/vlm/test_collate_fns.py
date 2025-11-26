@@ -499,10 +499,12 @@ class TestCollateFunctionIntegration:
 
         assert call_records == [True, True]
         first_call_kwargs = processor_with_modalities.call_kwargs_list[-1]
-        assert set(first_call_kwargs.keys()) == {"audio", "images", "videos"}
+        expected_modal_keys = {"audio", "images", "videos", "padding_side"}
+        assert set(first_call_kwargs.keys()) == expected_modal_keys
         assert first_call_kwargs["audio"] == [["user-0_audio"], ["user-1_audio"]]
         assert first_call_kwargs["images"] == [["user-0_image"], ["user-1_image"]]
         assert first_call_kwargs["videos"] == [["user-0_video"], ["user-1_video"]]
+        assert first_call_kwargs["padding_side"] == "right"
 
         expected_labels = torch.tensor([100, -100, 7, 8, -100])
         expected_loss_mask = torch.tensor([0, 1, 1, 1, 1], dtype=torch.float)
@@ -527,7 +529,7 @@ class TestCollateFunctionIntegration:
 
         assert call_records == [False, False]
         second_call_kwargs = processor_without_modalities.call_kwargs_list[-1]
-        assert second_call_kwargs == {}
+        assert second_call_kwargs == {"padding_side": "right"}
 
         assert torch.equal(batch_empty["labels"][0], expected_labels)
         assert torch.equal(batch_empty["loss_mask"][0], expected_loss_mask)
