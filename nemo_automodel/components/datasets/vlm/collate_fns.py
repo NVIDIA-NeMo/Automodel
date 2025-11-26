@@ -200,6 +200,7 @@ def qwen3_omni_collate_fn(
         "text": texts,
         "return_tensors": "pt",
         "padding": True,
+        "padding_side": "right",
     }
 
     if has_data(all_audios):
