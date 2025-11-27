@@ -25,6 +25,8 @@ The table below shows finetuning (LoRA) performance for full sequences with no p
 
 | Model | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec/GPU |
 |-------|------:|----:|----:|----:|---:|-----------:|---:|---:|---:|---:|---:|-----:|---------|-------------------------:|---------------------:|---------------:|
+| Llama3 8B | 1 | 32 | 2 | 2 | 16 | 4096 | 1 | 1 | 1 | - | 1 | 1 | - | 10.51 | 402 | 12472.87 |
+| Qwen2.5 7B | 1 | 32 | 2 | 2 | 16 | 4096 | 1 | 1 | 1 | - | 1 | 1 | - | 9.29 | 423 | 14110.05 |
 | Llama3 70B | 8 | 32 | 1 | 4 | 4 | 4096 | 2 | 4 | 1 | - | 10 | 1 | - | 26.92 | 176 | 608.42 |
 | Qwen2.5 32B | 8 | 32 | 1 | 8 | 2 | 4096 | 1 | 4 | 1 | - | 8 | 1 | - | 8.40 | 261 | 1950.93 |
 
