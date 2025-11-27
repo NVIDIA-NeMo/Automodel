@@ -129,7 +129,7 @@ class LinearLoRA(nn.Linear):
             init_method (str): Method to initialize the LoRA weights.
         """
         if init_method == "xavier":
-            torch.nn.init.uniform_(self.lora_A.weight.data)
+            nn.init.xavier_normal_(self.lora_A.weight.data)
         else:
             nn.init.kaiming_uniform_(self.lora_A.weight.data, a=math.sqrt(5))
         self.lora_B.weight.data.fill_(0)
