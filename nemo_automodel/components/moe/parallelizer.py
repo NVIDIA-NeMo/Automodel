@@ -131,6 +131,7 @@ def apply_fsdp(
     offload_policy: OffloadPolicy | None = None,
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
+    wrap_outer_model: bool = True,
 ):
     if isinstance(lm_head_precision, str):
         lm_head_precision = dtype_from_str(lm_head_precision, default=None)
@@ -212,8 +213,8 @@ def apply_fsdp(
 
     fully_shard_default(_model)
 
-    # If model has a nested structure (outer model wrapping inner _model), wrap the outer model too
-    if model != _model:
+    # If model has a nested structure (outer model wrapping inner _model), wrap the outer model if requested
+    if wrap_outer_model and model is not _model:
         fully_shard_default(model)
 
 
@@ -252,6 +253,7 @@ def parallelize_model(
     activation_checkpointing: bool = False,
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
+    wrap_outer_model: bool = True,
 ):
     assert tp_axis_name is None or world_mesh[tp_axis_name].size() == 1, (
         "Tensor parallelism not supported for custom MoE models"
@@ -290,4 +292,5 @@ def parallelize_model(
             ep_shard_mesh=ep_shard_mesh,
             reshard_after_forward=reshard_after_forward,
             lm_head_precision=lm_head_precision,
+            wrap_outer_model=wrap_outer_model,
         )
