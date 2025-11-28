@@ -441,7 +441,11 @@ def main(config_path="examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml"):
     cfg = parse_args_and_load_config(config_path)
     trainer = KnowledgeDistillationRecipeForNextTokenPrediction(cfg)
     trainer.setup()
-    trainer.run_train_validation_loop()
+    try:
+        trainer.run_train_validation_loop()
+    except Exception as e:
+        trainer.callback_runner.on_exception(trainer, exception=e)
+        raise e
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -62,6 +62,7 @@ guides/gradient-checkpointing.md
 guides/pipelining.md
 guides/llm/knowledge-distillation.md
 guides/fp8-training.md
+guides/callbacks.md
 
 apidocs/index.rst
 ```
