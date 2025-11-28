@@ -18,6 +18,7 @@ import torch
 from torch import nn
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.models.deepseek_v3.rope_utils import yarn_get_mscale
 from nemo_automodel.shared.import_utils import is_te_min_version
 
 if TYPE_CHECKING:
@@ -28,7 +29,7 @@ from nemo_automodel.components.attention.utils import (
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
 )
-from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb
+from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
 from nemo_automodel.components.moe.utils import (
     BackendConfig,
     initialize_linear_module,
@@ -60,6 +61,12 @@ class GptOssAttention(nn.Module):
         )
 
         self.softmax_scale = self.head_dim**-0.5
+        # When using fused rope, YaRN concentration is not baked into freqs_cis,
+        # so we need to apply concentration to q and k after fused rope
+        if backend.rope_fusion:
+            self.yarn_concentration = yarn_get_mscale(config.rope_scaling["factor"])
+        else:
+            self.yarn_concentration = None
 
         assert backend.attn in ("flex", "te"), "Only Flex and TE Attention are supported for GPT-OSS"
         if backend.attn == "te" and not is_te_min_version("2.8.0"):
@@ -107,10 +114,18 @@ class GptOssAttention(nn.Module):
             k = k.view(bsz, seqlen, self.num_key_value_heads, self.head_dim)
             v = v.view(bsz, seqlen, self.num_key_value_heads, self.head_dim)
 
-        # freqs_cis is concatenated [cos, sin] along last dim with shape (B, T, head_dim)
-        cos, sin = freqs_cis.split(self.head_dim // 2, dim=-1)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        # Apply rotary positional embeddings
+        q, k = apply_rotary_emb_qk(
+            q,
+            k,
+            freqs_cis,
+            format=qkv_format,
+            rope_fusion=self.backend.rope_fusion,
+            cu_seqlens=attn_kwargs.get("cu_seqlens", None),
+            concentration=self.yarn_concentration,
+            cp_size=attn_kwargs.get("cp_size", 1),
+            cp_rank=attn_kwargs.get("cp_rank", 0),
+        )
 
         if self.backend.attn == "flex":
             updated_attn_kwargs = {
@@ -146,7 +161,7 @@ class GptOssAttention(nn.Module):
             ]
 
             if self.backend.attn == "flex":
-                nn.init.trunc_normal_(self.sinks, mean=0.0, std=init_std)
+                nn.init.normal_(self.sinks, mean=0.0, std=init_std)
             else:
                 nn.init.trunc_normal_(self.attn_module.softmax_offset, mean=0.0, std=init_std)
             for linear in linear_list:
