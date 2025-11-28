@@ -20,6 +20,7 @@ import torch
 from nemo_automodel.components.models.gpt_oss.rope_utils import (
     RotaryEmbedding,
     apply_rotary_emb,
+    apply_rotary_emb_qk,
     position_ids_to_freqs_cis,
 )
 
@@ -556,7 +557,7 @@ class TestRotaryEmbedding:
 
 
 class TestPositionIdsToFreqsCis:
-    """Tests for position_ids_to_freqs_cis function"""
+    """Tests for position_ids_to_freqs_cis function (non-fused rope format)"""
 
     def test_basic_computation_bshd(self):
         """Test basic frequency computation with bshd format"""
@@ -570,7 +571,7 @@ class TestPositionIdsToFreqsCis:
         seq_len = 8
         position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, seq_len)
 
-        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="bshd")
+        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="bshd", for_fused_rope=False)
 
         # Check output shape: should be (batch_size, seq_len, head_dim)
         assert freqs_cis.shape == (batch_size, seq_len, 64)
@@ -587,7 +588,7 @@ class TestPositionIdsToFreqsCis:
         seq_len = 16
         position_ids = torch.arange(seq_len)
 
-        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="thd")
+        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="thd", for_fused_rope=False)
 
         # Check output shape: should be (seq_len, head_dim)
         assert freqs_cis.shape == (seq_len, 64)
@@ -604,7 +605,7 @@ class TestPositionIdsToFreqsCis:
         seq_len = 8
         position_ids = torch.arange(seq_len).unsqueeze(0)
 
-        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="bshd")
+        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="bshd", for_fused_rope=False)
 
         assert freqs_cis.shape == (1, seq_len, 32)
 
@@ -619,7 +620,7 @@ class TestPositionIdsToFreqsCis:
         # Packed sequences: position IDs restart
         position_ids = torch.tensor([[0, 1, 2, 0, 1, 2, 3]])
 
-        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="bshd")
+        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="bshd", for_fused_rope=False)
 
         assert freqs_cis.shape == (1, 7, 64)
 
@@ -637,7 +638,7 @@ class TestPositionIdsToFreqsCis:
 
         position_ids = torch.tensor([[1000, 2000, 3000, 4000]])
 
-        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="bshd")
+        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="bshd", for_fused_rope=False)
 
         assert freqs_cis.shape == (1, 4, 64)
 
@@ -653,7 +654,7 @@ class TestPositionIdsToFreqsCis:
 
         position_ids = torch.arange(16).unsqueeze(0)
 
-        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="bshd")
+        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="bshd", for_fused_rope=False)
 
         assert freqs_cis.shape == (1, 16, 64)
 
@@ -673,7 +674,7 @@ class TestPositionIdsToFreqsCis:
             ]
         )
 
-        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="bshd")
+        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="bshd", for_fused_rope=False)
 
         assert freqs_cis.shape == (3, 4, 32)
 
@@ -683,7 +684,7 @@ class TestPositionIdsToFreqsCis:
 
 
 class TestPositionIdsToFreqsCisWithContextParallel:
-    """Tests for position_ids_to_freqs_cis with context parallelism"""
+    """Tests for position_ids_to_freqs_cis with context parallelism (non-fused rope format)"""
 
     @pytest.mark.parametrize("cp_size", [1, 2, 4])
     def test_freqs_cis_with_different_cp_sizes(self, cp_size):
@@ -700,7 +701,7 @@ class TestPositionIdsToFreqsCisWithContextParallel:
         position_ids_rank = torch.arange(seq_len_per_rank)
 
         # Compute freqs_cis for this rank's position_ids
-        freqs_cis_rank = position_ids_to_freqs_cis(rope, position_ids_rank, qkv_format="thd")
+        freqs_cis_rank = position_ids_to_freqs_cis(rope, position_ids_rank, qkv_format="thd", for_fused_rope=False)
 
         # Verify shape and properties
         assert freqs_cis_rank.ndim == 2
@@ -722,7 +723,7 @@ class TestPositionIdsToFreqsCisWithContextParallel:
         position_ids_rank = torch.arange(seq_len_per_rank) % 10
 
         # Compute freqs_cis
-        freqs_cis_rank = position_ids_to_freqs_cis(rope, position_ids_rank, qkv_format="thd")
+        freqs_cis_rank = position_ids_to_freqs_cis(rope, position_ids_rank, qkv_format="thd", for_fused_rope=False)
 
         # Verify that positions with same ID have same freqs_cis
         unique_positions = torch.unique(position_ids_rank)
@@ -747,7 +748,7 @@ class TestPositionIdsToFreqsCisWithContextParallel:
         position_ids_rank = torch.tensor([0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3])
 
         # Compute freqs_cis
-        freqs_cis_rank = position_ids_to_freqs_cis(rope, position_ids_rank, qkv_format="thd")
+        freqs_cis_rank = position_ids_to_freqs_cis(rope, position_ids_rank, qkv_format="thd", for_fused_rope=False)
 
         # Verify output properties
         assert freqs_cis_rank.dtype == torch.float32
@@ -770,7 +771,7 @@ class TestPositionIdsToFreqsCisWithContextParallel:
         for cp_rank in range(cp_size):
             # Each rank gets half the sequence
             position_ids_rank = torch.arange(seq_len // cp_size)
-            freqs_cis_rank = position_ids_to_freqs_cis(rope, position_ids_rank, qkv_format="thd")
+            freqs_cis_rank = position_ids_to_freqs_cis(rope, position_ids_rank, qkv_format="thd", for_fused_rope=False)
             freqs_cis_parts.append(freqs_cis_rank)
 
         # Verify that each part has the expected length
@@ -796,7 +797,7 @@ class TestPositionIdsToFreqsCisWithContextParallel:
         position_ids_rank = torch.arange(seq_len_per_rank)
 
         # Compute freqs_cis
-        freqs_cis_rank = position_ids_to_freqs_cis(rope, position_ids_rank, qkv_format="thd")
+        freqs_cis_rank = position_ids_to_freqs_cis(rope, position_ids_rank, qkv_format="thd", for_fused_rope=False)
 
         # Verify properties
         assert freqs_cis_rank.dtype == torch.float32
@@ -804,7 +805,7 @@ class TestPositionIdsToFreqsCisWithContextParallel:
 
 
 class TestIntegration:
-    """Integration tests combining multiple functions"""
+    """Integration tests combining multiple functions (non-fused rope format)"""
 
     def test_full_rope_pipeline(self):
         """Test full RoPE pipeline: RotaryEmbedding -> position_ids_to_freqs_cis -> apply_rotary_emb"""
@@ -820,7 +821,7 @@ class TestIntegration:
 
         # Step 1: Create position IDs and compute freqs_cis
         position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, seq_len)
-        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="bshd")
+        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="bshd", for_fused_rope=False)
 
         # Step 2: Extract cos and sin from freqs_cis
         # freqs_cis contains concatenated cos and sin
@@ -855,7 +856,7 @@ class TestIntegration:
         position_ids = torch.tensor([0, 1, 2, 0, 1, 2, 3, 0, 1, 2, 3, 4])
 
         # Compute freqs_cis
-        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="thd")
+        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="thd", for_fused_rope=False)
 
         # Verify output
         assert freqs_cis.shape == (total_tokens, 64)
@@ -880,7 +881,7 @@ class TestIntegration:
 
         # Create position IDs
         position_ids = torch.arange(seq_len).unsqueeze(0)
-        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="bshd")
+        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="bshd", for_fused_rope=False)
 
         # Verify output
         assert freqs_cis.shape == (batch_size, seq_len, 32)
@@ -969,7 +970,7 @@ class TestIntegration:
         position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, seq_len)
 
         # Compute freqs_cis
-        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="bshd")
+        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="bshd", for_fused_rope=False)
 
         # freqs_cis should have shape (batch_size, seq_len, rotary_dim)
         # because it contains concatenated cos and sin, each of size rotary_dim // 2
@@ -1070,7 +1071,7 @@ class TestIntegration:
         position_ids = torch.tensor([0, 1, 2, 0, 1, 2, 3, 0, 1, 2, 3, 4])
 
         # Compute freqs_cis
-        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="thd")
+        freqs_cis = position_ids_to_freqs_cis(rope, position_ids, qkv_format="thd", for_fused_rope=False)
 
         # Verify output shape: should be (total_tokens, rotary_dim)
         assert freqs_cis.shape == (total_tokens, rotary_dim)
@@ -1078,3 +1079,351 @@ class TestIntegration:
         # Tokens at position 0 in different sequences should have same freqs_cis
         torch.testing.assert_close(freqs_cis[0], freqs_cis[3])
         torch.testing.assert_close(freqs_cis[0], freqs_cis[7])
+
+
+class TestApplyRotaryEmbQk:
+    """Tests for apply_rotary_emb_qk function (GPT-OSS version)"""
+
+    def test_non_fused_rope_bshd(self):
+        """Test apply_rotary_emb_qk with non-fused rope in bshd format"""
+        batch_size = 2
+        seq_len = 4
+        num_heads = 8
+        head_dim = 64
+
+        q = torch.randn(batch_size, seq_len, num_heads, head_dim)
+        k = torch.randn(batch_size, seq_len, num_heads, head_dim)
+        # Non-fused rope uses [cos, sin] format
+        cos = torch.randn(seq_len, head_dim // 2)
+        sin = torch.randn(seq_len, head_dim // 2)
+        freqs_cis = torch.cat([cos, sin], dim=-1).unsqueeze(0).expand(batch_size, seq_len, head_dim)
+
+        q_out, k_out = apply_rotary_emb_qk(q, k, freqs_cis, format="bshd", rope_fusion=False)
+
+        # Check output shapes
+        assert q_out.shape == q.shape
+        assert k_out.shape == k.shape
+        assert q_out.dtype == q.dtype
+        assert k_out.dtype == k.dtype
+
+    def test_non_fused_rope_thd(self):
+        """Test apply_rotary_emb_qk with non-fused rope in thd format"""
+        total_tokens = 16
+        num_heads = 8
+        head_dim = 64
+
+        q = torch.randn(total_tokens, num_heads, head_dim)
+        k = torch.randn(total_tokens, num_heads, head_dim)
+        # Non-fused rope uses [cos, sin] format
+        cos = torch.randn(total_tokens, head_dim // 2)
+        sin = torch.randn(total_tokens, head_dim // 2)
+        freqs_cis = torch.cat([cos, sin], dim=-1)
+
+        q_out, k_out = apply_rotary_emb_qk(q, k, freqs_cis, format="thd", rope_fusion=False)
+
+        # Check output shapes
+        assert q_out.shape == q.shape
+        assert k_out.shape == k.shape
+
+    def test_non_fused_rope_consistency(self):
+        """Test that apply_rotary_emb_qk gives same results as individual apply_rotary_emb calls"""
+        batch_size = 2
+        seq_len = 4
+        num_heads = 4
+        head_dim = 32
+
+        q = torch.randn(batch_size, seq_len, num_heads, head_dim)
+        k = torch.randn(batch_size, seq_len, num_heads, head_dim)
+
+        # Create cos/sin
+        angles = torch.linspace(0, 2 * math.pi, seq_len * (head_dim // 2)).reshape(seq_len, head_dim // 2)
+        cos = torch.cos(angles)
+        sin = torch.sin(angles)
+        freqs_cis = torch.cat([cos, sin], dim=-1).unsqueeze(0).expand(batch_size, seq_len, head_dim)
+
+        # Apply using apply_rotary_emb_qk
+        q_out_qk, k_out_qk = apply_rotary_emb_qk(q, k, freqs_cis, format="bshd", rope_fusion=False)
+
+        # Apply using individual apply_rotary_emb calls
+        q_out_individual = apply_rotary_emb(q, cos, sin)
+        k_out_individual = apply_rotary_emb(k, cos, sin)
+
+        # Results should be close (might have small numerical differences due to broadcast)
+        torch.testing.assert_close(q_out_qk, q_out_individual, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(k_out_qk, k_out_individual, rtol=1e-5, atol=1e-5)
+
+    def test_dtype_preservation(self):
+        """Test that output dtype matches input dtype"""
+        batch_size = 2
+        seq_len = 4
+        num_heads = 4
+        head_dim = 32
+
+        for dtype in [torch.float32, torch.float16, torch.bfloat16]:
+            q = torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=dtype)
+            k = torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=dtype)
+            cos = torch.randn(seq_len, head_dim // 2)
+            sin = torch.randn(seq_len, head_dim // 2)
+            freqs_cis = torch.cat([cos, sin], dim=-1).unsqueeze(0).expand(batch_size, seq_len, head_dim)
+
+            q_out, k_out = apply_rotary_emb_qk(q, k, freqs_cis, format="bshd", rope_fusion=False)
+
+            assert q_out.dtype == dtype
+            assert k_out.dtype == dtype
+
+    def test_with_partial_rotary(self):
+        """Test apply_rotary_emb_qk with partial rotary embeddings"""
+        batch_size = 2
+        seq_len = 4
+        num_heads = 4
+        head_dim = 64
+        rotary_dim = 32  # Only rotate first 32 dimensions
+
+        q = torch.randn(batch_size, seq_len, num_heads, head_dim)
+        k = torch.randn(batch_size, seq_len, num_heads, head_dim)
+
+        # Store pass-through parts
+        q_pass = q[..., rotary_dim:].clone()
+        k_pass = k[..., rotary_dim:].clone()
+
+        # Partial cos/sin (rotary_dim // 2 each)
+        cos = torch.randn(seq_len, rotary_dim // 2)
+        sin = torch.randn(seq_len, rotary_dim // 2)
+        freqs_cis = torch.cat([cos, sin], dim=-1).unsqueeze(0).expand(batch_size, seq_len, rotary_dim)
+
+        q_out, k_out = apply_rotary_emb_qk(q, k, freqs_cis, format="bshd", rope_fusion=False)
+
+        # Check output shapes
+        assert q_out.shape == q.shape
+        assert k_out.shape == k.shape
+
+        # Pass-through parts should be preserved
+        torch.testing.assert_close(q_out[..., rotary_dim:], q_pass)
+        torch.testing.assert_close(k_out[..., rotary_dim:], k_pass)
+
+
+class TestPositionIdsToFreqsCisFusedRope:
+    """Tests for position_ids_to_freqs_cis with fused rope support"""
+
+    def test_non_fused_bshd_format(self):
+        """Test non-fused rope output format for bshd"""
+        rope = RotaryEmbedding(
+            head_dim=64,
+            base=10000,
+            dtype=torch.float32,
+        )
+
+        batch_size = 2
+        seq_len = 4
+        position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, seq_len)
+
+        freqs_cis = position_ids_to_freqs_cis(
+            rope, position_ids, qkv_format="bshd", for_fused_rope=False
+        )
+
+        # Non-fused returns [cos, sin] with shape (B, T, head_dim)
+        assert freqs_cis.shape == (batch_size, seq_len, 64)
+        assert freqs_cis.dtype == torch.float32
+
+    def test_fused_bshd_format(self):
+        """Test fused rope output format for bshd"""
+        rope = RotaryEmbedding(
+            head_dim=64,
+            base=10000,
+            dtype=torch.float32,
+        )
+
+        batch_size = 2
+        seq_len = 4
+        position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, seq_len)
+
+        freqs_cis = position_ids_to_freqs_cis(
+            rope, position_ids, qkv_format="bshd", for_fused_rope=True
+        )
+
+        # Fused rope expects shape (T, 1, 1, D) where D = head_dim (angles duplicated)
+        assert freqs_cis.shape == (seq_len, 1, 1, 64)
+        assert freqs_cis.dtype == torch.float32
+
+    def test_non_fused_thd_format(self):
+        """Test non-fused rope output format for thd"""
+        rope = RotaryEmbedding(
+            head_dim=64,
+            base=10000,
+            dtype=torch.float32,
+        )
+
+        seq_len = 8
+        position_ids = torch.arange(seq_len)
+
+        freqs_cis = position_ids_to_freqs_cis(
+            rope, position_ids, qkv_format="thd", for_fused_rope=False
+        )
+
+        # Non-fused thd returns [cos, sin] with shape (T, head_dim)
+        assert freqs_cis.shape == (seq_len, 64)
+        assert freqs_cis.dtype == torch.float32
+
+    def test_fused_thd_format(self):
+        """Test fused rope output format for thd"""
+        rope = RotaryEmbedding(
+            head_dim=64,
+            base=10000,
+            dtype=torch.float32,
+        )
+
+        seq_len = 8
+        position_ids = torch.arange(seq_len)
+
+        freqs_cis = position_ids_to_freqs_cis(
+            rope, position_ids, qkv_format="thd", for_fused_rope=True
+        )
+
+        # Fused rope with thd expects shape (T, 1, 1, D) where D = head_dim
+        assert freqs_cis.shape == (seq_len, 1, 1, 64)
+        assert freqs_cis.dtype == torch.float32
+
+    def test_fused_angles_are_duplicated(self):
+        """Test that fused rope format has angles duplicated [angles, angles]"""
+        rope = RotaryEmbedding(
+            head_dim=32,
+            base=10000,
+            dtype=torch.float32,
+        )
+
+        seq_len = 4
+        position_ids = torch.arange(seq_len).unsqueeze(0)
+
+        freqs_cis = position_ids_to_freqs_cis(
+            rope, position_ids, qkv_format="bshd", for_fused_rope=True
+        )
+
+        # Shape should be (T, 1, 1, head_dim)
+        assert freqs_cis.shape == (seq_len, 1, 1, 32)
+
+        # First half and second half should be identical (angles duplicated)
+        first_half = freqs_cis[:, 0, 0, :16]
+        second_half = freqs_cis[:, 0, 0, 16:]
+        torch.testing.assert_close(first_half, second_half)
+
+    def test_fused_thd_uses_sequential_positions(self):
+        """Test that fused rope with thd uses sequential positions regardless of input"""
+        rope = RotaryEmbedding(
+            head_dim=64,
+            base=10000,
+            dtype=torch.float32,
+        )
+
+        seq_len = 8
+        # Non-sequential position IDs (e.g., from packed sequences)
+        position_ids = torch.tensor([0, 1, 0, 1, 2, 0, 1, 2])
+
+        freqs_cis = position_ids_to_freqs_cis(
+            rope, position_ids, qkv_format="thd", for_fused_rope=True
+        )
+
+        # Shape should be (T, 1, 1, head_dim)
+        assert freqs_cis.shape == (seq_len, 1, 1, 64)
+
+        # For fused rope, positions should be sequential 0, 1, 2, ... regardless of input
+        angles = freqs_cis[:, 0, 0, :32]
+
+        # Each position should have unique angles (since they're sequential)
+        for i in range(seq_len - 1):
+            assert not torch.allclose(angles[i], angles[i + 1])
+
+    def test_non_fused_thd_preserves_positions(self):
+        """Test that non-fused rope with thd preserves input position IDs"""
+        rope = RotaryEmbedding(
+            head_dim=64,
+            base=10000,
+            dtype=torch.float32,
+        )
+
+        seq_len = 8
+        # Non-sequential position IDs (e.g., from packed sequences)
+        position_ids = torch.tensor([0, 1, 0, 1, 2, 0, 1, 2])
+
+        freqs_cis = position_ids_to_freqs_cis(
+            rope, position_ids, qkv_format="thd", for_fused_rope=False
+        )
+
+        # Shape should be (T, head_dim) for non-fused thd
+        assert freqs_cis.shape == (seq_len, 64)
+
+        # Positions with same ID should have same freqs_cis
+        # Position 0 appears at indices 0, 2, 5
+        torch.testing.assert_close(freqs_cis[0], freqs_cis[2])
+        torch.testing.assert_close(freqs_cis[0], freqs_cis[5])
+
+        # Position 1 appears at indices 1, 3, 6
+        torch.testing.assert_close(freqs_cis[1], freqs_cis[3])
+        torch.testing.assert_close(freqs_cis[1], freqs_cis[6])
+
+    def test_fused_with_scaling_factor(self):
+        """Test fused rope with YaRN scaling factor"""
+        rope = RotaryEmbedding(
+            head_dim=64,
+            base=10000,
+            dtype=torch.float32,
+            scaling_factor=2.0,
+            initial_context_length=4096,
+        )
+
+        seq_len = 8
+        position_ids = torch.arange(seq_len).unsqueeze(0)
+
+        freqs_cis = position_ids_to_freqs_cis(
+            rope, position_ids, qkv_format="bshd", for_fused_rope=True
+        )
+
+        # Shape should be (T, 1, 1, head_dim)
+        assert freqs_cis.shape == (seq_len, 1, 1, 64)
+        assert freqs_cis.dtype == torch.float32
+
+    def test_fused_with_partial_rotary(self):
+        """Test fused rope with partial rotary factor"""
+        head_dim = 128
+        partial_rotary_factor = 0.5
+        rotary_dim = int(head_dim * partial_rotary_factor)
+
+        rope = RotaryEmbedding(
+            head_dim=head_dim,
+            base=10000,
+            dtype=torch.float32,
+            partial_rotary_factor=partial_rotary_factor,
+        )
+
+        seq_len = 8
+        position_ids = torch.arange(seq_len).unsqueeze(0)
+
+        freqs_cis = position_ids_to_freqs_cis(
+            rope, position_ids, qkv_format="bshd", for_fused_rope=True
+        )
+
+        # Shape should be (T, 1, 1, rotary_dim) not head_dim
+        assert freqs_cis.shape == (seq_len, 1, 1, rotary_dim)
+
+    def test_non_fused_with_partial_rotary(self):
+        """Test non-fused rope with partial rotary factor"""
+        head_dim = 128
+        partial_rotary_factor = 0.5
+        rotary_dim = int(head_dim * partial_rotary_factor)
+
+        rope = RotaryEmbedding(
+            head_dim=head_dim,
+            base=10000,
+            dtype=torch.float32,
+            partial_rotary_factor=partial_rotary_factor,
+        )
+
+        batch_size = 2
+        seq_len = 8
+        position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, seq_len)
+
+        freqs_cis = position_ids_to_freqs_cis(
+            rope, position_ids, qkv_format="bshd", for_fused_rope=False
+        )
+
+        # Shape should be (B, T, rotary_dim) not head_dim
+        assert freqs_cis.shape == (batch_size, seq_len, rotary_dim)

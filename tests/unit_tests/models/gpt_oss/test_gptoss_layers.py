@@ -61,6 +61,7 @@ def backend_config():
         enable_deepep=False,
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
+        rope_fusion=False,
     )
 
 
@@ -202,6 +203,7 @@ class TestGptOssAttentionWithTE:
             enable_deepep=False,
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
+            rope_fusion=False,
         )
 
     def test_te_backend_requires_min_version(self, gpt_config):

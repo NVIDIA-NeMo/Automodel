@@ -12,6 +12,7 @@
 # See the License for the specific governing permissions and
 # limitations under the License.
 
+import math
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -28,7 +29,7 @@ from nemo_automodel.components.attention.utils import (
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
 )
-from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb
+from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
 from nemo_automodel.components.moe.utils import (
     BackendConfig,
     initialize_linear_module,
@@ -60,6 +61,11 @@ class GptOssAttention(nn.Module):
         )
 
         self.softmax_scale = self.head_dim**-0.5
+        # When using fused rope, YaRN concentration is not baked into freqs_cis,
+        # so we need to apply concentration^2 to softmax_scale
+        if backend.rope_fusion:
+            yarn_concentration = 0.1 * math.log(config.rope_scaling["factor"]) + 1.0
+            self.softmax_scale = self.softmax_scale * yarn_concentration * yarn_concentration
 
         assert backend.attn in ("flex", "te"), "Only Flex and TE Attention are supported for GPT-OSS"
         if backend.attn == "te" and not is_te_min_version("2.8.0"):
@@ -107,10 +113,15 @@ class GptOssAttention(nn.Module):
             k = k.view(bsz, seqlen, self.num_key_value_heads, self.head_dim)
             v = v.view(bsz, seqlen, self.num_key_value_heads, self.head_dim)
 
-        # freqs_cis is concatenated [cos, sin] along last dim with shape (B, T, head_dim)
-        cos, sin = freqs_cis.split(self.head_dim // 2, dim=-1)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        # Apply rotary positional embeddings
+        q, k = apply_rotary_emb_qk(
+            q,
+            k,
+            freqs_cis,
+            format=qkv_format,
+            rope_fusion=self.backend.rope_fusion,
+            cu_seqlens=attn_kwargs.get("cu_seqlens", None),
+        )
 
         if self.backend.attn == "flex":
             updated_attn_kwargs = {
