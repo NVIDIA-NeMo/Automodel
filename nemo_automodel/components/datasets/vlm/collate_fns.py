@@ -34,6 +34,8 @@ except ImportError:
     HAVE_QWEN_OMNI_UTILS = False
     process_mm_info = MagicMock()
 
+import logging
+logger = logging.getLogger(__name__)
 
 def create_loss_mask_with_start_of_response_token(input_ids, processor, start_of_response_token=None):
     r"""
@@ -232,6 +234,24 @@ def qwen3_omni_collate_fn(
     batch["labels"] = labels
     return batch
 
+def _find_pattern_indices(template, pattern, search_start_index=0, allow_first_token_mismatch=False):
+    template_len = len(template)
+    pattern_len = len(pattern)
+    for i in range(search_start_index, template_len - pattern_len + 1):
+        match = template[i : i + pattern_len] == pattern
+        if torch.all(match) or (allow_first_token_mismatch and torch.all(match[1:])):
+            return i, i + pattern_len
+    return -1, -1
+
+def _stop_tokens(processor):
+    candidates = [
+        '<end_of_turn>',
+        '<|im_end|>',
+        '<|eot_id|>',
+        processor.tokenizer.eos_token,
+    ]
+    return candidates
+
 
 def default_collate_fn(examples: list, processor, start_of_response_token=None) -> dict[str, torch.Tensor]:
     """Default collate function for VLM models."""
@@ -256,15 +276,49 @@ def default_collate_fn(examples: list, processor, start_of_response_token=None) 
         )
 
     batch["pixel_values"] = batch["pixel_values"].to(torch.bfloat16)
-    labels = batch["input_ids"].clone()[:, 1:]
-    labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
-    labels[torch.isin(labels, skipped_tokens)] = -100
-    batch["labels"] = labels
-    loss_masks = [
-        create_loss_mask_with_start_of_response_token(input_ids, processor, start_of_response_token)
-        for input_ids in batch["input_ids"]
-    ]
-    batch["loss_mask"] = torch.tensor(loss_masks, dtype=torch.float, device=batch["input_ids"].device)
+
+    for encoded, example in zip(batch["input_ids"], examples):
+        conversation = example["conversation"]
+        search_start_index = 0
+        #generate labels for each example
+        labels = torch.full_like(encoded, -100)
+        for message in conversation:
+            if message["role"] == "assistant":
+                assistant_text = message["content"] if isinstance(message["content"], str) else message["content"][0]["text"]
+                assistant_tokens = processor.tokenizer(assistant_text, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
+                answer_start, answer_end = _find_pattern_indices(encoded, assistant_tokens, search_start_index)
+                # include the next token if it is a stop token
+                if answer_end < len(encoded):
+                    next_token_str = processor.tokenizer.decode(encoded[answer_end])
+                    if next_token_str.strip() in _stop_tokens(processor):
+                        answer_end = answer_end + 1
+                if answer_start >= 0:
+                    labels[answer_start:answer_end] = encoded[answer_start:answer_end]
+                    search_start_index = answer_end
+                else:
+                    logger.warning(
+                    "Unable to find answer segment in the tokenized conversation. "
+                    "Skipping labeling for this and subsequent answers. Details: "
+                    "\n- Processed Text: %s"
+                    "\n- Tokens: %s"
+                    "\n- Target Answer Tokens: %s"
+                    "\n- Search Start Index: %d",
+                    conversation,
+                    encoded,
+                    assistant_tokens,
+                    search_start_index,
+                    )
+                    break
+
+        labels[torch.isin(labels, skipped_tokens)] = -100
+        batch["labels"] = labels.unsqueeze(0) if "labels" not in batch else torch.cat([batch["labels"], labels.unsqueeze(0)], dim=0)
+
+    batch["labels"] = batch["labels"][:, 1:]
+    # for all other keys whose shape is the same as input_ids, shift by 1 to the left
+    input_shape = batch["input_ids"].shape
+    for key in batch:
+        if batch[key].shape == input_shape and key != "labels":
+            batch[key] = batch[key][:, :-1]
     return batch
 
 
