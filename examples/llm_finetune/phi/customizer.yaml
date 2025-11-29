@@ -1,0 +1,123 @@
+step_scheduler:
+  global_batch_size: 16
+  local_batch_size: 2
+  ckpt_every_steps: 60
+  val_every_steps: 10
+  max_steps: 242
+  num_epochs: 2
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  ranked: true
+  seed: 1990
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: microsoft/phi-4
+  torch_dtype: bf16
+  trust_remote_code: false
+  attn_implementation: sdpa
+  output_hidden_states: true
+  use_liger_kernel: false
+checkpoint:
+  enabled: true
+  model_save_format: safetensors
+  checkpoint_dir: checkpoints/
+  save_consolidated: true
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  dp_size: 1
+  sequence_parallel: false
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1.0e-08
+  lr: 0.0001
+  weight_decay: 0.01
+  foreach: false
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 0
+  init_lr: 0
+  lr_warmup_steps: 200
+
+packed_sequence:
+  packed_sequence_size: 0
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: ["*_proj"]
+  dim: 8
+  alpha: 16
+  use_triton: false
+  dropout: 0.01
+  dropout_position: pre
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
+  path_or_dataset_id: /workspace/customizer-data/merged/training.jsonl
+  column_mapping:
+    question: prompt
+    answer: completion
+  answer_only_loss_mask: true
+  split: train
+  seq_length: 8192
+  padding: do_not_pad
+  truncation: longest_first
+  use_hf_chat_template: true
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: microsoft/phi-4
+    add_bos_token: false
+    add_eos_token: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
+  path_or_dataset_id: /workspace/customizer-data/merged/validation.jsonl
+  column_mapping:
+    question: prompt
+    answer: completion
+  answer_only_loss_mask: true
+  split: validation
+  seq_length: 8192
+  padding: do_not_pad
+  truncation: longest_first
+  use_hf_chat_template: true
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: microsoft/phi-4
+    add_bos_token: false
+    add_eos_token: true
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+# mlflow:
+#   experiment_name: "automodel-test"
+#   run_name: "run1"
+#   tracking_uri: http://mlflow.mlflow-system:80
+#   artifact_location: null 
+#   tags:
+#     task: "customizer-finetune"
+#     model_family: "phi-4"
+#     model_size: "14B"
+#     dataset: "email"
+#     framework: "automodel"
+
+# wandb:
+#   project: "customizer-debugging"
+#   entity: "Nemo-automodel"
+#   name: "automodel-refactor-chat-template"
