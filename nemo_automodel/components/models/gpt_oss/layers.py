@@ -12,13 +12,13 @@
 # See the License for the specific governing permissions and
 # limitations under the License.
 
-import math
 from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.models.deepseek_v3.rope_utils import yarn_get_mscale
 from nemo_automodel.shared.import_utils import is_te_min_version
 
 if TYPE_CHECKING:
@@ -62,10 +62,11 @@ class GptOssAttention(nn.Module):
 
         self.softmax_scale = self.head_dim**-0.5
         # When using fused rope, YaRN concentration is not baked into freqs_cis,
-        # so we need to apply concentration^2 to softmax_scale
+        # so we need to apply concentration to q and k after fused rope
         if backend.rope_fusion:
-            yarn_concentration = 0.1 * math.log(config.rope_scaling["factor"]) + 1.0
-            self.softmax_scale = self.softmax_scale * yarn_concentration * yarn_concentration
+            self.yarn_concentration = yarn_get_mscale(config.rope_scaling["factor"])
+        else:
+            self.yarn_concentration = None
 
         assert backend.attn in ("flex", "te"), "Only Flex and TE Attention are supported for GPT-OSS"
         if backend.attn == "te" and not is_te_min_version("2.8.0"):
@@ -121,6 +122,7 @@ class GptOssAttention(nn.Module):
             format=qkv_format,
             rope_fusion=self.backend.rope_fusion,
             cu_seqlens=attn_kwargs.get("cu_seqlens", None),
+            concentration=self.yarn_concentration,
         )
 
         if self.backend.attn == "flex":
@@ -157,7 +159,7 @@ class GptOssAttention(nn.Module):
             ]
 
             if self.backend.attn == "flex":
-                nn.init.trunc_normal_(self.sinks, mean=0.0, std=init_std)
+                nn.init.normal_(self.sinks, mean=0.0, std=init_std)
             else:
                 nn.init.trunc_normal_(self.attn_module.softmax_offset, mean=0.0, std=init_std)
             for linear in linear_list:

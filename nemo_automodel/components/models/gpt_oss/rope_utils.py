@@ -142,6 +142,7 @@ def apply_rotary_emb_qk(
     format: str = "bshd",
     rope_fusion: bool = True,
     cu_seqlens: torch.Tensor | None = None,
+    concentration: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply rotary embeddings to query and key tensors.
 
@@ -163,6 +164,9 @@ def apply_rotary_emb_qk(
 
         q = apply_rotary_pos_emb(q, freqs_cis, tensor_format=format, fused=True, cu_seqlens=cu_seqlens)
         k = apply_rotary_pos_emb(k, freqs_cis, tensor_format=format, fused=True, cu_seqlens=cu_seqlens)
+        if concentration is not None:
+            q = q * concentration
+            k = k * concentration
         return q, k
     else:
         cos, sin = freqs_cis.split(freqs_cis.shape[-1] // 2, dim=-1)

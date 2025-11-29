@@ -1201,6 +1201,50 @@ class TestApplyRotaryEmbQk:
         torch.testing.assert_close(q_out[..., rotary_dim:], q_pass)
         torch.testing.assert_close(k_out[..., rotary_dim:], k_pass)
 
+    def test_concentration_parameter_none(self):
+        """Test apply_rotary_emb_qk with concentration=None (default behavior)"""
+        batch_size = 2
+        seq_len = 4
+        num_heads = 4
+        head_dim = 32
+
+        q = torch.randn(batch_size, seq_len, num_heads, head_dim)
+        k = torch.randn(batch_size, seq_len, num_heads, head_dim)
+        cos = torch.randn(seq_len, head_dim // 2)
+        sin = torch.randn(seq_len, head_dim // 2)
+        freqs_cis = torch.cat([cos, sin], dim=-1).unsqueeze(0).expand(batch_size, seq_len, head_dim)
+
+        # With concentration=None (default), output should match non-concentration behavior
+        q_out_default, k_out_default = apply_rotary_emb_qk(q, k, freqs_cis, format="bshd", rope_fusion=False)
+        q_out_none, k_out_none = apply_rotary_emb_qk(q, k, freqs_cis, format="bshd", rope_fusion=False, concentration=None)
+
+        torch.testing.assert_close(q_out_default, q_out_none)
+        torch.testing.assert_close(k_out_default, k_out_none)
+
+    def test_concentration_parameter_non_fused_has_no_effect(self):
+        """Test that concentration parameter has no effect when rope_fusion=False"""
+        batch_size = 2
+        seq_len = 4
+        num_heads = 4
+        head_dim = 32
+        concentration = 1.5
+
+        q = torch.randn(batch_size, seq_len, num_heads, head_dim)
+        k = torch.randn(batch_size, seq_len, num_heads, head_dim)
+        cos = torch.randn(seq_len, head_dim // 2)
+        sin = torch.randn(seq_len, head_dim // 2)
+        freqs_cis = torch.cat([cos, sin], dim=-1).unsqueeze(0).expand(batch_size, seq_len, head_dim)
+
+        # With rope_fusion=False, concentration should be ignored
+        q_out_no_conc, k_out_no_conc = apply_rotary_emb_qk(q, k, freqs_cis, format="bshd", rope_fusion=False)
+        q_out_with_conc, k_out_with_conc = apply_rotary_emb_qk(
+            q, k, freqs_cis, format="bshd", rope_fusion=False, concentration=concentration
+        )
+
+        # Results should be the same since concentration is ignored for non-fused rope
+        torch.testing.assert_close(q_out_no_conc, q_out_with_conc)
+        torch.testing.assert_close(k_out_no_conc, k_out_with_conc)
+
 
 class TestPositionIdsToFreqsCisFusedRope:
     """Tests for position_ids_to_freqs_cis with fused rope support"""
