@@ -751,8 +751,8 @@ class TestFreqsCisFromPositionIdsFusedRope:
         assert freqs_cis.shape == (seq_len, 1, 1, head_dim)
         assert freqs_cis.dtype == torch.float32
 
-    def test_fused_angles_are_duplicated(self):
-        """Test that fused rope format has angles duplicated [angles, angles]"""
+    def test_fused_angles_are_interleaved(self):
+        """Test that fused rope format has angles interleaved [a0, a0, a1, a1, ...]"""
         seq_len = 4
         head_dim = 32
 
@@ -766,10 +766,11 @@ class TestFreqsCisFromPositionIdsFusedRope:
         # Shape should be (T, 1, 1, head_dim)
         assert freqs_cis.shape == (seq_len, 1, 1, head_dim)
 
-        # First half and second half should be identical (angles duplicated)
-        first_half = freqs_cis[:, 0, 0, :head_dim // 2]
-        second_half = freqs_cis[:, 0, 0, head_dim // 2:]
-        torch.testing.assert_close(first_half, second_half)
+        # Angles should be interleaved: [a0, a0, a1, a1, a2, a2, ...]
+        # Even indices and odd indices should be equal (each angle is duplicated consecutively)
+        even_indices = freqs_cis[:, 0, 0, 0::2]  # a0, a1, a2, ...
+        odd_indices = freqs_cis[:, 0, 0, 1::2]   # a0, a1, a2, ...
+        torch.testing.assert_close(even_indices, odd_indices)
 
     def test_fused_thd_uses_sequential_positions(self):
         """Test that fused rope with thd uses sequential positions regardless of input"""
@@ -790,7 +791,8 @@ class TestFreqsCisFromPositionIdsFusedRope:
         # For fused rope, positions should be sequential 0, 1, 2, ... regardless of input
         # So angles at position 0 and position 2 (original) should be different
         # (because they map to sequential positions 0 and 2)
-        angles = freqs_cis[:, 0, 0, :head_dim // 2]
+        # With interleaved format, extract unique angles from even indices
+        angles = freqs_cis[:, 0, 0, 0::2]
 
         # Each position should have unique angles (since they're sequential)
         for i in range(seq_len - 1):
