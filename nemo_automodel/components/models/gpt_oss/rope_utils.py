@@ -207,6 +207,6 @@ def position_ids_to_freqs_cis(
         freqs_cis = freqs_cis[0] if for_fused_rope else freqs_cis
 
     if for_fused_rope:
-        freqs_cis = freqs_cis.reshape(freqs_cis.size(0), 1, 1, freqs_cis.size(1))
+        freqs_cis = freqs_cis.reshape(freqs_cis.size(0), 1, 1, freqs_cis.size(1)).contiguous()
 
     return freqs_cis

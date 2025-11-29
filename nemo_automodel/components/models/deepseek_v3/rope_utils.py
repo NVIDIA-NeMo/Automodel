@@ -159,13 +159,11 @@ def apply_rotary_emb_qk(
     if rope_fusion:
         from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb
 
-        q = q.view(*q.shape[:-1], -1, 2).transpose(-2, -1).reshape(*q.shape[:-1], -1)
-        k = k.view(*k.shape[:-1], -1, 2).transpose(-2, -1).reshape(*k.shape[:-1], -1)
         q = apply_rotary_pos_emb(
-            q, freqs_cis, tensor_format=format, interleaved=False, fused=True, cu_seqlens=cu_seqlens
+            q, freqs_cis, tensor_format=format, interleaved=True, fused=True, cu_seqlens=cu_seqlens
         )
         k = apply_rotary_pos_emb(
-            k, freqs_cis, tensor_format=format, interleaved=False, fused=True, cu_seqlens=cu_seqlens
+            k, freqs_cis, tensor_format=format, interleaved=True, fused=True, cu_seqlens=cu_seqlens
         )
         return q, k
     else:
@@ -199,17 +197,18 @@ def freqs_cis_from_position_ids(
     angles = torch.einsum("bt,d->btd", position_ids.to(dtype=torch.float32), freqs)
 
     if for_fused_rope:
-        # TE fused rope expects [angles, angles] format
-        freqs_cis = torch.cat((angles, angles), dim=-1)
-
         if qkv_format == "thd":
-            freqs_cis = freqs_cis.squeeze(0)
+            freqs_cis = angles.squeeze(0)
         else:
             # For bshd, take first batch (assumes uniform positions)
-            freqs_cis = freqs_cis[0]
+            freqs_cis = angles[0]
+
+        # TE fused rope expects [angles, angles] format
+        # freqs_cis = torch.cat((angles, angles), dim=-1)
+        freqs_cis = torch.stack((freqs_cis.view(-1, 1), freqs_cis.view(-1, 1)), dim=-1).view(freqs_cis.shape[0], -1)
 
         # Reshape to (T, 1, 1, D) for TE fused rope
-        freqs_cis = freqs_cis.reshape(freqs_cis.size(0), 1, 1, freqs_cis.size(1))
+        freqs_cis = freqs_cis.reshape(freqs_cis.size(0), 1, 1, freqs_cis.size(1)).contiguous()
     else:
         # Return complex exponentials for non-fused rope (original behavior)
         freqs_cis = torch.polar(torch.ones_like(angles), angles)
