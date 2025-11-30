@@ -28,9 +28,15 @@ CONVERSATION = [
 class DummyTokenizer:
     def __init__(self, pad_token_id=0):
         self.pad_token_id = pad_token_id
+        self.eos_token = "<eos>"
 
-    def __call__(self, text, add_special_tokens=True):
-        return {"input_ids": [1, 2, 3]}
+    def __call__(self, text, add_special_tokens=True, **kwargs):
+        return {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long)}
+
+    def decode(self, token):
+        if isinstance(token, torch.Tensor):
+            token = token.item()
+        return str(token)
 
 
 class DummyQwen25Processor:
@@ -128,8 +134,8 @@ def test_qwen25_collate_shapes(collate_mod, fake_qwen_utils, monkeypatch):
     processor = DummyQwen25Processor()
     batch = collate_mod.qwen2_5_collate_fn([{"conversation": CONVERSATION}], processor)
 
-    assert batch["input_ids"].shape == (1, 5)
-    assert batch["labels"].shape == (1, 5)
+    assert batch["input_ids"].shape == (1, 4)
+    assert batch["labels"].shape == (1, 4)
     assert torch.all(batch["labels"][:, -1] == -100)
 
 
@@ -139,8 +145,8 @@ def test_default_collate_shapes(collate_mod, fake_qwen_utils, monkeypatch):
     processor = DummyDefaultProcessor()
     batch = collate_mod.default_collate_fn([{"conversation": CONVERSATION} for _ in range(2)], processor)
 
-    assert batch["input_ids"].shape == (2, 4)
-    assert batch["labels"].shape == (2, 4)
+    assert batch["input_ids"].shape == (2, 3)
+    assert batch["labels"].shape == (2, 3)
     assert batch["pixel_values"].dtype == torch.bfloat16
 
 
@@ -150,8 +156,8 @@ def test_qwen3_omni_collate_shapes(collate_mod, fake_qwen_utils, monkeypatch):
     processor = DummyQwen3OmniProcessor()
     batch = collate_mod.qwen3_omni_collate_fn([{"conversation": CONVERSATION} for _ in range(3)], processor)
 
-    assert batch["input_ids"].shape == (3, 5)
-    assert batch["labels"].shape == (3, 5)
+    assert batch["input_ids"].shape == (3, 4)
+    assert batch["labels"].shape == (3, 4)
 
 
 @pytest.mark.parametrize("fn_name", ["qwen2_5_collate_fn", "default_collate_fn", "qwen3_omni_collate_fn"])
