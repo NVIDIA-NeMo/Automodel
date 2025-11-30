@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 from nemo_automodel.components.datasets.vlm.utils import default_stop_tokens
 
+
 def _find_pattern_indices(template, pattern, search_start_index=0, allow_first_token_mismatch=False):
     template_len = len(template)
     pattern_len = len(pattern)
@@ -156,9 +157,7 @@ def phi4_mm_collate_fn(examples, processor):
     return batch
 
 
-def qwen2_5_collate_fn(
-    examples: list, processor
-) -> dict[str, torch.Tensor]:
+def qwen2_5_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
     """Collate function for Qwen2.5 VL model."""
     if not HAVE_QWEN_VL_UTILS:
         raise ImportError(MISSING_QWEN_VL_UTILS_MSG)
@@ -179,7 +178,7 @@ def qwen2_5_collate_fn(
         processor,
     )
     batch["labels"] = labels[:, 1:]
-    
+
     input_shape = batch["input_ids"].shape
     for key, value in list(batch.items()):
         if isinstance(value, torch.Tensor) and value.shape == input_shape:
@@ -252,6 +251,7 @@ def qwen3_omni_collate_fn(
         if isinstance(value, torch.Tensor) and value.shape == input_shape:
             batch[key] = value[:, :-1]
     return batch
+
 
 def default_collate_fn(
     examples: Sequence[Dict[str, Any]],
