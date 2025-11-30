@@ -13,11 +13,35 @@
 # limitations under the License.
 # tests/test_utils.py
 import json
+import types
 
 import pytest
 import torch
 
 from nemo_automodel.components.datasets.vlm import utils
+
+
+def test_default_stop_tokens_with_tokenizer():
+    tokenizer = types.SimpleNamespace(eos_token="<eos>")
+    processor = types.SimpleNamespace(tokenizer=tokenizer)
+
+    tokens = utils.default_stop_tokens(processor)
+
+    assert "<end_of_turn>" in tokens
+    assert "<|im_end|>" in tokens
+    assert "<|eot_id|>" in tokens
+    assert "<eos>" in tokens
+
+
+def test_default_stop_tokens_without_tokenizer():
+    processor = object()
+
+    tokens = utils.default_stop_tokens(processor)
+
+    assert "<end_of_turn>" in tokens
+    assert "<|im_end|>" in tokens
+    assert "<|eot_id|>" in tokens
+    assert all(token != "<eos>" for token in tokens)
 
 
 def test_json2token_basic():

@@ -38,6 +38,8 @@ from typing import Any, Dict, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
+from nemo_automodel.components.datasets.vlm.utils import default_stop_tokens
+
 def _find_pattern_indices(template, pattern, search_start_index=0, allow_first_token_mismatch=False):
     template_len = len(template)
     pattern_len = len(pattern)
@@ -46,15 +48,6 @@ def _find_pattern_indices(template, pattern, search_start_index=0, allow_first_t
         if torch.all(match) or (allow_first_token_mismatch and torch.all(match[1:])):
             return i, i + pattern_len
     return -1, -1
-
-def _stop_tokens(processor):
-    candidates = [
-        "<end_of_turn>",
-        "<|im_end|>",
-        "<|eot_id|>",
-        processor.tokenizer.eos_token,
-    ]
-    return candidates
 
 
 def _extract_assistant_text(message: Dict[str, Any]) -> str:
@@ -100,7 +93,7 @@ def build_labels(
 
             if answer_end < len(encoded):
                 next_token_str = tokenizer.decode(encoded[answer_end])
-                if next_token_str.strip() in _stop_tokens(processor):
+                if next_token_str.strip() in default_stop_tokens(processor):
                     answer_end += 1
 
             if answer_start >= 0:
