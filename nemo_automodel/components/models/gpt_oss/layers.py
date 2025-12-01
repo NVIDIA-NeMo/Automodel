@@ -163,6 +163,6 @@ class GptOssAttention(nn.Module):
             if self.backend.attn == "flex":
                 nn.init.normal_(self.sinks, mean=0.0, std=init_std)
             else:
-                nn.init.trunc_normal_(self.attn_module.softmax_offset, mean=0.0, std=init_std)
+                nn.init.normal_(self.attn_module.softmax_offset, mean=0.0, std=init_std)
             for linear in linear_list:
                 nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
