@@ -964,10 +964,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             True if self.cfg.get("peft", None) else False,
         )
 
-        if "max_grad_norm" in self.cfg:
-            self.max_grad_norm = float(self.cfg.max_grad_norm)
+        if self.cfg.get("clip_grad_norm.max_norm", None) is not None:
+            self.max_grad_norm = float(self.cfg.clip_grad_norm.max_norm)
         else:
-            logging.info("No max_grad_norm specified in config, using default value of 1.0")
+            logging.info("No clip_grad_norm.max_norm specified in config, using default value of 1.0")
             self.max_grad_norm = 1.0
 
         # Create Checkpointer instance
