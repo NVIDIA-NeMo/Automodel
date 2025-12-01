@@ -88,6 +88,14 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
         from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 
+
+        if "max_grad_norm" in self.cfg:
+            self.max_grad_norm = float(self.cfg.max_grad_norm)
+        else:
+            logging.info("No max_grad_norm specified in config, using default value of 1.0")
+            self.max_grad_norm = 1.0
+        quit()
+
         self.checkpointer = Checkpointer(
             config=checkpoint_config,
             dp_rank=self._get_dp_rank(include_cp=True),
@@ -240,7 +248,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
         # Calculate gradient norm (distributed-aware)
         grad_norm = clip_grad_norm(
-            max_grad_norm=1e9,  # Effectively no clipping (measure only)
+            max_grad_norm=self.max_grad_norm,
             model_parts=self.model_parts,
             norm_type=2.0,
             pp_enabled=self._get_pp_rank() != 0 if hasattr(self, "_get_pp_rank") else False,

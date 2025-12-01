@@ -600,6 +600,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
             True if self.cfg.get("peft", None) else False,
         )
 
+        if "max_grad_norm" in self.cfg:
+            self.max_grad_norm = float(self.cfg.max_grad_norm)
+        else:
+            logging.info("No max_grad_norm specified in config, using default value of 1.0")
+            self.max_grad_norm = 1.0
+
         # Create Checkpointer instance
         self.checkpointer = Checkpointer(
             config=checkpoint_config,
@@ -694,7 +700,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
             for batch_idx, batches in enumerate(self.step_scheduler):
-                log_data = self._run_train_optim_step(batches, 1.0)
+                log_data = self._run_train_optim_step(batches, self.max_grad_norm)
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step(1)
 
@@ -723,7 +729,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         self.checkpointer.close()
 
-    def _run_train_optim_step(self, batches, max_grad_norm=1.0):
+    def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
 
         Args:
@@ -772,8 +778,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 local_loss.backward()
 
         grad_norm = scale_grads_and_clip_grad_norm(
-            max_grad_norm,
-            [self.model],
+            max_grad_norm=max_grad_norm,
+            model_parts=[self.model],
             norm_type=2.0,
             pp_enabled=False,
             device_mesh=self.device_mesh,
