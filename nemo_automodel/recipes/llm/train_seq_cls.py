@@ -88,7 +88,6 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
         from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 
-
         if self.cfg.get("clip_grad_norm.max_norm", None) is not None:
             self.max_grad_norm = float(self.cfg.clip_grad_norm.max_norm)
         else:

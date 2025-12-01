@@ -606,7 +606,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             logging.info("No clip_grad_norm.max_norm specified in config, using default value of 1.0")
             self.max_grad_norm = 1.0
 
-
         # Create Checkpointer instance
         self.checkpointer = Checkpointer(
             config=checkpoint_config,
