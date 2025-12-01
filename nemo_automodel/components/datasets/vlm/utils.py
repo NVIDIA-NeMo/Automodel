@@ -12,7 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Iterable
+
 import torch
+
+
+def default_stop_tokens(processor) -> Iterable[str]:
+    tokenizer = getattr(processor, "tokenizer", None)
+    eos_token = getattr(tokenizer, "eos_token", None) if tokenizer is not None else None
+    candidates = [
+        "<end_of_turn>",
+        "<|im_end|>",
+        "<|eot_id|>",
+    ]
+    if eos_token is not None:
+        candidates.append(eos_token)
+    return tuple(candidates)
 
 
 def json2token(obj, sort_json_key: bool = True):
