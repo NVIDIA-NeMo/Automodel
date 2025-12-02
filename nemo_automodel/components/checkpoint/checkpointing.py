@@ -42,7 +42,7 @@ from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, O
 if TYPE_CHECKING:
     from peft import PeftConfig
 
-    from transformers.tokenization_utils import PreTrainedTokenizerBase
+    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 
 def _is_geq_torch_2_9() -> bool:
