@@ -26,7 +26,6 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.optim import Optimizer
 from torchdata.stateful_dataloader import StatefulDataLoader
-
 from transformers.processing_utils import ProcessorMixin
 
 try:
