@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 import torch.distributed.checkpoint as dcp
 import yaml
+from huggingface_hub import constants as hf_constants
 from packaging.version import parse
 from safetensors.torch import load_file, save_file
 from torch import nn
@@ -635,7 +636,7 @@ class Checkpointer:
             return None
         pretrained_model_name_or_path = getattr(model_state.model[0], "name_or_path")
         return get_safetensors_index_path(
-            getattr(self.config, "original_model_root_dir", None) or os.environ["HF_HOME"],
+            getattr(self.config, "original_model_root_dir", hf_constants.HF_HOME),
             pretrained_model_name_or_path,
         )
 
