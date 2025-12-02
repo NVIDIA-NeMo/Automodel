@@ -175,10 +175,11 @@ def build_model_and_optimizer(
 
     init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
     with ScopedRNG(seed=seed, ranked=True):
-        if not cfg_model.get("_target_", None).__self__.__module__.startswith("transformers"):
-            kwargs = {"tp_size": tp_size, "cp_size": cp_size, "has_packed_sequence": has_packed_sequence}
-        else:
+        if cfg_model.get("_target_", None).__self__.__module__.startswith("transformers"):
+            is_meta_device = False
             kwargs = {}
+        else:
+            kwargs = {"tp_size": tp_size, "cp_size": cp_size, "has_packed_sequence": has_packed_sequence}
 
         if cfg_quantization is not None:
             logger.info("Model weight quantization enabled with BitsAndBytes")
