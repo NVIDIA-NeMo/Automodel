@@ -12,65 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Iterable
+
 import torch
 
-# Common special tokens across VLM models
-QWEN_TOKENS = [
-    "<|im_start|>",
-    "<|im_end|>",
-    "<|endoftext|>",
-    "<|vision_start|>",
-    "<|vision_end|>",
-    "<|vision_pad|>",
-    "<|image_pad|>",
-    "<|video_pad|>",
-    "<img>",
-    "</img>",
-    "<IMG_CONTEXT>",
-]
-LLAVA_TOKENS = ["<image>", "<pad>"]
-LLAMA_TOKENS = [
-    "<|begin_of_text|>",
-    "<|end_of_text|>",
-    "<|finetune_right_pad_id|>",
-    "<|step_id|>",
-    "<|start_header_id|>",
-    "<|end_header_id|>",
-    "<|eom_id|>",
-    "<|eot_id|>",
-    "<|python_tag|>",
-    "<|image|>",
-]
-GEMMA_TOKENS = ["<image_soft_token>"]
 
-GEMMA_3N_TOKENS = [
-    "<image_soft_token>",
-    "<audio_soft_token>",
-    "<start_of_audio>",
-    "<start_of_image>",
-    "<end_of_audio>",
-    "<end_of_image>",
-]
-
-PAD_TOKENS = set(QWEN_TOKENS + LLAVA_TOKENS + LLAMA_TOKENS + GEMMA_TOKENS + GEMMA_3N_TOKENS)
-
-
-def extract_skipped_token_ids(processor):
-    """
-    Returns list of tokens to mask in labels.
-
-    Extracted from NeMo's HFAutoModelForImageTextToText.extract_skipped_token_ids
-    """
-    if processor is None:
-        return torch.IntTensor([])
-    tokenizer = getattr(processor, "tokenizer", processor)
-
-    skipped_token_ids = []
-    for key, val in tokenizer.added_tokens_decoder.items():
-        if str(val) in PAD_TOKENS:
-            skipped_token_ids.append(key)
-
-    return torch.IntTensor(list(set(skipped_token_ids)))
+def default_stop_tokens(processor) -> Iterable[str]:
+    tokenizer = getattr(processor, "tokenizer", None)
+    eos_token = getattr(tokenizer, "eos_token", None) if tokenizer is not None else None
+    candidates = [
+        "<end_of_turn>",
+        "<|im_end|>",
+        "<|eot_id|>",
+    ]
+    if eos_token is not None:
+        candidates.append(eos_token)
+    return tuple(candidates)
 
 
 def json2token(obj, sort_json_key: bool = True):
