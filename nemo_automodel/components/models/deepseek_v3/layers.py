@@ -92,12 +92,12 @@ class MLA(nn.Module):
         )
         self.softmax_scale = self.qk_head_dim**-0.5
 
-        rope_scaling = config.rope_scaling
+        rope_parameters = config.rope_parameters
 
-        if rope_scaling:
-            factor = rope_scaling["factor"]
-            mscale = rope_scaling["mscale"]
-            original_seq_len = rope_scaling["original_max_position_embeddings"]
+        if rope_parameters:
+            factor = rope_parameters["factor"]
+            mscale = rope_parameters["mscale"]
+            original_seq_len = rope_parameters["original_max_position_embeddings"]
             if config.max_position_embeddings > original_seq_len:
                 mscale = yarn_get_mscale(factor, mscale)
             self.softmax_scale = self.softmax_scale * mscale * mscale
