@@ -239,3 +239,63 @@ def test_make_cv17_dataset(monkeypatch):
         audio_array, sampling_rate = sample["audio"]
         assert audio_array == src["audio"]["array"]
         assert sampling_rate == src["audio"]["sampling_rate"]
+
+
+def test_make_unimm_chat_dataset(monkeypatch):
+    """End-to-end sanity check for `make_unimm_chat_dataset`."""
+    fake_ds = [
+        {
+            "image": "img_A",
+            "conversation": json.dumps(
+                [
+                    {"from": "human", "value": "Describe <image> please <IMAGE   > now."},
+                    {"from": "gpt", "value": "  Response 1  "},
+                ],
+            ),
+        },
+        {
+            "image": "img_B",
+            "conversation": json.dumps(
+                [
+                    {"from": "human", "value": "<image>"},
+                    {"from": "system", "value": "should be ignored"},
+                    {"from": "gpt", "value": "Answer 2"},
+                ],
+            ),
+        },
+    ]
+
+    # Patch `load_dataset` so no network call is issued.
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: fake_ds)
+
+    result = ds.make_unimm_chat_dataset()
+
+    assert len(result) == len(fake_ds)
+
+    # First sample exercises mixed text/image content and whitespace trimming.
+    convo_a = result[0]["conversation"]
+    assert len(convo_a) == 2
+
+    user_turn_a, assistant_turn_a = convo_a
+    assert user_turn_a["role"] == "user"
+    assert user_turn_a["content"] == [
+        {"type": "text", "text": "Describe"},
+        {"type": "image", "image": "img_A"},
+        {"type": "text", "text": "please"},
+        {"type": "image", "image": "img_A"},
+        {"type": "text", "text": "now."},
+    ]
+
+    assert assistant_turn_a["role"] == "assistant"
+    assert assistant_turn_a["content"] == [{"type": "text", "text": "Response 1"}]
+
+    # Second sample shows placeholder-only inputs and ignored speaker roles.
+    convo_b = result[1]["conversation"]
+    assert len(convo_b) == 2
+
+    user_turn_b, assistant_turn_b = convo_b
+    assert user_turn_b["role"] == "user"
+    assert user_turn_b["content"] == [{"type": "image", "image": "img_B"}]
+
+    assert assistant_turn_b["role"] == "assistant"
+    assert assistant_turn_b["content"] == [{"type": "text", "text": "Answer 2"}]

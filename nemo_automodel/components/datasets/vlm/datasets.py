@@ -14,6 +14,7 @@
 
 import json
 import random
+import re
 
 from datasets import load_dataset
 
@@ -134,3 +135,50 @@ def make_cv17_dataset(path_or_dataset="ysdede/commonvoice_17_tr_fixed", split="t
 
     ret = [format(example) for example in dataset]
     return ret
+
+
+def make_unimm_chat_dataset(path_or_dataset="Yirany/UniMM-Chat", split="train", **kwargs):
+    """Load and preprocess the UniMM-Chat dataset for image-to-text fine-tuning."""
+    dataset = load_dataset(path_or_dataset, split=split)
+    image_placeholder_pattern = re.compile(r"<image\s*>", re.IGNORECASE)
+
+    def convert_user_message(value, image):
+        """Convert a human message with optional image placeholders into multimodal content."""
+        segments = image_placeholder_pattern.split(value)
+        placeholders = len(image_placeholder_pattern.findall(value))
+        content = []
+
+        for idx, segment in enumerate(segments):
+            text = segment.strip()
+            if text:
+                content.append({"type": "text", "text": text})
+            if idx < placeholders:
+                content.append({"type": "image", "image": image})
+
+        if not content:
+            content.append({"type": "image", "image": image})
+
+        return content
+
+    def format(example):
+        conversation = []
+        image = example["image"]
+
+        for turn in json.loads(example["conversation"]):
+            speaker = turn.get("from")
+            value = turn.get("value", "")
+
+            if speaker == "human":
+                content = convert_user_message(value, image)
+                conversation.append({"role": "user", "content": content})
+            elif speaker == "gpt":
+                conversation.append(
+                    {"role": "assistant", "content": [{"type": "text", "text": value.strip()}]},
+                )
+            else:
+                # Skip unrecognized roles to keep dataset consistent
+                continue
+
+        return {"conversation": conversation}
+
+    return [format(example) for example in dataset]
