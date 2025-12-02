@@ -103,11 +103,10 @@ validation_dataset:
     trust_remote_code: true
   path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 64
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
 
 optimizer:
   _target_: torch.optim.Adam

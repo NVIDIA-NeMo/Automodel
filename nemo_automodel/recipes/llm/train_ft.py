@@ -797,7 +797,9 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled):
             val_ds_cfg,
             cfg.validation_dataloader,
             cfg.model,
-            cfg_ps=None,  # Use unpacked config for validation
+            cfg_ps=cfg.get("packed_sequence", None)
+            if _uses_te_dot_product_attention(cfg.model) and _uses_thd_collater(cfg.dataloader)
+            else None,
             seed=cfg.get("seed", 42),
             local_batch_size=cfg.get("step_scheduler.local_batch_size", 1),
             global_batch_size=cfg.get("step_scheduler.global_batch_size", 1),
