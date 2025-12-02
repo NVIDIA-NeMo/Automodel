@@ -42,7 +42,6 @@ from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, O
 
 if TYPE_CHECKING:
     from peft import PeftConfig
-
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 
