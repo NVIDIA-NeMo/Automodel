@@ -81,6 +81,8 @@ from transformers import AutoConfig
 from transformers.modeling_utils import no_init_weights
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.utils import ContextManagers
+import os
+from huggingface_hub import constants
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
