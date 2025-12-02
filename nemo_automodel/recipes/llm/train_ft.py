@@ -323,7 +323,7 @@ def build_model_and_optimizer(
             checkpointer.load_base_model(
                 model,
                 device,
-                cfg_model.get("cache_dir", hf_constants.HF_HOME),
+                cfg_model.get("cache_dir", os.environ.get("HF_HOME", os.path.join(constants.HF_HOME, "hub"))),
                 _get_model_name(cfg_model),
                 getattr(cfg_peft, "lora_A_init", None),
                 load_base_model=load_base_model,
