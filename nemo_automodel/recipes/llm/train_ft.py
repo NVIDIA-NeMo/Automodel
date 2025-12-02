@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import inspect
 import logging
-import os
 import pathlib
 import time
 from contextlib import nullcontext
@@ -26,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 import torch
 import torch.nn as nn
 import wandb
+from huggingface_hub import constants as hf_constants
 from torch.distributed.device_mesh import DeviceMesh
 from torch.utils.data import DataLoader, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
@@ -81,7 +81,6 @@ from transformers import AutoConfig
 from transformers.modeling_utils import no_init_weights
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.utils import ContextManagers
-from huggingface_hub import constants
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -260,7 +259,7 @@ def build_model_and_optimizer(
                 checkpointer.load_base_model(
                     mp,
                     device,
-                    cfg_model.get("cache_dir", os.environ.get("HF_HOME", constants.HF_HOME)),
+                    cfg_model.get("cache_dir", hf_constants.HF_HOME),
                     _get_model_name(cfg_model),
                     getattr(cfg_peft, "lora_A_init", None),
                     load_base_model=load_base_model,
@@ -324,7 +323,7 @@ def build_model_and_optimizer(
             checkpointer.load_base_model(
                 model,
                 device,
-                cfg_model.get("cache_dir", os.environ.get("HF_HOME", constants.HF_HOME)),
+                cfg_model.get("cache_dir", hf_constants.HF_HOME),
                 _get_model_name(cfg_model),
                 getattr(cfg_peft, "lora_A_init", None),
                 load_base_model=load_base_model,
@@ -381,7 +380,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         checkpoint_dir="checkpoints/",
         model_save_format="safetensors",
         model_repo_id=model_repo_id,
-        model_cache_dir=cache_dir if cache_dir is not None else os.environ.get("HF_HOME", constants.HF_HOME),
+        model_cache_dir=cache_dir if cache_dir is not None else hf_constants.HF_HOME,
         save_consolidated=True,
         is_peft=is_peft,
     )
