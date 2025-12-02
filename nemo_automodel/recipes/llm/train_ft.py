@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 import pathlib
 import time
 from contextlib import nullcontext
@@ -29,11 +30,6 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.utils.data import DataLoader, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
-from transformers import AutoConfig
-from transformers.modeling_utils import no_init_weights
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
-from transformers.utils.hub import TRANSFORMERS_CACHE
 from wandb import Settings
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -81,6 +77,10 @@ from nemo_automodel.components.utils.model_utils import (
     resolve_trust_remote_code,
 )
 from nemo_automodel.recipes.base_recipe import BaseRecipe
+from transformers import AutoConfig
+from transformers.modeling_utils import no_init_weights
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from transformers.utils import ContextManagers
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -174,7 +174,10 @@ def build_model_and_optimizer(
 
     init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
     with ScopedRNG(seed=seed, ranked=True):
-        kwargs = {"tp_size": tp_size, "cp_size": cp_size, "has_packed_sequence": has_packed_sequence}
+        if not cfg_model.get("_target_", None).__self__.__module__.startswith("transformers"):
+            kwargs = {"tp_size": tp_size, "cp_size": cp_size, "has_packed_sequence": has_packed_sequence}
+        else:
+            kwargs = {}
 
         if cfg_quantization is not None:
             logger.info("Model weight quantization enabled with BitsAndBytes")
@@ -255,7 +258,7 @@ def build_model_and_optimizer(
                 checkpointer.load_base_model(
                     mp,
                     device,
-                    cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
+                    cfg_model.get("cache_dir", os.environ["HF_HOME"]),
                     _get_model_name(cfg_model),
                     getattr(cfg_peft, "lora_A_init", None),
                     load_base_model=load_base_model,
@@ -319,7 +322,7 @@ def build_model_and_optimizer(
             checkpointer.load_base_model(
                 model,
                 device,
-                cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
+                cfg_model.get("cache_dir", os.environ["HF_HOME"]),
                 _get_model_name(cfg_model),
                 getattr(cfg_peft, "lora_A_init", None),
                 load_base_model=load_base_model,
@@ -376,7 +379,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         checkpoint_dir="checkpoints/",
         model_save_format="safetensors",
         model_repo_id=model_repo_id,
-        model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
+        model_cache_dir=cache_dir if cache_dir is not None else os.environ["HF_HOME"],
         save_consolidated=True,
         is_peft=is_peft,
     )
