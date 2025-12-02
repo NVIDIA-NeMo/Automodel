@@ -102,7 +102,7 @@ def precompute_freqs_cis(
         return ramp_func
 
     freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-    if rope_scaling is not None:
+    if rope_scaling is not None and all(map(lambda x: x in rope_scaling, ["factor", "beta_fast", "beta_slow", "original_max_position_embeddings"])):
         factor = rope_scaling["factor"]
         beta_fast = rope_scaling["beta_fast"]
         beta_slow = rope_scaling["beta_slow"]
