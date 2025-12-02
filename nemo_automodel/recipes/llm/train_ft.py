@@ -174,8 +174,7 @@ def build_model_and_optimizer(
     )
 
     with ScopedRNG(seed=seed, ranked=True):
-        target = cfg_model.get("_target_", None)
-        if target is not None and target.__self__.__module__.startswith("transformers"):
+        if cfg_model.get_as_string("_target_", "").startswith("transformers"):
             is_meta_device = False
             kwargs = {}
         else:
