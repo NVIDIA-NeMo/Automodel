@@ -293,7 +293,6 @@ class Checkpointer:
             key_mapping: Optional key remapping when reading from HF checkpoints.
         """
         # Validate checkpoint directory
-        print("model_path= ", model_path)
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model path {model_path} does not exist")
         model_state = ModelState(
