@@ -966,6 +966,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             True if self.cfg.get("peft", None) else False,
         )
 
+        if self.cfg.get("clip_grad_norm.max_norm", None) is not None:
+            self.max_grad_norm = float(self.cfg.clip_grad_norm.max_norm)
+        else:
+            logging.info("No clip_grad_norm.max_norm specified in config, using default value of 1.0")
+            self.max_grad_norm = 1.0
+
         # Create Checkpointer instance
         self.checkpointer = Checkpointer(
             config=checkpoint_config,
@@ -1126,7 +1132,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             for batches in self.step_scheduler:
                 # If QAT delayed fake-quant is configured, enable after threshold
                 self._enable_qat_if_delayed(self.step_scheduler.step)
-                train_log_data = self._run_train_optim_step(batches, 1.0)
+                train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
                 # log
                 self.log_train_metrics(train_log_data)
 
