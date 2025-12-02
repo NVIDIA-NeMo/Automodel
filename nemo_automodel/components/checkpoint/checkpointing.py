@@ -43,7 +43,6 @@ from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
 
 if TYPE_CHECKING:
     from peft import PeftConfig
-
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 
