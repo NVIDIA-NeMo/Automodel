@@ -93,7 +93,9 @@ class MLA(nn.Module):
         self.softmax_scale = self.qk_head_dim**-0.5
 
         rope_parameters = config.rope_parameters if hasattr(config, "rope_parameters") else config.rope_scaling
-        if rope_parameters and all(map(lambda x: x in rope_parameters, ["factor", "mscale", "original_max_position_embeddings"])):
+        if rope_parameters and all(
+            map(lambda x: x in rope_parameters, ["factor", "mscale", "original_max_position_embeddings"])
+        ):
             factor = rope_parameters["factor"]
             mscale = rope_parameters["mscale"]
             original_seq_len = rope_parameters["original_max_position_embeddings"]
