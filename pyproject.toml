@@ -78,7 +78,7 @@ dependencies = [
     "diffusers",
     "ftfy",
     "imageio-ffmpeg",
-    "liger-kernel@ git+https://github.com/linkedin/Liger-Kernel.git@3d075fd7044ae71d5f1e6be2bb25c0cdf838ba18; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
+    "liger-kernel @ git+https://github.com/linkedin/Liger-Kernel.git@3d075fd7044ae71d5f1e6be2bb25c0cdf838ba18; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "megatron-fsdp",
     "opencv-python-headless==4.10.0.84",
     "pybind11",
