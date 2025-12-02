@@ -32,6 +32,9 @@ from torch.utils.data import DataLoader, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoConfig
+from transformers.modeling_utils import no_init_weights
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from transformers.utils import ContextManagers
 from wandb import Settings
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -79,9 +82,6 @@ from nemo_automodel.components.utils.model_utils import (
     resolve_trust_remote_code,
 )
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from transformers.modeling_utils import no_init_weights
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from transformers.utils import ContextManagers
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
