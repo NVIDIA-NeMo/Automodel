@@ -222,7 +222,7 @@ def build_model_and_optimizer(
             checkpointer.load_base_model(
                 model,
                 device,
-                cfg_model.get("cache_dir", hf_constants.HF_HOME),
+                cfg_model.get("cache_dir", hf_constants.HF_HUB_CACHE),
                 _get_model_name(cfg_model),
                 getattr(cfg_peft, "lora_A_init", None),
                 load_base_model=load_base_model,
@@ -264,7 +264,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         checkpoint_dir="checkpoints/",
         model_save_format="safetensors",
         model_repo_id=model_repo_id,
-        model_cache_dir=cache_dir if cache_dir is not None else hf_constants.HF_HOME,
+        model_cache_dir=cache_dir if cache_dir is not None else hf_constants.HF_HUB_CACHE,
         save_consolidated=True,
         is_peft=is_peft,
     )
