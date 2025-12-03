@@ -28,8 +28,9 @@ def is_tied_word_embeddings(model: nn.Module) -> bool:
     non_tied_lm_head_models = {
         "Qwen3OmniMoeThinkerForConditionalGeneration",  # complicated config structure
     }
+    model_class_name = type(model).__name__
     for m in non_tied_lm_head_models:
-        if m in type(model[0]).__name__:
+        if m in model_class_name:
             return False
     config = getattr(model, "config", None)
     text_config = getattr(config, "get_text_config", lambda: None)()
