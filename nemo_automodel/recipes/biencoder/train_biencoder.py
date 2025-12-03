@@ -511,6 +511,13 @@ class TrainBiencoderRecipe(BaseRecipe):
 
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
+
+            # Set epoch on the dataset for epoch-based positive document cycling
+            # This allows the dataset to use different positive documents each epoch
+            dataset = self.dataloader.dataset
+            if hasattr(dataset, "set_epoch"):
+                dataset.set_epoch(epoch)
+
             # The step scheduler yields a list of batches for gradient accumulation
             for batches in self.step_scheduler:
                 train_log_data = self._run_train_optim_step(batches, 1.0)
