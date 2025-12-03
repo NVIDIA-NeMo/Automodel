@@ -311,3 +311,16 @@ def init_empty_weights():
         yield
     finally:
         nn.Module.register_parameter = old_register_parameter
+
+def is_tied_word_embeddings(model: nn.Module) -> bool:
+    non_tied_lm_head_models = {
+        "Qwen3OmniMoeThinkerForConditionalGeneration",  # complicated config structure
+    }
+    for m in non_tied_lm_head_models:
+        if m in type(model[0]).__name__:
+            return False
+    config = getattr(model, "config", None)
+    text_config = getattr(config, "get_text_config", lambda: None)()
+    return bool(
+        getattr(text_config, "tie_word_embeddings", getattr(config, "tie_word_embeddings", False))
+    )
