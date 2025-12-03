@@ -8,10 +8,11 @@ The `ColumnMappedTextInstructionDataset` is a lightweight, plug-and-play helper 
 * Schema flexibility without needing codebase changes
 * Consistent field names for training loops, regardless of dataset source
 
-It supports two data sources out-of-the-box and optionally streams them so they never fully reside in memory:
+It supports three data sources out-of-the-box and optionally streams them so they never fully reside in memory:
 
 1. **Local JSON/JSONL files** - pass a single file path or a list of paths on disk. The newline-delimited JSON works great.
 2. **Hugging Face Hub** - point to any dataset repo (`org/dataset`) that contains the required columns.
+3. **Delta Lake tables** - load from Databricks, cloud storage (S3, Azure, GCS), or local Delta tables with streaming support.
 
 ---
 ## Quickstart
@@ -161,14 +162,132 @@ dataset:
   start_of_turn_token: "<|assistant|>"
 ```
 
+### Delta Lake / Databricks Example
+
+The dataset loader supports Delta Lake tables from various sources including Databricks, cloud storage (S3, Azure Blob, GCS), and local Delta tables. This is particularly useful for enterprise data pipelines where training data is stored in a data lakehouse.
+
+**Prerequisites:**
+Install the `deltalake` package:
+```bash
+pip install deltalake
+```
+
+**Local Delta Table:**
+```python
+from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import (
+    ColumnMappedTextInstructionDataset,
+)
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B")
+
+# Path to local Delta table (directory containing _delta_log)
+ds = ColumnMappedTextInstructionDataset(
+    path_or_dataset_id="/path/to/delta_table",
+    column_mapping={
+        "question": "prompt",
+        "answer": "completion",
+    },
+    tokenizer=tokenizer,
+    answer_only_loss_mask=True,
+)
+```
+
+**Databricks with Unity Catalog:**
+```python
+# Using delta:// protocol for Databricks tables
+ds = ColumnMappedTextInstructionDataset(
+    path_or_dataset_id="delta://catalog.schema.instruction_data",
+    column_mapping={
+        "context": "system_prompt",
+        "question": "user_input",
+        "answer": "assistant_response",
+    },
+    tokenizer=tokenizer,
+    answer_only_loss_mask=True,
+    delta_storage_options={
+        "DATABRICKS_TOKEN": "dapi...",  # or set DATABRICKS_TOKEN env var
+        "DATABRICKS_HOST": "https://your-workspace.databricks.com",
+    },
+)
+```
+
+**Cloud Storage (S3, Azure, GCS):**
+```python
+# S3 Delta table
+ds = ColumnMappedTextInstructionDataset(
+    path_or_dataset_id="s3://my-bucket/path/to/delta_table",
+    column_mapping={"question": "input", "answer": "output"},
+    tokenizer=tokenizer,
+    delta_storage_options={
+        "AWS_ACCESS_KEY_ID": "...",
+        "AWS_SECRET_ACCESS_KEY": "...",
+        "AWS_REGION": "us-east-1",
+    },
+)
+
+# Azure Blob Storage
+ds = ColumnMappedTextInstructionDataset(
+    path_or_dataset_id="abfss://container@account.dfs.core.windows.net/delta_table",
+    column_mapping={"question": "input", "answer": "output"},
+    tokenizer=tokenizer,
+    delta_storage_options={
+        "AZURE_STORAGE_ACCOUNT_NAME": "...",
+        "AZURE_STORAGE_ACCOUNT_KEY": "...",
+    },
+)
+```
+
+**YAML Configuration for Delta Lake:**
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
+  path_or_dataset_id: delta://catalog.schema.training_data
+  column_mapping:
+    context: system_prompt
+    question: user_message
+    answer: assistant_message
+  answer_only_loss_mask: true
+  delta_storage_options:
+    DATABRICKS_TOKEN: ${oc.env:DATABRICKS_TOKEN}
+    DATABRICKS_HOST: ${oc.env:DATABRICKS_HOST}
+```
+
+**Streaming from Delta Lake:**
+For large Delta tables, use the iterable variant to stream data without loading it all into memory:
+```python
+from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset import (
+    ColumnMappedTextInstructionIterableDataset,
+)
+
+ds = ColumnMappedTextInstructionIterableDataset(
+    path_or_dataset_id="delta:///path/to/large_delta_table",
+    column_mapping={"question": "prompt", "answer": "response"},
+    tokenizer=tokenizer,
+    delta_storage_options={"DATABRICKS_TOKEN": "dapi..."},
+)
+
+# Iterate over samples
+for sample in ds:
+    print(sample["input_ids"][:10])
+    break
+```
+
+:::note
+**Authentication:** The Delta Lake loader automatically picks up credentials from environment variables
+(`DATABRICKS_TOKEN`, `AWS_ACCESS_KEY_ID`, `AZURE_STORAGE_ACCOUNT_KEY`, etc.) if not explicitly
+provided in `delta_storage_options`.
+:::
+
 ### Advanced Options
 | Arg                     | Default | Description |
 |-------------------------|---------|-------------|
-| `split`                 | `None`  | Which split to pull from a HF repo (`train`, `validation`, *etc.*). Ignored for local files. |
-(`dataset[idx]`) are **not** available — iterate instead. |
+| `split`                 | `None`  | Which split to pull from a HF repo (`train`, `validation`, *etc.*). Ignored for local files and Delta tables. |
 | `name`                  | `None`  | Name of the dataset configuration/subset to load |
 | `answer_only_loss_mask` | `True`  | Create a `loss_mask` where only the answer tokens contribute to the loss. Requires `start_of_turn_token`. |
 | `start_of_turn_token`   | `None`  | String token marking the assistant's response. Required when `answer_only_loss_mask=True` for tokenizers with chat template. |
+| `delta_storage_options` | `None`  | Dict of storage options for Delta Lake cloud authentication (e.g., `{"DATABRICKS_TOKEN": "dapi..."}`). |
+| `delta_version`         | `None`  | Specific version of the Delta table to read. If `None`, reads the latest version. |
 
 ---
 ## Tokenisation Paths

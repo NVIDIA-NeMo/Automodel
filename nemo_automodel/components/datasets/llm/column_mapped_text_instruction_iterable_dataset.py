@@ -30,8 +30,13 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
     """Streaming iterable variant that reuses the column-mapping/tokenization logic.
 
     This wraps a Hugging Face streaming dataset (IterableDataset from `datasets`)
-    and yields tokenized samples compatible with the non-streaming variant, while
-    supporting sharding and epoch-setting for deterministic shuffles upstream.
+    or Delta Lake table and yields tokenized samples compatible with the non-streaming
+    variant, while supporting sharding and epoch-setting for deterministic shuffles upstream.
+
+    Supports the following data sources:
+    - HuggingFace Hub datasets
+    - Local JSON/JSONL files
+    - Delta Lake tables (via delta://, dbfs:/, or local directories with _delta_log)
     """
 
     def __init__(
@@ -50,6 +55,8 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
         limit_dataset_samples: Optional[int] = None,
         repeat_on_exhaustion: bool = True,
         use_hf_chat_template: bool = False,
+        delta_storage_options: Optional[Dict[str, str]] = None,
+        delta_version: Optional[int] = None,
     ) -> None:
         if tokenizer is None:
             raise ValueError("Tokenizer is required")
@@ -86,7 +93,14 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
         self.repeat_on_exhaustion = bool(repeat_on_exhaustion)
 
         # Always load in streaming mode
-        ds = _load_dataset(path_or_dataset_id, split=split, streaming=True, name=name)
+        ds = _load_dataset(
+            path_or_dataset_id,
+            split=split,
+            streaming=True,
+            name=name,
+            delta_storage_options=delta_storage_options,
+            delta_version=delta_version,
+        )
         if limit_dataset_samples is not None:
             try:
                 ds = ds.take(limit_dataset_samples)

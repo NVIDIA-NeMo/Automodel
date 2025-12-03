@@ -14,6 +14,13 @@
 
 from .chat_dataset import ChatDataset  # noqa: F401
 from .column_mapped_text_instruction_dataset import ColumnMappedTextInstructionDataset  # noqa: F401
+from .column_mapped_text_instruction_iterable_dataset import ColumnMappedTextInstructionIterableDataset  # noqa: F401
+from .delta_lake_dataset import (  # noqa: F401
+    DeltaLakeDataset,
+    HFDeltaLakeDataset,
+    is_delta_lake_path,
+    load_delta_lake_dataset,
+)
 from .nanogpt_dataset import NanogptDataset  # noqa: F401
 from .retrieval_collator import RetrievalBiencoderCollator  # noqa: F401
 from .retrieval_dataset import make_retrieval_dataset  # noqa: F401
@@ -27,5 +34,10 @@ __all__ = [
     "make_xlam_dataset",
     "RetrievalBiencoderCollator",
     "ColumnMappedTextInstructionDataset",
+    "ColumnMappedTextInstructionIterableDataset",
     "ChatDataset",
+    "DeltaLakeDataset",
+    "HFDeltaLakeDataset",
+    "is_delta_lake_path",
+    "load_delta_lake_dataset",
 ]
