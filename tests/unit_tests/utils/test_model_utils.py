@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Dict
 
 import pytest
@@ -241,3 +242,66 @@ def test_init_empty_weights_torchao_branch_with_fake_weight(monkeypatch):
     assert getattr(m.p, "_linear_mm_config") == "cfg"
     assert getattr(m.p, "_dtype") == torch.float32
     assert isinstance(getattr(m.p, "_precomputed_scale"), torch.Tensor)
+
+
+class _ModuleContainer:
+    def __init__(self, module: nn.Module) -> None:
+        self._module = module
+        if hasattr(module, "config"):
+            self.config = module.config
+
+    def __getitem__(self, idx: int) -> nn.Module:
+        if idx == 0:
+            return self._module
+        raise IndexError
+
+
+def test_is_tied_word_embeddings_prefers_text_config_value():
+    class DummyTextConfig:
+        def __init__(self, tied: bool) -> None:
+            self.tie_word_embeddings = tied
+
+    class DummyConfig:
+        def __init__(self) -> None:
+            self.tie_word_embeddings = True
+            self._text = DummyTextConfig(False)
+
+        def get_text_config(self):
+            return self._text
+
+    class DummyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = DummyConfig()
+
+    container = _ModuleContainer(DummyModel())
+    assert model_utils.is_tied_word_embeddings(container) is False
+
+
+def test_is_tied_word_embeddings_falls_back_to_top_level_when_no_text_config():
+    class DummyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(tie_word_embeddings=True)
+
+    container = _ModuleContainer(DummyModel())
+    assert model_utils.is_tied_word_embeddings(container) is True
+
+
+def test_is_tied_word_embeddings_handles_missing_config():
+    class DummyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+
+    container = _ModuleContainer(DummyModel())
+    assert model_utils.is_tied_word_embeddings(container) is False
+
+
+def test_is_tied_word_embeddings_respects_exclusion_list():
+    class Qwen3OmniMoeThinkerForConditionalGeneration(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(tie_word_embeddings=True)
+
+    container = _ModuleContainer(Qwen3OmniMoeThinkerForConditionalGeneration())
+    assert model_utils.is_tied_word_embeddings(container) is False
