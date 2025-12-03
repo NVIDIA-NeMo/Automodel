@@ -26,7 +26,6 @@ from packaging.version import parse
 from safetensors.torch import load_file, save_file
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
-from transformers.utils import TRANSFORMERS_CACHE
 
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
@@ -43,6 +42,7 @@ from nemo_automodel.components.utils.model_utils import is_tied_word_embeddings
 
 if TYPE_CHECKING:
     from peft import PeftConfig
+
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 
@@ -635,7 +635,9 @@ class Checkpointer:
             return None
         pretrained_model_name_or_path = getattr(model_state.model[0], "name_or_path")
         return get_safetensors_index_path(
-            getattr(self.config, "original_model_root_dir", None) or TRANSFORMERS_CACHE, pretrained_model_name_or_path
+            getattr(self.config, "original_model_root_dir", None)
+            or "/lustre/fsw/portfolios/coreai/users/huiyingl/hf_cache/",
+            pretrained_model_name_or_path,
         )
 
 
