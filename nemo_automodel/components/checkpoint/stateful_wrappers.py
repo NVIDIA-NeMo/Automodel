@@ -94,7 +94,7 @@ class ModelState:
                 - ["score."] for some classification heads
         """
         self.model = [model] if isinstance(model, torch.nn.Module) else model
-        self.is_tied_lm_head = is_tied_word_embeddings(model)
+        self.is_tied_lm_head = is_tied_word_embeddings(self.model[0])
 
         if self.is_tied_lm_head:
             _, lm_head_param_name = _get_lm_head_weight_and_name(self.model[0])
