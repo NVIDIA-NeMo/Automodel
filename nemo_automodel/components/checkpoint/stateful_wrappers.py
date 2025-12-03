@@ -24,7 +24,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 
-from nemo_automodel.components.utils.model_utils import is_tied_word_embeddings
+from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
 
 _PREFIX = "model."
 
