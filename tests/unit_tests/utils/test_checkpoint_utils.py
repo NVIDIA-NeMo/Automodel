@@ -19,18 +19,6 @@ import torch.nn as nn
 import nemo_automodel.components.checkpoint.utils as checkpoint_utils
 
 
-class _ModuleContainer:
-    def __init__(self, module: nn.Module) -> None:
-        self._module = module
-        if hasattr(module, "config"):
-            self.config = module.config
-
-    def __getitem__(self, idx: int) -> nn.Module:
-        if idx == 0:
-            return self._module
-        raise IndexError
-
-
 def test_is_tied_word_embeddings_prefers_text_config_value():
     class DummyTextConfig:
         def __init__(self, tied: bool) -> None:
@@ -49,8 +37,8 @@ def test_is_tied_word_embeddings_prefers_text_config_value():
             super().__init__()
             self.config = DummyConfig()
 
-    container = _ModuleContainer(DummyModel())
-    assert checkpoint_utils.is_tied_word_embeddings(container) is False
+    model = DummyModel()
+    assert checkpoint_utils.is_tied_word_embeddings(model) is False
 
 
 def test_is_tied_word_embeddings_falls_back_to_top_level_when_no_text_config():
@@ -59,8 +47,8 @@ def test_is_tied_word_embeddings_falls_back_to_top_level_when_no_text_config():
             super().__init__()
             self.config = SimpleNamespace(tie_word_embeddings=True)
 
-    container = _ModuleContainer(DummyModel())
-    assert checkpoint_utils.is_tied_word_embeddings(container) is True
+    model = DummyModel()
+    assert checkpoint_utils.is_tied_word_embeddings(model) is True
 
 
 def test_is_tied_word_embeddings_handles_missing_config():
@@ -68,8 +56,8 @@ def test_is_tied_word_embeddings_handles_missing_config():
         def __init__(self) -> None:
             super().__init__()
 
-    container = _ModuleContainer(DummyModel())
-    assert checkpoint_utils.is_tied_word_embeddings(container) is False
+    model = DummyModel()
+    assert checkpoint_utils.is_tied_word_embeddings(model) is False
 
 
 def test_is_tied_word_embeddings_respects_exclusion_list():
@@ -78,5 +66,5 @@ def test_is_tied_word_embeddings_respects_exclusion_list():
             super().__init__()
             self.config = SimpleNamespace(tie_word_embeddings=True)
 
-    container = _ModuleContainer(Qwen3OmniMoeThinkerForConditionalGeneration())
-    assert checkpoint_utils.is_tied_word_embeddings(container) is False
+    model = Qwen3OmniMoeThinkerForConditionalGeneration()
+    assert checkpoint_utils.is_tied_word_embeddings(model) is False
