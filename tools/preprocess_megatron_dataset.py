@@ -35,6 +35,13 @@ except ImportError:
     PunktLanguageVars = object  # Fallback to the built-in object class
     nltk_available = False
 
+try:
+    import pyarrow.parquet as pq
+
+    parquet_available = True
+except ImportError:
+    parquet_available = False
+
 from transformers import AutoTokenizer
 
 from nemo_automodel.components.datasets.llm.megatron import indexed_dataset
@@ -56,6 +63,15 @@ class CustomLanguageVars(PunktLanguageVars):
 class IdentitySplitter(object):
     def tokenize(self, *text):
         return text
+
+
+def parquet_row_iterator(file_path, text_column, batch_size=10000):
+    """Iterate over parquet file rows, yielding JSON-like strings for each row."""
+    parquet_file = pq.ParquetFile(file_path)
+    for batch in parquet_file.iter_batches(batch_size=batch_size, columns=[text_column]):
+        for text_value in batch.column(text_column):
+            # Convert to Python string and yield as JSON line
+            yield json.dumps({"text": text_value.as_py()})
 
 
 class Encoder(object):
@@ -197,13 +213,77 @@ class Partition(object):
         fin.close()
         builders[key].finalize(output_idx_files[key])
 
+    def process_parquet_file(self, file_name):
+        input_file_name, output_prefix = file_name
+        print("Opening parquet file:", input_file_name)
+
+        startup_start = time.time()
+        encoder = Encoder(self.args)
+        tokenizer = AutoTokenizer.from_pretrained(self.args.pretrained_model_name_or_path)
+        pool = multiprocessing.Pool(self.workers, initializer=encoder.initializer)
+
+        # Create iterator over parquet rows
+        row_iterator = parquet_row_iterator(
+            input_file_name, self.args.text_column, batch_size=self.args.parquet_batch_size
+        )
+        encoded_docs = pool.imap(encoder.encode, row_iterator, 32)
+
+        level = "document"
+        if self.args.split_sentences:
+            level = "sentence"
+
+        output_bin_files = {}
+        output_idx_files = {}
+        builders = {}
+
+        for key in self.args.json_keys:
+            output_bin_files[key] = "{}_{}_{}.bin".format(output_prefix, key, level)
+            output_idx_files[key] = "{}_{}_{}.idx".format(output_prefix, key, level)
+            builders[key] = indexed_dataset.IndexedDatasetBuilder(
+                output_bin_files[key],
+                dtype=indexed_dataset.DType.optimal_dtype(len(tokenizer)),
+            )
+
+        startup_end = time.time()
+        proc_start = time.time()
+        total_bytes_processed = 0
+        print("Time to startup:", startup_end - startup_start)
+        for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
+            total_bytes_processed += bytes_processed
+            for key in doc.keys():
+                builders[key].add_document(doc[key], sentence_lens[key])
+            self.print_processing_stats(i, proc_start, total_bytes_processed, source=input_file_name)
+
+        pool.close()
+        pool.join()
+        builders[key].finalize(output_idx_files[key])
+
 
 def get_args():
     parser = argparse.ArgumentParser()
     group = parser.add_argument_group(title="input data")
-    group.add_argument("--input", type=str, required=True, help="Path to input JSON")
+    group.add_argument("--input", type=str, required=True, help="Path to input JSON or Parquet file(s)")
     group.add_argument(
         "--json-keys", nargs="+", default=["text"], help="space separate listed of keys to extract from json"
+    )
+    group.add_argument(
+        "--input-type",
+        type=str,
+        choices=["json", "parquet", "auto"],
+        default="auto",
+        help="Input file type. 'auto' detects from file extension (default: auto)",
+    )
+    group.add_argument(
+        "--text-column",
+        type=str,
+        default="text",
+        help="Column name containing text data in parquet files (default: text)",
+    )
+    group.add_argument(
+        "--parquet-batch-size",
+        type=int,
+        default=10000,
+        help="Batch size for reading parquet files (default: 10000)",
     )
     group.add_argument("--split-sentences", action="store_true", help="Split documents into sentences.")
     group.add_argument("--keep-newlines", action="store_true", help="Keep newlines between sentences when splitting.")
@@ -237,6 +317,18 @@ def get_args():
     return args
 
 
+def detect_file_type(file_path):
+    """Detect file type based on extension."""
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in [".parquet", ".pq"]:
+        return "parquet"
+    elif ext in [".json", ".jsonl"]:
+        return "json"
+    else:
+        # Default to json for unknown extensions
+        return "json"
+
+
 def check_files_exist(in_ss_out_names, key, num_items):
     for i in range(num_items):
         if not os.path.exists(in_ss_out_names[i][key]):
@@ -265,6 +357,23 @@ def main():
     if len(in_file_names) == 0:
         print(f"No files matched input pattern: {args.input}")
         return
+
+    # Determine file type
+    if args.input_type == "auto":
+        # Use the first file to detect type
+        file_type = detect_file_type(in_file_names[0])
+    else:
+        file_type = args.input_type
+
+    # Check parquet availability if needed
+    if file_type == "parquet" and not parquet_available:
+        raise Exception("pyarrow library is required for parquet files but is not available. Install with: pip install pyarrow")
+
+    # For parquet files, sentence splitting is not supported (text is already in a single column)
+    if file_type == "parquet" and args.split_sentences:
+        print("Warning: Sentence splitting for parquet files is not currently supported. Ignoring --split-sentences.")
+        args.split_sentences = False
+
     workers_per_file = max(1, args.workers // len(in_file_names))
     partition = Partition(args, workers_per_file)
     in_ss_out_names = []
@@ -282,30 +391,42 @@ def main():
             {"partition": in_file, "sentence_split": sentence_split_file, "output_prefix": output_prefix}
         )
 
-    # Optional sentence splitting per file
-    split_sentences_present = check_files_exist(in_ss_out_names, "sentence_split", len(in_ss_out_names))
-    if args.split_sentences and not split_sentences_present:
+    if file_type == "json":
+        # Optional sentence splitting per file (JSON only)
+        split_sentences_present = check_files_exist(in_ss_out_names, "sentence_split", len(in_ss_out_names))
+        if args.split_sentences and not split_sentences_present:
+            processes = []
+            for name in in_ss_out_names:
+                p = multiprocessing.Process(
+                    target=partition.split_sentences, args=((name["partition"], name["sentence_split"]),)
+                )
+                p.start()
+                processes.append(p)
+            for p in processes:
+                p.join()
+
+        # Encode each file independently
         processes = []
+        input_key = "sentence_split" if args.split_sentences else "partition"
         for name in in_ss_out_names:
             p = multiprocessing.Process(
-                target=partition.split_sentences, args=((name["partition"], name["sentence_split"]),)
+                target=partition.process_json_file, args=((name[input_key], name["output_prefix"]),)
             )
             p.start()
             processes.append(p)
         for p in processes:
             p.join()
-
-    # Encode each file independently
-    processes = []
-    input_key = "sentence_split" if args.split_sentences else "partition"
-    for name in in_ss_out_names:
-        p = multiprocessing.Process(
-            target=partition.process_json_file, args=((name[input_key], name["output_prefix"]),)
-        )
-        p.start()
-        processes.append(p)
-    for p in processes:
-        p.join()
+    else:
+        # Parquet processing
+        processes = []
+        for name in in_ss_out_names:
+            p = multiprocessing.Process(
+                target=partition.process_parquet_file, args=((name["partition"], name["output_prefix"]),)
+            )
+            p.start()
+            processes.append(p)
+        for p in processes:
+            p.join()
     return
 
 
