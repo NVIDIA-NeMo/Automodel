@@ -32,7 +32,7 @@
   - Minor perf regression with DSv3
   - Sequence parallel plan incorrect for Qwen3
   - Non-functional validation with MoE models utilizing TE, packed sequence and pipeline parallel size of 1
-  - PEFT (LoRA) support is scheduled for follow-up release
+  - Support for PEFT (LoRA) with MoE models is scheduled for follow-up release
   - CP support may be impacted by edge cases
 
 ### NeMo-Automodel 25.11 Container
