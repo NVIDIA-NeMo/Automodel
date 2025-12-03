@@ -294,7 +294,6 @@ def init_empty_weights():
         old_register_parameter(module, name, param)
         if param is not None:
             param_cls = type(module._parameters[name])
-            hf_initialized_flag = getattr(module._parameters[name], "_is_hf_initialized", None)
             if HAVE_TORCHAO and isinstance(
                 module._parameters[name], torch_ao.float8.fsdp_utils.WeightWithDynamicFloat8CastTensor
             ):
@@ -303,19 +302,15 @@ def init_empty_weights():
                     if k in fp8_parameter_mapping:
                         kwargs[fp8_parameter_mapping[k]] = getattr(module._parameters[name], k)
             else:
-                kwargs = module._parameters[name].__dict__.copy()
-                kwargs.pop("_is_hf_initialized", None)
+                kwargs = module._parameters[name].__dict__
                 kwargs["requires_grad"] = param.requires_grad
             module._parameters[name] = param_cls(module._parameters[name].to(device), **kwargs)
-            if hf_initialized_flag is not None:
-                module._parameters[name]._is_hf_initialized = hf_initialized_flag
 
     try:
         nn.Module.register_parameter = register_empty_parameter
         yield
     finally:
         nn.Module.register_parameter = old_register_parameter
-
 
 def is_tied_word_embeddings(model: nn.Module) -> bool:
     non_tied_lm_head_models = {
@@ -326,4 +321,6 @@ def is_tied_word_embeddings(model: nn.Module) -> bool:
             return False
     config = getattr(model, "config", None)
     text_config = getattr(config, "get_text_config", lambda: None)()
-    return bool(getattr(text_config, "tie_word_embeddings", getattr(config, "tie_word_embeddings", False)))
+    return bool(
+        getattr(text_config, "tie_word_embeddings", getattr(config, "tie_word_embeddings", False))
+    )
