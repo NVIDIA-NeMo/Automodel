@@ -33,6 +33,7 @@ from transformers import (
 )
 from transformers.modeling_utils import _get_resolved_checkpoint_files
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
+from transformers.utils.hub import DownloadKwargs
 
 from nemo_automodel import __version__
 from nemo_automodel._transformers.registry import ModelRegistry
@@ -347,22 +348,23 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                                     f"""Downloading model weights on {num_nodes} nodes. This incurs high storage usage. 
                                     It is recommended to download once with `hf download` and pass in the downloaded path to the `pretrained_model_name_or_path` argument."""
                                 )
-                            _get_resolved_checkpoint_files(
-                                pretrained_model_name_or_path=pretrained_model_name_or_path,
-                                subfolder="",
-                                variant=None,
-                                gguf_file=None,
-                                from_tf=False,
-                                from_flax=False,
-                                use_safetensors=None,
+                            download_kwargs = DownloadKwargs(
                                 cache_dir=None,
                                 force_download=False,
                                 proxies=None,
                                 local_files_only=False,
                                 token=None,
-                                user_agent={"file_type": "model", "framework": "pytorch", "from_auto_class": False},
                                 revision="main",
+                                subfolder="",
                                 commit_hash=getattr(hf_config, "_commit_hash", None),
+                            )
+                            _get_resolved_checkpoint_files(
+                                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                                variant=None,
+                                gguf_file=None,
+                                use_safetensors=None,
+                                download_kwargs=download_kwargs,
+                                user_agent={"file_type": "model", "framework": "pytorch", "from_auto_class": False},
                                 is_remote_code=False,
                                 transformers_explicit_filename=None,
                             )

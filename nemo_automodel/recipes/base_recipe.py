@@ -27,7 +27,13 @@ import torch.nn as nn
 from torch.optim import Optimizer
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.processing_utils import ProcessorMixin
-from transformers.tokenization_utils import PreTrainedTokenizerBase
+
+try:
+    # >= v5
+    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+except ImportError:
+    # < v5
+    from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.checkpoint.checkpointing import save_config
@@ -40,8 +46,6 @@ try:
     import yaml as _yaml
 except Exception:
     _yaml = None
-from transformers.processing_utils import ProcessorMixin
-from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 
 def has_load_restore_state(object):
