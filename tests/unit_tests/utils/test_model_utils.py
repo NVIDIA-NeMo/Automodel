@@ -241,4 +241,3 @@ def test_init_empty_weights_torchao_branch_with_fake_weight(monkeypatch):
     assert getattr(m.p, "_linear_mm_config") == "cfg"
     assert getattr(m.p, "_dtype") == torch.float32
     assert isinstance(getattr(m.p, "_precomputed_scale"), torch.Tensor)
-
