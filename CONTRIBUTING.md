@@ -56,6 +56,22 @@ mv <path_to_Automodel>/docker/common/uv-pytorch.lock <path_to_Automodel>/uv.lock
 
 * Please refer to the Automodel Dockerfile for source install steps: [link](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docker/Dockerfile#L53-L122)
 
+### MoE Dependency
+
+* Requires [cuDNN](https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
+
+```bash
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt-get update
+sudo apt-get install cudnn-cuda-12
+pip install transformer-engine[pytorch]==2.8.0
+# Flash-attn version should be selected to satisfy TE requirements
+# https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
+pip install flash-attn==2.7.4.post1
+pip install grouped_gemm
+```
+
 ## Development Dependencies
 
 We use [uv](https://docs.astral.sh/uv/) for managing dependencies.
