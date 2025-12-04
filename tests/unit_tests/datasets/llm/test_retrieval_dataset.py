@@ -530,6 +530,83 @@ def test_transform_func_with_use_dataset_instruction():
     assert out_with_instruction["doc_text"] == out_without_instruction["doc_text"]
 
 
+def test_transform_func_epoch_cycling():
+    corpus_dict = {
+        "corpusA": DummyCorpus(
+            {
+                "p1": {"text": "pos1", "image": "", "nr_ocr": ""},
+                "p2": {"text": "pos2", "image": "", "nr_ocr": ""},
+                "p3": {"text": "pos3", "image": "", "nr_ocr": ""},
+                "n1": {"text": "neg1", "image": "", "nr_ocr": ""},
+            }
+        )
+    }
+
+    # Example with multiple positive docs
+    examples = {
+        "question": ["Q"],
+        "corpus_id": ["corpusA"],
+        "pos_doc": [[{"id": "p1"}, {"id": "p2"}, {"id": "p3"}]],
+        "neg_doc": [[{"id": "n1"}]],
+    }
+
+    # Epoch 0: Should select first positive (p1)
+    out_0 = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict, epoch=0)
+    assert out_0["doc_text"][0][0] == "pos1"
+
+    # Epoch 1: Should select second positive (p2)
+    out_1 = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict, epoch=1)
+    assert out_1["doc_text"][0][0] == "pos2"
+
+    # Epoch 2: Should select third positive (p3)
+    out_2 = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict, epoch=2)
+    assert out_2["doc_text"][0][0] == "pos3"
+
+    # Epoch 3: Should cycle back to first positive (p1)
+    out_3 = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict, epoch=3)
+    assert out_3["doc_text"][0][0] == "pos1"
+
+
+def test_retrieval_transform_set_epoch():
+    """Test the RetrievalTransform stateful class and set_epoch method."""
+    corpus_dict = {
+        "corpusA": DummyCorpus(
+            {
+                "p1": {"text": "pos1", "image": "", "nr_ocr": ""},
+                "p2": {"text": "pos2", "image": "", "nr_ocr": ""},
+                "n1": {"text": "neg1", "image": "", "nr_ocr": ""},
+            }
+        )
+    }
+
+    dataset = Dataset.from_list(
+        [
+            {
+                "question_id": "q1",
+                "question": "Q",
+                "corpus_id": "corpusA",
+                "pos_doc": [{"id": "p1"}, {"id": "p2"}],
+                "neg_doc": [{"id": "n1"}],
+            }
+        ]
+    )
+
+    transform = rd.RetrievalTransform(num_neg_docs=1, corpus_dict=corpus_dict)
+    dataset.set_transform(transform)
+    dataset.set_epoch = transform.set_epoch
+
+    item_0 = dataset[0]
+    assert item_0["doc_text"][0] == "pos1"
+
+    dataset.set_epoch(1)
+    item_1 = dataset[0]
+    assert item_1["doc_text"][0] == "pos2"
+
+    dataset.set_epoch(0)
+    item_back = dataset[0]
+    assert item_back["doc_text"][0] == "pos1"
+
+
 def test_load_datasets_inline_jsonl(tmp_path):
     """Inline retrieval format: query + inline pos/neg doc texts (JSONL)."""
     f = tmp_path / "inline.jsonl"
