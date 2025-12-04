@@ -28,12 +28,14 @@
 - Task support
   - QAT for SFT
   - Sequence classification
-- Known issues / limitations
+- Known issues
   - Minor perf regression with DSv3
   - Sequence parallel plan incorrect for Qwen3
-  - Non-functional validation with MoE models utilizing TE, packed sequence and pipeline parallel size of 1
-  - Support for PEFT (LoRA) with MoE models is scheduled for follow-up release
-  - CP support may be impacted by edge cases
+  - Support for GPT-OSS 120B with DeepEP will be included in the next patch release
+  - Validation is not functional for custom models with TE when using packed sequence and pipeline parallel size of 1
+- Limitations
+  - PEFT (LoRA) support for MoE models is scheduled for the 26.02 release
+  - For non-MoE models, CP support requires the model leveraging the PyTorch SDPA API
 
 ### NeMo-Automodel 25.11 Container
 
