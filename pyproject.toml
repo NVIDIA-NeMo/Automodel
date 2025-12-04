@@ -92,6 +92,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+cuda = ["flash-attn<=2.8.3", "transformer-engine[pytorch]==2.8.0"]
+extra = ["flash-linear-attention", "perceptron", "sentencepiece"]
 vlm = [
     "pillow",
     "qwen-vl-utils[decord]; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
@@ -103,21 +105,6 @@ vlm = [
     "torchcodec; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "mistral_common[opencv]",
 ]
-fa = ["flash-attn<=2.8.3"]
-moe = [
-    # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
-    # wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
-    # sudo dpkg -i cuda-keyring_1.1-1_all.deb
-    # sudo apt-get update
-    # sudo apt-get install cudnn-cuda-12
-    "transformer-engine[pytorch]==2.8.0",
-    # Flash-attn version should be selected to satisfy TE requirements
-    # https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
-    # "flash-attn==2.7.4.post1",
-    # "grouped_gemm",
-]
-extra = ["flash-linear-attention", "perceptron", "sentencepiece"]
-
 all = [
     "nemo_automodel[extra]",
     "nemo_automodel[vlm]",

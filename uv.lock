@@ -2842,16 +2842,14 @@ all = [
     { name = "timm" },
     { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
 ]
+cuda = [
+    { name = "flash-attn" },
+    { name = "transformer-engine", extra = ["pytorch"] },
+]
 extra = [
     { name = "flash-linear-attention" },
     { name = "perceptron" },
     { name = "sentencepiece" },
-]
-fa = [
-    { name = "flash-attn" },
-]
-moe = [
-    { name = "transformer-engine", extra = ["pytorch"] },
 ]
 vlm = [
     { name = "backoff" },
@@ -2900,7 +2898,7 @@ requires-dist = [
     { name = "backoff", marker = "extra == 'vlm'" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "diffusers" },
-    { name = "flash-attn", marker = "extra == 'fa'", specifier = "<=2.8.3" },
+    { name = "flash-attn", marker = "extra == 'cuda'", specifier = "<=2.8.3" },
     { name = "flash-linear-attention", marker = "extra == 'extra'" },
     { name = "ftfy" },
     { name = "imageio-ffmpeg" },
@@ -2926,11 +2924,11 @@ requires-dist = [
     { name = "torchao" },
     { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'vlm'" },
     { name = "torchdata" },
-    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'moe'", specifier = "==2.8.0" },
+    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'cuda'", specifier = "==2.8.0" },
     { name = "transformers", specifier = "<=4.57.3" },
     { name = "wandb" },
 ]
-provides-extras = ["vlm", "fa", "moe", "extra", "all"]
+provides-extras = ["cuda", "extra", "vlm", "all"]
 
 [package.metadata.requires-dev]
 build = [
