@@ -40,6 +40,7 @@ from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.recipes.base_recipe import BaseRecipe
+from nemo_automodel.components.datasets.llm.retrieval_dataset import update_dataset_epoch
 
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.init_utils import DistInfo
@@ -511,6 +512,11 @@ class TrainBiencoderRecipe(BaseRecipe):
 
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
+            
+            # Update dataset epoch for positive document cycling
+            if hasattr(self.dataloader, "dataset"):
+                update_dataset_epoch(self.dataloader.dataset, epoch)
+
             # The step scheduler yields a list of batches for gradient accumulation
             for batches in self.step_scheduler:
                 train_log_data = self._run_train_optim_step(batches, 1.0)

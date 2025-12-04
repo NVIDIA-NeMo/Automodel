@@ -165,7 +165,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict):
     Same as _format_process_data in RetrievalMultiModalDatasetLoader.
 
     Args:
-        examples: Batch of examples with question, corpus_id, pos_doc, neg_doc
+        examples: Batch of examples with question, corpus_id, pos_doc, neg_doc, and optional epoch for cycling through positive documents
         num_neg_docs: Number of negative documents to use
         corpus_dict: Dictionary mapping corpus_id to corpus objects
     """
@@ -180,6 +180,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict):
     corpus_ids = examples["corpus_id"]
     batch_positives = examples["pos_doc"]
     batch_negatives = examples["neg_doc"]
+    epoch = examples.get("epoch", 0)  # Get epoch from examples if present, else default to 0
 
     # Check if we have enough negatives
     if num_neg_docs > len(batch_negatives[0]):
@@ -190,10 +191,10 @@ def _transform_func(examples, num_neg_docs, corpus_dict):
     for i_example in range(len(questions)):
         cur_pos_neg_doc = []
 
-        # Get one positive doc (take first one)
+        # Get one positive doc (cycle through positives based on epoch)
         positives = batch_positives[i_example]
         if isinstance(positives, list) and len(positives) > 0:
-            cur_pos_neg_doc.append(positives[0])
+            cur_pos_neg_doc.append(positives[epoch % len(positives)])
         else:
             cur_pos_neg_doc.append(positives)
 
@@ -246,10 +247,12 @@ def _transform_func(examples, num_neg_docs, corpus_dict):
     return result
 
 
-def _create_transform_func(num_neg_docs, corpus_dict):
+def _create_transform_func(num_neg_docs, corpus_dict, epoch=0):
     """Create transform function with specified number of negative documents."""
 
     def transform(examples):
+        # Inject epoch into examples so _transform_func can use it
+        examples["epoch"] = epoch
         return _transform_func(examples, num_neg_docs=num_neg_docs, corpus_dict=corpus_dict)
 
     return transform
@@ -313,6 +316,10 @@ def make_retrieval_dataset(
         negative_size = train_n_passages - 1
         dataset.set_transform(_create_transform_func(negative_size, corpus_dict))
 
+        # Store metadata for updating transform later
+        dataset.corpus_dict = corpus_dict
+        dataset.num_neg_docs = negative_size
+
     elif data_type == "eval":
         # Set transform for evaluation
         dataset.set_transform(_create_transform_func(eval_negative_size, corpus_dict))
@@ -323,6 +330,22 @@ def make_retrieval_dataset(
     logging.info(f"Created {data_type} dataset with {len(dataset)} examples")
 
     return dataset
+
+
+def update_dataset_epoch(dataset, epoch):
+    """
+    Update the dataset transform to use the specified epoch for positive document selection.
+
+    Args:
+        dataset: The HuggingFace dataset
+        epoch: The new epoch number
+    """
+    if hasattr(dataset, "corpus_dict") and hasattr(dataset, "num_neg_docs"):
+        dataset.set_transform(_create_transform_func(dataset.num_neg_docs, dataset.corpus_dict, epoch=epoch))
+    else:
+        # If metadata is missing (e.g. eval dataset or loaded differently), we can't update.
+        # This is expected for eval datasets or if make_retrieval_dataset wasn't used.
+        pass
 
 
 if __name__ == "__main__":
