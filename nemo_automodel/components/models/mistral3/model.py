@@ -19,7 +19,7 @@ from typing import Optional, Union
 
 import torch
 from torch import nn
-from transformers import AutoConfig, AutoModel
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 
@@ -592,18 +592,6 @@ sys.modules["transformers.models.ministral3.modeling_ministral3"] = modeling_mod
 setattr(mod_pkg, "configuration_ministral3", config_mod)
 setattr(mod_pkg, "modeling_ministral3", modeling_mod)
 
-# Register config with AutoConfig so CONFIG_MAPPING recognizes it
-try:
-    AutoConfig.register("ministral3", Ministral3Config)
-except Exception:
-    pass
-# Also ensure CONFIG_MAPPING has the entry (older HF versions)
-try:
-    CONFIG_MAPPING.register("ministral3", Ministral3Config)
-except Exception:
-    pass
-
-
 # Monkeypatch AutoModel.from_config so text_config with model_type=ministral3 resolves here
 _orig_auto_from_config = AutoModel.from_config
 
@@ -615,6 +603,35 @@ def _patched_from_config(cls, config, *model_args, **kwargs):
 
 
 AutoModel.from_config = classmethod(_patched_from_config)
+
+
+# Register config with AutoConfig so CONFIG_MAPPING recognizes it
+try:
+    AutoConfig.register("ministral3", Ministral3Config)
+except Exception:
+    pass
+# Also ensure CONFIG_MAPPING has the entry (older HF versions)
+try:
+    CONFIG_MAPPING.register("ministral3", Ministral3Config)
+except Exception:
+    pass
+# Register model mappings so HF Auto classes can resolve Ministral3/Mistral3
+try:
+    AutoModel.register("ministral3", Ministral3Model)
+except Exception:
+    pass
+try:
+    AutoModelForCausalLM.register("ministral3", Ministral3ForCausalLM)
+except Exception:
+    pass
+try:
+    AutoModel.register("mistral3", Mistral3ForConditionalGeneration)
+except Exception:
+    pass
+try:
+    AutoModelForCausalLM.register("mistral3", Mistral3ForConditionalGeneration)
+except Exception:
+    pass
 
 
 ModelClass = [Mistral3ForConditionalGeneration, Ministral3ForCausalLM]

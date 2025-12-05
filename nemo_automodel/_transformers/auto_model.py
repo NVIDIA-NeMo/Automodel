@@ -334,6 +334,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 try:
                     # if we have a custom model implementation available, we prioritize that over HF
                     if hf_config.architectures[0] in ModelRegistry.model_arch_name_to_cls:
+                        kwargs.pop("trust_remote_code", None)
                         model = ModelRegistry.model_arch_name_to_cls[hf_config.architectures[0]](
                             hf_config, *model_args, **kwargs
                         )
@@ -508,6 +509,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 try:
                     # if we have a custom model implementation available, we prioritize that over HF
                     if config.architectures[0] in ModelRegistry.model_arch_name_to_cls:
+                        kwargs.pop("trust_remote_code", None)
                         model = ModelRegistry.model_arch_name_to_cls[config.architectures[0]](
                             config, *model_args, **kwargs
                         )
