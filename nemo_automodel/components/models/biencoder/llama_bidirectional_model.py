@@ -400,8 +400,8 @@ class BiencoderModel(nn.Module):
         self.state_dict_adapter = BiencoderStateDictAdapter()
         self.config.architectures = ["LlamaBidirectionalModel"]
         self.config.auto_map = {
-            "model": "llama_bidirectional_model.LlamaBidirectionalModel",
-            "config": "llama_bidirectional_model.LlamaBidirectionalConfig",
+            "AutoModel": "llama_bidirectional_model.LlamaBidirectionalModel",
+            "AutoConfig": "llama_bidirectional_model.LlamaBidirectionalConfig",
         }
 
     def forward(self, query: Dict[str, Tensor] = None, passage: Dict[str, Tensor] = None):
