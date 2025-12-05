@@ -34,6 +34,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+from transformers.models.mistral3.configuration_mistral3 import Mistral3Config as HFMistral3Config
 from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditionalGeneration
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
@@ -615,21 +616,22 @@ try:
     CONFIG_MAPPING.register("ministral3", Ministral3Config)
 except Exception:
     pass
-# Register model mappings so HF Auto classes can resolve Ministral3/Mistral3
+# Register model mappings so HF Auto classes can resolve Ministral3 and HF mistral3
 try:
-    AutoModel.register("ministral3", Ministral3Model)
+    AutoModel.register(Ministral3Config, Ministral3Model)
 except Exception:
     pass
 try:
-    AutoModelForCausalLM.register("ministral3", Ministral3ForCausalLM)
+    AutoModelForCausalLM.register(Ministral3Config, Ministral3ForCausalLM)
+except Exception:
+    pass
+# Register for HF mistral3 config to avoid AutoModelForCausalLM errors
+try:
+    AutoModel.register(HFMistral3Config, Mistral3ForConditionalGeneration)
 except Exception:
     pass
 try:
-    AutoModel.register("mistral3", Mistral3ForConditionalGeneration)
-except Exception:
-    pass
-try:
-    AutoModelForCausalLM.register("mistral3", Mistral3ForConditionalGeneration)
+    AutoModelForCausalLM.register(HFMistral3Config, Mistral3ForConditionalGeneration)
 except Exception:
     pass
 

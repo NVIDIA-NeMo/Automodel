@@ -23,6 +23,7 @@ from nemo_automodel.components.models.mistral3.model import (
     Ministral3Config,
     Ministral3ForCausalLM,
     Ministral3Model,
+    Mistral3ForConditionalGeneration,
 )
 
 
@@ -52,6 +53,11 @@ class TestConfigAndAutoIntegration:
         cfg = tiny_config()
         model = AutoModel.from_config(cfg)
         assert isinstance(model, Ministral3Model)
+
+    def test_auto_model_for_causal_lm_registration(self):
+        cfg = tiny_config()
+        lm = mistral_mod.AutoModelForCausalLM.from_config(cfg)  # type: ignore[attr-defined]
+        assert isinstance(lm, Ministral3ForCausalLM)
 
 
 class TestMinistral3Model:
@@ -94,7 +100,8 @@ class TestMinistral3ForCausalLM:
 
 
 class TestModelClassExport:
-    def test_model_class_points_to_causal_lm(self):
+    def test_model_class_points_to_models(self):
         assert hasattr(mistral_mod, "ModelClass")
         assert mistral_mod.Ministral3ForCausalLM in mistral_mod.ModelClass
+        assert Mistral3ForConditionalGeneration in mistral_mod.ModelClass
 
