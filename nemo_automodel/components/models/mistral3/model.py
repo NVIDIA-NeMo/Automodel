@@ -127,7 +127,8 @@ class Ministral3Config(PretrainedConfig):
             "rope_type": self.rope_parameters.get("type", self.rope_parameters.get("rope_type", "yarn")),
             "factor": float(self.rope_parameters.get("factor", 16.0)),
             "original_max_position_embeddings": self.rope_parameters.get(
-                "original_max_position_embeddings", self.rope_parameters.get("max_position_embeddings", max_position_embeddings)
+                "original_max_position_embeddings",
+                self.rope_parameters.get("max_position_embeddings", max_position_embeddings),
             ),
             "beta_fast": float(self.rope_parameters.get("beta_fast", 32.0)),
             "beta_slow": float(self.rope_parameters.get("beta_slow", 1.0)),
