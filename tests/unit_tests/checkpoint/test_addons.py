@@ -89,7 +89,7 @@ def test_model_state_disables_tied_embeddings_for_non_tied_models():
     _DummyModel.__name__ = "Qwen3OmniMoeThinkerForConditionalGeneration"
 
     model = _DummyModel()
-    state = ModelState(model)
+    state = ModelState([model])
 
     assert state.is_tied_lm_head is False
     assert not hasattr(state, "lm_head_param_name")
