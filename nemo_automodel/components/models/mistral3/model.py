@@ -19,29 +19,24 @@ from typing import Optional, Union
 
 import torch
 from torch import nn
-
 from transformers import AutoConfig, AutoModel
-from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
+
+# -----------------------------------------------------------------------------
+# Ministral3 configuration (vendored from transformers v5.0.0rc0)
+# -----------------------------------------------------------------------------
+from transformers.configuration_utils import PretrainedConfig
 from transformers.generation import GenerationMixin
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
-
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditionalGeneration
-
-
-# -----------------------------------------------------------------------------
-# Ministral3 configuration (vendored from transformers v5.0.0rc0)
-# -----------------------------------------------------------------------------
-from transformers.configuration_utils import PretrainedConfig
-from transformers.utils import logging
-
+from transformers.processing_utils import Unpack
+from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
 
 logger = logging.get_logger(__name__)
 
