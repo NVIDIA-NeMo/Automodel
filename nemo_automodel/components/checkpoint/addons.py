@@ -253,9 +253,12 @@ def _maybe_save_custom_model_code(original_model_path: str | None, hf_metadata_d
     """
     if original_model_path is None:
         return
-    if not os.path.isdir(original_model_path):
+    if os.path.isfile(original_model_path):
+        pattern = original_model_path
+    elif os.path.isdir(original_model_path):
+        pattern = os.path.join(original_model_path, "**", "*.py")
+    else:
         return
-    pattern = os.path.join(original_model_path, "**", "*.py")
     for src_path in glob.glob(pattern, recursive=True):
         # Skip any .hidden paths
         rel_path = os.path.relpath(src_path, original_model_path)
