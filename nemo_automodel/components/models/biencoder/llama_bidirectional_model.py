@@ -46,6 +46,8 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, logging
 from transformers.utils.generic import check_model_inputs
 
+from nemo_automodel.components.models.biencoder.state_dict_adapter import BiencoderStateDictAdapter
+
 logger = logging.get_logger(__name__)
 
 
@@ -392,6 +394,15 @@ class BiencoderModel(nn.Module):
         self.linear_pooler = linear_pooler if linear_pooler is not None else nn.Identity()
         self.config = self.lm_q.config
         self.trainer = None
+
+        # For HuggingFace consolidated checkpoint compatibility
+        self.name_or_path = os.path.abspath(__file__)
+        self.state_dict_adapter = BiencoderStateDictAdapter()
+        self.config.architectures = ["LlamaBidirectionalModel"]
+        self.config.auto_map = {
+            "model": "llama_bidirectional_model.LlamaBidirectionalModel",
+            "config": "llama_bidirectional_model.LlamaBidirectionalConfig",
+        }
 
     def forward(self, query: Dict[str, Tensor] = None, passage: Dict[str, Tensor] = None):
         """Forward pass for training."""

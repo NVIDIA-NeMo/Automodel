@@ -433,6 +433,8 @@ class TrainBiencoderRecipe(BaseRecipe):
             self.model_parts = [model]
             self.pp = None
 
+        self.checkpointer.config.model_state_dict_keys = ["model." + k for k in model.lm_q.state_dict().keys()]
+
         # Build optimizer
         logger.info("Building optimizer...")
         trainable_params = list(filter(lambda x: x.requires_grad, self.model_parts[0].parameters()))
