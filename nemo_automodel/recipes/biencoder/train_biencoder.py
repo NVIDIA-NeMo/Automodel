@@ -620,7 +620,7 @@ class TrainBiencoderRecipe(BaseRecipe):
                 scheduler.step(1)
 
         # Compute average loss across gradient accumulation and DP ranks
-        reporting_loss = torch.sum(torch.stack(loss_buffer))
+        reporting_loss = torch.mean(torch.stack(loss_buffer))
         if torch.distributed.is_initialized():
             reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
             # Divide by DP group size to get average across all ranks
