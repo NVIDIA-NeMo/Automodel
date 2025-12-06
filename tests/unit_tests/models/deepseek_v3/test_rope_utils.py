@@ -19,6 +19,7 @@ import torch
 
 from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     apply_rotary_emb,
+    apply_rotary_emb_qk,
     freqs_cis_from_position_ids,
     precompute_freqs_cis,
     yarn_get_mscale,
@@ -573,3 +574,268 @@ class TestIntegration:
         # Verify output
         assert result.shape == x.shape
         assert result.dtype == x.dtype
+
+
+class TestApplyRotaryEmbQk:
+    """Tests for apply_rotary_emb_qk function (DeepseekV3 version)"""
+
+    def test_non_fused_rope_bshd(self):
+        """Test apply_rotary_emb_qk with non-fused rope in bshd format"""
+        batch_size = 2
+        seq_len = 4
+        num_heads = 8
+        head_dim = 64
+
+        q = torch.randn(batch_size, seq_len, num_heads, head_dim)
+        k = torch.randn(batch_size, seq_len, num_heads, head_dim)
+        freqs_cis = torch.randn(batch_size, seq_len, head_dim // 2, dtype=torch.complex64)
+
+        q_out, k_out = apply_rotary_emb_qk(q, k, freqs_cis, format="bshd", rope_fusion=False)
+
+        # Check output shapes
+        assert q_out.shape == q.shape
+        assert k_out.shape == k.shape
+        assert q_out.dtype == q.dtype
+        assert k_out.dtype == k.dtype
+
+    def test_non_fused_rope_thd(self):
+        """Test apply_rotary_emb_qk with non-fused rope in thd format"""
+        total_tokens = 16
+        num_heads = 8
+        head_dim = 64
+
+        q = torch.randn(total_tokens, num_heads, head_dim)
+        k = torch.randn(total_tokens, num_heads, head_dim)
+        freqs_cis = torch.randn(1, total_tokens, head_dim // 2, dtype=torch.complex64)
+
+        q_out, k_out = apply_rotary_emb_qk(q, k, freqs_cis, format="thd", rope_fusion=False)
+
+        # Check output shapes
+        assert q_out.shape == q.shape
+        assert k_out.shape == k.shape
+
+    def test_non_fused_rope_consistency(self):
+        """Test that apply_rotary_emb_qk gives same results as individual apply_rotary_emb calls"""
+        batch_size = 2
+        seq_len = 4
+        num_heads = 4
+        head_dim = 32
+
+        q = torch.randn(batch_size, seq_len, num_heads, head_dim)
+        k = torch.randn(batch_size, seq_len, num_heads, head_dim)
+        freqs_cis = torch.randn(batch_size, seq_len, head_dim // 2, dtype=torch.complex64)
+
+        # Normalize freqs_cis to have magnitude 1
+        freqs_cis = freqs_cis / freqs_cis.abs()
+
+        # Apply using apply_rotary_emb_qk
+        q_out_qk, k_out_qk = apply_rotary_emb_qk(q, k, freqs_cis, format="bshd", rope_fusion=False)
+
+        # Apply using individual apply_rotary_emb calls
+        q_out_individual = apply_rotary_emb(q, freqs_cis, qkv_format="bshd")
+        k_out_individual = apply_rotary_emb(k, freqs_cis, qkv_format="bshd")
+
+        # Results should be identical
+        torch.testing.assert_close(q_out_qk, q_out_individual)
+        torch.testing.assert_close(k_out_qk, k_out_individual)
+
+    def test_dtype_preservation(self):
+        """Test that output dtype matches input dtype"""
+        batch_size = 2
+        seq_len = 4
+        num_heads = 4
+        head_dim = 32
+
+        for dtype in [torch.float32, torch.float16, torch.bfloat16]:
+            q = torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=dtype)
+            k = torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=dtype)
+            freqs_cis = torch.randn(batch_size, seq_len, head_dim // 2, dtype=torch.complex64)
+
+            q_out, k_out = apply_rotary_emb_qk(q, k, freqs_cis, format="bshd", rope_fusion=False)
+
+            assert q_out.dtype == dtype
+            assert k_out.dtype == dtype
+
+    def test_norm_preservation(self):
+        """Test that rotary embeddings preserve norm when freqs_cis has unit magnitude"""
+        batch_size = 2
+        seq_len = 4
+        num_heads = 2
+        head_dim = 8
+
+        q = torch.randn(batch_size, seq_len, num_heads, head_dim)
+        k = torch.randn(batch_size, seq_len, num_heads, head_dim)
+        freqs_cis = torch.randn(batch_size, seq_len, head_dim // 2, dtype=torch.complex64)
+
+        # Normalize freqs_cis to have magnitude 1
+        freqs_cis = freqs_cis / freqs_cis.abs()
+
+        q_out, k_out = apply_rotary_emb_qk(q, k, freqs_cis, format="bshd", rope_fusion=False)
+
+        # The norm should be approximately preserved
+        q_input_norm = torch.norm(q.reshape(-1, head_dim), dim=-1)
+        q_output_norm = torch.norm(q_out.reshape(-1, head_dim), dim=-1)
+        torch.testing.assert_close(q_input_norm, q_output_norm, rtol=1e-4, atol=1e-4)
+
+        k_input_norm = torch.norm(k.reshape(-1, head_dim), dim=-1)
+        k_output_norm = torch.norm(k_out.reshape(-1, head_dim), dim=-1)
+        torch.testing.assert_close(k_input_norm, k_output_norm, rtol=1e-4, atol=1e-4)
+
+
+class TestFreqsCisFromPositionIdsFusedRope:
+    """Tests for freqs_cis_from_position_ids with fused rope support"""
+
+    def test_non_fused_bshd_format(self):
+        """Test non-fused rope output format for bshd"""
+        batch_size = 2
+        seq_len = 4
+        head_dim = 64
+
+        position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, seq_len)
+        freqs = torch.randn(head_dim // 2)
+
+        freqs_cis = freqs_cis_from_position_ids(
+            position_ids, freqs, qkv_format="bshd", for_fused_rope=False
+        )
+
+        # Non-fused should return complex exponentials with shape (B, T, D/2)
+        assert freqs_cis.shape == (batch_size, seq_len, head_dim // 2)
+        assert freqs_cis.dtype == torch.complex64
+
+    def test_fused_bshd_format(self):
+        """Test fused rope output format for bshd"""
+        batch_size = 2
+        seq_len = 4
+        head_dim = 64
+
+        position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, seq_len)
+        freqs = torch.randn(head_dim // 2)
+
+        freqs_cis = freqs_cis_from_position_ids(
+            position_ids, freqs, qkv_format="bshd", for_fused_rope=True
+        )
+
+        # Fused rope expects shape (T, 1, 1, D) where D = head_dim (angles duplicated)
+        assert freqs_cis.shape == (seq_len, 1, 1, head_dim)
+        assert freqs_cis.dtype == torch.float32
+
+    def test_non_fused_thd_format(self):
+        """Test non-fused rope output format for thd"""
+        seq_len = 8
+        head_dim = 64
+
+        position_ids = torch.arange(seq_len)
+        freqs = torch.randn(head_dim // 2)
+
+        freqs_cis = freqs_cis_from_position_ids(
+            position_ids, freqs, qkv_format="thd", for_fused_rope=False
+        )
+
+        # Non-fused thd should return complex exponentials with shape (T, D/2)
+        assert freqs_cis.shape == (seq_len, head_dim // 2)
+        assert freqs_cis.dtype == torch.complex64
+
+    def test_fused_thd_format(self):
+        """Test fused rope output format for thd"""
+        seq_len = 8
+        head_dim = 64
+
+        position_ids = torch.arange(seq_len)
+        freqs = torch.randn(head_dim // 2)
+
+        freqs_cis = freqs_cis_from_position_ids(
+            position_ids, freqs, qkv_format="thd", for_fused_rope=True
+        )
+
+        # Fused rope with thd expects shape (T, 1, 1, D) where D = head_dim
+        assert freqs_cis.shape == (seq_len, 1, 1, head_dim)
+        assert freqs_cis.dtype == torch.float32
+
+    def test_fused_angles_are_interleaved(self):
+        """Test that fused rope format has angles interleaved [a0, a0, a1, a1, ...]"""
+        seq_len = 4
+        head_dim = 32
+
+        position_ids = torch.arange(seq_len).unsqueeze(0)
+        freqs = torch.ones(head_dim // 2) * 0.1
+
+        freqs_cis = freqs_cis_from_position_ids(
+            position_ids, freqs, qkv_format="bshd", for_fused_rope=True
+        )
+
+        # Shape should be (T, 1, 1, head_dim)
+        assert freqs_cis.shape == (seq_len, 1, 1, head_dim)
+
+        # Angles should be interleaved: [a0, a0, a1, a1, a2, a2, ...]
+        # Even indices and odd indices should be equal (each angle is duplicated consecutively)
+        even_indices = freqs_cis[:, 0, 0, 0::2]  # a0, a1, a2, ...
+        odd_indices = freqs_cis[:, 0, 0, 1::2]   # a0, a1, a2, ...
+        torch.testing.assert_close(even_indices, odd_indices)
+
+    def test_fused_thd_uses_sequential_positions(self):
+        """Test that fused rope with thd uses sequential positions regardless of input"""
+        seq_len = 8
+        head_dim = 64
+
+        # Non-sequential position IDs (e.g., from packed sequences)
+        position_ids = torch.tensor([0, 1, 0, 1, 2, 0, 1, 2])
+        freqs = torch.ones(head_dim // 2) * 0.1
+
+        freqs_cis = freqs_cis_from_position_ids(
+            position_ids, freqs, qkv_format="thd", for_fused_rope=True
+        )
+
+        # Shape should be (T, 1, 1, head_dim)
+        assert freqs_cis.shape == (seq_len, 1, 1, head_dim)
+
+        # For fused rope, positions should be sequential 0, 1, 2, ... regardless of input
+        # So angles at position 0 and position 2 (original) should be different
+        # (because they map to sequential positions 0 and 2)
+        # With interleaved format, extract unique angles from even indices
+        angles = freqs_cis[:, 0, 0, 0::2]
+
+        # Each position should have unique angles (since they're sequential)
+        for i in range(seq_len - 1):
+            assert not torch.allclose(angles[i], angles[i + 1])
+
+    def test_non_fused_thd_preserves_positions(self):
+        """Test that non-fused rope with thd preserves input position IDs"""
+        seq_len = 8
+        head_dim = 64
+
+        # Non-sequential position IDs (e.g., from packed sequences)
+        position_ids = torch.tensor([0, 1, 0, 1, 2, 0, 1, 2])
+        freqs = torch.ones(head_dim // 2) * 0.1
+
+        freqs_cis = freqs_cis_from_position_ids(
+            position_ids, freqs, qkv_format="thd", for_fused_rope=False
+        )
+
+        # Shape should be (T, D/2) for non-fused thd
+        assert freqs_cis.shape == (seq_len, head_dim // 2)
+
+        # Positions with same ID should have same freqs_cis
+        # Position 0 appears at indices 0, 2, 5
+        torch.testing.assert_close(freqs_cis[0], freqs_cis[2])
+        torch.testing.assert_close(freqs_cis[0], freqs_cis[5])
+
+        # Position 1 appears at indices 1, 3, 6
+        torch.testing.assert_close(freqs_cis[1], freqs_cis[3])
+        torch.testing.assert_close(freqs_cis[1], freqs_cis[6])
+
+    def test_non_fused_complex_magnitude_is_one(self):
+        """Test that non-fused output has unit magnitude complex numbers"""
+        batch_size = 2
+        seq_len = 4
+        head_dim = 64
+
+        position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, seq_len)
+        freqs = torch.randn(head_dim // 2)
+
+        freqs_cis = freqs_cis_from_position_ids(
+            position_ids, freqs, qkv_format="bshd", for_fused_rope=False
+        )
+
+        # All complex numbers should have magnitude 1
+        magnitudes = torch.abs(freqs_cis)
+        torch.testing.assert_close(magnitudes, torch.ones_like(magnitudes), rtol=1e-5, atol=1e-5)
