@@ -44,7 +44,7 @@ from transformers.models.llama.modeling_llama import (
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, logging
-from transformers.utils.generic import check_model_inputs
+# from transformers.utils.generic import check_model_inputs  # Removed - causes issues with input validation
 
 logger = logging.get_logger(__name__)
 
@@ -167,12 +167,38 @@ class LlamaBidirectionalModel(LlamaModel):
     def _update_causal_mask(
         self,
         attention_mask: torch.Tensor,
+        input_tensor: torch.Tensor,
+        cache_position: torch.Tensor,
+        past_key_values: Optional[Cache] = None,
+        output_attentions: bool = False,
     ):
-        if attention_mask is not None and (attention_mask == 0.0).any():
-            return attention_mask
-        return None
+        """
+        Create a non-causal 4D attention mask from a 2D mask for bidirectional attention.
+        
+        For bidirectional models, we don't use causal masking, but we still need to
+        handle padding tokens properly.
+        """
+        if attention_mask is None:
+            return None
+            
+        # Check if there's any padding (zeros in attention mask)
+        if not (attention_mask == 0).any():
+            return None
+        
+        dtype = input_tensor.dtype
+        batch_size, seq_length = input_tensor.shape[:2]
+        
+        # Create 4D attention mask from 2D mask
+        # Shape: [batch_size, 1, 1, seq_length] -> broadcasts to [batch_size, num_heads, seq_length, seq_length]
+        # For bidirectional attention, each position can attend to all non-padded positions
+        expanded_mask = attention_mask[:, None, None, :].expand(batch_size, 1, seq_length, seq_length)
+        
+        # Convert to float and apply masking (0 -> -inf for masked positions, 1 -> 0 for valid positions)
+        inverted_mask = 1.0 - expanded_mask.to(dtype)
+        attention_mask_4d = inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
+        
+        return attention_mask_4d
 
-    @check_model_inputs
     @auto_docstring
     def forward(
         self,
@@ -203,7 +229,12 @@ class LlamaBidirectionalModel(LlamaModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = self._update_causal_mask(attention_mask=attention_mask)
+        causal_mask = self._update_causal_mask(
+            attention_mask=attention_mask,
+            input_tensor=inputs_embeds,
+            cache_position=cache_position,
+            past_key_values=past_key_values,
+        )
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
