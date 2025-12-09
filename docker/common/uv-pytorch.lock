@@ -2119,7 +2119,7 @@ wheels = [
 [[package]]
 name = "liger-kernel"
 version = "0.6.4"
-source = { git = "https://github.com/linkedin/Liger-Kernel.git?rev=3d075fd7044ae71d5f1e6be2bb25c0cdf838ba18#3d075fd7044ae71d5f1e6be2bb25c0cdf838ba18" }
+source = { git = "https://github.com/linkedin/Liger-Kernel.git?rev=49e63538e64b00780e424e34bc4f193dcfeba75c#49e63538e64b00780e424e34bc4f193dcfeba75c" }
 dependencies = [
     { name = "torch", marker = "sys_platform == 'never'" },
     { name = "triton", marker = "sys_platform == 'never'" },
@@ -2896,7 +2896,7 @@ requires-dist = [
     { name = "flash-linear-attention", marker = "extra == 'extra'" },
     { name = "ftfy" },
     { name = "imageio-ffmpeg" },
-    { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", git = "https://github.com/linkedin/Liger-Kernel.git?rev=3d075fd7044ae71d5f1e6be2bb25c0cdf838ba18" },
+    { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", git = "https://github.com/linkedin/Liger-Kernel.git?rev=49e63538e64b00780e424e34bc4f193dcfeba75c" },
     { name = "megatron-fsdp" },
     { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'" },
     { name = "mlflow" },
