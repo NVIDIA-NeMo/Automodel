@@ -434,6 +434,7 @@ class ConfigNode:
         # Bound method on a class (e.g., Class.from_pretrained)
         try:
             import inspect as _inspect  # local alias to avoid confusion with top-level import
+
             if _inspect.ismethod(obj):
                 owner = getattr(obj, "__self__", None)
                 if _inspect.isclass(owner):
@@ -488,6 +489,7 @@ class ConfigNode:
             is_target_like = key == "_target_" or (isinstance(key, str) and key.endswith("_fn")) or key == "collate_fn"
             try:
                 import inspect as _inspect
+
                 if is_target_like and (callable(value) or _inspect.ismethod(value) or _inspect.isclass(value)):
                     return self._to_dotted_path(value)
                 # Even if the key isn't target-like, convert bare callables to dotted path to avoid <function ...> repr
