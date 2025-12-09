@@ -78,7 +78,6 @@ dependencies = [
     "diffusers",
     "ftfy",
     "imageio-ffmpeg",
-    "liger_kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "megatron-fsdp",
     "opencv-python-headless==4.10.0.84",
     "pybind11",
