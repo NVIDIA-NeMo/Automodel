@@ -160,7 +160,7 @@ torch = [
     { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 grouped_gemm = { git = "https://github.com/fanshiqing/grouped_gemm", rev = "v1.1.4" }
-liger_kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "3d075fd7044ae71d5f1e6be2bb25c0cdf838ba18" }
+liger_kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "49e63538e64b00780e424e34bc4f193dcfeba75c" }
 
 [tool.coverage.paths]
 source = [".", "/workspace", "/home/runner/work/Automodel/Automodel"]
