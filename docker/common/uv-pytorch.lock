@@ -2117,15 +2117,6 @@ wheels = [
 ]
 
 [[package]]
-name = "liger-kernel"
-version = "0.6.4"
-source = { git = "https://github.com/linkedin/Liger-Kernel.git?rev=49e63538e64b00780e424e34bc4f193dcfeba75c#49e63538e64b00780e424e34bc4f193dcfeba75c" }
-dependencies = [
-    { name = "torch", marker = "sys_platform == 'never'" },
-    { name = "triton", marker = "sys_platform == 'never'" },
-]
-
-[[package]]
 name = "llvmlite"
 version = "0.45.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2809,7 +2800,6 @@ dependencies = [
     { name = "diffusers" },
     { name = "ftfy" },
     { name = "imageio-ffmpeg" },
-    { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "megatron-fsdp" },
     { name = "mlflow" },
     { name = "opencv-python-headless" },
@@ -2896,7 +2886,6 @@ requires-dist = [
     { name = "flash-linear-attention", marker = "extra == 'extra'" },
     { name = "ftfy" },
     { name = "imageio-ffmpeg" },
-    { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", git = "https://github.com/linkedin/Liger-Kernel.git?rev=49e63538e64b00780e424e34bc4f193dcfeba75c" },
     { name = "megatron-fsdp" },
     { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'" },
     { name = "mlflow" },
