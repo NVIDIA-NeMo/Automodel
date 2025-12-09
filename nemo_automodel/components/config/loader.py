@@ -464,13 +464,6 @@ class ConfigNode:
         except Exception:
             # Fallback to repr if anything goes wrong
             return repr(obj)
-
-        # Tidy up a few known verbose module paths
-        dotted = dotted.replace(
-            "torchdata.stateful_dataloader.stateful_dataloader.StatefulDataLoader",
-            "torchdata.stateful_dataloader.StatefulDataLoader",
-        )
-        dotted = dotted.replace("torch.optim.adamw.AdamW", "torch.optim.AdamW")
         return dotted
 
     def to_yaml_dict(self):
