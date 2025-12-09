@@ -13,9 +13,9 @@
 # limitations under the License.
 
 
-import torch
 from threading import local
 
+import torch
 
 # inspired by https://github.com/zasdfgbnm/autonvtx
 
