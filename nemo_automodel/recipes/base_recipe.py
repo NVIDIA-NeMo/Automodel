@@ -36,10 +36,7 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 
-try:
-    import yaml as _yaml
-except Exception:
-    _yaml = None
+import yaml
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils import PreTrainedTokenizerBase
 
@@ -384,11 +381,9 @@ class BaseRecipe:
             and getattr(self.cfg.model, "pretrained_model_name_or_path", None),
         }
         try:
-            if _yaml is not None:
-                details_yaml = _yaml.safe_dump(details, sort_keys=False, default_flow_style=False).strip()
-            else:
-                details_yaml = "\n".join(f"{k}: {v}" for k, v in details.items())
-            list(map(logging.info, ("Experiment_details:\n" + details_yaml).splitlines()))
+            details_yaml = yaml.safe_dump(details, sort_keys=False, default_flow_style=False).strip()
+            for line in ("Experiment_details:\n" + details_yaml).splitlines():
+                logging.info(line)
         except Exception:
             logging.info(f"Experiment details: {details}")
         # Resolved config
@@ -403,23 +398,8 @@ class BaseRecipe:
                 cfg_dict = dict(cfg_obj) if cfg_obj is not None else {}
 
             # Print as clean YAML on stdout for easy copy/paste and readability
-            if _yaml is not None:
-                cfg_yaml = _yaml.safe_dump(cfg_dict, sort_keys=False, default_flow_style=False).strip()
-                print(cfg_yaml, flush=True)
-            else:
-                # Fallback structured print if yaml is unavailable
-                def rec_print(d: dict | None, indent: int = 0):
-                    if d is None:
-                        return
-                    pad = "  " * indent
-                    for k, v in d.items():
-                        if isinstance(v, dict):
-                            print(f"{pad}{k}:", flush=True)
-                            rec_print(v, indent + 1)
-                        else:
-                            print(f"{pad}{k}: {v}", flush=True)
-
-                rec_print(cfg_dict, 0)
+            cfg_yaml = yaml.safe_dump(cfg_dict, sort_keys=False, default_flow_style=False).strip()
+            print(cfg_yaml, flush=True)
         except Exception:
             logging.info("Recipe config: <unavailable>")
 
