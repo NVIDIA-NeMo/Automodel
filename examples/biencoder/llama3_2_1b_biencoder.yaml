@@ -24,7 +24,7 @@ step_scheduler:
   local_batch_size: 4
   ckpt_every_steps: 500
   val_every_steps: 500
-  num_epochs: 1
+  num_epochs: 4
 
 dist_env:
   backend: nccl
@@ -32,10 +32,10 @@ dist_env:
 
 model:
   _target_: nemo_automodel.components.models.biencoder.NeMoAutoModelBiencoder.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+  pretrained_model_name_or_path: nvidia/llama-nemotron-embed-1b-v2
   share_encoder: true
   add_linear_pooler: false
-  out_dimension: 768
+  out_dimension: 2048
   do_gradient_checkpointing: false
   train_n_passages: 5
   eval_negative_size: 4
@@ -48,16 +48,14 @@ model:
 
 tokenizer:
   _target_: transformers.AutoTokenizer.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+  pretrained_model_name_or_path: nvidia/llama-nemotron-embed-1b-v2
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   dataset:
     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
     data_dir_list:
-      - training_datasets/nqsh_shuffled_50k.json
-      - training_datasets/miracl_train_es_llama3_1b_4m_512len.json
-      - training_datasets/mldr_en_perc95_small.json
+      - /lustre/fsw/portfolios/llmservice/users/sthan/data/nv_pp_all_output_train_eval/train_mined.json
     data_type: train
     train_n_passages: 5
     eval_negative_size: 4

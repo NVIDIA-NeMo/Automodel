@@ -159,7 +159,29 @@ def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True
     return (dataset, corpus_dict)
 
 
-def _transform_func(examples, num_neg_docs, corpus_dict):
+def _slice_with_mod(elements: List, offset: int, cnt: int) -> List:
+    """Select elements using modulo for cycling through the list.
+
+    This function allows cycling through elements based on an offset (e.g., epoch number).
+    When offset exceeds the length of elements, it wraps around using modulo.
+
+    Args:
+        elements: List of elements to select from
+        offset: Starting offset (e.g., current epoch)
+        cnt: Number of elements to select
+
+    Returns:
+        List of selected elements
+
+    Example:
+        elements = [0, 1, 2], offset = 0, cnt = 1 -> [0]
+        elements = [0, 1, 2], offset = 1, cnt = 1 -> [1]
+        elements = [0, 1, 2], offset = 3, cnt = 1 -> [0]  # wraps around
+    """
+    return [elements[(offset + idx) % len(elements)] for idx in range(cnt)]
+
+
+def _transform_func(examples, num_neg_docs, corpus_dict, current_epoch=0):
     """
     Transform function to convert from raw format to training format.
     Same as _format_process_data in RetrievalMultiModalDatasetLoader.
@@ -168,6 +190,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict):
         examples: Batch of examples with question, corpus_id, pos_doc, neg_doc
         num_neg_docs: Number of negative documents to use
         corpus_dict: Dictionary mapping corpus_id to corpus objects
+        current_epoch: Current training epoch for cycling through positives
     """
     # Handle both batched and single examples
     is_batched = isinstance(examples["question"], list)
@@ -177,6 +200,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict):
         examples = {k: [v] for k, v in examples.items()}
 
     questions = examples["question"]
+    question_ids = examples.get("question_id", [None] * len(questions))
     corpus_ids = examples["corpus_id"]
     batch_positives = examples["pos_doc"]
     batch_negatives = examples["neg_doc"]
@@ -190,10 +214,21 @@ def _transform_func(examples, num_neg_docs, corpus_dict):
     for i_example in range(len(questions)):
         cur_pos_neg_doc = []
 
-        # Get one positive doc (take first one)
+        # Get one positive doc using epoch-based cycling
         positives = batch_positives[i_example]
         if isinstance(positives, list) and len(positives) > 0:
-            cur_pos_neg_doc.append(positives[0])
+            pos_ids = list(range(len(positives)))
+            # Use modulo to cycle through positives based on epoch
+            cur_pos_id = _slice_with_mod(pos_ids, offset=current_epoch, cnt=1)
+            selected_pos_idx = cur_pos_id[0]
+            cur_pos_neg_doc.append(positives[selected_pos_idx])
+
+            # Log the positive selection for debugging (only log first example per batch to avoid spam)
+            if i_example == 0 and len(positives) > 1:
+                logging.debug(
+                    f"Epoch {current_epoch}: Selected positive index {selected_pos_idx} "
+                    f"out of {len(positives)} for question_id {question_ids[i_example]}"
+                )
         else:
             cur_pos_neg_doc.append(positives)
 
@@ -246,11 +281,94 @@ def _transform_func(examples, num_neg_docs, corpus_dict):
     return result
 
 
+class RetrievalDatasetWrapper:
+    """
+    Wrapper for HuggingFace Dataset that supports epoch-based positive document cycling.
+
+    This wrapper tracks the current epoch and uses it to select different positive
+    documents for each epoch, cycling through all available positives using modulo.
+
+    Attributes:
+        dataset: The underlying HuggingFace Dataset
+        corpus_dict: Dictionary mapping corpus_id to corpus objects
+        num_neg_docs: Number of negative documents to use
+        current_epoch: Current training epoch (used for positive selection)
+    """
+
+    def __init__(self, dataset: Dataset, corpus_dict: dict, num_neg_docs: int):
+        """
+        Initialize the wrapper.
+
+        Args:
+            dataset: HuggingFace Dataset with raw examples
+            corpus_dict: Dictionary mapping corpus_id to corpus objects
+            num_neg_docs: Number of negative documents to use per example
+        """
+        self._dataset = dataset
+        self._corpus_dict = corpus_dict
+        self._num_neg_docs = num_neg_docs
+        self._current_epoch = 0
+
+        # Set the transform function
+        self._dataset.set_transform(self._transform)
+
+    def _transform(self, examples):
+        """Transform function that uses current epoch for positive selection."""
+        return _transform_func(
+            examples,
+            num_neg_docs=self._num_neg_docs,
+            corpus_dict=self._corpus_dict,
+            current_epoch=self._current_epoch,
+        )
+
+    def set_epoch(self, epoch: int):
+        """
+        Set the current epoch for positive document cycling.
+
+        This should be called at the start of each epoch to cycle through
+        different positive documents.
+
+        Args:
+            epoch: The current epoch number (0-indexed)
+        """
+        self._current_epoch = epoch
+        logging.info(
+            f"RetrievalDatasetWrapper: Setting epoch to {epoch} - "
+            f"positive documents will be selected using index (epoch % num_positives)"
+        )
+
+    @property
+    def current_epoch(self) -> int:
+        """Get the current epoch."""
+        return self._current_epoch
+
+    def __len__(self):
+        """Return the length of the underlying dataset."""
+        return len(self._dataset)
+
+    def __getitem__(self, idx):
+        """Get an item from the underlying dataset."""
+        return self._dataset[idx]
+
+    def __iter__(self):
+        """Iterate over the underlying dataset."""
+        return iter(self._dataset)
+
+    @property
+    def dataset(self) -> Dataset:
+        """Access the underlying HuggingFace Dataset."""
+        return self._dataset
+
+
 def _create_transform_func(num_neg_docs, corpus_dict):
-    """Create transform function with specified number of negative documents."""
+    """Create transform function with specified number of negative documents.
+
+    Note: This function creates a transform that always uses epoch=0.
+    For epoch-based cycling, use RetrievalDatasetWrapper instead.
+    """
 
     def transform(examples):
-        return _transform_func(examples, num_neg_docs=num_neg_docs, corpus_dict=corpus_dict)
+        return _transform_func(examples, num_neg_docs=num_neg_docs, corpus_dict=corpus_dict, current_epoch=0)
 
     return transform
 
@@ -264,13 +382,17 @@ def make_retrieval_dataset(
     do_shuffle: bool = False,
     max_train_samples: int = None,
     train_data_select_offset: int = 0,
-):
+) -> RetrievalDatasetWrapper:
     """
     Load and return dataset in retrieval format for biencoder training.
 
     This function loads data from JSON files using the same method as
     RetrievalMultiModalDatasetLoader and returns it ready for training.
     Uses set_transform() for lazy evaluation - tokenization is handled by collator.
+
+    For training datasets, returns a RetrievalDatasetWrapper that supports
+    epoch-based positive document cycling. Call wrapper.set_epoch(epoch) at the
+    start of each epoch to cycle through different positive documents.
 
     Args:
         data_dir_list: Path(s) to JSON file(s) containing training data
@@ -283,7 +405,10 @@ def make_retrieval_dataset(
         train_data_select_offset: Offset for selecting training samples
 
     Returns:
-        A HuggingFace Dataset where each example is a dict with keys:
+        For training: RetrievalDatasetWrapper with epoch-based positive cycling
+        For eval: RetrievalDatasetWrapper (epoch is always 0)
+
+        Each example is a dict with keys:
         - 'question': Query text
         - 'doc_text': List of document texts [positive, negatives...]
         - 'doc_image': List of images or empty strings
@@ -309,20 +434,23 @@ def make_retrieval_dataset(
                 range(train_data_select_offset, min(train_data_select_offset + max_train_samples, len(dataset)))
             )
 
-        # Set transform for training (train_n_passages - 1 negatives)
+        # Wrap dataset for training with epoch-based positive cycling
         negative_size = train_n_passages - 1
-        dataset.set_transform(_create_transform_func(negative_size, corpus_dict))
+        wrapper = RetrievalDatasetWrapper(dataset, corpus_dict, negative_size)
+        logging.info(
+            f"Created training dataset wrapper with {len(dataset)} examples. "
+            f"Call set_epoch(epoch) to cycle through positive documents."
+        )
 
     elif data_type == "eval":
-        # Set transform for evaluation
-        dataset.set_transform(_create_transform_func(eval_negative_size, corpus_dict))
+        # Wrap dataset for evaluation (epoch is always 0)
+        wrapper = RetrievalDatasetWrapper(dataset, corpus_dict, eval_negative_size)
+        logging.info(f"Created eval dataset wrapper with {len(dataset)} examples.")
 
     else:
         raise ValueError(f"Invalid data type: {data_type}")
 
-    logging.info(f"Created {data_type} dataset with {len(dataset)} examples")
-
-    return dataset
+    return wrapper
 
 
 if __name__ == "__main__":
@@ -371,3 +499,14 @@ if __name__ == "__main__":
     if len(example["doc_text"]) > 1:
         print(f"First negative: {example['doc_text'][1][:100] if example['doc_text'][1] else '(empty)'}...")
     print(f"{'=' * 60}\n")
+
+    # Demo epoch cycling
+    if args.data_type == "train":
+        print("\nDemo: Epoch-based positive cycling")
+        print("-" * 40)
+        for epoch in range(3):
+            dataset.set_epoch(epoch)
+            example = dataset[0]
+            pos_doc_preview = example['doc_text'][0][:80] if example['doc_text'][0] else '(empty)'
+            print(f"Epoch {epoch}: Positive doc = {pos_doc_preview}...")
+        print(f"{'=' * 60}\n")
