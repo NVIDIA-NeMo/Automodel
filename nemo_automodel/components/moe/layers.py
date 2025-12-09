@@ -303,6 +303,29 @@ class GroupedExperts(nn.Module):
 
             y.scatter_add_(dim=0, index=idx_b, src=expert_out.to(x.dtype))
 
+        # Handle the edge case where no tokens are routed to any local experts.
+        # This can occur during expert parallelism when all tokens on a particular
+        # rank happen to select experts hosted on other ranks. We perform a dummy
+        # computation through the local expert weights to ensure:
+        # 1. Gradient flow through local expert parameters during backpropagation
+        # 2. Proper participation in collective operations (reduce-scatter)
+        # The computation is a no-op since we multiply by zero (using zeros_like input).
+        if active_local_experts == 0:
+            gate_and_up_proj = get_local_proj(self.gate_and_up_projs, experts_start_idx)
+            down_proj = get_local_proj(self.down_projs, experts_start_idx)
+            gate_up_proj_bias = get_local_proj(self.gate_up_proj_bias, experts_start_idx) if self.expert_bias else None
+            down_proj_bias = get_local_proj(self.down_proj_bias, experts_start_idx) if self.expert_bias else None
+
+            expert_out = (
+                self.expert_activation(
+                    torch.zeros_like(x[0]).unsqueeze(0),
+                    gate_and_up_proj=gate_and_up_proj,
+                    down_proj=down_proj,
+                )
+                * weights[0, 0, None]
+            )
+            y[0] += expert_out[0]
+
         if ep_size > 1:
             y = DTensor.from_local(y, device_mesh=ep_mesh, placements=[Partial()])
             y = y.redistribute(placements=[Shard(0)]).to_local()
