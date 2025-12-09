@@ -18,7 +18,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Union
 
-from datasets import VerificationMode, load_dataset
+from datasets import (
+    DatasetDict,
+    IterableDatasetDict,
+    VerificationMode,
+    concatenate_datasets,
+    load_dataset,
+)
 from torch.utils.data import Dataset
 
 from nemo_automodel.components.datasets.llm.formatting_utils import (
@@ -86,6 +92,14 @@ def _str_is_hf_repo_id(val: str) -> bool:
     return re.match(r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$", val) is not None and not Path(val).exists()
 
 
+def _maybe_concat_datasetdict(dataset, split: Optional[str]):
+    """If split is None and the loader returned a DatasetDict, merge its splits."""
+    if split is None and isinstance(dataset, (DatasetDict, IterableDatasetDict)):
+        logger.info("No split specified; concatenating DatasetDict splits: %s", list(dataset.keys()))
+        return concatenate_datasets([dataset[name] for name in dataset.keys()])
+    return dataset
+
+
 def _load_dataset(
     path_or_dataset_id: Union[str, List[str]],
     split: Optional[str] = None,
@@ -113,20 +127,31 @@ def _load_dataset(
         datasets.Dataset: The loaded dataset.
     """
     if isinstance(path_or_dataset_id, str) and _str_is_hf_repo_id(path_or_dataset_id):
-        return load_dataset(
-            path_or_dataset_id,
-            name=name,
-            split=split,
-            streaming=streaming,
-            verification_mode=VerificationMode.NO_CHECKS,
+        dataset = _maybe_concat_datasetdict(
+            load_dataset(
+                path_or_dataset_id,
+                name=name,
+                split=split,
+                streaming=streaming,
+                verification_mode=VerificationMode.NO_CHECKS,
+            ),
+            split,
         )
+        return dataset
 
     data_files = list(make_iterable(path_or_dataset_id))
     if not data_files:
         raise RuntimeError("No data files provided")
 
-    return load_dataset(
-        "json", data_files=data_files, split="train", streaming=streaming, verification_mode=VerificationMode.NO_CHECKS
+    return _maybe_concat_datasetdict(
+        load_dataset(
+            "json",
+            data_files=data_files,
+            split=split,
+            streaming=streaming,
+            verification_mode=VerificationMode.NO_CHECKS,
+        ),
+        split,
     )
 
 
