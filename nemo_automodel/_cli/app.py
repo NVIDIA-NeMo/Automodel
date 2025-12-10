@@ -48,12 +48,12 @@ COMMAND_ALIASES = {"finetune": "train_ft", "pretrain": "train_ft", "benchmark": 
 def get_recipe_script_path(command: str, domain: str, repo_root: str | Path) -> str:
     """
     Get the script path for a given command and domain.
-    
+
     Args:
         command: The command name (e.g., 'finetune', 'benchmark', 'pretrain')
         domain: The domain (e.g., 'llm', 'vlm')
         repo_root: The repository root path
-    
+
     Returns:
         str: Full path to the recipe script
     """
@@ -172,7 +172,7 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config, extra_args=Non
         )
     else:
         profile_cmd = ""
-    
+
     # create the command
     command_parts = [
         f"PYTHONPATH={repo_root}:$PYTHONPATH",
