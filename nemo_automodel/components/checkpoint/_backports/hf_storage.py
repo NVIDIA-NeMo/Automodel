@@ -255,7 +255,7 @@ class _HuggingFaceStorageReader(FsspecReader):
                     item_md = self.storage_data[req.storage_index]
 
                     stream.seek(item_md.offset)
-                    tensor_bytes = stream.read(item_md.length)
+                    tensor_bytes = bytearray(stream.read(item_md.length))
 
                     tensor = torch.frombuffer(
                         tensor_bytes,
