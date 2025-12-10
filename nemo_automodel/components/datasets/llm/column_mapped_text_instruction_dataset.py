@@ -88,7 +88,7 @@ def _str_is_hf_repo_id(val: str) -> bool:
 
 def _load_dataset(
     path_or_dataset_id: Union[str, List[str]],
-    split: Optional[str] = "train",
+    split: Optional[str] = None,
     streaming: bool = False,
     name: Optional[str] = None,
 ):
@@ -118,7 +118,7 @@ def _load_dataset(
             name=name,
             split=split,
             streaming=streaming,
-            verification_mode=VerificationMode.NO_CHECKS
+            verification_mode=VerificationMode.NO_CHECKS,
         )
 
     data_files = list(make_iterable(path_or_dataset_id))
