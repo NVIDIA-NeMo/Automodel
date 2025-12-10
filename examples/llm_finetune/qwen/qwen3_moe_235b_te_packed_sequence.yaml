@@ -43,7 +43,7 @@ model:
   _target_: nemo_automodel.components.models.qwen3_moe.model.Qwen3MoeForCausalLM.from_config
   config:
     _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: /adasif/models/models--Qwen--Qwen3-235B-A22B/snapshots/8efa61729e24bd65b1d152b5ab5409052aa80e65/
+    pretrained_model_name_or_path: Qwen/Qwen3-235B-A22B
   trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.moe.utils.BackendConfig
