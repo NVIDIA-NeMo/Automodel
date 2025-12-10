@@ -163,7 +163,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
         column_mapping: Dict[str, str],
         tokenizer,
         *,
-        split: Optional[str] = None,
+        split: Optional[str] = "train",
         name: Optional[str] = None,
         answer_only_loss_mask: bool = True,
         seq_length: Optional[int] = None,
