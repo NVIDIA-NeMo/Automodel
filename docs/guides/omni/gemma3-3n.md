@@ -218,7 +218,7 @@ peft:
 
 The training loss should look similar to the example below:
 
-<img src="medpix_peft.jpg" alt="Training Loss Curve" width="400px" />
+<img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/refs/heads/main/docs/guides/omni/medpix_peft.jpg" alt="Training Loss Curve" width="400px" />
 
 
 ### Checkpointing
@@ -296,7 +296,7 @@ uv run examples/vlm_generate/generate.py \
 
 Given the following image:
 
-<img src="medpix.jpg" alt="Sample image from the MedPix dataset" width="200px" />
+<img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/refs/heads/main/docs/guides/omni/medpix.jpg" alt="Sample image from the MedPix dataset" width="200px" />
 
 
 And the prompt:

@@ -93,7 +93,7 @@ FP8 quantization provides measurable performance improvements while maintaining 
 - **Convergence**: FP8 training achieves loss parity with BF16 training.
 - **Memory**: FP8 training achieves on par memory usage with BF16 baseline.
 
-<img src="fp8_convergence.jpg" alt="FP8 Convergence Comparison" width="600px" />
+<img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/refs/heads/main/docs/guides/fp8_convergence.jpg" alt="FP8 Convergence Comparison" width="600px" />
 
 *Figure: Loss curves comparing FP8 tensorwise scaling + torch.compile vs. BF16 + torch.compile training on 8xH100 with 8k sequence length, demonstrating virtually identical convergence behavior with 1.24x speedup*
 
