@@ -30,6 +30,7 @@ class BackendConfig:
     attn: Literal["te", "sdpa", "flex"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
     linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
+    rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
     enable_deepep: bool = HAVE_DEEP_EP
     fake_balanced_gate: bool = False
     enable_hf_state_dict_adapter: bool = True

@@ -134,20 +134,90 @@ class RotaryEmbedding(torch.nn.Module):
         return query, key
 
 
+def apply_rotary_emb_qk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    format: str = "bshd",
+    rope_fusion: bool = True,
+    cu_seqlens: torch.Tensor | None = None,
+    concentration: float | None = None,
+    cp_size: int = 1,
+    cp_rank: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply rotary embeddings to query and key tensors.
+
+    Args:
+        q: Query tensor.
+        k: Key tensor.
+        freqs_cis: Frequency tensor. Format depends on rope_fusion:
+                   - If rope_fusion=True: [angles, angles] for TE fused rope
+                   - If rope_fusion=False: [cos, sin] with concentration applied
+        format: QKV format ("bshd" or "thd").
+        rope_fusion: If True, use TE fused rope. If False, use non-fused rope.
+        cu_seqlens: Cumulative sequence lengths for variable-length sequences.
+        cp_size: Context parallelism size.
+        cp_rank: Context parallelism rank.
+
+    Returns:
+        Tuple of (q, k) with rotary embeddings applied.
+    """
+    if rope_fusion:
+        from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb
+
+        q = apply_rotary_pos_emb(
+            q, freqs_cis, tensor_format=format, fused=True, cu_seqlens=cu_seqlens, cp_size=cp_size, cp_rank=cp_rank
+        )
+        k = apply_rotary_pos_emb(
+            k, freqs_cis, tensor_format=format, fused=True, cu_seqlens=cu_seqlens, cp_size=cp_size, cp_rank=cp_rank
+        )
+        if concentration is not None:
+            q = q * concentration
+            k = k * concentration
+        return q, k
+    else:
+        cos, sin = freqs_cis.split(freqs_cis.shape[-1] // 2, dim=-1)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        return q, k
+
+
 @torch.no_grad()
 def position_ids_to_freqs_cis(
-    rotary_emb: RotaryEmbedding, position_ids: torch.Tensor, qkv_format: str = "bshd"
+    rotary_emb: RotaryEmbedding,
+    position_ids: torch.Tensor,
+    qkv_format: str = "bshd",
+    for_fused_rope: bool = True,
+    cp_size: int = 1,
 ) -> torch.Tensor:
     if qkv_format == "thd":
-        position_ids = position_ids.unsqueeze(0)
+        if for_fused_rope:
+            position_ids = torch.arange(
+                position_ids.shape[0] * cp_size, device=position_ids.device, dtype=torch.int32
+            ).unsqueeze(0)
+        else:
+            position_ids = position_ids.unsqueeze(0)
 
     concentration, inv_freq = rotary_emb._compute_concentration_and_inv_freq()
     inv_freq = inv_freq.to(device=position_ids.device, dtype=torch.float32)
     # angles: (B, T, D/2)
     angles = torch.einsum("bt,d->btd", position_ids.to(dtype=torch.float32), inv_freq)
-    cos = torch.cos(angles) * concentration
-    sin = torch.sin(angles) * concentration
-    freqs_cis = torch.cat([cos, sin], dim=-1)
+
+    if for_fused_rope:
+        # TE fused rope expects [angles, angles]
+        freqs_cis = torch.cat((angles, angles), dim=-1)
+    else:
+        # Non-fused rope expects [cos, sin] with concentration applied
+        cos = torch.cos(angles) * concentration
+        sin = torch.sin(angles) * concentration
+        freqs_cis = torch.cat([cos, sin], dim=-1)
+
     if qkv_format == "thd":
         freqs_cis = freqs_cis.squeeze(0)
+    else:
+        freqs_cis = freqs_cis[0] if for_fused_rope else freqs_cis
+
+    if for_fused_rope:
+        freqs_cis = freqs_cis.reshape(freqs_cis.size(0), 1, 1, freqs_cis.size(1)).contiguous()
+
     return freqs_cis
