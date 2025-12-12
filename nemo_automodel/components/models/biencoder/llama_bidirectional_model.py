@@ -46,7 +46,10 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, logging
 from transformers.utils.generic import check_model_inputs
 
-from nemo_automodel.components.models.biencoder.state_dict_adapter import BiencoderStateDictAdapter
+try:
+    from nemo_automodel.components.models.biencoder.state_dict_adapter import BiencoderStateDictAdapter
+except ImportError:
+    BiencoderStateDictAdapter = object
 
 logger = logging.get_logger(__name__)
 
