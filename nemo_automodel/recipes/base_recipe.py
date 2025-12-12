@@ -24,6 +24,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import yaml
 from torch.optim import Optimizer
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.processing_utils import ProcessorMixin
@@ -35,13 +36,6 @@ from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
-
-try:
-    import yaml as _yaml
-except Exception:
-    _yaml = None
-from transformers.processing_utils import ProcessorMixin
-from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 
 def has_load_restore_state(object):
@@ -384,32 +378,25 @@ class BaseRecipe:
             and getattr(self.cfg.model, "pretrained_model_name_or_path", None),
         }
         try:
-            if _yaml is not None:
-                details_yaml = _yaml.safe_dump(details, sort_keys=False, default_flow_style=False).strip()
-            else:
-                details_yaml = "\n".join(f"{k}: {v}" for k, v in details.items())
-            list(map(logging.info, ("Experiment_details:\n" + details_yaml).splitlines()))
+            details_yaml = yaml.safe_dump(details, sort_keys=False, default_flow_style=False).strip()
+            for line in ("Experiment_details:\n" + details_yaml).splitlines():
+                logging.info(line)
         except Exception:
             logging.info(f"Experiment details: {details}")
         # Resolved config
         try:
             cfg_obj = getattr(self, "cfg", None)
-            cfg_dict = (
-                cfg_obj.to_dict() if hasattr(cfg_obj, "to_dict") else (dict(cfg_obj) if cfg_obj is not None else {})
-            )
+            # Prefer YAML-ready dict that converts callables/classes to dotted paths and preserves typed scalars
+            if hasattr(cfg_obj, "to_yaml_dict"):
+                cfg_dict = cfg_obj.to_yaml_dict()
+            elif hasattr(cfg_obj, "to_dict"):
+                cfg_dict = cfg_obj.to_dict()
+            else:
+                cfg_dict = dict(cfg_obj) if cfg_obj is not None else {}
 
-            def rec_print(log_fn, cfg_dict: dict | None, indent: int = 2):
-                if cfg_dict is None:
-                    return
-                for k, v in cfg_dict.items():
-                    if isinstance(v, dict):
-                        log_fn(f"{' ' * indent}{k}:")
-                        rec_print(log_fn, v, indent + 2)
-                    else:
-                        log_fn(f"{' ' * indent}{k}: {v}")
-
-            logging.info("Recipe config:")
-            rec_print(logging.info, cfg_dict)
+            # Print as clean YAML on stdout for easy copy/paste and readability
+            cfg_yaml = yaml.safe_dump(cfg_dict, sort_keys=False, default_flow_style=False).strip()
+            print(cfg_yaml, flush=True)
         except Exception:
             logging.info("Recipe config: <unavailable>")
 

@@ -425,6 +425,86 @@ class ConfigNode:
             k: self._unwrap(v) for k, v in self.__dict__.items() if k not in ("raise_on_missing_attr", "_raw_config")
         }
 
+    def _to_dotted_path(self, obj):
+        """
+        Convert a callable/class/method object to a dotted path string.
+
+        Best-effort normalization for a few common cases to produce concise, user-friendly paths.
+        """
+        # Bound method on a class (e.g., Class.from_pretrained)
+        try:
+            import inspect as _inspect  # local alias to avoid confusion with top-level import
+
+            if _inspect.ismethod(obj):
+                owner = getattr(obj, "__self__", None)
+                if _inspect.isclass(owner):
+                    method_name = getattr(obj, "__name__", "unknown")
+                    module_name = getattr(owner, "__module__", None) or ""
+                    class_name = getattr(owner, "__name__", "UnknownClass")
+                    # Prefer shortened top-level for NeMoAutoModel* classes if possible
+                    if class_name.startswith("NeMoAutoModel"):
+                        module_name = "nemo_automodel"
+                    dotted = f"{module_name}.{class_name}.{method_name}".lstrip(".")
+                else:
+                    # Bound to instance – fall back to module + qualname
+                    module_name = getattr(obj, "__module__", None) or ""
+                    qualname = getattr(obj, "__qualname__", getattr(obj, "__name__", "unknown"))
+                    dotted = f"{module_name}.{qualname}".lstrip(".")
+            elif _inspect.isfunction(obj):
+                module_name = getattr(obj, "__module__", None) or ""
+                qualname = getattr(obj, "__qualname__", getattr(obj, "__name__", "unknown"))
+                dotted = f"{module_name}.{qualname}".lstrip(".")
+            elif _inspect.isclass(obj):
+                module_name = getattr(obj, "__module__", None) or ""
+                class_name = getattr(obj, "__name__", "UnknownClass")
+                dotted = f"{module_name}.{class_name}".lstrip(".")
+            else:
+                module_name = getattr(obj, "__module__", None) or ""
+                qualname = getattr(obj, "__qualname__", getattr(obj, "__name__", str(obj)))
+                dotted = f"{module_name}.{qualname}".lstrip(".")
+        except Exception:
+            # Fallback to repr if anything goes wrong
+            return repr(obj)
+        return dotted
+
+    def to_yaml_dict(self):
+        """
+        Convert configuration to a YAML-ready dictionary:
+        - Preserves typed scalars (ints, floats, bools)
+        - Converts callables/classes/methods (e.g., _target_, *_fn) to dotted path strings
+        - Recurses through nested ConfigNodes and lists
+        """
+
+        def _convert(key, value):
+            # Nested config
+            if isinstance(value, ConfigNode):
+                return value.to_yaml_dict()
+            # Lists
+            if isinstance(value, list):
+                return [_convert(None, v) for v in value]
+            # Dicts (shouldn't normally appear because we wrap into ConfigNode, but handle defensively)
+            if isinstance(value, dict):
+                return {k: _convert(k, v) for k, v in value.items()}
+            # Convert targets/functions to dotted path strings
+            is_target_like = key == "_target_" or (isinstance(key, str) and key.endswith("_fn")) or key == "collate_fn"
+            try:
+                import inspect as _inspect
+
+                if is_target_like and (callable(value) or _inspect.ismethod(value) or _inspect.isclass(value)):
+                    return self._to_dotted_path(value)
+                # Even if the key isn't target-like, convert bare callables to dotted path to avoid <function ...> repr
+                if callable(value) or _inspect.ismethod(value) or _inspect.isclass(value):
+                    return self._to_dotted_path(value)
+            except Exception:
+                pass
+            # Primitive – already typed via translate_value/_wrap
+            return value
+
+        # Walk live attributes to preserve translated scalars
+        return {
+            k: _convert(k, v) for k, v in self.__dict__.items() if k not in ("raise_on_missing_attr", "_raw_config")
+        }
+
     def _unwrap(self, v):
         """
         Recursively convert wrapped configuration values to basic Python types.
@@ -508,7 +588,7 @@ class ConfigNode:
             for key, value in self.__dict__.items()
             if key not in ("raise_on_missing_attr", "_raw_config")
         ]
-        return "\n#path: " + "\n".join(lines) + f"\n{indent}"
+        return "\n".join(lines) + f"\n{indent}"
 
     def _repr_value(self, value, level):
         """
