@@ -1221,7 +1221,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             loss_buffer.append(local_loss.clone().detach())
         else:
             model = self.model_parts[0]
-            sync_ctx = get_sync_ctx(model, idx == num_batches - 1) if is_train else nullcontext()
+            sync_ctx = (
+                get_sync_ctx(
+                    model,
+                    idx == num_batches - 1,
+                    defer_fsdp_grad_sync=getattr(self.model_wrapper, "defer_fsdp_grad_sync", True),
+                )
+                if is_train
+                else nullcontext()
+            )
             with train_ctx(), sync_ctx:
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory

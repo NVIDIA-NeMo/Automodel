@@ -128,6 +128,11 @@ class FSDP2Manager:
         metadata={"help": "Enable activation checkpointing if True. Applies to linear layers."},
     )
 
+    defer_fsdp_grad_sync: Optional[bool] = field(
+        default=True,
+        metadata={"help": "Defer FSDP gradient sync to only the final micro-batch before the optimizer step if True."},
+    )
+
     def __post_init__(self):
         """
         Post-initialization hook that sets up the distributed environment.
