@@ -385,3 +385,68 @@ def test_make_retrieval_dataset_invalid_type(tmp_path, monkeypatch):
         rd.make_retrieval_dataset(str(train_file), data_type="invalid")
 
 
+def test_transform_func_epoch_cycling():
+    corpus_dict = {
+        "corpusA": DummyCorpus(
+            {
+                "p1": {"text": "pos1", "image": "", "nr_ocr": ""},
+                "p2": {"text": "pos2", "image": "", "nr_ocr": ""},
+                "p3": {"text": "pos3", "image": "", "nr_ocr": ""},
+                "n1": {"text": "neg1", "image": "", "nr_ocr": ""},
+            }
+        )
+    }
+    
+    # Example with multiple positive docs
+    examples = {
+        "question": ["Q"],
+        "corpus_id": ["corpusA"],
+        "pos_doc": [[{"id": "p1"}, {"id": "p2"}, {"id": "p3"}]],
+        "neg_doc": [[{"id": "n1"}]],
+    }
+
+    # Epoch 0: Should select first positive (p1)
+    examples["epoch"] = 0
+    out_0 = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict)
+    assert out_0["doc_text"][0][0] == "pos1"
+
+    # Epoch 1: Should select second positive (p2)
+    examples["epoch"] = 1
+    out_1 = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict)
+    assert out_1["doc_text"][0][0] == "pos2"
+
+    # Epoch 2: Should select third positive (p3)
+    examples["epoch"] = 2
+    out_2 = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict)
+    assert out_2["doc_text"][0][0] == "pos3"
+
+    # Epoch 3: Should cycle back to first positive (p1)
+    examples["epoch"] = 3
+    out_3 = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict)
+    assert out_3["doc_text"][0][0] == "pos1"
+
+    # Test update_dataset_epoch helper
+    # Create a dummy dataset with metadata
+    dataset = Dataset.from_list([
+        {
+            "question_id": "q1",
+            "question": "Q",
+            "corpus_id": "corpusA",
+            "pos_doc": [{"id": "p1"}, {"id": "p2"}],
+            "neg_doc": [{"id": "n1"}]
+        }
+    ])
+    dataset.corpus_dict = corpus_dict
+    dataset.num_neg_docs = 1
+    
+    # Initial transform (epoch 0 default)
+    rd.update_dataset_epoch(dataset, epoch=0)
+    # Verify transform is set (we can't easily inspect the closure, but we can run it)
+    # The dataset transform is applied when accessing items
+    item_0 = dataset[0]
+    assert item_0["doc_text"][0] == "pos1"
+    
+    # Update to epoch 1
+    rd.update_dataset_epoch(dataset, epoch=1)
+    item_1 = dataset[0]
+    assert item_1["doc_text"][0] == "pos2"
