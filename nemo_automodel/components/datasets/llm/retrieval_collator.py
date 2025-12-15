@@ -57,6 +57,7 @@ class RetrievalBiencoderCollator:
         passage_prefix: str = "",
         padding: Union[bool, str, PaddingStrategy] = True,
         pad_to_multiple_of: int = None,
+        use_dataset_instruction: bool = False,
     ):
         """
         Initialize the collator.
@@ -69,6 +70,7 @@ class RetrievalBiencoderCollator:
             passage_prefix: Prefix to add to passages (e.g., "passage: ")
             padding: Padding strategy ("longest", "max_length", or "do_not_pad")
             pad_to_multiple_of: Pad to multiple of this value (e.g., 8 for FP16)
+            use_dataset_instruction: Whether to use instruction from dataset's metadata
         """
         self.tokenizer = tokenizer
         self.q_max_len = q_max_len
@@ -77,6 +79,7 @@ class RetrievalBiencoderCollator:
         self.passage_prefix = passage_prefix
         self.padding = padding
         self.pad_to_multiple_of = pad_to_multiple_of
+        self.use_dataset_instruction = use_dataset_instruction
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         """
@@ -100,14 +103,36 @@ class RetrievalBiencoderCollator:
         # Flatten documents (each example has multiple docs)
         doc_examples_flat = []
         doc_size = len(doc_examples[0])
-        for doc in doc_examples:
-            doc_examples_flat += doc
 
-        # Add prefixes if provided
-        if self.query_prefix:
-            query_examples = [self.query_prefix + " " + question for question in query_examples]
-        if self.passage_prefix:
-            doc_examples_flat = [self.passage_prefix + " " + passage for passage in doc_examples_flat]
+        if self.use_dataset_instruction:
+            query_instruction_examples = [x["query_instruction"] for x in batch]
+            passage_instruction_examples = [x["passage_instruction"] for x in batch]
+            passage_instruction_examples_flat = []
+
+            # Flatten documents with instructions
+            for doc, passage_instruction in zip(doc_examples, passage_instruction_examples):
+                doc_examples_flat += doc
+                passage_instruction_examples_flat += [passage_instruction] * len(doc)
+        else:
+            # Flatten documents without instructions
+            for doc in doc_examples:
+                doc_examples_flat += doc
+
+        # Add prefixes
+        if self.use_dataset_instruction:
+            query_examples = [
+                f"{query_instruction} {question}" if query_instruction else question
+                for query_instruction, question in zip(query_instruction_examples, query_examples)
+            ]
+            doc_examples_flat = [
+                f"{passage_instruction} {passage}" if passage_instruction else passage
+                for passage_instruction, passage in zip(passage_instruction_examples_flat, doc_examples_flat)
+            ]
+        else:
+            if self.query_prefix:
+                query_examples = [self.query_prefix + " " + question for question in query_examples]
+            if self.passage_prefix:
+                doc_examples_flat = [self.passage_prefix + " " + passage for passage in doc_examples_flat]
 
         # Tokenize queries (no padding yet)
         query_encodings = self.tokenizer(

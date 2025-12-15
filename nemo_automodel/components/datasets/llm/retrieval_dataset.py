@@ -17,6 +17,7 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import List, Optional, Union
 
 from datasets import Dataset, concatenate_datasets, load_dataset
@@ -57,6 +58,59 @@ DATASETS = {
 }
 
 
+@dataclass
+class CorpusInfo:
+    """
+    Data structure to hold corpus metadata and dataset object together.
+    Provides easy access to both components with descriptive attribute names.
+    """
+
+    metadata: dict
+    corpus: AbstractDataset
+
+    @property
+    def corpus_id(self) -> str:
+        """Get corpus ID from metadata"""
+        return self.metadata["corpus_id"]
+
+    @property
+    def query_instruction(self) -> str:
+        """Get query instruction from metadata"""
+        if "query_instruction" in self.metadata:
+            return self.metadata["query_instruction"]
+        else:
+            return ""
+
+    @property
+    def passage_instruction(self) -> str:
+        """Get passage instruction from metadata"""
+        if "passage_instruction" in self.metadata:
+            return self.metadata["passage_instruction"]
+        else:
+            return ""
+
+    @property
+    def task_type(self) -> str:
+        """Get task type from metadata"""
+        if "task_type" in self.metadata:
+            return self.metadata["task_type"]
+        else:
+            return ""
+
+    @property
+    def path(self) -> str:
+        """Get corpus path from the corpus object"""
+        return self.corpus.path
+
+    def get_document_by_id(self, doc_id: str):
+        """Delegate to corpus for convenience"""
+        return self.corpus.get_document_by_id(doc_id)
+
+    def get_all_ids(self):
+        """Delegate to corpus for convenience"""
+        return self.corpus.get_all_ids()
+
+
 def load_corpus_metadata(path: str):
     path_metadata = os.path.join(path, "merlin_metadata.json")
     if not os.path.isfile(path_metadata):
@@ -95,7 +149,7 @@ def add_corpus(qa_corpus_paths: Union[dict, list], corpus_dict: dict):
                 )
         else:
             corpus_id, corpus = load_corpus(corpus_info["path"], corpus_metadata)
-            corpus_dict[corpus_id] = corpus
+            corpus_dict[corpus_id] = CorpusInfo(corpus_metadata, corpus)
 
 
 def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True):
@@ -159,7 +213,7 @@ def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True
     return (dataset, corpus_dict)
 
 
-def _transform_func(examples, num_neg_docs, corpus_dict):
+def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
     """
     Transform function to convert from raw format to training format.
     Same as _format_process_data in RetrievalMultiModalDatasetLoader.
@@ -168,6 +222,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict):
         examples: Batch of examples with question, corpus_id, pos_doc, neg_doc
         num_neg_docs: Number of negative documents to use
         corpus_dict: Dictionary mapping corpus_id to corpus objects
+        use_dataset_instruction: Whether to use instruction from dataset's metadata
     """
     # Handle both batched and single examples
     is_batched = isinstance(examples["question"], list)
@@ -180,10 +235,6 @@ def _transform_func(examples, num_neg_docs, corpus_dict):
     corpus_ids = examples["corpus_id"]
     batch_positives = examples["pos_doc"]
     batch_negatives = examples["neg_doc"]
-
-    # Check if we have enough negatives
-    if num_neg_docs > len(batch_negatives[0]):
-        raise Exception(f"num_neg_docs {num_neg_docs} is bigger than 'neg_docs': {len(batch_negatives[0])}")
 
     cur_pos_neg_doc_batch = []
 
@@ -200,7 +251,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict):
         # Get negatives (limit to num_neg_docs)
         negatives = batch_negatives[i_example]
         neg_ids = [i for i in range(len(negatives))]
-        cur_neg_ids = neg_ids[:num_neg_docs]
+        cur_neg_ids = [neg_ids[idx % len(neg_ids)] for idx in range(num_neg_docs)]
         cur_pos_neg_doc += [negatives[n_id] for n_id in cur_neg_ids]
 
         cur_pos_neg_doc_batch.append(cur_pos_neg_doc)
@@ -208,6 +259,8 @@ def _transform_func(examples, num_neg_docs, corpus_dict):
     # Extract text and images from corpus
     cur_pos_neg_text_batch = []
     cur_pos_neg_image_batch = []
+    query_instruction_batch = []
+    passage_instruction_batch = []
 
     for idx_doc, docs in enumerate(cur_pos_neg_doc_batch):
         cur_pos_neg_text = []
@@ -237,7 +290,20 @@ def _transform_func(examples, num_neg_docs, corpus_dict):
         cur_pos_neg_text_batch.append(cur_pos_neg_text)
         cur_pos_neg_image_batch.append(cur_pos_neg_image)
 
-    result = {"question": questions, "doc_text": cur_pos_neg_text_batch, "doc_image": cur_pos_neg_image_batch}
+        if use_dataset_instruction:
+            query_instruction_batch.append(corpus_dict[cur_corpus_id].query_instruction)
+            passage_instruction_batch.append(corpus_dict[cur_corpus_id].passage_instruction)
+        else:
+            query_instruction_batch.append("")
+            passage_instruction_batch.append("")
+
+    result = {
+        "question": questions,
+        "doc_text": cur_pos_neg_text_batch,
+        "doc_image": cur_pos_neg_image_batch,
+        "query_instruction": query_instruction_batch,
+        "passage_instruction": passage_instruction_batch,
+    }
 
     # If input was not batched, return single example
     if not is_batched:
@@ -246,11 +312,16 @@ def _transform_func(examples, num_neg_docs, corpus_dict):
     return result
 
 
-def _create_transform_func(num_neg_docs, corpus_dict):
+def _create_transform_func(num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
     """Create transform function with specified number of negative documents."""
 
     def transform(examples):
-        return _transform_func(examples, num_neg_docs=num_neg_docs, corpus_dict=corpus_dict)
+        return _transform_func(
+            examples,
+            num_neg_docs=num_neg_docs,
+            corpus_dict=corpus_dict,
+            use_dataset_instruction=use_dataset_instruction,
+        )
 
     return transform
 
@@ -264,6 +335,7 @@ def make_retrieval_dataset(
     do_shuffle: bool = False,
     max_train_samples: int = None,
     train_data_select_offset: int = 0,
+    use_dataset_instruction: bool = False,
 ):
     """
     Load and return dataset in retrieval format for biencoder training.
@@ -311,11 +383,11 @@ def make_retrieval_dataset(
 
         # Set transform for training (train_n_passages - 1 negatives)
         negative_size = train_n_passages - 1
-        dataset.set_transform(_create_transform_func(negative_size, corpus_dict))
+        dataset.set_transform(_create_transform_func(negative_size, corpus_dict, use_dataset_instruction))
 
     elif data_type == "eval":
         # Set transform for evaluation
-        dataset.set_transform(_create_transform_func(eval_negative_size, corpus_dict))
+        dataset.set_transform(_create_transform_func(eval_negative_size, corpus_dict, use_dataset_instruction))
 
     else:
         raise ValueError(f"Invalid data type: {data_type}")
