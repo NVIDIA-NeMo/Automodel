@@ -17,13 +17,13 @@
 # Or with torchrun for multi-GPU:
 # torchrun --nproc-per-node=8 examples/biencoder/finetune.py --config examples/biencoder/llama3_2_1b_biencoder.yaml
 
-seed: 42
+seed: 125
 
 step_scheduler:
   global_batch_size: 128
-  local_batch_size: 4
-  ckpt_every_steps: 500
-  val_every_steps: 500
+  local_batch_size: 1
+  ckpt_every_steps: 3000
+  val_every_steps: 3000
   num_epochs: 1
 
 dist_env:
@@ -32,87 +32,65 @@ dist_env:
 
 model:
   _target_: nemo_automodel.components.models.biencoder.NeMoAutoModelBiencoder.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
-  share_encoder: true
-  add_linear_pooler: false
-  out_dimension: 768
-  do_gradient_checkpointing: false
+  pretrained_model_name_or_path: meta-llama/Llama-3.1-8B
   train_n_passages: 5
-  eval_negative_size: 4
   pooling: avg
-  l2_normalize: true
   t: 0.02
-  use_liger_kernel: true
-  use_sdpa_patching: true
   torch_dtype: bfloat16
 
 tokenizer:
-  _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+  _target_: transformers.AutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.1-8B
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   dataset:
     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
     data_dir_list:
-      - training_datasets/nqsh_shuffled_50k.json
-      - training_datasets/miracl_train_es_llama3_1b_4m_512len.json
-      - training_datasets/mldr_en_perc95_small.json
+      - ./embed_nemotron_dataset_v1/EmotionClassification/EmotionClassification.json
+      - ./embed_nemotron_dataset_v1/FEVER/FEVER.json
+      - ./embed_nemotron_dataset_v1/GooAQ/GooAQ.json
+      - ./embed_nemotron_dataset_v1/HotpotQA/HotpotQA.json
+      - ./embed_nemotron_dataset_v1/MAmmoTH2/MAmmoTH2.json
+      - ./embed_nemotron_dataset_v1/MIRACL/MIRACL.json
+      - ./embed_nemotron_dataset_v1/MSMARCO/MSMARCO.json
+      - ./embed_nemotron_dataset_v1/NaturalQuestions/NaturalQuestions.json
+      - ./embed_nemotron_dataset_v1/NFCorpus/NFCorpus.json
+      - ./embed_nemotron_dataset_v1/PAQ/PAQ.json
+      - ./embed_nemotron_dataset_v1/SciFact/SciFact.json
+      - ./embed_nemotron_dataset_v1/SQuAD/SQuAD.json
+      - ./embed_nemotron_dataset_v1/SyntheticClassificationData/SyntheticClassificationData.json
+      - ./embed_nemotron_dataset_v1/TriviaQA/TriviaQA.json
     data_type: train
     train_n_passages: 5
-    eval_negative_size: 4
-    seed: 42
+    seed: 125
     do_shuffle: true
+    use_dataset_instruction: true
   collate_fn:
     _target_: nemo_automodel.components.datasets.llm.RetrievalBiencoderCollator
     q_max_len: 512
     p_max_len: 512
-    query_prefix: "query:"
-    passage_prefix: "passage:"
+    query_prefix: ""
+    passage_prefix: ""
     pad_to_multiple_of: 8
+    use_dataset_instruction: true
   shuffle: true
-  num_workers: 0
-
-# Optional: Uncomment to enable validation
-# validation_dataloader:
-#   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-#   dataset:
-#     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
-#     data_dir_list: training_datasets/validation.json
-#     data_type: eval
-#     train_n_passages: 5
-#     eval_negative_size: 4
-#     seed: 42
-#     do_shuffle: false
-#     max_train_samples: 1000
-#     train_data_select_offset: 0
-#   collate_fn:
-#     _target_: nemo_automodel.components.datasets.llm.RetrievalBiencoderCollator
-#     q_max_len: 512
-#     p_max_len: 512
-#     query_prefix: "query:"
-#     passage_prefix: "passage:"
-#     padding: longest
-#     pad_to_multiple_of: 8
-#   batch_size: 2
-#   shuffle: false
-#   num_workers: 0
+  num_workers: 8
 
 optimizer:
   _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
-  lr: 5.0e-6
+  lr: 2.0e-6
   weight_decay: 0.01
   adam_w_mode: true
   bias_correction: true
   master_weights: true
 
-# Learning rate scheduler
 lr_scheduler:
-  lr_warmup_steps: 100
+  lr_warmup_steps: 2
 
 checkpoint:
   enabled: true
-  checkpoint_dir: ./output/llama3_2_1b_biencoder/checkpoints
+  checkpoint_dir: ./output/llama_embed_nemotron_8b
   model_save_format: safetensors
   save_consolidated: true
 
@@ -124,9 +102,6 @@ distributed:
   cp_size: 1
   sequence_parallel: false
 
-# Uncomment and configure for W&B logging
-# wandb:
-#   project: biencoder-finetuning
-#   entity: your_entity
-#   name: llama3_2_1b_biencoder
-
+dist_env:
+  backend: nccl
+  timeout_minutes: 30

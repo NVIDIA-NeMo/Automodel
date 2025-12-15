@@ -216,8 +216,9 @@ class TestApplyRotaryEmb:
 
         # Create bfloat16 input
         x_bf16 = torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=torch.bfloat16)
-        cos = torch.randn(seq_len, head_dim // 2)
-        sin = torch.randn(seq_len, head_dim // 2)
+        angles = torch.randn(seq_len, head_dim // 2)
+        cos = angles.cos()
+        sin = angles.sin()
 
         # Apply rotary embedding
         result = apply_rotary_emb(x_bf16, cos, sin)
