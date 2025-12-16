@@ -49,7 +49,8 @@ class TestNeMoAutoModelForCausalLM:
         ):
             cfg = Mock()
             cfg.architectures = ["HFArch"]
-            mock_cfg_from_pretrained.return_value = cfg
+            cfg.auto_map = []
+            mock_cfg_from_pretrained.return_value = (cfg, {})
             mock_model = MagicMock()
             mock_model.config = {}
             mock_from_pretrained.return_value = mock_model
@@ -151,7 +152,7 @@ class TestNeMoAutoModelForCausalLM:
             patch("nemo_automodel._transformers.auto_model.dist.is_initialized", return_value=True),
             patch("nemo_automodel._transformers.auto_model.dist.get_world_size", return_value=1),
             patch("nemo_automodel._transformers.auto_model.dist.get_rank", return_value=0),
-            patch("nemo_automodel._transformers.auto_model.dist.barrier") as mock_barrier,
+            patch("nemo_automodel.components.distributed.utils.FirstRankPerNode") as mock_barrier,
         ):
             # Prepare a fake config with architectures and commit hash
             cfg = Mock()
