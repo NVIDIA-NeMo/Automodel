@@ -392,7 +392,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             return cls._from_pretrained_parent_class(
                 pretrained_model_name_or_path,
                 *model_args,
-                config=hf_config,
                 torch_dtype=torch_dtype,
                 attn_implementation=attn_implementation,
                 **kwargs,
@@ -414,7 +413,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             model = cls._from_pretrained_parent_class(
                 pretrained_model_name_or_path,
                 *model_args,
-                config=hf_config,
                 torch_dtype=torch_dtype,
                 attn_implementation=attn_implementation,
                 **kwargs,
@@ -539,8 +537,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             return cls._from_config_parent_class(
                 config,
                 *model_args,
-                torch_dtype=torch_dtype,
                 attn_implementation=attn_implementation,
+                torch_dtype=torch_dtype,
                 **kwargs,
             )
 
@@ -557,8 +555,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             model = cls._from_config_parent_class(
                 config,
                 *model_args,
-                torch_dtype=torch_dtype,
                 attn_implementation=attn_implementation,
+                torch_dtype=torch_dtype,
                 **kwargs,
             )
         except ValueError as e:
