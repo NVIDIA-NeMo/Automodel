@@ -23,6 +23,16 @@ from typing import List, Optional, Union
 import torch
 import torch.distributed as dist
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoModelForSequenceClassification,
+    AutoModelForTextToWaveform,
+    PreTrainedModel,
+)
+from transformers.modeling_utils import _get_resolved_checkpoint_files
+from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel import __version__
@@ -35,16 +45,6 @@ from nemo_automodel.components.distributed.init_utils import (
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code
 from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoModelForImageTextToText,
-    AutoModelForSequenceClassification,
-    AutoModelForTextToWaveform,
-    PreTrainedModel,
-)
-from transformers.modeling_utils import _get_resolved_checkpoint_files
-from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 logger = logging.getLogger(__name__)
