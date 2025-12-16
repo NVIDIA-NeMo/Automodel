@@ -231,10 +231,9 @@ def build_model_and_optimizer(
                     param.requires_grad_(True)
             logging.info(f"Unfroze parameters matching: {unfreeze_modules}")
 
-    trainable_params, total_params = print_trainable_parameters(model)
     param_info = {
-        "trainable_params": trainable_params,
-        "total_params": total_params,
+        "trainable_params": 0,
+        "total_params": 0,
     }
 
     # hold a list copy of the model state dict keys before any parallelization
@@ -302,6 +301,10 @@ def build_model_and_optimizer(
 
                 model, optimizer = model_wrapper.parallelize(model, optimizer)
 
+                trainable_params, total_params = print_trainable_parameters(model)
+                param_info["trainable_params"] = trainable_params
+                param_info["total_params"] = total_params
+
                 return model, state_dict_keys, [optimizer], loss_fn, param_info
 
             else:
@@ -318,9 +321,6 @@ def build_model_and_optimizer(
                 getattr(cfg_peft, "lora_A_init", None),
                 load_base_model=load_base_model,
             )
-
-        # ensure the model is on device
-        model = model.to(device)
 
         # Apply torch.compile if configured
         if cfg_compile is not None:
@@ -341,6 +341,11 @@ def build_model_and_optimizer(
         trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         optimizer = [cfg_opt.instantiate(params=trainable_params)]
+
+    # Print trainable parameters after model has been moved to device
+    trainable_params, total_params = print_trainable_parameters(model)
+    param_info["trainable_params"] = trainable_params
+    param_info["total_params"] = total_params
 
     return model, state_dict_keys, optimizer, loss_fn, param_info
 
