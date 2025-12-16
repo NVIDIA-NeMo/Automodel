@@ -20,6 +20,9 @@ resolution-markers = [
     "python_full_version < '3.11' and sys_platform == 'darwin'",
 ]
 
+[options]
+prerelease-mode = "allow"
+
 [manifest]
 constraints = [{ name = "starlette", specifier = ">=0.49.1" }]
 
@@ -2925,7 +2928,7 @@ requires-dist = [
     { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'vlm'" },
     { name = "torchdata" },
     { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'cuda'", specifier = "==2.8.0" },
-    { name = "transformers", specifier = "<=4.57.3" },
+    { name = "transformers", specifier = "<=5.0.0rc0" },
     { name = "wandb" },
 ]
 provides-extras = ["cuda", "extra", "vlm", "all"]
