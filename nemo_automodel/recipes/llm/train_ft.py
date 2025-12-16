@@ -325,6 +325,9 @@ def build_model_and_optimizer(
                 load_base_model=load_base_model,
             )
 
+        # ensure the model is on device
+        model = model.to(device)
+
         # Apply torch.compile if configured
         if cfg_compile is not None:
             compile_config = build_compile_config(cfg_compile)
