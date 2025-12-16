@@ -250,6 +250,7 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path):
                 transformers_explicit_filename=None,
             )
 
+
 def get_architectures(hf_config):
     """
     Get the architectures from the HF config.
@@ -258,6 +259,7 @@ def get_architectures(hf_config):
     if hasattr(hf_config, "architectures"):
         architectures = hf_config.architectures or []
     return architectures
+
 
 class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
     """
