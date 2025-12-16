@@ -47,6 +47,7 @@ from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
 
 if TYPE_CHECKING:
     from peft import PeftConfig
+
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 
@@ -313,9 +314,7 @@ class Checkpointer:
 
         # For models that need tensor merging and don't have an adapter, try using transformers' conversion
         if is_init_step and model_type and requires_tensor_merging(model_type) and not has_state_dict_adapter:
-            converted_state_dict = _convert_checkpoint_with_transformers(
-                model_state.model[0], model_path, key_mapping
-            )
+            converted_state_dict = _convert_checkpoint_with_transformers(model_state.model[0], model_path, key_mapping)
             if converted_state_dict is not None:
                 # Load using full_state_dict=True to properly convert tensors to DTensors for FSDP
                 _load_full_state_dict_into_model(model_state.model, converted_state_dict)
@@ -887,7 +886,8 @@ def _load_full_state_dict_into_model(
         state_dict: Full state dict with regular tensors
     """
     from functools import partial
-    from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateDictOptions
+
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
     # Use full_state_dict=True to tell PyTorch this is a complete, non-sharded state dict
     # It will properly shard the tensors to match the model's DTensor layout
@@ -925,16 +925,17 @@ def _convert_checkpoint_with_transformers(
         Converted state dict ready for loading, or None if conversion failed.
     """
     try:
+        from copy import deepcopy
+
+        from safetensors import safe_open
+
         from transformers.conversion_mapping import get_model_conversion_mapping
         from transformers.core_model_loading import (
             WeightConverter,
             WeightRenaming,
-            rename_source_key,
             dot_natural_key,
+            rename_source_key,
         )
-        from safetensors import safe_open
-        from copy import deepcopy
-        from collections import defaultdict
     except ImportError:
         logging.warning(
             "transformers library with conversion_mapping not available. "
@@ -946,7 +947,9 @@ def _convert_checkpoint_with_transformers(
         # Get the weight conversion mapping from transformers
         weight_mapping = get_model_conversion_mapping(model, key_mapping=key_mapping, add_legacy=True)
         if not weight_mapping:
-            logging.warning(f"No conversion mapping found for model type {getattr(model.config, 'model_type', 'unknown')}")
+            logging.warning(
+                f"No conversion mapping found for model type {getattr(model.config, 'model_type', 'unknown')}"
+            )
             return None
 
         # Load the safetensors files
@@ -961,9 +964,6 @@ def _convert_checkpoint_with_transformers(
             with safe_open(sf_path, framework="pt", device="cpu") as f:
                 for key in f.keys():
                     checkpoint_state_dict[key] = f.get_tensor(key)
-
-        # Get model's expected keys
-        model_state_dict = model.state_dict()
 
         # Separate renamings and converters
         renamings = [entry for entry in weight_mapping if isinstance(entry, WeightRenaming)]
@@ -1010,6 +1010,7 @@ def _convert_checkpoint_with_transformers(
     except Exception as e:
         logging.warning(f"Failed to convert checkpoint with transformers: {e}")
         import traceback
+
         traceback.print_exc()
         return None
 
