@@ -24,6 +24,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel import __version__
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.distributed.init_utils import (
@@ -31,7 +32,6 @@ from nemo_automodel.components.distributed.init_utils import (
     get_local_world_size_preinit,
     get_world_size_safe,
 )
-from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code
 from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
@@ -227,7 +227,9 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path):
                 f"""Downloading model weights on {num_nodes} nodes. This incurs high storage usage. 
                 It is recommended to download once with `hf download` and pass in the downloaded path to the `pretrained_model_name_or_path` argument."""
             )
-        with FirstRankPerNode():
+        # Import via module reference (vs bound name) so unit tests can patch
+        # `nemo_automodel.components.distributed.utils.FirstRankPerNode`.
+        with dist_utils.FirstRankPerNode():
             _get_resolved_checkpoint_files(
                 pretrained_model_name_or_path=pretrained_model_name_or_path,
                 subfolder="",
@@ -248,6 +250,14 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path):
                 transformers_explicit_filename=None,
             )
 
+def get_architectures(hf_config):
+    """
+    Get the architectures from the HF config.
+    """
+    architectures = []
+    if hasattr(hf_config, "architectures"):
+        architectures = hf_config.architectures or []
+    return architectures
 
 class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
     """
@@ -277,6 +287,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         if name.startswith("NeMo"):
             cls.__name__ = name[4:]
         model = super().from_pretrained(*args, **kwargs)
+        # Some HF entrypoints (or tests/mocks) may return (model, unused_kwargs).
+        # Our NeMo wrappers always expect a model instance.
+        if isinstance(model, tuple) and len(model) == 2:
+            model, _ = model
         cls.__name__ = name
         return model
 
@@ -286,6 +300,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         if name.startswith("NeMo"):
             cls.__name__ = name[4:]
         model = super().from_config(*args, **kwargs)
+        # Some HF entrypoints (or tests/mocks) may return (model, unused_kwargs).
+        # Our NeMo wrappers always expect a model instance.
+        if isinstance(model, tuple) and len(model) == 2:
+            model, _ = model
         cls.__name__ = name
         return model
 
@@ -377,30 +395,32 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         # 1. if force_hf is True, we will use the parent class to load and return the model as is
         if force_hf:
-            return _BaseNeMoAutoModelClass._from_pretrained_parent_class(
+            return cls._from_pretrained_parent_class(
                 pretrained_model_name_or_path,
                 *model_args,
+                config=hf_config,
                 torch_dtype=torch_dtype,
                 attn_implementation=attn_implementation,
                 **kwargs,
             )
-
+        architectures = get_architectures(hf_config)
         # 2. If we have a custom model implementation available, we prioritize that over HF
-        if hf_config.architectures[0] in ModelRegistry.model_arch_name_to_cls:
+        if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
             # if we are able to init the custom model, we will now download the model weights on local rank 0
             _download_model_weights(hf_config, pretrained_model_name_or_path)
-            logger.info(f"Using custom model implementation for {hf_config.architectures[0]}")
+            logger.info(f"Using custom model implementation for {architectures[0]}")
             kwargs.pop("trust_remote_code", None)
-            return ModelRegistry.model_arch_name_to_cls[hf_config.architectures[0]](hf_config, *model_args, **kwargs)
+            return ModelRegistry.model_arch_name_to_cls[architectures[0]](hf_config, *model_args, **kwargs)
 
         # 3. fallback to parent class
         model = None
         try:
             if quantization_config is not None:
                 kwargs["quantization_config"] = quantization_config
-            model = _BaseNeMoAutoModelClass._from_pretrained_parent_class(
+            model = cls._from_pretrained_parent_class(
                 pretrained_model_name_or_path,
                 *model_args,
+                config=hf_config,
                 torch_dtype=torch_dtype,
                 attn_implementation=attn_implementation,
                 **kwargs,
@@ -522,7 +542,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         # 1. if force_hf is True, we will use the parent class to load and return the model as is
         if force_hf:
-            return _BaseNeMoAutoModelClass._from_config_parent_class(
+            return cls._from_config_parent_class(
                 config,
                 *model_args,
                 torch_dtype=torch_dtype,
@@ -531,15 +551,16 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             )
 
         # 2. If we have a custom model implementation available, we prioritize that over HF
-        if config.architectures[0] in ModelRegistry.model_arch_name_to_cls:
-            raise NotImplementedError("Custom model implementation is not supported for from_config")
+        architectures = get_architectures(config)
+        if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
+            return ModelRegistry.model_arch_name_to_cls[architectures[0]](config, *model_args, **kwargs)
 
         # 3. fallback to parent class
         model = None
         try:
             if quantization_config is not None:
                 kwargs["quantization_config"] = quantization_config
-            model = _BaseNeMoAutoModelClass._from_config_parent_class(
+            model = cls._from_config_parent_class(
                 config,
                 *model_args,
                 torch_dtype=torch_dtype,
