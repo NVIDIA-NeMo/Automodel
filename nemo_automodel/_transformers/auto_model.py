@@ -289,10 +289,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         if name.startswith("NeMo"):
             cls.__name__ = name[4:]
         model = super().from_pretrained(*args, **kwargs)
-        # Some HF entrypoints (or tests/mocks) may return (model, unused_kwargs).
-        # Our NeMo wrappers always expect a model instance.
-        if isinstance(model, tuple) and len(model) == 2:
-            model, _ = model
         cls.__name__ = name
         return model
 
@@ -302,10 +298,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         if name.startswith("NeMo"):
             cls.__name__ = name[4:]
         model = super().from_config(*args, **kwargs)
-        # Some HF entrypoints (or tests/mocks) may return (model, unused_kwargs).
-        # Our NeMo wrappers always expect a model instance.
-        if isinstance(model, tuple) and len(model) == 2:
-            model, _ = model
         cls.__name__ = name
         return model
 
