@@ -244,6 +244,9 @@ def build_model_and_optimizer(
         loss_fn = MaskedCrossEntropy()
 
     if autopipeline is not None:
+        trainable_params, total_params = print_trainable_parameters(model)
+        param_info["trainable_params"] = trainable_params
+        param_info["total_params"] = total_params
         if get_world_size_safe() == 1:
             logger.info("World size is 1, skipping autopipeline.")
         else:
@@ -343,9 +346,10 @@ def build_model_and_optimizer(
         optimizer = [cfg_opt.instantiate(params=trainable_params)]
 
     # Print trainable parameters after model has been moved to device
-    trainable_params, total_params = print_trainable_parameters(model)
-    param_info["trainable_params"] = trainable_params
-    param_info["total_params"] = total_params
+    if autopipeline is None:
+        trainable_params, total_params = print_trainable_parameters(model)
+        param_info["trainable_params"] = trainable_params
+        param_info["total_params"] = total_params
 
     return model, state_dict_keys, optimizer, loss_fn, param_info
 
