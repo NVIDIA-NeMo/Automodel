@@ -268,6 +268,7 @@ def patch_linear_module(
     lora_A_init_method="xavier",
     lora_dtype=None,
     use_triton=True,
+    layer_name=None,
 ):
     """
     Monkey-patches a nn.Linear (orig_linear param) to be a LinearLoRA.
@@ -321,6 +322,8 @@ def patch_linear_module(
         orig_linear.super_fwd = orig_linear.forward
 
     orig_linear.__class__ = new_cls
+    if layer_name is not None:
+        orig_linear._layer_name = layer_name
     return orig_linear
 
 
@@ -382,6 +385,7 @@ def apply_lora_to_linear_modules(
                 lora_A_init_method=peft_config.lora_A_init,
                 lora_dtype=lora_dtype,
                 use_triton=peft_config.use_triton,
+                layer_name=name,
             )
 
     return num_modules_matched

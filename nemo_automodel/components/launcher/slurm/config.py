@@ -71,6 +71,7 @@ class SlurmConfig:
     # User command
     command: str = field(default="", metadata=dict(help="Shell command(s) to run inside container"))
     chdir: str = field(default=None, metadata=dict(help="Working directory of the job"))
+    nsys_enabled: bool = field(default=False, metadata=dict(help="Enable nsys profiling"))
 
     def __post_init__(self):
         if isinstance(self.extra_mounts, list):

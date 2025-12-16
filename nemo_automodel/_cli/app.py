@@ -42,6 +42,24 @@ logging.getLogger().setLevel(logging.INFO)
 #         ├── ...
 #         └── qwen2_5_vl_3b_rdr.yaml
 
+COMMAND_ALIASES = {"finetune": "train_ft", "pretrain": "train_ft", "benchmark": "benchmark"}
+
+
+def get_recipe_script_path(command: str, domain: str, repo_root: str | Path) -> str:
+    """
+    Get the script path for a given command and domain.
+
+    Args:
+        command: The command name (e.g., 'finetune', 'benchmark', 'pretrain')
+        domain: The domain (e.g., 'llm', 'vlm')
+        repo_root: The repository root path
+
+    Returns:
+        str: Full path to the recipe script
+    """
+    recipe_name = COMMAND_ALIASES.get(command, command)
+    return f"{repo_root}/nemo_automodel/recipes/{domain}/{recipe_name}.py"
+
 
 def load_function(file_path: str | Path, func_name: str):
     """
@@ -135,16 +153,36 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config, extra_args=Non
     if slurm_config.get("job_name", "") == "":
         slurm_config["job_name"] = f"{args.domain}_{args.command}"
 
+    # Get the recipe script path
+    script_path = get_recipe_script_path(args.command, args.domain, repo_root)
+
+    # Build nsys profile command if enabled
+    if slurm_config.get("nsys_enabled", False):
+        profile_cmd = (
+            f"nsys profile -s none "
+            f"--trace=cuda,cudnn,nvtx "
+            f"--cudabacktrace=all "
+            f"--cuda-graph-trace=node "
+            f"--python-backtrace=cuda "
+            f"--wait all "
+            f"-o {job_dir}/automodel_profile_%p.nsys-rep "
+            f"--force-overwrite true "
+            f"--capture-range=cudaProfilerApi "
+            f"--capture-range-end=stop "
+        )
+    else:
+        profile_cmd = ""
+
     # create the command
     command_parts = [
         f"PYTHONPATH={repo_root}:$PYTHONPATH",
         # Use torchrun to launch multiple processes instead
-        "uv sync --inexact --frozen $(cat /opt/uv_args.txt) && uv run --no-sync torchrun ",
+        f"uv sync --inexact --frozen $(cat /opt/uv_args.txt) && {profile_cmd}uv run --no-sync torchrun ",
         f"--nproc_per_node={slurm_config['ntasks_per_node']} ",
         f"--nnodes={slurm_config['nodes']} ",
         "--rdzv_backend=c10d ",
         f"--rdzv_endpoint=${{MASTER_ADDR}}:${{MASTER_PORT}}",  # noqa: F541
-        f"{repo_root}/examples/{args.domain}_{args.command}/{args.command}.py",
+        script_path,
         "-c",
         f"{job_conf_path}",
     ]
@@ -174,8 +212,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         metavar="<command>",
-        choices=["finetune", "pretrain", "kd"],
-        help="Command within the domain (e.g., finetune, pretrain, kd, etc)",
+        choices=["finetune", "pretrain", "kd", "benchmark"],
+        help="Command within the domain (e.g., finetune, pretrain, kd, benchmark, etc)",
     )
     parser.add_argument(
         "domain",
@@ -229,12 +267,9 @@ def run_interactive(args):
     from torch.distributed.run import determine_local_world_size, get_args_parser
     from torch.distributed.run import run as thrun
 
-    COMMAND_ALIASES = {"finetune": "train_ft", "pretrain": "train_ft"}
-    # remap commands: finetune -> train_ft
-    command = COMMAND_ALIASES.get(args.command, args.command)
     config_path = args.config.resolve()
     repo_root = get_repo_root()
-    script_path = repo_root / "nemo_automodel" / "recipes" / args.domain / f"{command}.py"
+    script_path = Path(get_recipe_script_path(args.command, args.domain, repo_root))
 
     # launch job on this node
     num_devices = determine_local_world_size(nproc_per_node="gpu")
