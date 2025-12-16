@@ -20,7 +20,7 @@ when loading models. It primarily uses the transformers library's conversion_map
 module which handles both key renaming and tensor operations (merging/splitting).
 
 For MoE models, the conversion handles:
-- Key renaming from checkpoint format (e.g., block_sparse_moe.experts.X.w1) to 
+- Key renaming from checkpoint format (e.g., block_sparse_moe.experts.X.w1) to
   model format (e.g., mlp.experts.gate_up_proj)
 - Tensor merging for grouped expert formats (individual experts -> single 3D tensor)
 
@@ -41,6 +41,8 @@ _TRANSFORMERS_AVAILABLE = False
 try:
     from transformers.conversion_mapping import (
         get_checkpoint_conversion_mapping as _transformers_get_checkpoint_conversion_mapping,
+    )
+    from transformers.conversion_mapping import (
         get_model_conversion_mapping as _transformers_get_model_conversion_mapping,
     )
     from transformers.core_model_loading import WeightConverter, WeightRenaming
@@ -100,8 +102,8 @@ def get_checkpoint_conversion_mapping(model_type: str) -> Optional[list]:
     """
     Get the checkpoint conversion mapping for a given model type.
 
-    This returns a list of WeightConverter and/or WeightRenaming objects from 
-    transformers that define how to convert checkpoint keys and tensors to 
+    This returns a list of WeightConverter and/or WeightRenaming objects from
+    transformers that define how to convert checkpoint keys and tensors to
     model state dict format.
 
     Args:
@@ -113,7 +115,7 @@ def get_checkpoint_conversion_mapping(model_type: str) -> Optional[list]:
 
     Example:
         >>> mapping = get_checkpoint_conversion_mapping("mixtral")
-        >>> # Returns list with WeightRenaming for gate and WeightConverter 
+        >>> # Returns list with WeightRenaming for gate and WeightConverter
         >>> # for merging individual expert weights into grouped format
     """
     if not _TRANSFORMERS_AVAILABLE:
@@ -183,7 +185,7 @@ def get_combined_key_mapping(
                           `_checkpoint_conversion_mapping` attribute
 
     Returns:
-        Combined key mapping dictionary (regex pattern -> replacement), 
+        Combined key mapping dictionary (regex pattern -> replacement),
         or None if no mappings are defined.
     """
     result = {}
