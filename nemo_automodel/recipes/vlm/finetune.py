@@ -755,7 +755,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
             labels = batch.pop("labels")
 
             train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
-            with train_ctx(), get_sync_ctx(self.model, i == num_batches - 1):
+            with (
+                train_ctx(),
+                get_sync_ctx(
+                    self.model,
+                    i == num_batches - 1,
+                    defer_fsdp_grad_sync=getattr(self.model_wrapper, "defer_fsdp_grad_sync", True),
+                ),
+            ):
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
                     out = self.model(logits_to_keep=1, **batch)
