@@ -58,8 +58,9 @@ jobs:
           uv sync --link-mode copy --locked --group linting
 
       - name: Run ruff
+        env:
+          UV_PROJECT_ENVIRONMENT: ./venv
         run: |
-          source ./venv/bin/activate
           uv run ruff check . --verbose
           uv run ruff format --check . --verbose
 
@@ -88,8 +89,9 @@ jobs:
           uv sync --link-mode copy --locked --group linting
 
       - name: Run import-linter
+        env:
+          UV_PROJECT_ENVIRONMENT: ./venv
         run: |
-          source ./venv/bin/activate
           uv run lint-imports --debug --verbose --no-cache
 
   Nemo_Linting_Test:
