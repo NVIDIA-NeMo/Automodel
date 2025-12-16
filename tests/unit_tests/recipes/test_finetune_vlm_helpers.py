@@ -228,6 +228,7 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
     recipe.cfg = _Cfg(fp8=None)
     recipe.lr_scheduler = None
     recipe.timestamp = 0.0
+    recipe.model_wrapper = None
 
     recipe._dp_allreduce = lambda tensor, include_cp=False: tensor
     recipe._get_dp_group_size = lambda include_cp=True: 1
@@ -251,7 +252,7 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
     )
     monkeypatch.setattr(
         "nemo_automodel.recipes.vlm.finetune.get_sync_ctx",
-        lambda model, is_last: nullcontext(),
+        lambda model, is_last, defer_fsdp_grad_sync=True: nullcontext(),
     )
 
     calculate_mock = MagicMock(side_effect=fake_calculate_loss)
