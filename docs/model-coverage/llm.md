@@ -53,6 +53,8 @@ The table below lists the main architectures we test against (FSDP2 combined wit
 | `MistralForCausalLM`                  | Mistral, Mistral‑Instruct             | `mistralai/Mistral-7B-v0.1`, `mistralai/Mistral-7B-Instruct-v0.1` etc.            |
 | `MixtralForCausalLM`                  | Mixtral‑8x7B, Mixtral‑8x7B‑Instruct   | `mistralai/Mixtral-8x7B-v0.1`, `mistralai/Mixtral-8x7B-Instruct-v0.1` etc.        |
 | `NemotronForCausalLM`                 | Nemotron‑3, Nemotron‑4, Minitron      | `nvidia/Minitron-8B-Base` etc.                                                    |
+| `NemotronHForCausalLM`                | Nemotron-Nano-{9B,12B}                | `nvidia/NVIDIA-Nemotron-Nano-9B-v2`, `nvidia/NVIDIA-Nemotron-Nano-12B-v2` |
+| `NemotronHForCausalLM`                | Nemotron-3-Nano-30B-A3B-BF16                | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` |
 | `OLMoForCausalLM`                     | OLMo                                  | `allenai/OLMo-1B-hf`, `allenai/OLMo-7B-hf` etc.                                   |
 | `OLMo2ForCausalLM`                    | OLMo2                                 | `allenai/OLMo2-7B-1124` etc.                                                      |
 | `OLMoEForCausalLM`                    | OLMoE                                 | `allenai/OLMoE-1B-7B-0924`, `allenai/OLMoE-1B-7B-0924-Instruct` etc.              |
@@ -67,8 +69,8 @@ The table below lists the main architectures we test against (FSDP2 combined wit
 | `StableLmForCausalLM`                 | StableLM                              | `stabilityai/stablelm-3b-4e1t`, `stabilityai/stablelm-base-alpha-7b-v2` etc.      |
 | `Starcoder2ForCausalLM`               | Starcoder2                            | `bigcode/starcoder2-3b`, `bigcode/starcoder2-7b`, `bigcode/starcoder2-15b` etc.   |
 | `SolarForCausalLM`                    | Solar Pro                             | `upstage/solar-pro-preview-instruct` etc.                                          |
-
-
+| `Mistral3ForConditionalGeneration`    | Ministral3 3B, 8B, 14B                | `mistralai/Ministral-3-8B-Instruct-2512`, `mistralai/Ministral-3-3B-Instruct-2512`, `mistralai/Ministral-3-14B-Instruct-2512` |
+| `Mistral3ForConditionalGeneration`    | Devstral-Small-2-24B                | `mistralai/Devstral-Small-2-24B-Instruct-2512` |
 
 
 ## Fine-Tuning LLMs with NeMo Automodel
