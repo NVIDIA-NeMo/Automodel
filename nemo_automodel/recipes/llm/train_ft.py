@@ -231,10 +231,9 @@ def build_model_and_optimizer(
                     param.requires_grad_(True)
             logging.info(f"Unfroze parameters matching: {unfreeze_modules}")
 
-    trainable_params, total_params = print_trainable_parameters(model)
     param_info = {
-        "trainable_params": trainable_params,
-        "total_params": total_params,
+        "trainable_params": 0,
+        "total_params": 0,
     }
 
     # hold a list copy of the model state dict keys before any parallelization
@@ -245,6 +244,9 @@ def build_model_and_optimizer(
         loss_fn = MaskedCrossEntropy()
 
     if autopipeline is not None:
+        trainable_params, total_params = print_trainable_parameters(model)
+        param_info["trainable_params"] = trainable_params
+        param_info["total_params"] = total_params
         if get_world_size_safe() == 1:
             logger.info("World size is 1, skipping autopipeline.")
         else:
@@ -302,6 +304,10 @@ def build_model_and_optimizer(
 
                 model, optimizer = model_wrapper.parallelize(model, optimizer)
 
+                trainable_params, total_params = print_trainable_parameters(model)
+                param_info["trainable_params"] = trainable_params
+                param_info["total_params"] = total_params
+
                 return model, state_dict_keys, [optimizer], loss_fn, param_info
 
             else:
@@ -341,6 +347,12 @@ def build_model_and_optimizer(
         trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         optimizer = [cfg_opt.instantiate(params=trainable_params)]
+
+    # Print trainable parameters after model has been moved to device
+    if autopipeline is None:
+        trainable_params, total_params = print_trainable_parameters(model)
+        param_info["trainable_params"] = trainable_params
+        param_info["total_params"] = total_params
 
     return model, state_dict_keys, optimizer, loss_fn, param_info
 
