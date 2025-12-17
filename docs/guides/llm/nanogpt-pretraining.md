@@ -37,14 +37,28 @@ You can run this guide with a single GPU by changing the config.
 
 ## Pre-process the FineWeb Dataset
 
+::::{warning}
+**File Size Limitation**: The `nanogpt_data_processor.py` script has a **4GB file size limit** (~2^32 bytes) due to 32-bit position tracking in the BOS index. This translates to:
+- **~2 billion tokens** when using uint16 (vocabularies < 65,536 tokens, e.g., GPT-2)
+- **~1 billion tokens** when using uint32 (larger vocabularies)
+
+Always use the `--max-tokens` flag to stay within these limits (e.g., `--max-tokens 2B` or `--max-tokens 1.5B`).
+
+For larger datasets, please see [pretraining.md](pretraining.md) which supports sharded preprocessing without these constraints.
+::::
+
 ### Quick Intro to the FineWeb Dataset
-The [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) dataset consists of more than 18.5T tokens (originally 15T tokens) of cleaned and deduplicated English web data from [CommonCrawl](https://commoncrawl.org/). The data processing pipeline is optimized for LLM performance and runs on the datatrove library, our large-scale data processing library.
+The [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) dataset consists of more than 18.5T tokens of cleaned and deduplicated English web data from [CommonCrawl](https://commoncrawl.org/). For this guide, we use the **`sample-10BT` subset** (10 billion tokens), from which we extract a smaller sample (e.g., 500M tokens) that fits within the preprocessing tool's limits.
 
 Briefly, FineWeb is built by extracting main text from CommonCrawl WARC HTML, keeping English pages via fastText language scoring, applying multiple quality filters (e.g., Gopher repetition/quality checks, C4-style rules, and custom heuristics for list-like or repeated/poorly formatted lines), and then MinHash-deduplicating each crawl independently (5-gram shingling with 14×8 hash functions). Basic PII normalization is applied (e.g., anonymizing emails and public IPs). The result is released per-crawl (and convenient sampled subsets), ready for high-throughput streaming.
 
+:::tip
+To train on more than 2B tokens from FineWeb, see [pretraining.md](pretraining.md) which uses Megatron-Core's sharded dataset format without file size constraints.
+:::
+
 ### Pre-processing and Tokenization
 
-For the purposes of this guide, we provide a data preprocessing tool at [`nanogpt_data_processor.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/nanogpt_data_processor.py) that streams datasets from the Hugging Face Hub, tokenizes with GPT-2 BPE (using the [`tiktoken`](https://github.com/openai/tiktoken) library), and writes the output in **memory-mapped binary shards** to files. During training, we use the [`NanogptDataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/nanogpt_dataset.py) class that can stream efficiently at training time.
+For the purposes of this guide, we provide a data preprocessing tool at [`nanogpt_data_processor.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/nanogpt_data_processor.py) that streams datasets from the Hugging Face Hub, tokenizes using Hugging Face's `transformers.AutoTokenizer` (default: GPT-2), and writes the output in **memory-mapped binary shards** to files. During training, we use the [`NanogptDataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/nanogpt_dataset.py) class that can stream efficiently at training time.
 
 
 ```bash
@@ -64,7 +78,7 @@ python tools/nanogpt_data_processor.py \
 **How the preprocessor works:** The script streams data iteratively from the Hugging Face Hub (avoiding loading the entire dataset into memory), uses a multiprocessing pipeline with separate reader and writer processes, and parallelizes tokenization across multiple CPU cores using `ProcessPoolExecutor`. This design enables efficient processing of very large datasets while maintaining low memory overhead. By default, uses the `gpt2` tokenizer, but can support other tokenizers via `--tokenizer` option.
 
 Consider the following options:
-1. Drop the `--max-tokens` flag to stream the **entire** split (tens of billions of tokens).
+1. Adjust `--max-tokens` to control how many tokens to process (must stay within the 4GB file size limit mentioned above).
 2. Adjust `--chunk-size` for processing batch size.
 3. Use `--num-workers` to control parallelization.
 4. Specify `--output-dir` to change the output location.
@@ -376,7 +390,7 @@ Key configuration sections:
 ```yaml
 # Model configuration (two options available)
 model:
-  _target_: nemo_AutoModel.components.models.gpt2.build_gpt2_model
+  _target_: nemo_automodel.components.models.gpt2.build_gpt2_model
   vocab_size: 50258
   n_positions: 2048
   n_embd: 768
@@ -385,20 +399,20 @@ model:
 
 # Dataset configuration
 dataset:
-  _target_: nemo_AutoModel.components.datasets.llm.nanogpt_dataset.NanogptDataset
+  _target_: nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset
   file_pattern: "tools/fineweb_max_tokens_500M/dataset.bin"
   seq_len: 1024
   shuffle_files: true
 
 # Distributed training
 distributed:
-  _target_: nemo_AutoModel.components.distributed.fsdp2.FSDP2Manager
-  dp_size: none
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: null
   tp_size: 1
   cp_size: 1
 ```
 
-**About `_target_` configuration**: The `_target_` field specifies import paths to classes and functions within the nemo_AutoModel repository (or any Python module). For example, `nemo_AutoModel.components.models.gpt2.build_gpt2_model` imports and calls the GPT-2 model builder function. You can also specify paths to your own Python files (e.g., `my_custom_models.MyTransformer`) to use custom `nn.Module` implementations, allowing full flexibility in model architecture while leveraging the training infrastructure.
+**About `_target_` configuration**: The `_target_` field specifies import paths to classes and functions within the nemo_automodel package (or any Python module). For example, `nemo_automodel.components.models.gpt2.build_gpt2_model` imports and calls the GPT-2 model builder function. You can also specify paths to your own Python files (e.g., `my_custom_models.MyTransformer`) to use custom `nn.Module` implementations, allowing full flexibility in model architecture while leveraging the training infrastructure.
 
 Update the `file_pattern` to match your data location. For example, if using `tools/nanogpt_data_processor.py` with the default settings: `"tools/fineweb_max_tokens_500M/dataset.bin"`
 
@@ -423,8 +437,7 @@ torchrun --standalone --nproc-per-node 8 \
 automodel pretrain llm -c examples/llm_pretrain/nanogpt_pretrain.yaml
 
 # multi-GPU (automodel CLI + torchrun on 8 GPUs)
-automodel --nproc-per-node 8 \
-  $(which AutoModel) pretrain llm \
+automodel --nproc-per-node 8 pretrain llm \
   -c examples/llm_pretrain/nanogpt_pretrain.yaml
 ```
 :::tip
