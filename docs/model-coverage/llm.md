@@ -67,7 +67,8 @@ The table below lists the main architectures we test against (FSDP2 combined wit
 | `StableLmForCausalLM`                 | StableLM                              | `stabilityai/stablelm-3b-4e1t`, `stabilityai/stablelm-base-alpha-7b-v2` etc.      |
 | `Starcoder2ForCausalLM`               | Starcoder2                            | `bigcode/starcoder2-3b`, `bigcode/starcoder2-7b`, `bigcode/starcoder2-15b` etc.   |
 | `SolarForCausalLM`                    | Solar Pro                             | `upstage/solar-pro-preview-instruct` etc.                                          |
-
+| `Mistral3ForConditionalGeneration`    | Ministral3 3B, 8B, 14B                | `mistralai/Ministral-3-8B-Instruct-2512`, `mistralai/Ministral-3-3B-Instruct-2512`, `mistralai/Ministral-3-14B-Instruct-2512` |
+| `Mistral3ForConditionalGeneration`    | Devstral-Small-2-24B                | `mistralai/Devstral-Small-2-24B-Instruct-2512` |
 
 
 
