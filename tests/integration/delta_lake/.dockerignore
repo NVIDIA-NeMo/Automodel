@@ -1,5 +1,0 @@
-# Ignore everything except what we need
-*
-!test_delta_lake.py
-!delta_lake_dataset.py
-
