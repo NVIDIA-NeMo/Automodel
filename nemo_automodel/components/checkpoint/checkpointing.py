@@ -47,7 +47,6 @@ from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
 
 if TYPE_CHECKING:
     from peft import PeftConfig
-
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 
@@ -928,7 +927,6 @@ def _convert_checkpoint_with_transformers(
         from copy import deepcopy
 
         from safetensors import safe_open
-
         from transformers.conversion_mapping import get_model_conversion_mapping
         from transformers.core_model_loading import (
             WeightConverter,
