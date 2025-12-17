@@ -87,10 +87,8 @@ def _convert_tool_calls(raw_calls: List[Dict], example_id: Optional[int] = None)
         if not name:
             logger.warning("Skipping call without name: %s", call)
             continue
-        arguments_raw = call.get("arguments", "")
+        arguments = call.get("arguments", "")
 
-        # Dataset stores arguments as JSON string; pass through.
-        arguments = arguments_raw
         call_id = f"call_{example_id}_{idx}" if example_id is not None else f"call_{idx}"
         tool_calls.append(
             {
@@ -184,7 +182,5 @@ def make_xlam_dataset(
     return dataset.map(
         fmt_fn,
         batched=False,
-        load_from_cache_file=False,
         remove_columns=["id", "query", "answers", "tools"],
     )
-
