@@ -37,7 +37,7 @@ from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from transformers.models.mistral3.configuration_mistral3 import Mistral3Config as HFMistral3Config
 from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditionalGeneration
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
+from transformers.utils import TransformersKwargs, can_return_tuple, logging
 
 logger = logging.get_logger(__name__)
 
@@ -160,7 +160,6 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-@auto_docstring
 class Ministral3PreTrainedModel(PreTrainedModel):
     config: Ministral3Config
     base_model_prefix = "model"
@@ -177,21 +176,11 @@ class Ministral3PreTrainedModel(PreTrainedModel):
 
 
 @dataclass
-@auto_docstring(
-    custom_intro="""
-    Base class for Ministral3 outputs, with hidden states and attentions.
-    """
-)
 class Ministral3ModelOutputWithPast(BaseModelOutputWithPast):
     image_hidden_states: Optional[torch.FloatTensor] = None
 
 
 @dataclass
-@auto_docstring(
-    custom_intro="""
-    Base class for Ministral3 causal language model outputs.
-    """
-)
 class Ministral3CausalLMOutputWithPast(CausalLMOutputWithPast):
     pass
 
@@ -433,7 +422,6 @@ class Ministral3DecoderLayer(GradientCheckpointingLayer):
         return hidden_states
 
 
-@auto_docstring
 class Ministral3Model(Ministral3PreTrainedModel):
     def __init__(self, config: Ministral3Config):
         super().__init__(config)
@@ -451,7 +439,6 @@ class Ministral3Model(Ministral3PreTrainedModel):
         self.post_init()
 
     @can_return_tuple
-    @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -512,7 +499,6 @@ class Ministral3Model(Ministral3PreTrainedModel):
         )
 
 
-@auto_docstring
 class Ministral3ForCausalLM(Ministral3PreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
@@ -526,7 +512,6 @@ class Ministral3ForCausalLM(Ministral3PreTrainedModel, GenerationMixin):
         self.post_init()
 
     @can_return_tuple
-    @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
