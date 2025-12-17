@@ -38,9 +38,26 @@ from transformers.utils.generic import is_torch_tensor
 from transformers.utils.hub import PushToHubMixin
 from transformers.utils.import_utils import is_mistral_common_available, is_torch_available, requires
 
+
+class ValidationMode(Enum):
+    r"""Enum for the validation mode.
+
+    Attributes:
+        serving: The serving mode.
+        finetuning: The finetuning mode.
+        test: The test mode.
+
+    Examples:
+        >>> mode = ValidationMode.serving
+    """
+
+    serving = "serving"
+    finetuning = "finetuning"
+    test = "test"
+
+
 if is_mistral_common_available():
     from mistral_common.protocol.instruct.request import ChatCompletionRequest
-    from mistral_common.protocol.instruct.validator import ValidationMode
     from mistral_common.tokens.tokenizers.base import SpecialTokenPolicy, TokenizerVersion
     from mistral_common.tokens.tokenizers.image import MultiModalVersion
     from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
