@@ -16,7 +16,14 @@ from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import BatchEncoding
 
 
-class NeMoAutoTokenizer:
+class AutoTokenizerWithBosEosEnforced(AutoTokenizer):
+    """
+    A wrapper around HuggingFace's AutoTokenizer that ensures consistent BOS/EOS token handling.
+
+    There are pre-existing issues with some tokenizers (e.g. GPT2Tokenizer) where the BOS/EOS tokens
+    are not added automatically. This wrapper ensures they are always added when requested.
+    """
+
     @classmethod
     def from_pretrained(
         cls, pretrained_model_name_or_path, *args, force_hf=False, add_bos_token=True, add_eos_token=True, **kwargs
@@ -24,9 +31,13 @@ class NeMoAutoTokenizer:
         """
         Load the HF tokenizer class via AutoTokenizer and (optionally) wrap it to add BOS/EOS.
 
-        There are pre-existing issues with some tokenizers (e.g. GPT2Tokenizer) where the BOS/EOS tokens are not added
+        Args:
+            pretrained_model_name_or_path: Model identifier or path
+            force_hf: If True, return the raw HF tokenizer without wrapping
+            add_bos_token: Whether to add BOS token (default: True)
+            add_eos_token: Whether to add EOS token (default: True)
         """
-        hf_tok = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        hf_tok = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
         if force_hf:
             return hf_tok
 
