@@ -195,7 +195,7 @@ Below is the configuration from `examples/llm_pretrain/megatron_pretrain_gpt2.ya
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm_pretrain/pretrain.py --config recipes/llm_pretrain/megatron_pretrain.yaml
+# torchrun --nproc-per-node=8 examples/llm_pretrain/pretrain.py --config examples/llm_pretrain/megatron_pretrain_gpt2.yaml
 # Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
 # The model section is responsible for configuring the model we want to finetune.
@@ -215,11 +215,16 @@ dataset:
   paths: fineweb_edu/megatron_gpt2/processed_data_*_text_document*  # REPLACE THIS
   index_mapping_dir: fineweb_edu/megatron_gpt2/mapping_dir  # REPLACE THIS
   tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: openai-community/gpt2
   seq_length: 1024
   split: "0.99, 0.01, 0.00"  # train, validation, test
   splits_to_build: "train"  # has to be one of train, validation, test
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: torch.utils.data.default_collate
+  dataloader_type: "single"  # or "cyclic"
 
 # Similarly, for validation we use the "validation" split
 validation_dataset:
@@ -227,7 +232,7 @@ validation_dataset:
   paths: fineweb_edu/megatron_gpt2/processed_data_*_text_document*  # REPLACE THIS
   index_mapping_dir: fineweb_edu/megatron_gpt2/mapping_dir  # REPLACE THIS
   tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: openai-community/gpt2
   seq_length: 1024
   split: "0.99, 0.01, 0.00"  # train, validation, test
@@ -257,7 +262,7 @@ checkpoint:
   model_save_format: torch_save # torch_save or safetensors
   save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
-# For distributed processing, we will FSDP2.
+# For distributed processing, we use FSDP2.
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: none
