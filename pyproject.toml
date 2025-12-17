@@ -94,6 +94,15 @@ dependencies = [
 [project.optional-dependencies]
 cuda = ["flash-attn<=2.8.3", "transformer-engine[pytorch]==2.8.0"]
 extra = ["flash-linear-attention", "perceptron", "sentencepiece"]
+delta = [
+    "duckdb>=1.0.0",  # DuckDB supports deletion vectors (Databricks 15.4+)
+    "deltalake>=1.0.0",  # For basic Delta Lake operations
+]
+delta-databricks = [
+    "duckdb>=1.0.0",  # DuckDB supports deletion vectors
+    "deltalake>=1.0.0",  # For Delta Lake metadata
+    "databricks-sql-connector>=3.0.0",  # For Unity Catalog streaming access
+]
 vlm = [
     "pillow",
     "qwen-vl-utils[decord]; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
@@ -107,6 +116,7 @@ vlm = [
     "albumentations"
 ]
 all = [
+    "nemo_automodel[delta]",
     "nemo_automodel[extra]",
     "nemo_automodel[vlm]",
 ]
