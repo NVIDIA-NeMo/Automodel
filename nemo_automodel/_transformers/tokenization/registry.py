@@ -18,7 +18,6 @@ from typing import Callable, Dict, Type, Union
 
 from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import AutoTokenizerWithBosEosEnforced
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -88,4 +87,3 @@ _register_default_tokenizers()
 __all__ = [
     "TokenizerRegistry",
 ]
-

@@ -1,3 +1,4 @@
+# Permalink: https://github.com/huggingface/transformers/blob/dd24a80666b72c85f02c6cf9df18164cc174ab74/src/transformers/tokenization_mistral_common.py#L1
 # Copyright 2025 Mistral AI and The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +23,6 @@ from typing import Any, Union, overload
 
 import numpy as np
 from huggingface_hub import create_repo
-
 from transformers.audio_utils import load_audio_as
 from transformers.tokenization_utils_base import (
     LARGE_INTEGER,
@@ -37,7 +37,6 @@ from transformers.utils import PaddingStrategy, TensorType, add_end_docstrings, 
 from transformers.utils.generic import is_torch_tensor
 from transformers.utils.hub import PushToHubMixin
 from transformers.utils.import_utils import is_mistral_common_available, is_torch_available, requires
-
 
 if is_mistral_common_available():
     from mistral_common.protocol.instruct.request import ChatCompletionRequest
@@ -400,9 +399,7 @@ class MistralCommonBackend(PushToHubMixin):
             vocab = self.tokenizer.instruct_tokenizer.tokenizer.vocab()
             self._cache_get_vocab = {token: self._piece_to_id(token, False) for token in vocab}
             # Order the dict.
-            self._cache_get_vocab = dict(
-                sorted(((k, v) for k, v in self._cache_get_vocab.items()), key=lambda x: x[1])
-            )
+            self._cache_get_vocab = dict(sorted(((k, v) for k, v in self._cache_get_vocab.items()), key=lambda x: x[1]))
         return self._cache_get_vocab
 
     def __len__(self):
@@ -1017,9 +1014,7 @@ class MistralCommonBackend(PushToHubMixin):
         if return_length:
             encoded_inputs["length"] = len(encoded_inputs["input_ids"])
 
-        batch_outputs = BatchEncoding(
-            encoded_inputs, tensor_type=return_tensors, prepend_batch_axis=prepend_batch_axis
-        )
+        batch_outputs = BatchEncoding(encoded_inputs, tensor_type=return_tensors, prepend_batch_axis=prepend_batch_axis)
 
         return batch_outputs
 
