@@ -23,6 +23,7 @@ import torch.nn as nn
 from torch.utils.data import IterableDataset
 from types import SimpleNamespace
 from contextlib import AbstractContextManager
+from unittest.mock import MagicMock
 
 
 class DummyIterableDataset(IterableDataset):  # noqa: D401
@@ -429,3 +430,118 @@ def test_force_hf_true_disables_meta_init(monkeypatch):
     # Assert meta-init contexts were NOT entered
     assert flags["init_empty_entered"] is False
     assert flags["no_init_entered"] is False
+
+
+# -----------------
+# NVTX flag tests
+# -----------------
+def _minimal_cfg_with_nvtx(nvtx_value: bool):
+    """Helper to build a minimal ConfigNode for nvtx tests."""
+    return ConfigNode(
+        {
+            "nvtx": nvtx_value,
+            "model": {},
+            "dataloader": {},
+            "dataset": {},
+            "validation_dataloader": {},
+            "step_scheduler": {"local_batch_size": 1, "global_batch_size": 1},
+            "optimizer": {},
+            "loss_fn": {},
+            "checkpoint": {"best_metric_key": "default"},
+            "distributed": {"cp_size": 1},
+        }
+    )
+
+
+def _patch_setup_minimals(monkeypatch, patch_mock: MagicMock):
+    """Patch heavy dependencies so TrainFinetuneRecipeForNextTokenPrediction.setup runs lightly."""
+    # Lightweight distributed/env/logging
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.build_distributed",
+        lambda cfg: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
+    )
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.apply_cache_compatibility_patches", lambda: None)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.StatefulRNG", lambda *a, **k: "rng")
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_loss_fn", lambda cfg: "loss_fn")
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.build_checkpoint_config",
+        lambda *a, **k: SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None),
+    )
+
+    # Stub Checkpointer
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.Checkpointer",
+        lambda **kwargs: SimpleNamespace(
+            config=kwargs["config"],
+            load_base_model=lambda *a, **k: None,
+            maybe_wait_for_staging=lambda: None,
+            close=lambda: None,
+        ),
+    )
+
+    # Stub model/optimizer creation
+    dummy_model = DummyModel()
+    dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.build_model_and_optimizer",
+        lambda *a, **k: (dummy_model, ["w"], [dummy_opt], "loss_fn", {"trainable_params": 1, "total_params": 1}),
+    )
+
+    # Data-related stubs
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_dataloader", lambda *a, **k: ("dl", "tok"))
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_validation_dataloader", lambda *a, **k: {})
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.build_step_scheduler",
+        lambda *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[]),
+    )
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_lr_scheduler", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.build_metric_logger",
+        lambda *a, **k: SimpleNamespace(log=lambda *a, **k: None, close=lambda: None),
+    )
+
+    # No-op logging helpers
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._log_experiment_details", lambda self: None)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._log_library_versions", lambda self: None)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._log_model_and_optimizer_details", lambda *a, **k: None)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._setup_qat", lambda *a, **k: (None, None, None))
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction.load_checkpoint", lambda *a, **k: None)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._log_step_scheduler_details", lambda *a, **k: None)
+
+    # Avoid CUDA calls
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.torch.cuda.reset_peak_memory_stats", lambda: None)
+
+    # Make group/rank helpers trivial
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._get_dp_rank", lambda self, include_cp=False: 0)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._get_dp_group_size", lambda self, include_cp=False: 1)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._get_cp_group_size", lambda self: 1)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._get_tp_rank", lambda self: 0)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._get_pp_rank", lambda self: 0)
+
+    # Capture NVTX patch usage
+    monkeypatch.setattr("nemo_automodel.autonvtx.patch", patch_mock)
+
+
+def test_nvtx_true_enables_patching(monkeypatch):
+    cfg = _minimal_cfg_with_nvtx(nvtx_value=True)
+    patch_mock = MagicMock()
+    _patch_setup_minimals(monkeypatch, patch_mock)
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+
+    assert trainer.enable_nvtx is True
+    patch_mock.assert_called_once()
+
+
+def test_nvtx_false_skips_patching(monkeypatch):
+    cfg = _minimal_cfg_with_nvtx(nvtx_value=False)
+    patch_mock = MagicMock()
+    _patch_setup_minimals(monkeypatch, patch_mock)
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+
+    assert trainer.enable_nvtx is False
+    patch_mock.assert_not_called()
