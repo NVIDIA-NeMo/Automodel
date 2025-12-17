@@ -34,6 +34,7 @@ from transformers import (
 from transformers.modeling_utils import _get_resolved_checkpoint_files
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
+import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel import __version__
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.distributed.init_utils import (
@@ -216,6 +217,50 @@ def _verify_sdpa_support(model, is_hf_model, cp_size):
             raise ValueError("Model does not support SDPA required for context parallelism")
 
 
+def _download_model_weights(hf_config, pretrained_model_name_or_path):
+    if (not dist.is_initialized() or get_local_rank_preinit() == 0) and not os.path.isdir(
+        pretrained_model_name_or_path
+    ):
+        num_nodes = (get_world_size_safe() % get_local_world_size_preinit()) + 1  # 1-indexed
+        if num_nodes > 1:
+            logging.info(
+                f"""Downloading model weights on {num_nodes} nodes. This incurs high storage usage. 
+                It is recommended to download once with `hf download` and pass in the downloaded path to the `pretrained_model_name_or_path` argument."""
+            )
+        # Import via module reference (vs bound name) so unit tests can patch
+        # `nemo_automodel.components.distributed.utils.FirstRankPerNode`.
+        with dist_utils.FirstRankPerNode():
+            _get_resolved_checkpoint_files(
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                subfolder="",
+                variant=None,
+                gguf_file=None,
+                from_tf=False,
+                from_flax=False,
+                use_safetensors=None,
+                cache_dir=None,
+                force_download=False,
+                proxies=None,
+                local_files_only=False,
+                token=None,
+                user_agent={"file_type": "model", "framework": "pytorch", "from_auto_class": False},
+                revision="main",
+                commit_hash=getattr(hf_config, "_commit_hash", None),
+                is_remote_code=False,
+                transformers_explicit_filename=None,
+            )
+
+
+def get_architectures(hf_config):
+    """
+    Get the architectures from the HF config.
+    """
+    architectures = []
+    if hasattr(hf_config, "architectures"):
+        architectures = hf_config.architectures or []
+    return architectures
+
+
 class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
     """
     Drop-in replacement for ``_BaseAutoModelClass`` that includes custom-kernels.
@@ -237,6 +282,24 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
     - Only decoder-style (causal) architectures are currently supported by the
       Liger patch.  Unsupported models will silently fall back.
     """
+
+    @classmethod
+    def _from_pretrained_parent_class(cls, *args, **kwargs):
+        name = cls.__name__
+        if name.startswith("NeMo"):
+            cls.__name__ = name[4:]
+        model = super().from_pretrained(*args, **kwargs)
+        cls.__name__ = name
+        return model
+
+    @classmethod
+    def _from_config_parent_class(cls, *args, **kwargs):
+        name = cls.__name__
+        if name.startswith("NeMo"):
+            cls.__name__ = name[4:]
+        model = super().from_config(*args, **kwargs)
+        cls.__name__ = name
+        return model
 
     @classmethod
     def from_pretrained(
@@ -324,66 +387,36 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 **kwargs,
             )
 
-        # load model
-        model = None
-        try:
-            name = cls.__name__
-            if name.startswith("NeMo"):
-                cls.__name__ = name[4:]
-            if not force_hf:
-                try:
-                    # if we have a custom model implementation available, we prioritize that over HF
-                    if hf_config.architectures[0] in ModelRegistry.model_arch_name_to_cls:
-                        kwargs.pop("trust_remote_code", None)
-                        model = ModelRegistry.model_arch_name_to_cls[hf_config.architectures[0]](
-                            hf_config, *model_args, **kwargs
-                        )
-                        # if we are able to init the custom model, we will now download the model weights on local rank 0
-                        if (not dist.is_initialized() or get_local_rank_preinit() == 0) and not os.path.isdir(
-                            pretrained_model_name_or_path
-                        ):
-                            num_nodes = (get_world_size_safe() % get_local_world_size_preinit()) + 1  # 1-indexed
-                            if num_nodes > 1:
-                                logging.info(
-                                    f"""Downloading model weights on {num_nodes} nodes. This incurs high storage usage. 
-                                    It is recommended to download once with `hf download` and pass in the downloaded path to the `pretrained_model_name_or_path` argument."""
-                                )
-                            _get_resolved_checkpoint_files(
-                                pretrained_model_name_or_path=pretrained_model_name_or_path,
-                                subfolder="",
-                                variant=None,
-                                gguf_file=None,
-                                from_tf=False,
-                                from_flax=False,
-                                use_safetensors=None,
-                                cache_dir=None,
-                                force_download=False,
-                                proxies=None,
-                                local_files_only=False,
-                                token=None,
-                                user_agent={"file_type": "model", "framework": "pytorch", "from_auto_class": False},
-                                revision="main",
-                                commit_hash=getattr(hf_config, "_commit_hash", None),
-                                is_remote_code=False,
-                                transformers_explicit_filename=None,
-                            )
-                        if dist.is_initialized():
-                            dist.barrier()
-                        logger.info(f"Using custom model implementation for {hf_config.architectures[0]}")
-                        return model
-                except Exception as e:
-                    logger.error(f"Failed to use custom model implementation with error: {e}")
-
-            if quantization_config is not None:
-                kwargs["quantization_config"] = quantization_config
-            model = super().from_pretrained(
+        # 1. if force_hf is True, we will use the parent class to load and return the model as is
+        if force_hf:
+            return cls._from_pretrained_parent_class(
                 pretrained_model_name_or_path,
                 *model_args,
                 torch_dtype=torch_dtype,
                 attn_implementation=attn_implementation,
                 **kwargs,
             )
-            cls.__name__ = name
+        architectures = get_architectures(hf_config)
+        # 2. If we have a custom model implementation available, we prioritize that over HF
+        if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
+            # if we are able to init the custom model, we will now download the model weights on local rank 0
+            _download_model_weights(hf_config, pretrained_model_name_or_path)
+            logger.info(f"Using custom model implementation for {architectures[0]}")
+            kwargs.pop("trust_remote_code", None)
+            return ModelRegistry.model_arch_name_to_cls[architectures[0]](hf_config, *model_args, **kwargs)
+
+        # 3. fallback to parent class
+        model = None
+        try:
+            if quantization_config is not None:
+                kwargs["quantization_config"] = quantization_config
+            model = cls._from_pretrained_parent_class(
+                pretrained_model_name_or_path,
+                *model_args,
+                torch_dtype=torch_dtype,
+                attn_implementation=attn_implementation,
+                **kwargs,
+            )
         except ValueError as e:
             if "does not support" in str(e):
                 if model is not None:
@@ -499,35 +532,33 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 **kwargs,
             )
 
-        # load model
-        model = None
-        try:
-            name = cls.__name__
-            if name.startswith("NeMo"):
-                cls.__name__ = name[4:]
-            if not force_hf:
-                try:
-                    # if we have a custom model implementation available, we prioritize that over HF
-                    if config.architectures[0] in ModelRegistry.model_arch_name_to_cls:
-                        kwargs.pop("trust_remote_code", None)
-                        model = ModelRegistry.model_arch_name_to_cls[config.architectures[0]](
-                            config, *model_args, **kwargs
-                        )
-                        logger.info(f"Using custom model implementation for {config.architectures[0]}")
-                        return model
-                except Exception as e:
-                    logger.error(f"Failed to use custom model implementation with error: {e}")
-
-            if quantization_config is not None:
-                kwargs["quantization_config"] = quantization_config
-            model = super().from_config(
+        # 1. if force_hf is True, we will use the parent class to load and return the model as is
+        if force_hf:
+            return cls._from_config_parent_class(
                 config,
                 *model_args,
                 attn_implementation=attn_implementation,
                 torch_dtype=torch_dtype,
                 **kwargs,
             )
-            cls.__name__ = name
+
+        # 2. If we have a custom model implementation available, we prioritize that over HF
+        architectures = get_architectures(config)
+        if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
+            return ModelRegistry.model_arch_name_to_cls[architectures[0]](config, *model_args, **kwargs)
+
+        # 3. fallback to parent class
+        model = None
+        try:
+            if quantization_config is not None:
+                kwargs["quantization_config"] = quantization_config
+            model = cls._from_config_parent_class(
+                config,
+                *model_args,
+                attn_implementation=attn_implementation,
+                torch_dtype=torch_dtype,
+                **kwargs,
+            )
         except ValueError as e:
             if "does not support" in str(e):
                 logging.warning("Falling back to eager attention.")
