@@ -1,0 +1,12 @@
+services:
+  delta-lake-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      # Mount the test script for easy editing
+      - ./test_delta_lake.py:/app/test_delta_lake.py:ro
+    environment:
+      - PYSPARK_PYTHON=python3
+      - PYSPARK_DRIVER_PYTHON=python3
+
