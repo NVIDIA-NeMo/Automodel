@@ -142,7 +142,7 @@ def make_xlam_dataset(
     tokenizer,
     seq_length=None,
     limit_dataset_samples=None,
-    fp8=False,  # parity with other dataset builders
+    fp8=False,
     split="train",
     dataset_name="Salesforce/xlam-function-calling-60k",
     padding=False,
