@@ -20,9 +20,12 @@ from nemo_automodel._transformers.auto_model import (
     NeMoAutoModelForTextToWaveform,
 )
 
+from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
+
 __all__ = [
     "NeMoAutoModelForCausalLM",
     "NeMoAutoModelForImageTextToText",
     "NeMoAutoModelForSequenceClassification",
     "NeMoAutoModelForTextToWaveform",
+    "NeMoAutoTokenizer",
 ]

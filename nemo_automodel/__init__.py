@@ -32,16 +32,19 @@ try:
         NeMoAutoModelForImageTextToText,
         NeMoAutoModelForSequenceClassification,
         NeMoAutoModelForTextToWaveform,
+        NeMoAutoTokenizer,
     )  # noqa: I001
 
     globals()["NeMoAutoModelForCausalLM"] = NeMoAutoModelForCausalLM
     globals()["NeMoAutoModelForImageTextToText"] = NeMoAutoModelForImageTextToText
     globals()["NeMoAutoModelForSequenceClassification"] = NeMoAutoModelForSequenceClassification
     globals()["NeMoAutoModelForTextToWaveform"] = NeMoAutoModelForTextToWaveform
+    globals()["NeMoAutoTokenizer"] = NeMoAutoTokenizer
     __all__.append("NeMoAutoModelForCausalLM")
     __all__.append("NeMoAutoModelForImageTextToText")
     __all__.append("NeMoAutoModelForSequenceClassification")
     __all__.append("NeMoAutoModelForTextToWaveform")
+    __all__.append("NeMoAutoTokenizer")
 except:
     # optional dependency might be missing,
     # leave the name off the module namespace so other imports still work
