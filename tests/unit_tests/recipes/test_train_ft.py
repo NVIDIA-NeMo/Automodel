@@ -501,11 +501,23 @@ def _patch_setup_minimals(monkeypatch, patch_mock: MagicMock):
         lambda *a, **k: SimpleNamespace(log=lambda *a, **k: None, close=lambda: None),
     )
 
-    # No-op logging helpers
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._log_experiment_details", lambda self: None)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._log_library_versions", lambda self: None)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._log_model_and_optimizer_details", lambda *a, **k: None)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._setup_qat", lambda *a, **k: (None, None, None))
+    # No-op logging helpers on the recipe class
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._log_experiment_details",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._log_library_versions",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._log_model_and_optimizer_details",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._setup_qat",
+        lambda *a, **k: (None, None, None),
+    )
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction.load_checkpoint", lambda *a, **k: None)
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._log_step_scheduler_details", lambda *a, **k: None)
 
