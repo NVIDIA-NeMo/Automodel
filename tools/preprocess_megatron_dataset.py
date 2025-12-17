@@ -367,7 +367,9 @@ def main():
 
     # Check parquet availability if needed
     if file_type == "parquet" and not parquet_available:
-        raise Exception("pyarrow library is required for parquet files but is not available. Install with: pip install pyarrow")
+        raise Exception(
+            "pyarrow library is required for parquet files but is not available. Install with: pip install pyarrow"
+        )
 
     # For parquet files, sentence splitting is not supported (text is already in a single column)
     if file_type == "parquet" and args.split_sentences:
