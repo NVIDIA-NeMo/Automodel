@@ -1,4 +1,4 @@
-## Recipes and E2E Examples
+## Recipes and End-to-End Examples
 
 NeMo Automodel is organized around two key concepts: recipes and components.
 
