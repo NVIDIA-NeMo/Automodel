@@ -25,6 +25,7 @@ from nemo_automodel._transformers.auto_model import (
     NeMoAutoModelForCausalLM,
     NeMoAutoModelForImageTextToText,
     _get_next_fallback_attn,
+    _is_distributed_model_init,
     _patch_attention,
 )
 from nemo_automodel import __version__
@@ -1050,3 +1051,528 @@ def test_liger_apply_failure_raises(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Failed to patch model"):
         tgt._patch_liger_kernel(DummyModel())
+
+
+class TestIsDistributedModelInit:
+    """Test cases for _is_distributed_model_init helper function."""
+
+    def test_returns_false_when_both_none(self):
+        """Test that function returns False when both device_mesh and distributed are None."""
+        assert _is_distributed_model_init(None, None) is False
+
+    def test_returns_false_when_distributed_empty_dict(self):
+        """Test that function returns False when distributed is an empty dict."""
+        assert _is_distributed_model_init(None, {}) is False
+
+    def test_returns_true_when_distributed_has_content(self):
+        """Test that function returns True when distributed dict has content."""
+        assert _is_distributed_model_init(None, {"tp_size": 2}) is True
+        assert _is_distributed_model_init(None, {"dp_size": 4, "tp_size": 2}) is True
+
+    def test_returns_true_when_device_mesh_size_greater_than_one(self):
+        """Test that function returns True when device_mesh.size() > 1."""
+        mock_mesh = Mock()
+        mock_mesh.size.return_value = 2
+        assert _is_distributed_model_init(mock_mesh, None) is True
+
+    def test_returns_false_when_device_mesh_size_one(self):
+        """Test that function returns False when device_mesh.size() == 1."""
+        mock_mesh = Mock()
+        mock_mesh.size.return_value = 1
+        assert _is_distributed_model_init(mock_mesh, None) is False
+
+    def test_returns_true_when_both_device_mesh_and_distributed(self):
+        """Test that function returns True when both are provided and valid."""
+        mock_mesh = Mock()
+        mock_mesh.size.return_value = 4
+        assert _is_distributed_model_init(mock_mesh, {"tp_size": 2}) is True
+
+    def test_distributed_non_dict_returns_false(self):
+        """Test that non-dict distributed values return False."""
+        assert _is_distributed_model_init(None, "invalid") is False
+        assert _is_distributed_model_init(None, 123) is False
+        assert _is_distributed_model_init(None, [1, 2, 3]) is False
+
+
+class TestFromPretrainedDistributed:
+    """Test cases for from_pretrained with device_mesh and distributed options."""
+
+    def test_from_pretrained_delegates_to_distributed_when_device_mesh_provided(self):
+        """Test that from_pretrained delegates to from_pretrained_distributed when device_mesh is provided."""
+        mock_mesh = Mock()
+        mock_mesh.size.return_value = 2
+
+        with (
+            patch("nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained") as mock_cfg,
+            patch.object(
+                NeMoAutoModelForCausalLM, "from_pretrained_distributed", return_value=Mock(config={})
+            ) as mock_distributed,
+        ):
+            cfg = Mock()
+            cfg.architectures = ["HFArch"]
+            mock_cfg.return_value = cfg
+
+            NeMoAutoModelForCausalLM.from_pretrained(
+                "dummy/model",
+                device_mesh=mock_mesh,
+            )
+
+            mock_distributed.assert_called_once()
+            call_kwargs = mock_distributed.call_args[1]
+            assert call_kwargs["device_mesh"] is mock_mesh
+
+    def test_from_pretrained_delegates_to_distributed_when_distributed_dict_provided(self):
+        """Test that from_pretrained delegates to from_pretrained_distributed when distributed dict is provided."""
+        distributed_config = {"tp_size": 2, "dp_size": 4}
+
+        with (
+            patch("nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained") as mock_cfg,
+            patch.object(
+                NeMoAutoModelForCausalLM, "from_pretrained_distributed", return_value=Mock(config={})
+            ) as mock_distributed,
+        ):
+            cfg = Mock()
+            cfg.architectures = ["HFArch"]
+            mock_cfg.return_value = cfg
+
+            NeMoAutoModelForCausalLM.from_pretrained(
+                "dummy/model",
+                distributed=distributed_config,
+            )
+
+            mock_distributed.assert_called_once()
+            call_kwargs = mock_distributed.call_args[1]
+            assert call_kwargs["distributed"] == distributed_config
+
+    def test_from_pretrained_distributed_loads_model_with_fsdp2_manager(self):
+        """Test that from_pretrained_distributed creates FSDP2Manager for TP > 1."""
+        mock_mesh = Mock()
+        mock_mesh.size.return_value = 2
+        distributed_config = {"tp_size": 2}
+
+        mock_model = MagicMock()
+        mock_model.config = {}
+        mock_model.state_dict.return_value = {"layer.weight": torch.zeros(10)}
+
+        with (
+            patch("nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained") as mock_cfg,
+            patch("nemo_automodel._transformers.auto_model._get_model_from_nemo_registry", return_value=None),
+            patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", lambda x: x),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda x, y=None: x),
+            patch("nemo_automodel._transformers.auto_model.torch.distributed.is_initialized", return_value=True),
+            patch("nemo_automodel._transformers.auto_model.torch.distributed.get_world_size", return_value=2),
+            patch("nemo_automodel._transformers.auto_model.FSDP2Manager") as mock_fsdp2,
+            patch.object(transformers.AutoModelForCausalLM, "from_pretrained", return_value=mock_model),
+        ):
+            cfg = Mock()
+            cfg.architectures = ["HFArch"]
+            mock_cfg.return_value = cfg
+
+            mock_fsdp2_instance = Mock()
+            mock_fsdp2_instance.parallelize = Mock(return_value=mock_model)
+            mock_fsdp2.return_value = mock_fsdp2_instance
+
+            result = NeMoAutoModelForCausalLM.from_pretrained_distributed(
+                "dummy/model",
+                use_liger_kernel=False,
+                use_sdpa_patching=False,
+                sdpa_method=None,
+                torch_dtype="auto",
+                attn_implementation="eager",
+                quantization_config=None,
+                force_hf=False,
+                device_mesh=mock_mesh,
+                distributed=distributed_config,
+                device=None,
+                move_to_device=False,
+            )
+
+            # FSDP2Manager should be created with the correct parameters
+            mock_fsdp2.assert_called_once()
+            call_kwargs = mock_fsdp2.call_args[1]
+            assert call_kwargs["tp_size"] == 2
+
+    def test_from_pretrained_distributed_loads_model_with_ddp_manager(self):
+        """Test that from_pretrained_distributed creates DDPManager when no TP/CP/PP."""
+        distributed_config = {"dp_size": 2}
+
+        mock_model = MagicMock()
+        mock_model.config = {}
+        mock_model.state_dict.return_value = {"layer.weight": torch.zeros(10)}
+
+        with (
+            patch("nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained") as mock_cfg,
+            patch("nemo_automodel._transformers.auto_model._get_model_from_nemo_registry", return_value=None),
+            patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", lambda x: x),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda x, y=None: x),
+            patch("nemo_automodel._transformers.auto_model.torch.distributed.is_initialized", return_value=True),
+            patch("nemo_automodel._transformers.auto_model.torch.distributed.get_world_size", return_value=2),
+            patch("nemo_automodel._transformers.auto_model.DDPManager") as mock_ddp,
+            patch.object(transformers.AutoModelForCausalLM, "from_pretrained", return_value=mock_model),
+        ):
+            cfg = Mock()
+            cfg.architectures = ["HFArch"]
+            mock_cfg.return_value = cfg
+
+            mock_ddp_instance = Mock()
+            mock_ddp_instance.parallelize = Mock(return_value=mock_model)
+            mock_ddp.return_value = mock_ddp_instance
+
+            result = NeMoAutoModelForCausalLM.from_pretrained_distributed(
+                "dummy/model",
+                use_liger_kernel=False,
+                use_sdpa_patching=False,
+                sdpa_method=None,
+                torch_dtype="auto",
+                attn_implementation="eager",
+                quantization_config=None,
+                force_hf=False,
+                device_mesh=None,
+                distributed=distributed_config,
+                device=None,
+                move_to_device=False,
+            )
+
+            # DDPManager should be created
+            mock_ddp.assert_called_once()
+
+    def test_from_pretrained_distributed_disables_liger_with_tp(self):
+        """Test that Liger kernel is disabled when TP > 1."""
+        distributed_config = {"tp_size": 2}
+
+        mock_model = MagicMock()
+        mock_model.config = {}
+        mock_model.state_dict.return_value = {}
+
+        liger_called = []
+
+        def track_liger(model):
+            liger_called.append(True)
+            return model
+
+        with (
+            patch("nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained") as mock_cfg,
+            patch("nemo_automodel._transformers.auto_model._get_model_from_nemo_registry", return_value=None),
+            patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", track_liger),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda x, y=None: x),
+            patch("nemo_automodel._transformers.auto_model.torch.distributed.is_initialized", return_value=True),
+            patch("nemo_automodel._transformers.auto_model.torch.distributed.get_world_size", return_value=2),
+            patch("nemo_automodel._transformers.auto_model.FSDP2Manager") as mock_fsdp2,
+            patch.object(transformers.AutoModelForCausalLM, "from_pretrained", return_value=mock_model),
+        ):
+            cfg = Mock()
+            cfg.architectures = ["HFArch"]
+            mock_cfg.return_value = cfg
+
+            mock_fsdp2_instance = Mock()
+            mock_fsdp2_instance.parallelize = Mock(return_value=mock_model)
+            mock_fsdp2.return_value = mock_fsdp2_instance
+
+            result = NeMoAutoModelForCausalLM.from_pretrained_distributed(
+                "dummy/model",
+                use_liger_kernel=True,  # Request Liger
+                use_sdpa_patching=False,
+                sdpa_method=None,
+                torch_dtype="auto",
+                attn_implementation="eager",
+                quantization_config=None,
+                force_hf=False,
+                device_mesh=None,
+                distributed=distributed_config,
+                device=None,
+                move_to_device=False,
+            )
+
+            # Liger should NOT be called because TP > 1
+            assert len(liger_called) == 0
+
+    def test_from_pretrained_distributed_move_to_device(self):
+        """Test that move_to_device moves model to correct device."""
+        distributed_config = {}
+
+        mock_model = MagicMock()
+        mock_model.config = {}
+        mock_model.state_dict.return_value = {}
+
+        with (
+            patch("nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained") as mock_cfg,
+            patch("nemo_automodel._transformers.auto_model._get_model_from_nemo_registry", return_value=None),
+            patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", lambda x: x),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda x, y=None: x),
+            patch("nemo_automodel._transformers.auto_model.torch.distributed.is_initialized", return_value=False),
+            patch("nemo_automodel._transformers.auto_model._choose_device") as mock_choose,
+            patch("nemo_automodel._transformers.auto_model._move_module_to_device") as mock_move,
+            patch.object(transformers.AutoModelForCausalLM, "from_pretrained", return_value=mock_model),
+        ):
+            cfg = Mock()
+            cfg.architectures = ["HFArch"]
+            mock_cfg.return_value = cfg
+
+            mock_device = torch.device("cuda", 0)
+            mock_choose.return_value = mock_device
+
+            result = NeMoAutoModelForCausalLM.from_pretrained_distributed(
+                "dummy/model",
+                use_liger_kernel=False,
+                use_sdpa_patching=False,
+                sdpa_method=None,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="eager",
+                quantization_config=None,
+                force_hf=False,
+                device_mesh=None,
+                distributed=distributed_config,
+                device=None,
+                move_to_device=True,
+            )
+
+            mock_move.assert_called_once_with(mock_model, mock_device, torch.bfloat16)
+
+    def test_from_pretrained_distributed_injects_device_mesh_to_fsdp2(self):
+        """Test that caller-provided device_mesh is injected into FSDP2Manager."""
+        mock_mesh = Mock()
+        mock_mesh.size.return_value = 4
+        distributed_config = {"tp_size": 2}
+
+        mock_model = MagicMock()
+        mock_model.config = {}
+        mock_model.state_dict.return_value = {}
+
+        with (
+            patch("nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained") as mock_cfg,
+            patch("nemo_automodel._transformers.auto_model._get_model_from_nemo_registry", return_value=None),
+            patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", lambda x: x),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda x, y=None: x),
+            patch("nemo_automodel._transformers.auto_model.torch.distributed.is_initialized", return_value=True),
+            patch("nemo_automodel._transformers.auto_model.torch.distributed.get_world_size", return_value=4),
+            patch("nemo_automodel._transformers.auto_model.FSDP2Manager") as mock_fsdp2,
+            patch.object(transformers.AutoModelForCausalLM, "from_pretrained", return_value=mock_model),
+        ):
+            cfg = Mock()
+            cfg.architectures = ["HFArch"]
+            mock_cfg.return_value = cfg
+
+            mock_fsdp2_instance = Mock()
+            mock_fsdp2_instance.parallelize = Mock(return_value=mock_model)
+            mock_fsdp2.return_value = mock_fsdp2_instance
+
+            result = NeMoAutoModelForCausalLM.from_pretrained_distributed(
+                "dummy/model",
+                use_liger_kernel=False,
+                use_sdpa_patching=False,
+                sdpa_method=None,
+                torch_dtype="auto",
+                attn_implementation="eager",
+                quantization_config=None,
+                force_hf=False,
+                device_mesh=mock_mesh,
+                distributed=distributed_config,
+                device=None,
+                move_to_device=False,
+            )
+
+            # The device_mesh should be injected
+            assert mock_fsdp2_instance.device_mesh is mock_mesh
+
+    def test_from_pretrained_distributed_uses_nemo_registry(self):
+        """Test that from_pretrained_distributed uses NeMo registry when available."""
+        distributed_config = {"tp_size": 1}
+
+        custom_model = Mock()
+        custom_model.config = {}
+        custom_model.state_dict.return_value = {}
+
+        with (
+            patch("nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained") as mock_cfg,
+            patch(
+                "nemo_automodel._transformers.auto_model._get_model_from_nemo_registry", return_value=custom_model
+            ),
+            patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", lambda x: x),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda x, y=None: x),
+            patch("nemo_automodel._transformers.auto_model.torch.distributed.is_initialized", return_value=False),
+            patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_hf_loader,
+        ):
+            cfg = Mock()
+            cfg.architectures = ["CustomArch"]
+            mock_cfg.return_value = cfg
+
+            result = NeMoAutoModelForCausalLM.from_pretrained_distributed(
+                "dummy/model",
+                use_liger_kernel=False,
+                use_sdpa_patching=False,
+                sdpa_method=None,
+                torch_dtype="auto",
+                attn_implementation="eager",
+                quantization_config=None,
+                force_hf=False,
+                device_mesh=None,
+                distributed=distributed_config,
+                device=None,
+                move_to_device=False,
+            )
+
+            # HF loader should NOT be called
+            mock_hf_loader.assert_not_called()
+            assert result is custom_model
+
+    def test_from_pretrained_distributed_retry_on_attention_error(self, caplog):
+        """Test that from_pretrained_distributed retries with fallback attention on error."""
+        distributed_config = {"tp_size": 1}
+
+        mock_model = MagicMock()
+        mock_model.config = {}
+        mock_model.state_dict.return_value = {}
+
+        call_count = 0
+
+        def mock_from_pretrained_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            attn_impl = kwargs.get("attn_implementation", "flash_attention_2")
+            if attn_impl == "flash_attention_2":
+                raise ValueError("Model does not support flash_attention_2")
+            return mock_model
+
+        with (
+            patch("nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained") as mock_cfg,
+            patch("nemo_automodel._transformers.auto_model._get_model_from_nemo_registry", return_value=None),
+            patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", lambda x: x),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda x, y=None: x),
+            patch("nemo_automodel._transformers.auto_model.torch.distributed.is_initialized", return_value=False),
+            patch.object(
+                transformers.AutoModelForCausalLM, "from_pretrained", side_effect=mock_from_pretrained_side_effect
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            cfg = Mock()
+            cfg.architectures = ["HFArch"]
+            mock_cfg.return_value = cfg
+
+            result = NeMoAutoModelForCausalLM.from_pretrained_distributed(
+                "dummy/model",
+                use_liger_kernel=False,
+                use_sdpa_patching=False,
+                sdpa_method=None,
+                torch_dtype="auto",
+                attn_implementation="flash_attention_2",
+                quantization_config=None,
+                force_hf=False,
+                device_mesh=None,
+                distributed=distributed_config,
+                device=None,
+                move_to_device=False,
+            )
+
+            assert "Falling back to" in caplog.text
+            assert call_count >= 2
+
+    def test_from_pretrained_distributed_validates_sdpa_for_cp(self):
+        """Test that SDPA support is validated when CP > 1."""
+        distributed_config = {"cp_size": 2}
+
+        mock_model = MagicMock()
+        mock_model.config = {}
+        mock_model._supports_sdpa = False
+        mock_model.state_dict.return_value = {}
+
+        with (
+            patch("nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained") as mock_cfg,
+            patch("nemo_automodel._transformers.auto_model._get_model_from_nemo_registry", return_value=None),
+            patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", lambda x: x),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda x, y=None: x),
+            patch("nemo_automodel._transformers.auto_model.torch.distributed.is_initialized", return_value=True),
+            patch("nemo_automodel._transformers.auto_model.torch.distributed.get_world_size", return_value=2),
+            patch("nemo_automodel._transformers.auto_model.FSDP2Manager") as mock_fsdp2,
+            patch.object(transformers.AutoModelForCausalLM, "from_pretrained", return_value=mock_model),
+        ):
+            cfg = Mock()
+            cfg.architectures = ["HFArch"]
+            mock_cfg.return_value = cfg
+
+            mock_fsdp2_instance = Mock()
+            mock_fsdp2_instance.parallelize = Mock(return_value=mock_model)
+            mock_fsdp2.return_value = mock_fsdp2_instance
+
+            with pytest.raises(ValueError, match="Model does not support SDPA required for context parallelism"):
+                NeMoAutoModelForCausalLM.from_pretrained_distributed(
+                    "dummy/model",
+                    use_liger_kernel=False,
+                    use_sdpa_patching=False,
+                    sdpa_method=None,
+                    torch_dtype="auto",
+                    attn_implementation="sdpa",
+                    quantization_config=None,
+                    force_hf=False,
+                    device_mesh=None,
+                    distributed=distributed_config,
+                    device=None,
+                    move_to_device=False,
+                )
+
+
+class TestFromConfigDistributed:
+    """Test cases for from_config with device_mesh and distributed options."""
+
+    def test_from_config_with_distributed_creates_fsdp2_manager(self):
+        """Test that from_config creates FSDP2Manager when TP > 1."""
+        distributed_config = {"tp_size": 2}
+
+        mock_model = MagicMock()
+        mock_model.config = {}
+
+        with (
+            patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", lambda x: x),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda x, y=None: x),
+            patch("nemo_automodel._transformers.auto_model.torch.distributed.is_initialized", return_value=True),
+            patch("nemo_automodel._transformers.auto_model.torch.distributed.get_world_size", return_value=2),
+            patch("nemo_automodel._transformers.auto_model.FSDP2Manager") as mock_fsdp2,
+            patch.object(transformers.AutoModelForCausalLM, "from_config", return_value=mock_model),
+        ):
+            cfg = Mock()
+            cfg.architectures = ["HFArch"]
+            cfg.name_or_path = "dummy/model"
+
+            mock_fsdp2_instance = Mock()
+            mock_fsdp2_instance.parallelize = Mock(return_value=mock_model)
+            mock_fsdp2.return_value = mock_fsdp2_instance
+
+            result = NeMoAutoModelForCausalLM.from_config(
+                cfg,
+                distributed=distributed_config,
+            )
+
+            mock_fsdp2.assert_called()
+
+    def test_from_config_with_device_mesh(self):
+        """Test that from_config accepts device_mesh parameter."""
+        mock_mesh = Mock()
+        mock_mesh.size.return_value = 2
+        distributed_config = {"tp_size": 2}
+
+        mock_model = MagicMock()
+        mock_model.config = {}
+
+        with (
+            patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", lambda x: x),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda x, y=None: x),
+            patch("nemo_automodel._transformers.auto_model.torch.distributed.is_initialized", return_value=True),
+            patch("nemo_automodel._transformers.auto_model.torch.distributed.get_world_size", return_value=2),
+            patch("nemo_automodel._transformers.auto_model.FSDP2Manager") as mock_fsdp2,
+            patch.object(transformers.AutoModelForCausalLM, "from_config", return_value=mock_model),
+        ):
+            cfg = Mock()
+            cfg.architectures = ["HFArch"]
+            cfg.name_or_path = "dummy/model"
+
+            mock_fsdp2_instance = Mock()
+            mock_fsdp2_instance.parallelize = Mock(return_value=mock_model)
+            mock_fsdp2.return_value = mock_fsdp2_instance
+
+            result = NeMoAutoModelForCausalLM.from_config(
+                cfg,
+                device_mesh=mock_mesh,
+                distributed=distributed_config,
+            )
+
+            # Verify device_mesh is injected
+            assert mock_fsdp2_instance.device_mesh is mock_mesh

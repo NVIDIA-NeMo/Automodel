@@ -365,6 +365,94 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path):
             )
 
 
+def _build_parallel_manager(
+    distributed: Optional[Dict[str, Any]],
+    device_mesh: Optional[DeviceMesh] = None,
+) -> Optional[Union[FSDP2Manager, DDPManager]]:
+    """
+    Build the appropriate parallel manager (FSDP2Manager or DDPManager) based on distributed config.
+
+    This helper extracts common logic for creating parallel wrappers used in both
+    `from_pretrained_distributed` and `from_config`.
+
+    Args:
+        distributed: Dictionary containing distributed configuration with keys like
+            'tp_size', 'cp_size', 'pp_size', 'dp_size', 'world_size', 'backend',
+            'use_hf_tp_plan', 'sequence_parallel', 'activation_checkpointing'.
+        device_mesh: Optional pre-built DeviceMesh to inject into the manager.
+
+    Returns:
+        FSDP2Manager if tp_size > 1 or cp_size > 1 or pp_size > 1,
+        DDPManager if only data parallelism is needed,
+        None if torch.distributed is not initialized or no distributed config.
+    """
+    if not torch.distributed.is_initialized():
+        return None
+
+    conf = distributed if isinstance(distributed, dict) else {}
+    if not conf:
+        return None
+
+    tp = int(conf.get("tp_size", 1))
+    cp = int(conf.get("cp_size", 1))
+    pp = int(conf.get("pp_size", 1))
+    dp = int(conf.get("dp_size", 0))
+    world_size = conf.get("world_size", torch.distributed.get_world_size())
+    backend = conf.get("backend", "nccl" if torch.cuda.is_available() else "gloo")
+
+    internal_wrapper = None
+    if tp > 1 or cp > 1 or pp > 1:
+        internal_wrapper = FSDP2Manager(
+            dp_size=dp if dp > 0 else None,
+            tp_size=tp,
+            cp_size=cp,
+            pp_size=pp,
+            backend=backend,
+            world_size=world_size,
+            use_hf_tp_plan=bool(conf.get("use_hf_tp_plan", False)),
+            sequence_parallel=bool(conf.get("sequence_parallel", False)),
+            activation_checkpointing=bool(conf.get("activation_checkpointing", False)),
+        )
+        # If caller provided a prebuilt DeviceMesh, inject it
+        if device_mesh is not None:
+            internal_wrapper.device_mesh = device_mesh
+    else:
+        internal_wrapper = DDPManager(
+            backend=backend,
+            activation_checkpointing=bool(conf.get("activation_checkpointing", False)),
+        )
+
+    return internal_wrapper
+
+
+def _apply_parallelization(
+    model: torch.nn.Module,
+    internal_wrapper: Optional[Union[FSDP2Manager, DDPManager]],
+) -> torch.nn.Module:
+    """
+    Apply parallelization to the model using the provided wrapper.
+
+    Args:
+        model: The model to parallelize.
+        internal_wrapper: The parallel manager (FSDP2Manager or DDPManager).
+
+    Returns:
+        The parallelized model, or the original model if parallelization fails.
+    """
+    if internal_wrapper is None:
+        return model
+
+    if not torch.distributed.is_initialized():
+        logger.warning("distributed requested but torch.distributed is not initialized; skipping parallelize")
+        return model
+
+    try:
+        return internal_wrapper.parallelize(model)
+    except Exception as e:
+        logger.warning("parallelize failed: %s", e)
+        return model
+
+
 def get_architectures(hf_config):
     """
     Get the architectures from the HF config.
@@ -707,37 +795,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 pass
 
         # Build internal wrapper (FSDP2 or DDP) using device_mesh or config
-        internal_wrapper = None
-        if torch.distributed.is_initialized():
-            conf = distributed if isinstance(distributed, dict) else {}
-            tp = int(conf.get("tp_size", 1))
-            cp = int(conf.get("cp_size", 1))
-            pp = int(conf.get("pp_size", 1))
-            dp = int(conf.get("dp_size", 0))
-            world_size = conf.get("world_size", torch.distributed.get_world_size())
-            backend = conf.get("backend", "nccl" if torch.cuda.is_available() else "gloo")
-
-            if tp > 1 or cp > 1 or pp > 1:
-                internal_wrapper = FSDP2Manager(
-                    dp_size=dp if dp > 0 else None,
-                    tp_size=tp,
-                    cp_size=cp,
-                    pp_size=pp,
-                    backend=backend,
-                    world_size=world_size,
-                    use_hf_tp_plan=bool(conf.get("use_hf_tp_plan", False)),
-                    sequence_parallel=bool(conf.get("sequence_parallel", False)),
-                    activation_checkpointing=bool(conf.get("activation_checkpointing", False)),
-                )
-                # If caller provided a prebuilt DeviceMesh, inject it
-                if device_mesh is not None:
-                    internal_wrapper.device_mesh = device_mesh
-            elif conf:
-                internal_wrapper = DDPManager(
-                    backend=backend,
-                    activation_checkpointing=bool(conf.get("activation_checkpointing", False)),
-                )
-            # no-op: model_wrapper removed; liger disabled via conf above
+        internal_wrapper = _build_parallel_manager(distributed, device_mesh)
 
         # Kernel patching
         try:
@@ -758,16 +816,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             return _retry(use_sdpa_patching=False)
 
         _verify_sdpa_support(model, is_hf_model, cp_size)
-        # Optional: parallelize model according to parallel_scheme decision
-        # Priority: FSDP2 when tp_size>1 or cp_size>1; else DDP when dp_size>1; else single GPU
-        if internal_wrapper is not None:
-            if torch.distributed.is_initialized():
-                try:
-                    model = internal_wrapper.parallelize(model)
-                except Exception as e:
-                    logger.warning("internal parallelize failed: %s", e)
-            else:
-                logger.warning("distributed requested but torch.distributed is not initialized; skipping parallelize")
+
+        # Apply parallelization
+        model = _apply_parallelization(model, internal_wrapper)
 
         # Finally move the model to the chosen device (post-parallelization), if requested
         if move_to_device:
@@ -952,40 +1003,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             raise e
 
         # Build internal wrapper (FSDP2 or DDP) using device_mesh or config
-        internal_wrapper = None
-        if torch.distributed.is_initialized():
-            conf = distributed if isinstance(distributed, dict) else {}
-            tp = int(conf.get("tp_size", 1))
-            cp = int(conf.get("cp_size", 1))
-            pp = int(conf.get("pp_size", 1))
-            dp = int(conf.get("dp_size", 0))
-            world_size = conf.get("world_size", torch.distributed.get_world_size())
-            backend = conf.get("backend", "nccl" if torch.cuda.is_available() else "gloo")
-
-            if tp > 1 or cp > 1 or pp > 1:
-                internal_wrapper = FSDP2Manager(
-                    dp_size=dp if dp > 0 else None,
-                    tp_size=tp,
-                    cp_size=cp,
-                    pp_size=pp,
-                    backend=backend,
-                    world_size=world_size,
-                    use_hf_tp_plan=bool(conf.get("use_hf_tp_plan", False)),
-                    sequence_parallel=bool(conf.get("sequence_parallel", False)),
-                    activation_checkpointing=bool(conf.get("activation_checkpointing", False)),
-                )
-                # If caller provided a prebuilt DeviceMesh, inject it
-                if device_mesh is not None:
-                    internal_wrapper.device_mesh = device_mesh
-            elif conf:
-                internal_wrapper = DDPManager(
-                    backend=backend,
-                    activation_checkpointing=bool(conf.get("activation_checkpointing", False)),
-                )
-
-        # If distributed tensor/context parallelism is requested, avoid Liger patch like in train_ft
-        # (handled above when building internal_wrapper in from_pretrained; for from_config, we only rely on
-        # distributed dict and internal_wrapper built below.)
+        internal_wrapper = _build_parallel_manager(distributed, device_mesh)
 
         # Kernel patching
         try:
@@ -1006,48 +1024,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             return _retry(use_sdpa_patching=False)
 
         _verify_sdpa_support(model, is_hf_model, cp_size)
-        # Optional: parallelize model according to parallel_scheme decision
-        # Priority: FSDP2 when tp_size>1 or cp_size>1; else DDP when dp_size>1; else single GPU
-        if internal_wrapper is not None:
-            if torch.distributed.is_initialized():
-                try:
-                    model = internal_wrapper.parallelize(model)
-                except Exception as e:
-                    logger.warning("internal parallelize failed: %s", e)
-            else:
-                logger.warning("distributed requested but torch.distributed is not initialized; skipping parallelize")
-        elif distributed is not None and torch.distributed.is_initialized():
-            conf = distributed if isinstance(distributed, dict) else {}
-            tp = int(conf.get("tp_size", 1))
-            cp = int(conf.get("cp_size", 1))
-            pp = int(conf.get("pp_size", 1))
-            dp = int(conf.get("dp_size", 0))
-            world_size = conf.get("world_size", torch.distributed.get_world_size())
-            backend = conf.get("backend", "nccl" if torch.cuda.is_available() else "gloo")
 
-            if tp > 1 or cp > 1 or pp > 1:
-                manager = FSDP2Manager(
-                    dp_size=dp if dp > 0 else None,
-                    tp_size=tp,
-                    cp_size=cp,
-                    pp_size=pp,
-                    backend=backend,
-                    world_size=world_size,
-                    use_hf_tp_plan=bool(conf.get("use_hf_tp_plan", False)),
-                    sequence_parallel=bool(conf.get("sequence_parallel", False)),
-                    activation_checkpointing=bool(conf.get("activation_checkpointing", False)),
-                )
-                try:
-                    model = manager.parallelize(model)
-                except Exception as e:
-                    logger.warning("FSDP2Manager.parallelize failed: %s", e)
-            else:
-                ddp_backend = backend
-                try:
-                    ddp_manager = DDPManager(backend=ddp_backend, activation_checkpointing=bool(conf.get("activation_checkpointing", False)))
-                    model = ddp_manager.parallelize(model)
-                except Exception as e:
-                    logger.warning("DDPManager.parallelize failed: %s", e)
+        # Apply parallelization
+        model = _apply_parallelization(model, internal_wrapper)
 
         # Finally move the model to the chosen device (post-parallelization), if requested
         if move_to_device:
