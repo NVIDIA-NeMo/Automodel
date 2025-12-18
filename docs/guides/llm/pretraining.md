@@ -10,7 +10,7 @@ NeMo Automodel provides an end-to-end recipe to run LLM pretraining with Hugging
 
 ## Model and Dataset Context
 
-In this guide, we do pretraining OpenAI’s `GPT2-124M` model on a FineWeb-Edu subset of 10 billion tokens.
+In this guide, we pretrain OpenAI’s `GPT2-124M` model on a FineWeb-Edu subset of 10 billion tokens.
 
 ### 📚 About the FineWeb-Edu Dataset
 
