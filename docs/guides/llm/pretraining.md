@@ -318,7 +318,7 @@ In these scenarios, you can pass `is_meta_device: true` in the model config. The
 
 ## Run the Pretraining Recipe
 
-Assuming you saved or will use the provided config at `examples/llm_pretrain/megatron_pretrain_gpt2.yaml`:
+Assuming you saved, or plan to use, the provided config at `examples/llm_pretrain/megatron_pretrain_gpt2.yaml`:
 
 ``` bash
 uv run torchrun --nproc-per-node=2 examples/llm_pretrain/pretrain.py --config examples/llm_pretrain/megatron_pretrain_gpt2.yaml
