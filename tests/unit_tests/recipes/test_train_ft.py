@@ -13,22 +13,21 @@
 # limitations under the License.
 
 import logging
-from unittest.mock import MagicMock, patch
-from nemo_automodel.recipes.llm.train_ft import (
-    TrainFinetuneRecipeForNextTokenPrediction,
-    build_validation_dataloader,
-    build_dataloader,
-    build_model_and_optimizer,
-)
-from nemo_automodel.components.config.loader import ConfigNode
-from unittest.mock import patch
 import importlib
 import torch
 import torch.nn as nn
-from torch.utils.data import IterableDataset
-from types import SimpleNamespace
 from contextlib import AbstractContextManager
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call, patch
+
+from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.recipes.llm.train_ft import (
+    TrainFinetuneRecipeForNextTokenPrediction,
+    build_dataloader,
+    build_model_and_optimizer,
+    build_validation_dataloader,
+)
+from torch.utils.data import IterableDataset
 
 
 class DummyIterableDataset(IterableDataset):  # noqa: D401
@@ -567,3 +566,37 @@ def test_nvtx_false_skips_patching(monkeypatch):
 
     assert trainer.enable_nvtx is False
     patch_mock.assert_not_called()
+
+
+def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
+    cfg = _minimal_cfg_with_nvtx(nvtx_value=True)
+    patch_mock = MagicMock()
+    _patch_setup_minimals(monkeypatch, patch_mock)
+
+    class DummyAutoPipeline(SimpleNamespace):
+        pass
+
+    # Make isinstance(model, AutoPipeline) succeed with our dummy
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.AutoPipeline", DummyAutoPipeline)
+
+    parts = [DummyModel(), DummyModel()]
+
+    def _build_model_and_optimizer_stub(*args, **kwargs):
+        ap = DummyAutoPipeline(parts=parts, info=SimpleNamespace(has_last_stage=False, has_first_stage=False, schedule=None))
+        dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
+        return ap, ["w"], [dummy_opt], "loss_fn", {"trainable_params": 2, "total_params": 2}
+
+    # Override the default stub to return a pipeline-wrapped model
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model_and_optimizer", _build_model_and_optimizer_stub)
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+
+    assert trainer.enable_nvtx is True
+    patch_mock.assert_has_calls(
+        [
+            call(parts[0], name="PipelineStage_0"),
+            call(parts[1], name="PipelineStage_1"),
+        ],
+        any_order=False,
+    )
