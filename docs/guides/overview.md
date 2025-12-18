@@ -30,7 +30,7 @@ Starter configurations and scripts for pretraining with datasets from different 
 - Example models: GPT-2 baseline, NanoGPT, DeepSeek-V3, Moonlight 16B TE (Slurm)
 - How-to guides:
   - [LLM pretraining](llm/pretraining.md)
-  - [Pretraining with Megatron-Core dataset](llm/pretraining.md)
+  - [Pretraining with NanoGPT](llm/nanogpt-pretraining.md)
 
 ### Knowledge Distillation (KD)
 
