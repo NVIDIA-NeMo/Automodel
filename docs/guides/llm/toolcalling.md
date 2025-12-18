@@ -1,16 +1,17 @@
-# Function Calling with NeMo Automodel using FUNCTIONGEMMA
+# Function Calling with NeMo Automodel using FunctionGemma
 
-This tutorial walks through fine-tuning a function-calling model with NeMo Automodel using [FUNCTIONGEMMA](https://HFLINK) on the xLAM function-calling dataset.
+This tutorial walks through fine-tuning a function-calling model with NeMo Automodel using [FunctionGemma](https://HFLINK) on the xLAM function-calling dataset.
 
-## FUCTIONGEMMA introduction
-- Built on the Gemma 3 architecture with updated tokenizer and chat/tool formats.
-- Sized for speed on edge devices: ~270M params for fast dense inference on-device.
-- Explicitly trained for function calling: handles function definitions, parallel calls, and function responses in addition to natural language replies.
-- Text-only focus: text in, text out.
+## FunctionGemma introduction
+FunctionGemma is a lightweight, 270M-parameter variant built on the Gemma 3 architecture with a function-calling chat format. It is intended to be fine-tuned for task-specific function calling, and its compact size makes it practical for edge or resource-constrained deployments.
+- Gemma 3 architecture, updated tokenizer and function-calling chat format.
+- Trained specifically for function calling: multiple tool definitions, parallel calls, tool responses, and natural-language summaries.
+- Small/edge friendly: ~270M params for fast, dense inference on-device.
+- Text-only, function-oriented model (not a general dialogue model), best used after task-specific finetuning.
 
 ## Prerequisites
 - Install NeMo Automodel and its extras: `pip install nemo-automodel`.
-- A FUNCTIONGEMMA checkpoint available locally or via https://HFLINK.
+- A FunctionGemma checkpoint available locally or via https://HFLINK.
 - Small model footprint: can be fine-tuned on a single GPU; scale batch/sequence as needed.
 
 ## The xLAM dataset
@@ -97,7 +98,7 @@ torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py \
 You should be able to see training loss curve similar to the below:
 
 <p align="center">
-  <img src="https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/functiongemma-sft-loss.png" alt="FUNCTIONGEMMA SFT loss" width="400">
+  <img src="https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/functiongemma-sft-loss.png" alt="FunctionGemma SFT loss" width="400">
 </p>
 
 ## Run PEFT (LoRA)
@@ -118,5 +119,5 @@ torchrun --nproc-per-node=1 examples/llm_finetune/finetune.py \
 ```
 
 <p align="center">
-  <img src="https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/functiongemma-peft-loss.png" alt="FUNCTIONGEMMA PEFT loss" width="400">
+  <img src="https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/functiongemma-peft-loss.png" alt="FunctionGemma PEFT loss" width="400">
 </p>
