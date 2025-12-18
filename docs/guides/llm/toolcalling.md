@@ -51,7 +51,7 @@ Example entry:
 
 The helper `make_xlam_dataset` converts each xLAM row into OpenAI-style tool schemas and tool calls, then renders them through the chat template so loss is applied only on the tool-call arguments:
 
-```120:152:nemo_automodel/components/datasets/llm/xlam.py
+```python
 def _format_example(
     example,
     tokenizer,
