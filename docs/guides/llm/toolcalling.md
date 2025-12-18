@@ -1,6 +1,7 @@
 # Function Calling with NeMo Automodel using FunctionGemma
 
-This tutorial walks through fine-tuning a function-calling model with NeMo Automodel using [FunctionGemma](https://huggingface.co/google/functiongemma-270m-it) on the xLAM function-calling dataset.
+This tutorial walks through fine-tuning [FunctionGemma](https://huggingface.co/google/functiongemma-270m-it), Google's 270m function-calling model with NeMo Automodel on the xLAM function-calling dataset.
+
 
 ## FunctionGemma introduction
 FunctionGemma is a lightweight, 270M-parameter variant built on the Gemma 3 architecture with a function-calling chat format. It is intended to be fine-tuned for task-specific function calling, and its compact size makes it practical for edge or resource-constrained deployments.
