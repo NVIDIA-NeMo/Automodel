@@ -14,7 +14,12 @@
 
 import logging
 from unittest.mock import MagicMock, patch
-from nemo_automodel.recipes.llm.train_ft import build_validation_dataloader, build_dataloader, build_model_and_optimizer
+from nemo_automodel.recipes.llm.train_ft import (
+    TrainFinetuneRecipeForNextTokenPrediction,
+    build_validation_dataloader,
+    build_dataloader,
+    build_model_and_optimizer,
+)
 from nemo_automodel.components.config.loader import ConfigNode
 from unittest.mock import patch
 import importlib
@@ -467,6 +472,11 @@ def _patch_setup_minimals(monkeypatch, patch_mock: MagicMock):
     monkeypatch.setattr(
         "nemo_automodel.recipes.llm.train_ft.build_checkpoint_config",
         lambda *a, **k: SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None),
+    )
+    # Avoid requiring a distributed _target_
+    monkeypatch.setattr(
+        "nemo_automodel.components.config.loader.ConfigNode.instantiate",
+        lambda self, *a, **k: SimpleNamespace(pp_size=0, device_mesh=None, moe_mesh=None),
     )
 
     # Stub Checkpointer
