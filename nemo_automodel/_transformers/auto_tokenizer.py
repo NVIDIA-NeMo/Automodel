@@ -20,7 +20,6 @@ from transformers import AutoConfig, AutoTokenizer
 from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import AutoTokenizerWithBosEosEnforced
 from nemo_automodel._transformers.tokenization.registry import TokenizerRegistry
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -118,9 +117,7 @@ class NeMoAutoTokenizer:
             The model_type string, or None if it cannot be determined
         """
         try:
-            config = AutoConfig.from_pretrained(
-                pretrained_model_name_or_path, trust_remote_code=trust_remote_code
-            )
+            config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=trust_remote_code)
             return getattr(config, "model_type", None)
         except Exception as e:
             logger.debug(f"Could not load config to determine model type: {e}")
