@@ -12,7 +12,7 @@ NeMo Automodel provides an end-to-end recipe to run LLM pretraining with Hugging
 
 In this guide, we pretrain OpenAI’s `GPT2-124M` model on a FineWeb-Edu subset of 10 billion tokens.
 
-### 📚 About the FineWeb-Edu Dataset
+### About the FineWeb-Edu Dataset
 
 [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) is a dataset consisting of 1.3T tokens of educational web pages filtered from the larger [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) dataset. The educational web pages were filtered from the main dataset using a finetuned [Bert](https://huggingface.co/docs/transformers/en/model_doc/bert)-like classifier. Further reading on the filtering process can be found [here](https://huggingface.co/spaces/HuggingFaceFW/blogpost-fineweb-v1).
 
