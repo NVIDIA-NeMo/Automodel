@@ -326,7 +326,7 @@ uv run torchrun --nproc-per-node=2 examples/llm_pretrain/pretrain.py --config ex
 
 ### Sample Output
 
-You should see step-wise logs with loss, memory, and tokens/sec. Checkpoints will be saved under `checkpoints/` as configured.
+You should see step‑wise logs reporting loss, memory usage, and tokens per second. Checkpoints will be saved under the `checkpoints/` directory as configured.
 
 ```bash
 $ uv run torchrun --nproc-per-node=2 examples/llm_pretrain/pretrain.py --config examples/llm_pretrain/megatron_pretrain_gpt2.yaml
