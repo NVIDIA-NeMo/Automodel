@@ -1,6 +1,6 @@
 # Dataset Overview: LLM and VLM Datasets in NeMo Automodel
 
-This page summarizes the datasets already supported in NeMo Automodel for LLM and VLM, and shows how to plug in your own datasets via simple Python functions or purely through YAML using the `_target_` mechanism.
+This page summarizes the datasets already supported in NeMo Automodel for LLM and VLM, and shows how to plug in your own datasets using simple Python functions or directly through YAML using the `_target_` mechanism.
 
 - See also: [LLM datasets](llm/dataset.md) and [VLM datasets](vlm/dataset.md) for deeper, task-specific guides.
 
