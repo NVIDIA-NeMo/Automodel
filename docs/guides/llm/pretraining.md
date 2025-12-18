@@ -739,7 +739,7 @@ cfg-path: examples/llm_pretrain/megatron_pretrain_gpt2.yaml
 ```
 For each training batch, the fine-tuning recipe logs the current loss, along with current peak memory usage and tokens per second (TPS).
 
-Over the course of training, you should see the model loss start to converge. A good point of comparison for convergence is the reproduction in the [llm.c repository](https://github.com/karpathy/llm.c/discussions/481).
+As training progresses, you should observe the model loss beginning to converge. To verify your results, you can compare your convergence curves against the baseline benchmarks provided in the [llm.c repository](https://github.com/karpathy/llm.c/discussions/481).
 
 :::{figure} ./gpt2_loss.png
 :name: gpt2-train-loss
