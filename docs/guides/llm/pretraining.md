@@ -1,4 +1,4 @@
-# Pretraining using Megatron-Core Datasets with NeMo Automodel
+# Pretraining using Megatron Core Datasets with NeMo Automodel
 
 ## Introduction
 
