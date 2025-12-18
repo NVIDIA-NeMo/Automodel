@@ -174,7 +174,7 @@ The `TrainFinetuneRecipeForNextTokenPrediction` class is one such recipe. It inh
 
 - Misc: Checkpoint handling, logging, and RNG setup.
 
-### Recipe Config (example)
+### Recipe Config Example
 
 Below is the configuration from `examples/llm_pretrain/megatron_pretrain_gpt2.yaml`:
 
