@@ -110,7 +110,7 @@ fineweb_edu/
 ```
 
 ## Preprocess to a Megatron Core Dataset
-NeMo AutoModel provides tooling to perform the task of tokenizing and saving in the Megatron-Core dataset format. This can be used as follows:
+NeMo Automodel provides tooling to perform the task of tokenizing and saving in the Megatron Core dataset format. You can use it as follows:
 
 ```
 uv run tools/preprocess_megatron_dataset.py --input "fineweb_edu/fineweb_edu_10bt/fineweb_edu_10bt.chunk.*.jsonl" --json-keys text --output-prefix processed_data --output-path fineweb_edu/megatron_gpt2/ --workers 8 --pretrained-model-name-or-path openai-community/gpt2 --append-eod
