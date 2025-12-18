@@ -2,7 +2,7 @@
 
 NeMo Automodel is organized around two key concepts: recipes and components.
 
-Recipes are executable scripts configured via YAML files. Each recipe defines its own training and validation loop, orchestrated through a `step_scheduler`. It specifies the model, dataset, loss function, optimizer and scheduler, checkpointing, and distributed training settings—allowing end-to-end training with a single command.
+Recipes are executable scripts configured with YAML files. Each recipe defines its own training and validation loop, orchestrated through a `step_scheduler`. It specifies the model, dataset, loss function, optimizer, scheduler, checkpointing, and distributed training settings—allowing end-to-end training with a single command.
 
 Components are modular, plug-and-play building blocks referenced using the `_target_` field. These include models, datasets, loss functions, and distribution managers. Recipes assemble these components, making it easy to swap them out to change precision, distribution strategy, dataset, or task—without modifying the training loop itself.
 
