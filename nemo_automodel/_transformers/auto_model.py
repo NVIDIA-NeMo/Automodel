@@ -50,7 +50,7 @@ HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from transformers import PretrainedConfig
+    pass
 
 logger = logging.getLogger(__name__)
 
