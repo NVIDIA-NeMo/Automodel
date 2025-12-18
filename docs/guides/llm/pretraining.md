@@ -2,7 +2,7 @@
 
 ## Introduction
 
-Pretraining builds a base large language model (LLM) from (typically random) initialization by optimizing the next-token prediction objective over massive unlabeled text corpora.
+Pretraining builds a base large language model (LLM) by training a randomly initialized model to predict the next token across massive, unlabeled datasets.
 
 Strong pretraining establishes broad linguistic competence and world knowledge, scaling with data, model size, and compute; it provides the foundation upon which later fine-tuning or domain adaptation is performed.
 
