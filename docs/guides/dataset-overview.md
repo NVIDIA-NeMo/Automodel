@@ -59,6 +59,132 @@ dataset:
 ```
   - See the detailed guide, [Column-Mapped Text Instruction Dataset](llm/column-mapped-text-instruction-dataset.md), for more information.
 
+- **ChatDataset (multi-turn conversations and tool calling)**
+  - Class: `nemo_automodel.components.datasets.llm.ChatDataset`
+  - Use case: multi-turn conversations and tool calling in OpenAI chat format
+  - Sources: local JSON/JSONL or Hugging Face Hub dataset ID
+  - Key args:
+    - `path_or_dataset_id`: path to local file(s) or HuggingFace dataset ID
+    - `tokenizer`: tokenizer instance (required; must have chat template support)
+    - `split`: dataset split (e.g., "train", "validation")
+    - `name`: dataset configuration/subset name
+    - `seq_length`: maximum sequence length for padding/truncation
+    - `padding`: padding strategy ("do_not_pad", "max_length", etc.)
+    - `truncation`: truncation strategy ("do_not_truncate", "longest_first", etc.)
+    - `start_of_turn_token`: token marking assistant response start (for answer-only loss)
+    - `chat_template`: optional override for tokenizer's chat template
+  - Notes:
+    - Requires a tokenizer with chat template support
+    - Supports both single-turn and multi-turn tool calling
+    - Tool definitions are provided in a `tools` field at the conversation level
+    - Tool calls appear in assistant messages via `tool_calls` field
+    - Tool responses use the `tool` role
+  - Example YAML:
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.ChatDataset
+  path_or_dataset_id: Salesforce/xlam-function-calling-60k
+  split: train
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: google/functiongemma-270m-it
+  seq_length: 2048
+  start_of_turn_token: "<start_of_turn>"
+```
+  - Expected data format (OpenAI messages format):
+```json
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "What's the weather in Seattle?"
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "arguments": "{\"city\": \"Seattle\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "{\"temperature\": 65, \"condition\": \"cloudy\"}"
+    },
+    {
+      "role": "assistant",
+      "content": "It's 65°F and cloudy in Seattle."
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {"type": "string"}
+          },
+          "required": ["city"]
+        }
+      }
+    }
+  ]
+}
+```
+  - For single-turn tool calling (one tool call per conversation), omit the tool response and final assistant message:
+```json
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Book a table for two at 7pm in Seattle."
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "type": "function",
+          "function": {
+            "name": "book_table",
+            "arguments": "{\"party_size\": 2, \"time\": \"19:00\", \"city\": \"Seattle\"}"
+          }
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "book_table",
+        "description": "Book a restaurant table",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "party_size": {"type": "integer"},
+            "time": {"type": "string"},
+            "city": {"type": "string"}
+          }
+        }
+      }
+    }
+  ]
+}
+```
+  - See the [Function Calling guide](llm/toolcalling.md) for an end-to-end example with FunctionGemma.
+
 - **NanoGPT Binary Shards (pretraining)**
   - Class: `nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset`
   - Use case: token-level LM pretraining over `.bin` shards produced by NanoGPT-style preprocessors (supports legacy and current formats)
@@ -85,8 +211,6 @@ dataset:
   splits_to_build: "train"
 ```
  - See the detailed pretraining guide, [Megatron MCore Pretraining](llm/mcore-pretraining.md), which uses MegatronPretraining data.
-
-> ⚠️ Note: Multi-turn conversational and tool-calling/function-calling dataset support is coming soon.
 
 ## Packed Sequence Support
 To reduce padding and improve throughput with variable-length sequences:
