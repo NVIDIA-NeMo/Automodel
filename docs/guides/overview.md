@@ -14,7 +14,7 @@ This page maps the ready-to-run recipes found in the `examples/` directory to th
 ## Large Language Models (LLM)
 This section provides practical recipes and configurations for working with large language models across three core workflows: fine-tuning, pretraining, and knowledge distillation.
 
-### Fine-tuning
+### Fine-Tuning
 
 End-to-end fine-tuning recipes for many open models. Each subfolder contains YAML configurations showing task setups (e.g., SQuAD, HellaSwag), precision options (e.g., FP8), and parameter-efficient methods (e.g., LoRA/QLoRA).
 
