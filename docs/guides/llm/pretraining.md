@@ -36,7 +36,7 @@ Here’s a glimpse of what the data looks like:
 }
 ```
 
-#### Downloading the FineWeb-Edu Dataset
+#### Download the FineWeb-Edu Dataset
 
 For the purposes of this guide, we will be using the FineWeb-Edu 10BT subset which is a subset randomly sampled from FineWeb-Edu of around 10B tokens. In order to prepare the dataset, follow the following commands:
 
