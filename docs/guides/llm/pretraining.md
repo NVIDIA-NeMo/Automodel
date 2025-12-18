@@ -50,7 +50,7 @@ python setup/download_prepare_hf_data.py fineweb_edu_10bt <MEMORY> --data_dir <D
 cd ..
 mv lingua/fineweb_edu .
 ```
-`<MEMORY>` can be replaced with how much system memory `terashuf` (the tool used to shuffle samples) will be allocated, and `<DATA_DIR>` is the root directory where the data will be stored. An example command you can run is:
+Replace `<MEMORY>` with the amount of system memory allocated to `terashuf` (the tool used for sample shuffling), and set `<DATA_DIR>` to the root directory where the data will be stored. You can run the following example command:
 ```bash
 python setup/download_prepare_hf_data.py fineweb_edu_10bt 16 --data_dir ./fineweb_edu --seed 42 --nchunks 1
 ```
