@@ -4,7 +4,7 @@
 
 Pretraining builds a base large language model (LLM) by training a randomly initialized model to predict the next token across massive, unlabeled datasets.
 
-Strong pretraining establishes broad linguistic competence and world knowledge, scaling with data, model size, and compute; it provides the foundation upon which later fine-tuning or domain adaptation is performed.
+Robust pretraining establishes a foundation of linguistic competence and world knowledge that scales with data, parameters, and compute. This base model then serves as the necessary starting point for later fine-tuning or domain-specific adaptation.
 
 NeMo Automodel provides an end-to-end recipe to run LLM pretraining with Hugging Face–native models and Megatron-Core style datasets.
 
