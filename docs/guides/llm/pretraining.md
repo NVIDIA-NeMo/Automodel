@@ -38,7 +38,7 @@ Here’s a glimpse of what the data looks like:
 
 #### Download the FineWeb-Edu Dataset
 
-For the purposes of this guide, we will be using the FineWeb-Edu 10BT subset which is a subset randomly sampled from FineWeb-Edu of around 10B tokens. In order to prepare the dataset, follow the following commands:
+For this guide, we use the FineWeb-Edu 10BT sample—a collection of approximately 10 billion tokens randomly drawn from the full FineWeb-Edu dataset. To prepare the data, run the following commands:
 
 ```bash
 # run this inside the Automodel directory
