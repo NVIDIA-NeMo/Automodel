@@ -223,6 +223,37 @@ class TestNeMoAutoModelForCausalLM:
         model = NeMoAutoModelForCausalLM.from_config(config, attn_implementation="eager")
         assert model.config.nemo_version == __version__
 
+    def test_from_config_with_string_calls_autoconfig(self):
+        """Test that from_config calls AutoConfig.from_pretrained when config is a string."""
+        mock_model = MagicMock()
+        mock_model.config = {}
+        mock_config = Mock()
+        mock_config.architectures = ["HFArch"]
+        mock_config.name_or_path = "hf-internal-testing/tiny-random-gpt2"
+
+        with (
+            patch("nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained") as mock_autoconfig,
+            patch("nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL", False),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch.object(transformers.AutoModelForCausalLM, "from_config") as mock_from_config,
+        ):
+            mock_autoconfig.return_value = mock_config
+            mock_from_config.return_value = mock_model
+
+            model = NeMoAutoModelForCausalLM.from_config(
+                "hf-internal-testing/tiny-random-gpt2",
+                trust_remote_code=False
+            )
+
+            # Verify AutoConfig.from_pretrained was called with the string
+            mock_autoconfig.assert_called_once_with(
+                "hf-internal-testing/tiny-random-gpt2",
+                trust_remote_code=False
+            )
+            # Verify the model was returned
+            assert model is mock_model
+            assert model.config["nemo_version"] == __version__
+
     def test_from_pretrained_runtimeerror_triggers_reload(self):
         """When _patch_liger_kernel raises, the loader should retry with
         use_liger_kernel=False and return the second model instance."""

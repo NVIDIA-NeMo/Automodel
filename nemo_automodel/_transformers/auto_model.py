@@ -457,7 +457,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
     @classmethod
     def from_config(
         cls,
-        config: "PretrainedConfig" | str,
+        config,
         *model_args,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
