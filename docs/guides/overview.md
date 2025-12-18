@@ -51,7 +51,7 @@ Curated configurations for benchmarking different training stacks and settings (
 ## Vision Language Models (VLM)
 This section provides practical recipes and configurations for working with vision-language models, covering fine-tuning and generation workflows for multimodal tasks.
 
-### Fine-tuning
+### Fine-Tuning
 
 Vision-language model fine-tuning recipes.
 
