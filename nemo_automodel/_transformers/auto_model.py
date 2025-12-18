@@ -218,18 +218,19 @@ def _verify_sdpa_support(model, is_hf_model, cp_size):
 
 
 def _download_model_weights(hf_config, pretrained_model_name_or_path):
-    if (not dist.is_initialized() or get_local_rank_preinit() == 0) and not os.path.isdir(
-        pretrained_model_name_or_path
-    ):
-        num_nodes = (get_world_size_safe() % get_local_world_size_preinit()) + 1  # 1-indexed
-        if num_nodes > 1:
-            logging.info(
-                f"""Downloading model weights on {num_nodes} nodes. This incurs high storage usage. 
-                It is recommended to download once with `hf download` and pass in the downloaded path to the `pretrained_model_name_or_path` argument."""
-            )
-        # Import via module reference (vs bound name) so unit tests can patch
-        # `nemo_automodel.components.distributed.utils.FirstRankPerNode`.
-        with dist_utils.FirstRankPerNode():
+    if os.path.isdir(pretrained_model_name_or_path):
+        return
+    # Import via module reference (vs bound name) so unit tests can patch
+    # `nemo_automodel.components.distributed.utils.FirstRankPerNode`.
+    with dist_utils.FirstRankPerNode():
+        if (not dist.is_initialized() or get_local_rank_preinit() == 0):
+            num_nodes = (get_world_size_safe() % get_local_world_size_preinit()) + 1  # 1-indexed
+            if num_nodes > 1:
+                logging.info(
+                    f"""Downloading model weights on {num_nodes} nodes. This incurs high storage usage.
+                    It is recommended to download once with `hf download` and pass in the downloaded
+                    path to the `pretrained_model_name_or_path` argument."""
+                )
             _get_resolved_checkpoint_files(
                 pretrained_model_name_or_path=pretrained_model_name_or_path,
                 subfolder="",
