@@ -109,7 +109,7 @@ fineweb_edu/
     └── fineweb_edu_10bt.val.jsonl
 ```
 
-## Preprocess to a Megatron-Core Dataset
+## Preprocess to a Megatron Core Dataset
 NeMo AutoModel provides tooling to perform the task of tokenizing and saving in the Megatron-Core dataset format. This can be used as follows:
 
 ```
