@@ -158,7 +158,7 @@ Replace `--workers` with the amount of CPU cores you'd like to use to tokenize i
 
 ## Use a Recipe for Pretraining
 
-This example demonstrates how to perform pretraining on a large language model using NVIDIA's NeMo Automodel library. We use the LLM [training recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py), specifically `TrainFinetuneRecipeForNextTokenPrediction`, which orchestrates the pretraining process end-to-end: model loading, dataset preparation, optimizer setup, distributed training, checkpointing, and logging.
+This example demonstrates how to perform pretraining on a large language model using NVIDIA's NeMo Automodel library. We use the LLM [training recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py), specifically `TrainFinetuneRecipeForNextTokenPrediction`, which orchestrates the pretraining process — including loading, dataset preparation, optimizer setup, distributed training, checkpointing, and logging.
 
 ### What is a Recipe?
 
