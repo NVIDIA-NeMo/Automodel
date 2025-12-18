@@ -32,8 +32,8 @@ try:
         NeMoAutoModelForImageTextToText,
         NeMoAutoModelForSequenceClassification,
         NeMoAutoModelForTextToWaveform,
-        NeMoAutoTokenizer,
     )  # noqa: I001
+    from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 
     globals()["NeMoAutoModelForCausalLM"] = NeMoAutoModelForCausalLM
     globals()["NeMoAutoModelForImageTextToText"] = NeMoAutoModelForImageTextToText
