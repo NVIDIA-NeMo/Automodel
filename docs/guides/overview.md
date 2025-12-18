@@ -53,7 +53,7 @@ This section provides practical recipes and configurations for working with visi
 
 ### Fine-Tuning
 
-Vision-language model fine-tuning recipes.
+Fine-tuning recipes for VLMs.
 
 - Folder: [examples/vlm_finetune](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/vlm_finetune)
 - Representative family: Gemma 3 (various configurations)
