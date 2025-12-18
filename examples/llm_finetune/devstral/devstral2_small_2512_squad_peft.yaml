@@ -1,7 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,7 +19,7 @@
 
 step_scheduler:
   global_batch_size: 64
-  local_batch_size: 8
+  local_batch_size: 1
   ckpt_every_steps: 200
   val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 1
@@ -36,7 +35,16 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: mistralai/Devstral-Small-2-24B-Instruct-2512
+  pretrained_model_name_or_path: akoumpa/Devstral-Small-2-24B-Instruct-2512-BF16
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: True
+  dim: 8
+  alpha: 32
+  use_triton: True
+  # dtype needs a fix to resolve to type instead of string
+  # lora_dtype: torch.bfloat16
 
 checkpoint:
   enabled: true
@@ -56,8 +64,8 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: train
 
 packed_sequence:
@@ -69,11 +77,12 @@ dataloader:
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
   shuffle: true
 
+
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: validation
-  num_samples_limit: 64
+  limit_dataset_samples: 64
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -86,6 +95,10 @@ optimizer:
   lr: 1.0e-5
   weight_decay: 0
   # min_lr: 1.0e-5
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 1.0e-6
 
 # Uncomment and configure for W&B logging
 # wandb:
