@@ -47,6 +47,7 @@ from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
 
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
+
 logger = logging.getLogger(__name__)
 
 
@@ -468,8 +469,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         patch it with Liger or SDPA-optimized kernels.
 
         Args:
-            config (transformers.PretrainedConfig):
+            config (transformers.PretrainedConfig | str):
                 The configuration object used to build the model.
+                If config is passed as a string (e.g., model-id / local checkpoint),
+                it will be create a config internally using AutoConfig.
             *model_args:
                 Positional arguments forwarded to the underlying
                 ``transformers.AutoModelForCausalLM.from_config`` call.
@@ -532,6 +535,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 **kwargs,
             )
 
+        # handle model_id passed as config
+        if isinstance(config, str):
+            config = AutoConfig.from_pretrained(config, trust_remote_code=kwargs.get("trust_remote_code", False))
         # 1. if force_hf is True, we will use the parent class to load and return the model as is
         if force_hf:
             return cls._from_config_parent_class(
