@@ -3,6 +3,6 @@ docker/ @nvidia-nemo/automation
 pyproject.toml @nvidia-nemo/automation
 
 docs @akoumpa @jgerh
-nemo_automodel @akoumpa @HuiyingLi @adil-a @hemildesai @ybabakhin @shan-nvidia @rnyak @oliverholworthy
-examples @akoumpa @HuiyingLi @adil-a @hemildesai @ybabakhin @shan-nvidia @rnyak @oliverholworthy
+nemo_automodel @akoumpa @HuiyingLi @adil-a @hemildesai @ybabakhin @shan-nvidia @rnyak @oliverholworthy @gabrielspmoreira
+examples @akoumpa @HuiyingLi @adil-a @hemildesai @ybabakhin @shan-nvidia @rnyak @oliverholworthy @gabrielspmoreira
 README.md @akoumpa @HuiyingLi
