@@ -14,7 +14,7 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm_pretrain/pretrain.py --config recipes/llm_pretrain/megatron_pretrain.yaml
+# torchrun --nproc-per-node=8 examples/llm_pretrain/pretrain.py --config examples/llm_pretrain/megatron_pretrain_gpt2.yaml
 # Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
 

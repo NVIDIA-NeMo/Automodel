@@ -17,7 +17,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 
-def main(default_config_path="examples/llm/nanogpt_pretrain.yaml"):
+def main(default_config_path="examples/llm_pretrain/nanogpt_pretrain.yaml"):
     """Entry-point for launching NanoGPT-style pre-training.
 
     The script follows the same invocation pattern as *examples/llm_finetune/finetune.py*:
