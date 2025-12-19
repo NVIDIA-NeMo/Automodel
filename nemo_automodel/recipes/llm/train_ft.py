@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 import torch
 import torch.nn as nn
 import wandb
+from huggingface_hub import constants as hf_constants
 from torch.distributed.device_mesh import DeviceMesh
 from torch.utils.data import DataLoader, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
@@ -32,8 +33,7 @@ from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoConfig
 from transformers.modeling_utils import no_init_weights
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
-from transformers.utils.hub import TRANSFORMERS_CACHE
+from transformers.utils import ContextManagers
 from wandb import Settings
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -172,9 +172,13 @@ def build_model_and_optimizer(
         "force_hf", False
     )
 
-    init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
     with ScopedRNG(seed=seed, ranked=True):
-        kwargs = {"tp_size": tp_size, "cp_size": cp_size, "has_packed_sequence": has_packed_sequence}
+        if cfg_model.get_as_string("_target_", "").startswith("transformers"):
+            is_meta_device = False
+            kwargs = {}
+        else:
+            kwargs = {"tp_size": tp_size, "cp_size": cp_size, "has_packed_sequence": has_packed_sequence}
+        init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
 
         if cfg_quantization is not None:
             logger.info("Model weight quantization enabled with BitsAndBytes")
@@ -255,7 +259,7 @@ def build_model_and_optimizer(
                 checkpointer.load_base_model(
                     mp,
                     device,
-                    cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
+                    cfg_model.get("cache_dir", hf_constants.HF_HUB_CACHE),
                     _get_model_name(cfg_model),
                     getattr(cfg_peft, "lora_A_init", None),
                     load_base_model=load_base_model,
@@ -319,7 +323,7 @@ def build_model_and_optimizer(
             checkpointer.load_base_model(
                 model,
                 device,
-                cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
+                cfg_model.get("cache_dir", hf_constants.HF_HUB_CACHE),
                 _get_model_name(cfg_model),
                 getattr(cfg_peft, "lora_A_init", None),
                 load_base_model=load_base_model,
@@ -376,7 +380,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         checkpoint_dir="checkpoints/",
         model_save_format="safetensors",
         model_repo_id=model_repo_id,
-        model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
+        model_cache_dir=cache_dir if cache_dir is not None else hf_constants.HF_HUB_CACHE,
         save_consolidated=True,
         is_peft=is_peft,
     )
