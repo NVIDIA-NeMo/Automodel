@@ -2,6 +2,7 @@
 docker/ @nvidia-nemo/automation
 pyproject.toml @nvidia-nemo/automation
 
+docs @akoumpa @jgerh
 nemo_automodel @akoumpa @HuiyingLi @adil-a @hemildesai @ybabakhin @shan-nvidia
 examples @akoumpa @HuiyingLi @adil-a @hemildesai @ybabakhin @shan-nvidia
 README.md @akoumpa @HuiyingLi
