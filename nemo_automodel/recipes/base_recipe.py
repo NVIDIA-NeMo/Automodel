@@ -288,6 +288,7 @@ class BaseRecipe:
         that points to `target_dir`.
         Assumes caller ensures rank 0 if needed.
         """
+        return
         ckpt_root = self.checkpointer.config.checkpoint_dir
         link_path = os.path.join(ckpt_root, link_name)
         if os.path.lexists(link_path):
