@@ -72,12 +72,13 @@ class NeMoAutoTokenizer(AutoTokenizer):
         tokenizer_kwargs: Optional[dict[str, Any]] = None,
         **kwargs,
     ) -> Union[str, list[int], list[str], list[list[int]], transformers.tokenization_utils_base.BatchEncoding]:
-        if not self.supports_system_role and conversation[0].get("role", None) == "system":
-            if not any(map(lambda x: x.get("role", None) == "system", conversation[1:])):
+        if not self.supports_system_role:
+            if conversation[0].get("role", None) == "system" \
+                and not any(map(lambda x: x.get("role", None) == "system", conversation[1:])):
                 # in this case we will drop the first message
                 conversation = conversation[1:]
             else:
-                raise ValueError("System role appeared in multiple messages.")
+                raise ValueError("System role appears in multiple messages.")
 
         return super().apply_chat_template(
             conversation,
