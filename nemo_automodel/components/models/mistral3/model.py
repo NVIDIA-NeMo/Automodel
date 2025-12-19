@@ -12,14 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
-import types
 from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
 from torch import nn
-from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoModelForImageTextToText
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 
@@ -554,71 +552,61 @@ class Ministral3ForCausalLM(Ministral3PreTrainedModel, GenerationMixin):
 
 
 # -----------------------------------------------------------------------------
-# Register modules into transformers namespace for AutoModel
+# Register Ministral3 with transformers Auto classes
 # -----------------------------------------------------------------------------
-mod_pkg = sys.modules.setdefault("transformers.models.ministral3", types.ModuleType("transformers.models.ministral3"))
-config_mod = types.ModuleType("transformers.models.ministral3.configuration_ministral3")
-modeling_mod = types.ModuleType("transformers.models.ministral3.modeling_ministral3")
+def _register_ministral3_with_transformers():
+    """
+    Register Ministral3Config and models with transformers Auto classes.
 
-config_mod.Ministral3Config = Ministral3Config
-config_mod.__all__ = ["Ministral3Config"]
-modeling_mod.Ministral3Config = Ministral3Config
-modeling_mod.Ministral3PreTrainedModel = Ministral3PreTrainedModel
-modeling_mod.Ministral3Model = Ministral3Model
-modeling_mod.Ministral3ForCausalLM = Ministral3ForCausalLM
-modeling_mod.__all__ = [
-    "Ministral3Config",
-    "Ministral3PreTrainedModel",
-    "Ministral3Model",
-    "Ministral3ForCausalLM",
-]
+    This uses the official transformers registration API. Registration is idempotent
+    (re-registering the same config/model is a no-op in recent transformers versions).
+    """
+    import logging
 
-sys.modules["transformers.models.ministral3.configuration_ministral3"] = config_mod
-sys.modules["transformers.models.ministral3.modeling_ministral3"] = modeling_mod
-setattr(mod_pkg, "configuration_ministral3", config_mod)
-setattr(mod_pkg, "modeling_ministral3", modeling_mod)
+    _logger = logging.getLogger(__name__)
 
-# Monkeypatch AutoModel.from_config so text_config with model_type=ministral3 resolves here
-_orig_auto_from_config = AutoModel.from_config
+    # Register config with AutoConfig
+    if "ministral3" not in CONFIG_MAPPING:
+        try:
+            AutoConfig.register("ministral3", Ministral3Config)
+        except ValueError as e:
+            # Already registered (can happen on reimport)
+            _logger.debug(f"Ministral3Config registration skipped: {e}")
 
+    # Register models with Auto classes
+    # Note: AutoModel.register / AutoModelForCausalLM.register will raise if
+    # the config is already mapped to a different model class, but that's the
+    # desired behavior (fail loudly rather than silently override).
+    try:
+        AutoModel.register(Ministral3Config, Ministral3Model)
+    except ValueError as e:
+        _logger.debug(f"Ministral3Model registration skipped: {e}")
 
-def _patched_from_config(cls, config, *model_args, **kwargs):
-    if getattr(config, "model_type", None) == "ministral3":
-        return Ministral3Model(config)
-    return _orig_auto_from_config.__func__(cls, config, *model_args, **kwargs)
+    try:
+        AutoModelForCausalLM.register(Ministral3Config, Ministral3ForCausalLM)
+    except ValueError as e:
+        _logger.debug(f"Ministral3ForCausalLM registration skipped: {e}")
 
+    # Register HuggingFace's Mistral3ForConditionalGeneration with Auto classes.
+    # HF's _from_config uses torch.set_default_dtype() context manager, so dtype
+    # should be handled correctly when torch_dtype is passed to from_config().
+    try:
+        AutoModelForCausalLM.register(HFMistral3Config, Mistral3ForConditionalGeneration)
+    except ValueError as e:
+        _logger.debug(f"Mistral3ForConditionalGeneration (CausalLM) registration skipped: {e}")
 
-AutoModel.from_config = classmethod(_patched_from_config)
-
-
-# Register config with AutoConfig so CONFIG_MAPPING recognizes it
-try:
-    AutoConfig.register("ministral3", Ministral3Config)
-except Exception:
-    pass
-# Also ensure CONFIG_MAPPING has the entry (older HF versions)
-try:
-    CONFIG_MAPPING.register("ministral3", Ministral3Config)
-except Exception:
-    pass
-# Register model mappings so HF Auto classes can resolve Ministral3 and HF mistral3
-try:
-    AutoModel.register(Ministral3Config, Ministral3Model)
-except Exception:
-    pass
-try:
-    AutoModelForCausalLM.register(Ministral3Config, Ministral3ForCausalLM)
-except Exception:
-    pass
-# Register for HF mistral3 config to avoid AutoModelForCausalLM errors
-try:
-    AutoModel.register(HFMistral3Config, Mistral3ForConditionalGeneration)
-except Exception:
-    pass
-try:
-    AutoModelForCausalLM.register(HFMistral3Config, Mistral3ForConditionalGeneration)
-except Exception:
-    pass
+    try:
+        AutoModelForImageTextToText.register(HFMistral3Config, Mistral3ForConditionalGeneration)
+    except ValueError as e:
+        _logger.debug(f"Mistral3ForConditionalGeneration (ImageTextToText) registration skipped: {e}")
 
 
-ModelClass = [Mistral3ForConditionalGeneration, Ministral3ForCausalLM]
+# Perform registration at module import time
+_register_ministral3_with_transformers()
+
+# Export ModelClass for discovery by nemo_automodel's ModelRegistry
+# Note: We intentionally do NOT export Mistral3ForConditionalGeneration here.
+# If exported, ModelRegistry would bypass HF's _from_config which handles torch_dtype
+# via torch.set_default_dtype() context. By not exporting it, the model goes through
+# HF's Auto class path which properly respects torch_dtype.
+ModelClass = Ministral3ForCausalLM

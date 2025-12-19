@@ -17,7 +17,8 @@ from unittest.mock import patch
 
 from transformers.tokenization_utils_base import BatchEncoding
 
-from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer, _add_token
+from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
+from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import _add_token
 
 
 class _StubHFTokenizer:
