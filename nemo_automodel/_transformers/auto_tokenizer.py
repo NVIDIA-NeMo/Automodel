@@ -73,8 +73,9 @@ class NeMoAutoTokenizer(AutoTokenizer):
         **kwargs,
     ) -> Union[str, list[int], list[str], list[list[int]], transformers.tokenization_utils_base.BatchEncoding]:
         if not self.supports_system_role:
-            if conversation[0].get("role", None) == "system" \
-                and not any(map(lambda x: x.get("role", None) == "system", conversation[1:])):
+            if conversation[0].get("role", None) == "system" and not any(
+                map(lambda x: x.get("role", None) == "system", conversation[1:])
+            ):
                 # in this case we will drop the first message
                 conversation = conversation[1:]
             else:
