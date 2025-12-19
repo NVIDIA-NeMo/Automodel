@@ -50,7 +50,6 @@ from transformers.models.llama.modeling_llama import (
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
-from transformers.utils.generic import check_model_inputs
 
 from nemo_automodel.components.models.common.combined_projection import (
     CombinedGateUpMLP,
@@ -58,9 +57,12 @@ from nemo_automodel.components.models.common.combined_projection import (
 )
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
 from nemo_automodel.shared.utils import dtype_from_str
 
 __all__ = ["build_llama_model", "LlamaForCausalLM"]
+
+check_model_inputs = get_check_model_inputs_decorator()
 
 
 class LlamaAttention(CombinedQKVAttentionMixin, nn.Module):
