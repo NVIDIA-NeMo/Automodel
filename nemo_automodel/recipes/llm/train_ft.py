@@ -882,6 +882,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         apply_cache_compatibility_patches()
         # Set up the stateful random number generator
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
+        # Enable NVTX patching only when explicitly requested in config
+        self.enable_nvtx = bool(self.cfg.get("nvtx", False))
 
         self.device_mesh = None
         self.moe_mesh = None
@@ -1018,16 +1020,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
             self.pp = model
-            import nemo_automodel.autonvtx as autonvtx
+            if self.enable_nvtx:
+                import nemo_automodel.autonvtx as autonvtx
 
-            # Patch each pipeline stage with NVTX profiling
-            for i, part in enumerate(self.model_parts):
-                autonvtx.patch(part, name=f"PipelineStage_{i}")
+                # Patch each pipeline stage with NVTX profiling
+                for i, part in enumerate(self.model_parts):
+                    autonvtx.patch(part, name=f"PipelineStage_{i}")
         else:
-            import nemo_automodel.autonvtx as autonvtx
+            if self.enable_nvtx:
+                import nemo_automodel.autonvtx as autonvtx
 
-            # Patch model with NVTX profiling
-            autonvtx.patch(model, name=model.__class__.__name__)
+                # Patch model with NVTX profiling
+                autonvtx.patch(model, name=model.__class__.__name__)
             self.model_parts = [model]
             self.pp = None
 
