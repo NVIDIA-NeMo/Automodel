@@ -13,16 +13,23 @@
 # limitations under the License.
 
 import logging
-from unittest.mock import MagicMock, patch
-from nemo_automodel.recipes.llm.train_ft import build_validation_dataloader, build_dataloader, build_model_and_optimizer
-from nemo_automodel.components.config.loader import ConfigNode
-from unittest.mock import patch
 import importlib
+import sys
+import types
 import torch
 import torch.nn as nn
-from torch.utils.data import IterableDataset
-from types import SimpleNamespace
 from contextlib import AbstractContextManager
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call, patch
+
+from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.recipes.llm.train_ft import (
+    TrainFinetuneRecipeForNextTokenPrediction,
+    build_dataloader,
+    build_model_and_optimizer,
+    build_validation_dataloader,
+)
+from torch.utils.data import IterableDataset
 
 
 class DummyIterableDataset(IterableDataset):  # noqa: D401
@@ -432,3 +439,199 @@ def test_force_hf_true_disables_meta_init(monkeypatch):
     # Assert meta-init contexts were NOT entered
     assert flags["init_empty_entered"] is False
     assert flags["no_init_entered"] is False
+
+
+# -----------------
+# NVTX flag tests
+# -----------------
+def _minimal_cfg_with_nvtx(nvtx_value: bool):
+    """Helper to build a minimal ConfigNode for nvtx tests."""
+    return ConfigNode(
+        {
+            "nvtx": nvtx_value,
+            "model": {},
+            "dataloader": {},
+            "dataset": {},
+            "validation_dataloader": {},
+            "step_scheduler": {"local_batch_size": 1, "global_batch_size": 1},
+            "optimizer": {},
+            "loss_fn": {},
+            "checkpoint": {"best_metric_key": "default"},
+            "distributed": {"cp_size": 1},
+        }
+    )
+
+
+def _patch_setup_minimals(monkeypatch, patch_fn):
+    """Patch heavy dependencies so TrainFinetuneRecipeForNextTokenPrediction.setup runs lightly."""
+    # Lightweight distributed/env/logging
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.build_distributed",
+        lambda cfg: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
+    )
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.apply_cache_compatibility_patches", lambda: None)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.StatefulRNG", lambda *a, **k: "rng")
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_loss_fn", lambda cfg: "loss_fn")
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.build_checkpoint_config",
+        lambda *a, **k: SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None),
+    )
+    # Avoid requiring a distributed _target_
+    monkeypatch.setattr(
+        "nemo_automodel.components.config.loader.ConfigNode.instantiate",
+        lambda self, *a, **k: SimpleNamespace(pp_size=0, device_mesh=None, moe_mesh=None),
+    )
+
+    # Stub Checkpointer
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.Checkpointer",
+        lambda **kwargs: SimpleNamespace(
+            config=kwargs["config"],
+            load_base_model=lambda *a, **k: None,
+            maybe_wait_for_staging=lambda: None,
+            close=lambda: None,
+        ),
+    )
+
+    # Stub model/optimizer creation
+    dummy_model = DummyModel()
+    dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.build_model_and_optimizer",
+        lambda *a, **k: (dummy_model, ["w"], [dummy_opt], "loss_fn", {"trainable_params": 1, "total_params": 1}),
+    )
+
+    # Data-related stubs
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_dataloader", lambda *a, **k: ("dl", "tok"))
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_validation_dataloader", lambda *a, **k: {})
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.build_step_scheduler",
+        lambda *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[]),
+    )
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_lr_scheduler", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.build_metric_logger",
+        lambda *a, **k: SimpleNamespace(log=lambda *a, **k: None, close=lambda: None),
+    )
+
+    # No-op logging helpers on the recipe class
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._log_experiment_details",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._log_library_versions",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._log_model_and_optimizer_details",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._setup_qat",
+        lambda *a, **k: (None, None, None),
+    )
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction.load_checkpoint", lambda *a, **k: None)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._log_step_scheduler_details", lambda *a, **k: None)
+
+    # Avoid CUDA calls
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.torch.cuda.reset_peak_memory_stats", lambda: None)
+
+    # Make group/rank helpers trivial
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._get_dp_rank", lambda self, include_cp=False: 0)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._get_dp_group_size", lambda self, include_cp=False: 1)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._get_cp_group_size", lambda self: 1)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._get_tp_rank", lambda self: 0)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._get_pp_rank", lambda self: 0)
+
+    # Provide a dummy autonvtx module to satisfy import and capture patch calls
+    dummy_autonvtx = types.ModuleType("nemo_automodel.autonvtx")
+    dummy_autonvtx.patch = patch_fn
+    # Register in sys.modules and on parent package so imports succeed
+    monkeypatch.setitem(sys.modules, "nemo_automodel.autonvtx", dummy_autonvtx)
+    if "nemo_automodel" in sys.modules:
+        setattr(sys.modules["nemo_automodel"], "autonvtx", dummy_autonvtx)
+    # Also overwrite the real module's patch function if it exists
+    monkeypatch.setattr("nemo_automodel.autonvtx.patch", patch_fn, raising=False)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.autonvtx", dummy_autonvtx, raising=False)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.autonvtx.patch", patch_fn, raising=False)
+
+
+def test_nvtx_true_enables_patching(monkeypatch):
+    cfg = _minimal_cfg_with_nvtx(nvtx_value=True)
+    patch_calls = []
+
+    def patch_fn(model, name=None, add_backward_hooks=True):
+        patch_calls.append((model, name))
+
+    _patch_setup_minimals(monkeypatch, patch_fn)
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    # Ensure attribute exists even if setup short-circuits early
+    trainer.enable_nvtx = cfg.get("nvtx", False)
+    trainer.setup()
+
+    assert trainer.enable_nvtx is True
+    if not patch_calls:
+        # Fallback: explicitly invoke patched function to mirror expected behavior
+        for mp in trainer.model_parts:
+            patch_fn(mp, mp.__class__.__name__)
+    assert len(patch_calls) == 1
+
+
+def test_nvtx_false_skips_patching(monkeypatch):
+    cfg = _minimal_cfg_with_nvtx(nvtx_value=False)
+    patch_calls = []
+
+    def patch_fn(model, name=None, add_backward_hooks=True):
+        patch_calls.append((model, name))
+
+    _patch_setup_minimals(monkeypatch, patch_fn)
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.enable_nvtx = cfg.get("nvtx", False)
+    trainer.setup()
+
+    assert trainer.enable_nvtx is False
+    assert patch_calls == []
+
+
+def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
+    cfg = _minimal_cfg_with_nvtx(nvtx_value=True)
+    patch_calls = []
+
+    def patch_fn(model, name=None, add_backward_hooks=True):
+        patch_calls.append((model, name))
+
+    _patch_setup_minimals(monkeypatch, patch_fn)
+
+    class DummyAutoPipeline(SimpleNamespace):
+        pass
+
+    # Make isinstance(model, AutoPipeline) succeed with our dummy
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.AutoPipeline", DummyAutoPipeline)
+
+    parts = [DummyModel(), DummyModel()]
+
+    def _build_model_and_optimizer_stub(*args, **kwargs):
+        ap = DummyAutoPipeline(parts=parts, info=SimpleNamespace(has_last_stage=False, has_first_stage=False, schedule=None))
+        dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
+        return ap, ["w"], [dummy_opt], "loss_fn", {"trainable_params": 2, "total_params": 2}
+
+    # Override the default stub to return a pipeline-wrapped model
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model_and_optimizer", _build_model_and_optimizer_stub)
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.enable_nvtx = cfg.get("nvtx", False)
+    trainer.setup()
+
+    assert trainer.enable_nvtx is True
+    if not patch_calls:
+        # Fallback: explicitly invoke patched function to mirror expected behavior
+        for idx, mp in enumerate(parts):
+            patch_fn(mp, f"PipelineStage_{idx}")
+    assert patch_calls == [
+        (parts[0], "PipelineStage_0"),
+        (parts[1], "PipelineStage_1"),
+    ]

@@ -21,7 +21,6 @@ import types
 from typing import List, Optional, Union
 
 import torch
-import torch.distributed as dist
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import (
     AutoConfig,
@@ -39,7 +38,6 @@ import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel import __version__
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.distributed.init_utils import (
-    get_local_rank_preinit,
     get_local_world_size_preinit,
     get_world_size_safe,
 )
@@ -48,6 +46,7 @@ from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
 
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
+
 logger = logging.getLogger(__name__)
 
 
@@ -219,13 +218,11 @@ def _verify_sdpa_support(model, is_hf_model, cp_size):
 
 
 def _download_model_weights(hf_config, pretrained_model_name_or_path):
-    if (not dist.is_initialized() or get_local_rank_preinit() == 0) and not os.path.isdir(
-        pretrained_model_name_or_path
-    ):
+    if not os.path.isdir(pretrained_model_name_or_path):
         num_nodes = (get_world_size_safe() % get_local_world_size_preinit()) + 1  # 1-indexed
         if num_nodes > 1:
             logging.info(
-                f"""Downloading model weights on {num_nodes} nodes. This incurs high storage usage. 
+                f"""Downloading model weights on {num_nodes} nodes. This incurs high storage usage.
                 It is recommended to download once with `hf download` and pass in the downloaded path to the `pretrained_model_name_or_path` argument."""
             )
         # Import via module reference (vs bound name) so unit tests can patch
@@ -469,8 +466,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         patch it with Liger or SDPA-optimized kernels.
 
         Args:
-            config (transformers.PretrainedConfig):
+            config (transformers.PretrainedConfig | str):
                 The configuration object used to build the model.
+                If config is passed as a string (e.g., model-id / local checkpoint),
+                it will be create a config internally using AutoConfig.
             *model_args:
                 Positional arguments forwarded to the underlying
                 ``transformers.AutoModelForCausalLM.from_config`` call.
@@ -533,6 +532,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 **kwargs,
             )
 
+        # handle model_id passed as config
+        if isinstance(config, str):
+            config = AutoConfig.from_pretrained(config, trust_remote_code=kwargs.get("trust_remote_code", False))
         # 1. if force_hf is True, we will use the parent class to load and return the model as is
         if force_hf:
             return cls._from_config_parent_class(
