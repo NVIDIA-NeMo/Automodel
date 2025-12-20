@@ -44,14 +44,16 @@ from transformers.models.llama.modeling_llama import (
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, logging
-from transformers.utils.generic import check_model_inputs
 
 try:
     from nemo_automodel.components.models.biencoder.state_dict_adapter import BiencoderStateDictAdapter
 except ImportError:
     BiencoderStateDictAdapter = object
 
+from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
+
 logger = logging.get_logger(__name__)
+check_model_inputs = get_check_model_inputs_decorator()
 
 
 def contrastive_scores_and_labels(
@@ -177,7 +179,7 @@ class LlamaBidirectionalModel(LlamaModel):
             return attention_mask
         return None
 
-    @check_model_inputs()
+    @check_model_inputs
     @auto_docstring
     def forward(
         self,
