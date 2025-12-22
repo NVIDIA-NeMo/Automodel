@@ -195,7 +195,7 @@ dataset:
 - **Megatron (pretraining; interoperable with pre-tokenized Megatron data)**
   - Class: `nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining`
   - Use case: large-scale LM pretraining over Megatron-LM formatted tokenized corpora
-  - Interoperability: if your corpus has already been tokenized/indexed for Megatron (i.e., `.bin`/`.idx` pairs), you can point Automodel to those assets directly; no re-tokenization required
+  - Interoperability: If your corpus has already been tokenized/indexed for Megatron (i.e., `.bin`/`.idx` pairs), you can point Automodel to those assets directly. No re-tokenization required.
   - Key args: `paths` (single path, glob, weighted list, or per-split dict), `seq_length`, `tokenizer`, `split`, `index_mapping_dir`, `splits_to_build`
   - Example YAML:
 ```yaml
