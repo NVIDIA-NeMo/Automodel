@@ -57,7 +57,7 @@ dataset:
   answer_only_loss_mask: true
   start_of_turn_token: "<|assistant|>"
 ```
-  - See the detailed guide, [Column-Mapped Text Instruction Dataset](llm/column-mapped-text-instruction-dataset.md), for more information.
+See the detailed guide, [Column-Mapped Text Instruction Dataset](llm/column-mapped-text-instruction-dataset.md), for more information.
 
 - **ChatDataset (multi-turn conversations and tool calling)**
   - Class: `nemo_automodel.components.datasets.llm.ChatDataset`
@@ -183,7 +183,7 @@ dataset:
   ]
 }
 ```
-  - See the [Function Calling guide](llm/toolcalling.md) for an end-to-end example with FunctionGemma.
+See the [Function Calling guide](llm/toolcalling.md) for an end-to-end example with FunctionGemma.
 
 - **NanoGPT Binary Shards (pretraining)**
   - Class: `nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset`
@@ -210,7 +210,7 @@ dataset:
   split: "0.99, 0.01, 0.00"  # train, validation, test
   splits_to_build: "train"
 ```
- - See the detailed pretraining guide, [Megatron MCore Pretraining](llm/mcore-pretraining.md), which uses MegatronPretraining data.
+See the detailed pretraining guide, [Megatron MCore Pretraining](llm/mcore-pretraining.md), which uses MegatronPretraining data.
 
 ## Packed Sequence Support
 To reduce padding and improve throughput with variable-length sequences:
