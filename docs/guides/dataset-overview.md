@@ -313,7 +313,7 @@ dataset:
 Where `build_my_dataset` returns either a `datasets.Dataset` or a list/iterator of conversation dicts (for VLM).
 
 ### 3) Use ColumnMappedTextInstructionDataset for most instruction datasets (LLM)
-- Ideal when your data has columns like `instruction`, `input`, `output` but with arbitrary names
+- Ideal when your data has columns like `instruction`, `input`, or `output` but with arbitrary names
 - Supports local JSON/JSONL and HF Hub
 ```yaml
 dataset:
