@@ -23,7 +23,7 @@ dataset:
   split: train
 ```
 
-- **SQuAD-style QA (instruction SFT)**
+- **SQuAD-style Question Answering (QA) (instruction SFT)**
   - Factory: `nemo_automodel.components.datasets.llm.squad.make_squad_dataset`
   - Use case: instruction/QA tuning with either prompt+answer formatting or chat-template formatting
   - Notes:
