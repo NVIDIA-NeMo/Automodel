@@ -65,7 +65,7 @@ dataset:
   - Sources: local JSON/JSONL or Hugging Face Hub dataset ID
   - Key args:
     - `path_or_dataset_id`: path to local file(s) or HuggingFace dataset ID
-    - `tokenizer`: tokenizer instance (required; must have chat template support)
+    - `tokenizer`: tokenizer instance (required. Must have chat template support)
     - `split`: dataset split (e.g., "train", "validation")
     - `name`: dataset configuration/subset name
     - `seq_length`: maximum sequence length for padding/truncation
