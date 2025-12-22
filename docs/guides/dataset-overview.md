@@ -236,7 +236,7 @@ VLM datasets are represented as conversations (message lists) that combine text 
 Built-in dataset makers (return lists of `conversation` dicts):
 - **RDR items**: `nemo_automodel.components.datasets.vlm.datasets.make_rdr_dataset` (HF: `quintend/rdr-items`)
 - **CORD-V2 receipts (Consolidated Receipt Dataset for Post-OCR Parsing)**: `nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset` (HF: `naver-clova-ix/cord-v2`)
-- **MedPix-VQA (medical)**: `nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset`
+- **MedPix-VQA (Medical Pixel Question Answering)**: `nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset`
 - **CommonVoice 17 (CV17) (audio)**: `nemo_automodel.components.datasets.vlm.datasets.make_cv17_dataset`
 
 
