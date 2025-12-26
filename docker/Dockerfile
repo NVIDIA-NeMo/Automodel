@@ -69,6 +69,9 @@ FROM update_base_container AS automodel_dep
 # Install Grouped Gemm
 RUN pip install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
 
+# Install Liger Kernel
+RUN pip install git+https://github.com/linkedin/Liger-Kernel.git@49e63538e64b00780e424e34bc4f193dcfeba75c
+
 # Install Mamba
 ARG INSTALL_MAMBA=False
 ARG MAMBA_COMMIT=6b32be06d026e170b3fdaf3ae6282c5a6ff57b06
