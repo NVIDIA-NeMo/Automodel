@@ -208,7 +208,9 @@ class FSDP2Manager:
         self.dp_shard_size = self.dp_size // self.dp_replicate_size
 
         self.device_mesh = self._get_device_mesh()
-        self.moe_mesh = self._get_moe_mesh() if self.ep_size > 1 else None
+        # Always create the MoE mesh, even when ep_size == 1.
+        # This allows DeepEP to still initialize its EP process groups/dispatcher on a 1-way EP axis.
+        self.moe_mesh = self._get_moe_mesh()
 
         return self
 

@@ -327,13 +327,14 @@ def split_model_into_stages(
                             setattr(parent_module, name, nn.ModuleDict())
 
                 # Handle other modules
-                elif full_name not in modules_to_keep and not any(
-                    kept_name.startswith(full_name + ".") for kept_name in modules_to_keep
+                elif (
+                    full_name not in modules_to_keep
+                    and not any(kept_name.startswith(full_name + ".") for kept_name in modules_to_keep)
                 ):
                     # This module and its children are not needed
                     setattr(parent_module, name, None)
-                else:
-                    # Recursively process children
+                elif full_name not in modules_to_keep:
+                    # Recursively process children only if the module itself is not kept
                     _process_module(module, full_name)
 
         # Process the model

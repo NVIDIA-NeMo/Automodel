@@ -893,6 +893,21 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
             self.moe_mesh = getattr(self.model_wrapper, "moe_mesh", None)
 
+        # Propagate EP degree into model backend config so DeepEP can be automatically disabled for EP=1.
+        # (DeepEP token dispatchers require TPxEP > 1.)
+        ep_size = 1
+        if self.model_wrapper is not None:
+            ep_size = int(getattr(self.model_wrapper, "ep_size", 1) or 1)
+        else:
+            ep_size = int(self.cfg.get("distributed.ep_size", 1) or 1)
+
+        if hasattr(self.cfg, "model") and self.cfg.get("model.backend", None) is not None:
+            try:
+                self.cfg.model.backend.ep_size = ep_size
+            except Exception:
+                # Some configs may use a plain dict backend; best-effort only.
+                pass
+
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
             run = build_wandb(self.cfg)

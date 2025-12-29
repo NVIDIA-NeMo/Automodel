@@ -516,18 +516,26 @@ def get_hf_tp_shard_plan(model):
     # model_cls._tp_plan will override model_cls after xxxForCausalLM.post_init() (transformers==4.51.3)
     if hasattr(model_cls, "_tp_plan") and model_cls._tp_plan is not None:
         assert isinstance(model_cls._tp_plan, dict), f"model_cls._tp_plan is not a dict: {model_cls._tp_plan}"
+        logger.info(f"[DEBUG] Found model_cls._tp_plan on {model_cls.__name__}: {model_cls._tp_plan}")
         hf_tp_plan.update(model_cls._tp_plan)
 
-    if hasattr(model, "_tp_plan") and model._tp_plan is not None:
-        hf_tp_plan.update(model._tp_plan)
+    # Check if _tp_plan is set as an INSTANCE attribute (not just inherited from class)
+    if "_tp_plan" in model.__dict__ and model.__dict__["_tp_plan"] is not None:
+        logger.info(f"[DEBUG] Found model._tp_plan on instance __dict__: {model.__dict__['_tp_plan']}")
+        hf_tp_plan.update(model.__dict__["_tp_plan"])
 
+    # Check inner model's _tp_plan and add prefix
     if hasattr(inner_model, "_tp_plan") and inner_model._tp_plan is not None:
-        hf_tp_plan.update({f"{model_prefix}.{k}": v for k, v in inner_model._tp_plan.items()})
+        inner_plan_prefixed = {f"{model_prefix}.{k}": v for k, v in inner_model._tp_plan.items()}
+        logger.info(f"[DEBUG] Found inner_model._tp_plan on {type(inner_model).__name__}, prefixing with '{model_prefix}': {inner_plan_prefixed}")
+        hf_tp_plan.update(inner_plan_prefixed)
 
     assert len(hf_tp_plan) > 0, (
         f"Hugging Face tp plan is not supported for {model_cls}, please set dtensor_cfg.tensor_parallel_size to 1 or provide a custom_parallel_plan. "
         "The usage example of custom_parallel_plan can refer to `docs/design-docs/fsdp2-parallel-plan.md`."
     )
+
+    logger.info(f"[DEBUG] Final merged hf_tp_plan before translation: {hf_tp_plan}")
 
     # hf tp plan not contain embed_tokens, we add it and set to rowwise_rep
     if f"{model_prefix}.embed_tokens" not in hf_tp_plan:

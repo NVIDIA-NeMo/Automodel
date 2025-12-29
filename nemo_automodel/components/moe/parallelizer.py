@@ -56,13 +56,19 @@ class ExpertParallel(ParallelStyle):
     def _partition_fn(self, name, module, device_mesh):
         # shard on the expert dimension
         assert device_mesh.ndim == 1
+        
+        logger.info(f"[ExpertParallel._partition_fn] Called with module type: {type(module).__name__}")
 
         for name, param in module.named_parameters(recurse=False):
             dist_param = nn.Parameter(distribute_tensor(param, device_mesh, [Shard(0)]))
             module.register_parameter(name, dist_param)
 
         if isinstance(module, GroupedExpertsDeepEP):
+            logger.info(f"[ExpertParallel._partition_fn] Calling init_token_dispatcher on GroupedExpertsDeepEP")
             module.init_token_dispatcher(ep_mesh=device_mesh)
+            logger.info(f"[ExpertParallel._partition_fn] init_token_dispatcher completed")
+        else:
+            logger.warning(f"[ExpertParallel._partition_fn] Module is NOT GroupedExpertsDeepEP, it's {type(module)}")
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
         return distribute_module(
@@ -74,7 +80,7 @@ class ExpertParallel(ParallelStyle):
 
 def apply_ep(model: nn.Module, ep_mesh: DeviceMesh):
     """Applies EP to MoE module."""
-    assert ep_mesh.size() > 1
+    assert ep_mesh.size() >= 1
 
     if hasattr(model, "model") and model.model is not None:
         _model = model.model
@@ -82,12 +88,34 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh):
         _model = model
 
     for _, block in _model.layers.named_children():
-        if isinstance(block.mlp, MoE):
-            parallelize_module(
-                module=block.mlp.experts,
-                device_mesh=ep_mesh,
-                parallelize_plan=ExpertParallel(),
-            )
+        # Support both naming conventions: mlp (DeepSeek) and block_sparse_moe (Mixtral)
+        moe_module = None
+        if hasattr(block, 'mlp') and isinstance(block.mlp, MoE):
+            moe_module = block.mlp
+            logger.info(f"[apply_ep] Found MoE via block.mlp")
+        elif hasattr(block, 'block_sparse_moe') and hasattr(block.block_sparse_moe, 'moe_layer'):
+            if isinstance(block.block_sparse_moe.moe_layer, MoE):
+                moe_module = block.block_sparse_moe.moe_layer
+                logger.info(f"[apply_ep] Found MoE via block.block_sparse_moe.moe_layer")
+        
+        if moe_module is not None:
+            if ep_mesh.size() == 1:
+                # EP "init-only" mode: we still need DeepEP's token dispatcher and EP group,
+                # but we do not need to DTensor-shard parameters when the EP axis is size 1.
+                n_inited = 0
+                for m in moe_module.experts.modules():
+                    if isinstance(m, GroupedExpertsDeepEP):
+                        m.init_token_dispatcher(ep_mesh=ep_mesh)
+                        n_inited += 1
+                logger.info(f"[apply_ep] EP mesh size=1; initialized DeepEP token dispatcher for {n_inited} module(s)")
+            else:
+                logger.info(f"[apply_ep] Calling parallelize_module on experts, calling init_token_dispatcher...")
+                parallelize_module(
+                    module=moe_module.experts,
+                    device_mesh=ep_mesh,
+                    parallelize_plan=ExpertParallel(),
+                )
+                logger.info(f"[apply_ep] Experts parallelized successfully")
 
 
 def apply_ac(model: nn.Module, ignore_router: bool = False, hidden_size: int = 7168, num_experts: int = 256):
@@ -155,11 +183,19 @@ def apply_fsdp(
         _model = model
 
     for _, block in _model.layers.named_children():
-        if isinstance(block.mlp, MoE) and ep_shard_enabled:
+        # Support both naming conventions: mlp (DeepSeek) and block_sparse_moe (Mixtral)
+        moe_module = None
+        if hasattr(block, 'mlp') and isinstance(block.mlp, MoE):
+            moe_module = block.mlp
+        elif hasattr(block, 'block_sparse_moe') and hasattr(block.block_sparse_moe, 'moe_layer'):
+            if isinstance(block.block_sparse_moe.moe_layer, MoE):
+                moe_module = block.block_sparse_moe.moe_layer
+        
+        if moe_module is not None and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
             # shards than experts (dim=0).
             fully_shard(
-                block.mlp.experts,
+                moe_module.experts,
                 mesh=ep_shard_mesh,
                 shard_placement_fn=lambda _: Shard(1),
                 reshard_after_forward=reshard_after_forward,
@@ -171,8 +207,8 @@ def apply_fsdp(
         # removed from the FSDP for the transformer block due to the rules of the
         # PyTorch FSDP implementation.
         ignored_params = None
-        if isinstance(block.mlp, MoE) and ep_enabled:
-            ignored_params = set(block.mlp.experts.parameters())
+        if moe_module is not None and ep_enabled:
+            ignored_params = set(moe_module.experts.parameters())
 
         fully_shard_default(block, ignored_params=ignored_params)
 
@@ -263,14 +299,22 @@ def parallelize_model(
     if cp_enabled:
         apply_cp(model, world_mesh[cp_axis_name])
 
-    ep_enabled = ep_axis_name is not None and moe_mesh is not None and moe_mesh[ep_axis_name].size() > 1
-    if ep_enabled:
-        assert model.model.moe_config.n_routed_experts % moe_mesh[ep_axis_name].size() == 0, (
-            f"n_routed_experts {model.model.moe_config.n_routed_experts} must be divisible by "
-            f"expert_parallel_degree {moe_mesh[ep_axis_name].size()}"
-        )
+    ep_mesh = None
+    if ep_axis_name is not None and moe_mesh is not None and ep_axis_name in moe_mesh.mesh_dim_names:
+        ep_mesh = moe_mesh[ep_axis_name]
 
-        apply_ep(model, moe_mesh[ep_axis_name])
+    # Always apply EP initialization if an EP mesh is available, even when ep_size == 1.
+    # DeepEP requires the EP process group / token dispatcher even in the non-sharded case.
+    if ep_mesh is not None:
+        if ep_mesh.size() > 1:
+            assert model.model.moe_config.n_routed_experts % ep_mesh.size() == 0, (
+            f"n_routed_experts {model.model.moe_config.n_routed_experts} must be divisible by "
+            f"expert_parallel_degree {ep_mesh.size()}"
+            )
+        apply_ep(model, ep_mesh)
+
+    # "Sharded EP" toggle (used for FSDP interaction/ignored_params) remains size>1.
+    ep_enabled = ep_mesh is not None and ep_mesh.size() > 1
 
     if activation_checkpointing:
         apply_ac(model)

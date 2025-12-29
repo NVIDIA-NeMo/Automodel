@@ -31,12 +31,17 @@ class BackendConfig:
     linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     enable_deepep: bool = HAVE_DEEP_EP
+    # Expert parallel size (EP degree). DeepEP token dispatchers require TPxEP > 1,
+    # so we treat EP=1 as "DeepEP off" even if deep_ep is installed.
+    ep_size: int = 1
     fake_balanced_gate: bool = False
     enable_hf_state_dict_adapter: bool = True
     enable_fsdp_optimizations: bool = False
     gate_precision: str | torch.dtype | None = None
 
     def __post_init__(self):
+        if self.ep_size is None or self.ep_size <= 0:
+            self.ep_size = 1
         if isinstance(self.gate_precision, str):
             self.gate_precision = dtype_from_str(self.gate_precision, default=None)
 

@@ -14,6 +14,7 @@
 
 from dataclasses import dataclass
 from functools import partial
+import logging
 from typing import Literal, Optional
 
 import torch
@@ -22,6 +23,8 @@ import torch.nn.functional as F
 
 from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module
 from nemo_automodel.shared.utils import dtype_from_str
+
+logger = logging.getLogger(__name__)
 
 try:
     from torch.distributed.device_mesh import DeviceMesh
@@ -424,6 +427,7 @@ class GroupedExpertsDeepEP(nn.Module):
         super().__init__()
 
         self.config = config
+        self.n_routed_experts = config.n_routed_experts
         self.expert_bias = config.expert_bias
         self.gate_and_up_projs = nn.Parameter(
             torch.empty(config.n_routed_experts, config.dim, config.moe_inter_dim * 2)
@@ -440,8 +444,10 @@ class GroupedExpertsDeepEP(nn.Module):
         self.expert_activation = get_expert_activation_for_deepep(config)
 
     def init_token_dispatcher(self, ep_mesh: DeviceMesh):
+        logger.info(f"[GroupedExpertsDeepEP.init_token_dispatcher] CALLED! ep_mesh size: {ep_mesh.size()}")
         self.ep_size = ep_mesh.size()
         self.ep_rank = ep_mesh.get_local_rank()
+        logger.info(f"[GroupedExpertsDeepEP.init_token_dispatcher] ep_size={self.ep_size}, ep_rank={self.ep_rank}")
 
         # TODO: merge with MoEArgs
         config = MegatronMoEConfig(
@@ -464,6 +470,7 @@ class GroupedExpertsDeepEP(nn.Module):
             config=config,
             ep_group=ep_mesh.get_group(),
         )
+        logger.info(f"[GroupedExpertsDeepEP.init_token_dispatcher] token_dispatcher created successfully")
 
     def forward(
         self,
@@ -700,7 +707,7 @@ class Gate(nn.Module):
             # Add correction bias to balance tokens across gates.
             if self.e_score_correction_bias is not None:
                 correction_bias = self.e_score_correction_bias
-                scores = scores + correction_bias
+                scores = scores + correction_bias.to(scores.device)
 
             if self.n_groups > 1:
                 scores = scores.view(x.size(0), self.n_groups, -1)
@@ -914,7 +921,8 @@ class MoE(nn.Module):
             self.gate = FakeBalancedGate(config)
         else:
             self.gate = Gate(config, gate_precision=backend.gate_precision)
-        if backend.enable_deepep:
+        # DeepEP requires TPxEP > 1. For EP=1 we fall back to the non-DeepEP experts path.
+        if backend.enable_deepep and getattr(backend, "ep_size", 1) > 1:
             self.experts = GroupedExpertsDeepEP(config)
         else:
             self.experts = GroupedExperts(config)

@@ -108,5 +108,12 @@ def translate_to_lora(plan):
         RowwiseParallel: RowwiseParallelLora,
         SequenceParallel: SequenceParallelLora,
     }
-    plan.__class__ = CLS_MAP.get(type(plan), plan.__class__)
+    target_cls = CLS_MAP.get(type(plan))
+    if target_cls is not None:
+        # Create a new instance of the target class and copy state from the original plan.
+        # This avoids FrozenInstanceError when trying to assign to __class__ on frozen dataclasses.
+        # Note: We only perform this translation if LoRA is actually being used in the model.
+        new_plan = target_cls.__new__(target_cls)
+        new_plan.__dict__.update(plan.__dict__)
+        return new_plan
     return plan
