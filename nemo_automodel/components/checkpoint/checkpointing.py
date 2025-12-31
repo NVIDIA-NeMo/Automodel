@@ -860,9 +860,7 @@ def _maybe_adapt_state_dict_to_hf(
     """
     adapter = getattr(model_part, "state_dict_adapter", None)
     if adapter:
-        return adapter.to_hf(
-            state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization, **kwargs
-        )
+        return adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization, **kwargs)
     return state_dict
 
 
