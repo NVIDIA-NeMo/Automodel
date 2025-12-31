@@ -1258,10 +1258,20 @@ class TestMoE:
         assert isinstance(moe.gate, FakeBalancedGate)
         assert isinstance(moe.experts, GroupedExperts)
 
-    def test_moe_init_with_deepep(self, moe_config, backend_config):
-        """Test MoE initialization with DeepEP."""
+    def test_moe_init_with_deepep_single_device(self, moe_config, backend_config):
+        """DeepEP enabled but world size == 1 should fall back to GroupedExperts."""
         backend_config.enable_deepep = True
-        moe = MoE(moe_config, backend_config)
+        with patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=1):
+            moe = MoE(moe_config, backend_config)
+
+        assert isinstance(moe.gate, Gate)
+        assert isinstance(moe.experts, GroupedExperts)
+
+    def test_moe_init_with_deepep_multi_device(self, moe_config, backend_config):
+        """DeepEP enabled and world size > 1 should use GroupedExpertsDeepEP."""
+        backend_config.enable_deepep = True
+        with patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=2):
+            moe = MoE(moe_config, backend_config)
 
         assert isinstance(moe.gate, Gate)
         assert isinstance(moe.experts, GroupedExpertsDeepEP)
