@@ -120,6 +120,68 @@ class TestToHF:
         assert "exclude.me" not in out
 
 
+    def test_aggregates_with_device_mesh_non_dtensor(self, adapter, monkeypatch):
+        local_experts = torch.tensor(
+            [
+                [[1.0, 2.0], [3.0, 4.0]],
+                [[5.0, 6.0], [7.0, 8.0]],
+            ],
+            dtype=adapter.dtype,
+        )  # shape: [2, 2, 2]
+
+        # Only experts 1 and 2 live on this rank
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.state_dict_utils.get_expert_range_for_rank_from_mesh",
+            lambda mesh, n_experts: (1, 3),
+        )
+        # No distributed init => skip all_gather branch
+        monkeypatch.setattr("torch.distributed.is_initialized", lambda: False)
+
+        device_mesh = Mock()
+        device_mesh.mesh_dim_names = ["ep"]
+
+        state_dict = {
+            "model.language_model.layers.0.mlp.experts.gate_and_up_projs": local_experts,
+        }
+
+        out = adapter.to_hf(state_dict, device_mesh=device_mesh)
+        gate_key = "model.language_model.layers.0.mlp.experts.gate_up_proj"
+        global_gate = out[gate_key]
+
+        assert global_gate.shape == (adapter.moe_config.n_routed_experts, 2, 2)
+        # Experts 1 and 2 should be populated from local_experts; others remain zero
+        torch.testing.assert_close(global_gate[1:3], local_experts)
+        assert torch.all(global_gate[0] == 0)
+        assert torch.all(global_gate[3] == 0)
+
+
+    def test_aggregates_dtensor_path_uses_split_helper(self, adapter, monkeypatch):
+        local_slice = torch.tensor([[9.0, 10.0]], dtype=adapter.dtype)  # shape: [1, 2]
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.state_dict_utils.is_dtensor", lambda tensor: True
+        )
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.state_dict_utils.split_experts_weights_dtensor_aware",
+            lambda weight, n_experts: ([local_slice], [2]),
+        )
+        monkeypatch.setattr("torch.distributed.is_initialized", lambda: False)
+
+        device_mesh = Mock()
+        device_mesh.mesh_dim_names = ["ep"]
+
+        state_dict = {
+            "model.language_model.layers.0.mlp.experts.down_projs": torch.empty(1, 1, 2),
+        }
+
+        out = adapter.to_hf(state_dict, device_mesh=device_mesh)
+        down_key = "model.language_model.layers.0.mlp.experts.down_proj"
+        global_down = out[down_key]
+
+        assert global_down.shape[0] == adapter.moe_config.n_routed_experts
+        torch.testing.assert_close(global_down[2], local_slice)
+
+
 class TestFromHF:
     def test_detects_model_prefix(self, adapter):
         hf_state = {
@@ -172,6 +234,9 @@ class TestFromHF:
 
             def to_local(self):
                 return self._data
+
+            def __getitem__(self, idx):
+                return self._data[idx]
 
         captured = {"locals": []}
 
