@@ -21,6 +21,7 @@ from types import FunctionType
 from typing import Any, Dict, Generator, List, Optional, Union
 
 import torch
+import transformers
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
@@ -43,6 +44,14 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
 )
+
+
+def _is_transformers_v5_or_higher() -> bool:
+    """Check if transformers version is 5.x or higher."""
+    version = transformers.__version__
+    major_version = int(version.split(".")[0])
+    return major_version >= 5
+
 from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
 from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
 from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
@@ -487,8 +496,13 @@ def get_hf_tp_shard_plan(model):
         model_prefix = "model.language_model"
 
     elif model_cls == Gemma3ForConditionalGeneration:
-        inner_model = model.language_model
-        model_prefix = "language_model"
+        # In transformers v5, Gemma3 uses 'model' instead of 'language_model'
+        if _is_transformers_v5_or_higher():
+            inner_model = model.model
+            model_prefix = "model"
+        else:
+            inner_model = model.language_model
+            model_prefix = "language_model"
 
     elif model_cls == Llama4ForConditionalGeneration:
         inner_model = model.language_model.model
@@ -766,8 +780,14 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
             ans.append(reduce(getattr, parts, model))
         return ans
 
+    # Gemma3 layer paths depend on transformers version
+    _gemma3_layers = (
+        ["model.layers", "model.vision_tower.vision_model.encoder.layers"]
+        if _is_transformers_v5_or_higher()
+        else ["language_model.layers", "vision_tower.vision_model.encoder.layers"]
+    )
     VLM_MODEL_CLS_TO_LAYERS = {
-        Gemma3ForConditionalGeneration: ["language_model.layers", "vision_tower.vision_model.encoder.layers"],
+        Gemma3ForConditionalGeneration: _gemma3_layers,
         Qwen2_5_VLForConditionalGeneration: ["language_model.layers", "visual.blocks"],
         Qwen2VLForConditionalGeneration: ["language_model.layers", "visual.blocks"],
         # Note: `model.` is not a mistake here, it's the full fqn

@@ -22,11 +22,11 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 import torch.distributed.checkpoint as dcp
 import yaml
+from huggingface_hub import constants as hf_constants
 from packaging.version import parse
 from safetensors.torch import load_file, save_file
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
-from transformers.utils import TRANSFORMERS_CACHE
 
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
@@ -38,12 +38,16 @@ from nemo_automodel.components.checkpoint._backports.hf_storage import (
     get_fqn_to_file_index_mapping,
 )
 from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon, PeftAddon
+from nemo_automodel.components.checkpoint.conversion_mapping import (
+    get_combined_key_mapping,
+    requires_tensor_merging,
+)
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
 
 if TYPE_CHECKING:
     from peft import PeftConfig
-    from transformers.tokenization_utils import PreTrainedTokenizerBase
+    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 
 def _is_geq_torch_2_9() -> bool:
@@ -284,6 +288,7 @@ class Checkpointer:
         - For PEFT (non-init): rank 0 reads `adapter_model.safetensors`, then broadcasts.
         - Otherwise: use DCP with a Hugging Face or default storage reader to populate the state dict.
         - If the model exposes a `state_dict_adapter`, convert to/from HF format as needed.
+        - For models requiring tensor merging (e.g., Mixtral), uses transformers' conversion mapping.
 
         Args:
             model: Model or parallelized model parts to load into.
@@ -301,6 +306,20 @@ class Checkpointer:
             is_init_step=is_init_step,
             skip_task_head_prefixes=getattr(self.config, "skip_task_head_prefixes_for_base_model", None),
         )
+
+        # Check if this model requires tensor merging (e.g., Mixtral with grouped experts)
+        model_type = getattr(getattr(model_state.model[0], "config", None), "model_type", None)
+        has_state_dict_adapter = hasattr(model_state.model[0], "state_dict_adapter")
+
+        # For models that need tensor merging and don't have an adapter, try using transformers' conversion
+        if is_init_step and model_type and requires_tensor_merging(model_type) and not has_state_dict_adapter:
+            converted_state_dict = _convert_checkpoint_with_transformers(model_state.model[0], model_path, key_mapping)
+            if converted_state_dict is not None:
+                # Load using full_state_dict=True to properly convert tensors to DTensors for FSDP
+                _load_full_state_dict_into_model(model_state.model, converted_state_dict)
+                return
+
+        # Standard loading path
         state_dict = model_state.state_dict()
         storage_reader = self._get_storage_reader(model_path, key_mapping, is_init_step=is_init_step)
 
@@ -310,7 +329,6 @@ class Checkpointer:
 
         state_dict = self._do_load(state_dict, model_path, storage_reader, is_init_step=is_init_step)
 
-        has_state_dict_adapter = hasattr(model_state.model[0], "state_dict_adapter")
         state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
         model_state.load_state_dict(state_dict, strict=not (len(model_state.model) > 1 or has_state_dict_adapter))
 
@@ -366,13 +384,17 @@ class Checkpointer:
 
         if load_base_model:
             assert model_name is not None, "model_name is required when loading base model"
+            # Get combined key mapping from model attribute and model-type specific conversions
+            model_type = getattr(getattr(model, "config", None), "model_type", None)
+            model_key_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
+            key_mapping = get_combined_key_mapping(model_type, model_key_mapping)
             self.load_model(
                 model,
                 model_path=model_name
                 if os.path.exists(model_name)
                 else get_safetensors_index_path(root_dir, model_name),
                 is_init_step=True,
-                key_mapping=getattr(model, "_checkpoint_conversion_mapping", None),
+                key_mapping=key_mapping,
             )
 
         is_tied_lm_head = is_tied_word_embeddings(model)
@@ -635,7 +657,8 @@ class Checkpointer:
             return None
         pretrained_model_name_or_path = getattr(model_state.model[0], "name_or_path")
         return get_safetensors_index_path(
-            getattr(self.config, "original_model_root_dir", None) or TRANSFORMERS_CACHE, pretrained_model_name_or_path
+            getattr(self.config, "original_model_root_dir", hf_constants.HF_HOME),
+            pretrained_model_name_or_path,
         )
 
 
@@ -845,6 +868,149 @@ def _apply(module, fn, recurse=True) -> nn.Module:
                 out_param.grad = grad_applied.requires_grad_(param_grad.requires_grad)
 
     return module
+
+
+def _load_full_state_dict_into_model(
+    model_parts: list[nn.Module],
+    state_dict: dict[str, torch.Tensor],
+) -> None:
+    """
+    Load a full (non-sharded) state dict into a potentially FSDP-wrapped model.
+
+    Uses PyTorch's set_model_state_dict with full_state_dict=True to properly
+    shard the tensors when loading into DTensors.
+
+    Args:
+        model_parts: List of model parts (for pipeline parallelism)
+        state_dict: Full state dict with regular tensors
+    """
+    from functools import partial
+
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+
+    # Use full_state_dict=True to tell PyTorch this is a complete, non-sharded state dict
+    # It will properly shard the tensors to match the model's DTensor layout
+    options = StateDictOptions(
+        strict=False,
+        full_state_dict=True,  # Key: indicates state_dict contains full (non-sharded) tensors
+        broadcast_from_rank0=True,  # Broadcast from rank 0 to other ranks
+    )
+
+    func = partial(set_model_state_dict, model_state_dict=state_dict, options=options)
+    list(map(func, model_parts))
+
+
+def _convert_checkpoint_with_transformers(
+    model: nn.Module,
+    model_path: str,
+    key_mapping: Optional[dict[str, str]] = None,
+) -> Optional[dict[str, torch.Tensor]]:
+    """
+    Convert a checkpoint using transformers' conversion mapping for models that need tensor merging.
+
+    This handles MoE models like Mixtral where the checkpoint has individual expert weights
+    but the model uses grouped expert tensors. The transformers library's WeightConverter
+    operations handle the tensor merging (MergeModulelist, Concatenate).
+
+    This function converts the state dict WITHOUT loading it into the model, so it can be
+    used with FSDP-aware loading mechanisms.
+
+    Args:
+        model: The model (used to get conversion mapping and target keys).
+        model_path: Path to the HuggingFace checkpoint directory.
+        key_mapping: Optional additional key mapping.
+
+    Returns:
+        Converted state dict ready for loading, or None if conversion failed.
+    """
+    try:
+        from copy import deepcopy
+
+        from safetensors import safe_open
+        from transformers.conversion_mapping import get_model_conversion_mapping
+        from transformers.core_model_loading import (
+            WeightConverter,
+            WeightRenaming,
+            dot_natural_key,
+            rename_source_key,
+        )
+    except ImportError:
+        logging.warning(
+            "transformers library with conversion_mapping not available. "
+            "Cannot use transformers' WeightConverter for tensor merging."
+        )
+        return None
+
+    try:
+        # Get the weight conversion mapping from transformers
+        weight_mapping = get_model_conversion_mapping(model, key_mapping=key_mapping, add_legacy=True)
+        if not weight_mapping:
+            logging.warning(
+                f"No conversion mapping found for model type {getattr(model.config, 'model_type', 'unknown')}"
+            )
+            return None
+
+        # Load the safetensors files
+        safetensors_files = glob.glob(os.path.join(model_path, "*.safetensors"))
+        if not safetensors_files:
+            logging.warning(f"No safetensors files found in {model_path}")
+            return None
+
+        # Load checkpoint state dict
+        checkpoint_state_dict = {}
+        for sf_path in safetensors_files:
+            with safe_open(sf_path, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    checkpoint_state_dict[key] = f.get_tensor(key)
+
+        # Separate renamings and converters
+        renamings = [entry for entry in weight_mapping if isinstance(entry, WeightRenaming)]
+        converters = [entry for entry in weight_mapping if isinstance(entry, WeightConverter)]
+        pattern_to_converter = {k: converter for converter in converters for k in converter.source_patterns}
+
+        # Process checkpoint keys and apply conversions
+        converted_state_dict = {}
+        param_name_to_mapping: dict[str, WeightRenaming | WeightConverter] = {}
+
+        # Sort by key for consistent ordering
+        sorted_items = sorted(checkpoint_state_dict.items(), key=lambda kv: dot_natural_key(kv[0]))
+
+        for original_key, tensor in sorted_items:
+            # Rename the key
+            renamed_key, source_pattern = rename_source_key(original_key, renamings, converters)
+
+            # Check if this needs conversion
+            if source_pattern is not None:
+                # This key is part of a WeightConverter operation
+                new_converter = deepcopy(pattern_to_converter[source_pattern])
+                mapping = param_name_to_mapping.setdefault(renamed_key, new_converter)
+                mapping.add_tensor(renamed_key, original_key, source_pattern, tensor)
+            else:
+                # Simple rename or pass-through
+                mapping = param_name_to_mapping.setdefault(renamed_key, WeightRenaming(original_key, renamed_key))
+                mapping.add_tensor(renamed_key, original_key, original_key, tensor)
+
+        # Now apply all the conversions
+        for first_param_name, mapping in param_name_to_mapping.items():
+            try:
+                realized_value, _ = mapping.convert(first_param_name, model=model, config=model.config)
+                for target_name, param in realized_value.items():
+                    param = param[0] if isinstance(param, list) else param
+                    converted_state_dict[target_name] = param
+                mapping.reset()
+            except Exception as e:
+                logging.warning(f"Conversion failed for {first_param_name}: {e}")
+                continue
+
+        logging.info(f"Converted {len(converted_state_dict)} keys using transformers conversion mapping")
+        return converted_state_dict
+
+    except Exception as e:
+        logging.warning(f"Failed to convert checkpoint with transformers: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return None
 
 
 def _maybe_adapt_state_dict_to_hf(
