@@ -326,7 +326,9 @@ def test_grouped_experts_deepep_lora_forward_mocked(moe_config):
     out = lora_module(x, token_mask, weights, indices)
     
     # Verify equivalence with zero LoRA weights (DeepEP LoRA B is zero-init by default)
-    with torch.no_grad():
+    # GroupedExpertsDeepEP.forward hardcodes a call to .to_local() which regular 
+    # Parameters don't have. We surgicaly patch it only for this unit test.
+    with torch.no_grad(), patch.object(torch.Tensor, "to_local", create=True, side_effect=lambda self: self):
         out_orig = orig_experts(x, token_mask, weights, indices)
     
     assert out.shape == (num_tokens, 16)
