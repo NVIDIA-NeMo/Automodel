@@ -222,7 +222,7 @@ class GroupedExpertsLoRA(GroupedExperts):
             expert_out = expert_out_val * weights[idx, top, None]
             # ---------------------------------------------
 
-            y.scatter_add_(dim=0, index=idx_b, src=expert_out.to(x.dtype))
+            y = torch.scatter_add(y, dim=0, index=idx_b, src=expert_out.to(x.dtype))
 
         if ep_size > 1:
             y = DTensor.from_local(y, device_mesh=ep_mesh, placements=[Partial()])
