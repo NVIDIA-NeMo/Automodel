@@ -177,6 +177,10 @@ class GroupedExpertsLoRA(GroupedExperts):
             if idx.numel() == 0:
                 continue
 
+            # DEBUG: Trace Gradient Flow (only for first expert of first layer)
+            if i == 0 and idx.numel() > 0 and x.requires_grad:
+                print(f"[DEBUG] Expert {i} active. x_idx.requires_grad={x.requires_grad}")
+
             gate_and_up_proj = get_local_proj(self.gate_and_up_projs, i)
             down_proj = get_local_proj(self.down_projs, i)
 
@@ -190,7 +194,13 @@ class GroupedExpertsLoRA(GroupedExperts):
             # 1. Gate + Up Projection
             gate_and_up_out = x_idx @ gate_and_up_proj
             # Add LoRA
-            gate_and_up_out = gate_and_up_out + compute_lora(x_idx, self.lora_gate_and_up_A, self.lora_gate_and_up_B, i)
+            lora_term_gate = compute_lora(x_idx, self.lora_gate_and_up_A, self.lora_gate_and_up_B, i)
+            gate_and_up_out = gate_and_up_out + lora_term_gate
+            
+            # DEBUG
+            if i == 0 and idx.numel() > 0 and x.requires_grad:
+                 print(f"[DEBUG] gate_and_up_out.requires_grad={gate_and_up_out.requires_grad}")
+                 print(f"[DEBUG] lora_term.requires_grad={lora_term_gate.requires_grad}")
             
             # Activation logic (duplicated from layers.py swiglu/quick_geglu but adapted)
             # We need to manually apply activation because we modified the projection output
