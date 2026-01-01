@@ -306,7 +306,8 @@ def test_grouped_experts_deepep_lora_forward_mocked(moe_config):
     # Capture deterministic data to return from the mock dispatcher
     dtype = torch.bfloat16
     permuted_x = torch.randn(num_tokens, 16, device=device).to(dtype)
-    permuted_probs = torch.ones(num_tokens, 1, device=device).to(dtype)
+    # permuted_probs should be 1D [num_tokens] because it's unsqueezed in forward
+    permuted_probs = torch.ones(num_tokens, device=device).to(dtype)
     
     # Set the same mock on both modules to ensure they see the same "dispatched" data
     mock_dispatcher.token_permutation2 = MagicMock(
@@ -316,6 +317,7 @@ def test_grouped_experts_deepep_lora_forward_mocked(moe_config):
     orig_experts.token_dispatcher = mock_dispatcher
     
     x = torch.randn(num_tokens, 16, device=device).to(dtype)
+    # weights should also be [num_tokens, TopK] where TopK=1
     weights = torch.ones(num_tokens, 1, device=device).to(dtype)
     indices = torch.zeros(num_tokens, 1, dtype=torch.long, device=device)
     token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
