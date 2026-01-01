@@ -169,6 +169,9 @@ def test_grouped_experts_deepep_lora_forward_real(moe_config):
     try:
         orig_experts.init_token_dispatcher(mock_mesh)
     except Exception as e:
+        import traceback
+        print(f"\nDEBUG: init_token_dispatcher failed with error: {e}")
+        traceback.print_exc()
         pytest.skip(f"Failed to init token dispatcher (likely needs distributed env): {e}")
 
     # Initialize weights

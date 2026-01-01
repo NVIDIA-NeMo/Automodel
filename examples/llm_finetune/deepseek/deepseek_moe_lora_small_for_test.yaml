@@ -70,7 +70,7 @@ peft:
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/deepseek_small
-  model_save_format: torch_save
+  model_save_format: safetensors
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
@@ -87,6 +87,8 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
+  tokenizer:
+    pretrained_model_name_or_path: meta-llama/Llama-2-7b-hf
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
