@@ -190,6 +190,16 @@ def clip_grad_norm(
     # Collect all parameters
     parameters = [p for m in model_parts for p in m.parameters() if p.requires_grad]
 
+    # DEBUG: Check gradients
+    n_grads = sum(1 for p in parameters if p.grad is not None)
+    if n_grads == 0:
+        print("[DEBUG] No gradients found on any parameter!")
+    else:
+        first_grad = next(p.grad for p in parameters if p.grad is not None)
+        print(f"[DEBUG] Found {n_grads} parameters with gradients.")
+        if hasattr(first_grad, "mean"):
+            print(f"[DEBUG] First grad avg: {first_grad.float().mean().item():.6f}, max: {first_grad.max().item():.6f}")
+
     # Determine pp_mesh if PP is enabled
     pp_mesh = None
     if pp_enabled:
