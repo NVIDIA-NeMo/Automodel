@@ -5,12 +5,12 @@ quantization:
   bnb_4bit_quant_type: "nf4"
 
 step_scheduler:
-  global_batch_size: 1
-  local_batch_size: 1
-  ckpt_every_steps: 10
-  val_every_steps: 10
+  global_batch_size: 8
+  local_batch_size: 4
+  ckpt_every_steps: 50
+  val_every_steps: 50
   num_epochs: 1
-  max_steps: 10
+  max_steps: 100
 
 dist_env:
   backend: nccl
@@ -53,10 +53,11 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.mock.build_unpacked_dataset
-  num_sentences: 20
-  vocab_size: 151936
-  max_sentence_len: 128
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+  tokenizer:
+    pretrained_model_name_or_path: Qwen/Qwen1.5-MoE-A2.7B
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -65,10 +66,10 @@ dataloader:
   num_workers: 2
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.mock.build_unpacked_dataset
-  num_sentences: 10
-  vocab_size: 151936
-  max_sentence_len: 128
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: validation
+  num_samples_limit: 64
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
