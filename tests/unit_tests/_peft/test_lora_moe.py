@@ -157,11 +157,26 @@ def test_grouped_experts_deepep_lora_forward_real(moe_config):
     
     orig_experts = GroupedExpertsDeepEP(moe_config).to(device)
     
-    # Mock DeviceMesh for single device execution
+    # Mock DeviceMesh and group for execution
     mock_mesh = MagicMock()
-    mock_mesh.size.return_value = 1
-    mock_mesh.get_local_rank.return_value = 0
-    mock_mesh.get_group.return_value = None # Assuming ep_group=None works for single device or we need a dummy group
+    mock_group = MagicMock()
+    
+    # Check if we are actually in a distributed env
+    if torch.distributed.is_initialized():
+        real_size = torch.distributed.get_world_size()
+        real_rank = torch.distributed.get_rank()
+        mock_mesh.size.return_value = real_size
+        mock_mesh.get_local_rank.return_value = real_rank
+        # We need ep_size > 1 for MoEFlexTokenDispatcher assertion
+        # If real_size is 1, we fake it as 2 for initialization testing if needed, 
+        # but better to run with nproc_per_node=2
+        mock_group.size.return_value = real_size
+    else:
+        mock_mesh.size.return_value = 2 # Fake 2 experts/ranks
+        mock_mesh.get_local_rank.return_value = 0
+        mock_group.size.return_value = 2
+        
+    mock_mesh.get_group.return_value = mock_group
     
     # We might need a real ProcessGroup if MoEFlexTokenDispatcher requires it.
     # But for ep_size=1, it might skip comms.
