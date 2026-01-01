@@ -32,7 +32,7 @@ model:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  target_modules: ["experts"]
+  target_modules: ["*.experts"]
   dim: 64
   alpha: 64
   dropout: 0.05
