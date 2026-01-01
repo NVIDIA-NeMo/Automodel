@@ -1,5 +1,4 @@
 quantization:
-  _target_: nemo_automodel.components.quantization.qlora.BitsAndBytesConfig
   load_in_4bit: true
   bnb_4bit_compute_dtype: bfloat16
   bnb_4bit_use_double_quant: true
