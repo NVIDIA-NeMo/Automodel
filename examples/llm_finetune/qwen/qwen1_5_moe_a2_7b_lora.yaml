@@ -1,11 +1,11 @@
 
 step_scheduler:
-  global_batch_size: 8
+  global_batch_size: 1
   local_batch_size: 1
-  ckpt_every_steps: 100
-  val_every_steps: 50
+  ckpt_every_steps: 10
+  val_every_steps: 10
   num_epochs: 1
-  max_steps: 500
+  max_steps: 10
 
 dist_env:
   backend: nccl
@@ -47,9 +47,10 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
-  split: train
+  _target_: nemo_automodel.components.datasets.llm.mock.build_unpacked_dataset
+  num_sentences: 20
+  vocab_size: 151936
+  max_sentence_len: 128
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -58,10 +59,10 @@ dataloader:
   num_workers: 2
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
-  split: validation
-  num_samples_limit: 64
+  _target_: nemo_automodel.components.datasets.llm.mock.build_unpacked_dataset
+  num_sentences: 10
+  vocab_size: 151936
+  max_sentence_len: 128
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
