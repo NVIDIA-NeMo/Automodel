@@ -286,23 +286,24 @@ def test_grouped_experts_deepep_lora_forward_mocked(moe_config):
     moe_config.moe_inter_dim = 32
     moe_config.dtype = torch.bfloat16
     
-    orig_experts = GroupedExpertsDeepEP(moe_config).to(device)
+    orig_experts = GroupedExpertsDeepEP(moe_config).to(device).to(torch.bfloat16)
+    # Initialize expert weights BEFORE creating LoRA module so they match after copy
+    orig_experts.init_weights(device)
     
     # Manually inject mock state since DeepEP init fails on non-Hopper hardware
     orig_experts.n_routed_experts = 4
     orig_experts.ep_size = 1
     
-    lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4).to(device)
+    lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4).to(device).to(torch.bfloat16)
     mock_dispatcher = MockDeepEPDispatcher()
     
     # Mock tokens_per_expert for ops.gmm - needs to sum to num_tokens
     num_tokens = 8
     # One expert gets all tokens for simplicity
-    # IMPORTANT: grouped_gemm expects batch_sizes (tokens_per_expert) to be on CPU
     tokens_per_expert = torch.tensor([num_tokens, 0, 0, 0], dtype=torch.long, device="cpu")
     
     # Capture deterministic data to return from the mock dispatcher
-    dtype = orig_experts.gate_and_up_projs.dtype
+    dtype = torch.bfloat16
     permuted_x = torch.randn(num_tokens, 16, device=device).to(dtype)
     permuted_probs = torch.ones(num_tokens, 1, device=device).to(dtype)
     
@@ -313,8 +314,8 @@ def test_grouped_experts_deepep_lora_forward_mocked(moe_config):
     lora_module.token_dispatcher = mock_dispatcher
     orig_experts.token_dispatcher = mock_dispatcher
     
-    x = torch.randn(num_tokens, 16, device=device).to(orig_experts.gate_and_up_projs.dtype)
-    weights = torch.ones(num_tokens, 1, device=device).to(orig_experts.gate_and_up_projs.dtype)
+    x = torch.randn(num_tokens, 16, device=device).to(dtype)
+    weights = torch.ones(num_tokens, 1, device=device).to(dtype)
     indices = torch.zeros(num_tokens, 1, dtype=torch.long, device=device)
     token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
     
