@@ -1,0 +1,84 @@
+
+# ------------------------------------------------------------------------------------------------
+# WARNING: HARDWARE REQUIREMENTS
+# ------------------------------------------------------------------------------------------------
+# This config targets DeepSeek-V3 (671B parameters).
+# It requires a massive multi-node cluster (e.g., 8x-16x H100/A100 nodes) just to load the model.
+# DO NOT ATTEMPT TO RUN ON A SINGLE GPU OR WORKSTATION.
+# ------------------------------------------------------------------------------------------------
+
+step_scheduler:
+  global_batch_size: 1024
+  local_batch_size: 1
+  ckpt_every_steps: 50
+  val_every_steps: 25
+  num_epochs: 1
+  max_steps: 10
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_pretrained
+  pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
+  trust_remote_code: true
+  torch_dtype: bfloat16
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: ["experts"]
+  dim: 64
+  alpha: 64
+  dropout: 0.05
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/deepseek_v3_lora
+  model_save_format: torch_save
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: none
+  dp_replicate_size: 1
+  tp_size: 8  # Tensor Parallelism required for model size
+  cp_size: 1
+  sequence_parallel: true
+  # Expert Parallelism (EP) might be needed if supported by FSDP2Manager config, 
+  # otherwise FSDP handles sharding.
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+  num_workers: 8
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: validation
+  num_samples_limit: 128
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  num_workers: 8
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.95]

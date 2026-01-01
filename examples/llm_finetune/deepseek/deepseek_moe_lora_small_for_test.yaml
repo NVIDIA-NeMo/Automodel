@@ -1,0 +1,112 @@
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 4
+  ckpt_every_steps: 100
+  val_every_steps: 50
+  num_epochs: 1
+  max_steps: 200
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_config
+  config:
+    _target_: transformers.models.deepseek_v3.configuration_deepseek_v3.DeepseekV3Config
+    vocab_size: 32000
+    hidden_size: 1024
+    intermediate_size: 2816
+    moe_intermediate_size: 1408
+    num_hidden_layers: 12
+    num_attention_heads: 16
+    num_key_value_heads: 16
+    n_routed_experts: 8
+    n_shared_experts: 1
+    n_group: 1
+    topk_group: 1
+    num_experts_per_tok: 2
+    routed_scaling_factor: 1.0
+    first_k_dense_replace: 1
+    norm_topk_prob: false
+    torch_dtype: bfloat16
+    # MLA specific (scaled down)
+    kv_lora_rank: 128
+    q_lora_rank: 512
+    qk_rope_head_dim: 64
+    v_head_dim: 64
+    qk_nope_head_dim: 64
+  moe_config:
+    _target_: nemo_automodel.components.moe.layers.MoEConfig
+    n_routed_experts: 8
+    n_shared_experts: 1
+    n_activated_experts: 2
+    n_expert_groups: 1
+    n_limited_groups: 1
+    train_gate: true
+    gate_bias_update_factor: 0.001
+    aux_loss_coeff: 0.01
+    score_func: sigmoid
+    route_scale: 1.0
+    dim: 1024
+    inter_dim: 2816
+    moe_inter_dim: 1408
+    norm_topk_prob: false
+    dtype: bfloat16
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: ["experts"]
+  dim: 16
+  alpha: 32
+  dropout: 0.05
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/deepseek_small
+  model_save_format: torch_save
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: none
+  dp_replicate_size: 1
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+  num_workers: 2
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: validation
+  num_samples_limit: 256
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  num_workers: 2
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 3.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.95]

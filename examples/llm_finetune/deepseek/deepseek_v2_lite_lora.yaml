@@ -1,0 +1,77 @@
+
+step_scheduler:
+  global_batch_size: 16
+  local_batch_size: 1
+  ckpt_every_steps: 100
+  val_every_steps: 50
+  num_epochs: 1
+  max_steps: 10
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 20
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  # This repo unifies DeepSeek V2/V3 support under `deepseek_v3` (shared MLA/DeepEP architecture).
+  # We use V2-Lite weights because V3 (671B) is too large for single-node testing.
+  # Explicitly use V3 class because V2 architecture name is not in registry.
+  _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_pretrained
+  pretrained_model_name_or_path: deepseek-ai/DeepSeek-V2-Lite
+  trust_remote_code: true
+  torch_dtype: bfloat16
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: ["experts"]
+  dim: 16
+  alpha: 32
+  dropout: 0.05
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/deepseek_v2_lite_lora
+  model_save_format: torch_save
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: none
+  dp_replicate_size: 1
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+  num_workers: 4
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: validation
+  num_samples_limit: 128
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  num_workers: 4
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 2.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.95]

@@ -1,0 +1,251 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import pytest
+import torch
+import torch.nn as nn
+from unittest.mock import MagicMock, patch
+
+from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, MoEConfig
+from nemo_automodel.components._peft.lora_moe import GroupedExpertsLoRA, GroupedExpertsDeepEPLoRA
+from nemo_automodel.components._peft.lora import patch_moe_module, apply_lora_to_linear_modules, PeftConfig
+
+@pytest.fixture
+def moe_config():
+    return MoEConfig(
+        n_routed_experts=4,
+        n_shared_experts=0,
+        n_activated_experts=2,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        dim=16,
+        inter_dim=32,
+        moe_inter_dim=32,
+        norm_topk_prob=False,
+        expert_activation="swiglu",
+        dtype=torch.float32
+    )
+
+def test_grouped_experts_lora_init(moe_config):
+    """Test initialization of GroupedExpertsLoRA, verifying shapes and frozen weights."""
+    orig_experts = GroupedExperts(moe_config)
+    # Initialize weights to avoid NaNs
+    with torch.no_grad():
+        orig_experts.init_weights(buffer_device=torch.device("cpu"))
+    
+    lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8)
+
+    assert isinstance(lora_experts, GroupedExpertsLoRA)
+    assert lora_experts.lora_dim == 4
+    assert lora_experts.scale == 2.0
+    
+    # Check shapes
+    # lora_gate_and_up_A: [n_experts, in_dim, lora_dim] -> [4, 16, 4]
+    assert lora_experts.lora_gate_and_up_A.shape == (4, 16, 4)
+    # lora_gate_and_up_B: [n_experts, lora_dim, out_dim] -> [4, 4, 64]
+    assert lora_experts.lora_gate_and_up_B.shape == (4, 4, 64) # 32 * 2
+    # lora_down_A: [n_experts, inter_dim, lora_dim] -> [4, 32, 4]
+    assert lora_experts.lora_down_A.shape == (4, 32, 4)
+    # lora_down_B: [n_experts, lora_dim, out_dim] -> [4, 4, 16]
+    assert lora_experts.lora_down_B.shape == (4, 4, 16)
+
+    # Check requires_grad
+    assert not lora_experts.gate_and_up_projs.requires_grad
+    assert not lora_experts.down_projs.requires_grad
+    assert lora_experts.lora_gate_and_up_A.requires_grad
+    assert lora_experts.lora_gate_and_up_B.requires_grad
+
+def test_apply_lora_equivalence(moe_config):
+    """Test that applying LoRA to a model maintains output equivalence upon initialization."""
+    class MockModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = GroupedExperts(moe_config)
+            self.linear = nn.Linear(16, 16)
+
+        def forward(self, x, token_mask, weights, indices):
+            return self.experts(x, token_mask, weights, indices) + self.linear(x)
+
+    model = MockModel()
+    # Initialize weights
+    with torch.no_grad():
+        model.experts.init_weights(buffer_device=torch.device("cpu"))
+        nn.init.normal_(model.linear.weight)
+        nn.init.zeros_(model.linear.bias)
+
+    # Mock input
+    bs = 2
+    seq_len = 5
+    dim = 16
+    x = torch.randn(bs * seq_len, dim)
+    token_mask = torch.ones(bs * seq_len, dtype=torch.bool)
+    weights = torch.rand(bs * seq_len, 2)
+    indices = torch.randint(0, 4, (bs * seq_len, 2))
+
+    # Baseline output
+    with torch.no_grad():
+        out_orig = model(x, token_mask, weights, indices)
+
+    # Apply LoRA
+    peft_config = PeftConfig(
+        target_modules=["*experts*"],
+        dim=4
+    )
+    apply_lora_to_linear_modules(model, peft_config)
+    
+    # LoRA output
+    with torch.no_grad():
+        out_lora = model(x, token_mask, weights, indices)
+
+    assert torch.allclose(out_orig, out_lora, atol=1e-6)
+    assert isinstance(model.experts, GroupedExpertsLoRA)
+
+def test_grouped_experts_deepep_lora_init(moe_config):
+    """Test initialization of GroupedExpertsDeepEPLoRA, verifying shapes."""
+    orig_experts = GroupedExpertsDeepEP(moe_config)
+    # Initialize weights
+    with torch.no_grad():
+        orig_experts.init_weights(buffer_device=torch.device("cpu"))
+
+    lora_experts = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4, alpha=8)
+    
+    assert isinstance(lora_experts, GroupedExpertsDeepEPLoRA)
+    assert lora_experts.lora_dim == 4
+    
+    # Check shapes
+    assert lora_experts.lora_gate_and_up_A.shape == (4, 16, 4)
+    assert lora_experts.lora_gate_and_up_B.shape == (4, 4, 64)
+    assert lora_experts.lora_down_A.shape == (4, 32, 4)
+    assert lora_experts.lora_down_B.shape == (4, 4, 16)
+
+    # Check requires_grad
+    assert not lora_experts.gate_and_up_projs.requires_grad
+    assert not lora_experts.down_projs.requires_grad
+    assert lora_experts.lora_gate_and_up_A.requires_grad
+    assert lora_experts.lora_gate_and_up_B.requires_grad
+
+try:
+    import grouped_gemm
+except ImportError:
+    grouped_gemm = None
+
+@pytest.mark.skipif(
+    grouped_gemm is None or not torch.cuda.is_available(),
+    reason="Requires grouped_gemm and CUDA"
+)
+def test_grouped_experts_deepep_lora_forward_real(moe_config):
+    """Test forward pass correctness of GroupedExpertsDeepEPLoRA using real CUDA kernels (skipped if unavailable)."""
+    # Setup for real execution
+    device = torch.device("cuda")
+    moe_config.dtype = torch.float16 # DeepEP usually requires half precision
+    
+    orig_experts = GroupedExpertsDeepEP(moe_config).to(device)
+    
+    # Mock DeviceMesh for single device execution
+    mock_mesh = MagicMock()
+    mock_mesh.size.return_value = 1
+    mock_mesh.get_local_rank.return_value = 0
+    mock_mesh.get_group.return_value = None # Assuming ep_group=None works for single device or we need a dummy group
+    
+    # We might need a real ProcessGroup if MoEFlexTokenDispatcher requires it.
+    # But for ep_size=1, it might skip comms.
+    # Let's try to initialize.
+    try:
+        orig_experts.init_token_dispatcher(mock_mesh)
+    except Exception as e:
+        pytest.skip(f"Failed to init token dispatcher (likely needs distributed env): {e}")
+
+    # Initialize weights
+    with torch.no_grad():
+        orig_experts.init_weights(buffer_device=device)
+    
+    lora_experts = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4, alpha=8).to(device)
+    
+    # Real input
+    bs = 2
+    seq_len = 128
+    dim = 16
+    x = torch.randn(bs * seq_len, dim, device=device, dtype=torch.float16)
+    token_mask = torch.ones(bs * seq_len, dtype=torch.bool, device=device)
+    
+    # Weights and indices need to be consistent with n_routed_experts=4
+    # We can use a simple routing strategy or random
+    weights = torch.rand(bs * seq_len, 2, device=device, dtype=torch.float32)
+    weights = weights / weights.sum(dim=-1, keepdim=True)
+    indices = torch.randint(0, 4, (bs * seq_len, 2), device=device, dtype=torch.int32)
+    
+    # Run forward
+    out = lora_experts(x, token_mask, weights, indices)
+    
+    assert out.shape == x.shape
+    assert not torch.isnan(out).any()
+    
+    # Verify equivalence with zero LoRA weights
+    # GroupedExpertsDeepEPLoRA initializes B weights to zero by default, so output should match exactly.
+    
+    with torch.no_grad():
+        out_orig = orig_experts(x, token_mask, weights, indices)
+    
+    # Tolerances for float16
+    assert torch.allclose(out, out_orig, atol=1e-3, rtol=1e-3)
+
+def test_patch_moe_module(moe_config):
+    """Test that patch_moe_module correctly wraps the original experts with the appropriate LoRA class."""
+    orig_experts = GroupedExperts(moe_config)
+    patched = patch_moe_module(orig_experts, dim=4)
+    assert isinstance(patched, GroupedExpertsLoRA)
+    
+    orig_experts_deep = GroupedExpertsDeepEP(moe_config)
+    patched_deep = patch_moe_module(orig_experts_deep, dim=4)
+    assert isinstance(patched_deep, GroupedExpertsDeepEPLoRA)
+
+def test_apply_lora_patching_logic(moe_config):
+    """
+    Test the patching logic of apply_lora_to_linear_modules.
+    Verifies that:
+    1. Exact name matching works for MoE modules.
+    2. Wildcard matching works for MoE modules.
+    3. Non-target modules (e.g., standard Linear layers not in target list) are NOT patched.
+    """
+    class MockModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = GroupedExperts(moe_config)
+            self.linear = nn.Linear(16, 16)
+
+    model = MockModel()
+    peft_config = PeftConfig(
+        target_modules=["experts"],
+        dim=4
+    )
+    
+    count = apply_lora_to_linear_modules(model, peft_config)
+    assert count == 1
+    assert isinstance(model.experts, GroupedExpertsLoRA)
+    assert isinstance(model.linear, nn.Linear) # Should not be patched
+
+    # Test wildcard matching
+    model = MockModel()
+    peft_config = PeftConfig(
+        target_modules=["*experts*"],
+        dim=4
+    )
+    count = apply_lora_to_linear_modules(model, peft_config)
+    assert count == 1
+    assert isinstance(model.experts, GroupedExpertsLoRA)

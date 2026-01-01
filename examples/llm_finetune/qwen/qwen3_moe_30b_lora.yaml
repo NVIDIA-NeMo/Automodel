@@ -1,0 +1,81 @@
+
+# ------------------------------------------------------------------------------------------------
+# WARNING: HARDWARE REQUIREMENTS
+# ------------------------------------------------------------------------------------------------
+# This config targets Qwen3-30B-A3B (30B parameters).
+# It requires multiple GPUs (e.g., 2x A100 80GB or 4x 3090/4090) to load.
+# ------------------------------------------------------------------------------------------------
+
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 1
+  ckpt_every_steps: 100
+  val_every_steps: 50
+  num_epochs: 1
+  max_steps: 1000
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 20
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.components.models.qwen3_moe.model.Qwen3MoeForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: ["experts"]
+  dim: 16
+  alpha: 32
+  dropout: 0.05
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/qwen3_moe_lora
+  model_save_format: torch_save
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: none
+  dp_replicate_size: 1
+  tp_size: 2  # Tensor Parallelism recommended
+  cp_size: 1
+  sequence_parallel: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+  num_workers: 4
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: validation
+  num_samples_limit: 128
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  num_workers: 4
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
