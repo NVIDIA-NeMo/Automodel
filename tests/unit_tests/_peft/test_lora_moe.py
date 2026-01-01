@@ -288,7 +288,8 @@ def test_grouped_experts_deepep_lora_forward_mocked(moe_config):
     
     orig_experts = GroupedExpertsDeepEP(moe_config).to(device).to(torch.bfloat16)
     # Initialize expert weights BEFORE creating LoRA module so they match after copy
-    orig_experts.init_weights(device)
+    with torch.no_grad():
+        orig_experts.init_weights(device)
     
     # Manually inject mock state since DeepEP init fails on non-Hopper hardware
     orig_experts.n_routed_experts = 4
