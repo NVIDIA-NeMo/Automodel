@@ -157,36 +157,27 @@ def test_grouped_experts_deepep_lora_forward_real(moe_config):
     
     orig_experts = GroupedExpertsDeepEP(moe_config).to(device)
     
-    # Mock DeviceMesh and group for execution
+    # Mock DeviceMesh and group wrapper
     mock_mesh = MagicMock()
-    mock_group = MagicMock()
     
-    # Check if we are actually in a distributed env
+    # Use real group if running under torchrun (required for DeepEP CUDA kernels)
     if torch.distributed.is_initialized():
-        real_size = torch.distributed.get_world_size()
-        real_rank = torch.distributed.get_rank()
-        mock_mesh.size.return_value = real_size
-        mock_mesh.get_local_rank.return_value = real_rank
-        # We need ep_size > 1 for MoEFlexTokenDispatcher assertion
-        # If real_size is 1, we fake it as 2 for initialization testing if needed, 
-        # but better to run with nproc_per_node=2
-        mock_group.size.return_value = real_size
+        group = torch.distributed.group.WORLD
+        mock_mesh.size.return_value = torch.distributed.get_world_size()
+        mock_mesh.get_local_rank.return_value = torch.distributed.get_rank()
+        mock_mesh.get_group.return_value = group
     else:
-        mock_mesh.size.return_value = 2 # Fake 2 experts/ranks
-        mock_mesh.get_local_rank.return_value = 0
+        # Fallback to mock for offline skip-checks
+        mock_group = MagicMock()
         mock_group.size.return_value = 2
-        
-    mock_mesh.get_group.return_value = mock_group
+        mock_mesh.size.return_value = 2
+        mock_mesh.get_local_rank.return_value = 0
+        mock_mesh.get_group.return_value = mock_group
     
-    # We might need a real ProcessGroup if MoEFlexTokenDispatcher requires it.
-    # But for ep_size=1, it might skip comms.
     # Let's try to initialize.
     try:
         orig_experts.init_token_dispatcher(mock_mesh)
     except Exception as e:
-        import traceback
-        print(f"\nDEBUG: init_token_dispatcher failed with error: {e}")
-        traceback.print_exc()
         pytest.skip(f"Failed to init token dispatcher (likely needs distributed env): {e}")
 
     # Initialize weights
@@ -267,3 +258,70 @@ def test_apply_lora_patching_logic(moe_config):
     count = apply_lora_to_linear_modules(model, peft_config)
     assert count == 1
     assert isinstance(model.experts, GroupedExpertsLoRA)
+    assert isinstance(model.linear, nn.Linear) # Should not be patched
+
+class MockDeepEPDispatcher:
+    """Mock dispatcher that simulates DeepEP's token permutation locally."""
+    def token_permutation2(self, hidden_states, num_local_tokens, token_probs, token_indices):
+        # Simply return the hidden states as if it was a single expert local dispatch
+        # To make it compatible with ops.gmm, we need a tokens_per_expert tensor
+        tokens_per_expert = torch.zeros(4, dtype=torch.long, device=hidden_states.device)
+        return hidden_states, tokens_per_expert, token_probs
+
+    def token_unpermutation(self, hidden_states):
+        return hidden_states
+
+@pytest.mark.skipif(grouped_gemm is None, reason="Requires grouped_gemm")
+def test_grouped_experts_deepep_lora_forward_mocked(moe_config):
+    """
+    Test Forward pass of GroupedExpertsDeepEPLoRA using a Mock Dispatcher.
+    
+    This test verifies the LoRA-wrapped gated GEMM logic (using grouped_gemm kernels) 
+    independently of the DeepEP communication backend. This allows verification on 
+    non-Hopper (non-sm_90) hardware where DeepEP is physically unavailable.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    moe_config.n_routed_experts = 4
+    moe_config.dim = 16
+    moe_config.moe_inter_dim = 32
+    
+    orig_experts = GroupedExpertsDeepEP(moe_config).to(device)
+    
+    # Manually inject mock state since DeepEP init fails on non-Hopper hardware
+    orig_experts.n_routed_experts = 4
+    orig_experts.ep_size = 1
+    
+    lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4).to(device)
+    mock_dispatcher = MockDeepEPDispatcher()
+    
+    # Mock tokens_per_expert for ops.gmm - needs to sum to num_tokens
+    num_tokens = 8
+    # One expert gets all tokens for simplicity
+    # IMPORTANT: grouped_gemm expects batch_sizes (tokens_per_expert) to be on CPU
+    tokens_per_expert = torch.tensor([num_tokens, 0, 0, 0], dtype=torch.long, device="cpu")
+    
+    # Capture deterministic data to return from the mock dispatcher
+    permuted_x = torch.randn(num_tokens, 16, device=device).to(orig_experts.gate_and_up_projs.dtype)
+    permuted_probs = torch.ones(num_tokens, 1, device=device).to(orig_experts.gate_and_up_projs.dtype)
+    
+    # Set the same mock on both modules to ensure they see the same "dispatched" data
+    mock_dispatcher.token_permutation2 = MagicMock(
+        return_value=(permuted_x, tokens_per_expert, permuted_probs)
+    )
+    lora_module.token_dispatcher = mock_dispatcher
+    orig_experts.token_dispatcher = mock_dispatcher
+    
+    x = torch.randn(num_tokens, 16, device=device).to(orig_experts.gate_and_up_projs.dtype)
+    weights = torch.ones(num_tokens, 1, device=device).to(orig_experts.gate_and_up_projs.dtype)
+    indices = torch.zeros(num_tokens, 1, dtype=torch.long, device=device)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+    
+    # This will now reach the lora_module.forward -> ops.gmm calls!
+    out = lora_module(x, token_mask, weights, indices)
+    
+    # Verify equivalence with zero LoRA weights (DeepEP LoRA B is zero-init by default)
+    with torch.no_grad():
+        out_orig = orig_experts(x, token_mask, weights, indices)
+    
+    assert out.shape == (num_tokens, 16)
+    assert torch.allclose(out, out_orig, atol=1e-3, rtol=1e-3)
