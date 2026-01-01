@@ -5,8 +5,8 @@ quantization:
   bnb_4bit_quant_type: "nf4"
 
 step_scheduler:
-  global_batch_size: 8
-  local_batch_size: 4
+  global_batch_size: 32
+  local_batch_size: 8
   ckpt_every_steps: 50
   val_every_steps: 50
   num_epochs: 1
@@ -53,8 +53,8 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.SQuAD
-  path_or_dataset: rajpurkar/squad
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: train
   tokenizer:
     pretrained_model_name_or_path: Qwen/Qwen1.5-MoE-A2.7B
@@ -66,10 +66,9 @@ dataloader:
   num_workers: 2
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.SQuAD
-  path_or_dataset: rajpurkar/squad
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: validation
-  num_samples_limit: 64
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
