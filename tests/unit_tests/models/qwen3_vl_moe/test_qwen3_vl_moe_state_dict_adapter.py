@@ -181,6 +181,47 @@ class TestToHF:
         assert global_down.shape[0] == adapter.moe_config.n_routed_experts
         torch.testing.assert_close(global_down[2], local_slice)
 
+    def test_all_gather_path_populates_global_tensor(self, adapter, monkeypatch):
+        # Local shard has experts 0 and 1; simulate another rank providing experts 2 and 3
+        local_experts = torch.tensor(
+            [
+                [[1.0]],
+                [[2.0]],
+            ],
+            dtype=adapter.dtype,
+        )  # shape: [2, 1, 1]
+
+        device_mesh = Mock()
+        device_mesh.mesh_dim_names = ["ep"]
+        device_mesh.get_group = lambda dim: "ep_group" if dim == 0 else None
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.state_dict_utils.get_expert_range_for_rank_from_mesh",
+            lambda mesh, n_experts: (0, 2),
+        )
+        monkeypatch.setattr("torch.distributed.is_initialized", lambda: True)
+        monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
+
+        def fake_all_gather_object(gathered, payload, group=None):
+            # payload from this rank for experts [0,1]; simulate other rank with [2,3]
+            gathered[0] = payload
+            other_weights = [torch.tensor([[3.0]], dtype=adapter.dtype), torch.tensor([[4.0]], dtype=adapter.dtype)]
+            gathered[1] = ([2, 3], other_weights)
+
+        monkeypatch.setattr("torch.distributed.all_gather_object", fake_all_gather_object)
+
+        state_dict = {"model.language_model.layers.0.mlp.experts.gate_and_up_projs": local_experts}
+        out = adapter.to_hf(state_dict, device_mesh=device_mesh)
+
+        gate_key = "model.language_model.layers.0.mlp.experts.gate_up_proj"
+        global_gate = out[gate_key]
+
+        assert global_gate.shape == (adapter.moe_config.n_routed_experts, 1, 1)
+        torch.testing.assert_close(global_gate[0], torch.tensor([[1.0]], dtype=adapter.dtype))
+        torch.testing.assert_close(global_gate[1], torch.tensor([[2.0]], dtype=adapter.dtype))
+        torch.testing.assert_close(global_gate[2], torch.tensor([[3.0]], dtype=adapter.dtype))
+        torch.testing.assert_close(global_gate[3], torch.tensor([[4.0]], dtype=adapter.dtype))
+
 
 class TestFromHF:
     def test_detects_model_prefix(self, adapter):
