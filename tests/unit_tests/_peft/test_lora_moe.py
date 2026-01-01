@@ -284,6 +284,7 @@ def test_grouped_experts_deepep_lora_forward_mocked(moe_config):
     moe_config.n_routed_experts = 4
     moe_config.dim = 16
     moe_config.moe_inter_dim = 32
+    moe_config.dtype = torch.bfloat16
     
     orig_experts = GroupedExpertsDeepEP(moe_config).to(device)
     
@@ -301,8 +302,9 @@ def test_grouped_experts_deepep_lora_forward_mocked(moe_config):
     tokens_per_expert = torch.tensor([num_tokens, 0, 0, 0], dtype=torch.long, device="cpu")
     
     # Capture deterministic data to return from the mock dispatcher
-    permuted_x = torch.randn(num_tokens, 16, device=device).to(orig_experts.gate_and_up_projs.dtype)
-    permuted_probs = torch.ones(num_tokens, 1, device=device).to(orig_experts.gate_and_up_projs.dtype)
+    dtype = orig_experts.gate_and_up_projs.dtype
+    permuted_x = torch.randn(num_tokens, 16, device=device).to(dtype)
+    permuted_probs = torch.ones(num_tokens, 1, device=device).to(dtype)
     
     # Set the same mock on both modules to ensure they see the same "dispatched" data
     mock_dispatcher.token_permutation2 = MagicMock(
