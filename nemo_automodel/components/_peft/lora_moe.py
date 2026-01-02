@@ -63,60 +63,58 @@ class GroupedExpertsLoRA(GroupedExperts):
             self.gate_up_proj_bias.data.copy_(orig_module.gate_up_proj_bias.data)
             self.down_proj_bias.data.copy_(orig_module.down_proj_bias.data)
 
-        self._init_adapter(
+        self.lora_A_init_method = lora_A_init_method
+        GroupedExpertsLoRA._init_adapter(
+            self,
             lora_dim=lora_dim,
             alpha=alpha,
             lora_A_init_method=lora_A_init_method,
             lora_dtype=lora_dtype,
         )
-        self._init_stats_printed = False
 
-    def _init_adapter(self, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None):
-        self.lora_dim = lora_dim
-        self.scale = alpha / lora_dim
+    @staticmethod
+    def _init_adapter(obj, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None):
+        obj.lora_dim = lora_dim
+        obj.scale = alpha / lora_dim
 
         # Freeze base weights
-        self.gate_and_up_projs.requires_grad = False
-        self.down_projs.requires_grad = False
-        if self.expert_bias:
-            self.gate_up_proj_bias.requires_grad = False
-            self.down_proj_bias.requires_grad = False
+        obj.gate_and_up_projs.requires_grad = False
+        obj.down_projs.requires_grad = False
+        if obj.expert_bias:
+            obj.gate_up_proj_bias.requires_grad = False
+            obj.down_proj_bias.requires_grad = False
 
         # Determine dtype
         if isinstance(lora_dtype, str):
             lora_dtype = dtype_from_str(lora_dtype)
-        dtype = lora_dtype or self.gate_and_up_projs.dtype
-        device = self.gate_and_up_projs.device
+        dtype = lora_dtype or obj.gate_and_up_projs.dtype
+        device = obj.gate_and_up_projs.device
 
         # LoRA weights for gate_proj, up_proj, and down_proj
         # We treat gate_and_up as a single block for LoRA as well to match structure
         # Shape: [n_experts, in_dim, lora_dim] and [n_experts, lora_dim, out_dim]
         
         # gate_and_up: [n_experts, dim, moe_inter_dim * 2]
-        self.lora_gate_and_up_A = nn.Parameter(
-            torch.empty(self.n_routed_experts, self.config.dim, lora_dim, dtype=dtype, device=device)
+        obj.lora_gate_and_up_A = nn.Parameter(
+            torch.empty(obj.n_routed_experts, obj.config.dim, lora_dim, dtype=dtype, device=device)
         )
-        self.lora_gate_and_up_B = nn.Parameter(
-            torch.empty(self.n_routed_experts, lora_dim, self.config.moe_inter_dim * 2, dtype=dtype, device=device)
+        obj.lora_gate_and_up_B = nn.Parameter(
+            torch.empty(obj.n_routed_experts, lora_dim, obj.config.moe_inter_dim * 2, dtype=dtype, device=device)
         )
 
         # down: [n_experts, moe_inter_dim, dim]
-        self.lora_down_A = nn.Parameter(
-            torch.empty(self.n_routed_experts, self.config.moe_inter_dim, lora_dim, dtype=dtype, device=device)
+        obj.lora_down_A = nn.Parameter(
+            torch.empty(obj.n_routed_experts, obj.config.moe_inter_dim, lora_dim, dtype=dtype, device=device)
         )
-        self.lora_down_B = nn.Parameter(
-            torch.empty(self.n_routed_experts, lora_dim, self.config.dim, dtype=dtype, device=device)
+        obj.lora_down_B = nn.Parameter(
+            torch.empty(obj.n_routed_experts, lora_dim, obj.config.dim, dtype=dtype, device=device)
         )
 
-        self._init_lora_weights(lora_A_init_method)
+        # Initialize LoRA weights
+        GroupedExpertsLoRA.init_lora_weights(obj, lora_A_init_method)
 
-    def _init_lora_weights(self, init_method):
-        # Register hooks to debug parameter gradients
-        self.lora_gate_and_up_A.register_hook(lambda grad: print(f"[DEBUG] lora_gate_and_up_A gradient norm: {grad.norm().item():.10f}"))
-        self.lora_gate_and_up_B.register_hook(lambda grad: print(f"[DEBUG] lora_gate_and_up_B gradient norm: {grad.norm().item():.10f}"))
-        self.lora_down_A.register_hook(lambda grad: print(f"[DEBUG] lora_down_A gradient norm: {grad.norm().item():.10f}"))
-        self.lora_down_B.register_hook(lambda grad: print(f"[DEBUG] lora_down_B gradient norm: {grad.norm().item():.10f}"))
-
+    @torch.no_grad
+    def init_lora_weights(self, init_method):
         if init_method == "xavier":
             nn.init.xavier_normal_(self.lora_gate_and_up_A)
             nn.init.xavier_normal_(self.lora_down_A)
@@ -127,22 +125,9 @@ class GroupedExpertsLoRA(GroupedExperts):
         nn.init.zeros_(self.lora_gate_and_up_B)
         nn.init.zeros_(self.lora_down_B)
 
-        if self.lora_gate_and_up_A.device.type != "meta":
-            print(f"[DEBUG] GroupedExpertsLoRA init: lora_gate_and_up_A stats: mean={self.lora_gate_and_up_A.mean().item():.6f}, max={self.lora_gate_and_up_A.max().item():.6f}, std={self.lora_gate_and_up_A.std().item():.6f}")
-            print(f"[DEBUG] GroupedExpertsLoRA init: lora_down_A stats: mean={self.lora_down_A.mean().item():.6f}, max={self.lora_down_A.max().item():.6f}, std={self.lora_down_A.std().item():.6f}")
-
-    def forward(self, x, token_mask, weights, indices):
+    def forward(self, x: torch.Tensor, token_mask: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor):
         """
-        Forward pass for GroupedExpertsLoRA.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape [num_tokens, dim].
-            token_mask (torch.Tensor): Boolean mask indicating valid tokens.
-            weights (torch.Tensor): Routing weights for the selected experts.
-            indices (torch.Tensor): Indices of the selected experts.
-
-        Returns:
-            torch.Tensor: Output tensor after expert computation with LoRA.
+        Forward pass for the GroupedExpertsLoRA.
         """
         # Duplicate logic from GroupedExperts.forward but inject LoRA
         # This is necessary because the original forward doesn't expose hooks for the inner expert computation
@@ -164,16 +149,6 @@ class GroupedExpertsLoRA(GroupedExperts):
             indices = DTensor.from_local(indices, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
             token_mask = DTensor.from_local(token_mask, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
 
-        print(f"[DEBUG] GroupedExpertsLoRA.forward: x stats: mean={x.mean().item():.6f}, max={x.max().item():.6f}, requires_grad={x.requires_grad}, grad_fn={x.grad_fn}")
-        
-        if not self._init_stats_printed and self.lora_gate_and_up_A.device.type != "meta":
-            print(f"[DEBUG] GroupedExpertsLoRA FIRST FORWARD - lora_gate_and_up_A stats: mean={self.lora_gate_and_up_A.mean().item():.6f}, std={self.lora_gate_and_up_A.std().item():.6f}")
-            print(f"[DEBUG] GroupedExpertsLoRA FIRST FORWARD - lora_down_A stats: mean={self.lora_down_A.mean().item():.6f}, std={self.lora_down_A.std().item():.6f}")
-            self._init_stats_printed = True
-
-        print(f"[DEBUG] self.lora_gate_and_up_A.requires_grad={self.lora_gate_and_up_A.requires_grad}")
-        print(f"[DEBUG] self.lora_gate_and_up_A device: {self.lora_gate_and_up_A.device}")
-
         n_local_experts = self.n_routed_experts // ep_size
         experts_start_idx = ep_rank * n_local_experts
         experts_end_idx = experts_start_idx + n_local_experts
@@ -186,34 +161,10 @@ class GroupedExpertsLoRA(GroupedExperts):
 
         # Helper for LoRA computation: x @ A @ B * scale
         def compute_lora(x, lora_A, lora_B, expert_id):
-            local_A = lora_A[expert_id]
-            local_B = lora_B[expert_id]
+            local_A = get_local_proj(lora_A, expert_id)
+            local_B = get_local_proj(lora_B, expert_id)
             
-            # MatMul 1: x @ A
-            out_A = x @ local_A
-            
-            # MatMul 2: out_A @ B
-            out_B = out_A @ local_B
-            
-            res = out_B * self.scale
-            
-            if expert_id == experts_start_idx and x.dim() > 1 and res.requires_grad:
-                def grad_trace_hook(name):
-                    return lambda grad: print(f"[DEBUG] Expert {expert_id} {name} grad norm: {grad.norm().item():.10f}")
-                
-                res.register_hook(grad_trace_hook("lora_res"))
-                out_B.register_hook(grad_trace_hook("lora_out_B"))
-                out_A.register_hook(grad_trace_hook("lora_out_A"))
-                local_B.register_hook(grad_trace_hook("local_B_slice"))
-                local_A.register_hook(grad_trace_hook("local_A_slice"))
-                
-                print(f"[DEBUG] compute_lora: Expert {expert_id} local_A abs mean: {local_A.abs().mean().item():.10f}")
-                print(f"[DEBUG] compute_lora: Expert {expert_id} out_A abs mean: {out_A.abs().mean().item():.10f}")
-                print(f"[DEBUG] compute_lora: Expert {expert_id} local_B requires_grad: {local_B.requires_grad}")
-                
-                print(f"[DEBUG] compute_lora stats: x.dtype={x.dtype}, A.dtype={local_A.dtype}, out_A.dtype={out_A.dtype}, B.dtype={local_B.dtype}")
-                
-            return res
+            return x @ local_A @ local_B * self.scale
 
         y = torch.zeros_like(x)
 
@@ -223,10 +174,6 @@ class GroupedExpertsLoRA(GroupedExperts):
 
             if idx.numel() == 0:
                 continue
-
-            # DEBUG: Trace Gradient Flow (only for first expert of first layer)
-            if i == 0 and idx.numel() > 0 and x.requires_grad:
-                print(f"[DEBUG] Expert {i} active. x_idx.requires_grad={x.requires_grad}")
 
             gate_and_up_proj = get_local_proj(self.gate_and_up_projs, i)
             down_proj = get_local_proj(self.down_projs, i)
@@ -241,12 +188,7 @@ class GroupedExpertsLoRA(GroupedExperts):
             # 1. Gate + Up Projection
             gate_and_up_out = x_idx @ gate_and_up_proj
             # Add LoRA
-            lora_term_gate = compute_lora(x_idx, self.lora_gate_and_up_A, self.lora_gate_and_up_B, i)
-            gate_and_up_out = gate_and_up_out + lora_term_gate
-            
-            if i == experts_start_idx and x_idx.numel() > 0:
-                print(f"[DEBUG] Expert {i}: x_idx stats: mean={x_idx.mean().item():.6f}, max={x_idx.max().item():.6f}")
-                print(f"[DEBUG] Expert {i}: lora_term_gate stats: mean={lora_term_gate.mean().item():.6f}, max={lora_term_gate.max().item():.6f}, requires_grad={lora_term_gate.requires_grad}, grad_fn={lora_term_gate.grad_fn}")
+            gate_and_up_out = gate_and_up_out + compute_lora(x_idx, self.lora_gate_and_up_A, self.lora_gate_and_up_B, i)
             
             # Activation logic (duplicated from layers.py swiglu/quick_geglu but adapted)
             # We need to manually apply activation because we modified the projection output
@@ -280,27 +222,12 @@ class GroupedExpertsLoRA(GroupedExperts):
             
             expert_out = expert_out_val * weights[idx, top, None]
             
-            if i == experts_start_idx and expert_out.requires_grad:
-                expert_out.register_hook(lambda grad: print(f"[DEBUG] Expert {i} expert_out_weighted grad norm: {grad.norm().item():.10f}"))
-                expert_out_val.register_hook(lambda grad: print(f"[DEBUG] Expert {i} expert_out_val grad norm: {grad.norm().item():.10f}"))
-            
-            # Try more direct accumulation for 1-GPU to ensure no disconnect
-            if ep_size == 1:
-                y[idx_b] = y[idx_b] + expert_out.to(y.dtype)
-            else:
-                y = torch.scatter_add(y, dim=0, index=idx_b, src=expert_out.to(x.dtype))
+            y = torch.scatter_add(y, dim=0, index=idx_b, src=expert_out.to(x.dtype))
 
         if ep_size > 1:
             y = DTensor.from_local(y, device_mesh=ep_mesh, placements=[Partial()])
             y = y.redistribute(placements=[Shard(0)]).to_local()
         
-        if y.requires_grad:
-            def hook(grad):
-                print(f"[DEBUG] GroupedExpertsLoRA output y grad stats: mean={grad.mean().item():.6f}, max={grad.max().item():.6f}, norm={grad.norm().item():.6f}")
-            y.register_hook(hook)
-
-        print(f"[DEBUG] GroupedExpertsLoRA.forward output y stats: mean={y.mean().item():.6f}, max={y.max().item():.6f}, requires_grad={y.requires_grad}, grad_fn={y.grad_fn}")
-
         return y
 
 
@@ -346,52 +273,50 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         if not hasattr(self, "token_dispatcher"):
              self.token_dispatcher = getattr(orig_module, "token_dispatcher", None)
 
-        self._init_adapter(
+        self.lora_A_init_method = lora_A_init_method
+        GroupedExpertsDeepEPLoRA._init_adapter(
+            self,
             lora_dim=lora_dim,
             alpha=alpha,
             lora_A_init_method=lora_A_init_method,
             lora_dtype=lora_dtype,
         )
 
-    def _init_adapter(self, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None):
-        self.lora_dim = lora_dim
-        self.scale = alpha / lora_dim
+    @staticmethod
+    def _init_adapter(obj, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None):
+        obj.lora_dim = lora_dim
+        obj.scale = alpha / lora_dim
 
-        self.gate_and_up_projs.requires_grad = False
-        self.down_projs.requires_grad = False
-        if self.expert_bias:
-            self.gate_up_proj_bias.requires_grad = False
-            self.down_proj_bias.requires_grad = False
+        obj.gate_and_up_projs.requires_grad = False
+        obj.down_projs.requires_grad = False
+        if obj.expert_bias:
+            obj.gate_up_proj_bias.requires_grad = False
+            obj.down_proj_bias.requires_grad = False
 
         if isinstance(lora_dtype, str):
             lora_dtype = dtype_from_str(lora_dtype)
-        dtype = lora_dtype or self.gate_and_up_projs.dtype
-        device = self.gate_and_up_projs.device
+        dtype = lora_dtype or obj.gate_and_up_projs.dtype
+        device = obj.gate_and_up_projs.device
 
         # LoRA weights
-        self.lora_gate_and_up_A = nn.Parameter(
-            torch.empty(self.config.n_routed_experts, self.config.dim, lora_dim, dtype=dtype, device=device)
+        obj.lora_gate_and_up_A = nn.Parameter(
+            torch.empty(obj.config.n_routed_experts, obj.config.dim, lora_dim, dtype=dtype, device=device)
         )
-        self.lora_gate_and_up_B = nn.Parameter(
-            torch.empty(self.config.n_routed_experts, lora_dim, self.config.moe_inter_dim * 2, dtype=dtype, device=device)
-        )
-
-        self.lora_down_A = nn.Parameter(
-            torch.empty(self.config.n_routed_experts, self.config.moe_inter_dim, lora_dim, dtype=dtype, device=device)
-        )
-        self.lora_down_B = nn.Parameter(
-            torch.empty(self.config.n_routed_experts, lora_dim, self.config.dim, dtype=dtype, device=device)
+        obj.lora_gate_and_up_B = nn.Parameter(
+            torch.empty(obj.config.n_routed_experts, lora_dim, obj.config.moe_inter_dim * 2, dtype=dtype, device=device)
         )
 
-        self._init_lora_weights(lora_A_init_method)
+        obj.lora_down_A = nn.Parameter(
+            torch.empty(obj.config.n_routed_experts, obj.config.moe_inter_dim, lora_dim, dtype=dtype, device=device)
+        )
+        obj.lora_down_B = nn.Parameter(
+            torch.empty(obj.config.n_routed_experts, lora_dim, obj.config.dim, dtype=dtype, device=device)
+        )
 
-    def _init_lora_weights(self, init_method):
-        # Register hooks for DeepEP version as well
-        self.lora_gate_and_up_A.register_hook(lambda grad: print(f"[DEBUG] DeepEP lora_gate_and_up_A gradient norm: {grad.norm().item():.10f}"))
-        self.lora_gate_and_up_B.register_hook(lambda grad: print(f"[DEBUG] DeepEP lora_gate_and_up_B gradient norm: {grad.norm().item():.10f}"))
-        self.lora_down_A.register_hook(lambda grad: print(f"[DEBUG] DeepEP lora_down_A gradient norm: {grad.norm().item():.10f}"))
-        self.lora_down_B.register_hook(lambda grad: print(f"[DEBUG] DeepEP lora_down_B gradient norm: {grad.norm().item():.10f}"))
+        GroupedExpertsDeepEPLoRA.init_lora_weights(obj, lora_A_init_method)
 
+    @torch.no_grad
+    def init_lora_weights(self, init_method):
         if init_method == "xavier":
             nn.init.xavier_normal_(self.lora_gate_and_up_A)
             nn.init.xavier_normal_(self.lora_down_A)
@@ -402,11 +327,13 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         nn.init.zeros_(self.lora_gate_and_up_B)
         nn.init.zeros_(self.lora_down_B)
 
-        if self.lora_gate_and_up_A.device.type != "meta":
-            print(f"[DEBUG] GroupedExpertsDeepEPLoRA init: lora_gate_and_up_A stats: mean={self.lora_gate_and_up_A.mean().item():.6f}, max={self.lora_gate_and_up_A.max().item():.6f}, std={self.lora_gate_and_up_A.std().item():.6f}")
-            print(f"[DEBUG] GroupedExpertsDeepEPLoRA init: lora_down_A stats: mean={self.lora_down_A.mean().item():.6f}, max={self.lora_down_A.max().item():.6f}, std={self.lora_down_A.std().item():.6f}")
-
-    def forward(self, x, token_mask, weights, indices):
+    def forward(
+        self,
+        x: torch.Tensor,
+        token_mask: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+    ):
         """
         Forward pass for GroupedExpertsDeepEPLoRA.
 
@@ -449,13 +376,6 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 return proj
 
         if torch.count_nonzero(tokens_per_expert) > 0:
-            if not self._init_stats_printed and self.lora_gate_and_up_A.device.type != "meta":
-                print(f"[DEBUG] GroupedExpertsDeepEPLoRA FIRST FORWARD - lora_gate_and_up_A stats: mean={local_A.mean().item() if 'local_A' in locals() else self.lora_gate_and_up_A.mean().item():.6f}")
-                self._init_stats_printed = True
-
-            print(f"[DEBUG] GroupedExpertsDeepEPLoRA.forward: x stats: mean={x.mean().item():.6f}, max={x.max().item():.6f}, requires_grad={x.requires_grad}, grad_fn={x.grad_fn}")
-            print(f"[DEBUG] GroupedExpertsDeepEPLoRA.forward: permuted_local_hidden_states stats: mean={permuted_local_hidden_states.mean().item():.6f}, max={permuted_local_hidden_states.max().item():.6f}")
-            print(f"[DEBUG] self.lora_gate_and_up_A stats: mean={to_local(self.lora_gate_and_up_A).mean().item():.6f}, max={to_local(self.lora_gate_and_up_A).max().item():.6f}, requires_grad={self.lora_gate_and_up_A.requires_grad}")
             # 1. Gate + Up Projection
             output1 = ops.gmm(
                 permuted_local_hidden_states,
@@ -479,16 +399,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 trans_b=False
             )
             
-            if lora_out1.requires_grad:
-                def grad_trace_hook_deepep(name):
-                    return lambda grad: print(f"[DEBUG] DeepEP {name} grad norm: {grad.norm().item():.10f}")
-                lora_out1.register_hook(grad_trace_hook_deepep("lora_out1"))
-                lora_out1_A.register_hook(grad_trace_hook_deepep("lora_out1_A"))
-
             output1 = output1 + lora_out1 * self.scale
-
-            print(f"[DEBUG] output1 stats: mean={output1.mean().item():.6f}, max={output1.max().item():.6f}, requires_grad={output1.requires_grad}, grad_fn={output1.grad_fn}")
-            print(f"[DEBUG] lora_out1 stats: mean={lora_out1.mean().item():.6f}, max={lora_out1.max().item():.6f}, requires_grad={lora_out1.requires_grad}, grad_fn={lora_out1.grad_fn}")
 
             if self.expert_bias:
                 gate_and_up_bias = get_local_weights(self.gate_up_proj_bias)
@@ -524,9 +435,8 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             output1 = torch.matmul(x[0:1] * 0, local_base_up[0:1])
             
             # Add LoRA dummy computation
-            local_lora_A = get_local_weights(self.lora_gate_and_up_A)
-            local_lora_B = get_local_weights(self.lora_gate_and_up_B)
-            dummy_lora1 = torch.matmul(torch.matmul(x[0:1] * 0, local_lora_A[0:1]), local_lora_B[0:1])
+            dummy_lora1 = torch.matmul(x[0:1] * 0, get_local_weights(self.lora_gate_and_up_A)[0:1])
+            dummy_lora1 = torch.matmul(dummy_lora1, get_local_weights(self.lora_gate_and_up_B)[0:1])
             output1 = output1 + dummy_lora1 * self.scale
             
             output1_ = self.expert_activation(output1, permuted_probs)
@@ -534,9 +444,8 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             output2 = torch.matmul(output1_, local_base_down[0:1])
             
             # Add LoRA dummy computation
-            local_lora_down_A = get_local_weights(self.lora_down_A)
-            local_lora_down_B = get_local_weights(self.lora_down_B)
-            dummy_lora2 = torch.matmul(torch.matmul(output1_ * 0, local_lora_down_A[0:1]), local_lora_down_B[0:1])
+            dummy_lora2 = torch.matmul(output1_ * 0, get_local_weights(self.lora_down_A)[0:1])
+            dummy_lora2 = torch.matmul(dummy_lora2, get_local_weights(self.lora_down_B)[0:1])
             output2 = output2 + dummy_lora2 * self.scale
 
         y = self.token_dispatcher.token_unpermutation(output2)
