@@ -12,17 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-MAJOR = 0
-MINOR = 2
-PATCH = 0
-PRE_RELEASE = ""
-
-# Use the following formatting: (major, minor, patch, pre-release)
-VERSION = (MAJOR, MINOR, PATCH, PRE_RELEASE)
-
-__shortversion__ = ".".join(map(str, VERSION[:3]))
-__version__ = ".".join(map(str, VERSION[:3])) + "".join(VERSION[3:])
+try:
+    from ._version import __git_version__ as __git_version__
+    from ._version import __version__ as __version__
+except ModuleNotFoundError:
+    # Fallbacks for running directly from the source tree before _version.py is generated
+    __git_version__ = "unknown"
+    __version__ = "0.0.0"
 
 __package_name__ = "nemo_automodel"
 __contact_names__ = "NVIDIA"

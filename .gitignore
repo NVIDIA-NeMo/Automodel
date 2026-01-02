@@ -159,6 +159,9 @@ cifar-10-batches-py
 tests/.data
 tests/data
 
+# Generated files
+nemo_automodel/_version.py
+
 # outputs folder
 examples/*/outputs
 examples/*/NeMo_experiments
