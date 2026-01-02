@@ -175,11 +175,28 @@ class GroupedExpertsLoRA(GroupedExperts):
 
         # Helper for LoRA computation: x @ A @ B * scale
         def compute_lora(x, lora_A, lora_B, expert_id):
-            local_A = get_local_proj(lora_A, expert_id)
-            local_B = get_local_proj(lora_B, expert_id)
-            if expert_id == experts_start_idx and x.dim() > 1:
-                print(f"[DEBUG] self.scale value: {self.scale}")
-            return (x @ local_A @ local_B) * self.scale
+            local_A = lora_A[expert_id]
+            local_B = lora_B[expert_id]
+            
+            # MatMul 1: x @ A
+            out_A = x @ local_A
+            
+            # MatMul 2: out_A @ B
+            out_B = out_A @ local_B
+            
+            res = out_B * self.scale
+            
+            if expert_id == experts_start_idx and x.dim() > 1 and res.requires_grad:
+                def grad_trace_hook(name):
+                    return lambda grad: print(f"[DEBUG] Layer {self.layer_id if hasattr(self, 'layer_id') else '?'} Expert {expert_id} {name} grad norm: {grad.norm().item():.10f}")
+                
+                res.register_hook(grad_trace_hook("lora_res"))
+                out_B.register_hook(grad_trace_hook("lora_out_B"))
+                out_A.register_hook(grad_trace_hook("lora_out_A"))
+                local_B.register_hook(grad_trace_hook("local_B_slice"))
+                local_A.register_hook(grad_trace_hook("local_A_slice"))
+                
+            return res
 
         y = torch.zeros_like(x)
 
@@ -245,8 +262,9 @@ class GroupedExpertsLoRA(GroupedExperts):
                 expert_out_val = expert_out_val + down_proj_bias
             
             expert_out = expert_out_val * weights[idx, top, None]
-            # ---------------------------------------------
-
+            if i == experts_start_idx and expert_out.requires_grad:
+                expert_out.register_hook(lambda grad: print(f"[DEBUG] Expert {i} expert_out grad norm: {grad.norm().item():.10f}"))
+            
             y = torch.scatter_add(y, dim=0, index=idx_b, src=expert_out.to(x.dtype))
 
         if ep_size > 1:
@@ -415,11 +433,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 trans_b=False,
             )
             
-            # Add LoRA: x @ A @ B
-            # We can use ops.gmm for LoRA as well if we chain them
-            # A: [E, D, R], B: [E, R, H]
-            # x: [T, D], stack of blocks [t_i, D] for each expert
-            # x @ A -> [T, R] (stack of blocks [t_i, R] for each expert)
+            # Add LoRA
             lora_out1_A = ops.gmm(
                 permuted_local_hidden_states,
                 get_local_weights(self.lora_gate_and_up_A),
@@ -433,6 +447,13 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 tokens_per_expert,
                 trans_b=False
             )
+            
+            if lora_out1.requires_grad:
+                def grad_trace_hook_deepep(name):
+                    return lambda grad: print(f"[DEBUG] DeepEP {name} grad norm: {grad.norm().item():.10f}")
+                lora_out1.register_hook(grad_trace_hook_deepep("lora_out1"))
+                lora_out1_A.register_hook(grad_trace_hook_deepep("lora_out1_A"))
+
             output1 = output1 + lora_out1 * self.scale
 
             print(f"[DEBUG] output1 stats: mean={output1.mean().item():.6f}, max={output1.max().item():.6f}, requires_grad={output1.requires_grad}, grad_fn={output1.grad_fn}")
