@@ -412,7 +412,7 @@ def compute_trust_remote_code_from_model(cfg_model):
         cfg_model (ConfigNode): Model configuration.
 
     Returns:
-        Whether to trust remote code.
+        bool: Whether to trust remote code.
     """
     if hasattr(cfg_model, "trust_remote_code"):
         return getattr(cfg_model, "trust_remote_code")
