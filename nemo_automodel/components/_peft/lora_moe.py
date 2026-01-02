@@ -63,13 +63,13 @@ class GroupedExpertsLoRA(GroupedExperts):
             self.gate_up_proj_bias.data.copy_(orig_module.gate_up_proj_bias.data)
             self.down_proj_bias.data.copy_(orig_module.down_proj_bias.data)
 
-        # Initialize LoRA adapters
         self._init_adapter(
             lora_dim=lora_dim,
             alpha=alpha,
             lora_A_init_method=lora_A_init_method,
             lora_dtype=lora_dtype,
         )
+        self._init_stats_printed = False
 
     def _init_adapter(self, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None):
         self.lora_dim = lora_dim
@@ -127,8 +127,9 @@ class GroupedExpertsLoRA(GroupedExperts):
         nn.init.zeros_(self.lora_gate_and_up_B)
         nn.init.zeros_(self.lora_down_B)
 
-        print(f"[DEBUG] GroupedExpertsLoRA init: lora_gate_and_up_A stats: mean={self.lora_gate_and_up_A.mean().item():.6f}, max={self.lora_gate_and_up_A.max().item():.6f}, std={self.lora_gate_and_up_A.std().item():.6f}")
-        print(f"[DEBUG] GroupedExpertsLoRA init: lora_down_A stats: mean={self.lora_down_A.mean().item():.6f}, max={self.lora_down_A.max().item():.6f}, std={self.lora_down_A.std().item():.6f}")
+        if self.lora_gate_and_up_A.device.type != "meta":
+            print(f"[DEBUG] GroupedExpertsLoRA init: lora_gate_and_up_A stats: mean={self.lora_gate_and_up_A.mean().item():.6f}, max={self.lora_gate_and_up_A.max().item():.6f}, std={self.lora_gate_and_up_A.std().item():.6f}")
+            print(f"[DEBUG] GroupedExpertsLoRA init: lora_down_A stats: mean={self.lora_down_A.mean().item():.6f}, max={self.lora_down_A.max().item():.6f}, std={self.lora_down_A.std().item():.6f}")
 
     def forward(self, x, token_mask, weights, indices):
         """
@@ -164,7 +165,14 @@ class GroupedExpertsLoRA(GroupedExperts):
             token_mask = DTensor.from_local(token_mask, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
 
         print(f"[DEBUG] GroupedExpertsLoRA.forward: x stats: mean={x.mean().item():.6f}, max={x.max().item():.6f}, requires_grad={x.requires_grad}, grad_fn={x.grad_fn}")
+        
+        if not self._init_stats_printed and self.lora_gate_and_up_A.device.type != "meta":
+            print(f"[DEBUG] GroupedExpertsLoRA FIRST FORWARD - lora_gate_and_up_A stats: mean={self.lora_gate_and_up_A.mean().item():.6f}, std={self.lora_gate_and_up_A.std().item():.6f}")
+            print(f"[DEBUG] GroupedExpertsLoRA FIRST FORWARD - lora_down_A stats: mean={self.lora_down_A.mean().item():.6f}, std={self.lora_down_A.std().item():.6f}")
+            self._init_stats_printed = True
+
         print(f"[DEBUG] self.lora_gate_and_up_A.requires_grad={self.lora_gate_and_up_A.requires_grad}")
+        print(f"[DEBUG] self.lora_gate_and_up_A device: {self.lora_gate_and_up_A.device}")
 
         n_local_experts = self.n_routed_experts // ep_size
         experts_start_idx = ep_rank * n_local_experts
@@ -394,8 +402,9 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         nn.init.zeros_(self.lora_gate_and_up_B)
         nn.init.zeros_(self.lora_down_B)
 
-        print(f"[DEBUG] GroupedExpertsDeepEPLoRA init: lora_gate_and_up_A stats: mean={self.lora_gate_and_up_A.mean().item():.6f}, max={self.lora_gate_and_up_A.max().item():.6f}, std={self.lora_gate_and_up_A.std().item():.6f}")
-        print(f"[DEBUG] GroupedExpertsDeepEPLoRA init: lora_down_A stats: mean={self.lora_down_A.mean().item():.6f}, max={self.lora_down_A.max().item():.6f}, std={self.lora_down_A.std().item():.6f}")
+        if self.lora_gate_and_up_A.device.type != "meta":
+            print(f"[DEBUG] GroupedExpertsDeepEPLoRA init: lora_gate_and_up_A stats: mean={self.lora_gate_and_up_A.mean().item():.6f}, max={self.lora_gate_and_up_A.max().item():.6f}, std={self.lora_gate_and_up_A.std().item():.6f}")
+            print(f"[DEBUG] GroupedExpertsDeepEPLoRA init: lora_down_A stats: mean={self.lora_down_A.mean().item():.6f}, max={self.lora_down_A.max().item():.6f}, std={self.lora_down_A.std().item():.6f}")
 
     def forward(self, x, token_mask, weights, indices):
         """
@@ -440,6 +449,10 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 return proj
 
         if torch.count_nonzero(tokens_per_expert) > 0:
+            if not self._init_stats_printed and self.lora_gate_and_up_A.device.type != "meta":
+                print(f"[DEBUG] GroupedExpertsDeepEPLoRA FIRST FORWARD - lora_gate_and_up_A stats: mean={local_A.mean().item() if 'local_A' in locals() else self.lora_gate_and_up_A.mean().item():.6f}")
+                self._init_stats_printed = True
+
             print(f"[DEBUG] GroupedExpertsDeepEPLoRA.forward: x stats: mean={x.mean().item():.6f}, max={x.max().item():.6f}, requires_grad={x.requires_grad}, grad_fn={x.grad_fn}")
             print(f"[DEBUG] GroupedExpertsDeepEPLoRA.forward: permuted_local_hidden_states stats: mean={permuted_local_hidden_states.mean().item():.6f}, max={permuted_local_hidden_states.max().item():.6f}")
             print(f"[DEBUG] self.lora_gate_and_up_A stats: mean={to_local(self.lora_gate_and_up_A).mean().item():.6f}, max={to_local(self.lora_gate_and_up_A).max().item():.6f}, requires_grad={self.lora_gate_and_up_A.requires_grad}")
