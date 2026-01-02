@@ -162,8 +162,10 @@ class GroupedExpertsLoRA(GroupedExperts):
         experts_end_idx = experts_start_idx + n_local_experts
 
         def get_local_proj(proj, expert_id):
-            local_proj = proj.to_local() if isinstance(proj, DTensor) else proj
-            return local_proj[expert_id - experts_start_idx]
+            if isinstance(proj, DTensor):
+                return proj.to_local()[expert_id - experts_start_idx]
+            else:
+                return proj[expert_id]
 
         # Helper for LoRA computation: x @ A @ B * scale
         def compute_lora(x, lora_A, lora_B, expert_id):
@@ -209,13 +211,12 @@ class GroupedExpertsLoRA(GroupedExperts):
             if gate_up_proj_bias is not None:
                 gate_and_up_out = gate_and_up_out + gate_up_proj_bias
             
-            # Assuming swiglu/quick_geglu structure (split in half)
-            gate_out, up_out = torch.chunk(gate_and_up_out, 2, -1)
+            # Correct splitting: Interleaved (even=gate, odd=up) to match base MoE
+            gate_out, up_out = gate_and_up_out[..., ::2], gate_and_up_out[..., 1::2]
             
             if self.config.expert_activation == "swiglu":
                 inter = torch.nn.functional.silu(gate_out) * up_out
             elif self.config.expert_activation == "quick_geglu":
-                # Simplified quick_geglu logic
                 limit = self.config.activation_limit
                 alpha = self.config.activation_alpha
                 gate_out = gate_out.clamp(min=None, max=limit)
@@ -367,6 +368,18 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         def to_local(tensor):
             return tensor.to_local() if hasattr(tensor, "to_local") else tensor
 
+        n_local_experts = self.n_routed_experts // self.ep_size
+        experts_start_idx = self.ep_rank * n_local_experts
+        experts_end_idx = experts_start_idx + n_local_experts
+
+        def get_local_weights(proj):
+            if isinstance(proj, DTensor):
+                return proj.to_local()
+            elif self.ep_size > 1:
+                return proj[experts_start_idx:experts_end_idx]
+            else:
+                return proj
+
         if torch.count_nonzero(tokens_per_expert) > 0:
             print(f"[DEBUG] GroupedExpertsDeepEPLoRA.forward: x stats: mean={x.mean().item():.6f}, max={x.max().item():.6f}, requires_grad={x.requires_grad}, grad_fn={x.grad_fn}")
             print(f"[DEBUG] GroupedExpertsDeepEPLoRA.forward: permuted_local_hidden_states stats: mean={permuted_local_hidden_states.mean().item():.6f}, max={permuted_local_hidden_states.max().item():.6f}")
@@ -374,7 +387,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             # 1. Gate + Up Projection
             output1 = ops.gmm(
                 permuted_local_hidden_states,
-                to_local(self.gate_and_up_projs),
+                get_local_weights(self.gate_and_up_projs),
                 tokens_per_expert,
                 trans_b=False,
             )
@@ -386,54 +399,70 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             # x @ A -> [T, R] (stack of blocks [t_i, R] for each expert)
             lora_out1_A = ops.gmm(
                 permuted_local_hidden_states,
-                to_local(self.lora_gate_and_up_A),
+                get_local_weights(self.lora_gate_and_up_A),
                 tokens_per_expert,
                 trans_b=False
             )
-            # [T, R] @ [E, R, H] -> [T, H]
+            # [T, R] @ [E_local, R, H] -> [T, H]
             lora_out1 = ops.gmm(
                 lora_out1_A,
-                to_local(self.lora_gate_and_up_B),
+                get_local_weights(self.lora_gate_and_up_B),
                 tokens_per_expert,
                 trans_b=False
             )
             output1 = output1 + lora_out1 * self.scale
-            
+
             print(f"[DEBUG] output1 stats: mean={output1.mean().item():.6f}, max={output1.max().item():.6f}, requires_grad={output1.requires_grad}, grad_fn={output1.grad_fn}")
             print(f"[DEBUG] lora_out1 stats: mean={lora_out1.mean().item():.6f}, max={lora_out1.max().item():.6f}, requires_grad={lora_out1.requires_grad}, grad_fn={lora_out1.grad_fn}")
 
             if self.expert_bias:
-                gate_and_up_bias = to_local(self.gate_up_proj_bias)
+                gate_and_up_bias = get_local_weights(self.gate_up_proj_bias)
                 output1 = self._apply_bias(output1, gate_and_up_bias, tokens_per_expert)
             
             output1 = self.expert_activation(output1, permuted_probs)
             
             # 2. Down Projection
-            output2 = ops.gmm(output1, to_local(self.down_projs), tokens_per_expert, trans_b=False)
+            output2 = ops.gmm(output1, get_local_weights(self.down_projs), tokens_per_expert, trans_b=False)
             
             # Add LoRA
             lora_out2_A = ops.gmm(
                 output1,
-                to_local(self.lora_down_A),
+                get_local_weights(self.lora_down_A),
                 tokens_per_expert,
                 trans_b=False
             )
             lora_out2 = ops.gmm(
                 lora_out2_A,
-                to_local(self.lora_down_B),
+                get_local_weights(self.lora_down_B),
                 tokens_per_expert,
                 trans_b=False
             )
             output2 = output2 + lora_out2 * self.scale
 
             if self.expert_bias:
-                down_bias = to_local(self.down_proj_bias)
+                down_bias = get_local_weights(self.down_proj_bias)
                 output2 = self._apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
         else:
-            # Handle empty case
-            output1 = torch.matmul(x[0] * 0, to_local(self.gate_and_up_projs)[0])
+            # Handle empty case for DeepEP
+            # Use slicing compatible with ep_size
+            local_base_up = to_local(self.gate_and_up_projs)
+            output1 = torch.matmul(x[0:1] * 0, local_base_up[0:1])
+            
+            # Add LoRA dummy computation
+            local_lora_A = get_local_weights(self.lora_gate_and_up_A)
+            local_lora_B = get_local_weights(self.lora_gate_and_up_B)
+            dummy_lora1 = torch.matmul(torch.matmul(x[0:1] * 0, local_lora_A[0:1]), local_lora_B[0:1])
+            output1 = output1 + dummy_lora1 * self.scale
+            
             output1_ = self.expert_activation(output1, permuted_probs)
-            output2 = torch.matmul(output1_, to_local(self.down_projs)[0])
+            local_base_down = to_local(self.down_projs)
+            output2 = torch.matmul(output1_, local_base_down[0:1])
+            
+            # Add LoRA dummy computation
+            local_lora_down_A = get_local_weights(self.lora_down_A)
+            local_lora_down_B = get_local_weights(self.lora_down_B)
+            dummy_lora2 = torch.matmul(torch.matmul(output1_ * 0, local_lora_down_A[0:1]), local_lora_down_B[0:1])
+            output2 = output2 + dummy_lora2 * self.scale
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
