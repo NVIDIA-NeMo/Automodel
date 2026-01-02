@@ -171,6 +171,8 @@ class GroupedExpertsLoRA(GroupedExperts):
         def compute_lora(x, lora_A, lora_B, expert_id):
             local_A = get_local_proj(lora_A, expert_id)
             local_B = get_local_proj(lora_B, expert_id)
+            if expert_id == experts_start_idx and x.dim() > 1:
+                print(f"[DEBUG] self.scale value: {self.scale}")
             return (x @ local_A @ local_B) * self.scale
 
         y = torch.zeros_like(x)
@@ -211,8 +213,12 @@ class GroupedExpertsLoRA(GroupedExperts):
             if gate_up_proj_bias is not None:
                 gate_and_up_out = gate_and_up_out + gate_up_proj_bias
             
-            # Correct splitting: Interleaved (even=gate, odd=up) to match base MoE
-            gate_out, up_out = gate_and_up_out[..., ::2], gate_and_up_out[..., 1::2]
+            # Correct splitting based on activation type
+            if self.config.expert_activation == "swiglu":
+                gate_out, up_out = torch.chunk(gate_and_up_out, 2, -1)
+            else:
+                # for quick_geglu
+                gate_out, up_out = gate_and_up_out[..., ::2], gate_and_up_out[..., 1::2]
             
             if self.config.expert_activation == "swiglu":
                 inter = torch.nn.functional.silu(gate_out) * up_out
@@ -241,7 +247,12 @@ class GroupedExpertsLoRA(GroupedExperts):
             y = DTensor.from_local(y, device_mesh=ep_mesh, placements=[Partial()])
             y = y.redistribute(placements=[Shard(0)]).to_local()
         
-        print(f"[DEBUG] GroupedExpertsLoRA.forward output y stats: mean={y.mean().item():.6f}, max={y.max().item():.6f}, grad_fn={y.grad_fn}")
+        if y.requires_grad:
+            def hook(grad):
+                print(f"[DEBUG] GroupedExpertsLoRA output y grad stats: mean={grad.mean().item():.6f}, max={grad.max().item():.6f}, norm={grad.norm().item():.6f}")
+            y.register_hook(hook)
+
+        print(f"[DEBUG] GroupedExpertsLoRA.forward output y stats: mean={y.mean().item():.6f}, max={y.max().item():.6f}, requires_grad={y.requires_grad}, grad_fn={y.grad_fn}")
 
         return y
 
