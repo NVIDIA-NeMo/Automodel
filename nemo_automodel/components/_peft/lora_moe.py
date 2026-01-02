@@ -113,6 +113,16 @@ class GroupedExpertsLoRA(GroupedExperts):
 
     @torch.no_grad
     def init_lora_weights(self, init_method):
+        """Initialize LoRA weights.
+
+        IMPORTANT: This method is called by the PEFT framework's `_init_peft_adapters`
+        after the model is materialized from meta device to the target device. The method
+        name is critical - it serves as a hook for the framework.
+        Do not rename or remove this method.
+
+        Args:
+            init_method (str): Initialization method ('xavier' or 'kaiming').
+        """
         if init_method == "xavier":
             nn.init.xavier_normal_(self.lora_gate_and_up_A)
             nn.init.xavier_normal_(self.lora_down_A)
@@ -319,6 +329,16 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
 
     @torch.no_grad
     def init_lora_weights(self, init_method):
+        """Initialize LoRA weights.
+
+        IMPORTANT: This method is called by the PEFT framework's `_init_peft_adapters`
+        after the model is materialized from meta device to the target device. The method
+        name is critical - it serves as a hook for the framework.
+        Do not rename or remove this method.
+
+        Args:
+            init_method (str): Initialization method ('xavier' or 'kaiming').
+        """
         if init_method == "xavier":
             nn.init.xavier_normal_(self.lora_gate_and_up_A)
             nn.init.xavier_normal_(self.lora_down_A)
