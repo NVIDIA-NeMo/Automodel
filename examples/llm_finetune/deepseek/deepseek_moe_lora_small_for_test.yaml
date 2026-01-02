@@ -62,7 +62,7 @@ model:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  target_modules: ["experts"]
+  target_modules: ["*.experts"]
   dim: 16
   alpha: 32
   dropout: 0.05
@@ -71,6 +71,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/deepseek_small
   model_save_format: safetensors
+  load_base_model: false
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager

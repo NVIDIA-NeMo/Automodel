@@ -154,6 +154,9 @@ class GroupedExpertsLoRA(GroupedExperts):
             indices = DTensor.from_local(indices, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
             token_mask = DTensor.from_local(token_mask, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
 
+        print(f"[DEBUG] GroupedExpertsLoRA.forward: x stats: mean={x.mean().item():.6f}, max={x.max().item():.6f}, requires_grad={x.requires_grad}, grad_fn={x.grad_fn}")
+        print(f"[DEBUG] self.lora_gate_and_up_A.requires_grad={self.lora_gate_and_up_A.requires_grad}")
+
         n_local_experts = self.n_routed_experts // ep_size
         experts_start_idx = ep_rank * n_local_experts
         experts_end_idx = experts_start_idx + n_local_experts
@@ -197,10 +200,9 @@ class GroupedExpertsLoRA(GroupedExperts):
             lora_term_gate = compute_lora(x_idx, self.lora_gate_and_up_A, self.lora_gate_and_up_B, i)
             gate_and_up_out = gate_and_up_out + lora_term_gate
             
-            # DEBUG
-            if i == 0 and idx.numel() > 0 and x.requires_grad:
-                 print(f"[DEBUG] gate_and_up_out.requires_grad={gate_and_up_out.requires_grad}")
-                 print(f"[DEBUG] lora_term.requires_grad={lora_term_gate.requires_grad}")
+            if i == experts_start_idx and x_idx.numel() > 0:
+                print(f"[DEBUG] Expert {i}: x_idx stats: mean={x_idx.mean().item():.6f}, max={x_idx.max().item():.6f}")
+                print(f"[DEBUG] Expert {i}: lora_term_gate stats: mean={lora_term_gate.mean().item():.6f}, max={lora_term_gate.max().item():.6f}, requires_grad={lora_term_gate.requires_grad}, grad_fn={lora_term_gate.grad_fn}")
             
             # Activation logic (duplicated from layers.py swiglu/quick_geglu but adapted)
             # We need to manually apply activation because we modified the projection output
@@ -237,6 +239,8 @@ class GroupedExpertsLoRA(GroupedExperts):
         if ep_size > 1:
             y = DTensor.from_local(y, device_mesh=ep_mesh, placements=[Partial()])
             y = y.redistribute(placements=[Shard(0)]).to_local()
+        
+        print(f"[DEBUG] GroupedExpertsLoRA.forward output y stats: mean={y.mean().item():.6f}, max={y.max().item():.6f}, grad_fn={y.grad_fn}")
 
         return y
 
@@ -364,6 +368,9 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             return tensor.to_local() if hasattr(tensor, "to_local") else tensor
 
         if torch.count_nonzero(tokens_per_expert) > 0:
+            print(f"[DEBUG] GroupedExpertsDeepEPLoRA.forward: x stats: mean={x.mean().item():.6f}, max={x.max().item():.6f}, requires_grad={x.requires_grad}, grad_fn={x.grad_fn}")
+            print(f"[DEBUG] GroupedExpertsDeepEPLoRA.forward: permuted_local_hidden_states stats: mean={permuted_local_hidden_states.mean().item():.6f}, max={permuted_local_hidden_states.max().item():.6f}")
+            print(f"[DEBUG] self.lora_gate_and_up_A stats: mean={to_local(self.lora_gate_and_up_A).mean().item():.6f}, max={to_local(self.lora_gate_and_up_A).max().item():.6f}, requires_grad={self.lora_gate_and_up_A.requires_grad}")
             # 1. Gate + Up Projection
             output1 = ops.gmm(
                 permuted_local_hidden_states,
@@ -391,6 +398,9 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 trans_b=False
             )
             output1 = output1 + lora_out1 * self.scale
+            
+            print(f"[DEBUG] output1 stats: mean={output1.mean().item():.6f}, max={output1.max().item():.6f}, requires_grad={output1.requires_grad}, grad_fn={output1.grad_fn}")
+            print(f"[DEBUG] lora_out1 stats: mean={lora_out1.mean().item():.6f}, max={lora_out1.max().item():.6f}, requires_grad={lora_out1.requires_grad}, grad_fn={lora_out1.grad_fn}")
 
             if self.expert_bias:
                 gate_and_up_bias = to_local(self.gate_up_proj_bias)
