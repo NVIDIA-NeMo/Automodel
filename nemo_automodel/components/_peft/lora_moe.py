@@ -111,6 +111,12 @@ class GroupedExpertsLoRA(GroupedExperts):
         self._init_lora_weights(lora_A_init_method)
 
     def _init_lora_weights(self, init_method):
+        # Register hooks to debug parameter gradients
+        self.lora_gate_and_up_A.register_hook(lambda grad: print(f"[DEBUG] lora_gate_and_up_A gradient norm: {grad.norm().item():.10f}"))
+        self.lora_gate_and_up_B.register_hook(lambda grad: print(f"[DEBUG] lora_gate_and_up_B gradient norm: {grad.norm().item():.10f}"))
+        self.lora_down_A.register_hook(lambda grad: print(f"[DEBUG] lora_down_A gradient norm: {grad.norm().item():.10f}"))
+        self.lora_down_B.register_hook(lambda grad: print(f"[DEBUG] lora_down_B gradient norm: {grad.norm().item():.10f}"))
+
         if init_method == "xavier":
             nn.init.xavier_normal_(self.lora_gate_and_up_A)
             nn.init.xavier_normal_(self.lora_down_A)
@@ -339,6 +345,12 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         self._init_lora_weights(lora_A_init_method)
 
     def _init_lora_weights(self, init_method):
+        # Register hooks for DeepEP version as well
+        self.lora_gate_and_up_A.register_hook(lambda grad: print(f"[DEBUG] DeepEP lora_gate_and_up_A gradient norm: {grad.norm().item():.10f}"))
+        self.lora_gate_and_up_B.register_hook(lambda grad: print(f"[DEBUG] DeepEP lora_gate_and_up_B gradient norm: {grad.norm().item():.10f}"))
+        self.lora_down_A.register_hook(lambda grad: print(f"[DEBUG] DeepEP lora_down_A gradient norm: {grad.norm().item():.10f}"))
+        self.lora_down_B.register_hook(lambda grad: print(f"[DEBUG] DeepEP lora_down_B gradient norm: {grad.norm().item():.10f}"))
+
         if init_method == "xavier":
             nn.init.xavier_normal_(self.lora_gate_and_up_A)
             nn.init.xavier_normal_(self.lora_down_A)
