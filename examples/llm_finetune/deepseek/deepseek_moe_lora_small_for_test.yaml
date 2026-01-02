@@ -1,9 +1,9 @@
 
 step_scheduler:
-  global_batch_size: 8
+  global_batch_size: 32
   local_batch_size: 4
   ckpt_every_steps: 100
-  val_every_steps: 50
+  val_every_steps: 100
   num_epochs: 1
   max_steps: 200
 
@@ -89,7 +89,7 @@ dataset:
   path_or_dataset: rowan/hellaswag
   split: train
   tokenizer:
-    pretrained_model_name_or_path: meta-llama/Llama-2-7b-hf
+    pretrained_model_name_or_path: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
