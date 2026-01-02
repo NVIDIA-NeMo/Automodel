@@ -13,7 +13,7 @@
 # limitations under the License.
 import importlib
 
-from .package_info import __package_name__, __version__
+from .package_info import __git_version__, __package_name__, __version__
 
 __all__ = [
     "recipes",
@@ -21,6 +21,7 @@ __all__ = [
     "components",
     "__version__",
     "__package_name__",
+    "__git_version__",
 ]
 
 # Promote NeMoAutoModelForCausalLM, AutoModelForImageTextToText into the top level
