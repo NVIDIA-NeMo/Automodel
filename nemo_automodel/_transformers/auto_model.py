@@ -228,24 +228,25 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path):
         # Import via module reference (vs bound name) so unit tests can patch
         # `nemo_automodel.components.distributed.utils.FirstRankPerNode`.
         with dist_utils.FirstRankPerNode():
+            download_kwargs = {
+                "cache_dir": None,
+                "force_download": False,
+                "proxies": None,
+                "local_files_only": False,
+                "token": None,
+                "revision": "main",
+                "subfolder": "",
+                "commit_hash": getattr(hf_config, "_commit_hash", None),
+            }
             _get_resolved_checkpoint_files(
                 pretrained_model_name_or_path=pretrained_model_name_or_path,
-                subfolder="",
                 variant=None,
                 gguf_file=None,
-                from_tf=False,
-                from_flax=False,
                 use_safetensors=None,
-                cache_dir=None,
-                force_download=False,
-                proxies=None,
-                local_files_only=False,
-                token=None,
+                download_kwargs=download_kwargs,
                 user_agent={"file_type": "model", "framework": "pytorch", "from_auto_class": False},
-                revision="main",
-                commit_hash=getattr(hf_config, "_commit_hash", None),
                 is_remote_code=False,
-                transformers_explicit_filename=None,
+                transformers_explicit_filename=getattr(hf_config, "transformers_weights", None),
             )
 
 

@@ -27,7 +27,7 @@ from huggingface_hub import constants as hf_constants
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoProcessor
-from transformers.modeling_utils import no_init_weights
+from transformers.initialization import no_init_weights
 from transformers.processing_utils import ProcessorMixin
 from transformers.utils import ContextManagers
 from wandb import Settings
