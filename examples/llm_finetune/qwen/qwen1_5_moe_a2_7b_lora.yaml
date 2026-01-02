@@ -69,6 +69,7 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: validation
+  limit_dataset_samples: 64
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -77,6 +78,6 @@ validation_dataloader:
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 2.0e-4
+  lr: 1.0e-4
   weight_decay: 0.0
   betas: [0.9, 0.95]

@@ -101,7 +101,7 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 256
+  num_samples_limit: 128
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
