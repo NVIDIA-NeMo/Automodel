@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import math
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -58,7 +57,7 @@ class GroupedExpertsLoRA(GroupedExperts):
 
         self.gate_and_up_projs.data.copy_(orig_module.gate_and_up_projs.data)
         self.down_projs.data.copy_(orig_module.down_projs.data)
-        
+
         if self.expert_bias:
             self.gate_up_proj_bias.data.copy_(orig_module.gate_up_proj_bias.data)
             self.down_proj_bias.data.copy_(orig_module.down_proj_bias.data)
@@ -93,7 +92,7 @@ class GroupedExpertsLoRA(GroupedExperts):
         # LoRA weights for gate_proj, up_proj, and down_proj
         # We treat gate_and_up as a single block for LoRA as well to match structure
         # Shape: [n_experts, in_dim, lora_dim] and [n_experts, lora_dim, out_dim]
-        
+
         # gate_and_up: [n_experts, dim, moe_inter_dim * 2]
         obj.lora_gate_and_up_A = nn.Parameter(
             torch.empty(obj.n_routed_experts, obj.config.dim, lora_dim, dtype=dtype, device=device)
@@ -121,7 +120,7 @@ class GroupedExpertsLoRA(GroupedExperts):
         else:
             nn.init.kaiming_uniform_(self.lora_gate_and_up_A, a=math.sqrt(5))
             nn.init.kaiming_uniform_(self.lora_down_A, a=math.sqrt(5))
-            
+
         nn.init.zeros_(self.lora_gate_and_up_B)
         nn.init.zeros_(self.lora_down_B)
 
@@ -131,7 +130,7 @@ class GroupedExpertsLoRA(GroupedExperts):
         """
         # Duplicate logic from GroupedExperts.forward but inject LoRA
         # This is necessary because the original forward doesn't expose hooks for the inner expert computation
-        
+
         assert not isinstance(x, DTensor)
 
         if isinstance(self.gate_and_up_projs, DTensor):
@@ -163,7 +162,7 @@ class GroupedExpertsLoRA(GroupedExperts):
         def compute_lora(x, lora_A, lora_B, expert_id):
             local_A = get_local_proj(lora_A, expert_id)
             local_B = get_local_proj(lora_B, expert_id)
-            
+
             return x @ local_A @ local_B * self.scale
 
         y = torch.zeros_like(x)
@@ -189,19 +188,19 @@ class GroupedExpertsLoRA(GroupedExperts):
             gate_and_up_out = x_idx @ gate_and_up_proj
             # Add LoRA
             gate_and_up_out = gate_and_up_out + compute_lora(x_idx, self.lora_gate_and_up_A, self.lora_gate_and_up_B, i)
-            
+
             # Activation logic (duplicated from layers.py swiglu/quick_geglu but adapted)
             # We need to manually apply activation because we modified the projection output
             if gate_up_proj_bias is not None:
                 gate_and_up_out = gate_and_up_out + gate_up_proj_bias
-            
+
             # Correct splitting based on activation type
             if self.config.expert_activation == "swiglu":
                 gate_out, up_out = torch.chunk(gate_and_up_out, 2, -1)
             else:
                 # for quick_geglu
                 gate_out, up_out = gate_and_up_out[..., ::2], gate_and_up_out[..., 1::2]
-            
+
             if self.config.expert_activation == "swiglu":
                 inter = torch.nn.functional.silu(gate_out) * up_out
             elif self.config.expert_activation == "quick_geglu":
@@ -219,15 +218,15 @@ class GroupedExpertsLoRA(GroupedExperts):
 
             if down_proj_bias is not None:
                 expert_out_val = expert_out_val + down_proj_bias
-            
+
             expert_out = expert_out_val * weights[idx, top, None]
-            
+
             y = torch.scatter_add(y, dim=0, index=idx_b, src=expert_out.to(x.dtype))
 
         if ep_size > 1:
             y = DTensor.from_local(y, device_mesh=ep_mesh, placements=[Partial()])
             y = y.redistribute(placements=[Shard(0)]).to_local()
-        
+
         return y
 
 
@@ -245,7 +244,10 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         lora_down_A (nn.Parameter): LoRA A matrix for down projection.
         lora_down_B (nn.Parameter): LoRA B matrix for down projection.
     """
-    def __init__(self, orig_module: GroupedExpertsDeepEP, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None):
+
+    def __init__(
+        self, orig_module: GroupedExpertsDeepEP, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None
+    ):
         """
         Initializes the GroupedExpertsDeepEPLoRA module.
 
@@ -257,10 +259,10 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             lora_dtype (torch.dtype): Data type for LoRA weights.
         """
         super().__init__(orig_module.config)
-        
+
         self.gate_and_up_projs.data.copy_(orig_module.gate_and_up_projs.data)
         self.down_projs.data.copy_(orig_module.down_projs.data)
-        
+
         if self.expert_bias:
             self.gate_up_proj_bias.data.copy_(orig_module.gate_up_proj_bias.data)
             self.down_proj_bias.data.copy_(orig_module.down_proj_bias.data)
@@ -269,9 +271,9 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         self.n_routed_experts = self.config.n_routed_experts
         # Also need ep_size for forward check, default to 1 if not set
         if not hasattr(self, "ep_size"):
-             self.ep_size = getattr(orig_module, "ep_size", 1)
+            self.ep_size = getattr(orig_module, "ep_size", 1)
         if not hasattr(self, "token_dispatcher"):
-             self.token_dispatcher = getattr(orig_module, "token_dispatcher", None)
+            self.token_dispatcher = getattr(orig_module, "token_dispatcher", None)
 
         self.lora_A_init_method = lora_A_init_method
         GroupedExpertsDeepEPLoRA._init_adapter(
@@ -323,7 +325,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         else:
             nn.init.kaiming_uniform_(self.lora_gate_and_up_A, a=math.sqrt(5))
             nn.init.kaiming_uniform_(self.lora_down_A, a=math.sqrt(5))
-            
+
         nn.init.zeros_(self.lora_gate_and_up_B)
         nn.init.zeros_(self.lora_down_B)
 
@@ -383,46 +385,33 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 tokens_per_expert,
                 trans_b=False,
             )
-            
+
             # Add LoRA
             lora_out1_A = ops.gmm(
                 permuted_local_hidden_states,
                 get_local_weights(self.lora_gate_and_up_A),
                 tokens_per_expert,
-                trans_b=False
+                trans_b=False,
             )
             # [T, R] @ [E_local, R, H] -> [T, H]
             lora_out1 = ops.gmm(
-                lora_out1_A,
-                get_local_weights(self.lora_gate_and_up_B),
-                tokens_per_expert,
-                trans_b=False
+                lora_out1_A, get_local_weights(self.lora_gate_and_up_B), tokens_per_expert, trans_b=False
             )
-            
+
             output1 = output1 + lora_out1 * self.scale
 
             if self.expert_bias:
                 gate_and_up_bias = get_local_weights(self.gate_up_proj_bias)
                 output1 = self._apply_bias(output1, gate_and_up_bias, tokens_per_expert)
-            
+
             output1 = self.expert_activation(output1, permuted_probs)
-            
+
             # 2. Down Projection
             output2 = ops.gmm(output1, get_local_weights(self.down_projs), tokens_per_expert, trans_b=False)
-            
+
             # Add LoRA
-            lora_out2_A = ops.gmm(
-                output1,
-                get_local_weights(self.lora_down_A),
-                tokens_per_expert,
-                trans_b=False
-            )
-            lora_out2 = ops.gmm(
-                lora_out2_A,
-                get_local_weights(self.lora_down_B),
-                tokens_per_expert,
-                trans_b=False
-            )
+            lora_out2_A = ops.gmm(output1, get_local_weights(self.lora_down_A), tokens_per_expert, trans_b=False)
+            lora_out2 = ops.gmm(lora_out2_A, get_local_weights(self.lora_down_B), tokens_per_expert, trans_b=False)
             output2 = output2 + lora_out2 * self.scale
 
             if self.expert_bias:
@@ -433,16 +422,16 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             # Use slicing compatible with ep_size
             local_base_up = to_local(self.gate_and_up_projs)
             output1 = torch.matmul(x[0:1] * 0, local_base_up[0:1])
-            
+
             # Add LoRA dummy computation
             dummy_lora1 = torch.matmul(x[0:1] * 0, get_local_weights(self.lora_gate_and_up_A)[0:1])
             dummy_lora1 = torch.matmul(dummy_lora1, get_local_weights(self.lora_gate_and_up_B)[0:1])
             output1 = output1 + dummy_lora1 * self.scale
-            
+
             output1_ = self.expert_activation(output1, permuted_probs)
             local_base_down = to_local(self.down_projs)
             output2 = torch.matmul(output1_, local_base_down[0:1])
-            
+
             # Add LoRA dummy computation
             dummy_lora2 = torch.matmul(output1_ * 0, get_local_weights(self.lora_down_A)[0:1])
             dummy_lora2 = torch.matmul(dummy_lora2, get_local_weights(self.lora_down_B)[0:1])

@@ -14,8 +14,6 @@
 
 import logging
 import math
-import re
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
@@ -25,6 +23,7 @@ import torch.nn.functional as F
 
 try:
     import transformer_engine
+
     HAS_TE = True
 except ImportError:
     HAS_TE = False
@@ -40,9 +39,9 @@ from nemo_automodel.components._peft.lora_kernel import (
     lora_db_update_wrapper,
     lora_forward_wrapper,
 )
+from nemo_automodel.components._peft.lora_moe import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
 from nemo_automodel.components._peft.module_matcher import ModuleMatcher
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP
-from nemo_automodel.components._peft.lora_moe import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
 from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -434,7 +433,7 @@ def apply_lora_to_linear_modules(
                 lora_dtype = peft_config.lora_dtype
                 if quantization_config is not None and lora_dtype is None:
                     lora_dtype = quantization_config.bnb_4bit_compute_dtype or torch.bfloat16
-                
+
                 # Replace the module in the model
                 new_module = patch_moe_module(
                     module,
@@ -443,7 +442,7 @@ def apply_lora_to_linear_modules(
                     lora_A_init_method=peft_config.lora_A_init,
                     lora_dtype=lora_dtype,
                 )
-                
+
                 # Find parent and replace
                 if "." not in name:
                     setattr(model, name, new_module)
