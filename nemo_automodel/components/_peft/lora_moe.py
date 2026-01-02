@@ -127,6 +127,9 @@ class GroupedExpertsLoRA(GroupedExperts):
         nn.init.zeros_(self.lora_gate_and_up_B)
         nn.init.zeros_(self.lora_down_B)
 
+        print(f"[DEBUG] GroupedExpertsLoRA init: lora_gate_and_up_A stats: mean={self.lora_gate_and_up_A.mean().item():.6f}, max={self.lora_gate_and_up_A.max().item():.6f}, std={self.lora_gate_and_up_A.std().item():.6f}")
+        print(f"[DEBUG] GroupedExpertsLoRA init: lora_down_A stats: mean={self.lora_down_A.mean().item():.6f}, max={self.lora_down_A.max().item():.6f}, std={self.lora_down_A.std().item():.6f}")
+
     def forward(self, x, token_mask, weights, indices):
         """
         Forward pass for GroupedExpertsLoRA.
@@ -188,13 +191,19 @@ class GroupedExpertsLoRA(GroupedExperts):
             
             if expert_id == experts_start_idx and x.dim() > 1 and res.requires_grad:
                 def grad_trace_hook(name):
-                    return lambda grad: print(f"[DEBUG] Layer {self.layer_id if hasattr(self, 'layer_id') else '?'} Expert {expert_id} {name} grad norm: {grad.norm().item():.10f}")
+                    return lambda grad: print(f"[DEBUG] Expert {expert_id} {name} grad norm: {grad.norm().item():.10f}")
                 
                 res.register_hook(grad_trace_hook("lora_res"))
                 out_B.register_hook(grad_trace_hook("lora_out_B"))
                 out_A.register_hook(grad_trace_hook("lora_out_A"))
                 local_B.register_hook(grad_trace_hook("local_B_slice"))
                 local_A.register_hook(grad_trace_hook("local_A_slice"))
+                
+                print(f"[DEBUG] compute_lora: Expert {expert_id} local_A abs mean: {local_A.abs().mean().item():.10f}")
+                print(f"[DEBUG] compute_lora: Expert {expert_id} out_A abs mean: {out_A.abs().mean().item():.10f}")
+                print(f"[DEBUG] compute_lora: Expert {expert_id} local_B requires_grad: {local_B.requires_grad}")
+                
+                print(f"[DEBUG] compute_lora stats: x.dtype={x.dtype}, A.dtype={local_A.dtype}, out_A.dtype={out_A.dtype}, B.dtype={local_B.dtype}")
                 
             return res
 
@@ -262,10 +271,16 @@ class GroupedExpertsLoRA(GroupedExperts):
                 expert_out_val = expert_out_val + down_proj_bias
             
             expert_out = expert_out_val * weights[idx, top, None]
-            if i == experts_start_idx and expert_out.requires_grad:
-                expert_out.register_hook(lambda grad: print(f"[DEBUG] Expert {i} expert_out grad norm: {grad.norm().item():.10f}"))
             
-            y = torch.scatter_add(y, dim=0, index=idx_b, src=expert_out.to(x.dtype))
+            if i == experts_start_idx and expert_out.requires_grad:
+                expert_out.register_hook(lambda grad: print(f"[DEBUG] Expert {i} expert_out_weighted grad norm: {grad.norm().item():.10f}"))
+                expert_out_val.register_hook(lambda grad: print(f"[DEBUG] Expert {i} expert_out_val grad norm: {grad.norm().item():.10f}"))
+            
+            # Try more direct accumulation for 1-GPU to ensure no disconnect
+            if ep_size == 1:
+                y[idx_b] = y[idx_b] + expert_out.to(y.dtype)
+            else:
+                y = torch.scatter_add(y, dim=0, index=idx_b, src=expert_out.to(x.dtype))
 
         if ep_size > 1:
             y = DTensor.from_local(y, device_mesh=ep_mesh, placements=[Partial()])
@@ -378,6 +393,9 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             
         nn.init.zeros_(self.lora_gate_and_up_B)
         nn.init.zeros_(self.lora_down_B)
+
+        print(f"[DEBUG] GroupedExpertsDeepEPLoRA init: lora_gate_and_up_A stats: mean={self.lora_gate_and_up_A.mean().item():.6f}, max={self.lora_gate_and_up_A.max().item():.6f}, std={self.lora_gate_and_up_A.std().item():.6f}")
+        print(f"[DEBUG] GroupedExpertsDeepEPLoRA init: lora_down_A stats: mean={self.lora_down_A.mean().item():.6f}, max={self.lora_down_A.max().item():.6f}, std={self.lora_down_A.std().item():.6f}")
 
     def forward(self, x, token_mask, weights, indices):
         """
