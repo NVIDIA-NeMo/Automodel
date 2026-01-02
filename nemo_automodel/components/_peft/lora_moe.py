@@ -290,15 +290,11 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             self.gate_up_proj_bias.data.copy_(orig_module.gate_up_proj_bias.data)
             self.down_proj_bias.data.copy_(orig_module.down_proj_bias.data)
 
-        # Ensure n_routed_experts is set (it might not be if init_token_dispatcher wasn't called)
-        self.n_routed_experts = self.config.n_routed_experts
-        # Also need ep_size, ep_rank for forward check, default to 1/0 if not set
-        if not hasattr(self, "ep_size"):
-            self.ep_size = getattr(orig_module, "ep_size", 1)
-        if not hasattr(self, "ep_rank"):
-            self.ep_rank = getattr(orig_module, "ep_rank", 0)
-        if not hasattr(self, "token_dispatcher"):
-            self.token_dispatcher = getattr(orig_module, "token_dispatcher", None)
+        # Copy DeepEP state explicitly from orig_module (no hasattr guards for robustness)
+        self.n_routed_experts = getattr(orig_module, "n_routed_experts", self.config.n_routed_experts)
+        self.ep_size = getattr(orig_module, "ep_size", 1)
+        self.ep_rank = getattr(orig_module, "ep_rank", 0)
+        self.token_dispatcher = getattr(orig_module, "token_dispatcher", None)
 
         GroupedExpertsDeepEPLoRA._init_adapter(
             self,
@@ -399,10 +395,12 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         )
         permuted_probs = permuted_probs.unsqueeze(-1)
 
-        def to_local(tensor):
-            return tensor.to_local() if hasattr(tensor, "to_local") else tensor
-
         n_local_experts = self.n_routed_experts // self.ep_size
+
+        assert tokens_per_expert.numel() == n_local_experts, (
+            f"tokens_per_expert size {tokens_per_expert.numel()} != n_local_experts {n_local_experts}"
+        )
+
         experts_start_idx = self.ep_rank * n_local_experts
         experts_end_idx = experts_start_idx + n_local_experts
 
@@ -455,24 +453,23 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 down_bias = get_local_weights(self.down_proj_bias)
                 output2 = self._apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
         else:
-            # Handle empty case for DeepEP
-            # Use slicing compatible with ep_size
-            local_base_up = to_local(self.gate_and_up_projs)
-            output1 = torch.matmul(x[0:1] * 0, local_base_up[0:1])
+            # Handle empty case for DeepEP - use [0] indexing to match base shapes exactly
+            W1 = get_local_weights(self.gate_and_up_projs)[0]  # [dim, 2*inter]
+            W2 = get_local_weights(self.down_projs)[0]  # [inter, dim]
+            A1 = get_local_weights(self.lora_gate_and_up_A)[0]  # [dim, r]
+            B1 = get_local_weights(self.lora_gate_and_up_B)[0]  # [r, 2*inter]
+            A2 = get_local_weights(self.lora_down_A)[0]  # [inter, r]
+            B2 = get_local_weights(self.lora_down_B)[0]  # [r, dim]
 
-            # Add LoRA dummy computation
-            dummy_lora1 = torch.matmul(x[0:1] * 0, get_local_weights(self.lora_gate_and_up_A)[0:1])
-            dummy_lora1 = torch.matmul(dummy_lora1, get_local_weights(self.lora_gate_and_up_B)[0:1])
-            output1 = output1 + dummy_lora1 * self.scale
+            dummy_x = x[0] * 0  # [dim]
+
+            output1 = torch.matmul(dummy_x, W1)
+            output1 = output1 + torch.matmul(torch.matmul(dummy_x, A1), B1) * self.scale
 
             output1_ = self.expert_activation(output1, permuted_probs)
-            local_base_down = to_local(self.down_projs)
-            output2 = torch.matmul(output1_, local_base_down[0:1])
 
-            # Add LoRA dummy computation
-            dummy_lora2 = torch.matmul(output1_ * 0, get_local_weights(self.lora_down_A)[0:1])
-            dummy_lora2 = torch.matmul(dummy_lora2, get_local_weights(self.lora_down_B)[0:1])
-            output2 = output2 + dummy_lora2 * self.scale
+            output2 = torch.matmul(output1_, W2)
+            output2 = output2 + torch.matmul(torch.matmul(output1_ * 0, A2), B2) * self.scale
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
