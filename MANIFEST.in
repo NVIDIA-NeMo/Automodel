@@ -1,1 +1,2 @@
 include build_backend.py
+include version.txt

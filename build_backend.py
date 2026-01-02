@@ -1,9 +1,11 @@
+import logging
 import subprocess
 from pathlib import Path
 
 from setuptools import build_meta as orig
 
 _root = Path(__file__).parent.resolve()
+logger = logging.getLogger(__name__)
 
 
 def is_git_repo():
@@ -15,7 +17,7 @@ def get_git_commit_hash(cwd: Path | None, length: int = 10) -> str:
         cmd = ["git", "rev-parse", f"--short={length}", "HEAD"]
         return subprocess.check_output(cmd, cwd=cwd).strip().decode("utf-8")
     except Exception:
-        return ""
+        return "unknown"
 
 
 def get_git_branch(cwd: Path | None = None) -> str:
@@ -29,7 +31,7 @@ def get_git_branch(cwd: Path | None = None) -> str:
 def get_git_tag(cwd: Path | None = None) -> str:
     try:
         cmd = ["git", "describe", "--tags", "--match", "v*", "--exact-match"]
-        return subprocess.check_output(cmd, cwd=cwd, stderr=subprocess.DEVNULL).strip().decode("utf-8")
+        return subprocess.check_output(cmd, cwd=cwd).strip().decode("utf-8")
     except Exception:
         return ""
 
@@ -54,20 +56,19 @@ def _generate_version_info():
 
     # If file exists and not in git repo (installing from sdist), keep existing file
     if _version_file.exists() and not is_git_repo():
-        print("The _version file already exists (not in git repo), keeping it")
+        logger.info("The _version file already exists (not in git repo), keeping it")
         return version
 
     # In git repo (editable) or file doesn't exist, create/update it
     with open(_version_file, "w") as f:
-        f.write('"""Build _version for nemo_automodel package."""\n')
+        f.write('"""Generate version info file with git metadata."""\n')
         if git_branch.startswith("release") or git_tag:
-            # Release version or tag version may be push to PyPI, it shouldn't has git hash suffix which will affect wheel name.
+            # Release version or tag version may be pushed to PyPI; it shouldn't have a git hash suffix, which will affect the wheel name.
             f.write(f'__version__ = "{version}"\n')
         else:
             f.write(f'__version__ = "{version}+{git_commit_hash}"\n')
-        git_commit_hash = git_commit_hash or "unknown"
         f.write(f'__git_version__ = "{git_commit_hash}"\n')
-    print(f"Created _version file with version {version}")
+    logger.info(f"Created _version file with version {version}")
     return version
 
 

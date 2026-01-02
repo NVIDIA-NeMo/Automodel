@@ -12,8 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ._version import __git_version__ as __git_version__
-from ._version import __version__ as __version__
+try:
+    from ._version import __git_version__ as __git_version__
+    from ._version import __version__ as __version__
+except ModuleNotFoundError:
+    # Fallbacks for running directly from the source tree before _version.py is generated
+    __git_version__ = "unknown"
+    __version__ = "0.0.0"
 
 __package_name__ = "nemo_automodel"
 __contact_names__ = "NVIDIA"
