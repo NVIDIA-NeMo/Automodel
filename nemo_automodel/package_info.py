@@ -12,17 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-MAJOR = 0
-MINOR = 3
-PATCH = 0
-PRE_RELEASE = "rc0"
-
-# Use the following formatting: (major, minor, patch, pre-release)
-VERSION = (MAJOR, MINOR, PATCH, PRE_RELEASE)
-
-__shortversion__ = ".".join(map(str, VERSION[:3]))
-__version__ = ".".join(map(str, VERSION[:3])) + "".join(VERSION[3:])
+from ._version import __git_version__ as __git_version__
+from ._version import __version__ as __version__
 
 __package_name__ = "nemo_automodel"
 __contact_names__ = "NVIDIA"
