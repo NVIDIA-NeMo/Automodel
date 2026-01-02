@@ -150,9 +150,14 @@ def _parse_input_metadata(
         for output_data in output_files_data.values():
             # Add this tensor to the output file if it's already assigned there
             if fqn in output_data.fqn_data:
+                dtype = _getdtype(dtype_str)
+                try:
+                    dtype_size = torch.finfo(dtype).bits // 8  # Convert bits to bytes
+                except TypeError:
+                    dtype_size = torch.tensor([], dtype=dtype).element_size()
                 output_data.fqn_data[fqn] = _FqnData(
                     shape_in_file=tensor_size,
-                    dtype_size=torch.finfo(_getdtype(dtype_str)).bits // 8,  # Convert bits to bytes
+                    dtype_size=dtype_size,
                     dtype_str=dtype_str,
                 )
 
