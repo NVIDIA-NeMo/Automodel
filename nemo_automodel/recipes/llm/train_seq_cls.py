@@ -407,8 +407,11 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
+        # Log training metrics to wandb every N steps (configurable via wandb.log_train_every_steps)
         if wandb.run is not None:
-            wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+            log_train_every_steps = self.cfg.get("wandb", {}).get("log_train_every_steps", 1)
+            if self.step_scheduler.step % log_train_every_steps == 0:
+                wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
 
         # JSONL training log
         self.metric_logger_train.log(log_data)
