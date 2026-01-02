@@ -102,6 +102,8 @@ validation_dataset:
   path_or_dataset: rowan/hellaswag
   split: validation
   num_samples_limit: 128
+  tokenizer:
+    pretrained_model_name_or_path: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
