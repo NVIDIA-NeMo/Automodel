@@ -134,11 +134,25 @@ class GroupedExpertsLoRA(GroupedExperts):
         nn.init.zeros_(self.lora_down_B)
 
     def forward(self, x: torch.Tensor, token_mask: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor):
+        """Forward pass for GroupedExpertsLoRA with LoRA injection.
+
+        This method duplicates the logic from GroupedExperts.forward but injects LoRA
+        computations into the expert processing. This is necessary because the original
+        forward doesn't expose hooks for the inner expert computation.
+
+        Args:
+            x (torch.Tensor): Input tensor. Shape is [num_tokens, model_dim].
+            token_mask (torch.Tensor): Boolean mask indicating valid tokens.
+                Shape is [num_tokens].
+            weights (torch.Tensor): Routing weights for the selected experts.
+                Shape is [num_tokens, num_activated_experts].
+            indices (torch.Tensor): Indices of the selected experts.
+                Shape is [num_tokens, num_activated_experts].
+
+        Returns:
+            torch.Tensor: Output tensor after expert computation with LoRA.
+                Shape is [num_tokens, model_dim].
         """
-        Forward pass for the GroupedExpertsLoRA.
-        """
-        # Duplicate logic from GroupedExperts.forward but inject LoRA
-        # This is necessary because the original forward doesn't expose hooks for the inner expert computation
 
         assert not isinstance(x, DTensor)
 
@@ -356,17 +370,20 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         weights: torch.Tensor,
         indices: torch.Tensor,
     ):
-        """
-        Forward pass for GroupedExpertsDeepEPLoRA.
+        """Forward pass for GroupedExpertsDeepEPLoRA with LoRA injection.
 
         Args:
-            x (torch.Tensor): Input tensor of shape [num_tokens, dim].
+            x (torch.Tensor): Input tensor. Shape is [num_tokens, model_dim].
             token_mask (torch.Tensor): Boolean mask indicating valid tokens.
+                Shape is [num_tokens].
             weights (torch.Tensor): Routing weights for the selected experts.
+                Shape is [num_tokens, num_activated_experts].
             indices (torch.Tensor): Indices of the selected experts.
+                Shape is [num_tokens, num_activated_experts].
 
         Returns:
             torch.Tensor: Output tensor after expert computation with LoRA.
+                Shape is [num_tokens, model_dim].
         """
         # Duplicated from GroupedExpertsDeepEP.forward with LoRA injection
         assert not isinstance(x, DTensor)
