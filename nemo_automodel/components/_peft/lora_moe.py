@@ -62,7 +62,6 @@ class GroupedExpertsLoRA(GroupedExperts):
             self.gate_up_proj_bias.data.copy_(orig_module.gate_up_proj_bias.data)
             self.down_proj_bias.data.copy_(orig_module.down_proj_bias.data)
 
-        self.lora_A_init_method = lora_A_init_method
         GroupedExpertsLoRA._init_adapter(
             self,
             lora_dim=lora_dim,
@@ -269,13 +268,14 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
 
         # Ensure n_routed_experts is set (it might not be if init_token_dispatcher wasn't called)
         self.n_routed_experts = self.config.n_routed_experts
-        # Also need ep_size for forward check, default to 1 if not set
+        # Also need ep_size, ep_rank for forward check, default to 1/0 if not set
         if not hasattr(self, "ep_size"):
             self.ep_size = getattr(orig_module, "ep_size", 1)
+        if not hasattr(self, "ep_rank"):
+            self.ep_rank = getattr(orig_module, "ep_rank", 0)
         if not hasattr(self, "token_dispatcher"):
             self.token_dispatcher = getattr(orig_module, "token_dispatcher", None)
 
-        self.lora_A_init_method = lora_A_init_method
         GroupedExpertsDeepEPLoRA._init_adapter(
             self,
             lora_dim=lora_dim,
