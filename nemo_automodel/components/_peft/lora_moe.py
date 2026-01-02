@@ -190,12 +190,14 @@ class GroupedExpertsLoRA(GroupedExperts):
 
         y = torch.zeros_like(x)
 
+        active_local_experts = 0
         for i in range(experts_start_idx, experts_end_idx):
             indices_mask = torch.logical_and(indices == i, token_mask.unsqueeze(-1))
             idx, top = torch.where(indices_mask)
 
             if idx.numel() == 0:
                 continue
+            active_local_experts += 1
 
             gate_and_up_proj = get_local_proj(self.gate_and_up_projs, i)
             down_proj = get_local_proj(self.down_projs, i)
@@ -244,7 +246,44 @@ class GroupedExpertsLoRA(GroupedExperts):
 
             expert_out = expert_out_val * weights[idx, top, None]
 
-            y = torch.scatter_add(y, dim=0, index=idx_b, src=expert_out.to(x.dtype))
+            y.scatter_add_(dim=0, index=idx_b, src=expert_out.to(x.dtype))
+
+        # Handle the edge case where no tokens are routed to any local experts.
+        # This ensures gradient flow through local expert parameters during backprop
+        # and proper participation in collective operations (reduce-scatter).
+        if active_local_experts == 0:
+            gate_and_up_proj = get_local_proj(self.gate_and_up_projs, experts_start_idx)
+            down_proj = get_local_proj(self.down_projs, experts_start_idx)
+
+            dummy_x = torch.zeros_like(x[0]).unsqueeze(0)
+
+            # Gate + Up with LoRA
+            gate_and_up_out = dummy_x @ gate_and_up_proj
+            gate_and_up_out = gate_and_up_out + compute_lora(
+                dummy_x, self.lora_gate_and_up_A, self.lora_gate_and_up_B, experts_start_idx
+            )
+
+            # Activation
+            if self.config.expert_activation == "swiglu":
+                gate_out, up_out = torch.chunk(gate_and_up_out, 2, -1)
+                inter = torch.nn.functional.silu(gate_out) * up_out
+            elif self.config.expert_activation == "quick_geglu":
+                gate_out, up_out = gate_and_up_out[..., ::2], gate_and_up_out[..., 1::2]
+                limit = self.config.activation_limit
+                alpha = self.config.activation_alpha
+                gate_out = gate_out.clamp(min=None, max=limit)
+                up_out = up_out.clamp(min=-limit, max=limit)
+                out_glu = gate_out * torch.sigmoid(alpha * gate_out)
+                inter = out_glu * (up_out + 1)
+
+            # Down with LoRA
+            expert_out_val = inter @ down_proj
+            expert_out_val = expert_out_val + compute_lora(
+                inter, self.lora_down_A, self.lora_down_B, experts_start_idx
+            )
+
+            expert_out = expert_out_val * weights[0, 0, None]
+            y[0] += expert_out[0]
 
         if ep_size > 1:
             y = DTensor.from_local(y, device_mesh=ep_mesh, placements=[Partial()])
