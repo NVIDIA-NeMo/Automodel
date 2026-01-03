@@ -30,16 +30,19 @@ try:
     from nemo_automodel._transformers.auto_model import (
         NeMoAutoModelForCausalLM,
         NeMoAutoModelForImageTextToText,
+        NeMoAutoModelForMultimodalLM,
         NeMoAutoModelForSequenceClassification,
         NeMoAutoModelForTextToWaveform,
     )  # noqa: I001
 
     globals()["NeMoAutoModelForCausalLM"] = NeMoAutoModelForCausalLM
     globals()["NeMoAutoModelForImageTextToText"] = NeMoAutoModelForImageTextToText
+    globals()["NeMoAutoModelForMultimodalLM"] = NeMoAutoModelForMultimodalLM
     globals()["NeMoAutoModelForSequenceClassification"] = NeMoAutoModelForSequenceClassification
     globals()["NeMoAutoModelForTextToWaveform"] = NeMoAutoModelForTextToWaveform
     __all__.append("NeMoAutoModelForCausalLM")
     __all__.append("NeMoAutoModelForImageTextToText")
+    __all__.append("NeMoAutoModelForMultimodalLM")
     __all__.append("NeMoAutoModelForSequenceClassification")
     __all__.append("NeMoAutoModelForTextToWaveform")
 except:

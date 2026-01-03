@@ -25,6 +25,8 @@ from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import (
 )
 from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration as HFQwen3VLMoeForConditionalGeneration,
+)
+from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeModelOutputWithPast,
 )
 
@@ -38,7 +40,6 @@ from nemo_automodel.components.models.qwen3_vl_moe.model import (
 )
 from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.components.moe.utils import BackendConfig
-
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -68,7 +69,7 @@ def text_config():
         router_aux_loss_coef=0.01,
         norm_topk_prob=False,
         pad_token_id=0,
-        rope_scaling={"rope_type": "default", "mrope_section": [1, 1, 1]},
+        rope_parameters={"rope_theta": 10000.0, "partial_rotary_factor": 1.0},
     )
 
 
@@ -179,9 +180,7 @@ class TestQwen3VLMoeTextModelBackend:
         freqs_shape = model.layers[0].forward.call_args.kwargs["freqs_cis"].shape
         assert freqs_shape == (3, batch, seq_len, text_config.head_dim * 2)
 
-    def test_forward_applies_deepstack_visual_embeds(
-        self, text_config, backend_config, moe_config, device
-    ):
+    def test_forward_applies_deepstack_visual_embeds(self, text_config, backend_config, moe_config, device):
         model = Qwen3VLMoeTextModelBackend(text_config, backend=backend_config, moe_config=moe_config).to(device)
         batch, seq_len = 1, 2
         input_ids = torch.randint(0, text_config.vocab_size, (batch, seq_len), device=device)
@@ -197,9 +196,10 @@ class TestQwen3VLMoeTextModelBackend:
         ]
         visual_pos_masks = torch.tensor([[True, False]], device=device)
 
-        with patch.object(model.rotary_emb, "forward", return_value=(cos, sin)), patch.object(
-            model, "_deepstack_process", side_effect=lambda hs, *_: hs
-        ) as mock_deepstack:
+        with (
+            patch.object(model.rotary_emb, "forward", return_value=(cos, sin)),
+            patch.object(model, "_deepstack_process", side_effect=lambda hs, *_: hs) as mock_deepstack,
+        ):
             model(
                 input_ids=input_ids,
                 visual_pos_masks=visual_pos_masks,
@@ -218,9 +218,7 @@ class TestQwen3VLMoeTextModelBackend:
         out = model._deepstack_process(hidden_states.clone(), visual_pos_masks, visual_embeds)
 
         torch.testing.assert_close(out[visual_pos_masks], visual_embeds)
-        torch.testing.assert_close(
-            out[visual_pos_masks.logical_not()], hidden_states[visual_pos_masks.logical_not()]
-        )
+        torch.testing.assert_close(out[visual_pos_masks.logical_not()], hidden_states[visual_pos_masks.logical_not()])
 
     def test_init_weights_invokes_layer_init(self, text_config, backend_config, moe_config):
         model = Qwen3VLMoeTextModelBackend(text_config, backend=backend_config, moe_config=moe_config)
@@ -275,12 +273,13 @@ class TestQwen3VLMoeForConditionalGeneration:
         squeezed_padding_mask = torch.ones(batch, seq_len, dtype=torch.bool, device=device)
         squeezed_kwargs = {"foo": "bar"}
 
-        with patch(
-            "nemo_automodel.components.models.qwen3_vl_moe.model.squeeze_input_for_thd",
-            return_value=(squeezed_ids, squeezed_position_ids, squeezed_padding_mask, squeezed_kwargs),
-        ) as mock_squeeze, patch.object(
-            HFQwen3VLMoeForConditionalGeneration, "forward", return_value="sentinel"
-        ) as mock_super:
+        with (
+            patch(
+                "nemo_automodel.components.models.qwen3_vl_moe.model.squeeze_input_for_thd",
+                return_value=(squeezed_ids, squeezed_position_ids, squeezed_padding_mask, squeezed_kwargs),
+            ) as mock_squeeze,
+            patch.object(HFQwen3VLMoeForConditionalGeneration, "forward", return_value="sentinel") as mock_super,
+        ):
             result = model.forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -306,9 +305,10 @@ class TestQwen3VLMoeForConditionalGeneration:
     def test_initialize_weights_invokes_language_model(self, vl_config, backend_config, moe_config):
         model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config)
 
-        with patch.object(model.model.language_model, "init_weights") as mock_init, patch(
-            "torch.nn.init.trunc_normal_"
-        ) as mock_trunc:
+        with (
+            patch.object(model.model.language_model, "init_weights") as mock_init,
+            patch("torch.nn.init.trunc_normal_") as mock_trunc,
+        ):
             buffer_ctx = torch.cuda.device(torch.cuda.current_device())
             model.initialize_weights(buffer_device=buffer_ctx, dtype=torch.float32)
 
@@ -337,14 +337,22 @@ class TestQwen3VLMoeModel:
 class TestQwen3VLMoeFromPretrainedAndModelClass:
     def test_from_pretrained_classmethod(self):
         cfg = Qwen3VLMoeConfig()
-        cfg.text_config.rope_scaling = {"rope_type": "default", "mrope_section": [1, 1, 1]}
+        cfg.text_config.rope_parameters = {
+            "rope_theta": 10000.0,
+            "rope_type": "default",
+            "mrope_section": [1, 1, 1],
+            "partial_rotary_factor": 1.0,
+        }
 
-        with patch(
-            "transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe.Qwen3VLMoeConfig.from_pretrained",
-            return_value=cfg,
-        ) as mock_from_pretrained, patch.object(
-            Qwen3VLMoeForConditionalGeneration, "from_config", wraps=Qwen3VLMoeForConditionalGeneration.from_config
-        ) as mock_from_config:
+        with (
+            patch(
+                "transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe.Qwen3VLMoeConfig.from_pretrained",
+                return_value=cfg,
+            ) as mock_from_pretrained,
+            patch.object(
+                Qwen3VLMoeForConditionalGeneration, "from_config", wraps=Qwen3VLMoeForConditionalGeneration.from_config
+            ) as mock_from_config,
+        ):
             model = Qwen3VLMoeForConditionalGeneration.from_pretrained("qwen3/vl-moe")
 
         assert isinstance(model, Qwen3VLMoeForConditionalGeneration)
@@ -353,4 +361,3 @@ class TestQwen3VLMoeFromPretrainedAndModelClass:
 
     def test_modelclass_export_exists(self):
         assert ModelClass is Qwen3VLMoeForConditionalGeneration
-
