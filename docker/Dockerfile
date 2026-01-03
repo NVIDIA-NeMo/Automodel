@@ -67,7 +67,7 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
 FROM update_base_container AS automodel_dep
 
 # Install Grouped Gemm
-RUN pip install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
+RUN pip install --no-build-isolation git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
 
 # Install Mamba
 ARG INSTALL_MAMBA=False
