@@ -20,6 +20,7 @@ from torch.utils.data import _utils as torch_data_utils
 # Monkey patch pin_memory to optionally accept a device argument.
 # The device argument was removed in some newer torch versions but we
 # need it for compatibility with torchdata.
+_original_pin_memory_loop = torch_data_utils.pin_memory._pin_memory_loop
 _original_pin_memory = torch_data_utils.pin_memory.pin_memory
 _original_pin_memory_sig = inspect.signature(_original_pin_memory)
 
@@ -30,7 +31,14 @@ if "device" not in _original_pin_memory_sig.parameters:
         """Patched pin_memory that accepts an optional device argument."""
         return _original_pin_memory(data)
 
+    @functools.wraps(_original_pin_memory_loop)
+    def _pin_memory_loop(in_queue, out_queue, device_id, done_event, device):
+        """Patched _pin_memory_loop to accept a device argument."""
+        return _original_pin_memory_loop(in_queue, out_queue, device_id, done_event)
+
     torch_data_utils.pin_memory.pin_memory = _patched_pin_memory
+    torch_data_utils.pin_memory._pin_memory_loop = _pin_memory_loop
+
 
 from .package_info import __package_name__, __version__
 
