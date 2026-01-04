@@ -28,6 +28,7 @@ from nemo_automodel.recipes.llm.train_ft import (
     build_dataloader,
     build_model_and_optimizer,
     build_validation_dataloader,
+    compute_trust_remote_code_from_model,
 )
 from torch.utils.data import IterableDataset
 
@@ -632,3 +633,36 @@ def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
         (parts[0], "PipelineStage_0"),
         (parts[1], "PipelineStage_1"),
     ]
+
+
+def test_compute_trust_remote_code_prefers_cfg_flag():
+    cfg_model = ConfigNode({"trust_remote_code": False, "pretrained_model_name_or_path": "ignored"})
+
+    with patch("nemo_automodel.recipes.llm.train_ft.resolve_trust_remote_code") as mock_resolve:
+        result = compute_trust_remote_code_from_model(cfg_model)
+
+    assert result is False
+    mock_resolve.assert_not_called()
+
+
+def test_compute_trust_remote_code_prefers_nested_config():
+    cfg_model = ConfigNode({"config": {"trust_remote_code": True}})
+
+    with patch("nemo_automodel.recipes.llm.train_ft.resolve_trust_remote_code") as mock_resolve:
+        result = compute_trust_remote_code_from_model(cfg_model)
+
+    assert result is True
+    mock_resolve.assert_not_called()
+
+
+def test_compute_trust_remote_code_falls_back_to_resolve():
+    cfg_model = ConfigNode({"pretrained_model_name_or_path": "nvidia/foo"})
+
+    with patch(
+        "nemo_automodel.recipes.llm.train_ft.resolve_trust_remote_code",
+        return_value=True,
+    ) as mock_resolve:
+        result = compute_trust_remote_code_from_model(cfg_model)
+
+    assert result is True
+    mock_resolve.assert_called_once_with("nvidia/foo")
