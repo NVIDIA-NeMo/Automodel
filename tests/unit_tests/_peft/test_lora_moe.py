@@ -16,6 +16,10 @@ import pytest
 import torch
 import torch.nn as nn
 from unittest.mock import MagicMock, patch
+try:
+    import grouped_gemm
+except ImportError:
+    grouped_gemm = None
 
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, MoEConfig
 from nemo_automodel.components._peft.lora_moe import GroupedExpertsLoRA, GroupedExpertsDeepEPLoRA
@@ -154,15 +158,6 @@ def test_grouped_experts_deepep_lora_init(moe_config, device):
     assert not lora_experts.down_projs.requires_grad
     assert lora_experts.lora_gate_and_up_A.requires_grad
     assert lora_experts.lora_gate_and_up_B.requires_grad
-
-
-try:
-    import grouped_gemm
-except ImportError:
-    grouped_gemm = None
-
-
-
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
