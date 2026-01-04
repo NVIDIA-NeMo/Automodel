@@ -11,7 +11,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 import importlib
+import inspect
+
+from torch.utils.data import _utils as torch_data_utils
+
+# Monkey patch pin_memory to optionally accept a device argument.
+# The device argument was removed in some newer torch versions but we
+# need it for compatibility with torchdata.
+_original_pin_memory = torch_data_utils.pin_memory.pin_memory
+_original_pin_memory_sig = inspect.signature(_original_pin_memory)
+
+if "device" not in _original_pin_memory_sig.parameters:
+
+    @functools.wraps(_original_pin_memory)
+    def _patched_pin_memory(data, device=None):
+        """Patched pin_memory that accepts an optional device argument."""
+        return _original_pin_memory(data)
+
+    torch_data_utils.pin_memory.pin_memory = _patched_pin_memory
 
 from .package_info import __package_name__, __version__
 
