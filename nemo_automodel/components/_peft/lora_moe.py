@@ -278,9 +278,7 @@ class GroupedExpertsLoRA(GroupedExperts):
 
             # Down with LoRA
             expert_out_val = inter @ down_proj
-            expert_out_val = expert_out_val + compute_lora(
-                inter, self.lora_down_A, self.lora_down_B, experts_start_idx
-            )
+            expert_out_val = expert_out_val + compute_lora(inter, self.lora_down_A, self.lora_down_B, experts_start_idx)
 
             expert_out = expert_out_val * weights[0, 0, None]
             y[0] += expert_out[0]

@@ -59,6 +59,7 @@ class ExpertParallel(ParallelStyle):
 
         for name, param in module.named_parameters(recurse=False):
             dist_param = nn.Parameter(distribute_tensor(param, device_mesh, [Shard(0)]))
+            dist_param.requires_grad = param.requires_grad
             module.register_parameter(name, dist_param)
 
         if isinstance(module, GroupedExpertsDeepEP):

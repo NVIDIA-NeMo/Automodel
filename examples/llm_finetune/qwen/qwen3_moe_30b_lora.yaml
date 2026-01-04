@@ -3,15 +3,16 @@
 # WARNING: HARDWARE REQUIREMENTS
 # ------------------------------------------------------------------------------------------------
 # This config targets Qwen3-30B-A3B (30B parameters).
-# It requires multiple GPUs (e.g., 2x A100 80GB or 4x 3090/4090) to load.
+# It requires at least 8 GPUs (e.g., 8x A100 80GB or 8x H100 80GB) to run,
+# but you can potentially run it on less GPUs by reducing the local batch size.
 # ------------------------------------------------------------------------------------------------
 
 step_scheduler:
-  global_batch_size: 32
-  local_batch_size: 1
+  global_batch_size: 1024
+  local_batch_size: 128
   ckpt_every_steps: 100
   val_every_steps: 50
-  num_epochs: 1
+  num_epochs: 2
   max_steps: 1000
 
 dist_env:
@@ -28,26 +29,39 @@ model:
   pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
   trust_remote_code: true
   torch_dtype: bfloat16
+  backend:
+    _target_: nemo_automodel.components.moe.utils.BackendConfig
+    attn: te
+    linear: torch
+    rms_norm: te
+    enable_deepep: true
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  target_modules: ["*.experts"]
-  dim: 16
+  target_modules: ["*"]
+  dim: 32
   alpha: 32
-  dropout: 0.05
+  dropout: 0.0
 
 checkpoint:
-  enabled: true
+  enabled: false
   checkpoint_dir: checkpoints/qwen3_moe_lora
   model_save_format: safetensors
 
+parallelizer:
+  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
+  activation_checkpointing: true
+
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
-  dp_size: none
-  dp_replicate_size: 1
-  tp_size: 2  # Tensor Parallelism recommended
+  tp_size: 1
   cp_size: 1
-  sequence_parallel: false
+  pp_size: 1
+  dp_replicate_size: 1
+  ep_size: 8
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -76,6 +90,7 @@ validation_dataloader:
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 1.0e-4
+  lr: 1.0e-3
   weight_decay: 0.01
   betas: [0.9, 0.95]
+  eps: 1e-8

@@ -21,19 +21,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    import transformer_engine
-
-    HAS_TE = True
-except ImportError:
-    HAS_TE = False
-
-try:
-    import bitsandbytes
-except ImportError:
-    pass
-
-logger = logging.getLogger(__name__)
 from nemo_automodel.components._peft.lora_kernel import (
     lora_da_dx_update_wrapper,
     lora_db_update_wrapper,
@@ -47,6 +34,8 @@ from nemo_automodel.shared.utils import dtype_from_str
 
 HAS_BNB, bitsandbytes = safe_import("bitsandbytes")
 HAS_TE, transformer_engine = safe_import("transformer_engine")
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
