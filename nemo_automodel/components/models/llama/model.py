@@ -21,7 +21,7 @@ Example (YAML):
 
 ```yaml
 model:
-  _target_: nemo_automodel.components.models.llama.build_llama_model
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
 ```
 """
@@ -58,8 +58,6 @@ from nemo_automodel.components.models.common.combined_projection import (
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
 from nemo_automodel.shared.utils import dtype_from_str
-
-__all__ = ["build_llama_model", "LlamaForCausalLM"]
 
 check_model_inputs = get_check_model_inputs_decorator()
 
