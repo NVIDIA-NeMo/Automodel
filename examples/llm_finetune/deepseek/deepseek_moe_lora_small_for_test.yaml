@@ -1,3 +1,10 @@
+# ------------------------------------------------------------------------------------------------
+# TEST ONLY: Small DeepSeek-style MoE for E2E Testing
+# ------------------------------------------------------------------------------------------------
+# This is NOT a real model config. It creates a randomly initialized small MoE
+# for verifying the training pipeline works end-to-end without downloading real weights.
+# DO NOT use this for actual training.
+# ------------------------------------------------------------------------------------------------
 
 step_scheduler:
   global_batch_size: 32
