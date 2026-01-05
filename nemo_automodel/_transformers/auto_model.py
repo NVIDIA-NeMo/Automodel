@@ -27,10 +27,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel import __version__
 from nemo_automodel._transformers.registry import ModelRegistry
-from nemo_automodel.components.distributed.init_utils import (
-    get_local_world_size_preinit,
-    get_world_size_safe,
-)
+from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code
 from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str

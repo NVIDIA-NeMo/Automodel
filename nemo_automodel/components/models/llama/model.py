@@ -34,10 +34,7 @@ from typing import Callable, Optional, Union
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.models.common.combined_projection import (
-    CombinedGateUpMLP,
-    CombinedQKVAttentionMixin,
-)
+from nemo_automodel.components.models.common.combined_projection import CombinedGateUpMLP, CombinedQKVAttentionMixin
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
 from transformers import LlamaConfig
