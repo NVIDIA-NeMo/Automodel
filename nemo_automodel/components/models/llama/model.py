@@ -577,3 +577,6 @@ def build_llama_model(pretrained_model_name_or_path: str, **kwargs: Any) -> nn.M
     model = model.to(dtype=torch_dtype)
 
     return model
+
+
+ModelClass = LlamaForCausalLM
