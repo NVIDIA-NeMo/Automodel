@@ -210,7 +210,7 @@ dataset:
   split: "0.99, 0.01, 0.00"  # train, validation, test
   splits_to_build: "train"
 ```
-See the detailed pretraining guide, [Megatron MCore Pretraining](llm/mcore-pretraining.md), which uses MegatronPretraining data.
+See the detailed [pretraining guide](llm/pretraining.md), which uses MegatronPretraining data.
 
 ## Packed Sequence Support
 To reduce padding and improve throughput with variable-length sequences:
