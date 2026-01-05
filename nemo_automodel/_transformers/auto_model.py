@@ -426,12 +426,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             _download_model_weights(hf_config, pretrained_model_name_or_path)
             logger.info(f"Using custom model implementation for {architectures[0]}")
             kwargs.pop("trust_remote_code", None)
+            # TODO: restore weights after initialization.
             with local_torch_dtype(torch_dtype, ModelRegistry.model_arch_name_to_cls[architectures[0]].__name__):
-                return  ModelRegistry.model_arch_name_to_cls[architectures[0]](
-                    hf_config,
-                    *model_args,
-                    **kwargs,
-                )
+                return  ModelRegistry.model_arch_name_to_cls[architectures[0]](hf_config)
 
         # 3. fallback to parent class
         model = None
@@ -564,7 +561,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         # handle model_id passed as config
         if isinstance(config, str):
-            config = AutoConfig.from_pretrained(config, trust_remote_code=kwargs.get("trust_remote_code", False))
+            config = AutoConfig.from_pretrained(
+                config, trust_remote_code=kwargs.get("trust_remote_code", False),
+                attn_implementation=attn_implementation,
+            )
         # 1. if force_hf is True, we will use the parent class to load and return the model as is
         if force_hf:
             return cls._from_config_parent_class(
@@ -578,7 +578,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         # 2. If we have a custom model implementation available, we prioritize that over HF
         architectures = get_architectures(config)
         if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
-            return ModelRegistry.model_arch_name_to_cls[architectures[0]](config, *model_args, **kwargs)
+            with local_torch_dtype(torch_dtype, ModelRegistry.model_arch_name_to_cls[architectures[0]].__name__):
+                return ModelRegistry.model_arch_name_to_cls[architectures[0]](config)
 
         # 3. fallback to parent class
         model = None
