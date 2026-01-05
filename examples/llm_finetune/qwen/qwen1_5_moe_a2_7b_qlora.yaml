@@ -1,3 +1,15 @@
+# ------------------------------------------------------------------------------------------------
+# Single-GPU QLoRA Example for Qwen1.5-MoE-A2.7B
+# ------------------------------------------------------------------------------------------------
+# This config demonstrates MoE LoRA training on a single GPU using 4-bit quantization (QLoRA).
+#
+# Key differences from multi-GPU DeepEP configs:
+# - Uses 4-bit quantization to fit in single GPU memory
+# - No Expert Parallelism (ep_size defaults to 1)
+# - No DeepEP backend (requires multi-GPU)
+# - Smaller batch sizes appropriate for single GPU
+# ------------------------------------------------------------------------------------------------
+
 quantization:
   load_in_4bit: true
   bnb_4bit_compute_dtype: bfloat16
