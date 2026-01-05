@@ -422,10 +422,9 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         if not self.dist_env.is_main:
             return
 
-        # Log training metrics to wandb every N steps (configurable via wandb.log_train_every_steps)
-        if wandb.run is not None:
-            log_train_every_steps = self.cfg.get("wandb", {}).get("log_train_every_steps", 1)
-            if self.step_scheduler.step % log_train_every_steps == 0:
+        # Log to remote services (WandB) according to step_scheduler frequency
+        if self.step_scheduler.is_remote_logging_step:
+            if wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=log_data.step)
 
         logging.info(

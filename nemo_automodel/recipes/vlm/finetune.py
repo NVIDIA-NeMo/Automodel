@@ -477,13 +477,6 @@ def build_wandb(cfg) -> wandb.Run:
     """
     assert cfg.get("wandb", None) is not None
     kwargs = cfg.wandb.to_dict()
-
-    # Remove custom config keys that are not wandb.init parameters
-    # These are used by our training logic but not passed to wandb
-    custom_keys = {"log_train_every_steps"}
-    for key in custom_keys:
-        kwargs.pop(key, None)
-
     if kwargs.get("name", "") == "":
         kwargs["name"] = "_".join(_get_model_name(cfg.model).split("/")[-2:])
     run = wandb.init(
@@ -965,12 +958,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        # Log training metrics to wandb every N steps (configurable via wandb.log_train_every_steps)
-        if wandb.run is not None:
-            log_train_every_steps = self.cfg.get("wandb", {}).get("log_train_every_steps", 1)
-            if self.step_scheduler.step % log_train_every_steps == 0:
+        # Log to remote services (WandB) according to step_scheduler frequency
+        if self.step_scheduler.is_remote_logging_step:
+            if wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
-        # JSONL training log
+
+        # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
         logging.info(
             "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
