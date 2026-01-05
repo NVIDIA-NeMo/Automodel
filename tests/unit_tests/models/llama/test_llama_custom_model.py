@@ -21,9 +21,8 @@ import pytest
 import torch
 from transformers import AutoModelForCausalLM, LlamaConfig
 
-from nemo_automodel.components.models.llama.model import build_llama_model
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
-
+from nemo_automodel import NeMoAutoModelForCausalLM
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
 
@@ -72,7 +71,7 @@ class TestLlamaModel:
         )
 
         # Build custom model
-        llama_model_custom = build_llama_model(
+        llama_model_custom = NeMoAutoModelForCausalLM.from_pretrained(
             pretrained_model_name_or_path=tiny_llama_checkpoint,
             attn_implementation="eager",
             torch_dtype=torch.bfloat16,
@@ -161,7 +160,7 @@ class TestLlamaModel:
     def test_state_dict_adapter_to_hf(self, tiny_llama_checkpoint):
         """Test converting custom model state dict back to HF format."""
         # Build custom model (which uses adapter internally to load from HF checkpoint)
-        llama_model_custom = build_llama_model(
+        llama_model_custom = NeMoAutoModelForCausalLM.from_pretrained(
             pretrained_model_name_or_path=tiny_llama_checkpoint,
             attn_implementation="eager",
             torch_dtype=torch.bfloat16,
@@ -187,7 +186,7 @@ class TestLlamaModel:
             export_path = os.path.join(tmpdir, "hf_checkpoint")
 
             # Build custom model
-            llama_model_custom = build_llama_model(
+            llama_model_custom = NeMoAutoModelForCausalLM.from_pretrained(
                 pretrained_model_name_or_path=tiny_llama_checkpoint,
                 attn_implementation="eager",
                 torch_dtype=torch.bfloat16,
