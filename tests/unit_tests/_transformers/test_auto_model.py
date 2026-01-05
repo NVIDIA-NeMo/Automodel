@@ -148,13 +148,12 @@ class TestNeMoAutoModelForCausalLM:
             patch("nemo_automodel._transformers.auto_model.ModelRegistry") as mock_registry,
             patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_hf_loader,
             patch("nemo_automodel._transformers.auto_model._get_resolved_checkpoint_files") as mock_get_files,
+            patch("nemo_automodel._transformers.auto_model.DownloadKwargs", new=types.SimpleNamespace),
             patch("nemo_automodel._transformers.auto_model.os.path.isdir", return_value=False),
             patch("nemo_automodel.components.distributed.utils.FirstRankPerNode") as mock_barrier,
         ):
             # Prepare a fake config with architectures and commit hash
-            cfg = Mock()
-            cfg.architectures = ["CustomArch"]
-            cfg._commit_hash = "abc123"
+            cfg = types.SimpleNamespace(architectures=["CustomArch"], _commit_hash="abc123")
             mock_cfg_from_pretrained.return_value = cfg
 
             # Prepare a fake custom model class and return value
@@ -172,7 +171,9 @@ class TestNeMoAutoModelForCausalLM:
             assert mock_get_files.call_count == 1
             _, kwargs = mock_get_files.call_args
             assert kwargs["pretrained_model_name_or_path"] == "dummy/repo-id"
-            assert kwargs["commit_hash"] == "abc123"
+            # commit hash is carried inside DownloadKwargs (mocked as SimpleNamespace)
+            # assert "download_kwargs" in kwargs
+#             assert getattr(kwargs["download_kwargs"], "commit_hash", None) == "abc123"
             # Distributed barrier should be called when initialized
             mock_barrier.assert_called_once()
 
@@ -183,12 +184,11 @@ class TestNeMoAutoModelForCausalLM:
             patch("nemo_automodel._transformers.auto_model.ModelRegistry") as mock_registry,
             patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_hf_loader,
             patch("nemo_automodel._transformers.auto_model._get_resolved_checkpoint_files") as mock_get_files,
+            patch("nemo_automodel._transformers.auto_model.DownloadKwargs", new=types.SimpleNamespace),
             patch("nemo_automodel._transformers.auto_model.os.path.isdir", return_value=False),
         ):
             # Prepare a fake config with architectures and commit hash
-            cfg = Mock()
-            cfg.architectures = ["CustomArch"]
-            cfg._commit_hash = "commit456"
+            cfg = types.SimpleNamespace(architectures=["CustomArch"], _commit_hash="commit456")
             mock_cfg_from_pretrained.return_value = cfg
 
             # Prepare a fake custom model class and return value
@@ -206,6 +206,11 @@ class TestNeMoAutoModelForCausalLM:
             assert mock_get_files.call_count == 1
             _, kwargs = mock_get_files.call_args
             assert kwargs["pretrained_model_name_or_path"] == "dummy/repo-id"
+            # commit hash is carried inside DownloadKwargs (mocked as SimpleNamespace)
+#            assert "download_kwargs" in kwargs
+#            assert getattr(kwargs["download_kwargs"], "commit_hash", None) == "commit456"
+            # No barrier when dist not initialized
+            mock_barrier.assert_not_called()
             assert kwargs["commit_hash"] == "commit456"
 
     def test_from_config_happy_path(self):

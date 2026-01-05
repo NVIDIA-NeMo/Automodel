@@ -23,12 +23,13 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 import torch
 import torch.nn as nn
 import wandb
+from huggingface_hub import constants as hf_constants
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoProcessor
-from transformers.modeling_utils import no_init_weights
+from transformers.initialization import no_init_weights
 from transformers.processing_utils import ProcessorMixin
-from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
+from transformers.utils import ContextManagers
 from wandb import Settings
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
@@ -221,7 +222,7 @@ def build_model_and_optimizer(
             checkpointer.load_base_model(
                 model,
                 device,
-                cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
+                cfg_model.get("cache_dir", hf_constants.HF_HUB_CACHE),
                 _get_model_name(cfg_model),
                 getattr(cfg_peft, "lora_A_init", None),
                 load_base_model=load_base_model,
@@ -263,7 +264,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         checkpoint_dir="checkpoints/",
         model_save_format="safetensors",
         model_repo_id=model_repo_id,
-        model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
+        model_cache_dir=cache_dir if cache_dir is not None else hf_constants.HF_HUB_CACHE,
         save_consolidated=True,
         is_peft=is_peft,
     )

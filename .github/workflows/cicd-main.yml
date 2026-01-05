@@ -45,21 +45,21 @@ jobs:
       - name: Set up UV
         uses: astral-sh/setup-uv@v1
         with:
-          version: 0.7.2
+          version: 0.8.22
       - name: Install ruff
         env:
           UV_PROJECT_ENVIRONMENT: ./venv
         run: |
-          uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
-          source ./venv/bin/activate
+          uv venv ${UV_PROJECT_ENVIRONMENT}
 
           export PATH="./bin/:$PATH"
 
           uv sync --link-mode copy --locked --group linting
 
       - name: Run ruff
+        env:
+          UV_PROJECT_ENVIRONMENT: ./venv
         run: |
-          source ./venv/bin/activate
           uv run ruff check . --verbose
           uv run ruff format --check . --verbose
 
@@ -80,16 +80,16 @@ jobs:
         env:
           UV_PROJECT_ENVIRONMENT: ./venv
         run: |
-          uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
-          source ./venv/bin/activate
+          uv venv ${UV_PROJECT_ENVIRONMENT}
 
           export PATH="./bin/:$PATH"
 
           uv sync --link-mode copy --locked --group linting
 
       - name: Run import-linter
+        env:
+          UV_PROJECT_ENVIRONMENT: ./venv
         run: |
-          source ./venv/bin/activate
           uv run lint-imports --debug --verbose --no-cache
 
   Nemo_Linting_Test:
