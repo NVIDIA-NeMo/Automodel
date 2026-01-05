@@ -33,10 +33,6 @@ from typing import Callable, Optional, Union
 
 import torch
 import torch.nn as nn
-
-from nemo_automodel.components.models.common.combined_projection import CombinedGateUpMLP, CombinedQKVAttentionMixin
-from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
-from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
 from transformers import LlamaConfig
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_causal_mask
@@ -53,6 +49,10 @@ from transformers.models.llama.modeling_llama import (
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
+
+from nemo_automodel.components.models.common.combined_projection import CombinedGateUpMLP, CombinedQKVAttentionMixin
+from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
+from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
 
 check_model_inputs = get_check_model_inputs_decorator()
 
