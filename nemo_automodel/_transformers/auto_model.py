@@ -18,21 +18,11 @@ import inspect
 import logging
 import os
 import types
+from contextlib import contextmanager
 from typing import List, Optional, Union
 
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoModelForImageTextToText,
-    AutoModelForSequenceClassification,
-    AutoModelForTextToWaveform,
-    PreTrainedModel,
-)
-from transformers.modeling_utils import _get_resolved_checkpoint_files
-from transformers.models.auto.auto_factory import _BaseAutoModelClass
-from contextlib import contextmanager
 
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel import __version__
@@ -44,6 +34,16 @@ from nemo_automodel.components.distributed.init_utils import (
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code
 from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoModelForSequenceClassification,
+    AutoModelForTextToWaveform,
+    PreTrainedModel,
+)
+from transformers.modeling_utils import _get_resolved_checkpoint_files
+from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 
@@ -72,6 +72,7 @@ def local_torch_dtype(dtype: torch.dtype, model_class_name: str | None = None):
         yield
     finally:
         torch.set_default_dtype(original_dtype)
+
 
 def _assert_same_signature(original, patched):
     """
@@ -384,7 +385,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
               `use_liger_kernel=False` or `use_sdpa_patching=False`
         """
         torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
-        hf_config, is_hf_model = _prepare_hf_config_and_flag(pretrained_model_name_or_path, force_hf, kwargs, attn_implementation=attn_implementation)
+        hf_config, is_hf_model = _prepare_hf_config_and_flag(
+            pretrained_model_name_or_path, force_hf, kwargs, attn_implementation=attn_implementation
+        )
         tp_size, cp_size, has_packed_sequence = _pop_tp_cp_has_packed(kwargs)
         attn_implementation, use_liger_kernel = _apply_preload_overrides(
             is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel
@@ -428,7 +431,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             kwargs.pop("trust_remote_code", None)
             # TODO: restore weights after initialization.
             with local_torch_dtype(torch_dtype, ModelRegistry.model_arch_name_to_cls[architectures[0]].__name__):
-                return  ModelRegistry.model_arch_name_to_cls[architectures[0]](hf_config)
+                return ModelRegistry.model_arch_name_to_cls[architectures[0]](hf_config)
 
         # 3. fallback to parent class
         model = None
@@ -562,7 +565,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         # handle model_id passed as config
         if isinstance(config, str):
             config = AutoConfig.from_pretrained(
-                config, trust_remote_code=kwargs.get("trust_remote_code", False),
+                config,
+                trust_remote_code=kwargs.get("trust_remote_code", False),
                 attn_implementation=attn_implementation,
             )
         # 1. if force_hf is True, we will use the parent class to load and return the model as is
