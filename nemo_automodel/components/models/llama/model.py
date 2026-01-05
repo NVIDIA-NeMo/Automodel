@@ -357,7 +357,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
     def __init__(
         self,
         config: LlamaConfig,
-        trust_remote_code: bool = False,
     ):
         super().__init__(config)
         self.config = config
