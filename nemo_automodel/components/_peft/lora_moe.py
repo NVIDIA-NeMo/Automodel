@@ -492,9 +492,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 trans_b=False,
             )
             # [T, R] @ [E_local, R, H] -> [T, H]
-            lora_out1 = ops.gmm(
-                lora_out1_A, to_local(self.lora_gate_and_up_B), tokens_per_expert, trans_b=False
-            )
+            lora_out1 = ops.gmm(lora_out1_A, to_local(self.lora_gate_and_up_B), tokens_per_expert, trans_b=False)
 
             output1 = output1 + lora_out1 * self.scale
 
