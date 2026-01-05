@@ -32,6 +32,7 @@ from transformers import (
 )
 from transformers.modeling_utils import _get_resolved_checkpoint_files
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
+from contextlib import contextmanager
 
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel import __version__
@@ -48,6 +49,29 @@ HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 
 logger = logging.getLogger(__name__)
 
+
+@contextmanager
+def local_torch_dtype(dtype: torch.dtype, model_class_name: str | None = None):
+    """
+    Locally change the torch default dtype to `dtype`, and restore the old one upon exiting the context.
+    If `model_class_name` is provided, it's used to provide a more helpful error message if `dtype` is not valid.
+    """
+    # Just a more helping error before we set `torch.set_default_dtype` later on which would crash in this case
+    if not dtype.is_floating_point:
+        if model_class_name is not None:
+            error_message = (
+                f"{model_class_name} cannot be instantiated under `dtype={dtype}` as it's not a floating-point dtype"
+            )
+        else:
+            error_message = f"Cannot set `{dtype}` as torch's default as it's not a floating-point dtype"
+        raise ValueError(error_message)
+
+    original_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(dtype)
+        yield
+    finally:
+        torch.set_default_dtype(original_dtype)
 
 def _assert_same_signature(original, patched):
     """
@@ -157,7 +181,7 @@ def _get_next_fallback_attn(attn_implementation: str) -> str:
         return priorities[0]
 
 
-def _prepare_hf_config_and_flag(pretrained_model_name_or_path, force_hf, kwargs):
+def _prepare_hf_config_and_flag(pretrained_model_name_or_path, force_hf, kwargs, attn_implementation):
     """
     Resolve trust_remote_code default, fetch HF config and determine if model is HF-based.
     """
@@ -165,7 +189,9 @@ def _prepare_hf_config_and_flag(pretrained_model_name_or_path, force_hf, kwargs)
         "trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path)
     )
     hf_config = kwargs.pop("config", None) or AutoConfig.from_pretrained(
-        pretrained_model_name_or_path, trust_remote_code=kwargs["trust_remote_code"]
+        pretrained_model_name_or_path,
+        **kwargs,
+        attn_implementation=attn_implementation,
     )
     architectures = getattr(hf_config, "architectures", None) or []
     is_hf_model = (not architectures or architectures[0] not in ModelRegistry.model_arch_name_to_cls) or force_hf
@@ -358,7 +384,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
               `use_liger_kernel=False` or `use_sdpa_patching=False`
         """
         torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
-        hf_config, is_hf_model = _prepare_hf_config_and_flag(pretrained_model_name_or_path, force_hf, kwargs)
+        hf_config, is_hf_model = _prepare_hf_config_and_flag(pretrained_model_name_or_path, force_hf, kwargs, attn_implementation=attn_implementation)
         tp_size, cp_size, has_packed_sequence = _pop_tp_cp_has_packed(kwargs)
         attn_implementation, use_liger_kernel = _apply_preload_overrides(
             is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel
@@ -400,7 +426,12 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             _download_model_weights(hf_config, pretrained_model_name_or_path)
             logger.info(f"Using custom model implementation for {architectures[0]}")
             kwargs.pop("trust_remote_code", None)
-            return ModelRegistry.model_arch_name_to_cls[architectures[0]](hf_config, *model_args, **kwargs)
+            with local_torch_dtype(torch_dtype, ModelRegistry.model_arch_name_to_cls[architectures[0]].__name__):
+                return  ModelRegistry.model_arch_name_to_cls[architectures[0]](
+                    hf_config,
+                    *model_args,
+                    **kwargs,
+                )
 
         # 3. fallback to parent class
         model = None
