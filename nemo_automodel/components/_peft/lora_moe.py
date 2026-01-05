@@ -470,11 +470,16 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         )
         permuted_probs = permuted_probs.unsqueeze(-1)
 
+        # Helper to get local weights. In production, all weights are DTensor after parallelization.
+        # The isinstance check is for unit tests where parallelizer is mocked and weights remain Parameters.
+        def to_local(proj):
+            return proj.to_local() if isinstance(proj, DTensor) else proj
+
         if torch.count_nonzero(tokens_per_expert) > 0:
             # 1. Gate + Up Projection
             output1 = ops.gmm(
                 permuted_local_hidden_states,
-                self.gate_and_up_projs.to_local(),
+                to_local(self.gate_and_up_projs),
                 tokens_per_expert,
                 trans_b=False,
             )
@@ -482,42 +487,42 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             # Add LoRA
             lora_out1_A = ops.gmm(
                 permuted_local_hidden_states,
-                self.lora_gate_and_up_A.to_local(),
+                to_local(self.lora_gate_and_up_A),
                 tokens_per_expert,
                 trans_b=False,
             )
             # [T, R] @ [E_local, R, H] -> [T, H]
             lora_out1 = ops.gmm(
-                lora_out1_A, self.lora_gate_and_up_B.to_local(), tokens_per_expert, trans_b=False
+                lora_out1_A, to_local(self.lora_gate_and_up_B), tokens_per_expert, trans_b=False
             )
 
             output1 = output1 + lora_out1 * self.scale
 
             if self.expert_bias:
-                gate_and_up_bias = self.gate_up_proj_bias.to_local()
+                gate_and_up_bias = to_local(self.gate_up_proj_bias)
                 output1 = self._apply_bias(output1, gate_and_up_bias, tokens_per_expert)
 
             output1 = self.expert_activation(output1, permuted_probs)
 
             # 2. Down Projection
-            output2 = ops.gmm(output1, self.down_projs.to_local(), tokens_per_expert, trans_b=False)
+            output2 = ops.gmm(output1, to_local(self.down_projs), tokens_per_expert, trans_b=False)
 
             # Add LoRA
-            lora_out2_A = ops.gmm(output1, self.lora_down_A.to_local(), tokens_per_expert, trans_b=False)
-            lora_out2 = ops.gmm(lora_out2_A, self.lora_down_B.to_local(), tokens_per_expert, trans_b=False)
+            lora_out2_A = ops.gmm(output1, to_local(self.lora_down_A), tokens_per_expert, trans_b=False)
+            lora_out2 = ops.gmm(lora_out2_A, to_local(self.lora_down_B), tokens_per_expert, trans_b=False)
             output2 = output2 + lora_out2 * self.scale
 
             if self.expert_bias:
-                down_bias = self.down_proj_bias.to_local()
+                down_bias = to_local(self.down_proj_bias)
                 output2 = self._apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
         else:
             # Handle empty case for DeepEP - use [0] indexing to match base shapes exactly
-            W1 = self.gate_and_up_projs.to_local()[0]  # [dim, 2*inter]
-            W2 = self.down_projs.to_local()[0]  # [inter, dim]
-            A1 = self.lora_gate_and_up_A.to_local()[0]  # [dim, r]
-            B1 = self.lora_gate_and_up_B.to_local()[0]  # [r, 2*inter]
-            A2 = self.lora_down_A.to_local()[0]  # [inter, r]
-            B2 = self.lora_down_B.to_local()[0]  # [r, dim]
+            W1 = to_local(self.gate_and_up_projs)[0]  # [dim, 2*inter]
+            W2 = to_local(self.down_projs)[0]  # [inter, dim]
+            A1 = to_local(self.lora_gate_and_up_A)[0]  # [dim, r]
+            B1 = to_local(self.lora_gate_and_up_B)[0]  # [r, 2*inter]
+            A2 = to_local(self.lora_down_A)[0]  # [inter, r]
+            B2 = to_local(self.lora_down_B)[0]  # [r, dim]
 
             dummy_x = x[0] * 0  # [dim]
 
