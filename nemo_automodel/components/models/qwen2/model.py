@@ -508,3 +508,6 @@ def build_qwen2_model(pretrained_model_name_or_path: str, **kwargs: Any) -> nn.M
     model = model.to(dtype=torch_dtype)
 
     return model
+
+
+ModelClass = Qwen2ForCausalLM
