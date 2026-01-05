@@ -48,6 +48,8 @@ class BiencoderStateDictAdapter(StateDictAdapter):
             if key.startswith("lm_q."):
                 new_key = key.replace("lm_q.", "model.")
                 hf_state_dict[new_key] = value
+            elif key.startswith("linear_pooler."):
+                hf_state_dict[key] = value
 
         return hf_state_dict
 
@@ -76,6 +78,8 @@ class BiencoderStateDictAdapter(StateDictAdapter):
                 biencoder_state_dict[new_key_q] = value
                 new_key_p = key.replace("model.", "lm_p.")
                 biencoder_state_dict[new_key_p] = value
+            elif key.startswith("linear_pooler."):
+                biencoder_state_dict[key] = value
 
         return biencoder_state_dict
 
@@ -94,6 +98,8 @@ class BiencoderStateDictAdapter(StateDictAdapter):
         if fqn.startswith("lm_q."):
             new_fqn = fqn.replace("lm_q.", "model.")
             return [(new_fqn, tensor)]
+        if fqn.startswith("linear_pooler."):
+            return [(fqn, tensor)]
 
         # Skip tensors that are not part of lm_q
         return []
