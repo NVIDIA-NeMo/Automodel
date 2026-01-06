@@ -486,12 +486,38 @@ class BaseRecipe:
         for k, v in attrs.items():
             logging.info(f"- {k}: {v}")
 
+    def _resolve_dp_dim_name(self, include_cp: bool = False) -> str:
+        """Resolve the actual data parallel dimension name to use.
+
+        Returns the flattened dimension if available, otherwise falls back to dp_shard.
+        This centralizes the logic for handling cases where mesh flattening was skipped.
+
+        Args:
+            include_cp: If True and CP > 1, include context parallel in dimension.
+
+        Returns:
+            The dimension name to use for DP operations.
+        """
+        if include_cp and self.device_mesh["cp"].size() > 1:
+            # Prefer flattened "dp_cp", fallback to "dp_shard"
+            return "dp_cp" if "dp_cp" in self.device_mesh.mesh_dim_names else "dp_shard"
+        else:
+            # Prefer flattened "dp", fallback to "dp_shard"
+            return "dp" if "dp" in self.device_mesh.mesh_dim_names else "dp_shard"
+
     def _get_dp_group(self, include_cp: bool = False):
+        """Get the data parallel process group.
+
+        Args:
+            include_cp: If True and CP > 1, include context parallel dimension in the group.
+
+        Returns:
+            The data parallel ProcessGroup, or None if no device mesh.
+        """
         if not self.device_mesh:
             return None
-        if include_cp and self.device_mesh["cp"].size() > 1:
-            return self.device_mesh["dp_cp"].get_group()
-        return self.device_mesh["dp"].get_group()
+        dim_name = self._resolve_dp_dim_name(include_cp)
+        return self.device_mesh[dim_name].get_group()
 
     def _get_dp_group_size(self, include_cp: bool = False):
         dp_group = self._get_dp_group(include_cp=include_cp)
@@ -503,11 +529,18 @@ class BaseRecipe:
         return self.device_mesh["cp"].size()
 
     def _get_dp_rank(self, include_cp: bool = False):
+        """Get the local rank in the data parallel group.
+
+        Args:
+            include_cp: If True and CP > 1, include context parallel dimension in the rank.
+
+        Returns:
+            The local rank in the data parallel group (0 if no device mesh).
+        """
         if not self.device_mesh:
             return 0
-        if include_cp and self.device_mesh["cp"].size() > 1:
-            return self.device_mesh.get_local_rank("dp_cp")
-        return self.device_mesh.get_local_rank("dp")
+        dim_name = self._resolve_dp_dim_name(include_cp)
+        return self.device_mesh.get_local_rank(dim_name)
 
     def _get_tp_rank(self):
         if not self.device_mesh or self.device_mesh["tp"].size() == 1:
