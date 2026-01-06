@@ -48,12 +48,16 @@ logger = logging.getLogger(__name__)
 
 
 @contextmanager
-def local_torch_dtype(dtype: torch.dtype, model_class_name: str | None = None):
+def local_torch_dtype(
+    dtype: torch.dtype, model_class_name: str | None = None, default_dtype: torch.dtype = torch.bfloat16
+):
     """
     Locally change the torch default dtype to `dtype`, and restore the old one upon exiting the context.
     If `model_class_name` is provided, it's used to provide a more helpful error message if `dtype` is not valid.
     """
     # Just a more helping error before we set `torch.set_default_dtype` later on which would crash in this case
+    if isinstance(dtype, str):
+        dtype = default_dtype
     if not dtype.is_floating_point:
         if model_class_name is not None:
             error_message = (
@@ -62,7 +66,6 @@ def local_torch_dtype(dtype: torch.dtype, model_class_name: str | None = None):
         else:
             error_message = f"Cannot set `{dtype}` as torch's default as it's not a floating-point dtype"
         raise ValueError(error_message)
-
     original_dtype = torch.get_default_dtype()
     try:
         torch.set_default_dtype(dtype)
@@ -426,9 +429,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             _download_model_weights(hf_config, pretrained_model_name_or_path)
             logger.info(f"Using custom model implementation for {architectures[0]}")
             kwargs.pop("trust_remote_code", None)
-            # TODO: restore weights after initialization.
-            with local_torch_dtype(torch_dtype, ModelRegistry.model_arch_name_to_cls[architectures[0]].__name__):
-                return ModelRegistry.model_arch_name_to_cls[architectures[0]](hf_config)
+            # TODO(@akoumpa): restore weights after initialization.
+            model_cls = ModelRegistry.model_arch_name_to_cls[architectures[0]]
+            with local_torch_dtype(torch_dtype, model_cls.__name__):
+                return model_cls(hf_config)
 
         # 3. fallback to parent class
         model = None
