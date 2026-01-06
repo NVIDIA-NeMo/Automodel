@@ -172,6 +172,8 @@ omit = [
     "nemo_automodel/components/_peft/lora_kernel.py",
     "nemo_automodel/components/loss/triton/te_cross_entropy.py",
     "nemo_automodel/components/moe/megatron/*.py",
+    "config.py",
+    "config-3.py",
 ]
 
 [tool.ruff]
