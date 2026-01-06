@@ -123,21 +123,30 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         Returns:
             Tuple of dimension names to use for the FSDP mesh.
         """
-        if dp_shard_cp_mesh_name in device_mesh.mesh_dim_names:
-            # Best case: use pre-flattened (dp_replicate, dp_shard_cp)
+        mesh_dim_names = getattr(device_mesh, "mesh_dim_names", None)
+
+        # If mesh_dim_names not available, use the default passed names (backward compatibility)
+        if mesh_dim_names is None:
+            logger.debug(f"FSDP mesh: ({dp_replicate_mesh_name}, {dp_shard_cp_mesh_name}) [no mesh_dim_names]")
+            return (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
+
+        # Use flattened dimension if available
+        if dp_shard_cp_mesh_name in mesh_dim_names:
             logger.debug(f"FSDP mesh: ({dp_replicate_mesh_name}, {dp_shard_cp_mesh_name}) [flattened]")
             return (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-        elif device_mesh["cp"].size() == 1:
-            # CP unused: construct 2D mesh without cp
-            logger.debug(f"FSDP mesh: ({dp_replicate_mesh_name}, dp_shard) [cp=1, unflattened]")
+
+        # Check if cp dimension exists and get its size
+        cp_size = device_mesh["cp"].size() if "cp" in mesh_dim_names else 1
+
+        if cp_size == 1:
+            logger.debug(f"FSDP mesh: ({dp_replicate_mesh_name}, dp_shard) [cp={cp_size}, unflattened]")
             return (dp_replicate_mesh_name, "dp_shard")
         else:
-            # This should be unreachable: if cp > 1, flattening should have succeeded
             raise RuntimeError(
-                f"Cannot construct FSDP mesh: cp={device_mesh['cp'].size()} but '{dp_shard_cp_mesh_name}' dimension not found. "
+                f"Cannot construct FSDP mesh: cp={cp_size} but '{dp_shard_cp_mesh_name}' dimension not found. "
                 f"FSDP requires 1D or 2D mesh, but would need 3D: ({dp_replicate_mesh_name}, dp_shard, cp). "
                 f"Flattening (dp_shard, cp) -> '{dp_shard_cp_mesh_name}' should occur in FSDP2Manager._get_device_mesh() (fsdp2.py). "
-                f"Available: {device_mesh.mesh_dim_names}"
+                f"Available: {mesh_dim_names}"
             )
 
     def parallelize(

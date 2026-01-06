@@ -498,12 +498,18 @@ class BaseRecipe:
         Returns:
             The dimension name to use for DP operations.
         """
-        if include_cp and self.device_mesh["cp"].size() > 1:
-            # Prefer flattened "dp_cp", fallback to "dp_shard"
-            return "dp_cp" if "dp_cp" in self.device_mesh.mesh_dim_names else "dp_shard"
+        mesh_dim_names = getattr(self.device_mesh, "mesh_dim_names", None)
+
+        # If mesh_dim_names not available, use default behavior
+        if mesh_dim_names is None:
+            mesh_dim_names = []
+
+        cp_size = self.device_mesh["cp"].size() if "cp" in mesh_dim_names else 1
+
+        if include_cp and cp_size > 1:
+            return "dp_cp" if "dp_cp" in mesh_dim_names else "dp_shard"
         else:
-            # Prefer flattened "dp", fallback to "dp_shard"
-            return "dp" if "dp" in self.device_mesh.mesh_dim_names else "dp_shard"
+            return "dp" if "dp" in mesh_dim_names else "dp_shard"
 
     def _get_dp_group(self, include_cp: bool = False):
         """Get the data parallel process group.
