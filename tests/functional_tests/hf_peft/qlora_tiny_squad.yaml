@@ -1,0 +1,102 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Tiny QLoRA smoke config used by functional tests.
+# The launcher script overrides the model + dataset paths to use local test fixtures.
+
+step_scheduler:
+  global_batch_size: 2
+  local_batch_size: 1
+  ckpt_every_steps: 2
+  val_every_steps: null
+  max_steps: 2
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 5
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  # Overridden by the functional-test launcher to a tiny local HF model.
+  pretrained_model_name_or_path: hf-internal-testing/tiny-random-gpt2
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: true
+  dim: 4
+  alpha: 8
+  dropout: 0.0
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: none
+  dp_replicate_size: 1
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+quantization:
+  load_in_4bit: true
+  load_in_8bit: false
+  bnb_4bit_compute_dtype: bfloat16
+  bnb_4bit_use_double_quant: true
+  bnb_4bit_quant_type: nf4
+  bnb_4bit_quant_storage: bfloat16
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: train
+  limit_dataset_samples: 128
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: validation
+  limit_dataset_samples: 64
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  lr: 1.0e-4
+  weight_decay: 0.0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors
+  save_consolidated: false
+
+
