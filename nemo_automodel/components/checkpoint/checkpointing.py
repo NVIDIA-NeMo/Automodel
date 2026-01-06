@@ -205,7 +205,9 @@ class Checkpointer:
         state_dict = model_state.state_dict()
 
         # Convert to HF format if using custom model implementations
-        state_dict = _maybe_adapt_state_dict_to_hf(model_state.model[0], state_dict, quantization=False)
+        state_dict = _maybe_adapt_state_dict_to_hf(
+            model_state.model[0], state_dict, quantization=False, device_mesh=self.moe_mesh
+        )
         # Build the consolidated model.safetensors.index.json if needed
         fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
 
@@ -324,7 +326,10 @@ class Checkpointer:
         storage_reader = self._get_storage_reader(model_path, key_mapping, is_init_step=is_init_step)
 
         state_dict = _maybe_adapt_state_dict_to_hf(
-            model_state.model[0], state_dict, quantization=self.config.dequantize_base_checkpoint
+            model_state.model[0],
+            state_dict,
+            quantization=self.config.dequantize_base_checkpoint,
+            device_mesh=self.moe_mesh,
         )
 
         state_dict = self._do_load(state_dict, model_path, storage_reader, is_init_step=is_init_step)
@@ -1014,14 +1019,14 @@ def _convert_checkpoint_with_transformers(
 
 
 def _maybe_adapt_state_dict_to_hf(
-    model_part: nn.Module, state_dict: dict[str, torch.Tensor], quantization: bool = False
+    model_part: nn.Module, state_dict: dict[str, torch.Tensor], quantization: bool = False, **kwargs
 ) -> dict[str, torch.Tensor]:
     """
     Custom models use state dict adapters to convert the state dict to the Hugging Face format.
     """
     adapter = getattr(model_part, "state_dict_adapter", None)
     if adapter:
-        return adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization)
+        return adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization, **kwargs)
     return state_dict
 
 

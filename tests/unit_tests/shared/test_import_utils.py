@@ -174,3 +174,29 @@ def test_is_te_min_version():
     """
     assert si.is_te_min_version("0.0.0") is True
     assert si.is_te_min_version("9999.0.0", check_equality=False) is False
+
+
+def test_get_transformers_version_type():
+    """
+    ``get_transformers_version`` should *never* raise – even when transformers is unavailable
+    while building docs – and must always return a ``packaging.version.Version``.
+    """
+    ver = si.get_transformers_version()
+    assert isinstance(ver, PkgVersion)
+
+
+def test_is_transformers_min_version():
+    """
+    * A ridiculously low requirement must be satisfied.
+    * A far-future version must *not* be satisfied.
+    """
+    assert si.is_transformers_min_version("0.0.0") is True
+    assert si.is_transformers_min_version("9999.0.0", check_equality=False) is False
+
+
+def test_get_check_model_inputs_decorator():
+    """
+    ``get_check_model_inputs_decorator`` should always return a callable decorator.
+    """
+    decorator = si.get_check_model_inputs_decorator()
+    assert callable(decorator)

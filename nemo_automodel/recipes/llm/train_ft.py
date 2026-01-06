@@ -409,13 +409,24 @@ def build_loss_fn(cfg_loss):
     return cfg_loss.instantiate()
 
 
-def _build_tokenizer(cfg_model, cfg_ds):
-    def compute_trust_remote_code():
-        if hasattr(cfg_model, "trust_remote_code"):
-            return getattr(cfg_model, "trust_remote_code")
-        return resolve_trust_remote_code(_get_model_name(cfg_model))
+def compute_trust_remote_code_from_model(cfg_model):
+    """Compute the value of trust_remote_code based on the model configuration.
 
-    trust_remote_code = compute_trust_remote_code()
+    Args:
+        cfg_model (ConfigNode): Model configuration.
+
+    Returns:
+        bool: Whether to trust remote code.
+    """
+    if hasattr(cfg_model, "trust_remote_code"):
+        return getattr(cfg_model, "trust_remote_code")
+    elif hasattr(cfg_model, "config") and hasattr(cfg_model.config, "trust_remote_code"):
+        return getattr(cfg_model.config, "trust_remote_code")
+    return resolve_trust_remote_code(_get_model_name(cfg_model))
+
+
+def _build_tokenizer(cfg_model, cfg_ds):
+    trust_remote_code = compute_trust_remote_code_from_model(cfg_model)
     # if tokenizer is not provided, use the model config to instantiate it
     if "tokenizer" not in cfg_ds and _get_model_name(cfg_model) is not None:
         logging.info("Using model config to instantiate tokenizer")
@@ -596,7 +607,9 @@ def build_dataloader(
         if pp_enabled:
             from nemo_automodel.components.datasets.utils import add_causal_masks_to_batch
 
-            hf_model_config = AutoConfig.from_pretrained(_get_model_name(cfg_model))
+            hf_model_config = AutoConfig.from_pretrained(
+                _get_model_name(cfg_model), trust_remote_code=compute_trust_remote_code_from_model(cfg_model)
+            )
 
             if "collate_fn" in dl_kwargs:
                 # Case 1: PP enabled + collate_fn exists -> chain them
