@@ -213,13 +213,16 @@ def reduce_loss(
     return loss, denominator
 
 
-def get_sync_ctx(model, is_optim_step):
+def get_sync_ctx(model, is_optim_step, defer_fsdp_grad_sync: bool):
     """
     Get the synchronization context for the model.
 
     Args:
         model: The model to synchronize.
         is_optim_step: Whether the current step is an optimizer step.
+        defer_fsdp_grad_sync: Controls FSDP2 gradient synchronization during gradient accumulation.
+            - True: disable gradient sync on non-final micro-batches (saves comm, can increase peak memory).
+            - False: always sync gradients on every micro-batch (more comm, lower peak memory).
 
     Returns:
         A context manager that synchronizes the model.
@@ -229,7 +232,10 @@ def get_sync_ctx(model, is_optim_step):
     # all-reduce for every micro-batch and greatly improves throughput.
     sync_ctx = nullcontext()
     if isinstance(model, dist.fsdp._fully_shard._fully_shard.FSDPModule):
-        model.set_requires_gradient_sync(is_optim_step)
+        if defer_fsdp_grad_sync:
+            model.set_requires_gradient_sync(is_optim_step)
+        else:
+            model.set_requires_gradient_sync(True)
     elif isinstance(model, torch.nn.parallel.DistributedDataParallel) and not is_optim_step:
         sync_ctx = model.no_sync()
     return sync_ctx

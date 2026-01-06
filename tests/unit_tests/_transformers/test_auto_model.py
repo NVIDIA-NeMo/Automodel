@@ -49,7 +49,8 @@ class TestNeMoAutoModelForCausalLM:
         ):
             cfg = Mock()
             cfg.architectures = ["HFArch"]
-            mock_cfg_from_pretrained.return_value = cfg
+            cfg.auto_map = []
+            mock_cfg_from_pretrained.return_value = (cfg, {})
             mock_model = MagicMock()
             mock_model.config = {}
             mock_from_pretrained.return_value = mock_model
@@ -148,10 +149,7 @@ class TestNeMoAutoModelForCausalLM:
             patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_hf_loader,
             patch("nemo_automodel._transformers.auto_model._get_resolved_checkpoint_files") as mock_get_files,
             patch("nemo_automodel._transformers.auto_model.os.path.isdir", return_value=False),
-            patch("nemo_automodel._transformers.auto_model.dist.is_initialized", return_value=True),
-            patch("nemo_automodel._transformers.auto_model.dist.get_world_size", return_value=1),
-            patch("nemo_automodel._transformers.auto_model.dist.get_rank", return_value=0),
-            patch("nemo_automodel._transformers.auto_model.dist.barrier") as mock_barrier,
+            patch("nemo_automodel.components.distributed.utils.FirstRankPerNode") as mock_barrier,
         ):
             # Prepare a fake config with architectures and commit hash
             cfg = Mock()
@@ -186,9 +184,6 @@ class TestNeMoAutoModelForCausalLM:
             patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_hf_loader,
             patch("nemo_automodel._transformers.auto_model._get_resolved_checkpoint_files") as mock_get_files,
             patch("nemo_automodel._transformers.auto_model.os.path.isdir", return_value=False),
-            patch("nemo_automodel._transformers.auto_model.dist.is_initialized", return_value=False),
-            patch("nemo_automodel._transformers.auto_model.dist.get_world_size", return_value=1),
-            patch("nemo_automodel._transformers.auto_model.dist.barrier") as mock_barrier,
         ):
             # Prepare a fake config with architectures and commit hash
             cfg = Mock()
@@ -212,8 +207,6 @@ class TestNeMoAutoModelForCausalLM:
             _, kwargs = mock_get_files.call_args
             assert kwargs["pretrained_model_name_or_path"] == "dummy/repo-id"
             assert kwargs["commit_hash"] == "commit456"
-            # No barrier when dist not initialized
-            mock_barrier.assert_not_called()
 
     def test_from_config_happy_path(self):
         """Test the basic from_config functionality works."""
@@ -221,6 +214,37 @@ class TestNeMoAutoModelForCausalLM:
 
         model = NeMoAutoModelForCausalLM.from_config(config, attn_implementation="eager")
         assert model.config.nemo_version == __version__
+
+    def test_from_config_with_string_calls_autoconfig(self):
+        """Test that from_config calls AutoConfig.from_pretrained when config is a string."""
+        mock_model = MagicMock()
+        mock_model.config = {}
+        mock_config = Mock()
+        mock_config.architectures = ["HFArch"]
+        mock_config.name_or_path = "hf-internal-testing/tiny-random-gpt2"
+
+        with (
+            patch("nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained") as mock_autoconfig,
+            patch("nemo_automodel._transformers.auto_model.HAS_LIGER_KERNEL", False),
+            patch("nemo_automodel._transformers.auto_model._patch_attention", lambda obj, sdpa_method=None: obj),
+            patch.object(transformers.AutoModelForCausalLM, "from_config") as mock_from_config,
+        ):
+            mock_autoconfig.return_value = mock_config
+            mock_from_config.return_value = mock_model
+
+            model = NeMoAutoModelForCausalLM.from_config(
+                "hf-internal-testing/tiny-random-gpt2",
+                trust_remote_code=False
+            )
+
+            # Verify AutoConfig.from_pretrained was called with the string
+            mock_autoconfig.assert_called_once_with(
+                "hf-internal-testing/tiny-random-gpt2",
+                trust_remote_code=False
+            )
+            # Verify the model was returned
+            assert model is mock_model
+            assert model.config["nemo_version"] == __version__
 
     def test_from_pretrained_runtimeerror_triggers_reload(self):
         """When _patch_liger_kernel raises, the loader should retry with

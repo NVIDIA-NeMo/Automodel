@@ -231,10 +231,9 @@ def build_model_and_optimizer(
                     param.requires_grad_(True)
             logging.info(f"Unfroze parameters matching: {unfreeze_modules}")
 
-    trainable_params, total_params = print_trainable_parameters(model)
     param_info = {
-        "trainable_params": trainable_params,
-        "total_params": total_params,
+        "trainable_params": 0,
+        "total_params": 0,
     }
 
     # hold a list copy of the model state dict keys before any parallelization
@@ -245,6 +244,9 @@ def build_model_and_optimizer(
         loss_fn = MaskedCrossEntropy()
 
     if autopipeline is not None:
+        trainable_params, total_params = print_trainable_parameters(model)
+        param_info["trainable_params"] = trainable_params
+        param_info["total_params"] = total_params
         if get_world_size_safe() == 1:
             logger.info("World size is 1, skipping autopipeline.")
         else:
@@ -302,6 +304,10 @@ def build_model_and_optimizer(
 
                 model, optimizer = model_wrapper.parallelize(model, optimizer)
 
+                trainable_params, total_params = print_trainable_parameters(model)
+                param_info["trainable_params"] = trainable_params
+                param_info["total_params"] = total_params
+
                 return model, state_dict_keys, [optimizer], loss_fn, param_info
 
             else:
@@ -341,6 +347,12 @@ def build_model_and_optimizer(
         trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         optimizer = [cfg_opt.instantiate(params=trainable_params)]
+
+    # Print trainable parameters after model has been moved to device
+    if autopipeline is None:
+        trainable_params, total_params = print_trainable_parameters(model)
+        param_info["trainable_params"] = trainable_params
+        param_info["total_params"] = total_params
 
     return model, state_dict_keys, optimizer, loss_fn, param_info
 
@@ -393,13 +405,24 @@ def build_loss_fn(cfg_loss):
     return cfg_loss.instantiate()
 
 
-def _build_tokenizer(cfg_model, cfg_ds):
-    def compute_trust_remote_code():
-        if hasattr(cfg_model, "trust_remote_code"):
-            return getattr(cfg_model, "trust_remote_code")
-        return resolve_trust_remote_code(_get_model_name(cfg_model))
+def compute_trust_remote_code_from_model(cfg_model):
+    """Compute the value of trust_remote_code based on the model configuration.
 
-    trust_remote_code = compute_trust_remote_code()
+    Args:
+        cfg_model (ConfigNode): Model configuration.
+
+    Returns:
+        bool: Whether to trust remote code.
+    """
+    if hasattr(cfg_model, "trust_remote_code"):
+        return getattr(cfg_model, "trust_remote_code")
+    elif hasattr(cfg_model, "config") and hasattr(cfg_model.config, "trust_remote_code"):
+        return getattr(cfg_model.config, "trust_remote_code")
+    return resolve_trust_remote_code(_get_model_name(cfg_model))
+
+
+def _build_tokenizer(cfg_model, cfg_ds):
+    trust_remote_code = compute_trust_remote_code_from_model(cfg_model)
     # if tokenizer is not provided, use the model config to instantiate it
     if "tokenizer" not in cfg_ds and _get_model_name(cfg_model) is not None:
         logging.info("Using model config to instantiate tokenizer")
@@ -580,7 +603,9 @@ def build_dataloader(
         if pp_enabled:
             from nemo_automodel.components.datasets.utils import add_causal_masks_to_batch
 
-            hf_model_config = AutoConfig.from_pretrained(_get_model_name(cfg_model))
+            hf_model_config = AutoConfig.from_pretrained(
+                _get_model_name(cfg_model), trust_remote_code=compute_trust_remote_code_from_model(cfg_model)
+            )
 
             if "collate_fn" in dl_kwargs:
                 # Case 1: PP enabled + collate_fn exists -> chain them
@@ -870,6 +895,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         apply_cache_compatibility_patches()
         # Set up the stateful random number generator
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
+        # Enable NVTX patching only when explicitly requested in config
+        self.enable_nvtx = bool(self.cfg.get("nvtx", False))
 
         self.device_mesh = None
         self.moe_mesh = None
@@ -1006,7 +1033,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
             self.pp = model
+            if self.enable_nvtx:
+                import nemo_automodel.autonvtx as autonvtx
+
+                # Patch each pipeline stage with NVTX profiling
+                for i, part in enumerate(self.model_parts):
+                    autonvtx.patch(part, name=f"PipelineStage_{i}")
         else:
+            if self.enable_nvtx:
+                import nemo_automodel.autonvtx as autonvtx
+
+                # Patch model with NVTX profiling
+                autonvtx.patch(model, name=model.__class__.__name__)
             self.model_parts = [model]
             self.pp = None
 
@@ -1221,7 +1259,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             loss_buffer.append(local_loss.clone().detach())
         else:
             model = self.model_parts[0]
-            sync_ctx = get_sync_ctx(model, idx == num_batches - 1) if is_train else nullcontext()
+            sync_ctx = (
+                get_sync_ctx(
+                    model,
+                    idx == num_batches - 1,
+                    defer_fsdp_grad_sync=getattr(self.model_wrapper, "defer_fsdp_grad_sync", True),
+                )
+                if is_train
+                else nullcontext()
+            )
             with train_ctx(), sync_ctx:
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
