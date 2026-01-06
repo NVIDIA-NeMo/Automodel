@@ -28,7 +28,7 @@ rng:
   ranked: true
 
 model:
-  _target_: nemo_automodel.components.models.llama.model.build_llama_model
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
   torch_dtype: bf16
 
