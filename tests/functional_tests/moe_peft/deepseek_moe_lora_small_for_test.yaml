@@ -66,6 +66,15 @@ model:
     moe_inter_dim: 1408
     norm_topk_prob: false
     dtype: bfloat16
+  backend:
+    _target_: nemo_automodel.components.moe.utils.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch
+    enable_deepep: false
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
@@ -119,6 +128,6 @@ validation_dataloader:
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 3.0e-4
+  lr: 3.0e-3
   weight_decay: 0.01
   betas: [0.9, 0.95]

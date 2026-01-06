@@ -189,6 +189,10 @@ jobs:
             test-folder: hf_peft
             runner: self-hosted-nemo
             timeout: 30
+          - test-name: L2_MOE_PEFT
+            test-folder: moe_peft
+            runner: self-hosted-nemo
+            timeout: 30
           - test-name: L2_HF_Transformer
             test-folder: hf_transformer
             runner: self-hosted-nemo

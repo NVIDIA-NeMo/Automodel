@@ -286,3 +286,321 @@ def test_grouped_experts_deepep_lora_forward_mocked(moe_config, device):
 
     assert out.shape == (num_tokens, 16)
     assert torch.allclose(out, out_orig, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_grouped_experts_lora_forward(moe_config, device):
+    """Test forward pass of GroupedExpertsLoRA."""
+    orig_experts = GroupedExperts(moe_config).to(device)
+    with torch.no_grad():
+        orig_experts.init_weights(buffer_device=device)
+
+    lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8).to(device)
+
+    # Create input
+    num_tokens = 10
+    x = torch.randn(num_tokens, 16, device=device)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+    weights = torch.rand(num_tokens, 2, device=device)
+    indices = torch.randint(0, 4, (num_tokens, 2), device=device)
+
+    # Forward pass
+    out = lora_experts(x, token_mask, weights, indices)
+
+    assert out.shape == (num_tokens, 16)
+    assert not torch.isnan(out).any()
+    assert not torch.isinf(out).any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_lora_weight_initialization_xavier(moe_config, device):
+    """Test Xavier initialization for LoRA weights."""
+    orig_experts = GroupedExperts(moe_config).to(device)
+    with torch.no_grad():
+        orig_experts.init_weights(buffer_device=device)
+
+    lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8, lora_A_init_method="xavier").to(device)
+
+    # Check that B matrices are zero-initialized
+    assert torch.allclose(lora_experts.lora_gate_and_up_B, torch.zeros_like(lora_experts.lora_gate_and_up_B))
+    assert torch.allclose(lora_experts.lora_down_B, torch.zeros_like(lora_experts.lora_down_B))
+
+    # Check that A matrices are not zero (xavier initialized)
+    assert not torch.allclose(lora_experts.lora_gate_and_up_A, torch.zeros_like(lora_experts.lora_gate_and_up_A))
+    assert not torch.allclose(lora_experts.lora_down_A, torch.zeros_like(lora_experts.lora_down_A))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_lora_weight_initialization_kaiming(moe_config, device):
+    """Test Kaiming initialization for LoRA weights."""
+    orig_experts = GroupedExperts(moe_config).to(device)
+    with torch.no_grad():
+        orig_experts.init_weights(buffer_device=device)
+
+    lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8, lora_A_init_method="kaiming").to(device)
+
+    # Check that B matrices are zero-initialized
+    assert torch.allclose(lora_experts.lora_gate_and_up_B, torch.zeros_like(lora_experts.lora_gate_and_up_B))
+    assert torch.allclose(lora_experts.lora_down_B, torch.zeros_like(lora_experts.lora_down_B))
+
+    # Check that A matrices are not zero (kaiming initialized)
+    assert not torch.allclose(lora_experts.lora_gate_and_up_A, torch.zeros_like(lora_experts.lora_gate_and_up_A))
+    assert not torch.allclose(lora_experts.lora_down_A, torch.zeros_like(lora_experts.lora_down_A))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_lora_scale_parameter(moe_config, device):
+    """Test that LoRA scale parameter is correctly computed and applied."""
+    orig_experts = GroupedExperts(moe_config).to(device)
+    with torch.no_grad():
+        orig_experts.init_weights(buffer_device=device)
+
+    # Test different alpha/dim combinations
+    lora_dim = 4
+    alpha = 16
+    lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=lora_dim, alpha=alpha).to(device)
+
+    expected_scale = alpha / lora_dim
+    assert lora_experts.scale == expected_scale
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_lora_gradient_flow(moe_config, device):
+    """Test that gradients flow only through LoRA parameters, not base weights."""
+    orig_experts = GroupedExperts(moe_config).to(device)
+    with torch.no_grad():
+        orig_experts.init_weights(buffer_device=device)
+
+    lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8).to(device)
+
+    # Create input
+    num_tokens = 10
+    x = torch.randn(num_tokens, 16, device=device, requires_grad=True)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+    weights = torch.rand(num_tokens, 2, device=device)
+    indices = torch.randint(0, 4, (num_tokens, 2), device=device)
+
+    # Forward pass
+    out = lora_experts(x, token_mask, weights, indices)
+    loss = out.sum()
+
+    # Backward pass
+    loss.backward()
+
+    # Check gradients
+    assert lora_experts.gate_and_up_projs.grad is None
+    assert lora_experts.down_projs.grad is None
+    assert lora_experts.lora_gate_and_up_A.grad is not None
+    assert lora_experts.lora_gate_and_up_B.grad is not None
+    assert lora_experts.lora_down_A.grad is not None
+    assert lora_experts.lora_down_B.grad is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_lora_zero_active_experts(moe_config, device):
+    """Test the edge case where no tokens are routed to any local experts."""
+    orig_experts = GroupedExperts(moe_config).to(device)
+    with torch.no_grad():
+        orig_experts.init_weights(buffer_device=device)
+
+    lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8).to(device)
+
+    # Create input where no tokens match any expert
+    num_tokens = 10
+    x = torch.randn(num_tokens, 16, device=device, requires_grad=True)
+    token_mask = torch.zeros(num_tokens, dtype=torch.bool, device=device)  # All masked out
+    weights = torch.rand(num_tokens, 2, device=device)
+    indices = torch.randint(0, 4, (num_tokens, 2), device=device)
+
+    # Forward pass - should handle gracefully
+    out = lora_experts(x, token_mask, weights, indices)
+    assert out.shape == (num_tokens, 16)
+
+    # Test backward pass for gradient flow
+    loss = out.sum()
+    loss.backward()
+
+    # Check that gradients exist for LoRA parameters
+    assert lora_experts.lora_gate_and_up_A.grad is not None
+    assert lora_experts.lora_gate_and_up_B.grad is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_lora_with_expert_bias(device):
+    """Test LoRA with expert bias enabled."""
+    moe_config = MoEConfig(
+        n_routed_experts=4,
+        n_shared_experts=0,
+        n_activated_experts=2,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        dim=16,
+        inter_dim=32,
+        moe_inter_dim=32,
+        norm_topk_prob=False,
+        expert_activation="swiglu",
+        dtype=torch.float32,
+        expert_bias=True  # Enable bias
+    )
+
+    orig_experts = GroupedExperts(moe_config).to(device)
+    with torch.no_grad():
+        orig_experts.init_weights(buffer_device=device)
+
+    lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8).to(device)
+
+    # Check that bias parameters exist and are frozen
+    assert hasattr(lora_experts, 'gate_up_proj_bias')
+    assert hasattr(lora_experts, 'down_proj_bias')
+    assert not lora_experts.gate_up_proj_bias.requires_grad
+    assert not lora_experts.down_proj_bias.requires_grad
+
+    # Test forward pass
+    num_tokens = 10
+    x = torch.randn(num_tokens, 16, device=device)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+    weights = torch.rand(num_tokens, 2, device=device)
+    indices = torch.randint(0, 4, (num_tokens, 2), device=device)
+
+    out = lora_experts(x, token_mask, weights, indices)
+    assert out.shape == (num_tokens, 16)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_quick_geglu_activation_with_lora(device):
+    """Test GroupedExpertsLoRA with QuickGEGLU activation."""
+    moe_config = MoEConfig(
+        n_routed_experts=4,
+        n_shared_experts=0,
+        n_activated_experts=2,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        dim=16,
+        inter_dim=32,
+        moe_inter_dim=32,
+        norm_topk_prob=False,
+        expert_activation="quick_geglu",  # Use QuickGEGLU
+        activation_alpha=1.702,
+        activation_limit=7.0,
+        dtype=torch.float32
+    )
+
+    orig_experts = GroupedExperts(moe_config).to(device)
+    with torch.no_grad():
+        orig_experts.init_weights(buffer_device=device)
+
+    lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8).to(device)
+
+    # Test forward pass
+    num_tokens = 10
+    x = torch.randn(num_tokens, 16, device=device)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+    weights = torch.rand(num_tokens, 2, device=device)
+    indices = torch.randint(0, 4, (num_tokens, 2), device=device)
+
+    out = lora_experts(x, token_mask, weights, indices)
+    assert out.shape == (num_tokens, 16)
+    assert not torch.isnan(out).any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_lora_dtype_conversion(moe_config, device):
+    """Test LoRA with explicit dtype specification."""
+    orig_experts = GroupedExperts(moe_config).to(device)
+    with torch.no_grad():
+        orig_experts.init_weights(buffer_device=device)
+
+    # Create LoRA with explicit bfloat16 dtype
+    if device.type == 'cuda' and torch.cuda.is_bf16_supported():
+        lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8, lora_dtype="bfloat16").to(device)
+
+        # Check that LoRA weights have the correct dtype
+        assert lora_experts.lora_gate_and_up_A.dtype == torch.bfloat16
+        assert lora_experts.lora_gate_and_up_B.dtype == torch.bfloat16
+        assert lora_experts.lora_down_A.dtype == torch.bfloat16
+        assert lora_experts.lora_down_B.dtype == torch.bfloat16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_lora_backward_pass_values(moe_config, device):
+    """Test that LoRA backward pass produces non-zero gradients."""
+    orig_experts = GroupedExperts(moe_config).to(device)
+    with torch.no_grad():
+        orig_experts.init_weights(buffer_device=device)
+
+    lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8).to(device)
+
+    # Manually set LoRA B weights to non-zero to ensure LoRA contributes to output
+    with torch.no_grad():
+        lora_experts.lora_gate_and_up_B.normal_(0, 0.01)
+        lora_experts.lora_down_B.normal_(0, 0.01)
+
+    # Create input
+    num_tokens = 10
+    x = torch.randn(num_tokens, 16, device=device, requires_grad=True)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+    weights = torch.rand(num_tokens, 2, device=device)
+    indices = torch.randint(0, 4, (num_tokens, 2), device=device)
+
+    # Forward and backward
+    out = lora_experts(x, token_mask, weights, indices)
+    loss = out.sum()
+    loss.backward()
+
+    # Check that gradients are non-zero
+    assert not torch.allclose(lora_experts.lora_gate_and_up_A.grad, torch.zeros_like(lora_experts.lora_gate_and_up_A.grad))
+    assert not torch.allclose(lora_experts.lora_gate_and_up_B.grad, torch.zeros_like(lora_experts.lora_gate_and_up_B.grad))
+
+
+@pytest.mark.skipif(
+    grouped_gemm is None or not torch.cuda.is_available(),
+    reason="Requires grouped_gemm and CUDA"
+)
+def test_deepep_lora_zero_tokens(moe_config, device):
+    """Test DeepEP LoRA forward pass with zero tokens routed to experts."""
+    moe_config.n_routed_experts = 4
+    moe_config.dim = 16
+    moe_config.moe_inter_dim = 32
+    moe_config.dtype = torch.bfloat16
+
+    orig_experts = GroupedExpertsDeepEP(moe_config).to(device).to(torch.bfloat16)
+    with torch.no_grad():
+        orig_experts.init_weights(device)
+
+    orig_experts.n_routed_experts = 4
+    orig_experts.ep_size = 1
+
+    lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4).to(device).to(torch.bfloat16)
+    mock_dispatcher = MockDeepEPDispatcher()
+
+    num_tokens = 8
+    # All experts get zero tokens
+    tokens_per_expert = torch.tensor([0, 0, 0, 0], dtype=torch.long, device="cpu")
+
+    dtype = torch.bfloat16
+    permuted_x = torch.randn(num_tokens, 16, device=device).to(dtype)
+    permuted_probs = torch.ones(num_tokens, device=device).to(dtype)
+
+    mock_dispatcher.token_permutation2 = MagicMock(
+        return_value=(permuted_x, tokens_per_expert, permuted_probs)
+    )
+    lora_module.token_dispatcher = mock_dispatcher
+
+    x = torch.randn(num_tokens, 16, device=device).to(dtype)
+    weights = torch.ones(num_tokens, 1, device=device).to(dtype)
+    indices = torch.zeros(num_tokens, 1, dtype=torch.long, device=device)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+    # Should handle zero tokens gracefully
+    out = lora_module(x, token_mask, weights, indices)
+    assert out.shape == (num_tokens, 16)
