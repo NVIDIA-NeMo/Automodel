@@ -259,9 +259,9 @@ class FSDP2Manager:
                 logger.debug(f"Skipping {flattened_name} flatten (dimensions are all size 1)")
 
         # Create flattened submeshes for data parallelism combinations
-        _try_flatten_submesh(dp_mesh_dim_names, "dp")                    # dp_replicate + dp_shard
+        _try_flatten_submesh(dp_mesh_dim_names, "dp")  # dp_replicate + dp_shard
         _try_flatten_submesh(dp_shard_cp_mesh_dim_names, "dp_shard_cp")  # dp_shard + cp
-        _try_flatten_submesh(dp_cp_mesh_dim_names, "dp_cp")              # dp_replicate + dp_shard + cp
+        _try_flatten_submesh(dp_cp_mesh_dim_names, "dp_cp")  # dp_replicate + dp_shard + cp
 
         return self.device_mesh
 
