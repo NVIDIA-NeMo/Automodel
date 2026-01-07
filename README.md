@@ -54,6 +54,42 @@ What you can expect:
 
 > ⚠️ Note: NeMo AutoModel is under active development. New features, improvements, and documentation updates are released regularly. We are working toward a stable release, so expect the interface to solidify over time. Your feedback and contributions are welcome, and we encourage you to follow along as new updates roll out.
 
+### 🤗 Transformers drop-in AutoClasses (API compatibility)
+
+NeMo AutoModel ships **drop-in replacements** for key 🤗 `transformers` AutoClasses, enabling it to use it with your own training code. They intentionally preserve the Hugging Face *public* model APIs (e.g., `forward`, `generate`, `save_pretrained`) while extending **only** the AutoClass constructors with NeMo-specific knobs (kernel patching, HF fallback controls, etc.).
+
+
+| 🤗 `transformers` | NeMo AutoModel |
+|---|---|
+| <pre><code>from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
+tok = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
+</code></pre> | <pre><code>from nemo_automodel import NeMoAutoModelForCausalLM
+from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
+
+model = NeMoAutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
+tok = NeMoAutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
+</code></pre> |
+| <pre><code>from transformers import AutoModelForImageTextToText
+
+model = AutoModelForImageTextToText.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
+</code></pre> | <pre><code>from nemo_automodel import NeMoAutoModelForImageTextToText
+
+model = NeMoAutoModelForImageTextToText.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
+</code></pre> |
+
+Also available:
+- **Sequence classification**: `transformers.AutoModelForSequenceClassification` → `nemo_automodel.NeMoAutoModelForSequenceClassification`
+- **Text-to-waveform**: `transformers.AutoModelForTextToWaveform` → `nemo_automodel.NeMoAutoModelForTextToWaveform`
+
+Notes:
+- **Tokenizer**: `NeMoAutoTokenizer.from_pretrained(...)` returns a small wrapper by default that can auto-add BOS/EOS when `add_special_tokens=True`. Use `force_hf=True` to return the raw HF tokenizer instance.
+- **Model loading**: NeMo AutoClasses accept the standard HF `from_pretrained/from_config` surface and add optional NeMo-only knobs (kernel patching, HF fallback controls). If you want the exact HF behavior, pass `force_hf=True`.
+
+Coming Soon:
+- NeMo Automodel support for transformers v5.
+
 ### Why PyTorch Distributed and SPMD
 
 - **One program, any scale**: The same training script runs on 1 GPU or 1000+ by changing the mesh.
@@ -78,6 +114,7 @@ What you can expect:
 
 ## Table of Contents
 - [Feature Roadmap](#feature-roadmap)
+- [🤗 Transformers API compatibility](#-transformers-drop-in-autoclasses-api-compatibility)
 - [Getting Started](#getting-started)
 - [LLM](#llm-pre-training)
   - [Pre-training](#llm-pre-training)
