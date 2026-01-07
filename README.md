@@ -30,7 +30,11 @@
 Overview
 ---
 
-Nemo AutoModel is a Pytorch DTensor‑native SPMD open-source training library under [NVIDIA NeMo Framework](https://github.com/NVIDIA-NeMo), designed to streamline and scale training and finetuning for LLMs and VLMs. Designed for flexibility, reproducibility, and scale, NeMo AutoModel enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
+NeMo AutoModel is an open-source training library under [NVIDIA NeMo Framework](https://github.com/NVIDIA-NeMo) that **simplifies distributed training** for LLMs and VLMs, from a single GPU to multi-node runs, with first-class integration for 🤗 Transformers models and checkpoints.
+
+**Two common ways to use it:**
+- **As a library in your own trainer**: swap `transformers.AutoModel*` / `AutoTokenizer` for NeMo’s **API-compatible AutoClasses** and keep your training loop.
+- **As a ready-to-run trainer**: use the provided **YAML-driven recipes** (and `automodel` CLI) to run SFT/PEFT/pretraining out of the box.
 <p align="center">
 <a href="https://github.com/NVIDIA-NeMo/Automodel"><picture>
     <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/refs/heads/main/docs/automodel_diagram.png">
@@ -54,7 +58,7 @@ What you can expect:
 
 > ⚠️ Note: NeMo AutoModel is under active development. New features, improvements, and documentation updates are released regularly. We are working toward a stable release, so expect the interface to solidify over time. Your feedback and contributions are welcome, and we encourage you to follow along as new updates roll out.
 
-### 🤗 Transformers drop-in AutoClasses (API compatibility)
+### Use as a library: 🤗 Transformers-compatible AutoClasses
 
 NeMo AutoModel ships **drop-in replacements** for key 🤗 `transformers` AutoClasses, enabling its use with your own training code!
 They intentionally preserve the Hugging Face *public* model APIs (e.g., `forward`, `generate`, `save_pretrained`) while extending **only** the AutoClass constructors with NeMo-specific knobs (kernel patching, HF fallback controls, etc.).
@@ -82,31 +86,9 @@ Notes:
 Coming Soon:
 - NeMo Automodel support for transformers v5.
 
-### Why PyTorch Distributed and SPMD
-
-- **One program, any scale**: The same training script runs on 1 GPU or 1000+ by changing the mesh.
-- **PyTorch Distributed native**: Partition model/optimizer states with `DeviceMesh` + placements (`Shard`, `Replicate`).
-- **SPMD first**: Parallelism is configuration. No model rewrites when scaling up or changing strategy.
-- **Decoupled concerns**: Model code stays pure PyTorch; parallel strategy lives in config.
-- **Composability**: Mix **tensor**, **sequence**, and **data** parallel by editing placements.
-- **Portability**: Fewer bespoke abstractions; easier to reason about failure modes and restarts.
-<!-- - **Interoperability**: HF models/tokenizers/optimizers plug in directly; no format round‑trips. -->
-
-<!-- ### Key Features -->
-
-<!-- - **Mesh‑defined parallelism**: Compose tensor/sequence/pipeline/data parallel by changing placements and sizes. -->
-<!-- - **FSDP2 on DTensor**: Memory‑efficient sharding (HSDP included) for large scale training. -->
-<!-- - **Pretraining, SFT & PEFT**: Day‑0 support for LLMs both regimes with shared configs/utilities.
-- **Mixed precision**: BF16/FP16/FP8; sequence packing; optimized CUDA kernels. -->
-<!-- - **Mesh‑aware DCP**: Sharded SafeTensors with merge/reshard utilities; interoperable with HF. -->
-<!-- - **Large-Scale Distributed Training**: Built-in FSDP2 and Megatron-FSDP for seamless multi-node scaling. -->
-<!-- - **Vision-Language Model Ready**: Native support for VLMs (Qwen2-VL, Gemma-3-VL, etc). -->
-<!-- - **Day-0 Hugging Face Support**: Instantly fine-tune any model from the Hugging Face Hub. -->
-
-
 ## Table of Contents
 - [Feature Roadmap](#feature-roadmap)
-- [🤗 Transformers API compatibility](#-transformers-drop-in-autoclasses-api-compatibility)
+- [🤗 Transformers API compatibility](#use-as-a-library--transformers-compatible-autoclasses)
 - [Getting Started](#getting-started)
 - [LLM](#llm-pre-training)
   - [Pre-training](#llm-pre-training)
@@ -117,11 +99,12 @@ Coming Soon:
   - [Parameter-Efficient Fine-Tuning (PEFT)](#vlm-parameter-efficient-fine-tuning-peft)
 - [Supported Models](#supported-models)
 - [Performance](#performance)
+- [Scaling & Parallelism (advanced)](#scaling--parallelism-advanced)
 - [Interoperability](#-interoperability)
 - [Contributing](#-contributing)
 - [License](#-license)
 
-> TL;DR: SPMD turns “how to parallelize” into a *runtime layout choice*, not a code fork.
+> TL;DR: Use NeMo AutoModel either as an HF-compatible **model/tokenizer library** in your own trainer, or run its **YAML-driven training recipes** for scalable fine-tuning and pretraining.
 
 ## Feature Roadmap
 
@@ -172,6 +155,17 @@ uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config ex
 # VLM example: single GPU fine-tuning (Gemma-3-VL) with LoRA
 uv run examples/vlm_finetune/finetune.py --config examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml
 ```
+
+## Scaling & Parallelism (advanced)
+
+NeMo AutoModel is built on **PyTorch Distributed + DTensor** so you can scale the *same* model/training code from a laptop to a cluster by changing configuration.
+
+- **One program, any scale**: Run on 1 GPU or 1000+ by changing the mesh/config.
+- **PyTorch Distributed native**: Partition model/optimizer states with `DeviceMesh` + placements (`Shard`, `Replicate`).
+- **SPMD first**: Parallelism is configuration — no code fork to change strategy.
+- **Decoupled concerns**: Model code stays “regular PyTorch”; parallel strategy lives in config.
+- **Composability**: Mix **tensor**, **sequence**, and **data** parallel by editing placements.
+- **Portability**: Fewer bespoke abstractions; easier to reason about restarts and failure modes.
 
 
 ## LLM Pre-training
