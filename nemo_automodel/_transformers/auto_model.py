@@ -187,7 +187,8 @@ def get_hf_config(pretrained_model_name_or_path, attn_implementation, kwargs):
     """
     Get the HF config for the model.
     """
-    trust_remote_code = kwargs.get("trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path))
+    kwargs = kwargs.copy()
+    trust_remote_code = kwargs.pop("trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path))
     hf_config = kwargs.get("config", None)
     if hf_config is None:
         hf_config = AutoConfig.from_pretrained(
