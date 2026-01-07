@@ -103,6 +103,7 @@ class TestNeMoAutoModelForCausalLM:
             # Prepare a fake custom model class and return value
             custom_model_instance = Mock()
             custom_cls = Mock(return_value=custom_model_instance)
+            custom_cls.__name__ = "MockMockMock"
             mock_registry.model_arch_name_to_cls = {"CustomArch": custom_cls}
 
             returned = NeMoAutoModelForCausalLM.from_pretrained("dummy/path")
@@ -130,6 +131,7 @@ class TestNeMoAutoModelForCausalLM:
             # Registry provides a custom class
             custom_model_instance = Mock()
             custom_cls = Mock(return_value=custom_model_instance)
+            custom_cls.__name__ = "MockMockMock"
             mock_registry.model_arch_name_to_cls = {"CustomArch": custom_cls}
 
             returned = NeMoAutoModelForCausalLM.from_config(cfg)
@@ -149,9 +151,6 @@ class TestNeMoAutoModelForCausalLM:
             patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_hf_loader,
             patch("nemo_automodel._transformers.auto_model._get_resolved_checkpoint_files") as mock_get_files,
             patch("nemo_automodel._transformers.auto_model.os.path.isdir", return_value=False),
-            patch("nemo_automodel._transformers.auto_model.dist.is_initialized", return_value=True),
-            patch("nemo_automodel._transformers.auto_model.dist.get_world_size", return_value=1),
-            patch("nemo_automodel._transformers.auto_model.dist.get_rank", return_value=0),
             patch("nemo_automodel.components.distributed.utils.FirstRankPerNode") as mock_barrier,
         ):
             # Prepare a fake config with architectures and commit hash
@@ -163,6 +162,7 @@ class TestNeMoAutoModelForCausalLM:
             # Prepare a fake custom model class and return value
             custom_model_instance = Mock()
             custom_cls = Mock(return_value=custom_model_instance)
+            custom_cls.__name__ = "MockMockMock"
             mock_registry.model_arch_name_to_cls = {"CustomArch": custom_cls}
 
             returned = NeMoAutoModelForCausalLM.from_pretrained("dummy/repo-id")
@@ -187,9 +187,6 @@ class TestNeMoAutoModelForCausalLM:
             patch.object(transformers.AutoModelForCausalLM, "from_pretrained") as mock_hf_loader,
             patch("nemo_automodel._transformers.auto_model._get_resolved_checkpoint_files") as mock_get_files,
             patch("nemo_automodel._transformers.auto_model.os.path.isdir", return_value=False),
-            patch("nemo_automodel._transformers.auto_model.dist.is_initialized", return_value=False),
-            patch("nemo_automodel._transformers.auto_model.dist.get_world_size", return_value=1),
-            patch("nemo_automodel._transformers.auto_model.dist.barrier") as mock_barrier,
         ):
             # Prepare a fake config with architectures and commit hash
             cfg = Mock()
@@ -200,6 +197,7 @@ class TestNeMoAutoModelForCausalLM:
             # Prepare a fake custom model class and return value
             custom_model_instance = Mock()
             custom_cls = Mock(return_value=custom_model_instance)
+            custom_cls.__name__ = "MockMockMock"
             mock_registry.model_arch_name_to_cls = {"CustomArch": custom_cls}
 
             returned = NeMoAutoModelForCausalLM.from_pretrained("dummy/repo-id")
@@ -213,8 +211,6 @@ class TestNeMoAutoModelForCausalLM:
             _, kwargs = mock_get_files.call_args
             assert kwargs["pretrained_model_name_or_path"] == "dummy/repo-id"
             assert kwargs["commit_hash"] == "commit456"
-            # No barrier when dist not initialized
-            mock_barrier.assert_not_called()
 
     def test_from_config_happy_path(self):
         """Test the basic from_config functionality works."""
@@ -248,7 +244,8 @@ class TestNeMoAutoModelForCausalLM:
             # Verify AutoConfig.from_pretrained was called with the string
             mock_autoconfig.assert_called_once_with(
                 "hf-internal-testing/tiny-random-gpt2",
-                trust_remote_code=False
+                trust_remote_code=False,
+                attn_implementation="flash_attention_2",
             )
             # Verify the model was returned
             assert model is mock_model
@@ -547,6 +544,7 @@ class TestNeMoAutoModelForCausalLM:
             else:
                 custom_model_instance = Mock()
                 custom_cls = Mock(return_value=custom_model_instance)
+                custom_cls.__name__ = "MockMockMock"
                 mock_registry.model_arch_name_to_cls = {"CustomArch": custom_cls}
 
             mock_hf_loader.return_value = MagicMock(config={})

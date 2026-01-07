@@ -50,7 +50,6 @@ from transformers.models.qwen2.modeling_qwen2 import (
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
-from transformers.utils.generic import check_model_inputs
 
 from nemo_automodel.components.models.common.combined_projection import (
     CombinedGateUpMLP,
@@ -58,9 +57,12 @@ from nemo_automodel.components.models.common.combined_projection import (
 )
 from nemo_automodel.components.models.qwen2.state_dict_adapter import Qwen2StateDictAdapter
 from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
 from nemo_automodel.shared.utils import dtype_from_str
 
 __all__ = ["build_qwen2_model", "Qwen2ForCausalLM"]
+
+check_model_inputs = get_check_model_inputs_decorator()
 
 
 class Qwen2Attention(CombinedQKVAttentionMixin, nn.Module):
@@ -252,7 +254,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs()
+    @check_model_inputs
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -506,3 +508,6 @@ def build_qwen2_model(pretrained_model_name_or_path: str, **kwargs: Any) -> nn.M
     model = model.to(dtype=torch_dtype)
 
     return model
+
+
+ModelClass = Qwen2ForCausalLM
