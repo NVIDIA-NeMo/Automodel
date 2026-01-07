@@ -35,14 +35,12 @@ parallelizer:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: openai/gpt-oss-120b
-  is_meta_device: true
 
 checkpoint:
   enabled: false
   checkpoint_dir: /tmp/checkpoints/
   model_save_format: safetensors # torch_save or safetensors
   save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
-  dequantize_base_checkpoint: true
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
@@ -74,7 +72,6 @@ dataset:
 packed_sequence:
   # Set packed_sequence_size > 0 to run with packed sequences
   packed_sequence_size: 0
-  split_across_pack: false
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

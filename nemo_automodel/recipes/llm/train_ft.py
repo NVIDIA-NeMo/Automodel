@@ -29,14 +29,14 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.utils.data import DataLoader, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
-from transformers import AutoConfig, AutoTokenizer
-from transformers.integrations.accelerate import init_empty_weights
+from transformers import AutoConfig
 from transformers.modeling_utils import no_init_weights
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
 from transformers.utils.hub import TRANSFORMERS_CACHE
 from wandb import Settings
 
+from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
@@ -45,6 +45,7 @@ from nemo_automodel.components.datasets.llm.megatron.sampler import create_megat
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
 from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.ddp import DDPManager
 from nemo_automodel.components.distributed.init_utils import (
     get_rank_safe,
     get_world_size_safe,
@@ -54,7 +55,8 @@ from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPMana
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.components.loggers.metric_logger import MetricLoggerDist, MetricsSample
+from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
+from nemo_automodel.components.loggers.mlflow_utils import build_mlflow
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
@@ -74,7 +76,9 @@ from nemo_automodel.components.utils.compile_utils import (
 )
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
+    init_empty_weights,
     print_trainable_parameters,
+    resolve_trust_remote_code,
 )
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
@@ -122,25 +126,6 @@ def _get_num_thd_chunks(pp_enabled, cfg):
     return 1
 
 
-def _get_packed_sequence_config(has_packed_sequence, is_hf_model, cp_size):
-    kwargs = {}
-    if has_packed_sequence and is_hf_model:
-        if cp_size == 1:
-            kwargs["attn_implementation"] = "flash_attention_2"
-            logger.warning(
-                "Packed sequence is supported only with Flash Attention. "
-                "Setting model's attn_implementation to flash_attention_2"
-            )
-        else:
-            # TODO: support packed sequence with CP size > 1
-            raise ValueError("Packed sequence is only supported with CP size 1")
-    if cp_size > 1 and is_hf_model:
-        kwargs["attn_implementation"] = "sdpa"
-        logger.warning("Packed sequence is supported only with SDPA. Setting model's attn_implementation to sdpa")
-
-    return kwargs
-
-
 def build_model_and_optimizer(
     device,
     cfg_model,
@@ -154,12 +139,14 @@ def build_model_and_optimizer(
     cp_size=1,
     cfg_fp8=None,
     cfg_compile=None,
+    cfg_qat=None,
     cfg_quantization=None,
     autopipeline: AutoPipeline | None = None,
     loss_fn=None,
     parallelize_fn=None,
     load_base_model=True,
-) -> tuple[nn.Module | AutoPipeline, list[str], list["Optimizer"], nn.Module]:  # noqa: F821
+    unfreeze_modules: list[str] | None = None,
+) -> tuple[nn.Module | AutoPipeline, list[str], list["Optimizer"], nn.Module, dict]:  # noqa: F821
     """
     Build and initialize a model and optimizer.
 
@@ -176,24 +163,18 @@ def build_model_and_optimizer(
         cp_size: Column parallel size.
         cfg_fp8: Configuration for FP8.
         cfg_compile: Configuration for torch.compile.
+        unfreeze_modules: List of module names/substrings to unfreeze (e.g. ["classifier"]). Applied after PEFT freezing but before optimizer creation.
 
     Returns:
-        The instantiated model on the specified device, the state dict keys before any parallelization, the optimizer, and the loss function.
+        The instantiated model on the specified device, the state dict keys before any parallelization, the optimizer, the loss function, and param_info dict.
     """
-    is_hf_model = cfg_model.get("pretrained_model_name_or_path", None) is not None
-    is_meta_device = False
-    if hasattr(cfg_model, "is_meta_device"):
-        is_meta_device = cfg_model.is_meta_device
-        if is_meta_device and isinstance(model_wrapper, MegatronFSDPManager):
-            raise ValueError("Meta device initialization is not supported with MegatronFSDPManager")
-        del cfg_model.is_meta_device
-    if autopipeline is not None:
-        is_meta_device = True
+    is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and not cfg_model.get(
+        "force_hf", False
+    )
 
     init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
     with ScopedRNG(seed=seed, ranked=True):
-        kwargs = {}
-        kwargs.update(_get_packed_sequence_config(has_packed_sequence, is_hf_model, cp_size))
+        kwargs = {"tp_size": tp_size, "cp_size": cp_size, "has_packed_sequence": has_packed_sequence}
 
         if cfg_quantization is not None:
             logger.info("Model weight quantization enabled with BitsAndBytes")
@@ -203,15 +184,14 @@ def build_model_and_optimizer(
 
         # Instantiate the model in meta device to avoid OOM
         with init_ctx:
-            if is_hf_model and (tp_size > 1 or cp_size > 1):
-                logger.info("Disabling Liger kernel with TP ({}) or CP ({})".format(tp_size, cp_size))
-                kwargs["use_liger_kernel"] = False
             model = cfg_model.instantiate(**kwargs)
 
-            # Check if the model supports SDPA and raise an error if it doesn't
-            if cp_size > 1 and is_hf_model and hasattr(model, "_supports_sdpa"):
-                if model._supports_sdpa is False:
-                    raise ValueError("Model does not support SDPA required for context parallelism")
+            if checkpointer.config.dequantize_base_checkpoint is None:
+                # try to infer whether the base weights are quantized
+                try:
+                    checkpointer.config.dequantize_base_checkpoint = hasattr(model.config, "quantization_config")
+                except:
+                    checkpointer.config.dequantize_base_checkpoint = False
 
             # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
             if cfg_peft is not None:
@@ -226,11 +206,35 @@ def build_model_and_optimizer(
                     model, cfg_peft, quantization_config=kwargs.get("quantization_config", None)
                 )
 
-            if cfg_fp8 is not None:
-                fp8_config = build_fp8_config(cfg_fp8)
-                model = apply_fp8_to_model(model, config=fp8_config)
+        if cfg_fp8 is not None:
+            fp8_config = build_fp8_config(cfg_fp8)
+            model = apply_fp8_to_model(model, config=fp8_config)
 
-    print_trainable_parameters(model)
+        # Apply QAT if configured (torchao QAT)
+        if cfg_qat is not None and cfg_qat.get("enabled", False):
+            if cfg_peft is not None:
+                raise ValueError("QAT with PEFT is not supported in 25.11")
+            from nemo_automodel.components.quantization.qat import prepare_qat_model
+
+            if any(map(lambda x: x.dtype != torch.bfloat16, model.parameters())):
+                logger.warning("QAT is only supported for bfloat16 models. Support will be added in future release.")
+                quit(code=0)
+            quantizer = cfg_qat.quantizer.instantiate(precision=torch.bfloat16, scales_precision=torch.bfloat16)
+            model, qat_mode = prepare_qat_model(model, quantizer)
+            # Attach helpers for delayed fake-quant toggling if desired
+            model._qat_mode = qat_mode  # type: ignore[attr-defined]
+
+        # Explicitly unfreeze specified modules (e.g. task heads) that need full fine-tuning
+        if unfreeze_modules:
+            for name, param in model.named_parameters():
+                if any(module_name in name for module_name in unfreeze_modules):
+                    param.requires_grad_(True)
+            logging.info(f"Unfroze parameters matching: {unfreeze_modules}")
+
+    param_info = {
+        "trainable_params": 0,
+        "total_params": 0,
+    }
 
     # hold a list copy of the model state dict keys before any parallelization
     state_dict_keys = list(model.state_dict().keys())
@@ -240,6 +244,9 @@ def build_model_and_optimizer(
         loss_fn = MaskedCrossEntropy()
 
     if autopipeline is not None:
+        trainable_params, total_params = print_trainable_parameters(model)
+        param_info["trainable_params"] = trainable_params
+        param_info["total_params"] = total_params
         if get_world_size_safe() == 1:
             logger.info("World size is 1, skipping autopipeline.")
         else:
@@ -297,7 +304,11 @@ def build_model_and_optimizer(
 
                 model, optimizer = model_wrapper.parallelize(model, optimizer)
 
-                return model, state_dict_keys, [optimizer], loss_fn
+                trainable_params, total_params = print_trainable_parameters(model)
+                param_info["trainable_params"] = trainable_params
+                param_info["total_params"] = total_params
+
+                return model, state_dict_keys, [optimizer], loss_fn, param_info
 
             else:
                 load_weights = True
@@ -337,7 +348,13 @@ def build_model_and_optimizer(
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         optimizer = [cfg_opt.instantiate(params=trainable_params)]
 
-    return model, state_dict_keys, optimizer, loss_fn
+    # Print trainable parameters after model has been moved to device
+    if autopipeline is None:
+        trainable_params, total_params = print_trainable_parameters(model)
+        param_info["trainable_params"] = trainable_params
+        param_info["total_params"] = total_params
+
+    return model, state_dict_keys, optimizer, loss_fn, param_info
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
@@ -388,18 +405,37 @@ def build_loss_fn(cfg_loss):
     return cfg_loss.instantiate()
 
 
+def compute_trust_remote_code_from_model(cfg_model):
+    """Compute the value of trust_remote_code based on the model configuration.
+
+    Args:
+        cfg_model (ConfigNode): Model configuration.
+
+    Returns:
+        bool: Whether to trust remote code.
+    """
+    if hasattr(cfg_model, "trust_remote_code"):
+        return getattr(cfg_model, "trust_remote_code")
+    elif hasattr(cfg_model, "config") and hasattr(cfg_model.config, "trust_remote_code"):
+        return getattr(cfg_model.config, "trust_remote_code")
+    return resolve_trust_remote_code(_get_model_name(cfg_model))
+
+
 def _build_tokenizer(cfg_model, cfg_ds):
+    trust_remote_code = compute_trust_remote_code_from_model(cfg_model)
     # if tokenizer is not provided, use the model config to instantiate it
     if "tokenizer" not in cfg_ds and _get_model_name(cfg_model) is not None:
         logging.info("Using model config to instantiate tokenizer")
-        trust_remote_code = getattr(cfg_model, "trust_remote_code", False)
-        tokenizer = AutoTokenizer.from_pretrained(_get_model_name(cfg_model), trust_remote_code=trust_remote_code)
+        tokenizer = NeMoAutoTokenizer.from_pretrained(_get_model_name(cfg_model), trust_remote_code=trust_remote_code)
     elif cfg_ds.get("tokenizer", None) is None:
         tokenizer = None
     elif "_target_" not in cfg_ds.tokenizer:
-        tokenizer = AutoTokenizer.from_pretrained(**cfg_ds.tokenizer.to_dict())
+        tokenizer_dict = cfg_ds.tokenizer.to_dict()
+        trust_remote_code = tokenizer_dict.pop("trust_remote_code", trust_remote_code)
+        tokenizer = NeMoAutoTokenizer.from_pretrained(**tokenizer_dict, trust_remote_code=trust_remote_code)
     else:
-        tokenizer = cfg_ds.tokenizer.instantiate()
+        trust_remote_code = cfg_ds.tokenizer.to_dict().pop("trust_remote_code", trust_remote_code)
+        tokenizer = cfg_ds.tokenizer.instantiate(trust_remote_code=trust_remote_code)
 
     # Finally, check if the dataset target accepts a tokenizer parameter
     kwargs = {}
@@ -462,6 +498,22 @@ def build_dataloader(
             with FirstRankPerNode():
                 ds = cfg_ds.instantiate(**kwargs)
 
+        # If using an IterableDataset, per-rank sharding for unique samples
+        if isinstance(ds, IterableDataset):
+            try:
+                if ds.num_shards >= dp_world_size:
+                    ds = ds.shard(dp_world_size, dp_rank)
+                    logging.info(
+                        f"Sharded IterableDataset via dataset.shard: world_size={dp_world_size}, rank={dp_rank}"
+                    )
+                else:
+                    from datasets.distributed import split_dataset_by_node
+
+                    ds.dataset = split_dataset_by_node(ds.dataset, world_size=dp_world_size, rank=dp_rank)
+                    logging.info(f"Sharded dataset via split_dataset_by_node: world_size={dp_world_size}")
+            except Exception as e:
+                logging.warning(f"IterableDataset sharding skipped due to error: {e}")
+
         packed_sequence_size = getattr(cfg_ps, "packed_sequence_size", 0)
         # check if packed sequence is supported
         if packed_sequence_size > 0 and not supports_seq_lens:
@@ -477,7 +529,6 @@ def build_dataloader(
                 ds,
                 split=cfg_ds.split,  # Assumes split is defined in dataset config
                 packed_sequence_size=packed_sequence_size,
-                split_across_pack=getattr(cfg_ps, "split_across_pack", False),
                 max_packs=getattr(cfg_ps, "max_packs", None),
                 padding_idx=getattr(tokenizer, "pad_token_id", 0),
                 cp_size=cp_size,
@@ -518,6 +569,22 @@ def build_dataloader(
                 dl_kwargs["drop_last"] = True
         else:
             logging.info("Using IterableDataset; skipping sampler.")
+            # Optional shuffle for streaming IterableDataset (uses HF dataset shuffle if available)
+            shuffle = cfg_dl.get("shuffle", False)
+            shuffle_buffer_size = cfg_dl.get("shuffle_buffer_size", 10000)
+            # Do not pass shuffle-related kwargs to the DataLoader when using IterableDataset
+            # But leave them in dl config to be consistent
+            if hasattr(cfg_dl, "shuffle"):
+                del cfg_dl.shuffle
+            if hasattr(cfg_dl, "shuffle_buffer_size"):
+                del cfg_dl.shuffle_buffer_size
+
+            if shuffle and hasattr(ds, "shuffle"):
+                try:
+                    ds = ds.shuffle(buffer_size=shuffle_buffer_size, seed=seed)
+                    logging.info(f"Shuffling IterableDataset with buffer_size={shuffle_buffer_size}, seed={seed}")
+                except Exception as e:
+                    logging.warning(f"IterableDataset shuffle skipped due to error: {e}")
             dl_kwargs = {}
 
         # Handle collate_fn with optional mask precomputation for pipeline parallelism
@@ -536,7 +603,9 @@ def build_dataloader(
         if pp_enabled:
             from nemo_automodel.components.datasets.utils import add_causal_masks_to_batch
 
-            hf_model_config = AutoConfig.from_pretrained(_get_model_name(cfg_model))
+            hf_model_config = AutoConfig.from_pretrained(
+                _get_model_name(cfg_model), trust_remote_code=compute_trust_remote_code_from_model(cfg_model)
+            )
 
             if "collate_fn" in dl_kwargs:
                 # Case 1: PP enabled + collate_fn exists -> chain them
@@ -753,7 +822,9 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled):
             val_ds_cfg,
             cfg.validation_dataloader,
             cfg.model,
-            cfg_ps=None,  # Use unpacked config for validation
+            cfg_ps=cfg.get("packed_sequence", None)
+            if _uses_te_dot_product_attention(cfg.model) and _uses_thd_collater(cfg.dataloader)
+            else None,
             seed=cfg.get("seed", 42),
             local_batch_size=cfg.get("step_scheduler.local_batch_size", 1),
             global_batch_size=cfg.get("step_scheduler.global_batch_size", 1),
@@ -824,6 +895,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         apply_cache_compatibility_patches()
         # Set up the stateful random number generator
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
+        # Enable NVTX patching only when explicitly requested in config
+        self.enable_nvtx = bool(self.cfg.get("nvtx", False))
 
         self.device_mesh = None
         self.moe_mesh = None
@@ -837,6 +910,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             suppress_wandb_log_messages()
             run = build_wandb(self.cfg)
             logging.info("🚀 View run at {}".format(run.url))
+
+        self.mlflow_logger = None
+        if self.dist_env.is_main and hasattr(self.cfg, "mlflow"):
+            self.mlflow_logger = build_mlflow(self.cfg)
+            self.mlflow_logger.log_params(self.cfg.to_dict())
+            logging.info("MLflow experiment tracking enabled")
 
         # Log experiment details on main rank
         self._log_experiment_details()
@@ -914,6 +993,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             True if self.cfg.get("peft", None) else False,
         )
 
+        if self.cfg.get("clip_grad_norm.max_norm", None) is not None:
+            self.max_grad_norm = float(self.cfg.clip_grad_norm.max_norm)
+        else:
+            logging.info("No clip_grad_norm.max_norm specified in config, using default value of 1.0")
+            self.max_grad_norm = 1.0
+
         # Create Checkpointer instance
         self.checkpointer = Checkpointer(
             config=checkpoint_config,
@@ -923,7 +1008,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             moe_mesh=self.moe_mesh,
         )
 
-        model, model_state_dict_keys, self.optimizer, self.loss_fn = build_model_and_optimizer(
+        model, model_state_dict_keys, self.optimizer, self.loss_fn, self.param_info = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
             self.cfg.optimizer,
@@ -936,6 +1021,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
             cfg_quantization=self.cfg.get("quantization", None),
+            cfg_qat=self.cfg.get("qat", None),
             autopipeline=autopipeline,
             loss_fn=self.loss_fn,
             parallelize_fn=parallelize_fn,
@@ -947,7 +1033,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
             self.pp = model
+            if self.enable_nvtx:
+                import nemo_automodel.autonvtx as autonvtx
+
+                # Patch each pipeline stage with NVTX profiling
+                for i, part in enumerate(self.model_parts):
+                    autonvtx.patch(part, name=f"PipelineStage_{i}")
         else:
+            if self.enable_nvtx:
+                import nemo_automodel.autonvtx as autonvtx
+
+                # Patch model with NVTX profiling
+                autonvtx.patch(model, name=model.__class__.__name__)
             self.model_parts = [model]
             self.pp = None
 
@@ -973,6 +1070,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self._get_dp_rank(),
             self.pp_enabled,
         )
+        self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         # Scheduler
         self.step_scheduler = build_step_scheduler(
             self.cfg.get("step_scheduler", None),
@@ -987,13 +1085,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Log model, parameter counts, norms, optimizer and scheduler
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
 
+        # Handle delayed fake-quant toggling for QAT if configured
+        self._qat_disable_fn, self._qat_enable_fn, self._qat_enable_after = self._setup_qat(self.cfg, self.model_parts)
+
         restore_from = self.cfg.get("checkpoint.restore_from", None)
         # Initialize JSONL loggers
-        self.metric_logger_train = MetricLoggerDist(
+        self.metric_logger_train = build_metric_logger(
             pathlib.Path(self.checkpointer.config.checkpoint_dir) / "training.jsonl"
         )
         self.metric_logger_valid = {
-            name: MetricLoggerDist(
+            name: build_metric_logger(
                 pathlib.Path(self.checkpointer.config.checkpoint_dir)
                 / (f"validation_{name}.jsonl" if name != "default" else "validation.jsonl")
             )
@@ -1005,6 +1106,50 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
+
+    def _setup_qat(self, cfg, model_parts: list[nn.Module]):
+        if not cfg.get("qat.enabled", False):
+            return None, None, None
+        from nemo_automodel.components.quantization.qat import (
+            get_disable_fake_quant_fn,
+            get_enable_fake_quant_fn,
+        )
+
+        qat_cfg = cfg.qat
+        _qat_enable_after = qat_cfg.get("fake_quant_after_n_steps", 0)
+        # Collect mode from any model part that has it
+        qat_mode = None
+        if hasattr(model_parts[0], "_qat_mode"):
+            qat_mode = getattr(model_parts[0], "_qat_mode")
+
+        if qat_mode is None:
+            return None, None, None
+
+        _qat_disable_fn = get_disable_fake_quant_fn(qat_mode)
+        _qat_enable_fn = get_enable_fake_quant_fn(qat_mode)
+        if _qat_disable_fn is not None and _qat_enable_after is not None:
+            try:
+                # start with fake-quant disabled, will enable later
+                for part in model_parts:
+                    _qat_disable_fn(part)
+                logger.info("QAT fake-quant disabled initially; will enable after %s steps", _qat_enable_after)
+            except Exception as e:
+                logger.warning("Failed to disable fake-quant at setup: %s", e)
+        return _qat_disable_fn, _qat_enable_fn, _qat_enable_after
+
+    def _enable_qat_if_delayed(self, step: int):
+        if getattr(self, "_qat_enable_after", None) is None:
+            return
+        if step < self._qat_enable_after or self._qat_enable_fn is None:
+            return
+        try:
+            for mp in self.model_parts:
+                self._qat_enable_fn(mp)
+            logger.info("Enabled QAT fake-quant after step %s", step)
+            # Enable one
+            self._qat_enable_after = None
+        except Exception as e:
+            logger.warning("Failed to enable fake-quant: %s", e)
 
     # ------------------ main loop ------------------
     def run_train_validation_loop(self):
@@ -1023,24 +1168,34 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # 1. len(batches) == grad_acc_steps
             # 2. len(batches[0]) == batch_size
             for batches in self.step_scheduler:
-                train_log_data = self._run_train_optim_step(batches, 1.0)
+                # If QAT delayed fake-quant is configured, enable after threshold
+                self._enable_qat_if_delayed(self.step_scheduler.step)
+                train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
                 # log
                 self.log_train_metrics(train_log_data)
 
-                # Save the checkpoint every ckpt_every_steps
-                if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(epoch, self.step_scheduler.step)
-
                 # Run validation every val_every_steps
+                val_losses = {}
                 if self.step_scheduler.is_val_step:
                     if self.pp_enabled:
                         logger.warning("Validation is not supported for pipeline parallelism")
-                        continue
-                    for val_name, val_dataloader in self.val_dataloaders.items():
-                        val_log_data = self._run_validation_epoch(val_dataloader)
-                        self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
+                    else:
+                        for val_name, val_dataloader in self.val_dataloaders.items():
+                            val_log_data = self._run_validation_epoch(val_dataloader)
+                            val_losses[val_name] = val_log_data.metrics["val_loss"]
+                            self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
                     for mp in self.model_parts:
                         mp.train()
+
+                # Save the checkpoint every ckpt_every_steps
+                if self.step_scheduler.is_ckpt_step:
+                    self.save_checkpoint(
+                        epoch,
+                        self.step_scheduler.step,
+                        train_log_data.metrics["loss"],
+                        val_losses,
+                        best_metric_key=self.best_metric_key,
+                    )
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
         for v in self.metric_logger_valid.values():
@@ -1104,7 +1259,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             loss_buffer.append(local_loss.clone().detach())
         else:
             model = self.model_parts[0]
-            sync_ctx = get_sync_ctx(model, idx == num_batches - 1) if is_train else nullcontext()
+            sync_ctx = (
+                get_sync_ctx(
+                    model,
+                    idx == num_batches - 1,
+                    defer_fsdp_grad_sync=getattr(self.model_wrapper, "defer_fsdp_grad_sync", True),
+                )
+                if is_train
+                else nullcontext()
+            )
             with train_ctx(), sync_ctx:
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
@@ -1286,7 +1449,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
 
     def log_val_metrics(self, val_name, log_data, metric_logger=None):
-        """Log metrics to wandb and other loggers
+        """Log metrics to wandb, MLflow and other loggers
         Args:
             log_data: MetricsSample object, containing:
                 step: int, the current step.
@@ -1304,6 +1467,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         if wandb.run is not None:
             wandb.log(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
+
+        if self.mlflow_logger is not None:
+            self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         # JSONL validation log
         if not metric_logger is None:
@@ -1341,6 +1507,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         if wandb.run is not None:
             wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+
+        if self.mlflow_logger is not None:
+            self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
+
         # JSONL training log
         self.metric_logger_train.log(log_data)
         logging.info(

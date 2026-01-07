@@ -26,6 +26,7 @@ from packaging.version import parse
 from safetensors.torch import load_file, save_file
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
+from transformers.utils import TRANSFORMERS_CACHE
 
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
@@ -38,6 +39,7 @@ from nemo_automodel.components.checkpoint._backports.hf_storage import (
 )
 from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon, PeftAddon
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
+from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
 
 if TYPE_CHECKING:
     from peft import PeftConfig
@@ -87,7 +89,11 @@ class CheckpointingConfig:
     is_peft: bool
     model_state_dict_keys: list[str] = None  # copy of the model state dict keys before any parallelization
     is_async: bool = False
-    dequantize_base_checkpoint: bool = False
+    dequantize_base_checkpoint: bool | None = None
+    original_model_root_dir: str | None = None
+    skip_task_head_prefixes_for_base_model: list[str] | None = (
+        None  # Parameter prefixes to skip when loading base model
+    )
 
     def __post_init__(self):
         """
@@ -195,7 +201,9 @@ class Checkpointer:
         state_dict = model_state.state_dict()
 
         # Convert to HF format if using custom model implementations
-        state_dict = _maybe_adapt_state_dict_to_hf(model_state.model[0], state_dict, quantization=False)
+        state_dict = _maybe_adapt_state_dict_to_hf(
+            model_state.model[0], state_dict, quantization=False, device_mesh=self.moe_mesh
+        )
         # Build the consolidated model.safetensors.index.json if needed
         fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
 
@@ -209,6 +217,7 @@ class Checkpointer:
                 tokenizer=tokenizer,
                 peft_config=peft_config,
                 fqn_to_file_index_mapping=fqn_to_file_index_mapping,
+                original_model_path=self._get_original_model_path(model_state),
             )
 
         storage_writer = self._get_storage_writer(
@@ -288,12 +297,20 @@ class Checkpointer:
         # Validate checkpoint directory
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model path {model_path} does not exist")
-        model_state = ModelState(model, is_peft=self.config.is_peft, is_init_step=is_init_step)
+        model_state = ModelState(
+            model,
+            is_peft=self.config.is_peft,
+            is_init_step=is_init_step,
+            skip_task_head_prefixes=getattr(self.config, "skip_task_head_prefixes_for_base_model", None),
+        )
         state_dict = model_state.state_dict()
         storage_reader = self._get_storage_reader(model_path, key_mapping, is_init_step=is_init_step)
 
         state_dict = _maybe_adapt_state_dict_to_hf(
-            model_state.model[0], state_dict, quantization=self.config.dequantize_base_checkpoint
+            model_state.model[0],
+            state_dict,
+            quantization=self.config.dequantize_base_checkpoint,
+            device_mesh=self.moe_mesh,
         )
 
         state_dict = self._do_load(state_dict, model_path, storage_reader, is_init_step=is_init_step)
@@ -363,7 +380,8 @@ class Checkpointer:
                 key_mapping=getattr(model, "_checkpoint_conversion_mapping", None),
             )
 
-        is_tied_lm_head = getattr(getattr(model, "config", {}), "tie_word_embeddings", False)
+        is_tied_lm_head = is_tied_word_embeddings(model)
+        self.config.original_model_root_dir = root_dir
         if hasattr(model, "tie_weights") and is_tied_lm_head:
             model.tie_weights()
 
@@ -614,6 +632,17 @@ class Checkpointer:
         if self.config.model_save_format == SerializationFormat.SAFETENSORS or is_init_step:
             return _HuggingFaceStorageReader(path=model_path, key_mapping=key_mapping)
 
+    def _get_original_model_path(self, model_state: ModelState) -> str | None:
+        """
+        Get the path to the original model from the Hugging Face checkpoint.
+        """
+        if not hasattr(model_state.model[0], "name_or_path"):
+            return None
+        pretrained_model_name_or_path = getattr(model_state.model[0], "name_or_path")
+        return get_safetensors_index_path(
+            getattr(self.config, "original_model_root_dir", None) or TRANSFORMERS_CACHE, pretrained_model_name_or_path
+        )
+
 
 def get_safetensors_index_path(cache_dir: str, repo_id: str | None) -> str | None:
     """
@@ -824,14 +853,14 @@ def _apply(module, fn, recurse=True) -> nn.Module:
 
 
 def _maybe_adapt_state_dict_to_hf(
-    model_part: nn.Module, state_dict: dict[str, torch.Tensor], quantization: bool = False
+    model_part: nn.Module, state_dict: dict[str, torch.Tensor], quantization: bool = False, **kwargs
 ) -> dict[str, torch.Tensor]:
     """
     Custom models use state dict adapters to convert the state dict to the Hugging Face format.
     """
     adapter = getattr(model_part, "state_dict_adapter", None)
     if adapter:
-        return adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization)
+        return adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization, **kwargs)
     return state_dict
 
 

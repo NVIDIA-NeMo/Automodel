@@ -43,15 +43,15 @@ from typing import Any, Dict, Optional
 import torch
 import wandb
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
-from transformers import AutoTokenizer
 
+from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.training.rng import ScopedRNG
-from nemo_automodel.components.training.utils import count_tail_padding
+from nemo_automodel.components.training.utils import ScopedModuleOffloading, count_tail_padding
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     calculate_loss,
@@ -105,10 +105,10 @@ def _build_teacher_model(cfg_teacher, seed, has_packed_sequence, device, model_w
 def _verify_tokenizer_compatibility(student_cfg, teacher_cfg, trust_remote_code=True):
     if student_cfg is None or teacher_cfg is None:
         raise ValueError("Student and teacher model configs are required")
-    student_tokenizer = AutoTokenizer.from_pretrained(
+    student_tokenizer = NeMoAutoTokenizer.from_pretrained(
         student_cfg.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
     )
-    teacher_tokenizer = AutoTokenizer.from_pretrained(
+    teacher_tokenizer = NeMoAutoTokenizer.from_pretrained(
         teacher_cfg.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
     )
     if student_tokenizer.vocab_size != teacher_tokenizer.vocab_size:
@@ -134,12 +134,14 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         if self.pp_enabled:
             raise ValueError("Pipeline parallelism support will be added in the future for knowledge distillation")
 
+        self._offload_teacher_model = self.cfg.get("offload_teacher_model", False)
         # teacher specific
+        teacher_device = self.dist_env.device if not self._offload_teacher_model else "cpu"
         self.teacher_model = _build_teacher_model(
             self.cfg.get("teacher_model", None),
             self.cfg.get("seed", 42),
             self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
-            self.dist_env.device,
+            teacher_device,
             self.model_wrapper,
             self.device_mesh,
         )
@@ -171,8 +173,24 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
 
         model = self.model_parts[0]
-        sync_ctx = get_sync_ctx(model, idx == num_batches - 1) if is_train else nullcontext()
+        sync_ctx = (
+            get_sync_ctx(
+                model,
+                idx == num_batches - 1,
+                defer_fsdp_grad_sync=getattr(self.model_wrapper, "defer_fsdp_grad_sync", True),
+            )
+            if is_train
+            else nullcontext()
+        )
         with train_ctx(), sync_ctx:
+            # No grad for teacher forward
+            with (
+                ScopedModuleOffloading(self.teacher_model, enabled=self._offload_teacher_model),
+                torch.inference_mode(),
+            ):
+                teacher_logits = self.teacher_model(**batch)
+                teacher_logits = getattr(teacher_logits, "logits", teacher_logits).detach().clone()
+
             # Student forward
             student_keep_last = isinstance(self.loss_fn, FusedLinearCrossEntropy)
             if student_keep_last:
@@ -191,11 +209,6 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 hidden_states=student_out.hidden_states[-1] if "hidden_states" in student_out else None,
                 num_label_tokens=num_label_tokens,
             )
-            # No grad for teacher forward
-            with torch.no_grad():
-                teacher_logits = self.teacher_model(**batch)
-                teacher_logits = getattr(teacher_logits, "logits", teacher_logits).detach()
-
             # Reminder: kd_loss is normalized by num_label_tokens,
             # which typically is larger than the number of labels in this batch,
             # because it contains the total number of labels for all batches contained

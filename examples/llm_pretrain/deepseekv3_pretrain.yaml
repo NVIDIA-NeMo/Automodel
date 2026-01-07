@@ -14,12 +14,12 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc_per_node 8 
+# torchrun --nproc_per_node 8
 #     --nnodes $NNODES
-#     --master_addr $MASTER_ADDR 
+#     --master_addr $MASTER_ADDR
 #     --master_port 29400
-#     --node_rank $NODE_RANK 
-#     examples/llm_pretrain/pretrain.py 
+#     --node_rank $NODE_RANK
+#     examples/llm_pretrain/pretrain.py
 #     --config examples/llm_pretrain/deepseekv3_pretrain.yaml
 
 
@@ -41,7 +41,7 @@ rng:
   ranked: true
 
 parallelize_fn:
-  _target_: nemo_automodel.components.models.deepseek_v3.parallelizer.parallelize_model
+  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
   activation_checkpointing: false
 
 # Option 1 - shorthand builder w/ automatic optimized path
@@ -50,7 +50,6 @@ model:
   config:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
-  is_meta_device: true
 
 # Option 2 - more fine-grained builder
 # model:
@@ -58,7 +57,6 @@ model:
 #   config:
 #     _target_: transformers.AutoConfig.from_pretrained
 #     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
-#   is_meta_device: true
 #   backend:
 #     _target_: nemo_automodel.components.moe.utils.BackendConfig
 #     attn: te
@@ -96,7 +94,7 @@ dataset:
   paths: /path/to/fineweb_edu/processed_data_*_text_document*  # REPLACE THIS
   index_mapping_dir: /path/to/fineweb_edu/mapping_dir  # REPLACE THIS
   tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
     trust_remote_code: true
   seq_length: 1024
@@ -113,7 +111,7 @@ validation_dataset:
   paths: /path/to/fineweb_edu/processed_data_*_text_document*  # REPLACE THIS
   index_mapping_dir: /path/to/fineweb_edu/mapping_dir  # REPLACE THIS
   tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
     trust_remote_code: true
   seq_length: 1024
@@ -153,4 +151,4 @@ autopipeline:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir> 
+#   save_dir: <your_wandb_save_dir>

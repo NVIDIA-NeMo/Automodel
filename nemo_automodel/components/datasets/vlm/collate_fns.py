@@ -15,7 +15,6 @@ from unittest.mock import MagicMock
 
 import torch
 
-from nemo_automodel.components.datasets.vlm.utils import extract_skipped_token_ids
 from nemo_automodel.shared.import_utils import MISSING_QWEN_VL_UTILS_MSG
 
 try:
@@ -34,52 +33,94 @@ except ImportError:
     HAVE_QWEN_OMNI_UTILS = False
     process_mm_info = MagicMock()
 
+import logging
+from typing import Any, Dict, List, Optional, Sequence
 
-def create_loss_mask_with_start_of_response_token(input_ids, processor, start_of_response_token=None):
-    r"""
-    Create loss mask by finding start of turn token positions, similar to squad.py approach.
+logger = logging.getLogger(__name__)
 
-    Args:
-        input_ids: List or tensor of token IDs for a single example
-        processor: Processor/tokenizer to convert token string to ID
-        start_of_response_token: String token that marks the start of turns (e.g., "<start_of_turn>model\n")
+from nemo_automodel.components.datasets.vlm.utils import default_stop_tokens
 
-    Returns:
-        loss_mask: List of 0/1 flags where 0 = masked (prompt), 1 = unmasked (response)
-    """
 
-    def find_sequence_in_list(input_ids, target_sequence):
-        """Find the starting index of target_sequence in input_ids"""
-        if not target_sequence:
-            return -1
-        for i in range(len(input_ids) - len(target_sequence) + 1):
-            if input_ids[i : i + len(target_sequence)] == target_sequence:
-                return i
-        return -1
+def _find_pattern_indices(template, pattern, search_start_index=0, allow_first_token_mismatch=False):
+    template_len = len(template)
+    pattern_len = len(pattern)
+    for i in range(search_start_index, template_len - pattern_len + 1):
+        match = template[i : i + pattern_len] == pattern
+        if torch.all(match) or (allow_first_token_mismatch and torch.all(match[1:])):
+            return i, i + pattern_len
+    return -1, -1
 
+
+def _extract_assistant_text(message: Dict[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                return item.get("text", "")
+    return ""
+
+
+def build_labels(
+    input_ids_batch: torch.Tensor,
+    conversations: Sequence[Sequence[Dict[str, Any]]],
+    processor,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Construct label and optional loss-mask tensors aligned to assistant responses."""
     tokenizer = getattr(processor, "tokenizer", processor)
-    input_ids = input_ids.tolist()
 
-    if start_of_response_token is None:
-        return [1] * len(input_ids)
+    labels_list: List[torch.Tensor] = []
 
-    if isinstance(start_of_response_token, str):
-        start_of_response_token_ids = tokenizer(start_of_response_token, add_special_tokens=False)["input_ids"]
-        first_occurrence = find_sequence_in_list(input_ids, start_of_response_token_ids)
-        response_start = first_occurrence if first_occurrence >= 0 else 0
-    else:
-        response_start = 0
+    for encoded, conversation in zip(input_ids_batch, conversations):
+        labels = torch.full_like(encoded, -100)
+        search_start_index = 0
 
-    pad_token_id = getattr(tokenizer, "pad_token_id", 0)
-    if pad_token_id is None:
-        pad_token_id = 0
-    loss_mask = [0] * response_start + [1] * (len(input_ids) - response_start)
+        for message in conversation:
+            if message.get("role") != "assistant":
+                continue
 
-    for i, token_id in enumerate(input_ids):
-        if token_id == pad_token_id:
-            loss_mask[i] = 0
+            assistant_text = _extract_assistant_text(message)
+            if not assistant_text:
+                continue
 
-    return loss_mask
+            assistant_tokens = tokenizer(
+                assistant_text,
+                add_special_tokens=False,
+                return_tensors="pt",
+            )["input_ids"][0].to(encoded.device)
+
+            answer_start, answer_end = _find_pattern_indices(encoded, assistant_tokens, search_start_index)
+
+            if answer_end < len(encoded):
+                next_token_str = tokenizer.decode(encoded[answer_end])
+                if next_token_str.strip() in default_stop_tokens(processor):
+                    answer_end += 1
+
+            if answer_start >= 0:
+                labels[answer_start:answer_end] = encoded[answer_start:answer_end]
+                search_start_index = answer_end
+            else:
+                logger.warning(
+                    (
+                        "Unable to find answer segment in the tokenized conversation. "
+                        "Skipping labeling for this and subsequent answers. Details:"
+                        "\n- Processed Text: %s"
+                        "\n- Tokens: %s"
+                        "\n- Target Answer Tokens: %s"
+                        "\n- Search Start Index: %d"
+                    ),
+                    conversation,
+                    encoded,
+                    assistant_tokens,
+                    search_start_index,
+                )
+                break
+
+        labels_list.append(labels)
+
+    labels_tensor = torch.stack(labels_list)
+    return labels_tensor
 
 
 def phi4_mm_collate_fn(examples, processor):
@@ -93,29 +134,20 @@ def phi4_mm_collate_fn(examples, processor):
     batch = processor(
         text=texts, audios=audio_inputs, return_tensors="pt", padding=True, truncation=True, max_length=1024
     )
-    labels = batch["input_ids"].clone()[:, 1:]
-    labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
 
-    loss_masks = []
-    for i, conversation in enumerate(conversations):
-        input_ids = batch["input_ids"][i].tolist()
+    labels = build_labels(
+        batch["input_ids"],
+        conversations,
+        processor,
+    )
 
-        assistant_content = conversation[1]["content"]
-        assistant_tokens = processor.tokenizer(assistant_content, add_special_tokens=False)["input_ids"]
+    batch["labels"] = labels[:, 1:]
 
-        loss_mask = [0] * len(input_ids)
-        for start_idx in range(len(input_ids) - len(assistant_tokens) + 1):
-            if input_ids[start_idx : start_idx + len(assistant_tokens)] == assistant_tokens:
-                for j in range(len(assistant_tokens)):
-                    loss_mask[start_idx + j] = 1
-                break
-        loss_masks.append(loss_mask)
+    input_shape = batch["input_ids"].shape
+    for key, value in list(batch.items()):
+        if isinstance(value, torch.Tensor) and value.shape == input_shape:
+            batch[key] = value[:, :-1]
 
-    max_len = max(len(mask) for mask in loss_masks)
-    padded_loss_masks = [mask + [0] * (max_len - len(mask)) for mask in loss_masks]
-    batch["loss_mask"] = torch.tensor(padded_loss_masks, dtype=torch.float)
-
-    labels[batch["loss_mask"] == 0] = -100
     batch["labels"] = labels
 
     # Remove specified batch features if present
@@ -125,17 +157,14 @@ def phi4_mm_collate_fn(examples, processor):
     return batch
 
 
-def qwen2_5_collate_fn(
-    examples: list, processor, start_of_response_token="<|im_start|>assistant\n"
-) -> dict[str, torch.Tensor]:
+def qwen2_5_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
     """Collate function for Qwen2.5 VL model."""
     if not HAVE_QWEN_VL_UTILS:
         raise ImportError(MISSING_QWEN_VL_UTILS_MSG)
 
-    skipped_tokens = extract_skipped_token_ids(processor)
-
-    texts = [processor.apply_chat_template(example["conversation"], tokenize=False) for example in examples]
-    image_inputs = [process_vision_info(example["conversation"])[0] for example in examples]
+    conversations = [example["conversation"] for example in examples]
+    texts = [processor.apply_chat_template(conversation, tokenize=False) for conversation in conversations]
+    image_inputs = [process_vision_info(conversation)[0] for conversation in conversations]
 
     batch = processor(
         text=texts,
@@ -143,39 +172,38 @@ def qwen2_5_collate_fn(
         padding=True,
         return_tensors="pt",
     )
+    labels = build_labels(
+        batch["input_ids"],
+        conversations,
+        processor,
+    )
+    batch["labels"] = labels[:, 1:]
 
-    labels = batch["input_ids"].clone()[:, 1:]
-    labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
-    labels[torch.isin(labels, skipped_tokens)] = -100
-    batch["labels"] = labels
-    loss_masks = [
-        create_loss_mask_with_start_of_response_token(input_ids, processor, start_of_response_token)
-        for input_ids in batch["input_ids"]
-    ]
-    batch["loss_mask"] = torch.tensor(loss_masks, dtype=torch.float, device=batch["input_ids"].device)
+    input_shape = batch["input_ids"].shape
+    for key, value in list(batch.items()):
+        if isinstance(value, torch.Tensor) and value.shape == input_shape:
+            batch[key] = value[:, :-1]
+
     return batch
 
 
 def qwen3_omni_collate_fn(
-    examples: list, processor, start_of_response_token="<|im_start|>assistant\n", use_audio_in_video=False
-) -> dict[str, torch.Tensor]:
+    examples: Sequence[Dict[str, Any]],
+    processor,
+    use_audio_in_video: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """Collate function for Qwen3 Omni processors."""
     if not HAVE_QWEN_OMNI_UTILS:
         raise ImportError(
             "qwen_omni_utils is required for qwen3_omni_collate_fn. Install it with: pip install qwen-omni-utils"
         )
 
-    skipped_tokens = extract_skipped_token_ids(processor)
-
-    # Extract conversations from examples
     conversations = [example["conversation"] for example in examples]
-
-    # Apply chat template to get text for each example
     texts = [
         processor.apply_chat_template(conversation, add_generation_prompt=False, tokenize=False)
         for conversation in conversations
     ]
 
-    # Process multimodal info (audios, images, videos) for each conversation
     all_audios = []
     all_images = []
     all_videos = []
@@ -185,9 +213,7 @@ def qwen3_omni_collate_fn(
         all_images.append(images)
         all_videos.append(videos)
 
-    # Helper function to check if a modality has actual data
     def has_data(modality_list):
-        """Check if any item in the list contains actual data (not None or empty list)."""
         for item in modality_list:
             if item is None:
                 continue
@@ -200,6 +226,7 @@ def qwen3_omni_collate_fn(
         "text": texts,
         "return_tensors": "pt",
         "padding": True,
+        "padding_side": "right",
     }
 
     if has_data(all_audios):
@@ -211,30 +238,32 @@ def qwen3_omni_collate_fn(
 
     batch = processor(**processor_kwargs)
 
-    labels = batch["input_ids"].clone()[:, 1:]
-    labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
+    labels = build_labels(
+        batch["input_ids"],
+        conversations,
+        processor,
+    )
 
-    labels[torch.isin(labels, skipped_tokens)] = -100
-    batch["labels"] = labels
+    batch["labels"] = labels[:, 1:]
 
-    # Create loss masks to only compute loss on assistant responses
-    loss_masks = [
-        create_loss_mask_with_start_of_response_token(input_ids, processor, start_of_response_token)
-        for input_ids in batch["input_ids"]
-    ]
-    batch["loss_mask"] = torch.tensor(loss_masks, dtype=torch.float, device=batch["input_ids"].device)
+    input_shape = batch["input_ids"].shape
+    for key, value in list(batch.items()):
+        if isinstance(value, torch.Tensor) and value.shape == input_shape:
+            batch[key] = value[:, :-1]
     return batch
 
 
-def default_collate_fn(examples: list, processor, start_of_response_token=None) -> dict[str, torch.Tensor]:
-    """Default collate function for VLM models."""
+def default_collate_fn(
+    examples: Sequence[Dict[str, Any]],
+    processor,
+) -> Dict[str, torch.Tensor]:
+    """Default collate function for multimodal VLM datasets."""
     if not HAVE_QWEN_VL_UTILS:
         raise ImportError(MISSING_QWEN_VL_UTILS_MSG)
 
-    skipped_tokens = extract_skipped_token_ids(processor)
-
+    conversations = [example["conversation"] for example in examples]
     batch = processor.apply_chat_template(
-        [example["conversation"] for example in examples],
+        conversations,
         tokenize=True,
         padding=True,
         truncation=True,
@@ -249,15 +278,18 @@ def default_collate_fn(examples: list, processor, start_of_response_token=None) 
         )
 
     batch["pixel_values"] = batch["pixel_values"].to(torch.bfloat16)
-    labels = batch["input_ids"].clone()[:, 1:]
-    labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
-    labels[torch.isin(labels, skipped_tokens)] = -100
-    batch["labels"] = labels
-    loss_masks = [
-        create_loss_mask_with_start_of_response_token(input_ids, processor, start_of_response_token)
-        for input_ids in batch["input_ids"]
-    ]
-    batch["loss_mask"] = torch.tensor(loss_masks, dtype=torch.float, device=batch["input_ids"].device)
+
+    labels = build_labels(
+        batch["input_ids"],
+        conversations,
+        processor,
+    )
+    batch["labels"] = labels[:, 1:]
+
+    input_shape = batch["input_ids"].shape
+    for key in batch:
+        if batch[key].shape == input_shape and key != "labels":
+            batch[key] = batch[key][:, :-1]
     return batch
 
 

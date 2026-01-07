@@ -14,6 +14,12 @@
 
 import inspect
 import logging
+import os
+from contextlib import contextmanager
+
+from nemo_automodel.shared.import_utils import safe_import
+
+HAVE_TORCHAO, torch_ao = safe_import("torchao")
 
 import torch
 import torch.nn as nn
@@ -73,6 +79,22 @@ def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
         except Exception:
             pass
     return total_params, trainable_params, local_sq_norm
+
+
+def resolve_trust_remote_code(pretrained_model_name_or_path):
+    """
+    Whitelist NVIDIA models to allow remote code execution.
+
+    Args:
+        pretrained_model_name_or_path (str): The name or path of the pretrained model.
+
+    Returns:
+        bool: True if the model should be loaded with trust_remote_code, False otherwise.
+    """
+    if not pretrained_model_name_or_path:
+        return False
+    # pretrained_model_name_or_path can be something like nvidia/NVIDIA-Nemotron-Nano-9B-v2
+    return not os.path.isdir(pretrained_model_name_or_path) and pretrained_model_name_or_path.startswith("nvidia/")
 
 
 def print_trainable_parameters(model: nn.Module) -> tuple[int, int]:
@@ -238,3 +260,54 @@ def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, se
             attn_kwargs[key] = value.item()
 
     return input_ids, position_ids, padding_mask, attn_kwargs
+
+
+# taken and edited from https://github.com/huggingface/transformers/blob/32a58e31463e238c967207bf73772490c353551a/src/transformers/integrations/accelerate.py#L53-L158
+@contextmanager
+def init_empty_weights():
+    """
+    A context manager under which models are initialized with all parameters on the specified device.
+
+    Args:
+        device (`torch.device`):
+            Device to initialize all parameters on.
+
+    Example:
+
+    ```python
+    import torch.nn as nn
+    from nemo_automodel.components.utils.model_utils import init_empty_weights
+
+    with init_empty_weights():
+        tst = nn.Linear(100, 100)  # on `cuda` device
+    ```
+    """
+    device = torch.device("meta")
+    fp8_parameter_mapping = {
+        "_linear_mm_config": "linear_mm_config",
+        "_dtype": "dtype",
+        "_precomputed_scale": "precomputed_scale",
+    }
+    old_register_parameter = nn.Module.register_parameter
+
+    def register_empty_parameter(module, name, param):
+        old_register_parameter(module, name, param)
+        if param is not None:
+            param_cls = type(module._parameters[name])
+            if HAVE_TORCHAO and isinstance(
+                module._parameters[name], torch_ao.float8.fsdp_utils.WeightWithDynamicFloat8CastTensor
+            ):
+                kwargs = {}
+                for k in module._parameters[name].__dict__:
+                    if k in fp8_parameter_mapping:
+                        kwargs[fp8_parameter_mapping[k]] = getattr(module._parameters[name], k)
+            else:
+                kwargs = module._parameters[name].__dict__
+                kwargs["requires_grad"] = param.requires_grad
+            module._parameters[name] = param_cls(module._parameters[name].to(device), **kwargs)
+
+    try:
+        nn.Module.register_parameter = register_empty_parameter
+        yield
+    finally:
+        nn.Module.register_parameter = old_register_parameter

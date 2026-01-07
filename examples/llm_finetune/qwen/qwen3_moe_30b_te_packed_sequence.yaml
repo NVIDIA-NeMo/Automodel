@@ -22,7 +22,6 @@ step_scheduler:
   global_batch_size: 32
   local_batch_size: 4
   ckpt_every_steps: 500
-  val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 2
 
 dist_env:
@@ -39,10 +38,8 @@ parallelizer:
   activation_checkpointing: false
 
 model:
-  _target_: nemo_automodel.components.models.qwen3_moe.model.Qwen3MoeForCausalLM.from_config
-  config:
-    _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
+  _target_: nemo_automodel.components.models.qwen3_moe.model.Qwen3MoeForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
   backend:
     _target_: nemo_automodel.components.moe.utils.BackendConfig
     attn: te
@@ -51,7 +48,6 @@ model:
     enable_deepep: true
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
-  is_meta_device: true
 
 autopipeline:
   _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
@@ -89,7 +85,6 @@ dataset:
 packed_sequence:
   # Set packed_sequence_size > 0 to run with packed sequences
   packed_sequence_size: 1024
-  split_across_pack: False
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -100,7 +95,7 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 64
+  pad_to_max_length: false
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

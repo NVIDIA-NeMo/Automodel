@@ -84,14 +84,6 @@ def _package_tokenized_example(
     Returns:
         A dictionary with input_ids, labels, and attention_mask.
     """
-    # llama3 tokenizer does not add eos token
-    # see: https://github.com/huggingface/transformers/issues/22794
-    if not _has_chat_template(tokenizer) and eos_token_id != input_ids[-1]:
-        input_ids += [eos_token_id]
-        assistant_masks += [1]
-    if not _has_chat_template(tokenizer) and pad_token_id is not None:
-        assistant_masks += [pad_token_id]
-
     labels = input_ids.copy()
     input_ids = input_ids[:-1]
     # input_ids= [a, b] -> attention_mask = [1, 1]
@@ -152,12 +144,20 @@ def format_prompt_completion(
 
     # Tokenize separately to locate answer start
     if answer_only_loss_mask:
-        prompt_ids = tokenizer(prompt)["input_ids"]
+        # don't add eos token here. NOTE: this is only for calculating the length of the prompt.
+        # we are not modifying the prompt to be returned here.
+        prompt_ids = [tokenizer.bos_token_id] if getattr(tokenizer, "add_bos_token", False) else []
+        prompt_ids += tokenizer(prompt, add_special_tokens=False)["input_ids"]
         len_prompt_ids = len(prompt_ids)
     else:
         len_prompt_ids = 0
     # Tokenize full text
-    input_ids = tokenizer(full_text, padding=padding, truncation=truncation, max_length=seq_length)["input_ids"]
+    input_ids = tokenizer(
+        full_text,
+        padding=padding,
+        truncation=truncation,
+        max_length=seq_length,
+    )["input_ids"]
 
     # Create assistant_masks: 0 for prompt tokens, 1 for answer tokens
     assistant_masks = [0] * len_prompt_ids + [1] * (len(input_ids) - len_prompt_ids)
@@ -183,6 +183,7 @@ def format_chat_template(
     padding: Union[str, bool] = "do_not_pad",
     truncation: Union[str, bool] = "do_not_truncate",
     tools: Optional[List[Dict]] = None,
+    answer_only_loss_mask: bool = True,
 ) -> Dict[str, List[int]]:
     """
     Format a chat template style example.
@@ -194,6 +195,7 @@ def format_chat_template(
         pad_token_id: The padding token id.
         seq_length: Optional sequence length for padding.
         tools: Optional list of tool definitions for function calling.
+        answer_only_loss_mask: Whether to compute the loss mask only on the answer tokens.
 
     Returns:
         A dictionary with the formatted example.
@@ -220,6 +222,22 @@ def format_chat_template(
     input_ids = tokenized_chat.get("input_ids")
     if template_has_generation_kwd:
         mask = tokenized_chat["assistant_masks"]
+    elif not template_has_generation_kwd and answer_only_loss_mask:
+        # in this case we need to manually split up the formatted_text. Only the final assistant turn should be considered as answer.
+        answer_text = formatted_text.pop()
+        assert answer_text["role"] == "assistant", "The last message in the formatted_text must be an assistant message"
+        tokenized_prompt = tokenizer.apply_chat_template(
+            formatted_text,
+            tools=tools,
+            tokenize=True,
+            return_dict=True,
+            return_assistant_tokens_mask=template_has_generation_kwd,
+            padding=padding,
+            truncation=truncation,
+            max_length=seq_length,
+        )
+        len_prompt_ids = len(tokenized_prompt.get("input_ids", []))
+        mask = [0] * len_prompt_ids + [1] * (len(input_ids) - len_prompt_ids)
     else:
         mask = [1] * len(input_ids)
 

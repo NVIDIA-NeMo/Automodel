@@ -58,10 +58,12 @@ class LayerContainer:
 
 
 class DummyModel:
-    def __init__(self, blocks, embed_tokens=None, lm_head=None):
+    def __init__(self, blocks, embed_tokens=None, lm_head=None, audio_tower=None, visual=None):
         self.layers = LayerContainer(blocks)
         self.embed_tokens = embed_tokens
         self.lm_head = lm_head
+        self.audio_tower = audio_tower
+        self.visual = visual
 
 
 def _install_torch_and_layers_stubs(monkeypatch):
@@ -528,6 +530,55 @@ def test_apply_fsdp_without_ep_enabled_has_no_ignored_params(monkeypatch):
     assert block_kwargs.get("ignored_params") is None
 
 
+@pytest.mark.parametrize(
+    "audio_trainable, visual_trainable",
+    [
+        (True, True),
+        (False, False),
+    ],
+)
+def test_apply_fsdp_handles_multimodal_components(monkeypatch, audio_trainable, visual_trainable):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    logging_mock = MagicMock()
+    monkeypatch.setattr(P.logging, "info", logging_mock)
+
+    class Tower:
+        def __init__(self, requires_grad):
+            self._params = [types.SimpleNamespace(requires_grad=requires_grad)]
+
+        def parameters(self):
+            return iter(self._params)
+
+    audio_tower = Tower(audio_trainable)
+    visual_tower = Tower(visual_trainable)
+
+    model = DummyModel([DummyBlock()], audio_tower=audio_tower, visual=visual_tower)
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=object(),
+        pp_enabled=False,
+        ep_enabled=False,
+        ep_shard_enabled=False,
+        ep_shard_mesh=None,
+    )
+
+    audio_call = _find_call_by_first_arg(fully_shard_mock, audio_tower)
+    visual_call = _find_call_by_first_arg(fully_shard_mock, visual_tower)
+    assert (audio_call is not None) == audio_trainable
+    assert (visual_call is not None) == visual_trainable
+
+    if not audio_trainable:
+        logging_mock.assert_any_call("Skipping FSDP wrap for frozen audio tower")
+    if not visual_trainable:
+        logging_mock.assert_any_call("Skipping FSDP wrap for frozen visual tower")
+
+
 class MeshView:
     def __init__(self, size):
         self._size = size
@@ -853,3 +904,185 @@ def test_parallelize_model_with_lm_head_precision_string_input(monkeypatch):
     apply_fsdp_mock.assert_called_once()
     _, kwargs = apply_fsdp_mock.call_args
     assert kwargs.get("lm_head_precision") == "float32"
+
+
+def test_apply_fsdp_with_wrap_outer_model_true(monkeypatch):
+    """Test that apply_fsdp wraps both inner _model and outer model when wrap_outer_model=True."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    block = DummyBlock(mlp=DummyMoE())
+    # Create a model with nested structure (model.model exists)
+    inner_model = DummyModel([block])
+
+    class OuterModel:
+        def __init__(self, inner):
+            self.model = inner
+
+    outer_model = OuterModel(inner_model)
+    fsdp_mesh = object()
+
+    P.apply_fsdp(
+        model=outer_model,
+        fsdp_mesh=fsdp_mesh,
+        pp_enabled=False,
+        ep_enabled=False,
+        ep_shard_enabled=False,
+        wrap_outer_model=True,
+    )
+
+    # Find calls for inner model and outer model
+    inner_call = _find_call_by_first_arg(fully_shard_mock, inner_model)
+    outer_call = _find_call_by_first_arg(fully_shard_mock, outer_model)
+
+    # Both should be wrapped
+    assert inner_call is not None, "Inner model should be wrapped"
+    assert outer_call is not None, "Outer model should be wrapped when wrap_outer_model=True"
+
+
+def test_apply_fsdp_with_wrap_outer_model_false(monkeypatch):
+    """Test that apply_fsdp only wraps inner _model when wrap_outer_model=False (default)."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    block = DummyBlock(mlp=DummyMoE())
+    # Create a model with nested structure (model.model exists)
+    inner_model = DummyModel([block])
+
+    class OuterModel:
+        def __init__(self, inner):
+            self.model = inner
+
+    outer_model = OuterModel(inner_model)
+    fsdp_mesh = object()
+
+    P.apply_fsdp(
+        model=outer_model,
+        fsdp_mesh=fsdp_mesh,
+        pp_enabled=False,
+        ep_enabled=False,
+        ep_shard_enabled=False,
+        wrap_outer_model=False,
+    )
+
+    # Find calls for inner model and outer model
+    inner_call = _find_call_by_first_arg(fully_shard_mock, inner_model)
+    outer_call = _find_call_by_first_arg(fully_shard_mock, outer_model)
+
+    # Only inner should be wrapped
+    assert inner_call is not None, "Inner model should be wrapped"
+    assert outer_call is None, "Outer model should NOT be wrapped when wrap_outer_model=False"
+
+
+def test_apply_fsdp_wrap_outer_model_no_nested_structure(monkeypatch):
+    """Test that wrap_outer_model has no effect when model has no nested structure."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    block = DummyBlock(mlp=DummyMoE())
+    # Create a model without nested structure (no model.model)
+    model = DummyModel([block])
+    fsdp_mesh = object()
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=fsdp_mesh,
+        pp_enabled=False,
+        ep_enabled=False,
+        ep_shard_enabled=False,
+        wrap_outer_model=True,
+    )
+
+    # Find call for model
+    model_call = _find_call_by_first_arg(fully_shard_mock, model)
+
+    # Model should be wrapped exactly once (not twice)
+    assert model_call is not None, "Model should be wrapped"
+    # Count how many times model was passed as first arg
+    model_call_count = sum(
+        1 for args, _ in fully_shard_mock.call_args_list if args and args[0] is model
+    )
+    assert model_call_count == 1, "Model should only be wrapped once when model == _model"
+
+
+def test_parallelize_model_passes_wrap_outer_model_to_apply_fsdp(monkeypatch):
+    """Test that parallelize_model passes wrap_outer_model to apply_fsdp."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    apply_fsdp_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_fsdp", apply_fsdp_mock)
+    monkeypatch.setattr(P, "apply_ep", MagicMock())
+    monkeypatch.setattr(P, "apply_ac", MagicMock())
+
+    world_mesh = FakeWorldMesh({("dp",): 2}, mesh_dim_names=["dp"])
+    moe_mesh = None
+
+    class Inner:
+        def __init__(self):
+            self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+
+    class Outer:
+        def __init__(self):
+            self.model = Inner()
+
+    model = Outer()
+
+    P.parallelize_model(
+        model=model,
+        world_mesh=world_mesh,
+        moe_mesh=moe_mesh,
+        pp_enabled=False,
+        dp_axis_names=("dp",),
+        wrap_outer_model=True,
+    )
+
+    # Verify apply_fsdp was called with wrap_outer_model=True
+    apply_fsdp_mock.assert_called_once()
+    _, kwargs = apply_fsdp_mock.call_args
+    assert kwargs.get("wrap_outer_model") is True
+
+
+def test_parallelize_model_wrap_outer_model_defaults_to_true(monkeypatch):
+    """Test that parallelize_model defaults wrap_outer_model to True."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    apply_fsdp_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_fsdp", apply_fsdp_mock)
+    monkeypatch.setattr(P, "apply_ep", MagicMock())
+    monkeypatch.setattr(P, "apply_ac", MagicMock())
+
+    world_mesh = FakeWorldMesh({("dp",): 2}, mesh_dim_names=["dp"])
+    moe_mesh = None
+
+    class Inner:
+        def __init__(self):
+            self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+
+    class Outer:
+        def __init__(self):
+            self.model = Inner()
+
+    model = Outer()
+
+    P.parallelize_model(
+        model=model,
+        world_mesh=world_mesh,
+        moe_mesh=moe_mesh,
+        pp_enabled=False,
+        dp_axis_names=("dp",),
+    )
+
+    # Verify apply_fsdp was called with wrap_outer_model=False (default)
+    apply_fsdp_mock.assert_called_once()
+    _, kwargs = apply_fsdp_mock.call_args
+    assert kwargs.get("wrap_outer_model") is True

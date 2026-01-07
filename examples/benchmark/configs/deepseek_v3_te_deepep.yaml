@@ -59,6 +59,7 @@ parallelizer:
   _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
   activation_checkpointing: true
   reshard_after_forward: false
+  wrap_outer_model: false
 
 model:
   _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_config
@@ -66,7 +67,6 @@ model:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
   trust_remote_code: true
-  is_meta_device: true
   backend:
     _target_: nemo_automodel.components.moe.utils.BackendConfig
     attn: te

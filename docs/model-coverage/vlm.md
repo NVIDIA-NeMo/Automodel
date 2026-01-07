@@ -23,12 +23,16 @@ For other installation options (e.g., uv) please see our [Installation Guide](..
 NeMo Automodel supports <a href=https://huggingface.co/docs/transformers/main/model_doc/auto#transformers.AutoModelForImageTextToText>AutoModelForImageTextToText<a> in the <a href="https://huggingface.co/models?pipeline_tag=image-text-to-text&sort=trending">Image-Text-to-Text<a> category. Specifically, the following VLM models from Hugging Face have been tested and support both Supervised Fine-Tuning (SFT) and Parameter-Efficient Fine-Tuning (PEFT) with LoRA:
 
 
-| Model                              | Dataset                     | FSDP2      | PEFT       |
-|------------------------------------|-----------------------------|------------|------------|
-| Gemma 3-4B & 27B                   | naver-clova-ix & rdr-items  | Supported  | Supported  |
-| Gemma 3n                           | naver-clova-ix & rdr-items  | Supported  | Supported  |
-| Qwen2-VL-2B-Instruct & Qwen2.5-VL-3B-Instruct | cord-v2          | Supported  | Supported  |
-| llava-v1.6                         | cord-v2 & naver-clova-ix    | Supported  | Supported  |
+| Model                              | Dataset                     | FSDP2      | PEFT       | Example YAML |
+|------------------------------------|-----------------------------|------------|------------|--------------|
+| Gemma 3-4B & 27B                   | naver-clova-ix & rdr-items  | Supported  | Supported  | [gemma3_vl_4b_cord_v2.yaml](../../examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml) |
+| Gemma 3n                           | naver-clova-ix & rdr-items  | Supported  | Supported  | [gemma3n_vl_4b_medpix.yaml](../../examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml) |
+| Qwen2-VL-2B-Instruct & Qwen2.5-VL-3B-Instruct | cord-v2          | Supported  | Supported  | [qwen2_5_vl_3b_rdr.yaml](../../examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml) |
+| Qwen3-VL-MoE                       | cord-v2                     | Supported  | Supported  | [qwen3_vl_moe_30b_te_deepep.yaml](../../examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_te_deepep.yaml) |
+| Qwen3-Omni-30BA3B                  | cord-v2                     | Supported  | Supported  | [qwen3_omni_moe_30b_te_deepep.yaml](../../examples/vlm_finetune/qwen3/qwen3_omni_moe_30b_te_deepep.yaml) |
+| InternVL3.5-4B                     | cord-v2                     | Supported  | Supported  | [internvl_3_5_4b.yaml](../../examples/vlm_finetune/internvl/internvl_3_5_4b.yaml) |
+| Ministral3-{3B,8B,14B}             | MedPix-VQA                  | Supported  | Supported  | [ministral3_3b_medpix.yaml](../../examples/vlm_finetune/mistral/ministral3_3b_medpix.yaml), [ministral3_8b_medpix.yaml](../../examples/vlm_finetune/mistral/ministral3_8b_medpix.yaml), [ministral3_14b_medpix.yaml](../../examples/vlm_finetune/mistral/ministral3_14b_medpix.yaml) |
+| Phi-4-multimodal-instruct          | commonvoice_17_tr_fixed     | Supported  | Supported  | [phi4_mm_cv17.yaml](../../examples/vlm_finetune/phi4/phi4_mm_cv17.yaml) |
 
 For detailed instructions on fine-tuning these models using both SFT and PEFT approaches, please refer to the [Gemma 3 and Gemma 3n Fine-Tuning Guide](../guides/omni/gemma3-3n.md). The guide covers dataset preparation, configuration, and running both full fine-tuning and LoRA-based parameter efficient fine-tuning.
 

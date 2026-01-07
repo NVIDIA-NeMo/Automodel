@@ -51,7 +51,6 @@ model:
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
-  is_meta_device: true
 
 checkpoint:
   enabled: false
@@ -85,7 +84,7 @@ loss_fn:
 dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
     trust_remote_code: true
   path_or_dataset: rowan/hellaswag
@@ -94,7 +93,6 @@ dataset:
 packed_sequence:
   # Set packed_sequence_size > 0 to run with packed sequences
   packed_sequence_size: 0
-  split_across_pack: False
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -104,7 +102,7 @@ dataloader:
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
     trust_remote_code: true
   path_or_dataset: rowan/hellaswag

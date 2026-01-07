@@ -61,13 +61,48 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
     git submodule init && git submodule update && \
     pip install nvidia-mathdx==25.1.1 && \
     env NVTE_CUDA_ARCHS="80;90;100;120" NVTE_BUILD_THREADS_PER_JOB=8 pip install --no-cache-dir --no-build-isolation -v . && \
-    rm -rf TransformerEngine; \
+    cd ../ && rm -rf TransformerEngine; \
     fi
 
 FROM update_base_container AS automodel_dep
 
 # Install Grouped Gemm
 RUN pip install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
+
+# Install Mamba
+ARG INSTALL_MAMBA=False
+ARG MAMBA_COMMIT=6b32be06d026e170b3fdaf3ae6282c5a6ff57b06
+RUN if [ "$INSTALL_MAMBA" = "True" ]; then \
+    git clone https://github.com/Dao-AILab/causal-conv1d.git && \
+    cd causal-conv1d && \
+    git checkout v1.5.3 && \
+    CAUSAL_CONV1D_FORCE_BUILD=TRUE pip install --no-build-isolation -v . && \
+    cd ../ && rm -rf causal-conv1d && \
+    git clone https://github.com/state-spaces/mamba.git && \
+    cd mamba && \
+    git checkout $MAMBA_COMMIT && \
+    sed -i "/triton/d" setup.py && \
+    sed -i "/triton/d" pyproject.toml && \
+    pip install --no-build-isolation -v . && \
+    cd ../ && rm -rf mamba; \
+    fi
+
+# Install Bitsandbytes
+ARG INSTALL_BITSANDBYTES=False
+ARG BITSANDBYTES_COMMIT=0.48.2
+RUN if [ $INSTALL_BITSANDBYTES = "True" ]; then \
+    git clone https://github.com/bitsandbytes-foundation/bitsandbytes.git && \
+    cd bitsandbytes && \
+    git pull && \
+    git fetch origin $DEEPEP_COMMIT && \
+    git checkout FETCH_HEAD && \
+    cmake -DCOMPUTE_BACKEND=cuda -DCOMPUTE_CAPABILITY="80;86;90;100;110" -S . && \
+    make && \
+    cmake -DCOMPUTE_BACKEND=cpu -S . && \
+    make && \
+    pip install . && \
+    cd ../ && rm -rf bitsandbytes; \
+    fi
 
 # Install Deepep
 COPY docker/common/deepep.patch /opt/deepep.patch
@@ -90,7 +125,7 @@ FROM automodel_dep as automodel_final
 
 # Install Automodel
 ARG BASE_IMAGE=cuda
-ARG AUTOMODEL_INSTALL=vlm
+ARG AUTOMODEL_INSTALL=all
 COPY . /opt/Automodel
 RUN cd /opt/Automodel && \
     if [ "$BASE_IMAGE" = "pytorch" ]; then \
@@ -113,3 +148,9 @@ ENV NVIDIA_BUILD_ID=${NVIDIA_BUILD_ID:-<unknown>}
 LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 ARG NVIDIA_BUILD_REF
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
+
+ARG RC_DATE=00.00
+ARG TARGETARCH
+# NOTICES.txt file points to where the OSS source code is archived
+RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-automodel/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
+    echo "For further inquiries or assistance, contact us at oss-requests@nvidia.com" >> NOTICES.txt

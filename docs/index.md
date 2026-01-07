@@ -11,13 +11,14 @@ launcher/local-workstation.md
 launcher/cluster.md
 ```
 
-<!--
+<!-- 
 environment/cluster.md
 -->
 
 ```{toctree}
 :caption: Announcements
 :hidden:
+Accelerating Large-Scale Mixture-of-Experts Training in PyTorch with NeMo Automodel <https://github.com/NVIDIA-NeMo/Automodel/discussions/777>
 Challenges in Enabling PyTorch Native Pipeline Parallelism for Hugging Face Transformer Models <https://github.com/NVIDIA-NeMo/Automodel/discussions/589>
 Google Gemma 3n: Efficient Multimodal Fine-tuning Made Simple <https://github.com/NVIDIA-NeMo/Automodel/discussions/494>
 Fine-tune Hugging Face Models Instantly with Day-0 Support with NVIDIA NeMo AutoModel <https://github.com/NVIDIA-NeMo/Automodel/discussions/477>
@@ -29,8 +30,9 @@ Fine-tune Hugging Face Models Instantly with Day-0 Support with NVIDIA NeMo Auto
 :hidden:
 guides/overview.md
 guides/llm/finetune.md
-guides/llm/mcore-pretraining.md
+guides/llm/toolcalling.md
 guides/llm/pretraining.md
+guides/llm/nanogpt-pretraining.md
 guides/llm/sequence-classification.md
 guides/omni/gemma3-3n.md
 ```

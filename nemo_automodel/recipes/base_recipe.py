@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import getpass
+import json
 import logging
 import os
 import re
@@ -23,23 +24,19 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import yaml
 from torch.optim import Optimizer
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils import PreTrainedTokenizerBase
 
+from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
+from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import AutoTokenizerWithBosEosEnforced
 from nemo_automodel.components.checkpoint.checkpointing import save_config
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
-
-try:
-    import yaml as _yaml
-except Exception:
-    _yaml = None
-from transformers.processing_utils import ProcessorMixin
-from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 
 def has_load_restore_state(object):
@@ -80,7 +77,17 @@ def is_tokenizer(object):
     Returns:
         bool: returns True if object is a tokenizer or VLM processor.
     """
-    return isinstance(object, (PreTrainedTokenizerBase, ProcessorMixin))
+    # Note: some NeMo flows wrap HF tokenizers (e.g., BOS/EOS enforcement wrapper). Those
+    # wrappers still implement `save_pretrained()` via delegation and should be checkpointed.
+    return isinstance(
+        object,
+        (
+            PreTrainedTokenizerBase,
+            ProcessorMixin,
+            NeMoAutoTokenizer,
+            AutoTokenizerWithBosEosEnforced,
+        ),
+    )
 
 
 def is_lr_scheduler(object):
@@ -140,6 +147,11 @@ class BaseRecipe:
             raise ValueError("cannot set __state_tracked")
         if "__state_tracked" not in self.__dict__:
             self.__dict__["__state_tracked"] = set()
+
+        # Initialize best checkpoint tracking
+        if "_best_val_loss" not in self.__dict__:
+            self.__dict__["_best_val_loss"] = float("inf")
+
         # Track stateful objects unless they are validation/eval components.
         should_track = (
             is_model(value)
@@ -156,7 +168,14 @@ class BaseRecipe:
             self.__dict__["__state_tracked"].add(key)
         super().__setattr__(key, value)
 
-    def save_checkpoint(self, epoch: int, step: int):
+    def save_checkpoint(
+        self,
+        epoch: int,
+        step: int,
+        train_loss: float,
+        val_loss: dict[str, float] | None = None,
+        best_metric_key: str = "default",
+    ):
         """
         Save the current training state as a checkpoint.
 
@@ -165,6 +184,9 @@ class BaseRecipe:
         Args:
             epoch (int): The current epoch.
             step (int): The current step.
+            train_loss (float): The current training loss.
+            val_loss (dict[str, float]): The current validation losses.
+            best_metric_key (str): The validation metric key used to select the best checkpoint.
         """
         if not self.checkpointer.config.enabled:
             return
@@ -184,16 +206,47 @@ class BaseRecipe:
             if is_dist_initialized:
                 torch.distributed.barrier()
 
+        # If a previous async checkpoint just finished, also update the "best" symlink now (if pending)
+        prev_best_pending = getattr(self, "_last_pending_best_checkpoint_info", None)
+        if prev_best_pending is not None:
+            if is_rank_0 and prev_best_pending.get("val") is not None:
+                self._update_best_symlink(prev_best_pending["path"], float(prev_best_pending["val"]))
+            setattr(self, "_last_pending_best_checkpoint_info", None)
+            if is_dist_initialized:
+                torch.distributed.barrier()
+
         path = self.checkpointer.config.checkpoint_dir
         path = os.path.join(path, f"epoch_{epoch}_step_{step}")
+
+        best_val_metric = (
+            val_loss[next(iter(val_loss.keys())) if len(val_loss) == 1 else best_metric_key] if val_loss else None
+        )
 
         if is_rank_0:
             assert not os.path.exists(path), f"Checkpoint directory {path} already exists"
             os.makedirs(path, exist_ok=True)
             print(f"Saving checkpoint to {path}", flush=True)
+
+            def to_item(x):
+                if isinstance(x, torch.Tensor):
+                    return x.item()
+                return x
+
+            # dump the train and val loss to a json file
+            loss_dict = {"train_loss": train_loss}
+            if val_loss:
+                # the name of the key can be "default", so we rename it to "val_loss"
+                key = next(iter(val_loss.keys()))
+                loss_dict["val_loss"] = val_loss.pop(key) if len(val_loss) == 1 else loss_dict.update(val_loss)
+            with open(os.path.join(path, "losses.json"), "w") as f:
+                try:
+                    json.dump({k: to_item(v) for k, v in loss_dict.items()}, f)
+                except:
+                    pass
+
         if is_dist_initialized:
             torch.distributed.barrier()
-        # TODO(@adil-a): Change this when we create a LR scheduler class
+
         model, optimizer, scheduler, tokenizer, config = None, None, None, None, None
 
         for key in sorted(self.__dict__["__state_tracked"]):
@@ -228,21 +281,26 @@ class BaseRecipe:
         if getattr(self.checkpointer.config, "is_async", False):
             # Async: defer symlink until the next call (after async_wait completes)
             setattr(self, "_last_pending_checkpoint_dir", path)
+            # Defer best symlink update similarly, capturing the metric used for comparison
+            if best_val_metric is not None:
+                setattr(self, "_last_pending_best_checkpoint_info", {"path": path, "val": float(best_val_metric)})
         else:
             # Sync: update immediately
             if is_rank_0:
                 self._update_latest_symlink(path)
+                if best_val_metric is not None:
+                    self._update_best_symlink(path, float(best_val_metric))
             if is_dist_initialized:
                 torch.distributed.barrier()
 
-    def _update_latest_symlink(self, target_dir: str) -> None:
+    def _update_checkpoint_symlink(self, link_name: str, target_dir: str) -> None:
         """
-        Create or update a symlink named "latest" under the checkpoint root
+        Create or update a symlink named `link_name` under the checkpoint root
         that points to `target_dir`.
-        Only called on rank 0.
+        Assumes caller ensures rank 0 if needed.
         """
         ckpt_root = self.checkpointer.config.checkpoint_dir
-        link_path = os.path.join(ckpt_root, "LATEST")
+        link_path = os.path.join(ckpt_root, link_name)
         if os.path.lexists(link_path):
             os.remove(link_path)
 
@@ -250,6 +308,28 @@ class BaseRecipe:
         target_abs = os.path.abspath(target_dir)
         relative_target = os.path.relpath(target_abs, start=ckpt_root_abs)
         os.symlink(relative_target, link_path)
+
+    def _update_latest_symlink(self, target_dir: str) -> None:
+        """
+        Create or update a symlink named "latest" under the checkpoint root
+        that points to `target_dir`.
+        Only called on rank 0.
+        """
+        self._update_checkpoint_symlink("LATEST", target_dir)
+
+    def _update_best_symlink(self, target_dir: str, val_loss: float) -> None:
+        """
+        Create or update a symlink named "LOWEST_VAL" under the checkpoint root
+        that points to the checkpoint with the lowest validation loss.
+        Only called on rank 0.
+        """
+        # Update best checkpoint if this one is better
+        if val_loss < self._best_val_loss:
+            self._best_val_loss = val_loss
+            self._update_checkpoint_symlink("LOWEST_VAL", target_dir)
+            logging.info(
+                f"Updated LOWEST_VAL checkpoint symlink to {os.path.basename(target_dir)} (val_loss={val_loss:.4f})"
+            )
 
     def load_checkpoint(self, restore_from: str | None = None):
         """
@@ -309,32 +389,25 @@ class BaseRecipe:
             and getattr(self.cfg.model, "pretrained_model_name_or_path", None),
         }
         try:
-            if _yaml is not None:
-                details_yaml = _yaml.safe_dump(details, sort_keys=False, default_flow_style=False).strip()
-            else:
-                details_yaml = "\n".join(f"{k}: {v}" for k, v in details.items())
-            list(map(logging.info, ("Experiment_details:\n" + details_yaml).splitlines()))
+            details_yaml = yaml.safe_dump(details, sort_keys=False, default_flow_style=False).strip()
+            for line in ("Experiment_details:\n" + details_yaml).splitlines():
+                logging.info(line)
         except Exception:
             logging.info(f"Experiment details: {details}")
         # Resolved config
         try:
             cfg_obj = getattr(self, "cfg", None)
-            cfg_dict = (
-                cfg_obj.to_dict() if hasattr(cfg_obj, "to_dict") else (dict(cfg_obj) if cfg_obj is not None else {})
-            )
+            # Prefer YAML-ready dict that converts callables/classes to dotted paths and preserves typed scalars
+            if hasattr(cfg_obj, "to_yaml_dict"):
+                cfg_dict = cfg_obj.to_yaml_dict()
+            elif hasattr(cfg_obj, "to_dict"):
+                cfg_dict = cfg_obj.to_dict()
+            else:
+                cfg_dict = dict(cfg_obj) if cfg_obj is not None else {}
 
-            def rec_print(log_fn, cfg_dict: dict | None, indent: int = 2):
-                if cfg_dict is None:
-                    return
-                for k, v in cfg_dict.items():
-                    if isinstance(v, dict):
-                        log_fn(f"{' ' * indent}{k}:")
-                        rec_print(log_fn, v, indent + 2)
-                    else:
-                        log_fn(f"{' ' * indent}{k}: {v}")
-
-            logging.info("Recipe config:")
-            rec_print(logging.info, cfg_dict)
+            # Print as clean YAML on stdout for easy copy/paste and readability
+            cfg_yaml = yaml.safe_dump(cfg_dict, sort_keys=False, default_flow_style=False).strip()
+            print(cfg_yaml, flush=True)
         except Exception:
             logging.info("Recipe config: <unavailable>")
 

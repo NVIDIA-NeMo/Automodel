@@ -45,6 +45,8 @@ class _StubTokenizerPlain:  # noqa: D401 – minimal interface only
 
     bos_token_id = 1
     eos_token_id = 2
+    # Mirror HF behavior flag used by formatting utils when computing prompt length
+    add_bos_token = True
 
     def __init__(self) -> None:
         self._vocab: Dict[str, int] = {}
@@ -143,7 +145,8 @@ def testformat_prompt_completion_answer_only_mask():
 
     # Prompt/answer masking logic
     prompt_text = f"{context} {question} "
-    prompt_ids = tok(prompt_text)["input_ids"]
+    # The implementation tokenizes prompt without special tokens to calculate mask
+    prompt_ids_no_special = tok(prompt_text, add_special_tokens=False)["input_ids"]
     full_text = f"{context} {question} {answer}"
     # @akoumparouli: remove the eos token
     full_text_ids = tok(full_text)["input_ids"][:-1]
@@ -151,9 +154,10 @@ def testformat_prompt_completion_answer_only_mask():
     assert len(full_text_ids) == 4
     assert len(full_text_ids) == len(out["input_ids"])
 
-    # Exclude the eos token
-    expected_zeros = len(prompt_ids) - 1
-    expected_ones = len(full_text_ids) - expected_zeros
+    # The format_prompt_completion adds BOS to len_prompt_ids, then shifts labels by 1
+    # So expected masked tokens = len(prompt_ids_no_special) + 1 (BOS) - 1 (shift) = len(prompt_ids_no_special)
+    expected_zeros = len(prompt_ids_no_special)
+    expected_ones = len(out["labels"]) - expected_zeros
 
     num_ignore_labels = out["labels"].count(-100)
     assert num_ignore_labels == expected_zeros, (out, out["labels"][-4:], len(out["labels"]), num_ignore_labels)
@@ -218,3 +222,101 @@ def test_apply_tokenizer_chat_template_full_loss_mask():
     assert set(out) == {"input_ids", "labels", "attention_mask"}
     assert len(out["input_ids"]) == len(out["labels"]) == len(out["attention_mask"])
     assert all(v == 1 for v in out["attention_mask"])
+
+
+class _StubTokenizerChatNoGen:
+    """Chat-template tokenizer WITHOUT generation keyword; returns no assistant mask."""
+
+    eos_token_id = 2
+    chat_template = "<dummy template without generation keyword>"
+    _start_of_turn_token_id = 99
+
+    def __init__(self) -> None:
+        self._vocab: Dict[str, int] = {}
+        self._cursor: int = 3  # start after BOS/EOS
+
+    def _id_for_token(self, tok: str) -> int:
+        if tok not in self._vocab:
+            self._vocab[tok] = self._cursor
+            self._cursor += 1
+        return self._vocab[tok]
+
+    def apply_chat_template(self, messages, **kwargs):  # type: ignore[override]
+        # Compose ids as:
+        # [SOT] + <all non-assistant message tokens> + [SOT] + <assistant tokens (if any)>
+        ids: List[int] = [self._start_of_turn_token_id]
+        # prompt tokens (system + user, etc.)
+        for msg in messages:
+            if msg["role"] == "assistant":
+                break
+            ids.extend(self._id_for_token(tok) for tok in str(msg["content"]).split())
+        # delimiter before assistant section
+        ids.append(self._start_of_turn_token_id)
+        # assistant tokens (if present)
+        assistant_started = False
+        for msg in messages:
+            if msg["role"] == "assistant":
+                assistant_started = True
+            if assistant_started:
+                ids.extend(self._id_for_token(tok) for tok in str(msg["content"]).split())
+        # Intentionally DO NOT append EOS here; function under test will handle it.
+        if kwargs.get("return_dict", False):
+            return {"input_ids": ids}
+        return ids
+
+
+def test_apply_chat_template_manual_mask_without_generation_kwd():
+    # Tokenizer without generation keyword in template
+    tok = _StubTokenizerChatNoGen()
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "what now"},
+        {"role": "assistant", "content": "answer goes here"},
+    ]
+
+    # Compute expected prompt length as used by the implementation
+    prompt_only = messages[:-1]
+    tokenized_prompt = tok.apply_chat_template(prompt_only, return_dict=True)
+    len_prompt_ids = len(tokenized_prompt["input_ids"])
+
+    out = format_chat_template(
+        tok,
+        formatted_text=[m.copy() for m in messages],
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.eos_token_id,
+        answer_only_loss_mask=True,
+    )
+
+    # Basic structure
+    pad_info = out.pop("___PAD_TOKEN_IDS___")
+    assert set(out) == {"input_ids", "labels", "attention_mask"}
+    assert len(out["input_ids"]) == len(out["labels"]) == len(out["attention_mask"])
+    assert pad_info["labels"] == -100
+
+    # Since labels drop the first token (treated as BOS/SOT), expected ignored labels:
+    expected_ignored = max(0, len_prompt_ids - 1)
+    assert out["labels"].count(-100) == expected_ignored
+    # Sanity: there must be supervised tokens (assistant section)
+    assert expected_ignored < len(out["labels"])
+    # Number of supervised tokens (exclude -100) should equal number of assistant tokens.
+    # Note: labels include the final EOS as supervised; subtract 1 to compare to assistant count.
+    assistant_tokens = sum(len(str(m["content"]).split()) for m in messages if m["role"] == "assistant")
+    num_supervised = sum(1 for v in out["labels"] if v != -100)
+    assert num_supervised - 1 == assistant_tokens
+
+
+def test_apply_chat_template_manual_mask_raises_when_last_not_assistant():
+    tok = _StubTokenizerChatNoGen()
+    # Last message is not assistant → assertion should trigger
+    bad_messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "q"},
+    ]
+    with pytest.raises(AssertionError):
+        _ = format_chat_template(
+            tok,
+            formatted_text=[m.copy() for m in bad_messages],
+            eos_token_id=tok.eos_token_id,
+            pad_token_id=tok.eos_token_id,
+            answer_only_loss_mask=True,
+        )

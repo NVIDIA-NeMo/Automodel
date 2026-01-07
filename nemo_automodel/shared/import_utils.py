@@ -419,3 +419,50 @@ def is_te_min_version(version, check_equality=True):
     if check_equality:
         return get_te_version() >= PkgVersion(version)
     return get_te_version() > PkgVersion(version)
+
+
+def get_transformers_version():
+    """Get transformers version from __version__."""
+    try:
+        import transformers
+
+        if hasattr(transformers, "__version__"):
+            _version = str(transformers.__version__)
+        else:
+            from importlib.metadata import version
+
+            _version = version("transformers")
+    except ImportError:
+        _version = "0.0.0"
+    return PkgVersion(_version)
+
+
+def is_transformers_min_version(version, check_equality=True):
+    """Check if minimum version of `transformers` is installed."""
+    if check_equality:
+        return get_transformers_version() >= PkgVersion(version)
+    return get_transformers_version() > PkgVersion(version)
+
+
+def get_check_model_inputs_decorator():
+    """
+    Get the appropriate check_model_inputs decorator based on transformers version.
+
+    In transformers >= 4.57.3, check_model_inputs became a function that returns a decorator.
+    In older versions, it was directly a decorator.
+
+    Returns:
+        Decorator function to validate model inputs.
+    """
+    try:
+        from transformers.utils.generic import check_model_inputs
+
+        if is_transformers_min_version("4.57.3"):
+            # New API: check_model_inputs() returns a decorator
+            return check_model_inputs()
+        else:
+            # Old API: check_model_inputs is directly a decorator
+            return check_model_inputs
+    except ImportError:
+        # If transformers is not available, return a no-op decorator
+        return null_decorator

@@ -34,11 +34,8 @@ parallelizer:
   activation_checkpointing: false
 
 model:
-  _target_: nemo_automodel.components.models.qwen3_next.model.Qwen3NextForCausalLM.from_config
-  config:
-    _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: Qwen/Qwen3-Next-80B-A3B-Instruct
-  is_meta_device: true
+  _target_: nemo_automodel.components.models.qwen3_next.model.Qwen3NextForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-Next-80B-A3B-Instruct
 
 checkpoint:
   enabled: false
@@ -76,7 +73,6 @@ dataset:
 packed_sequence:
   # Set packed_sequence_size > 0 to run with packed sequences
   packed_sequence_size: 0
-  split_across_pack: false
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

@@ -14,11 +14,39 @@
 import pytest
 import torch
 import torch.nn as nn
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import patch, MagicMock
+from types import SimpleNamespace
 
-from nemo_automodel.recipes.vlm.finetune import _freeze_model, _build_optimizer, build_model_and_optimizer
+from contextlib import nullcontext
+
+from nemo_automodel.components.loggers.metric_logger import MetricsSample
+from nemo_automodel.recipes.vlm.finetune import (
+    FinetuneRecipeForVLM,
+    _freeze_model,
+    _get_model_name,
+    build_model_and_optimizer,
+)
+
+
+class _Cfg(SimpleNamespace):
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+def test_get_model_name_prefers_pretrained_path():
+    cfg = _Cfg(pretrained_model_name_or_path="org/model")
+    assert _get_model_name(cfg) == "org/model"
+
+    cfg = _Cfg(config={"pretrained_model_name_or_path": "nested/model"})
+    assert _get_model_name(cfg) == "nested/model"
+
+    assert _get_model_name(_Cfg()) is None
+
+
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
+
+
+def _count_trainable(parameters):
+    return sum(p.numel() for p in parameters if getattr(p, "requires_grad", False))
 
 @pytest.fixture(autouse=True)
 def _mock_missing_cuda(monkeypatch):
@@ -55,8 +83,7 @@ class DummyOptConfig:
 
     def __init__(self, lr: float = 0.01):
         self.lr = lr
-        self.foreach = None  # will be modified by _build_optimizer when tp_size > 1
-
+        self.foreach = None 
     def instantiate(self, params):
         # Always return an SGD optimizer for the given params
         return torch.optim.SGD(params, lr=self.lr)
@@ -67,8 +94,11 @@ class DummyOptConfig:
 class DummyModelConfig:
     """Mimics the Hydra/OmegaConf model config with an *instantiate* method."""
 
-    def instantiate(self):
+    def instantiate(self, **kwargs):
         return DummyModel()
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
 
 
 # -----------------------------------------------------------------------------
@@ -104,41 +134,6 @@ def test_freeze_model_with_config(monkeypatch):
 
 
 # -----------------------------------------------------------------------------
-# _build_optimizer
-# -----------------------------------------------------------------------------
-
-def _count_trainable(p):
-    return sum(x.numel() for x in p if x.requires_grad)
-
-
-def test_build_optimizer_single_tp():
-    model = DummyModel()
-    cfg_opt = DummyOptConfig(lr=0.05)
-
-    optim = _build_optimizer(model, cfg_opt, tp_size=1)
-
-    # Optimizer should be torch.optim.Optimizer subclass with correct LR
-    assert isinstance(optim, torch.optim.Optimizer)
-    assert pytest.approx(optim.param_groups[0]["lr"], rel=1e-6) == 0.05
-
-    # cfg_opt.foreach should remain untouched (None)
-    assert cfg_opt.foreach is None
-
-
-def test_build_optimizer_multi_tp():
-    model = DummyModel()
-    cfg_opt = DummyOptConfig(lr=0.02)
-
-    optim = _build_optimizer(model, cfg_opt, tp_size=2)
-
-    # Optimizer still constructed
-    assert isinstance(optim, torch.optim.Optimizer)
-
-    # tp_size > 1 must disable foreach behaviour
-    assert cfg_opt.foreach in (False, None)
-
-
-# -----------------------------------------------------------------------------
 # build_model_and_optimizer
 # -----------------------------------------------------------------------------
 
@@ -158,18 +153,23 @@ def test_build_model_and_optimizer_basic():
         is_peft=False,
     )
     checkpointer = Checkpointer(config=ckpt_cfg, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
-    model, _, optim = build_model_and_optimizer(
-        device=device,
-        cfg_model=cfg_model,
-        cfg_opt=cfg_opt,
-        cfg_freeze=None,
-        cfg_peft=None,
-        model_wrapper=None,
-        seed=123,
-        checkpointer=checkpointer,
-        tp_size=1,
-        freeze_embeddings=True,
-    )
+    # Ensure meta init path is exercised and weights are materialized via checkpointer
+    def _load_base_model_stub(model, device, *args, **kwargs):
+        if hasattr(model, "to_empty"):
+            model.to_empty(device=device)
+    with patch.object(checkpointer, 'load_base_model', new=_load_base_model_stub):
+        model, _, optim = build_model_and_optimizer(
+            device=device,
+            cfg_model=cfg_model,
+            cfg_opt=cfg_opt,
+            cfg_freeze=None,
+            cfg_peft=None,
+            model_wrapper=SimpleNamespace(parallelize=lambda m: m),
+            seed=123,
+            checkpointer=checkpointer,
+            tp_size=1,
+            freeze_embeddings=True,
+        )
 
     # Check returned objects and their properties
     assert isinstance(model, DummyModel)
@@ -188,6 +188,94 @@ def test_build_model_and_optimizer_basic():
 
 
 # -----------------------------------------------------------------------------
+# FinetuneRecipeForVLM helpers
+# -----------------------------------------------------------------------------
+
+
+class _DummyOptimizer:
+    def __init__(self):
+        self.param_groups = [{"lr": 0.01}]
+        self.step_called = False
+        self.zero_grad_called = False
+
+    def step(self):
+        self.step_called = True
+
+    def zero_grad(self, set_to_none=True):
+        self.zero_grad_called = True
+
+
+class _TensorModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, **batch):
+        return torch.zeros((), requires_grad=True)
+
+
+@pytest.mark.cuda(False)
+def test_run_train_step_supports_tensor_outputs(monkeypatch):
+    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.device_mesh = None
+    recipe.moe_mesh = None
+    recipe.loss_fn = object()
+    recipe.model = _TensorModel()
+    recipe.optimizer = _DummyOptimizer()
+    recipe.step_scheduler = SimpleNamespace(step=0, epoch=0)
+    recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
+    recipe.cfg = _Cfg(fp8=None)
+    recipe.lr_scheduler = None
+    recipe.timestamp = 0.0
+    recipe.model_wrapper = None
+
+    recipe._dp_allreduce = lambda tensor, include_cp=False: tensor
+    recipe._get_dp_group_size = lambda include_cp=True: 1
+
+    batches = [
+        {
+            "labels": torch.tensor([[1, -100]]),
+            "input_ids": torch.tensor([[1, 2]]),
+        }
+    ]
+
+    logits_seen = {}
+
+    def fake_calculate_loss(*args, **kwargs):
+        logits_seen["value"] = kwargs["logits"]
+        return torch.tensor(1.0, requires_grad=True)
+
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
+        lambda device_mesh, batch, labels: (lambda: nullcontext(), batch),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.get_sync_ctx",
+        lambda model, is_last, defer_fsdp_grad_sync=True: nullcontext(),
+    )
+
+    calculate_mock = MagicMock(side_effect=fake_calculate_loss)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.calculate_loss", calculate_mock)
+
+    grad_clip_mock = MagicMock(return_value=2.5)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.scale_grads_and_clip_grad_norm",
+        grad_clip_mock,
+    )
+
+    metrics = recipe._run_train_optim_step(batches, max_grad_norm=1.0)
+
+    assert isinstance(metrics, MetricsSample)
+    assert logits_seen["value"].requires_grad
+    grad_clip_mock.assert_called_once()
+    assert calculate_mock.call_args.kwargs["num_label_tokens"] == 1
+    assert metrics.metrics["grad_norm"] == 2.5
+    assert recipe.optimizer.step_called
+    assert recipe.optimizer.zero_grad_called
+
+
+# -----------------------------------------------------------------------------
 # AutoProcessor exception handling test
 # -----------------------------------------------------------------------------
 
@@ -197,11 +285,10 @@ def test_autoprocessor_success():
     with patch('transformers.AutoProcessor') as mock_auto_processor:
         mock_processor = MagicMock()
         mock_auto_processor.from_pretrained.return_value = mock_processor
-        
-        cfg_model = MagicMock()
-        cfg_model.pretrained_model_name_or_path = "test/model"
-        
-        processor = mock_auto_processor.from_pretrained(cfg_model.pretrained_model_name_or_path)
+
+        model_id = "test/model"
+
+        processor = mock_auto_processor.from_pretrained(model_id)
         
         assert processor is mock_processor
         mock_auto_processor.from_pretrained.assert_called_once_with("test/model")
@@ -229,13 +316,10 @@ def test_autoprocessor_exception_handling(caplog):
         cfg_dl.get.return_value = None  # No custom settings
         cfg_dl.instantiate.return_value = MagicMock()
         
-        cfg_model = MagicMock()
-        cfg_model.pretrained_model_name_or_path = "test/model"
-        
         cfg_processor = None  # This triggers the exception path
         
         with caplog.at_level(logging.WARNING):
-            dataloader, processor = build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, None, 123, 1)
+            dataloader, processor = build_dataloader(cfg_ds, cfg_dl, "test/model", cfg_processor, None, 123, 1)
         
         # Verify the results
         assert processor is None
@@ -270,13 +354,10 @@ def test_autoprocessor_with_processor_kwargs(caplog):
         cfg_dl.get.return_value = None  # No custom settings
         cfg_dl.instantiate.return_value = MagicMock()
         
-        cfg_model = MagicMock()
-        cfg_model.pretrained_model_name_or_path = "test/model"
-        
         cfg_processor = ProcessorConfig()  # This has to_dict but no instantiate
         
         with caplog.at_level(logging.WARNING):
-            dataloader, processor = build_dataloader(cfg_ds, cfg_dl, cfg_model, cfg_processor, None, 123, 1)
+            dataloader, processor = build_dataloader(cfg_ds, cfg_dl, "test/model", cfg_processor, None, 123, 1)
         
         # Verify the results
         assert processor is None

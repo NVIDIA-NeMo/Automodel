@@ -16,7 +16,7 @@
 FineWeb dataset preprocessing script
 
 This tool downloads a dataset from the Hugging Face Hub (default: FineWeb),
-tokenizes the data (default: tiktoken + gpt2), and writes memory-mapped binary shards compatible
+tokenizes the data (default: GPT-2 via transformers.AutoTokenizer), and writes memory-mapped binary shards compatible
 with `BinTokenDataset` for efficient streaming pre-training.
 
 Usage (typical):

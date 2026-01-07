@@ -131,6 +131,7 @@ def apply_fsdp(
     offload_policy: OffloadPolicy | None = None,
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
+    wrap_outer_model: bool = True,
 ):
     if isinstance(lm_head_precision, str):
         lm_head_precision = dtype_from_str(lm_head_precision, default=None)
@@ -197,7 +198,24 @@ def apply_fsdp(
         else:
             fully_shard_default(lm_head)
 
+    # TODO: properly handle all possible multimodal component names
+    if hasattr(model, "audio_tower") and model.audio_tower is not None:
+        if any(param.requires_grad for param in model.audio_tower.parameters()):
+            fully_shard_default(model.audio_tower)
+        else:
+            logging.info("Skipping FSDP wrap for frozen audio tower")
+
+    if hasattr(model, "visual") and model.visual is not None:
+        if any(param.requires_grad for param in model.visual.parameters()):
+            fully_shard_default(model.visual)
+        else:
+            logging.info("Skipping FSDP wrap for frozen visual tower")
+
     fully_shard_default(_model)
+
+    # If model has a nested structure (outer model wrapping inner _model), wrap the outer model if requested
+    if wrap_outer_model and model is not _model:
+        fully_shard_default(model)
 
 
 def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p2p"):
@@ -235,6 +253,7 @@ def parallelize_model(
     activation_checkpointing: bool = False,
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
+    wrap_outer_model: bool = True,
 ):
     assert tp_axis_name is None or world_mesh[tp_axis_name].size() == 1, (
         "Tensor parallelism not supported for custom MoE models"
@@ -273,4 +292,5 @@ def parallelize_model(
             ep_shard_mesh=ep_shard_mesh,
             reshard_after_forward=reshard_after_forward,
             lm_head_precision=lm_head_precision,
+            wrap_outer_model=wrap_outer_model,
         )

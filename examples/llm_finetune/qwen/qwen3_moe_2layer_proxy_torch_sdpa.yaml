@@ -59,7 +59,6 @@ model:
     pad_token_id: 0
     use_cache: false
   trust_remote_code: true
-  is_meta_device: true
   backend:
     _target_: nemo_automodel.components.moe.utils.BackendConfig
     attn: sdpa
@@ -104,7 +103,6 @@ dataset:
 
 packed_sequence:
   packed_sequence_size: 0
-  split_across_pack: false
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
