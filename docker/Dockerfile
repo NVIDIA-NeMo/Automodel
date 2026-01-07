@@ -13,7 +13,7 @@
 # limitations under the License.
 
 ARG CUDA_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
-ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:25.09-py3
+ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:25.11-py3
 ARG BASE_IMAGE=cuda
 
 FROM ${CUDA_IMAGE} AS cuda
@@ -67,7 +67,7 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
 FROM update_base_container AS automodel_dep
 
 # Install Grouped Gemm
-RUN pip install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
+RUN pip install --no-build-isolation git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
 
 # Install Mamba
 ARG INSTALL_MAMBA=False
