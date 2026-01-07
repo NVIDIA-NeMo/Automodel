@@ -69,7 +69,7 @@ from nemo_automodel import (
 )
 # instantiate a model with NeMo's AutoClasses
 model = NeMoAutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
-tok = NeMoAutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
+tokenizer = NeMoAutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
 ```
 
 Also available:
