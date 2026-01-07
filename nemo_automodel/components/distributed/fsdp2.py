@@ -246,23 +246,12 @@ class FSDP2Manager:
         dp_shard_cp_mesh_dim_names.append("cp")
         dp_cp_mesh_dim_names.append("cp")
 
-        # Flatten submeshes only when at least one dimension is > 1
-        # Workaround for https://github.com/pytorch/pytorch/issues/169381
-        # PyTorch's _flatten() fails when all dimensions are size 1
-        def _try_flatten_submesh(submesh_dims: list, flattened_name: str) -> None:
-            """Conditionally flatten a submesh if it has multiple dimensions with at least one > 1."""
-            submesh_names = tuple(submesh_dims)
-            if len(submesh_names) > 1 and any(self.device_mesh[dim].size() > 1 for dim in submesh_names):
-                self.device_mesh[submesh_names]._flatten(mesh_dim_name=flattened_name)
-                logger.debug(f"Flattened {submesh_names} -> '{flattened_name}'")
-            else:
-                logger.debug(f"Skipping {flattened_name} flatten (dimensions are all size 1)")
-
-        # Create flattened submeshes for data parallelism combinations
-        _try_flatten_submesh(dp_mesh_dim_names, "dp")  # dp_replicate + dp_shard
-        _try_flatten_submesh(dp_shard_cp_mesh_dim_names, "dp_shard_cp")  # dp_shard + cp
-        _try_flatten_submesh(dp_cp_mesh_dim_names, "dp_cp")  # dp_replicate + dp_shard + cp
-
+        # submesh for dp
+        self.device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
+        # submesh for dp_shard_cp
+        self.device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_shard_cp")
+        # submesh for dp_cp
+        self.device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
         return self.device_mesh
 
     def _get_moe_mesh(self):

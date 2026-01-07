@@ -109,46 +109,6 @@ class ParallelizationStrategy(ABC):
 class DefaultParallelizationStrategy(ParallelizationStrategy):
     """Default parallelization strategy used by most models."""
 
-    @staticmethod
-    def _resolve_fsdp_mesh_dims(
-        device_mesh: DeviceMesh,
-        dp_replicate_mesh_name: str,
-        dp_shard_cp_mesh_name: str,
-    ) -> tuple:
-        """Resolve the appropriate mesh dimensions for FSDP.
-
-        FSDP requires a 1D or 2D mesh. This method determines the correct dimensions
-        to use, preferring flattened dimensions when available.
-
-        Returns:
-            Tuple of dimension names to use for the FSDP mesh.
-        """
-        mesh_dim_names = getattr(device_mesh, "mesh_dim_names", None)
-
-        # If mesh_dim_names not available, use the default passed names (backward compatibility)
-        if mesh_dim_names is None:
-            logger.debug(f"FSDP mesh: ({dp_replicate_mesh_name}, {dp_shard_cp_mesh_name}) [no mesh_dim_names]")
-            return (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-
-        # Use flattened dimension if available
-        if dp_shard_cp_mesh_name in mesh_dim_names:
-            logger.debug(f"FSDP mesh: ({dp_replicate_mesh_name}, {dp_shard_cp_mesh_name}) [flattened]")
-            return (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-
-        # Check if cp dimension exists and get its size
-        cp_size = device_mesh["cp"].size() if "cp" in mesh_dim_names else 1
-
-        if cp_size == 1:
-            logger.debug(f"FSDP mesh: ({dp_replicate_mesh_name}, dp_shard) [cp={cp_size}, unflattened]")
-            return (dp_replicate_mesh_name, "dp_shard")
-        else:
-            raise RuntimeError(
-                f"Cannot construct FSDP mesh: cp={cp_size} but '{dp_shard_cp_mesh_name}' dimension not found. "
-                f"FSDP requires 1D or 2D mesh, but would need 3D: ({dp_replicate_mesh_name}, dp_shard, cp). "
-                f"Flattening (dp_shard, cp) -> '{dp_shard_cp_mesh_name}' should occur in FSDP2Manager._get_device_mesh() (fsdp2.py). "
-                f"Available: {mesh_dim_names}"
-            )
-
     def parallelize(
         self,
         model: nn.Module,
@@ -166,8 +126,9 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         """Apply the default parallelization flow."""
         tp_mesh = device_mesh[tp_mesh_name]
 
-        # Determine the appropriate FSDP mesh dimensions (must be 1D or 2D)
-        dp_mesh_dim_names = self._resolve_fsdp_mesh_dims(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
+        # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
+        # if dp_replicate_size > 1, use HSDP, else use FSDP
+        dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
         dp_mesh = device_mesh[dp_mesh_dim_names]
 
         # Extract layers from the model for parallelization
