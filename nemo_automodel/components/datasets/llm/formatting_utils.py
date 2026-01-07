@@ -146,7 +146,7 @@ def format_prompt_completion(
     if answer_only_loss_mask:
         # don't add eos token here. NOTE: this is only for calculating the length of the prompt.
         # we are not modifying the prompt to be returned here.
-        prompt_ids = [tokenizer.bos_token_id] if tokenizer.add_bos_token else []
+        prompt_ids = [tokenizer.bos_token_id] if getattr(tokenizer, "add_bos_token", False) else []
         prompt_ids += tokenizer(prompt, add_special_tokens=False)["input_ids"]
         len_prompt_ids = len(prompt_ids)
     else:

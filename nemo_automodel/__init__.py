@@ -33,15 +33,18 @@ try:
         NeMoAutoModelForSequenceClassification,
         NeMoAutoModelForTextToWaveform,
     )  # noqa: I001
+    from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 
     globals()["NeMoAutoModelForCausalLM"] = NeMoAutoModelForCausalLM
     globals()["NeMoAutoModelForImageTextToText"] = NeMoAutoModelForImageTextToText
     globals()["NeMoAutoModelForSequenceClassification"] = NeMoAutoModelForSequenceClassification
     globals()["NeMoAutoModelForTextToWaveform"] = NeMoAutoModelForTextToWaveform
+    globals()["NeMoAutoTokenizer"] = NeMoAutoTokenizer
     __all__.append("NeMoAutoModelForCausalLM")
     __all__.append("NeMoAutoModelForImageTextToText")
     __all__.append("NeMoAutoModelForSequenceClassification")
     __all__.append("NeMoAutoModelForTextToWaveform")
+    __all__.append("NeMoAutoTokenizer")
 except:
     # optional dependency might be missing,
     # leave the name off the module namespace so other imports still work

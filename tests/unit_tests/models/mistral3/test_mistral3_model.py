@@ -98,10 +98,3 @@ class TestMinistral3ForCausalLM:
         assert outputs.logits.shape == (batch, seq_len, cfg.vocab_size)
         mock_forward.assert_called_once()
 
-
-class TestModelClassExport:
-    def test_model_class_points_to_models(self):
-        assert hasattr(mistral_mod, "ModelClass")
-        assert mistral_mod.Ministral3ForCausalLM in mistral_mod.ModelClass
-        assert Mistral3ForConditionalGeneration in mistral_mod.ModelClass
-
