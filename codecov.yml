@@ -1,13 +1,17 @@
 comment: false
+
 coverage:
   status:
     project:
-      default:
+      minimum-70:
         target: 70%
         threshold: 0%
+      no-regress:
+        target: auto
+        threshold: 0%
         base: auto
-        if_ci_failed: error
-        if_not_found: success
+
+if_ci_failed: error
 
 fixes:
   - "/workspace/::"
