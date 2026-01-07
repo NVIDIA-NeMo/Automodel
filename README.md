@@ -33,7 +33,7 @@ Overview
 NeMo AutoModel is an open-source training library under [NVIDIA NeMo Framework](https://github.com/NVIDIA-NeMo) that **simplifies distributed training** for LLMs and VLMs, from a single GPU to multi-node runs, with first-class integration for 🤗 Transformers models and checkpoints.
 
 **Two common ways to use it:**
-- **As a library in your own trainer**: swap `transformers.AutoModel*` / `AutoTokenizer` for NeMo’s **API-compatible AutoClasses** and keep your training loop (see [🤗 Transformers API compatibility](#use-as-a-library--transformers-compatible-autoclasses))
+- **As a library in your own trainer**: swap `transformers.AutoModel*` / `AutoTokenizer` for NeMo’s **API-compatible AutoClasses** and keep your training loop (see [🤗 Transformers API compatibility](#use-as-a-library--transformers-compatible-autoclasses)).
 - **As a ready-to-run trainer**: use the provided **YAML-driven recipes** (and `automodel` CLI) to run SFT/PEFT/pretraining out of the box.
 <p align="center">
 <a href="https://github.com/NVIDIA-NeMo/Automodel"><picture>
