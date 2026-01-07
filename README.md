@@ -59,25 +59,39 @@ What you can expect:
 NeMo AutoModel ships **drop-in replacements** for key 🤗 `transformers` AutoClasses, enabling it to use it with your own training code. They intentionally preserve the Hugging Face *public* model APIs (e.g., `forward`, `generate`, `save_pretrained`) while extending **only** the AutoClass constructors with NeMo-specific knobs (kernel patching, HF fallback controls, etc.).
 
 
-| 🤗 `transformers` | NeMo AutoModel |
-|---|---|
-| <pre><code>from transformers import AutoModelForCausalLM, AutoTokenizer
+<table>
+  <tr>
+    <td><b>🤗 <code>transformers</code></b></td>
+    <td><b>NeMo AutoModel</b></td>
+  </tr>
+  <tr>
+    <td>
+      <pre><code>from transformers import AutoModelForCausalLM, AutoTokenizer
 
 model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
-tok = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
-</code></pre> | <pre><code>from nemo_automodel import NeMoAutoModelForCausalLM
+tok = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")</code></pre>
+    </td>
+    <td>
+      <pre><code>from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 
 model = NeMoAutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
-tok = NeMoAutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
-</code></pre> |
-| <pre><code>from transformers import AutoModelForImageTextToText
+tok = NeMoAutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")</code></pre>
+    </td>
+  </tr>
+  <tr>
+    <td>
+      <pre><code>from transformers import AutoModelForImageTextToText
 
-model = AutoModelForImageTextToText.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
-</code></pre> | <pre><code>from nemo_automodel import NeMoAutoModelForImageTextToText
+model = AutoModelForImageTextToText.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")</code></pre>
+    </td>
+    <td>
+      <pre><code>from nemo_automodel import NeMoAutoModelForImageTextToText
 
-model = NeMoAutoModelForImageTextToText.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
-</code></pre> |
+model = NeMoAutoModelForImageTextToText.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")</code></pre>
+    </td>
+  </tr>
+</table>
 
 Also available:
 - **Sequence classification**: `transformers.AutoModelForSequenceClassification` → `nemo_automodel.NeMoAutoModelForSequenceClassification`
