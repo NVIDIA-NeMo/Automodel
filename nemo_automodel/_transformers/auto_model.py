@@ -428,6 +428,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 *model_args,
                 torch_dtype=torch_dtype,
                 attn_implementation=attn_implementation,
+                quantization_config=quantization_config,
                 **kwargs,
             )
         architectures = get_architectures(hf_config)
