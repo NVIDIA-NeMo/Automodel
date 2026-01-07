@@ -189,10 +189,10 @@ def _prepare_hf_config_and_flag(pretrained_model_name_or_path, force_hf, kwargs,
     kwargs["trust_remote_code"] = kwargs.get(
         "trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path)
     )
-        # Finally make sure flash_attention is available
+    # Finally make sure flash_attention is available
     if attn_implementation == "flash_attention_2":
         try:
-            from flash_attn import flash_attn_func
+            from flash_attn import flash_attn_func  # noqa: F401
         except (ImportError, ModuleNotFoundError):
             attn_implementation = "sdpa"
             logger.warning("Flash Attention 2 is not available. Setting model's attn_implementation to sdpa")
@@ -229,7 +229,7 @@ def _apply_preload_overrides(is_hf_model, tp_size, cp_size, has_packed_sequence,
         attn_implementation = "sdpa"
         logger.warning("Packed sequence is supported only with SDPA. Setting model's attn_implementation to sdpa")
 
-    if  is_hf_model and has_packed_sequence:
+    if is_hf_model and has_packed_sequence:
         if cp_size == 1:
             attn_implementation = "flash_attention_2"
             logger.warning(
