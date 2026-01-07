@@ -61,45 +61,30 @@ NeMo AutoModel ships **drop-in replacements** for key 🤗 `transformers` AutoCl
 
 <table>
   <tr>
-    <td><b>🤗 <code>transformers</code></b></td>
-    <td><b>NeMo AutoModel</b></td>
+    <td width="50%"><b>🤗 <code>transformers</code></b></td>
+    <td width="50%"><b>NeMo AutoModel</b></td>
   </tr>
   <tr>
-    <td>
-      <pre><code>from transformers import AutoModelForCausalLM, AutoTokenizer
-
-model = AutoModelForCausalLM.from_pretrained(
-  "meta-llama/Llama-3.2-1B"
-)
-tok = AutoTokenizer.from_pretrained(
-  "meta-llama/Llama-3.2-1B"
-)</code></pre>
+    <td width="50%" valign="top">
+      <code>from transformers import AutoModelForCausalLM, AutoTokenizer<br><br>
+      model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")<br>
+      tok = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")</code>
     </td>
-    <td>
-      <pre><code>from nemo_automodel import NeMoAutoModelForCausalLM, NeMoAutoTokenizer
-
-model = NeMoAutoModelForCausalLM.from_pretrained(
-  "meta-llama/Llama-3.2-1B"
-)
-tok = NeMoAutoTokenizer.from_pretrained(
-  "meta-llama/Llama-3.2-1B"
-)</code></pre>
+    <td width="50%" valign="top">
+      <code>from nemo_automodel import NeMoAutoModelForCausalLM<br>
+      from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer<br><br>
+      model = NeMoAutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")<br>
+      tok = NeMoAutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")</code>
     </td>
   </tr>
   <tr>
-    <td>
-      <pre><code>from transformers import AutoModelForImageTextToText
-
-model = AutoModelForImageTextToText.from_pretrained(
-  "Qwen/Qwen2.5-VL-3B-Instruct"
-)</code></pre>
+    <td width="50%" valign="top">
+      <code>from transformers import AutoModelForImageTextToText<br><br>
+      model = AutoModelForImageTextToText.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")</code>
     </td>
-    <td>
-      <pre><code>from nemo_automodel import NeMoAutoModelForImageTextToText
-
-model = NeMoAutoModelForImageTextToText.from_pretrained(
-  "Qwen/Qwen2.5-VL-3B-Instruct"
-)</code></pre>
+    <td width="50%" valign="top">
+      <code>from nemo_automodel import NeMoAutoModelForImageTextToText<br><br>
+      model = NeMoAutoModelForImageTextToText.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")</code>
     </td>
   </tr>
 </table>
