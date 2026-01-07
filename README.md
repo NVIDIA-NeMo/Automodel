@@ -63,11 +63,9 @@ They intentionally preserve the Hugging Face *public* model APIs (e.g., `forward
 AutoModel-only example:
 
 ```python
-from nemo_automodel import (
-    NeMoAutoModelForCausalLM,
-    NeMoAutoTokenizer,
-)
-# instantiate a model with NeMo's AutoClasses
+from nemo_automodel import NeMoAutoModelForCausalLM, NeMoAutoTokenizer
+
+# instantiate a model and tokenizer with NeMo's AutoClasses
 model = NeMoAutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
 tokenizer = NeMoAutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
 ```
