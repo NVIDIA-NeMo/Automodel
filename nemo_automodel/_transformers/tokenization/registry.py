@@ -16,7 +16,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Type, Union
 
-from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import AutoTokenizerWithBosEosEnforced
+from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import NeMoAutoTokenizerWithBosEosEnforced
 
 logger = logging.getLogger(__name__)
 

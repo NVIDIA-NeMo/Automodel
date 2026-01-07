@@ -51,7 +51,7 @@ class NeMoAutoTokenizer(AutoTokenizer):
 
     The dispatch logic is:
     1. If a custom tokenizer is registered for the model type, use it
-    2. Otherwise, fall back to AutoTokenizerWithBosEosEnforced
+    2. Otherwise, fall back to NeMoAutoTokenizerWithBosEosEnforced
 
     Example:
         >>> # Will use MistralCommonBackend if available for Mistral models
