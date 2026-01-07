@@ -33,7 +33,7 @@ class _TokenizerRegistry:
     model_type_to_tokenizer: Dict[str, Union[Type, Callable]] = field(default_factory=dict)
 
     # Default tokenizer class when no custom implementation is found
-    default_tokenizer_cls: Type = AutoTokenizerWithBosEosEnforced
+    default_tokenizer_cls: Type = NeMoAutoTokenizerWithBosEosEnforced
 
     def register(self, model_type: str, tokenizer_cls: Union[Type, Callable]) -> None:
         """
