@@ -25,9 +25,7 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
     """
 
     @classmethod
-    def from_pretrained(
-        cls, pretrained_model_name_or_path, *args, add_bos_token=True, add_eos_token=True, **kwargs
-    ):
+    def from_pretrained(cls, pretrained_model_name_or_path, *args, add_bos_token=True, add_eos_token=True, **kwargs):
         """
         Load the HF tokenizer class via AutoTokenizer and (optionally) wrap it to add BOS/EOS.
 

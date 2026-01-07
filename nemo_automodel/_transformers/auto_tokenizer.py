@@ -41,6 +41,7 @@ def _get_model_type(pretrained_model_name_or_path: str, trust_remote_code: bool 
         logger.debug(f"Could not load config to determine model type: {e}")
         return None
 
+
 class NeMoAutoTokenizer(AutoTokenizer):
     """
     Auto tokenizer class that dispatches to appropriate tokenizer implementations.
@@ -121,6 +122,7 @@ class NeMoAutoTokenizer(AutoTokenizer):
         return NeMoAutoTokenizerWithBosEosEnforced.from_pretrained(
             pretrained_model_name_or_path, *args, trust_remote_code=trust_remote_code, **kwargs
         )
+
 
 __all__ = [
     "NeMoAutoTokenizer",
