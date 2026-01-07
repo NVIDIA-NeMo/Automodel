@@ -68,27 +68,38 @@ NeMo AutoModel ships **drop-in replacements** for key 🤗 `transformers` AutoCl
     <td>
       <pre><code>from transformers import AutoModelForCausalLM, AutoTokenizer
 
-model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
-tok = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")</code></pre>
+model = AutoModelForCausalLM.from_pretrained(
+  "meta-llama/Llama-3.2-1B"
+)
+tok = AutoTokenizer.from_pretrained(
+  "meta-llama/Llama-3.2-1B"
+)</code></pre>
     </td>
     <td>
-      <pre><code>from nemo_automodel import NeMoAutoModelForCausalLM
-from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
+      <pre><code>from nemo_automodel import NeMoAutoModelForCausalLM, NeMoAutoTokenizer
 
-model = NeMoAutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
-tok = NeMoAutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")</code></pre>
+model = NeMoAutoModelForCausalLM.from_pretrained(
+  "meta-llama/Llama-3.2-1B"
+)
+tok = NeMoAutoTokenizer.from_pretrained(
+  "meta-llama/Llama-3.2-1B"
+)</code></pre>
     </td>
   </tr>
   <tr>
     <td>
       <pre><code>from transformers import AutoModelForImageTextToText
 
-model = AutoModelForImageTextToText.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")</code></pre>
+model = AutoModelForImageTextToText.from_pretrained(
+  "Qwen/Qwen2.5-VL-3B-Instruct"
+)</code></pre>
     </td>
     <td>
       <pre><code>from nemo_automodel import NeMoAutoModelForImageTextToText
 
-model = NeMoAutoModelForImageTextToText.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")</code></pre>
+model = NeMoAutoModelForImageTextToText.from_pretrained(
+  "Qwen/Qwen2.5-VL-3B-Instruct"
+)</code></pre>
     </td>
   </tr>
 </table>
