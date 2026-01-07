@@ -43,6 +43,7 @@ from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
 
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
+HAS_FA, _ = safe_import("flash_attn")
 
 logger = logging.getLogger(__name__)
 
@@ -182,29 +183,30 @@ def _get_next_fallback_attn(attn_implementation: str) -> str:
         return priorities[0]
 
 
-def _prepare_hf_config_and_flag(pretrained_model_name_or_path, force_hf, kwargs, attn_implementation):
+def get_hf_config(pretrained_model_name_or_path, attn_implementation, kwargs):
     """
-    Resolve trust_remote_code default, fetch HF config and determine if model is HF-based.
+    Get the HF config for the model.
     """
-    kwargs["trust_remote_code"] = kwargs.get(
-        "trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path)
-    )
-    # Finally make sure flash_attention is available
-    if attn_implementation == "flash_attention_2":
-        try:
-            from flash_attn import flash_attn_func  # noqa: F401
-        except (ImportError, ModuleNotFoundError):
-            attn_implementation = "sdpa"
-            logger.warning("Flash Attention 2 is not available. Setting model's attn_implementation to sdpa")
+    trust_remote_code = kwargs.get("trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path))
+    hf_config = kwargs.get("config", None)
+    if hf_config is None:
+        hf_config = AutoConfig.from_pretrained(
+            pretrained_model_name_or_path,
+            **kwargs,
+            trust_remote_code=trust_remote_code,
+            attn_implementation=attn_implementation,
+        )
+    return hf_config
 
-    hf_config = kwargs.pop("config", None) or AutoConfig.from_pretrained(
-        pretrained_model_name_or_path,
-        **kwargs,
-        attn_implementation=attn_implementation,
-    )
-    architectures = getattr(hf_config, "architectures", None) or []
+
+def get_is_hf_model(config, force_hf):
+    """
+    Resolve trust_remote_code default and determine if model is HF-based.
+    """
+    # Finally make sure flash_attention is available
+    architectures = getattr(config, "architectures", None) or []
     is_hf_model = (not architectures or architectures[0] not in ModelRegistry.model_arch_name_to_cls) or force_hf
-    return hf_config, is_hf_model
+    return is_hf_model
 
 
 def _pop_tp_cp_has_packed(kwargs):
@@ -231,6 +233,7 @@ def _apply_preload_overrides(is_hf_model, tp_size, cp_size, has_packed_sequence,
 
     if is_hf_model and has_packed_sequence:
         if cp_size == 1:
+            assert HAS_FA, "Flash Attention is not available"
             attn_implementation = "flash_attention_2"
             logger.warning(
                 "Packed sequence is supported only with Flash Attention. "
@@ -393,13 +396,15 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
               `use_liger_kernel=False` or `use_sdpa_patching=False`
         """
         torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
-        hf_config, is_hf_model = _prepare_hf_config_and_flag(
-            pretrained_model_name_or_path, force_hf, kwargs, attn_implementation=attn_implementation
+        is_hf_model = get_is_hf_model(
+            get_hf_config(pretrained_model_name_or_path, attn_implementation, kwargs),
+            force_hf,
         )
         tp_size, cp_size, has_packed_sequence = _pop_tp_cp_has_packed(kwargs)
         attn_implementation, use_liger_kernel = _apply_preload_overrides(
             is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel
         )
+        hf_config = get_hf_config(pretrained_model_name_or_path, attn_implementation, kwargs)
 
         def _retry(**override):
             """Internal helper to re-enter this function with patched args."""
