@@ -16,7 +16,7 @@ from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import BatchEncoding
 
 
-class AutoTokenizerWithBosEosEnforced(AutoTokenizer):
+class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
     """
     A wrapper around HuggingFace's AutoTokenizer that ensures consistent BOS/EOS token handling.
 
@@ -26,58 +26,30 @@ class AutoTokenizerWithBosEosEnforced(AutoTokenizer):
 
     @classmethod
     def from_pretrained(
-        cls, pretrained_model_name_or_path, *args, force_hf=False, add_bos_token=True, add_eos_token=True, **kwargs
+        cls, pretrained_model_name_or_path, *args, add_bos_token=True, add_eos_token=True, **kwargs
     ):
         """
         Load the HF tokenizer class via AutoTokenizer and (optionally) wrap it to add BOS/EOS.
 
         Args:
             pretrained_model_name_or_path: Model identifier or path
-            force_hf: If True, return the raw HF tokenizer without wrapping
             add_bos_token: Whether to add BOS token (default: True)
             add_eos_token: Whether to add EOS token (default: True)
         """
-        hf_tok = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
-        if force_hf:
-            return hf_tok
-
-        return cls(hf_tok, add_bos_token=add_bos_token, add_eos_token=add_eos_token)
-
-    def __init__(self, base_tokenizer, *, add_bos_token: bool, add_eos_token: bool):
-        self._base_tokenizer = base_tokenizer
-        self._add_bos = bool(add_bos_token)
-        self._add_eos = bool(add_eos_token)
-
-    @property
-    def add_bos_token(self):
-        return self._add_bos
-
-    @property
-    def add_eos_token(self):
-        return self._add_eos
-
-    def __getattr__(self, name):
-        base = object.__getattribute__(self, "_base_tokenizer")
-        return getattr(base, name)
-
-    def __setattr__(self, name, value):
-        # Route writes to the underlying tokenizer when appropriate
-        internal_fields = {"_base_tokenizer", "_add_bos", "_add_eos"}
-        if name in internal_fields:
-            return object.__setattr__(self, name, value)
-        base = self.__dict__.get("_base_tokenizer", None)
-        if base is not None and hasattr(base, name):
-            return setattr(base, name, value)
-        return object.__setattr__(self, name, value)
+        tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        tokenizer.add_bos_token = add_bos_token
+        tokenizer.add_eos_token = add_eos_token
+        tokenizer.__class__ = type("NeMoAutoTokenizerWithBosEosEnforced", (cls, type(tokenizer)), {})
+        return tokenizer
 
     def __call__(self, *args, **kwargs):
-        tokenized = self._base_tokenizer(*args, **kwargs)
+        tokenized = super().__call__(*args, **kwargs)
         if not kwargs.get("add_special_tokens", True):
             return tokenized
         if isinstance(tokenized, BatchEncoding):
             _tokenized_keys = {"input_ids", "attention_mask", "assistant_masks"}
-            add_bos_ids = self._add_bos and (getattr(self, "bos_token_id", None) is not None)
-            add_eos_ids = self._add_eos and (getattr(self, "eos_token_id", None) is not None)
+            add_bos_ids = self.add_bos_token and (getattr(self, "bos_token_id", None) is not None)
+            add_eos_ids = self.add_eos_token and (getattr(self, "eos_token_id", None) is not None)
             if not "input_ids" in tokenized:
                 return tokenized
             if add_bos_ids:
@@ -95,13 +67,13 @@ class AutoTokenizerWithBosEosEnforced(AutoTokenizer):
         return tokenized
 
     def encode(self, *args, **kwargs):
-        encoded = self._base_tokenizer.encode(*args, **kwargs)
+        encoded = super().encode(*args, **kwargs)
         if not kwargs.get("add_special_tokens", True):
             return encoded
-        if self._add_bos:
+        if self.add_bos_token:
             if encoded and (getattr(self, "bos_token_id", None) is not None) and encoded[0] != self.bos_token_id:
                 encoded = [self.bos_token_id] + encoded
-        if self._add_eos:
+        if self.add_eos_token:
             if encoded and (getattr(self, "eos_token_id", None) is not None) and encoded[-1] != self.eos_token_id:
                 encoded = encoded + [self.eos_token_id]
         return encoded
