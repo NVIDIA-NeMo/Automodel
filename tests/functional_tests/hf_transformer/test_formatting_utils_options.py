@@ -96,14 +96,14 @@ def test_format_prompt_completion_options(seq_length, padding, truncation):
 
     # Attention mask should have zeros only in padded tail (if any)
     if isinstance(seq_length, int):
-        # From the end, once we see a 0, the rest must be 0
-        seen_zero = False
+        # From the end, once we see a non-zero, no zeros should appear (right padding)
+        seen_nonzero = False
         for v in reversed(out["attention_mask"]):
-            if v == 0:
-                seen_zero = True
+            if v != 0:
+                seen_nonzero = True
             else:
-                if seen_zero:
-                    pytest.fail("Non-zero attention_mask value after padded zeros.")
+                if seen_nonzero:
+                    pytest.fail("Zero attention_mask value before non-padded tokens (padding not only in tail). ")
 
 
 @pytest.mark.parametrize(
@@ -170,12 +170,13 @@ def test_format_chat_template_options(seq_length, padding, truncation):
 
     # Attention mask padded tail zeros, if padded
     if isinstance(seq_length, int) and truncation == False:
-        seen_zero = False
+        # From the end, once we see a non-zero, no zeros should appear (right padding)
+        seen_nonzero = False
         for v in reversed(out["attention_mask"]):
-            if v == 0:
-                seen_zero = True
+            if v != 0:
+                seen_nonzero = True
             else:
-                if seen_zero:
-                    pytest.fail("Non-zero attention_mask value after padded zeros.")
+                if seen_nonzero:
+                    pytest.fail("Zero attention_mask value before non-padded tokens (padding not only in tail).")
 
 

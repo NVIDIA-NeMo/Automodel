@@ -1,4 +1,5 @@
 .github/ @nvidia-nemo/automation
+codecov.yml @nvidia-nemo/automation
 docker/ @nvidia-nemo/automation
 pyproject.toml @nvidia-nemo/automation
 

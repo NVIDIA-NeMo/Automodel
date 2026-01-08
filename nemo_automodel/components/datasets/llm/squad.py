@@ -50,8 +50,7 @@ def _formatting_prompts_func_with_chat_template(
     answer = example["answers"]["text"][0].strip()
 
     formatted_text = [
-        {"role": "system", "content": context},
-        {"role": "user", "content": question},
+        {"role": "user", "content": f"Context: {context} Question: {question} Answer: "},
         {"role": "assistant", "content": answer},
     ]
     return format_chat_template(
