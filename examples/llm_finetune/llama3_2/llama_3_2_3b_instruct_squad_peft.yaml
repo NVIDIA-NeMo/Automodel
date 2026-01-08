@@ -33,7 +33,6 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-3B-Instruct
   torch_dtype: bf16
-  attn_implementation: eager
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
@@ -43,10 +42,10 @@ peft:
   use_triton: True
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: safetensors # torch_save or safetensors
-  save_consolidated: false 
+  save_consolidated: true
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
