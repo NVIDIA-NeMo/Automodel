@@ -376,7 +376,7 @@ class BaseRecipe:
                             f"       Run: rm -rf {ckpt_root}/*step_*\n"
                             f"{'=' * 80}\n"
                         )
-                        logging.error(error_msg, flush=True)
+                        logging.error(error_msg)
                     # Ensure all ranks fail together
                     if torch.distributed.is_initialized():
                         torch.distributed.barrier()
