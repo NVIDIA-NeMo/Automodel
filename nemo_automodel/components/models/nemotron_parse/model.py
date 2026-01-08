@@ -171,7 +171,7 @@ class NemotronParseConfig(PretrainedConfig):
                     setattr(self.encoder, key, value)
         else:
             self.encoder = PretrainedConfig()
-        
+
         decoder["max_sequence_length"] = max_sequence_length
         self.decoder = NemotronParseTextConfig(**decoder)
         self.image_size = image_size or [2048, 1648]
@@ -327,7 +327,9 @@ class NemotronParseDecoder(MBartPreTrainedModel):
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
                     layer_head_mask=(head_mask[idx] if head_mask is not None else None),
-                    cross_attn_layer_head_mask=(cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None),
+                    cross_attn_layer_head_mask=(
+                        cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None
+                    ),
                     past_key_value=None,
                     output_attentions=output_attentions,
                     use_cache=False,
@@ -346,7 +348,9 @@ class NemotronParseDecoder(MBartPreTrainedModel):
 
         if not return_dict:
             return tuple(
-                v for v in [hidden_states, None, all_hidden_states, all_self_attns, all_cross_attentions] if v is not None
+                v
+                for v in [hidden_states, None, all_hidden_states, all_self_attns, all_cross_attentions]
+                if v is not None
             )
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
@@ -371,7 +375,9 @@ class RadioWithNeck(nn.Module):
         last_hidden_state = 1024
         self.conv1 = nn.Conv1d(1280, last_hidden_state, 1)
         self.layer_norm1 = nn.LayerNorm(last_hidden_state, eps=1e-06, elementwise_affine=True)
-        self.conv2 = nn.Conv2d(last_hidden_state, last_hidden_state, kernel_size=(1, 4), stride=(1, 4), padding=0, bias=False)
+        self.conv2 = nn.Conv2d(
+            last_hidden_state, last_hidden_state, kernel_size=(1, 4), stride=(1, 4), padding=0, bias=False
+        )
         self.layer_norm2 = nn.LayerNorm(last_hidden_state, eps=1e-06, elementwise_affine=True)
         self.sum_proj = nn.Linear(3840, last_hidden_state)
         self.layer_norm3 = nn.LayerNorm(last_hidden_state, eps=1e-06, elementwise_affine=True)
@@ -384,7 +390,12 @@ class RadioWithNeck(nn.Module):
         output = self.layer_norm1(output)
 
         patch_size = self.config.patch_size
-        output = rearrange(output, "b (h w) d -> b d h w", h=pixel_values.shape[-2] // patch_size, w=pixel_values.shape[-1] // patch_size)
+        output = rearrange(
+            output,
+            "b (h w) d -> b d h w",
+            h=pixel_values.shape[-2] // patch_size,
+            w=pixel_values.shape[-1] // patch_size,
+        )
         output = self.conv2(output)
         output = rearrange(output, "b d h w -> b (h w) d")
         output = self.layer_norm2(output)
@@ -431,8 +442,18 @@ class NemotronParseForConditionalGeneration(NemotronParsePreTrainedModel, Genera
         self.lm_head = nn.Linear(config.decoder.d_model, config.decoder.vocab_size, bias=False, dtype=torch.bfloat16)
 
         num_extra_heads = getattr(config, "num_extra_heads", 0)
-        self.decoder.extra_heads = nn.ModuleList([nn.Linear(config.decoder.d_model, config.decoder.d_model, dtype=torch.bfloat16) for _ in range(num_extra_heads)])
-        self.decoder.extra_proj = nn.ModuleList([nn.Linear(config.decoder.d_model, config.decoder.d_model, dtype=torch.bfloat16) for _ in range(num_extra_heads)])
+        self.decoder.extra_heads = nn.ModuleList(
+            [
+                nn.Linear(config.decoder.d_model, config.decoder.d_model, dtype=torch.bfloat16)
+                for _ in range(num_extra_heads)
+            ]
+        )
+        self.decoder.extra_proj = nn.ModuleList(
+            [
+                nn.Linear(config.decoder.d_model, config.decoder.d_model, dtype=torch.bfloat16)
+                for _ in range(num_extra_heads)
+            ]
+        )
 
         self.class_token_indx_start = getattr(config, "class_token_start_idx", 50000)
         self.post_init()
@@ -467,15 +488,20 @@ class NemotronParseForConditionalGeneration(NemotronParsePreTrainedModel, Genera
         return_dict: Optional[bool] = None,
         **kwargs,
     ) -> Union[Tuple[torch.FloatTensor], Seq2SeqLMOutput]:
-
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         kwargs_encoder = {k: v for k, v in kwargs.items() if not k.startswith("decoder_")}
-        kwargs_decoder = {k[len("decoder_"):]: v for k, v in kwargs.items() if k.startswith("decoder_")}
+        kwargs_decoder = {k[len("decoder_") :]: v for k, v in kwargs.items() if k.startswith("decoder_")}
 
         if encoder_outputs is None:
             if pixel_values is None:
                 raise ValueError("You have to specify pixel_values")
-            encoder_outputs = self.encoder(pixel_values, output_attentions=output_attentions, output_hidden_states=output_hidden_states, return_dict=return_dict, **kwargs_encoder)
+            encoder_outputs = self.encoder(
+                pixel_values,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                **kwargs_encoder,
+            )
         elif isinstance(encoder_outputs, tuple):
             encoder_outputs = BaseModelOutput(*encoder_outputs)
 
@@ -508,7 +534,13 @@ class NemotronParseForConditionalGeneration(NemotronParsePreTrainedModel, Genera
             decoder_inputs_embeds = decoder_outputs.inputs_embeds
             for iii, head in enumerate(self.decoder.extra_heads):
                 decoder_input_embeds_shift = self.decoder.extra_proj[iii](
-                    torch.cat((decoder_inputs_embeds[:, 1:, :], torch.zeros_like(decoder_inputs_embeds[:, 0, :].unsqueeze(1))), axis=1)
+                    torch.cat(
+                        (
+                            decoder_inputs_embeds[:, 1:, :],
+                            torch.zeros_like(decoder_inputs_embeds[:, 0, :].unsqueeze(1)),
+                        ),
+                        axis=1,
+                    )
                 )
                 hidden = head(decoder_outputs["hidden_states"][-1] + decoder_input_embeds_shift)
                 logits.append(self.lm_head(hidden))
@@ -531,7 +563,9 @@ class NemotronParseForConditionalGeneration(NemotronParsePreTrainedModel, Genera
             loss = losses_per_sample.sum() / (tokens_per_sample.sum() + 1e-6)
 
         if not return_dict:
-            return (loss,) + decoder_outputs + encoder_outputs if loss is not None else decoder_outputs + encoder_outputs
+            return (
+                (loss,) + decoder_outputs + encoder_outputs if loss is not None else decoder_outputs + encoder_outputs
+            )
 
         output_logits = self.lm_head(decoder_outputs.last_hidden_state)
         return Seq2SeqLMOutput(
