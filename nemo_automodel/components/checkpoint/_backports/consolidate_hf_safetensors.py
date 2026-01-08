@@ -257,8 +257,6 @@ def _process_output_file(
     sorted_tensors = sorted(output_data.fqn_data.items(), key=lambda x: x[1].offset_in_file)
 
     with open(output_file, "wb") as output_stream:
-    # with open(output_file, "r+b") as output_stream:
-        # output_stream.seek(0, os.SEEK_END)
         # Process each tensor in sequential output order
         for tensor_fqn, tensor_fqn_data in sorted_tensors:
             full_tensor_mv = memoryview(
