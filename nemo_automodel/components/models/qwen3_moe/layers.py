@@ -23,7 +23,7 @@ from nemo_automodel.components.attention.utils import (
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
 )
-from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb
+from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
 from nemo_automodel.components.moe.utils import (
     BackendConfig,
     initialize_linear_module,
@@ -113,9 +113,16 @@ class Qwen3MoeAttention(nn.Module):
         k = self.k_norm(k)
 
         # RoPE (complex rotation)
-        cos, sin = freqs_cis.split(self.head_dim // 2, dim=-1)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        q, k = apply_rotary_emb_qk(
+            q,
+            k,
+            freqs_cis,
+            format=qkv_format,
+            rope_fusion=self.backend.rope_fusion,
+            cu_seqlens=attn_kwargs.get("cu_seqlens", None),
+            cp_size=attn_kwargs.get("cp_size", 1),
+            cp_rank=attn_kwargs.get("cp_rank", 0),
+        )
 
         # Backend-specific attention
         q, k, v, _attn_kwargs = preprocess_args_and_kwargs_for_attn(

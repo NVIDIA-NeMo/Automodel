@@ -167,7 +167,13 @@ class DeepseekV3Model(nn.Module):
             )
 
         with torch.no_grad():
-            freqs_cis = freqs_cis_from_position_ids(position_ids, self.freqs_cis)
+            freqs_cis = freqs_cis_from_position_ids(
+                position_ids,
+                self.freqs_cis,
+                qkv_format=attn_kwargs.get("qkv_format", "bshd"),
+                for_fused_rope=self.backend.rope_fusion,
+                cp_size=attn_kwargs.get("cp_size", 1),
+            )
 
         h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
 
