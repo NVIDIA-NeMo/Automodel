@@ -12,25 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch import nn
 
 from nemo_automodel.components._peft.lora_kernel import (
     lora_da_dx_update_wrapper,
     lora_db_update_wrapper,
     lora_forward_wrapper,
 )
+from nemo_automodel.components._peft.lora_moe import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
 from nemo_automodel.components._peft.module_matcher import ModuleMatcher
+from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
 
 HAS_BNB, bitsandbytes = safe_import("bitsandbytes")
 HAS_TE, transformer_engine = safe_import("transformer_engine")
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -327,6 +332,48 @@ def patch_linear_module(
     return orig_linear
 
 
+def patch_moe_module(
+    orig_module,
+    dim=8,
+    alpha=32,
+    lora_A_init_method="xavier",
+    lora_dtype=None,
+):
+    """
+    Patches a custom MoE module (GroupedExperts or GroupedExpertsDeepEP) with LoRA.
+
+    Args:
+        orig_module (nn.Module): The original MoE module to be patched.
+        dim (int, optional): LoRA rank (dimension). Defaults to 8.
+        alpha (int, optional): LoRA scaling factor. Defaults to 32.
+        lora_A_init_method (str, optional): Initialization method for LoRA A matrix. Defaults to "xavier".
+        lora_dtype (torch.dtype or str, optional): Data type for LoRA weights. Defaults to None.
+
+    Returns:
+        nn.Module: The LoRA-wrapped MoE module (GroupedExpertsLoRA or GroupedExpertsDeepEPLoRA).
+    """
+    if isinstance(orig_module, GroupedExpertsDeepEP):
+        new_module = GroupedExpertsDeepEPLoRA(
+            orig_module,
+            lora_dim=dim,
+            alpha=alpha,
+            lora_A_init_method=lora_A_init_method,
+            lora_dtype=lora_dtype,
+        )
+    elif isinstance(orig_module, GroupedExperts):
+        new_module = GroupedExpertsLoRA(
+            orig_module,
+            lora_dim=dim,
+            alpha=alpha,
+            lora_A_init_method=lora_A_init_method,
+            lora_dtype=lora_dtype,
+        )
+    else:
+        raise NotImplementedError(f"Unsupported MoE module type: {type(orig_module)}")
+
+    return new_module
+
+
 # patch a model in-place
 def apply_lora_to_linear_modules(
     model: nn.Module,
@@ -369,24 +416,49 @@ def apply_lora_to_linear_modules(
     )
     num_modules_matched = 0
     for name, module in list(model.named_modules()):
-        if matcher.match(module, name):
-            num_modules_matched += 1
-            # For QLora, set lora_dtype to float16/bfloat16 since base weights are quantized
-            lora_dtype = peft_config.lora_dtype
-            if quantization_config is not None and lora_dtype is None:
-                lora_dtype = quantization_config.bnb_4bit_compute_dtype or torch.bfloat16
+        if isinstance(module, (GroupedExperts, GroupedExpertsDeepEP)):
+            if matcher.match(module, name):
+                num_modules_matched += 1
+                lora_dtype = peft_config.lora_dtype
+                if quantization_config is not None and lora_dtype is None:
+                    lora_dtype = quantization_config.bnb_4bit_compute_dtype or torch.bfloat16
 
-            patch_linear_module(
-                module,
-                dim=peft_config.dim,
-                alpha=peft_config.alpha,
-                dropout=peft_config.dropout,
-                dropout_position=peft_config.dropout_position,
-                lora_A_init_method=peft_config.lora_A_init,
-                lora_dtype=lora_dtype,
-                use_triton=peft_config.use_triton,
-                layer_name=name,
-            )
+                # Replace the module in the model
+                new_module = patch_moe_module(
+                    module,
+                    dim=peft_config.dim,
+                    alpha=peft_config.alpha,
+                    lora_A_init_method=peft_config.lora_A_init,
+                    lora_dtype=lora_dtype,
+                )
+
+                # Find parent and replace
+                if "." not in name:
+                    setattr(model, name, new_module)
+                else:
+                    parent_name, child_name = name.rsplit(".", 1)
+                    parent = model.get_submodule(parent_name)
+                    setattr(parent, child_name, new_module)
+        else:
+            # Standard Linear patching
+            if isinstance(module, nn.Linear) and matcher.match(module, name):
+                num_modules_matched += 1
+                # For QLora, set lora_dtype to float16/bfloat16 since base weights are quantized
+                lora_dtype = peft_config.lora_dtype
+                if quantization_config is not None and lora_dtype is None:
+                    lora_dtype = quantization_config.bnb_4bit_compute_dtype or torch.bfloat16
+
+                patch_linear_module(
+                    module,
+                    dim=peft_config.dim,
+                    alpha=peft_config.alpha,
+                    dropout=peft_config.dropout,
+                    dropout_position=peft_config.dropout_position,
+                    lora_A_init_method=peft_config.lora_A_init,
+                    lora_dtype=lora_dtype,
+                    use_triton=peft_config.use_triton,
+                    layer_name=name,
+                )
 
     return num_modules_matched
 
