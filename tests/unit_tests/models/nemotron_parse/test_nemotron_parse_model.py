@@ -38,12 +38,37 @@ def test_nemotron_parse_forward_with_stub_encoder(monkeypatch):
             feature = torch.zeros(batch, 16, 1280)
             return summary, feature
 
+    class DummyEncoderConfig:
+        def __init__(self, patch_size=16, max_resolution=64):
+            self.patch_size = patch_size
+            self.max_resolution = max_resolution
+
+        def to_dict(self):
+            return {"patch_size": self.patch_size, "max_resolution": self.max_resolution}
+
+    # Avoid downloading RADIO config (which requires open_clip) by returning a stub.
+    dummy_encoder_config = DummyEncoderConfig()
+    monkeypatch.setattr(np_model.AutoConfig, "from_pretrained", lambda *args, **kwargs: dummy_encoder_config)
     monkeypatch.setattr(np_model.AutoModel, "from_config", lambda config, trust_remote_code=True: DummyEncoder())
+
+    # Ensure decoder outputs carry inputs_embeds (not present in BaseModelOutput).
+    original_decoder_forward = np_model.NemotronParseDecoder.forward
+
+    def decoder_forward_with_inputs(self, *args, **kwargs):
+        outputs = original_decoder_forward(self, *args, **kwargs)
+        # Prefer passed embeds; otherwise derive from input_ids for the test.
+        inputs_embeds = kwargs.get("inputs_embeds")
+        if inputs_embeds is None and kwargs.get("input_ids") is not None:
+            inputs_embeds = self.embed_tokens(kwargs["input_ids"])
+        outputs.inputs_embeds = inputs_embeds
+        return outputs
+
+    monkeypatch.setattr(np_model.NemotronParseDecoder, "forward", decoder_forward_with_inputs, raising=True)
 
     # Bypass RadioWithNeck heavy convs by returning a small hidden state directly.
     def fake_forward(self, pixel_values, *args, **kwargs):
         batch = pixel_values.shape[0]
-        hidden = torch.zeros(batch, 2, decoder_dim)
+        hidden = torch.zeros(batch, 2, decoder_dim, dtype=torch.bfloat16)
         return DonutSwinModelOutput(last_hidden_state=hidden)
 
     monkeypatch.setattr(np_model.RadioWithNeck, "forward", fake_forward, raising=True)
@@ -63,7 +88,7 @@ def test_nemotron_parse_forward_with_stub_encoder(monkeypatch):
 
     model = np_model.NemotronParseForConditionalGeneration(config)
 
-    pixel_values = torch.zeros(1, 3, 4, 4)
+    pixel_values = torch.zeros(1, 3, 4, 4, dtype=torch.bfloat16)
     labels = torch.tensor([[1, 2]])
 
     outputs = model(pixel_values=pixel_values, labels=labels, return_dict=True)
