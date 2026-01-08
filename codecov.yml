@@ -8,7 +8,6 @@ coverage:
         base: auto
         if_ci_failed: error
         if_not_found: success
-    patch: off
 
 fixes:
   - "/workspace/::"
