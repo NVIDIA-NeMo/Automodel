@@ -114,6 +114,104 @@ def is_model(object):
     )
 
 
+def _list_existing_checkpoints(ckpt_root: Path) -> list[Path]:
+    """Return existing checkpoint directories under ckpt_root (matching '*step_*')."""
+    if not ckpt_root.exists():
+        return []
+    return list(ckpt_root.glob("*step_*"))
+
+
+def _resolve_restore_from_to_ckpt_dir(checkpoint_dir: str, restore_from: str) -> str | None:
+    """
+    Resolve restore_from to a checkpoint directory.
+
+    Returns:
+        - str: resolved checkpoint directory
+        - None: if restore_from='LATEST' but no checkpoint found (caller should start fresh)
+    """
+    # Handle "LATEST" keyword for convenience
+    if restore_from.upper() == "LATEST":
+        return _find_latest_checkpoint(checkpoint_dir)
+
+    # If restore_from is just a directory name (no path separator), treat it as
+    # relative to checkpoint_dir. Otherwise use as-is (absolute or relative path).
+    if os.path.sep not in restore_from and not os.path.isabs(restore_from):
+        return os.path.join(checkpoint_dir, restore_from)
+    return restore_from
+
+
+def _format_existing_ckpt_collision_error(ckpt_root: Path, existing_ckpts: list[Path]) -> str:
+    """Format an error message for 'starting fresh with existing checkpoints'."""
+    return "\n".join(
+        [
+            f"\n{'=' * 80}",
+            "ERROR: Checkpoint directory contains existing checkpoints",
+            f"{'=' * 80}",
+            f"Directory: {ckpt_root}",
+            f"Found {len(existing_ckpts)} existing checkpoint(s):",
+            f"  {', '.join([p.name for p in existing_ckpts[:5]])}",
+            f"  {'...' if len(existing_ckpts) > 5 else ''}",
+            "",
+            "Starting fresh training with existing checkpoints will cause checkpoint",
+            "name collisions when saving (e.g., epoch_0_step_100 already exists).",
+            "",
+            "To FIX, choose ONE of:",
+            "  1. Resume training:",
+            "       Set checkpoint.restore_from: 'LATEST' (for latest checkpoint)",
+            "       Or checkpoint.restore_from: 'epoch_0_step_100' (subdirectory name)",
+            "       Or checkpoint.restore_from: './path/to/checkpoint' (full path)",
+            "  2. Start fresh with unique directory:",
+            "       Set checkpoint.checkpoint_dir: './checkpoints/my_exp_name'",
+            "  3. Start fresh by removing existing checkpoints:",
+            f"       Run: rm -rf {ckpt_root}/*step_*",
+            f"{'=' * 80}",
+        ]
+    )
+
+
+def _format_missing_checkpoint_dir_error(checkpoint_dir: str, restore_from: str, resolved_ckpt_dir: str) -> str:
+    """Format a helpful error message for a missing checkpoint directory."""
+    error_msg = [
+        f"\n{'=' * 80}",
+        "ERROR: Checkpoint directory does not exist",
+        f"{'=' * 80}",
+        f"Specified: checkpoint.restore_from: '{restore_from}'",
+        f"Resolved to: {resolved_ckpt_dir}",
+        "",
+        "Please check:",
+        "  1. The checkpoint directory exists",
+        f"  2. The path is correct (restore_from: '{restore_from}')",
+        f"  3. Available checkpoints in {checkpoint_dir}:",
+    ]
+
+    ckpt_root = Path(checkpoint_dir)
+    available_ckpts = _list_existing_checkpoints(ckpt_root)
+    if available_ckpts:
+        error_msg += [f"       {', '.join([p.name for p in available_ckpts[:5]])}"]
+        if len(available_ckpts) > 5:
+            error_msg += [f"       ... and {len(available_ckpts) - 5} more"]
+    else:
+        error_msg += ["       (no checkpoints found)"] if ckpt_root.exists() else ["       (checkpoint_dir does not exist)"]
+
+    error_msg += [f"{'=' * 80}"]
+    return "\n".join(error_msg)
+
+
+def _is_rank_0() -> bool:
+    """True if distributed is not initialized or this process is rank 0.
+    TODO(@akoumpa): deprecate in favor of deviemesh api
+    """
+    return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+
+
+def _dist_barrier() -> None:
+    """Barrier if torch.distributed is initialized.
+    TODO(@akoumpa): deprecate in favor of deviemesh api
+    """
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
 class BaseRecipe:
     """
     BaseRecipe provides checkpoint load/save functionality for recipes.
@@ -320,6 +418,67 @@ class BaseRecipe:
                 f"Updated LOWEST_VAL checkpoint symlink to {os.path.basename(target_dir)} (val_loss={val_loss:.4f})"
             )
 
+    def _assert_safe_fresh_start(self, ckpt_root: Path, is_rank_0: bool) -> None:
+        """
+        Starting fresh training is only allowed if checkpoint_dir is empty (of '*step_*'),
+        to prevent checkpoint name collisions during saving.
+        """
+        existing_ckpts = _list_existing_checkpoints(ckpt_root)
+        if not existing_ckpts:
+            return
+
+        if is_rank_0:
+            logging.error(_format_existing_ckpt_collision_error(ckpt_root, existing_ckpts))
+
+        # Ensure all ranks fail together
+        _dist_barrier()
+        raise RuntimeError("Checkpoint directory contains existing checkpoints but restore_from not set")
+
+    def _validate_checkpoint_dir_exists(self, ckpt_dir: str, restore_from: str, is_rank_0: bool) -> None:
+        """Validate resolved checkpoint directory exists; raise FileNotFoundError with a helpful message."""
+        if os.path.exists(ckpt_dir):
+            return
+
+        # Build helpful error message on rank 0
+        if is_rank_0:
+            error_msg = _format_missing_checkpoint_dir_error(
+                checkpoint_dir=self.checkpointer.config.checkpoint_dir,
+                restore_from=restore_from,
+                resolved_ckpt_dir=ckpt_dir,
+            )
+        else:
+            error_msg = f"Checkpoint directory does not exist: {ckpt_dir}"
+
+        # Ensure all ranks fail together (before raising)
+        _dist_barrier()
+        raise FileNotFoundError(error_msg)
+
+    def _load_checkpoint_tracked_state(self, ckpt_dir: str):
+        """Load tracked state and return (model, optimizer, scheduler) for downstream loader calls."""
+        model, optimizer, scheduler = None, None, None
+
+        for key in sorted(self.__dict__["__state_tracked"]):
+            obj = getattr(self, key)
+            if is_model(obj):
+                assert model is None, "Multiple models found in checkpoint"
+                model = obj
+            elif is_optimizer(obj):
+                assert optimizer is None, "Multiple optimizers found in checkpoint"
+                optimizer = obj
+            elif is_lr_scheduler(obj):
+                assert scheduler is None, "Multiple schedulers found in checkpoint"
+                scheduler = obj
+            elif is_dataloader(obj) or isinstance(obj, StatefulRNG):
+                self.checkpointer.load_on_dp_ranks(obj, key, ckpt_dir)
+            elif is_tokenizer(obj) or isinstance(obj, ConfigNode):
+                # we don't need to load the tokenizer or config from the checkpoint
+                # we only save the tokenizer for consolidated checkpoints for downstream use
+                continue
+            else:
+                obj.load_state_dict(torch.load(os.path.join(ckpt_dir, f"{key}.pt"), weights_only=False))
+
+        return model, optimizer, scheduler
+
     def load_checkpoint(self, restore_from: str | None = None):
         """
         Loads checkpoint only when explicitly requested via restore_from.
@@ -338,127 +497,33 @@ class BaseRecipe:
                          - "./path/to/checkpoint": Absolute or relative path
         """
         if not self.checkpointer.config.enabled:
-            if (
-                not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-            ) and restore_from is not None:
+            if _is_rank_0() and restore_from is not None:
                 print("Enable checkpointing to resume from a checkpoint, skipping...", flush=True)
             return
 
-        is_rank_0 = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        is_rank_0 = _is_rank_0()
 
         if not restore_from:
             # Starting fresh - ensure checkpoint dir is safe to avoid name collisions
             ckpt_root = Path(self.checkpointer.config.checkpoint_dir)
-            if ckpt_root.exists():
-                existing_ckpts = list(ckpt_root.glob("*step_*"))
-                if existing_ckpts:
-                    if is_rank_0:
-                        error_msg = (
-                            f"\n{'=' * 80}\n"
-                            f"ERROR: Checkpoint directory contains existing checkpoints\n"
-                            f"{'=' * 80}\n"
-                            f"Directory: {ckpt_root}\n"
-                            f"Found {len(existing_ckpts)} existing checkpoint(s):\n"
-                            f"  {', '.join([p.name for p in existing_ckpts[:5]])}\n"
-                            f"  {'...' if len(existing_ckpts) > 5 else ''}\n"
-                            f"\n"
-                            f"Starting fresh training with existing checkpoints will cause checkpoint\n"
-                            f"name collisions when saving (e.g., epoch_0_step_100 already exists).\n"
-                            f"\n"
-                            f"To FIX, choose ONE of:\n"
-                            f"  1. Resume training:\n"
-                            f"       Set checkpoint.restore_from: 'LATEST' (for latest checkpoint)\n"
-                            f"       Or checkpoint.restore_from: 'epoch_0_step_100' (subdirectory name)\n"
-                            f"       Or checkpoint.restore_from: './path/to/checkpoint' (full path)\n"
-                            f"  2. Start fresh with unique directory:\n"
-                            f"       Set checkpoint.checkpoint_dir: './checkpoints/my_exp_name'\n"
-                            f"  3. Start fresh by removing existing checkpoints:\n"
-                            f"       Run: rm -rf {ckpt_root}/*step_*\n"
-                            f"{'=' * 80}\n"
-                        )
-                        logging.error(error_msg)
-                    # Ensure all ranks fail together
-                    if torch.distributed.is_initialized():
-                        torch.distributed.barrier()
-                    raise RuntimeError("Checkpoint directory contains existing checkpoints but restore_from not set")
+            self._assert_safe_fresh_start(ckpt_root, is_rank_0=is_rank_0)
             return
 
-        # Handle "LATEST" keyword for convenience
-        if isinstance(restore_from, str) and restore_from.upper() == "LATEST":
-            ckpt_dir = _find_latest_checkpoint(self.checkpointer.config.checkpoint_dir)
-            if ckpt_dir is None:
-                if is_rank_0:
-                    logging.warning(
-                        f"restore_from='LATEST' specified but no checkpoint found in "
-                        f"{self.checkpointer.config.checkpoint_dir}. Starting fresh."
-                    )
-                return
-        else:
-            # If restore_from is just a directory name (no path separator), treat it as
-            # relative to checkpoint_dir. Otherwise use as-is (absolute or relative path).
-            if os.path.sep not in restore_from and not os.path.isabs(restore_from):
-                ckpt_dir = os.path.join(self.checkpointer.config.checkpoint_dir, restore_from)
-            else:
-                ckpt_dir = restore_from
-
-        # Validate that checkpoint directory exists
-        if not os.path.exists(ckpt_dir):
-            # Build helpful error message on rank 0
+        ckpt_dir = _resolve_restore_from_to_ckpt_dir(self.checkpointer.config.checkpoint_dir, restore_from)
+        if ckpt_dir is None:
             if is_rank_0:
-                error_msg = (
-                    f"\n{'=' * 80}\n"
-                    f"ERROR: Checkpoint directory does not exist\n"
-                    f"{'=' * 80}\n"
-                    f"Specified: checkpoint.restore_from: '{restore_from}'\n"
-                    f"Resolved to: {ckpt_dir}\n"
-                    f"\n"
-                    f"Please check:\n"
-                    f"  1. The checkpoint directory exists\n"
-                    f"  2. The path is correct (restore_from: '{restore_from}')\n"
-                    f"  3. Available checkpoints in {self.checkpointer.config.checkpoint_dir}:\n"
+                logging.warning(
+                    "restore_from='LATEST' specified but no checkpoint found in "
+                    f"{self.checkpointer.config.checkpoint_dir}. Starting fresh."
                 )
-                # List available checkpoints to help user
-                ckpt_root = Path(self.checkpointer.config.checkpoint_dir)
-                if ckpt_root.exists():
-                    available_ckpts = list(ckpt_root.glob("*step_*"))
-                    if available_ckpts:
-                        error_msg += f"       {', '.join([p.name for p in available_ckpts[:5]])}\n"
-                        if len(available_ckpts) > 5:
-                            error_msg += f"       ... and {len(available_ckpts) - 5} more\n"
-                    else:
-                        error_msg += "       (no checkpoints found)\n"
-                else:
-                    error_msg += "       (checkpoint_dir does not exist)\n"
-                error_msg += f"{'=' * 80}\n"
-            else:
-                error_msg = f"Checkpoint directory does not exist: {ckpt_dir}"
+            return
 
-            # Ensure all ranks fail together (before raising)
-            if torch.distributed.is_initialized():
-                torch.distributed.barrier()
-
-            raise FileNotFoundError(error_msg)
+        self._validate_checkpoint_dir_exists(ckpt_dir, restore_from=restore_from, is_rank_0=is_rank_0)
 
         if is_rank_0:
             print(f"Loading checkpoint from {ckpt_dir}", flush=True)
 
-        model, optimizer, scheduler = None, None, None
-
-        for key in sorted(self.__dict__["__state_tracked"]):
-            if is_model(getattr(self, key)):
-                model = getattr(self, key)
-            elif is_optimizer(getattr(self, key)):
-                optimizer = getattr(self, key)
-            elif is_lr_scheduler(getattr(self, key)):
-                scheduler = getattr(self, key)
-            elif is_dataloader(getattr(self, key)) or isinstance(getattr(self, key), StatefulRNG):
-                self.checkpointer.load_on_dp_ranks(getattr(self, key), key, ckpt_dir)
-            elif is_tokenizer(getattr(self, key)) or isinstance(getattr(self, key), ConfigNode):
-                # we don't need to load the tokenizer or config from the checkpoint
-                # we only save the tokenizer for consolidated checkpoints for downstream use
-                continue
-            else:
-                getattr(self, key).load_state_dict(torch.load(os.path.join(ckpt_dir, f"{key}.pt"), weights_only=False))
+        model, optimizer, scheduler = self._load_checkpoint_tracked_state(ckpt_dir)
 
         self.checkpointer.load_model(model, os.path.join(ckpt_dir, "model"))
         self.checkpointer.load_optimizer(optimizer, model, ckpt_dir, scheduler)
