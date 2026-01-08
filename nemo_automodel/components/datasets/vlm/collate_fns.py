@@ -308,8 +308,6 @@ def nemotron_parse_collate_fn(
 
     batch["labels"] = labels[:, 1:]
 
-    # Build decoder inputs because the training loop removes labels before calling the model.
-    # Use tokenizer settings to perform a right shift with a start token.
     tokenizer = getattr(processor, "tokenizer", processor)
     pad_token_id = getattr(tokenizer, "pad_token_id", None)
     decoder_start_token_id = getattr(tokenizer, "decoder_start_token_id", None) or getattr(
@@ -334,7 +332,6 @@ def nemotron_parse_collate_fn(
         if isinstance(value, torch.Tensor) and value.shape == input_shape:
             batch[key] = value[:, :-1]
 
-    #import pdb; pdb.set_trace()
     return batch
 
 
@@ -383,6 +380,5 @@ COLLATE_FNS = {
     "Qwen2_5_VLProcessor": qwen2_5_collate_fn,
     "Qwen3OmniMoeProcessor": qwen3_omni_collate_fn,
     "NemotronParseProcessor": nemotron_parse_collate_fn,
-    "NemotronParseAutoProcessor": nemotron_parse_collate_fn,
     "default": default_collate_fn,
 }
