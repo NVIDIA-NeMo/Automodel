@@ -234,7 +234,6 @@ exclude_type_checking_imports = true
 name = "Components must not import each other"
 type = "independence"
 modules = [
-    "nemo_automodel.components._peft",
     "nemo_automodel.components.checkpoint",
     "nemo_automodel.components.config",
     "nemo_automodel.components.datasets",

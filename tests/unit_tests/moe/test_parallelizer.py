@@ -19,9 +19,16 @@ from unittest.mock import MagicMock
 import pytest
 
 
+class DummyParam:
+    """Mock parameter with requires_grad attribute."""
+
+    def __init__(self, requires_grad=True):
+        self.requires_grad = requires_grad
+
+
 class DummyExperts:
     def __init__(self):
-        self._params = {"weight": object()}
+        self._params = {"weight": DummyParam()}
 
     def named_parameters(self, recurse=False):
         for name, param in self._params.items():
@@ -334,6 +341,53 @@ def test_expert_parallel_partition_fn_shards_and_dispatcher(monkeypatch):
 
     # dispatcher must be initialized
     assert module.dispatch_called_with is device_mesh
+
+
+def test_expert_parallel_partition_fn_preserves_requires_grad(monkeypatch):
+    """Test that _partition_fn preserves the requires_grad attribute of parameters."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    class DummyExpertsWithGrad:
+        def __init__(self):
+            self._params = {}
+            # Create parameters with different requires_grad values
+            trainable_param = MagicMock()
+            trainable_param.requires_grad = True
+            frozen_param = MagicMock()
+            frozen_param.requires_grad = False
+            self._params["trainable_weight"] = trainable_param
+            self._params["frozen_weight"] = frozen_param
+            self.registered_params = {}
+
+        def named_parameters(self, recurse=False):
+            for name, param in self._params.items():
+                yield name, param
+
+        def register_parameter(self, name, param):
+            self.registered_params[name] = param
+
+    # Mock distribute_tensor to return a mock Parameter-like object
+    def fake_distribute_tensor(param, device_mesh, placements):
+        # Return a mock that can be wrapped in nn.Parameter
+        mock_tensor = MagicMock()
+        return mock_tensor
+
+    monkeypatch.setattr(P, "distribute_tensor", fake_distribute_tensor)
+    monkeypatch.setattr(P, "Shard", lambda dim: object())
+    # Ensure module doesn't match GroupedExpertsDeepEP to skip dispatcher init
+    monkeypatch.setattr(P, "GroupedExpertsDeepEP", type("NotMatching", (), {}))
+
+    ep = P.ExpertParallel()
+    module = DummyExpertsWithGrad()
+    device_mesh = type("Mesh", (), {"ndim": 1})()
+
+    ep._partition_fn("any", module, device_mesh)
+
+    # Verify requires_grad is preserved for each registered parameter
+    assert "trainable_weight" in module.registered_params
+    assert "frozen_weight" in module.registered_params
+    assert module.registered_params["trainable_weight"].requires_grad is True
+    assert module.registered_params["frozen_weight"].requires_grad is False
 
 
 def test_apply_ep_parallelizes_moe_experts(monkeypatch):

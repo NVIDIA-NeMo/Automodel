@@ -195,6 +195,7 @@ class GroupedExperts(nn.Module):
                 model and intermediate dimension parameters.
         """
         super().__init__()
+        self.config = config
         self.n_routed_experts = config.n_routed_experts
         self.expert_bias = config.expert_bias
         self.gate_and_up_projs = nn.Parameter(
