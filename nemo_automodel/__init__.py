@@ -26,10 +26,6 @@ __all__ = [
 # Promote NeMoAutoModelForCausalLM, AutoModelForImageTextToText into the top level
 # to enable: `from nemo_automodel import NeMoAutoModelForCausalLM`
 try:
-    # Import custom models to register them with HuggingFace AutoModel
-    # This must happen before using NeMoAutoModelForImageTextToText
-    from nemo_automodel.components.models import nemotron_parse  # noqa: F401
-
     # adjust this import path if your class lives somewhere else
     from nemo_automodel._transformers.auto_model import (
         NeMoAutoModelForCausalLM,
