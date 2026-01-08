@@ -115,7 +115,7 @@ RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     git fetch origin $DEEPEP_COMMIT && \
     git checkout FETCH_HEAD && \
     patch -p1 < /opt/deepep.patch && \
-    pip install --no-cache-dir nvidia-nvshmem-cu13 && \
+    pip install --no-cache-dir nvidia-nvshmem-cu13==3.4.5 && \
     TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install --no-cache-dir --no-build-isolation -v . && \
     rm -rf /opt/deepep.patch && \
     rm -rf DeepEP; \
