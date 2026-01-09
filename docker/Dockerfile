@@ -107,7 +107,7 @@ RUN if [ $INSTALL_BITSANDBYTES = "True" ]; then \
 # Install Deepep
 COPY docker/common/deepep.patch /opt/deepep.patch
 ARG INSTALL_DEEPEP=False
-ARG DEEPEP_COMMIT=ef73fd9a4c098e09929e48dfd696505ddc8e2043
+ARG DEEPEP_COMMIT=1dddd194c26911c35b4f53a148617dd73de0ffc9
 RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     git clone https://github.com/deepseek-ai/DeepEP.git && \
     cd DeepEP && \
@@ -115,7 +115,7 @@ RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     git fetch origin $DEEPEP_COMMIT && \
     git checkout FETCH_HEAD && \
     patch -p1 < /opt/deepep.patch && \
-    pip install --no-cache-dir nvidia-nvshmem-cu13 && \
+    pip install --no-cache-dir nvidia-nvshmem-cu13==3.4.5 && \
     TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install --no-cache-dir --no-build-isolation -v . && \
     rm -rf /opt/deepep.patch && \
     rm -rf DeepEP; \
