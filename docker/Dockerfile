@@ -52,7 +52,7 @@ RUN if [ -f /usr/local/bin/torchrun ]; then \
 
 # Install TE
 ARG INSTALL_TE=False
-ARG TE_COMMIT=release_v2.8
+ARG TE_COMMIT=release_v2.11
 RUN if [ "$INSTALL_TE" = "True" ]; then \
     git clone https://github.com/NVIDIA/TransformerEngine.git && \
     cd TransformerEngine && \
