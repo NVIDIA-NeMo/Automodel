@@ -191,7 +191,9 @@ def _format_missing_checkpoint_dir_error(checkpoint_dir: str, restore_from: str,
         if len(available_ckpts) > 5:
             error_msg += [f"       ... and {len(available_ckpts) - 5} more"]
     else:
-        error_msg += ["       (no checkpoints found)"] if ckpt_root.exists() else ["       (checkpoint_dir does not exist)"]
+        error_msg += (
+            ["       (no checkpoints found)"] if ckpt_root.exists() else ["       (checkpoint_dir does not exist)"]
+        )
 
     error_msg += [f"{'=' * 80}"]
     return "\n".join(error_msg)
