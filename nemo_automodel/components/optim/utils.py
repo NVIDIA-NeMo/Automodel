@@ -7,18 +7,14 @@ from typing import Any, Optional
 
 import torch.nn as nn
 
+_import_error: Exception | None = None
 try:
     from dion import Dion, Dion2, Muon, NorMuon
 except Exception as e:  # pragma: no cover - handled at runtime
-    Dion = Dion2 = Muon = NorMuon = None  # type: ignore[assignment]
-    _import_error: Exception | None = e
-else:
-    _import_error = None
+    Dion = Dion2 = Muon = NorMuon = None
+    _import_error = e
 
 logger = logging.getLogger(__name__)
-
-
-
 
 def is_dion_optimizer(cfg_opt) -> bool:
     target = getattr(cfg_opt, "_target_", None)
@@ -87,13 +83,13 @@ def _separate_param_groups(
         scalar_kwargs["beta1"] = scalar_betas[0]
         scalar_kwargs["beta2"] = scalar_betas[1]
     if scalar_eps is not None:
-        scalar_kwargs["epsilon"] = scalar_eps  # Dion2 uses "epsilon" not "eps"
+        scalar_kwargs["epsilon"] = scalar_eps
 
     effective_scalar_lr = scalar_lr if scalar_lr is not None else base_lr
     effective_embed_lr = embed_lr if embed_lr is not None else effective_scalar_lr
 
     param_groups = [
-        dict(params=matrix_params),  # defaults to Dion/Muon algorithm, uses base lr
+        dict(params=matrix_params),
         dict(params=vector_params, algorithm=scalar_opt, lr=effective_scalar_lr, weight_decay=weight_decay, **scalar_kwargs),
         dict(params=embed_params, algorithm=scalar_opt, lr=effective_embed_lr, weight_decay=0.0, **scalar_kwargs),
     ]
@@ -146,7 +142,7 @@ def build_dion_optimizer(
     """
     if _import_error:
         raise RuntimeError(
-            "Failed to import Dion. Please install with `pip install -e dion/[train]`."
+            "Failed to import Dion. Please install Dion."
         ) from _import_error
 
     target = cfg_opt._target_
@@ -162,7 +158,6 @@ def build_dion_optimizer(
     base_lr = float(cfg_dict.get("lr", 1e-4))
     weight_decay = float(cfg_dict.get("weight_decay", 0.0))
 
-    # Remove keys that are not accepted by Dion constructors
     signature = inspect.signature(target)
     valid_keys = set(signature.parameters.keys())
     cleaned_kwargs = {k: v for k, v in cfg_dict.items() if k in valid_keys}
@@ -173,9 +168,7 @@ def build_dion_optimizer(
         scalar_lr=scalar_lr, embed_lr=embed_lr, lm_head_lr=lm_head_lr
     )
 
-    # Dion/Muon only support 1D DeviceMesh. Extract 1D submesh from multi-D FSDP mesh.
-    dion_mesh = _get_dion_mesh(distributed_mesh)
-    
+    dion_mesh = _get_dion_mesh(distributed_mesh)    
 
     if "distributed_mesh" in valid_keys:
         cleaned_kwargs["distributed_mesh"] = dion_mesh
