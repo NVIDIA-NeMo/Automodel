@@ -33,6 +33,14 @@ checkpoint:
 
 > **Note:** The optimizer states are _always_ saved in DCP (`.distcp` extension) format.
 
+## Checkpoint Symbolic Links
+
+NeMo AutoModel automatically creates symbolic links in the checkpoint directory to provide convenient access to important checkpoints:
+
+- **LATEST**: Points to the most recently saved checkpoint. This is useful for resuming training from the last saved state.
+- **LOWEST_VAL**: Points to the checkpoint with the lowest validation score/loss. This provides easy access to the best-performing checkpoint based on validation metrics, making it ideal for model evaluation or deployment.
+
+These symbolic links eliminate the need to manually track checkpoint names or search through directories to find the best model. When validation is enabled in your training run, both links are automatically maintained and updated as training progresses.
 
 ## Safetensors
 To ensure seamless integration with the Hugging Face ecosystem, NeMo Automodel saves checkpoints in the [Safetensors](https://github.com/huggingface/safetensors) format. Safetensors is a memory-safe, zero-copy alternative to Python's pickle (Pytorch .bin), natively supported by Hugging Face Transformers, offering both safety and performance advantages over Python pickle-based approaches.
@@ -67,6 +75,7 @@ The `checkpoints/` should have the following contents:
 ```
 checkpoints/
 ├── LATEST -> epoch_0_step_19
+├── LOWEST_VAL -> epoch_0_step_19
 └── epoch_0_step_19
    ├── model
    │   ├── consolidated
@@ -130,6 +139,7 @@ After training, you'll get a compact, consolidated Safetensors checkpoint that c
 ```
 checkpoints/
 ├── LATEST -> epoch_0_step_19
+├── LOWEST_VAL -> epoch_0_step_19
 ├── epoch_0_step_19
 │   ├── config.yaml
 │   ├── dataloader
@@ -189,6 +199,7 @@ After 20 steps, the following checkpoint will be saved:
 ```
 checkpoints/
 ├── LATEST -> epoch_0_step_19
+├── LOWEST_VAL -> epoch_0_step_19
 └── epoch_0_step_19
    ├── config.yaml
    ├── dataloader
@@ -215,7 +226,7 @@ uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py --step_sche
 
 ## Asynchronous Checkpointing
 
-NeMo AutoModel can write checkpoints asynchronously to reduce training stalls caused by I/O. When enabled, checkpoint writes are scheduled in the background using PyTorch Distributed Checkpointing’s async API while training continues.
+NeMo AutoModel can write checkpoints asynchronously to reduce training stalls caused by I/O. When enabled, checkpoint writes are scheduled in the background using PyTorch Distributed Checkpointing's async API while training continues.
 
 - **Enable** (YAML):
   ```
@@ -232,6 +243,7 @@ You can also save additional states in NeMo AutoModel. By default, we also autom
 ```
 checkpoints/
 ├── LATEST -> epoch_0_step_19
+├── LOWEST_VAL -> epoch_0_step_19
 ├── epoch_0_step_19
 │   ├── config.yaml
 │   ├── dataloader
