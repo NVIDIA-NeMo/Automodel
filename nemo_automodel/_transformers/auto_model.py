@@ -13,13 +13,14 @@
 # limitations under the License.
 
 import functools
+import os
 import gc
 import inspect
 import logging
 import os
 import types
 from contextlib import contextmanager
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -33,6 +34,7 @@ from transformers import (
 )
 from transformers.modeling_utils import _get_resolved_checkpoint_files
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
+from transformers.utils.hub import TRANSFORMERS_CACHE
 
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel import __version__
@@ -41,6 +43,10 @@ from nemo_automodel.components.distributed.init_utils import get_local_world_siz
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code
 from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
+from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
+from nemo_automodel.components.distributed.ddp import DDPManager
+from torch.distributed.device_mesh import DeviceMesh
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 HAS_FA, _ = safe_import("flash_attn")
@@ -253,7 +259,87 @@ def _verify_sdpa_support(model, is_hf_model, cp_size):
     if cp_size > 1 and is_hf_model and hasattr(model, "_supports_sdpa"):
         if model._supports_sdpa is False:
             raise ValueError("Model does not support SDPA required for context parallelism")
+def _choose_device(device: Optional[torch.device]) -> torch.device:
+    if device is not None:
+        return device
+    if torch.cuda.is_available():
+        import os
 
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        return torch.device("cuda", local_rank)
+    return torch.device("cpu")
+
+
+def _move_module_to_device(module: torch.nn.Module, device: torch.device, torch_dtype: Any) -> None:
+    # torch_dtype can be "auto", torch.dtype, or string
+    if torch_dtype == "auto":
+        dtype = None
+    else:
+        dtype = dtype_from_str(torch_dtype) if isinstance(torch_dtype, str) else torch_dtype
+    if dtype is not None:
+        module.to(device=device, dtype=dtype)
+    else:
+        module.to(device=device)
+
+def _get_arch_name_from_config(pretrained_model_name_or_path, trust_remote_code: bool) -> str | None:
+    try:
+        config = AutoConfig.from_pretrained(
+            pretrained_model_name_or_path, trust_remote_code=trust_remote_code,
+        )
+        return config.architectures[0], config
+    except Exception:
+        return None, None
+
+def _get_model_from_nemo_registry(pretrained_model_name_or_path, model_args, kwargs) -> PreTrainedModel | None:
+    try:
+        arch_name, config = _get_arch_name_from_config(
+            pretrained_model_name_or_path, bool(kwargs.get("trust_remote_code", False))
+        )
+        # if we have a custom model implementation available, we prioritize that over HF
+        model_cls = ModelRegistry.model_arch_name_to_cls.get(arch_name, None)
+        if model_cls is None:
+            return None
+        # if we are able to init the custom model, we will now download the model weights on local rank 0
+        if (
+            not dist.is_initialized() or int(os.environ.get("LOCAL_RANK", "0")) == 0
+        ) and not os.path.isdir(pretrained_model_name_or_path):
+            num_nodes = (
+                dist.get_world_size() % int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+            ) + 1  # 1-indexed
+            if num_nodes > 1:
+                logging.info(
+                    f"""Downloading model weights on {num_nodes} nodes. This incurs high storage usage. 
+                    It is recommended to download once with `hf download` and pass in the downloaded path to the `pretrained_model_name_or_path` argument."""
+                )
+            _get_resolved_checkpoint_files(
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                subfolder="",
+                variant=None,
+                gguf_file=None,
+                from_tf=False,
+                from_flax=False,
+                use_safetensors=None,
+                cache_dir=None,
+                force_download=False,
+                proxies=None,
+                local_files_only=False,
+                token=None,
+                user_agent={"file_type": "model", "framework": "pytorch", "from_auto_class": False},
+                revision="main",
+                commit_hash=getattr(config, "_commit_hash", None),
+                is_remote_code=False,
+                transformers_explicit_filename=None,
+            )
+        if dist.is_initialized():
+            dist.barrier()
+        logger.info(f"Using custom model implementation for {config.architectures[0]}")
+        return model_cls(config, *model_args, **kwargs)
+    except Exception as e:
+        logger.error(f"Failed to use custom model implementation with error: {e}")
+        return None
+
+def _is_distributed_model_init(device_mesh) -> bool:
+    return isinstance(device_mesh, DeviceMesh) and device_mesh.size() > 1
 
 def _download_model_weights(hf_config, pretrained_model_name_or_path):
     if not os.path.isdir(pretrained_model_name_or_path):
@@ -285,6 +371,94 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path):
                 is_remote_code=False,
                 transformers_explicit_filename=None,
             )
+
+
+def _build_parallel_manager(
+    distributed: Optional[Dict[str, Any]],
+    device_mesh: Optional[DeviceMesh] = None,
+) -> Optional[Union[FSDP2Manager, DDPManager]]:
+    """
+    Build the appropriate parallel manager (FSDP2Manager or DDPManager) based on distributed config.
+
+    This helper extracts common logic for creating parallel wrappers used in both
+    `from_pretrained_distributed` and `from_config`.
+
+    Args:
+        distributed: Dictionary containing distributed configuration with keys like
+            'tp_size', 'cp_size', 'pp_size', 'dp_size', 'world_size', 'backend',
+            'use_hf_tp_plan', 'sequence_parallel', 'activation_checkpointing'.
+        device_mesh: Optional pre-built DeviceMesh to inject into the manager.
+
+    Returns:
+        FSDP2Manager if tp_size > 1 or cp_size > 1 or pp_size > 1,
+        DDPManager if only data parallelism is needed,
+        None if torch.distributed is not initialized or no distributed config.
+    """
+    if not torch.distributed.is_initialized():
+        return None
+
+    conf = distributed if isinstance(distributed, dict) else {}
+    if not conf:
+        return None
+
+    tp = int(conf.get("tp_size", 1))
+    cp = int(conf.get("cp_size", 1))
+    pp = int(conf.get("pp_size", 1))
+    dp = int(conf.get("dp_size", 0))
+    world_size = conf.get("world_size", torch.distributed.get_world_size())
+    backend = conf.get("backend", "nccl" if torch.cuda.is_available() else "gloo")
+
+    internal_wrapper = None
+    if tp > 1 or cp > 1 or pp > 1:
+        internal_wrapper = FSDP2Manager(
+            dp_size=dp if dp > 0 else None,
+            tp_size=tp,
+            cp_size=cp,
+            pp_size=pp,
+            backend=backend,
+            world_size=world_size,
+            use_hf_tp_plan=bool(conf.get("use_hf_tp_plan", False)),
+            sequence_parallel=bool(conf.get("sequence_parallel", False)),
+            activation_checkpointing=bool(conf.get("activation_checkpointing", False)),
+        )
+        # If caller provided a prebuilt DeviceMesh, inject it
+        if device_mesh is not None:
+            internal_wrapper.device_mesh = device_mesh
+    else:
+        internal_wrapper = DDPManager(
+            backend=backend,
+            activation_checkpointing=bool(conf.get("activation_checkpointing", False)),
+        )
+
+    return internal_wrapper
+
+
+def _apply_parallelization(
+    model: torch.nn.Module,
+    internal_wrapper: Optional[Union[FSDP2Manager, DDPManager]],
+) -> torch.nn.Module:
+    """
+    Apply parallelization to the model using the provided wrapper.
+
+    Args:
+        model: The model to parallelize.
+        internal_wrapper: The parallel manager (FSDP2Manager or DDPManager).
+
+    Returns:
+        The parallelized model, or the original model if parallelization fails.
+    """
+    if internal_wrapper is None:
+        return model
+
+    if not torch.distributed.is_initialized():
+        logger.warning("distributed requested but torch.distributed is not initialized; skipping parallelize")
+        return model
+
+    try:
+        return internal_wrapper.parallelize(model)
+    except Exception as e:
+        logger.warning("parallelize failed: %s", e)
+        return model
 
 
 def get_architectures(hf_config):
@@ -349,6 +523,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         attn_implementation: str = "flash_attention_2",
         quantization_config=None,
         force_hf: bool = False,
+        device_mesh: Optional[DeviceMesh] = None,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -427,6 +602,21 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 **kwargs,
             )
 
+        if _is_distributed_model_init(device_mesh):
+            return cls.from_pretrained_distributed(
+                pretrained_model_name_or_path,
+                *model_args,
+                use_liger_kernel=use_liger_kernel,
+                use_sdpa_patching=use_sdpa_patching,
+                sdpa_method=sdpa_method,
+                torch_dtype=torch_dtype,
+                attn_implementation=attn_implementation,
+                quantization_config=quantization_config,
+                force_hf=force_hf,
+                device_mesh=device_mesh,
+                **kwargs,
+            )
+
         # 1. if force_hf is True, we will use the parent class to load and return the model as is
         if force_hf:
             return cls._from_pretrained_parent_class(
@@ -437,6 +627,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 quantization_config=quantization_config,
                 **kwargs,
             )
+
         architectures = get_architectures(hf_config)
         # 2. If we have a custom model implementation available, we prioritize that over HF
         if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
@@ -451,9 +642,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         # 3. fallback to parent class
         model = None
+        if quantization_config is not None:
+            kwargs["quantization_config"] = quantization_config
         try:
-            if quantization_config is not None:
-                kwargs["quantization_config"] = quantization_config
             model = cls._from_pretrained_parent_class(
                 pretrained_model_name_or_path,
                 *model_args,
@@ -469,6 +660,145 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 logging.warning("Falling back to {} attention.".format(attn_implementation))
                 return _retry(attn_implementation=attn_implementation)
             raise e
+
+        # Kernel patching
+        if use_liger_kernel:
+            try:
+                model = _patch_liger_kernel(model)
+            except RuntimeError:
+                logging.warning("Retrying without Liger kernels.")
+                del model
+                gc.collect()
+                return _retry(use_liger_kernel=False)
+
+        # Patch sdpa attention
+        if use_sdpa_patching:
+            try:
+                model = _patch_attention(model, sdpa_method)  # noqa: F821
+            except:
+                logging.warning("Retrying without SDPA patching.")
+                return _retry(use_sdpa_patching=False)
+
+        model.config.update({"nemo_version": __version__})
+        return model
+
+    @classmethod
+    def from_pretrained_distributed(
+        cls,
+        pretrained_model_name_or_path,
+        *model_args,
+        use_liger_kernel,
+        use_sdpa_patching,
+        sdpa_method,
+        torch_dtype,
+        attn_implementation,
+        quantization_config,
+        force_hf,
+        device_mesh,
+        distributed,
+        device,
+        move_to_device,
+        **kwargs,
+    ) -> PreTrainedModel:
+        assert _is_distributed_model_init(device_mesh), "Distributed model initialization requires a device_mesh and distributed dictionary"
+
+        torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
+        
+        # Determine if this is an HF model
+        kwargs_copy = kwargs.copy()
+        kwargs_copy["trust_remote_code"] = kwargs_copy.get(
+            "trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path)
+        )
+        try:
+            hf_config = AutoConfig.from_pretrained(
+                pretrained_model_name_or_path, trust_remote_code=kwargs_copy["trust_remote_code"]
+            )
+            architectures = getattr(hf_config, "architectures", None) or []
+            is_hf_model = (not architectures or architectures[0] not in ModelRegistry.model_arch_name_to_cls) or force_hf
+        except Exception:
+            is_hf_model = True
+        
+        # Extract cp_size from distributed config
+        cp_size = 1
+        if distributed is not None and isinstance(distributed, dict):
+            cp_size = int(distributed.get("cp_size", 1))
+
+        def _retry(**override):
+            """Internal helper to re-enter this function with patched args."""
+            kwargs["quantization_config"] = quantization_config
+            if "quantization_config" in override:
+                if override["quantization_config"] is None:
+                    kwargs.pop("quantization_config")
+                else:
+                    kwargs["quantization_config"] = override["quantization_config"]
+
+            return cls.from_pretrained(
+                pretrained_model_name_or_path,
+                *model_args,
+                torch_dtype=torch_dtype,
+                attn_implementation=override.get("attn_implementation", attn_implementation),
+                use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
+                use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
+                sdpa_method=sdpa_method,
+                device_mesh=device_mesh,
+                **kwargs,
+            )
+
+        # load model
+        # First try to load from the NeMo registry
+        model = None
+        if not force_hf:
+            model = _get_model_from_nemo_registry(pretrained_model_name_or_path, model_args, kwargs)
+        
+        # If not found in the NeMo registry, load from the HF registry
+        if model is None:
+            try:
+                name = cls.__name__
+                if name.startswith("NeMo"):
+                    cls.__name__ = name[4:]
+                if quantization_config is not None:
+                    kwargs["quantization_config"] = quantization_config
+                model = super().from_pretrained(
+                    pretrained_model_name_or_path,
+                    *model_args,
+                    torch_dtype=torch_dtype,
+                    attn_implementation=attn_implementation,
+                    **kwargs,
+                )
+                cls.__name__ = name
+            except ValueError as e:
+                if "does not support" in str(e):
+                    if model is not None:
+                        del model
+                    attn_implementation = _get_next_fallback_attn(attn_implementation)
+                    logging.warning("Falling back to {} attention.".format(attn_implementation))
+                    return _retry(attn_implementation=attn_implementation)
+                raise e
+
+        # Copy state dict keys before any parallelization (used by checkpointing)
+        try:
+            state_dict_keys_before_parallel = list(model.state_dict().keys())
+        except Exception:
+            state_dict_keys_before_parallel = []
+
+        # Decide kernel patching based on requested parallelism
+        if distributed is not None:
+            conf = distributed if isinstance(distributed, dict) else {}
+            tp = int(conf.get("tp_size", 1))
+            cp = int(conf.get("cp_size", 1))
+            if tp > 1 or cp > 1:
+                use_liger_kernel = False
+
+            # Guard for CP requiring SDPA support on some models (moved from train_ft)
+            try:
+                if cp > 1 and hasattr(model, "_supports_sdpa") and model._supports_sdpa is False:
+                    raise ValueError("Model does not support SDPA required for context parallelism")
+            except Exception:
+                # If attribute missing, do not block
+                pass
+
+        # Build internal wrapper (FSDP2 or DDP) using device_mesh or config
+        internal_wrapper = _build_parallel_manager(distributed, device_mesh)
 
         # Kernel patching
         try:
@@ -490,6 +820,54 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         _verify_sdpa_support(model, is_hf_model, cp_size)
 
+        # Apply parallelization
+        model = _apply_parallelization(model, internal_wrapper)
+
+        # Finally move the model to the chosen device (post-parallelization), if requested
+        if move_to_device:
+            dev = _choose_device(device)
+            _move_module_to_device(model, dev, torch_dtype)
+
+        # Auto-detect local NeMo checkpoint path and load via Checkpointer
+        try:
+            is_local_path = isinstance(pretrained_model_name_or_path, str) and os.path.isdir(pretrained_model_name_or_path)
+            ckpt_model_dir = (
+                os.path.join(pretrained_model_name_or_path, "model") if is_local_path else None
+            )
+            if ckpt_model_dir and os.path.isdir(ckpt_model_dir):
+                ckpt_conf_dict = dict(
+                    enabled=True,
+                    checkpoint_dir=pretrained_model_name_or_path,
+                    model_save_format="safetensors",
+                    model_repo_id=None,
+                    model_cache_dir=kwargs.get("cache_dir", TRANSFORMERS_CACHE),
+                    save_consolidated=True,
+                    is_peft=False,
+                    is_async=False,
+                    dequantize_base_checkpoint=False,
+                )
+                if state_dict_keys_before_parallel:
+                    ckpt_conf_dict["model_state_dict_keys"] = state_dict_keys_before_parallel
+                checkpoint_config = CheckpointingConfig(**ckpt_conf_dict)
+
+                dp_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                tp_rank = 0
+                pp_rank = 0
+
+                model._nemo_checkpointer = Checkpointer(
+                    config=checkpoint_config,
+                    dp_rank=dp_rank,
+                    tp_rank=tp_rank,
+                    pp_rank=pp_rank,
+                    moe_mesh=getattr(internal_wrapper, "moe_mesh", None) if 'internal_wrapper' in locals() else None,
+                )
+                try:
+                    model._nemo_checkpointer.load_model(model, ckpt_model_dir)
+                except Exception as e:
+                    logger.warning(f"Failed to load local NeMo checkpoint from {ckpt_model_dir}: {e}")
+        except Exception as e:
+            logger.warning(f"Checkpoint autodetection failed: {e}")
+
         model.config.update({"nemo_version": __version__})
         return model
 
@@ -505,6 +883,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         attn_implementation: str = "flash_attention_2",
         quantization_config=None,
         force_hf: bool = False,
+        device_mesh: Optional[DeviceMesh] = None,
+        distributed: Optional[Dict[str, Any]] = None,
+        device: Optional[torch.device] = None,
+        move_to_device: bool = False,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -575,6 +957,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
+                device_mesh=device_mesh,
                 **kwargs,
             )
 
@@ -619,6 +1002,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 return _retry(attn_implementation="eager")
             raise e
 
+        # Build internal wrapper (FSDP2 or DDP) using device_mesh or config
+        internal_wrapper = _build_parallel_manager(distributed, device_mesh)
+
         # Kernel patching
         try:
             if use_liger_kernel:
@@ -638,6 +1024,14 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             return _retry(use_sdpa_patching=False)
 
         _verify_sdpa_support(model, is_hf_model, cp_size)
+
+        # Apply parallelization
+        model = _apply_parallelization(model, internal_wrapper)
+
+        # Finally move the model to the chosen device (post-parallelization), if requested
+        if move_to_device:
+            dev = _choose_device(device)
+            _move_module_to_device(model, dev, torch_dtype)
 
         model.config.update({"nemo_version": __version__})
         return model

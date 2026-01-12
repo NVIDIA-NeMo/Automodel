@@ -131,6 +131,50 @@ uv run python -c "import nemo_automodel; print('AutoModel ready')"
 ```
 
 
+### Drop-in Distributed Model Loading
+
+NeMo AutoModel provides a drop-in replacement for Hugging Face's `AutoModelForCausalLM` with built-in support for distributed training via `device_mesh` and `distributed` options:
+
+**Standard Hugging Face:**
+```python
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-8B")
+```
+
+**NeMo AutoModel with Distributed Support:**
+```python
+from nemo_automodel import NeMoAutoModelForCausalLM
+from torch.distributed.device_mesh import init_device_mesh
+
+# Initialize device mesh for tensor parallelism
+mesh = init_device_mesh(
+    "cuda",
+    mesh_shape=(1, 1, 1, 1, 2),  # (pp, dp_replicate, dp_shard, cp, tp)
+    mesh_dim_names=("pp", "dp_replicate", "dp_shard", "cp", "tp")
+)
+
+# Load model with automatic tensor parallelism
+model = NeMoAutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.1-8B",
+    device_mesh=mesh,
+)
+```
+
+Alternatively, use the `distributed` dictionary for more control:
+```python
+model = NeMoAutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.1-8B",
+    distributed={"tp_size": 2, "dp_size": 4},
+)
+```
+
+The distributed API supports:
+- **Tensor Parallelism (TP)**: Split model layers across GPUs
+- **Context Parallelism (CP)**: Distribute sequence context
+- **Pipeline Parallelism (PP)**: Split model stages across GPUs
+- **Data Parallelism (DP)**: Replicate model across GPUs with FSDP2
+
 ### Run a Recipe
 To run a NeMo AutoModel recipe, you need a recipe script (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/finetune.py), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/finetune.py)) and a YAML config file (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama/llama3_2_1b_squad.yaml), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml)):
 ```
