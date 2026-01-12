@@ -326,12 +326,8 @@ def _get_model_from_nemo_registry(pretrained_model_name_or_path, model_args, kwa
         logger.error(f"Failed to use custom model implementation with error: {e}")
         return None
 
-def _is_distributed_model_init(device_mesh, distributed) -> bool:
-    if isinstance(device_mesh, DeviceMesh) and device_mesh.size() > 1:
-        return True
-    if isinstance(distributed, dict) and len(distributed) > 0:
-        return True
-    return False
+def _is_distributed_model_init(device_mesh) -> bool:
+    return isinstance(device_mesh, DeviceMesh) and device_mesh.size() > 1
 
 def _download_model_weights(hf_config, pretrained_model_name_or_path):
     if not os.path.isdir(pretrained_model_name_or_path):
@@ -516,9 +512,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         quantization_config=None,
         force_hf: bool = False,
         device_mesh: Optional[DeviceMesh] = None,
-        distributed: Optional[Dict[str, Any]] = None,
-        device: Optional[torch.device] = None,
-        move_to_device: bool = False,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -595,7 +588,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 **kwargs,
             )
 
-        if _is_distributed_model_init(device_mesh, distributed):
+        if _is_distributed_model_init(device_mesh):
             return cls.from_pretrained_distributed(
                 pretrained_model_name_or_path,
                 *model_args,
@@ -607,9 +600,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 quantization_config=quantization_config,
                 force_hf=force_hf,
                 device_mesh=device_mesh,
-                distributed=distributed,
-                device=device,
-                move_to_device=move_to_device,
                 **kwargs,
             )
 
@@ -694,7 +684,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         move_to_device,
         **kwargs,
     ) -> PreTrainedModel:
-        assert _is_distributed_model_init(device_mesh, distributed), "Distributed model initialization requires a device_mesh and distributed dictionary"
+        assert _is_distributed_model_init(device_mesh), "Distributed model initialization requires a device_mesh and distributed dictionary"
 
         torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
         
@@ -735,9 +725,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
                 device_mesh=device_mesh,
-                distributed=distributed,
-                device=device,
-                move_to_device=move_to_device,
                 **kwargs,
             )
 
@@ -955,9 +942,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
                 device_mesh=device_mesh,
-                distributed=distributed,
-                device=device,
-                move_to_device=move_to_device,
                 **kwargs,
             )
 
