@@ -37,9 +37,9 @@ class _ModelRegistry:
     naming_override: Dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
+        self.naming_override["Qwen3OmniMoeThinkerForConditionalGeneration"] = "Qwen3OmniMoeForConditionalGeneration"
         for modeling_path in self.modeling_path:
             self._mapping_model_arch_name_to_cls(modeling_path)
-        self.naming_override["Qwen3OmniMoeThinkerForConditionalGeneration"] = "Qwen3OmniMoeForConditionalGeneration"
 
     @property
     def supported_models(self) -> Dict[str, Type[nn.Module]]:

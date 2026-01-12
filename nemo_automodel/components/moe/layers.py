@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import warnings
 from dataclasses import dataclass
 from functools import partial
 from typing import Literal, Optional
@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -194,6 +195,7 @@ class GroupedExperts(nn.Module):
                 model and intermediate dimension parameters.
         """
         super().__init__()
+        self.config = config
         self.n_routed_experts = config.n_routed_experts
         self.expert_bias = config.expert_bias
         self.gate_and_up_projs = nn.Parameter(
@@ -914,7 +916,15 @@ class MoE(nn.Module):
             self.gate = FakeBalancedGate(config)
         else:
             self.gate = Gate(config, gate_precision=backend.gate_precision)
-        if backend.enable_deepep:
+        if backend.enable_deepep and get_world_size_safe() == 1:
+            warnings.warn(
+                "DeepEP is enabled in config, but world size is 1. "
+                "DeepEP requires multiple GPUs. Falling back to standard GroupedExperts.",
+                category=UserWarning,
+                stacklevel=2,
+            )
+            self.experts = GroupedExperts(config)
+        elif backend.enable_deepep:
             self.experts = GroupedExpertsDeepEP(config)
         else:
             self.experts = GroupedExperts(config)

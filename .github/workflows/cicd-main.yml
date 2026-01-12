@@ -45,7 +45,7 @@ jobs:
       - name: Set up UV
         uses: astral-sh/setup-uv@v1
         with:
-          version: 0.7.2
+          version: 0.8.22
       - name: Install ruff
         env:
           UV_PROJECT_ENVIRONMENT: ./venv
@@ -60,8 +60,9 @@ jobs:
       - name: Run ruff
         run: |
           source ./venv/bin/activate
-          uv run ruff check . --verbose
-          uv run ruff format --check . --verbose
+          uv run --active ruff --version
+          uv run --active ruff check --verbose .
+          uv run --active ruff format --check --verbose .
 
   import_linting:
     runs-on: ubuntu-latest
@@ -187,6 +188,10 @@ jobs:
             timeout: 40
           - test-name: L2_HF_PEFT
             test-folder: hf_peft
+            runner: self-hosted-nemo
+            timeout: 30
+          - test-name: L2_MOE_PEFT
+            test-folder: moe_peft
             runner: self-hosted-nemo
             timeout: 30
           - test-name: L2_HF_Transformer
