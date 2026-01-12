@@ -137,6 +137,24 @@ class DummyPhi4Processor:
         return {"input_ids": base, "attention_mask": attention_mask, "extra": extra}
 
 
+class DummyNemotronParseProcessor:
+    def __init__(self):
+        self.tokenizer = types.SimpleNamespace(
+            pad_token_id=0,
+            decoder_start_token_id=5,
+            bos_token_id=6,
+            eos_token_id=7,
+        )
+
+    def __call__(self, *, images, text, padding, return_tensors):
+        assert padding is True and return_tensors == "pt"
+        batch_size = len(text)
+        input_ids = torch.tensor([[10, 11, 12, 13]], dtype=torch.long).repeat(batch_size, 1)
+        attention_mask = torch.ones_like(input_ids)
+        pixel_values = torch.ones(batch_size, 3, 2, 2, dtype=torch.float32)
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "pixel_values": pixel_values}
+
+
 def test_build_labels_includes_stop_token(collate_mod, monkeypatch):
     """
     Ensure `build_labels` copies the trailing stop token when it matches the configured set.
@@ -286,6 +304,48 @@ def test_qwen3_omni_collate_shapes(collate_mod, fake_qwen_utils, monkeypatch):
 
     assert batch["input_ids"].shape == (3, 4)
     assert batch["labels"].shape == (3, 4)
+
+
+def test_nemotron_parse_collate_shifts_and_casts(collate_mod, monkeypatch):
+    processor = DummyNemotronParseProcessor()
+
+    # Return deterministic labels to bypass tokenizer-heavy logic.
+    labels_stub = torch.tensor([[20, 21, 22, 23]], dtype=torch.long)
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        assert processor_arg is processor
+        assert input_ids.shape == (1, 4)
+        return labels_stub
+
+    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+
+    examples = [
+        {
+            "conversation": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "please parse"},
+                        {"type": "image", "image": "dummy.png"},
+                    ],
+                },
+                {"role": "assistant", "content": "ok"},
+            ]
+        }
+    ]
+
+    batch = collate_mod.nemotron_parse_collate_fn(
+        examples,
+        processor=processor,
+        task_prompt="</s><s><predict_bbox>",
+    )
+
+    assert batch["pixel_values"].dtype == torch.bfloat16
+    assert torch.equal(batch["input_ids"], torch.tensor([[10, 11, 12]]))
+    assert torch.equal(batch["attention_mask"], torch.tensor([[1, 1, 1]]))
+    assert torch.equal(batch["labels"], torch.tensor([[21, 22, 23]]))
+    assert torch.equal(batch["decoder_input_ids"], torch.tensor([[10, 11, 12]]))
+    assert torch.equal(batch["decoder_attention_mask"], torch.tensor([[1, 1, 1]]))
 
 
 @pytest.mark.parametrize("fn_name", ["qwen2_5_collate_fn", "default_collate_fn", "qwen3_omni_collate_fn"])
