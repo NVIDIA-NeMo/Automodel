@@ -39,6 +39,7 @@ The table below lists the main architectures we test against (FSDP2 combined wit
 | `GPTBigCodeForCausalLM`               | StarCoder, SantaCoder, WizardCoder    | `bigcode/starcoder`, `bigcode/gpt_bigcode-santacoder`, `WizardLM/WizardCoder-15B-V1.0` etc. |
 | `GPTJForCausalLM`                     | GPT‑J                                 | `EleutherAI/gpt-j-6b`, `nomic-ai/gpt4all-j` etc.                                  |
 | `GPTNeoXForCausalLM`                  | GPT‑NeoX, Pythia, OpenAssistant, Dolly V2, StableLM | `EleutherAI/gpt-neox-20b`, `EleutherAI/pythia-12b`, `OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5`, `databricks/dolly-v2-12b`, `stabilityai/stablelm-tuned-alpha-7b` etc. |
+| `GptOssForCausalLM`                   | GPT-OSS                               | `openai/gpt-oss-20b`, `openai/gpt-oss-120b`                                      |
 | `GraniteForCausalLM`                  | Granite 3.0, Granite 3.1, PowerLM     | `ibm-granite/granite-3.0-2b-base`, `ibm-granite/granite-3.1-8b-instruct`, `ibm/PowerLM-3b` etc. |
 | `GraniteMoeForCausalLM`               | Granite 3.0 MoE, PowerMoE             | `ibm-granite/granite-3.0-1b-a400m-base`, `ibm-granite/granite-3.0-3b-a800m-instruct`, `ibm/PowerMoE-3b` etc. |
 | `GraniteMoeSharedForCausalLM`         | Granite MoE Shared                    | `ibm-research/moe-7b-1b-active-shared-experts` (test model)                       |
