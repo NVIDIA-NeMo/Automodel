@@ -253,6 +253,88 @@ def qwen3_omni_collate_fn(
     return batch
 
 
+def nemotron_parse_collate_fn(
+    examples: Sequence[Dict[str, Any]],
+    processor,
+    task_prompt: str = "</s><s><predict_bbox><predict_classes><output_markdown>",
+) -> Dict[str, torch.Tensor]:
+    """
+    Collate function for NVIDIA Nemotron-Parse models.
+
+    The Nemotron-Parse processor does not expose a chat template, so we build the
+    prompt + answer string manually, mask the prompt tokens, and keep the
+    image preprocessing handled by the processor.
+    """
+
+    conversations = [example["conversation"] for example in examples]
+
+    images: List[Any] = []
+    targets: List[str] = []
+    for conversation in conversations:
+        image = None
+        assistant_text = ""
+
+        for message in conversation:
+            role = message.get("role")
+            content = message.get("content")
+
+            if role == "user":
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "image":
+                            image = item.get("image")
+                            break
+            elif role == "assistant" and not assistant_text:
+                assistant_text = _extract_assistant_text(message)
+
+            if image is not None and assistant_text:
+                break
+
+        images.append(image)
+        targets.append(assistant_text)
+
+    texts = [f"{task_prompt}{target}" for target in targets]
+
+    batch = processor(images=images, text=texts, padding=True, return_tensors="pt")
+
+    if "pixel_values" in batch:
+        batch["pixel_values"] = batch["pixel_values"].to(torch.bfloat16)
+
+    labels = build_labels(
+        batch["input_ids"],
+        conversations,
+        processor,
+    )
+
+    batch["labels"] = labels[:, 1:]
+
+    tokenizer = getattr(processor, "tokenizer", processor)
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    decoder_start_token_id = getattr(tokenizer, "decoder_start_token_id", None) or getattr(
+        tokenizer, "bos_token_id", None
+    )
+    if decoder_start_token_id is None:
+        decoder_start_token_id = getattr(tokenizer, "eos_token_id", None)
+    if pad_token_id is None or decoder_start_token_id is None:
+        raise ValueError("Nemotron-Parse collate_fn requires pad_token_id and decoder_start_token_id.")
+
+    decoder_input_ids = batch["input_ids"].clone()
+    decoder_input_ids[:, 0] = decoder_start_token_id
+    decoder_input_ids[:, 1:] = batch["input_ids"][:, :-1]
+
+    decoder_attention_mask = (decoder_input_ids != pad_token_id).long()
+
+    batch["decoder_input_ids"] = decoder_input_ids[:, 1:]
+    batch["decoder_attention_mask"] = decoder_attention_mask[:, 1:]
+
+    input_shape = batch["input_ids"].shape
+    for key, value in list(batch.items()):
+        if isinstance(value, torch.Tensor) and value.shape == input_shape:
+            batch[key] = value[:, :-1]
+
+    return batch
+
+
 def default_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
@@ -297,5 +379,6 @@ def default_collate_fn(
 COLLATE_FNS = {
     "Qwen2_5_VLProcessor": qwen2_5_collate_fn,
     "Qwen3OmniMoeProcessor": qwen3_omni_collate_fn,
+    "NemotronParseProcessor": nemotron_parse_collate_fn,
     "default": default_collate_fn,
 }
