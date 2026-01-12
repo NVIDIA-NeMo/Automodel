@@ -612,6 +612,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 attn_implementation=attn_implementation,
                 **kwargs,
             )
+
         architectures = get_architectures(hf_config)
         # 2. If we have a custom model implementation available, we prioritize that over HF
         if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
@@ -626,9 +627,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         # 3. fallback to parent class
         model = None
+        if quantization_config is not None:
+            kwargs["quantization_config"] = quantization_config
         try:
-            if quantization_config is not None:
-                kwargs["quantization_config"] = quantization_config
             model = cls._from_pretrained_parent_class(
                 pretrained_model_name_or_path,
                 *model_args,
@@ -646,22 +647,22 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             raise e
 
         # Kernel patching
-        try:
-            if use_liger_kernel:
+        if use_liger_kernel:
+            try:
                 model = _patch_liger_kernel(model)
-        except RuntimeError:
-            logging.warning("Retrying without Liger kernels.")
-            del model
-            gc.collect()
-            return _retry(use_liger_kernel=False)
+            except RuntimeError:
+                logging.warning("Retrying without Liger kernels.")
+                del model
+                gc.collect()
+                return _retry(use_liger_kernel=False)
 
         # Patch sdpa attention
-        try:
-            if use_sdpa_patching:
+        if use_sdpa_patching:
+            try:
                 model = _patch_attention(model, sdpa_method)  # noqa: F821
-        except:
-            logging.warning("Retrying without SDPA patching.")
-            return _retry(use_sdpa_patching=False)
+            except:
+                logging.warning("Retrying without SDPA patching.")
+                return _retry(use_sdpa_patching=False)
 
         model.config.update({"nemo_version": __version__})
         return model
