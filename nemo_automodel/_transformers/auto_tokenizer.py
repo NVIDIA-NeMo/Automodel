@@ -17,13 +17,32 @@ from typing import Callable, Optional, Type, Union
 
 from transformers import AutoConfig, AutoTokenizer
 
-from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import AutoTokenizerWithBosEosEnforced
+from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import NeMoAutoTokenizerWithBosEosEnforced
 from nemo_automodel._transformers.tokenization.registry import TokenizerRegistry
 
 logger = logging.getLogger(__name__)
 
 
-class NeMoAutoTokenizer:
+def _get_model_type(pretrained_model_name_or_path: str, trust_remote_code: bool = False) -> Optional[str]:
+    """
+    Determine the model type from the config.
+
+    Args:
+        pretrained_model_name_or_path: Model identifier or path
+        trust_remote_code: Whether to trust remote code
+
+    Returns:
+        The model_type string, or None if it cannot be determined
+    """
+    try:
+        config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=trust_remote_code)
+        return getattr(config, "model_type", None)
+    except Exception as e:
+        logger.debug(f"Could not load config to determine model type: {e}")
+        return None
+
+
+class NeMoAutoTokenizer(AutoTokenizer):
     """
     Auto tokenizer class that dispatches to appropriate tokenizer implementations.
 
@@ -32,7 +51,7 @@ class NeMoAutoTokenizer:
 
     The dispatch logic is:
     1. If a custom tokenizer is registered for the model type, use it
-    2. Otherwise, fall back to AutoTokenizerWithBosEosEnforced
+    2. Otherwise, fall back to NeMoAutoTokenizerWithBosEosEnforced
 
     Example:
         >>> # Will use MistralCommonBackend if available for Mistral models
@@ -77,7 +96,7 @@ class NeMoAutoTokenizer:
 
         Args:
             pretrained_model_name_or_path: Model identifier or path
-            force_default: If True, always use AutoTokenizerWithBosEosEnforced
+            force_default: If True, always use NeMoAutoTokenizerWithBosEosEnforced
             force_hf: If True, return the raw HF AutoTokenizer without any wrapping
             trust_remote_code: Whether to trust remote code when loading config
             **kwargs: Additional arguments passed to the tokenizer's from_pretrained
@@ -87,12 +106,12 @@ class NeMoAutoTokenizer:
         """
         # If force_hf, just use the base HF AutoTokenizer
         if force_hf:
-            return AutoTokenizer.from_pretrained(
+            return super().from_pretrained(
                 pretrained_model_name_or_path, *args, trust_remote_code=trust_remote_code, **kwargs
             )
 
         # Try to determine model type from config
-        model_type = cls._get_model_type(pretrained_model_name_or_path, trust_remote_code=trust_remote_code)
+        model_type = _get_model_type(pretrained_model_name_or_path, trust_remote_code=trust_remote_code)
 
         if model_type and cls._registry.has_custom_tokenizer(model_type):
             tokenizer_cls = cls._registry.get_tokenizer_cls(model_type)
@@ -100,32 +119,13 @@ class NeMoAutoTokenizer:
             return tokenizer_cls.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
 
         # Fall back to default BOS/EOS enforced tokenizer
-        return AutoTokenizerWithBosEosEnforced.from_pretrained(
+        return NeMoAutoTokenizerWithBosEosEnforced.from_pretrained(
             pretrained_model_name_or_path, *args, trust_remote_code=trust_remote_code, **kwargs
         )
-
-    @classmethod
-    def _get_model_type(cls, pretrained_model_name_or_path: str, trust_remote_code: bool = False) -> Optional[str]:
-        """
-        Determine the model type from the config.
-
-        Args:
-            pretrained_model_name_or_path: Model identifier or path
-            trust_remote_code: Whether to trust remote code
-
-        Returns:
-            The model_type string, or None if it cannot be determined
-        """
-        try:
-            config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=trust_remote_code)
-            return getattr(config, "model_type", None)
-        except Exception as e:
-            logger.debug(f"Could not load config to determine model type: {e}")
-            return None
 
 
 __all__ = [
     "NeMoAutoTokenizer",
-    "AutoTokenizerWithBosEosEnforced",
+    "NeMoAutoTokenizerWithBosEosEnforced",
     "TokenizerRegistry",
 ]

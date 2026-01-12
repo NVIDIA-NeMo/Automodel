@@ -104,6 +104,7 @@ vlm = [
     "numba",
     "torchcodec; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "mistral_common[opencv]",
+    "albumentations"
 ]
 all = [
     "nemo_automodel[extra]",

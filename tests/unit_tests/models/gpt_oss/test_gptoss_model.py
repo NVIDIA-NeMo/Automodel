@@ -92,6 +92,7 @@ def backend_config():
         enable_deepep=False,
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
+        rope_fusion=False,
     )
 
 
