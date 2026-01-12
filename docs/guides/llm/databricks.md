@@ -77,7 +77,7 @@ To run training on a single GPU, use this command:
     --checkpoint.checkpoint_dir /Volumes/<catalog_name>/<schema_name>/<volume_name>/checkpoints_single/
 ```
 
-The `--step_scheduler.max_steps 20` option limits the number of training steps taken (again, this is for example purposes – adapt for your actual use case as needed) and the `--checkpoint.checkpoint_dir` option tells Automodel where to {doc}`save model checkpoints </checkpointing>` while training. We recommend saving model checkpoints in a Databricks’ Unity Catalog [volume](https://docs.databricks.com/aws/en/volumes/).
+The `--step_scheduler.max_steps 20` option limits the number of training steps taken (again, this is for example purposes – adapt for your actual use case as needed) and the `--checkpoint.checkpoint_dir` option tells Automodel where to {doc}`save model checkpoints </guides/checkpointing>` while training. We recommend saving model checkpoints in a Databricks’ Unity Catalog [volume](https://docs.databricks.com/aws/en/volumes/).
 
 Looking at GPU metrics in Databricks, we see our single GPU is being well utilized (\~95% utilization).
 
