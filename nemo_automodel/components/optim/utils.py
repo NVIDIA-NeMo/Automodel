@@ -16,6 +16,7 @@ except Exception as e:  # pragma: no cover - handled at runtime
 
 logger = logging.getLogger(__name__)
 
+
 def is_dion_optimizer(cfg_opt) -> bool:
     target = getattr(cfg_opt, "_target_", None)
     name = getattr(target, "__name__", "")
@@ -36,7 +37,7 @@ def _separate_param_groups(
 ):
     """
     Separate model parameters into groups for Dion/Muon optimizers.
-    
+
     Args:
         model: The model to optimize.
         base_lr: Base learning rate for matrix params (Muon algorithm).
@@ -52,7 +53,6 @@ def _separate_param_groups(
     vector_params = []
     embed_params = []
     lm_head_params = []
-
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -90,7 +90,13 @@ def _separate_param_groups(
 
     param_groups = [
         dict(params=matrix_params),
-        dict(params=vector_params, algorithm=scalar_opt, lr=effective_scalar_lr, weight_decay=weight_decay, **scalar_kwargs),
+        dict(
+            params=vector_params,
+            algorithm=scalar_opt,
+            lr=effective_scalar_lr,
+            weight_decay=weight_decay,
+            **scalar_kwargs,
+        ),
         dict(params=embed_params, algorithm=scalar_opt, lr=effective_embed_lr, weight_decay=0.0, **scalar_kwargs),
     ]
 
@@ -103,7 +109,9 @@ def _separate_param_groups(
             d_in = first.shape[-1] if first.ndim >= 2 else max(1, first.numel())
             effective_lm_head_lr = base_lr / math.sqrt(float(d_in))
         param_groups.append(
-            dict(params=lm_head_params, algorithm=scalar_opt, lr=effective_lm_head_lr, weight_decay=0.0, **scalar_kwargs)
+            dict(
+                params=lm_head_params, algorithm=scalar_opt, lr=effective_lm_head_lr, weight_decay=0.0, **scalar_kwargs
+            )
         )
 
     return param_groups
@@ -111,14 +119,14 @@ def _separate_param_groups(
 
 def _get_dion_mesh(distributed_mesh: Any) -> Any:
     if distributed_mesh is None:
-        return None    
-    if not hasattr(distributed_mesh, 'ndim') or distributed_mesh.ndim == 1:
-        return distributed_mesh    
+        return None
+    if not hasattr(distributed_mesh, "ndim") or distributed_mesh.ndim == 1:
+        return distributed_mesh
     try:
         logger.info(f"[Dion] Extracting dp_shard_cp 1D submesh from distributed_mesh: {distributed_mesh}")
         dp_mesh_2d = distributed_mesh[("dp_replicate", "dp_shard_cp")]
         submesh = dp_mesh_2d["dp_shard_cp"]
-        if hasattr(submesh, 'ndim') and submesh.ndim == 1:
+        if hasattr(submesh, "ndim") and submesh.ndim == 1:
             logger.info(f"[Dion] Extracted dp_shard_cp 1D submesh via 2D mesh: {submesh}")
             return submesh
     except (KeyError, RuntimeError, TypeError) as e:
@@ -141,9 +149,7 @@ def build_dion_optimizer(
         process_group: Optional ProcessGroup for DDP.
     """
     if _import_error:
-        raise RuntimeError(
-            "Failed to import Dion. Please install Dion."
-        ) from _import_error
+        raise RuntimeError("Failed to import Dion. Please install Dion.") from _import_error
 
     target = cfg_opt._target_
 
@@ -154,7 +160,7 @@ def build_dion_optimizer(
     scalar_lr = cfg_dict.pop("scalar_lr", None)
     embed_lr = cfg_dict.pop("embed_lr", None)
     lm_head_lr = cfg_dict.pop("lm_head_lr", None)
-    
+
     base_lr = float(cfg_dict.get("lr", 1e-4))
     weight_decay = float(cfg_dict.get("weight_decay", 0.0))
 
@@ -163,12 +169,18 @@ def build_dion_optimizer(
     cleaned_kwargs = {k: v for k, v in cfg_dict.items() if k in valid_keys}
 
     param_groups = _separate_param_groups(
-        model, base_lr, scalar_opt, weight_decay, 
-        scalar_betas=scalar_betas, scalar_eps=scalar_eps,
-        scalar_lr=scalar_lr, embed_lr=embed_lr, lm_head_lr=lm_head_lr
+        model,
+        base_lr,
+        scalar_opt,
+        weight_decay,
+        scalar_betas=scalar_betas,
+        scalar_eps=scalar_eps,
+        scalar_lr=scalar_lr,
+        embed_lr=embed_lr,
+        lm_head_lr=lm_head_lr,
     )
 
-    dion_mesh = _get_dion_mesh(distributed_mesh)    
+    dion_mesh = _get_dion_mesh(distributed_mesh)
 
     if "distributed_mesh" in valid_keys:
         cleaned_kwargs["distributed_mesh"] = dion_mesh
