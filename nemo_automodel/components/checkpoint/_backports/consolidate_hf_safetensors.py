@@ -261,7 +261,14 @@ def _process_output_file(
 
     sorted_tensors = sorted(output_data.fqn_data.items(), key=lambda x: x[1].offset_in_file)
 
-    with open(output_file, "wb") as output_stream:
+    # `_write_metadata()` already created/truncated the file and wrote the safetensors header.
+    # Here we only need to append the raw tensor bytes after that header.
+    if not os.path.exists(output_file):
+        raise FileNotFoundError(
+            f"Expected output file {output_file} to exist (header written in _write_metadata()), but it does not."
+        )
+
+    with open(output_file, "ab") as output_stream:
         # Process each tensor in sequential output order
         for tensor_fqn, tensor_fqn_data in sorted_tensors:
             full_tensor_mv = memoryview(
