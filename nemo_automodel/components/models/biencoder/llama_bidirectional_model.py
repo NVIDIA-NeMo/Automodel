@@ -52,11 +52,13 @@ except ImportError:
 
 try:
     from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
+
     check_model_inputs = get_check_model_inputs_decorator()
 except ImportError:
     # Fallback to no-op decorator if import fails
     def check_model_inputs(func):
         return func
+
 
 logger = logging.get_logger(__name__)
 
