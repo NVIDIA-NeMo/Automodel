@@ -1,31 +1,31 @@
-# MLFlow Logging in NeMo Automodel
+# MLflow Logging in NeMo Automodel
 
 ## Introduction
 
-MLFlow is an open-source platform for managing the machine learning lifecycle, including experiment tracking, model versioning, and deployment. NeMo Automodel integrates with MLFlow to automatically log training metrics, parameters, and artifacts during model training.
+MLflow is an open-source platform for managing the machine learning lifecycle, including experiment tracking, model versioning, and deployment. NeMo Automodel integrates with MLflow to automatically log training metrics, parameters, and artifacts during model training.
 
-With MLFlow integration, you can:
+With MLflow integration, you can:
 - Track and compare experiments across multiple runs
 - Log hyperparameters and training configurations
 - Monitor training and validation metrics in real-time
 - Store model checkpoints and artifacts
-- Visualize experiment results through the MLFlow UI
+- Visualize experiment results through the MLflow UI
 - Share results with team members
 
 ## Prerequisites
 
-Before using MLFlow logging in NeMo Automodel, ensure you have:
+Before using MLflow logging in NeMo Automodel, ensure you have:
 
-1. **MLFlow installed**: MLFlow is included as a dependency in NeMo Automodel. If needed, install it manually:
+1. **MLflow installed**: MLflow is included as a dependency in NeMo Automodel. If needed, install it manually:
    ```bash
    uv add mlflow
    ```
 
-2. **MLFlow tracking server** (optional): For production use, set up a tracking server to centralize experiment data. For local development, MLFlow will use a local file-based store by default.
+2. **MLflow tracking server** (optional): For production use, set up a tracking server to centralize experiment data. For local development, MLflow will use a local file-based store by default.
 
 ## Configuration
 
-Enable MLFlow logging by adding a `mlflow` section to your recipe YAML configuration:
+Enable MLflow logging by adding an `mlflow` section to your recipe YAML configuration:
 
 ```yaml
 mlflow:
@@ -45,17 +45,17 @@ mlflow:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `experiment_name` | str | "automodel-experiment" | Name of the MLFlow experiment. All runs are grouped under this experiment. |
-| `run_name` | str | "" | Optional name for the current run. If empty, MLFlow generates a unique name. |
-| `tracking_uri` | str | null | URI of the MLFlow tracking server. If null, uses local file-based storage. |
-| `artifact_location` | str | null | Location to store artifacts. If null, uses default MLFlow location. |
+| `experiment_name` | str | "automodel-experiment" | Name of the MLflow experiment. All runs are grouped under this experiment. |
+| `run_name` | str | "" | Optional name for the current run. If empty, MLflow generates a unique name. |
+| `tracking_uri` | str | null | URI of the MLflow tracking server. If null, uses local file-based storage. |
+| `artifact_location` | str | null | Location to store artifacts. If null, uses default MLflow location. |
 | `tags` | dict | {} | Dictionary of tags to attach to the run for organization and filtering. |
 
 ### Tracking URI Options
 
-The `tracking_uri` parameter determines where MLFlow stores experiment data:
+The `tracking_uri` parameter determines where MLflow stores experiment data:
 
-- **Local file storage** (default): `null` or `file:///path/to/mlruns`
+- **Local file storage (default)**: `null` or `file:///path/to/mlruns`
 - **Remote tracking server**: `http://your-mlflow-server:5000`
 - **Database backend**: `postgresql://user:password@host:port/database`
 
@@ -63,7 +63,7 @@ For team collaboration, we recommend setting up a remote tracking server.
 
 ## What Gets Logged
 
-NeMo Automodel automatically logs the following information to MLFlow:
+NeMo Automodel automatically logs the following information to MLflow:
 
 ### Metrics
 - Training loss at each step
@@ -87,15 +87,17 @@ NeMo Automodel automatically logs the following information to MLFlow:
 - Model checkpoints (if configured)
 - Training configuration files
 
-> **Note**: Only rank 0 in distributed training logs to MLFlow to avoid duplicate entries and reduce overhead.
+:::{note}
+Only rank 0 in distributed training logs to MLflow to avoid duplicate entries and reduce overhead.
+:::
 
 ## Usage Example
 
-Here's a complete example of training with MLFlow logging enabled:
+Here's a complete example of training with MLflow logging enabled:
 
 ### 1. Configure Your Recipe
 
-Add the MLFlow configuration to your YAML file (e.g., `llama3_2_1b_squad.yaml`):
+Add the MLflow configuration to your YAML file (e.g., `llama3_2_1b_squad.yaml`):
 
 ```yaml
 step_scheduler:
@@ -126,16 +128,16 @@ uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py \
   --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
-During training, you'll see MLFlow logging messages:
+During training, you'll see MLflow logging messages:
 
 ```
 MLflow run started: abc123def456
 View run at: file:///path/to/mlruns/#/experiments/1/runs/abc123def456
 ```
 
-### 3. View Results in MLFlow UI
+### 3. View Results in MLflow UI
 
-Launch the MLFlow UI to visualize your experiments:
+Launch the MLflow UI to visualize your experiments:
 
 ```bash
 mlflow ui
@@ -149,10 +151,10 @@ By default, the UI runs at `http://localhost:5000`. Open this URL in your browse
 
 ## Integration with Other Loggers
 
-MLFlow can be used alongside other logging tools like Weights & Biases (WandB). Simply enable both in your configuration:
+MLflow can be used alongside other logging tools like Weights & Biases (WandB). Simply enable both in your configuration:
 
 ```yaml
-# Enable both MLFlow and WandB
+# Enable both MLflow and WandB
 mlflow:
   experiment_name: "my-experiment"
   tags:
@@ -170,12 +172,12 @@ Both loggers will track the same metrics independently, allowing you to leverage
 
 ### Experiment Organization
 
-1. **Use descriptive experiment names**: Group related runs under meaningful experiment names
+1. **Use descriptive experiment names**: Group related runs under meaningful experiment names.
    ```yaml
    experiment_name: "llama3-squad-ablation-study"
    ```
 
-2. **Tag your runs**: Add tags for easy filtering and comparison
+2. **Tag your runs**: Add tags for easy filtering and comparison.
    ```yaml
    tags:
      model_size: "1b"
@@ -183,14 +185,14 @@ Both loggers will track the same metrics independently, allowing you to leverage
      optimizer: "adam"
    ```
 
-3. **Use run names for variants**: Differentiate runs within an experiment
+3. **Use run names for variants**: Differentiate runs within an experiment.
    ```yaml
    run_name: "lr-1e5-bs64"
    ```
 
 ### Remote Tracking Server
 
-For team collaboration, set up a shared MLFlow tracking server:
+For team collaboration, set up a shared MLflow tracking server:
 
 ```yaml
 mlflow:
@@ -211,20 +213,20 @@ Supported storage backends include S3, Azure Blob Storage, Google Cloud Storage,
 
 ### Performance Considerations
 
-- MLFlow logging adds minimal overhead since only rank 0 logs
-- Metrics are logged asynchronously to avoid blocking training
-- For very frequent logging (every step), consider increasing `val_every_steps` to reduce I/O
+- MLflow logging adds minimal overhead since only rank 0 logs.
+- Metrics are logged asynchronously to avoid blocking training.
+- For very frequent logging (every step), consider increasing `val_every_steps` to reduce I/O.
 
 ## Troubleshooting
 
-### MLFlow Not Installed
+### MLflow Not Installed
 
 If you see an import error:
 ```
 ImportError: MLflow is not installed. Please install it with: uv add mlflow
 ```
 
-Install MLFlow:
+Install MLflow:
 ```bash
 uv add mlflow
 ```
@@ -238,14 +240,14 @@ If you can't connect to a remote tracking server:
 
 ### Missing Metrics
 
-If metrics aren't appearing in MLFlow:
+If metrics aren't appearing in MLflow:
 - Verify you're running on rank 0 or check rank 0 logs
-- Ensure the MLFlow run started successfully (check for "MLflow run started" message)
+- Ensure the MLflow run started successfully (check for "MLflow run started" message)
 - Check that metrics are being computed during training
 
 ## References
 
-- [MLFlow Documentation](https://mlflow.org/docs/latest/index.html)
-- [MLFlow Tracking](https://mlflow.org/docs/latest/tracking.html)
-- [MLFlow Python API](https://mlflow.org/docs/latest/python_api/index.html)
+- [MLflow Documentation](https://mlflow.org/docs/latest/index.html)
+- [MLflow Tracking](https://mlflow.org/docs/latest/tracking.html)
+- [MLflow Python API](https://mlflow.org/docs/latest/python_api/index.html)
 - [NeMo Automodel Examples](https://github.com/NVIDIA/NeMo-Automodel/tree/main/examples)
