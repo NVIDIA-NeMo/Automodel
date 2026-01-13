@@ -47,6 +47,7 @@ class StepScheduler(Stateful):
         dataloader: Optional[int],
         ckpt_every_steps: Optional[int] = None,
         val_every_steps: Optional[int] = None,
+        log_remote_every_steps: int = 1,
         start_step: int = 0,
         start_epoch: int = 0,
         num_epochs: int = 10,
@@ -62,6 +63,7 @@ class StepScheduler(Stateful):
             dataloader: The training dataloader.
             ckpt_every_steps (Optional[int]): Frequency of checkpoint steps.
             val_every_steps (Optional[int]): Number of training steps between validation.
+            log_remote_every_steps (int): Frequency of remote logging (e.g., WandB, MLflow). Default: 1 (every step).
             start_step (int): Initial global step. Used when resuming from checkpoint. Default: 0.
             start_epoch (int): Initial epoch. Used when resuming from checkpoint. Default: 0.
             num_epochs (int): Total number of epochs. Default: 10.
@@ -88,6 +90,8 @@ class StepScheduler(Stateful):
             self.epoch_len = None
         self.val_every_steps = val_every_steps
         assert val_every_steps is None or val_every_steps > 0, "val_every_steps must be greater than 0 if not None"
+        self.log_remote_every_steps = log_remote_every_steps
+        assert log_remote_every_steps > 0, "log_remote_every_steps must be greater than 0"
         if max_steps is None:
             assert self.epoch_len is not None, "epoch_len must be provided if max_steps is not provided"
             max_steps = _calculate_max_steps(self.num_epochs, self.epoch_len)
@@ -139,6 +143,13 @@ class StepScheduler(Stateful):
         self.epoch = epoch
         if hasattr(getattr(self.dataloader, "sampler", None), "set_epoch"):
             self.dataloader.sampler.set_epoch(epoch)
+
+    @property
+    def is_remote_logging_step(self):
+        """
+        Returns whether this step should log to remote services (WandB, MLflow, etc.).
+        """
+        return self.step % self.log_remote_every_steps == 0
 
     @property
     def is_val_step(self):
