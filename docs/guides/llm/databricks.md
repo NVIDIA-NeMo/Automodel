@@ -2,7 +2,7 @@
 
 Databricks is a widely-used platform for managing data, models, applications, and compute on the cloud. This guide shows how to use Automodel for scalable, performant model training on Databricks.
 
-The specific example here fine-tunes a [Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B) model using the [SQuAD dataset](https://huggingface.co/datasets/rajpurkar/squad) from HuggingFace, but any Automodel functionality (for example, {doc}`model pre-training <pretraining>`, {doc}`VLMs </model-coverage/vlm>`, {doc}`other support models </model-coverage/overview>`) can also be run on Databricks.
+The specific example here fine-tunes a [Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B) model using the [SQuAD dataset](https://huggingface.co/datasets/rajpurkar/squad) from Hugging Face, but any Automodel functionality (for example, {doc}`model pre-training <pretraining>`, {doc}`VLMs </model-coverage/vlm>`, {doc}`other support models </model-coverage/overview>`) can also be run on Databricks.
 
 ## Compute
 
@@ -11,10 +11,10 @@ Let’s start by [provisioning](https://docs.databricks.com/aws/en/compute/confi
 - Databricks runtime: 17.3 LTS (Machine Learning version)  
 - Worker instance type: `g6e.12xlarge` on AWS (4x L40S GPU per node)  
 - Number of workers: 2  
-- Globally [environment variable](https://docs.databricks.com/aws/en/compute/configure#environment-variables): `GLOO_SOCKET_IFNAME=eth0` (see [this](https://docs.databricks.com/aws/en/machine-learning/train-model/distributed-training/spark-pytorch-distributor#gloo-failure-runtimeerror-connection-refused) for details)   
+- Global [environment variable](https://docs.databricks.com/aws/en/compute/configure#environment-variables): `GLOO_SOCKET_IFNAME=eth0` (see [this](https://docs.databricks.com/aws/en/machine-learning/train-model/distributed-training/spark-pytorch-distributor#gloo-failure-runtimeerror-connection-refused) for details)   
 - Cluster-scoped [init script](https://docs.databricks.com/aws/en/init-scripts/cluster-scoped):
 
-```
+```bash
 #!/bin/bash
 
 # Install Automodel + upgrade transformers to newer, compatible version
@@ -25,15 +25,15 @@ Let’s start by [provisioning](https://docs.databricks.com/aws/en/compute/confi
 
 This will provision three compute nodes – one driver node we’ll attach a notebook to, and two worker nodes we’ll use for multi-node training.
 
-Note that we’ve selected a small number of instances for this example for demo purposes, but you can adjust the specific instance type and number of workers for your actual use case. 
+Note that we’ve selected a small number of instances for demo purposes, but you can adjust the specific instance type and number of workers for your actual use case.
 
 ## Training
 
 With the above compute resources provisioned, we’re ready to fine-tune a model using Automodel.
 
-Automodel uses YAML file recipes to configure various settings for the training process (for example, model, dataset, loss function, optimizer, etc.). Here we’ll use this [preconfigured recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) for fine-tuning a Llama-3.2-1B model using the SQuAD dataset from HuggingFace.  In a notebook connected to our compute resource, download the training script and configuration file with these `curl` commands:
+Automodel uses YAML file recipes to configure various settings for the training process (for example, model, dataset, loss function, optimizer, etc.). Here we’ll use this [preconfigured recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) for fine-tuning a Llama-3.2-1B model using the SQuAD dataset from Hugging Face. In a notebook connected to our compute resource, download the training script and configuration file with these `curl` commands:
 
-```
+```bash
 # Download training script
 !curl -O https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/refs/heads/main/examples/llm_finetune/finetune.py
 # Download configuration file
@@ -42,7 +42,7 @@ Automodel uses YAML file recipes to configure various settings for the training 
 
 Here’s what the model, dataset, and optimizer portions of the config file look like:
 
-```
+```yaml
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
@@ -70,7 +70,7 @@ To run fine-tuning, we’ll use the `finetune.py` script from the Automodel repo
 
 To run training on a single GPU, use this command:
 
-```
+```bash
 !python finetune.py \
     --config llama3_2_1b_squad.yaml \
     --step_scheduler.max_steps 20 \
@@ -89,9 +89,9 @@ Looking at GPU metrics in Databricks, we see our single GPU is being well utiliz
 Single GPU utilization of ~95% during model training.
 :::
 
-To utilize all four GPUs available on this `g6e.12xlarge` instance use `torchrun --nproc-per-node=4` with our same training script and config file: 
+To utilize all four GPUs available on this `g6e.12xlarge` instance, use `torchrun --nproc-per-node=4` with our same training script and config file: 
 
-```
+```bash
 !torchrun --nproc-per-node=4 finetune.py \
     --config llama3_2_1b_squad.yaml \
     --step_scheduler.max_steps 20 \
