@@ -40,6 +40,7 @@ def _pad_pack(
     packed_sequence_size: int,
     cross_entropy_ignore_idx: int = CROSS_ENTROPY_IGNORE_IDX,
     cp_size: int = 1,
+    include_seq_lens: bool = True,
 ) -> PACK_TYPE:
     """
     Pads a pack to ``packed_sequence_size``.
@@ -62,31 +63,42 @@ def _pad_pack(
         value=cross_entropy_ignore_idx,
     )
 
-    # seq_lens contains original sequence lengths
-    original_seq_lens = pack["seq_lens"].clone()
+    seq_lens_payload = {}
+    if include_seq_lens:
+        # seq_lens contains original sequence lengths
+        original_seq_lens = pack["seq_lens"].clone()
 
-    # seq_lens_padded: apply CP padding to each sequence, then add pack padding to last
-    if cp_size > 1:
-        cp_divisibility_factor = 2 * cp_size
-        # Apply CP padding to each sequence length
-        cp_padded_lens = []
-        for seq_len in pack["seq_lens"]:
-            cp_padded_len = ((seq_len + cp_divisibility_factor - 1) // cp_divisibility_factor) * cp_divisibility_factor
-            cp_padded_lens.append(cp_padded_len)
+        # seq_lens_padded: apply CP padding to each sequence, then add pack padding to last
+        if cp_size > 1:
+            cp_divisibility_factor = 2 * cp_size
+            # Apply CP padding to each sequence length
+            cp_padded_lens = []
+            for seq_len in pack["seq_lens"]:
+                cp_padded_len = (
+                    (seq_len + cp_divisibility_factor - 1) // cp_divisibility_factor
+                ) * cp_divisibility_factor
+                cp_padded_lens.append(cp_padded_len)
 
-        # Convert to tensor
-        padded_seq_lens = torch.tensor(cp_padded_lens, dtype=pack["seq_lens"].dtype, device=pack["seq_lens"].device)
+            # Convert to tensor
+            padded_seq_lens = torch.tensor(
+                cp_padded_lens, dtype=pack["seq_lens"].dtype, device=pack["seq_lens"].device
+            )
 
-        # Add pack-level padding to the last sequence
-        if num_padding_tokens > 0 and len(padded_seq_lens) > 0:
-            padded_seq_lens[-1] = padded_seq_lens[-1] + num_padding_tokens
-    else:
-        # No CP padding, just add pack-level padding to last sequence
-        if num_padding_tokens > 0 and len(pack["seq_lens"]) > 0:
-            padded_seq_lens = pack["seq_lens"].clone()
-            padded_seq_lens[-1] = padded_seq_lens[-1] + num_padding_tokens
+            # Add pack-level padding to the last sequence
+            if num_padding_tokens > 0 and len(padded_seq_lens) > 0:
+                padded_seq_lens[-1] = padded_seq_lens[-1] + num_padding_tokens
         else:
-            padded_seq_lens = pack["seq_lens"].clone()
+            # No CP padding, just add pack-level padding to last sequence
+            if num_padding_tokens > 0 and len(pack["seq_lens"]) > 0:
+                padded_seq_lens = pack["seq_lens"].clone()
+                padded_seq_lens[-1] = padded_seq_lens[-1] + num_padding_tokens
+            else:
+                padded_seq_lens = pack["seq_lens"].clone()
+
+        seq_lens_payload = {
+            "seq_lens": original_seq_lens,
+            "seq_lens_padded": padded_seq_lens,
+        }
 
     # Pad position_ids continuing the sequence from last value
     # in position_ids
@@ -103,14 +115,13 @@ def _pad_pack(
         "input_ids": padded_tokens,
         "labels": padded_labels,
         "position_ids": padded_position_ids,
-        "seq_lens": original_seq_lens,
-        "seq_lens_padded": padded_seq_lens,
+        **seq_lens_payload,
     }
 
     return padded_pack
 
 
-def _convert_to_tensors(pack: PACK_TYPE) -> PACK_TYPE:
+def _convert_to_tensors(pack: PACK_TYPE, *, include_seq_lens: bool = True) -> PACK_TYPE:
     """
     Converts a pack into tensors. Pack comes in as a dict of lists and is converted to tensors.
     """
@@ -118,8 +129,9 @@ def _convert_to_tensors(pack: PACK_TYPE) -> PACK_TYPE:
         "input_ids": torch.tensor(pack["input_ids"], dtype=torch.long),
         "labels": torch.tensor(pack["labels"], dtype=torch.long),
         "position_ids": torch.tensor(pack["position_ids"], dtype=torch.long),
-        "seq_lens": torch.tensor(pack["seq_lens"], dtype=torch.long),
     }
+    if include_seq_lens:
+        tensor_pack["seq_lens"] = torch.tensor(pack["seq_lens"], dtype=torch.long)
     return tensor_pack
 
 
@@ -129,17 +141,19 @@ def _tensorize_and_pad_pack(
     packed_sequence_size: int,
     cross_entropy_ignore_idx: int = CROSS_ENTROPY_IGNORE_IDX,
     cp_size: int = 1,
+    include_seq_lens: bool = True,
 ) -> None:
     """
     converts to tensors, pads a pack and returns it.
     """
-    pack = _convert_to_tensors(pack)
+    pack = _convert_to_tensors(pack, include_seq_lens=include_seq_lens)
     pack = _pad_pack(
         pack,
         padding_idx=padding_idx,
         packed_sequence_size=packed_sequence_size,
         cross_entropy_ignore_idx=cross_entropy_ignore_idx,
         cp_size=cp_size,
+        include_seq_lens=include_seq_lens,
     )
     return pack
 
@@ -161,6 +175,7 @@ def _split_and_add_pack(
     padding_idx: int,
     cross_entropy_ignore_idx=CROSS_ENTROPY_IGNORE_IDX,
     cp_size: int = 1,
+    include_seq_lens: bool = True,
 ) -> PACK_TYPE:
     """
     Splits the current pack at the boundary, processes it, adds it to ``packs``.
@@ -169,12 +184,13 @@ def _split_and_add_pack(
 
     TODO(@akoumparouli): refactor.
     """
-    pack = {
+    pack: PACK_TYPE = {
         "input_ids": current_pack["input_ids"][:previous_sample_boundary],
         "labels": current_pack["labels"][:previous_sample_boundary],
         "position_ids": current_pack["position_ids"][:previous_sample_boundary],
-        "seq_lens": current_pack["seq_lens"][:-1],
     }
+    if include_seq_lens:
+        pack["seq_lens"] = current_pack["seq_lens"][:-1]
 
     # Process and add the pack
     packs.append(
@@ -184,6 +200,7 @@ def _split_and_add_pack(
             packed_sequence_size=packed_sequence_size,
             cross_entropy_ignore_idx=cross_entropy_ignore_idx,
             cp_size=cp_size,
+            include_seq_lens=include_seq_lens,
         )
     )
 
@@ -207,6 +224,7 @@ def pack_dataset(
     padding_idx=0,
     drop_long_samples=False,
     cp_size=1,
+    include_seq_lens: bool = True,
 ):
     """
     Pack the dataset to defined length.
@@ -292,6 +310,7 @@ def pack_dataset(
                 padding_idx=padding_idx,
                 cross_entropy_ignore_idx=CROSS_ENTROPY_IGNORE_IDX,
                 cp_size=cp_size,
+                include_seq_lens=include_seq_lens,
             )
 
         # Keep track of previous sample boundary
@@ -310,6 +329,7 @@ def pack_dataset(
                 packed_sequence_size=packed_sequence_size,
                 cross_entropy_ignore_idx=CROSS_ENTROPY_IGNORE_IDX,
                 cp_size=cp_size,
+                include_seq_lens=include_seq_lens,
             )
         )
 
