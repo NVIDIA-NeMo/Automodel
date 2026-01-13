@@ -15,7 +15,7 @@ To run LLMs with NeMo Automodel, make sure you're using NeMo container version `
 For other installation options (e.g., uv), please see our [Installation Guide](../guides/installation.md).
 
 ## Supported Models
-NeMo Automodel supports the <a href=https://huggingface.co/transformers/v3.5.1/model_doc/auto.html#automodelforcausallm>AutoModelForCausalLM<a> in the <a href="https://huggingface.co/models?pipeline_tag=text-generation&sort=trending">Text Generation<a> category. During preprocessing, it uses `transformers.AutoTokenizer`, which is sufficient for most LLM cases. If your model requires custom text handling, such as for reasoning tasks, you can override the default tokenizer during the data preparation stage.
+NeMo Automodel supports the [AutoModelForCausalLM](https://huggingface.co/transformers/v3.5.1/model_doc/auto.html#automodelforcausallm) in the [Text Generation](https://huggingface.co/models?pipeline_tag=text-generation&sort=trending) category. During preprocessing, it uses `transformers.AutoTokenizer`, which is sufficient for most LLM cases. If your model requires custom text handling, such as for reasoning tasks, you can override the default tokenizer during the data preparation stage.
 
 The table below lists the main architectures we test against (FSDP2 combined with SFT/PEFT) and includes a representative checkpoint for each.
 
@@ -82,10 +82,10 @@ The models listed above can be fine-tuned using NeMo Automodel to adapt them to 
 
 2. **Supervised Fine-Tuning (SFT)**: Updates all or most model parameters for deeper adaptation, suitable for high-precision applications.
 
-Please see our [Fine-Tuning Guide](../guides/llm/finetune.md) how you can apply both of these fine-tuning methods with your data.
+Please see our [Fine-Tuning Guide](../guides/llm/finetune.md) to learn how you can apply both of these fine-tuning methods to your data.
 
 :::{tip}
-In these guides, we use the `SQuAD v1.1` dataset for demonstation purposes, but you can specify your own data as needed.
+In these guides, we use the `SQuAD v1.1` dataset for demonstration purposes, but you can specify your own data as needed.
 :::
 
 ### Example: Fine-Tuning with SQuAD Dataset
@@ -114,14 +114,18 @@ This structure makes SQuAD ideal for training context-based question answering m
 ### Get Started with Fine-Tuning
 To fine-tune any of the supported models:
 
-1. Choose your approach (PEFT or SFT), see our [Fine-Tuning Guide](../guides/llm/finetune.md).
+1. Choose your approach (PEFT or SFT). See our [Fine-Tuning Guide](../guides/llm/finetune.md).
 
 2. Key steps in both guides:
    * Model and dataset configuration
    * Training recipe setup
    * Inference with fine-tuned models
    * Model sharing via Hugging Face Hub
-   * Deployment with vLLM
+   - Model and dataset configuration
+   - Training recipe setup
+   - Inference with fine-tuned models
+   - Model sharing via Hugging Face Hub
+   - Deployment with vLLM
 
 3. Example launch commands:
 
@@ -137,4 +141,7 @@ Both guides provide complete YAML configuration examples and explain how to:
   * Customize training parameters
   * Monitor progress
   * Save and share checkpoints
-  * Deploy the fine-tuned model with optimized inference
+  - Customize training parameters
+  - Monitor progress
+  - Save and share checkpoints
+  - Deploy the fine-tuned model with optimized inference
