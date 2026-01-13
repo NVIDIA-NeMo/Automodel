@@ -581,7 +581,8 @@ class Checkpointer:
 
         # Add any missing keys from the model_state_dict
         # These will go to the same file as the last file (or file 1 for single-file models)
-        default_index = max(fqn_to_file_index_mapping.values())
+        # Use default of 1 when mapping is empty (e.g., biencoder models with different key prefixes)
+        default_index = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
 
         # add any additional keys that are not in the base checkpoint
         for fqn in list(state_dict.keys()):
