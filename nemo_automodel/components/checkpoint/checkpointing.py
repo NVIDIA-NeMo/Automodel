@@ -99,8 +99,9 @@ class CheckpointingConfig:
         """
         Convert a raw string such as "safetensors" into the right Enum.
         """
-        assert self.model_save_format in [v.value for v in SerializationFormat], (
-            f"Unsupported model save format: {self.model_save_format}"
+        formats = [v.value for v in SerializationFormat]
+        assert self.model_save_format in formats, (
+            f"Unsupported model save format: {self.model_save_format}. Supported formats: {formats}"
         )
         self.model_save_format = SerializationFormat[self.model_save_format.upper()]
 
@@ -580,7 +581,8 @@ class Checkpointer:
 
         # Add any missing keys from the model_state_dict
         # These will go to the same file as the last file (or file 1 for single-file models)
-        default_index = max(fqn_to_file_index_mapping.values())
+        # Use default of 1 when mapping is empty (e.g., biencoder models with different key prefixes)
+        default_index = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
 
         # add any additional keys that are not in the base checkpoint
         for fqn in list(state_dict.keys()):
