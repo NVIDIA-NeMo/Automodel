@@ -402,6 +402,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
+            hidden_states=hidden_states,
         )
 
     def save_pretrained_hf_format(self, save_directory: str, **kwargs):
