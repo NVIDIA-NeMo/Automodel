@@ -421,9 +421,11 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         """
         if not self.dist_env.is_main:
             return
-        # log_data
-        if wandb.run is not None:
-            wandb.log(log_data.to_dict(), step=log_data.step)
+
+        # Log to remote services (WandB) according to step_scheduler frequency
+        if self.step_scheduler.is_remote_logging_step:
+            if wandb.run is not None:
+                wandb.log(log_data.to_dict(), step=log_data.step)
 
         logging.info(
             "step {} | epoch {} | "
