@@ -99,8 +99,9 @@ class CheckpointingConfig:
         """
         Convert a raw string such as "safetensors" into the right Enum.
         """
-        assert self.model_save_format in [v.value for v in SerializationFormat], (
-            f"Unsupported model save format: {self.model_save_format}"
+        formats = [v.value for v in SerializationFormat]
+        assert self.model_save_format in formats, (
+            f"Unsupported model save format: {self.model_save_format}. Supported formats: {formats}"
         )
         self.model_save_format = SerializationFormat[self.model_save_format.upper()]
 
