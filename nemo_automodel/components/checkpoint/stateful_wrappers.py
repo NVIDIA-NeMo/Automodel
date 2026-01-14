@@ -35,12 +35,12 @@ def _is_quantized_param(param: torch.Tensor) -> bool:
     Detects quantization by checking for `quant_state` attribute which is
     common across BitsAndBytes quantized parameter types (Params4bit, Int8Params, etc.).
     """
-    return hasattr(param, "quant_state") and param.quant_state is not None
+    return getattr(param, "quant_state", None) is not None
 
 
 def _has_quantized_params(model: torch.nn.Module) -> bool:
     """Check if model has any BitsAndBytes quantized parameters."""
-    return any(_is_quantized_param(p) for p in model.parameters())
+    return any(map(_is_quantized_param, model.parameters()))
 
 
 def _get_peft_state_dict(model: torch.nn.Module) -> dict[str, Any]:
@@ -81,29 +81,6 @@ def _get_lm_head_weight_and_name(model: torch.nn.Module) -> Optional[tuple[torch
             return param, name
 
     return None, None
-
-
-def _get_peft_state_dict(models: list[torch.nn.Module]) -> dict[str, Any]:
-    """
-    Extract only the trainable PEFT (LoRA) adapter weights from the model(s).
-
-    This bypasses PyTorch's get_model_state_dict which doesn't handle Params4bit
-    objects from bitsandbytes properly (used in QLoRA).
-
-    Args:
-        models: List of model parts to extract PEFT weights from.
-
-    Returns:
-        dict: State dictionary containing only trainable LoRA adapter parameters.
-    """
-    state_dict = {}
-    for model in models:
-        for name, param in model.named_parameters():
-            # Only save trainable parameters (LoRA adapters have requires_grad=True)
-            if param.requires_grad:
-                # Move to CPU for serialization
-                state_dict[name] = param.detach().cpu()
-    return state_dict
 
 
 # modified from pytorch tutorial https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html
