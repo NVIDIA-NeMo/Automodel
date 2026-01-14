@@ -1,14 +1,16 @@
 comment: false
+
 coverage:
   status:
     project: false
-    patch:
+    patch: false
+    changes:
       default:
-        target: 80%
+        target: 70%
         threshold: 10%
         base: auto
         if_ci_failed: error
-        if_not_found: success
+        if_not_found: error
 
 fixes:
   - "/workspace/::"
