@@ -63,6 +63,7 @@ guides/gradient-checkpointing.md
 guides/pipelining.md
 guides/llm/knowledge-distillation.md
 guides/fp8-training.md
+guides/mlflow-logging.md
 
 apidocs/index.rst
 ```
