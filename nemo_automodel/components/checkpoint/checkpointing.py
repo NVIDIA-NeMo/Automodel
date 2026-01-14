@@ -251,6 +251,19 @@ class Checkpointer:
         """
         optimizer_path = os.path.join(weights_path, "optim")
         _ensure_dirs(optimizer_path)
+
+        # For PEFT (especially QLoRA), bypass DCP which doesn't handle Params4bit properly.
+        # Use native optimizer state dict which only contains states for trainable params.
+        if self.config.is_peft:
+            state_dict = {"optim": optimizer[0].state_dict()}
+            if scheduler is not None:
+                state_dict["sched"] = scheduler.state_dict()
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                torch.save(state_dict, os.path.join(optimizer_path, "optimizer.pt"))
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+            return
+
         optimizer_state = OptimizerState(model, optimizer, scheduler)
         state_dict = optimizer_state.state_dict()
         self._optim_ctx.future = self._do_save(state_dict, optimizer_path)
@@ -267,9 +280,20 @@ class Checkpointer:
             weights_path: Base directory for checkpoints.
             scheduler: Optional LR scheduler to populate.
         """
+        optimizer_path = os.path.join(weights_path, "optim")
+
+        # For PEFT (especially QLoRA), bypass DCP which doesn't handle Params4bit properly.
+        # Use native optimizer state dict which only contains states for trainable params.
+        if self.config.is_peft:
+            state_dict = torch.load(os.path.join(optimizer_path, "optimizer.pt"), weights_only=False)
+            optimizer[0].load_state_dict(state_dict["optim"])
+            if scheduler is not None and "sched" in state_dict:
+                scheduler.load_state_dict(state_dict["sched"])
+            return
+
         optimizer_state = OptimizerState(model, optimizer, scheduler)
         state_dict = optimizer_state.state_dict()
-        self._do_load(state_dict, os.path.join(weights_path, "optim"))
+        self._do_load(state_dict, optimizer_path)
         optimizer_state.load_state_dict(state_dict)
 
     def load_model(
