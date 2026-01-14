@@ -36,8 +36,8 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
-  # force_hf: true # @akoumpa: remove once checkpointer works with quantization
+  pretrained_model_name_or_path: meta-llama/Llama-3.1-8B
+  force_hf: true # @akoumpa: remove once checkpointer works with quantization
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
