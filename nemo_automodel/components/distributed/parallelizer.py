@@ -226,6 +226,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         sequence_parallel: bool = False,
         activation_checkpointing: bool = False,
         tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+        shard_placement_fn: Optional[Any] = None,
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
@@ -265,7 +266,11 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
 
         for layer in layers:
             parallelizer_utils.fully_shard_by_dtype(
-                layer, mesh=dp_mesh, mp_policy=mp_policy, offload_policy=offload_policy
+                layer,
+                mesh=dp_mesh,
+                mp_policy=mp_policy,
+                offload_policy=offload_policy,
+                shard_placement_fn=shard_placement_fn,
             )
 
         # do not reshard after forward for root model
@@ -273,6 +278,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         return fully_shard(
             model,
             mesh=dp_mesh,
+            shard_placement_fn=shard_placement_fn,
             mp_policy=mp_policy,
             offload_policy=offload_policy,
             reshard_after_forward=False,

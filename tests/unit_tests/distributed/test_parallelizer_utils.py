@@ -170,7 +170,7 @@ def test_get_module_from_path():
 def test__fully_shard_calls_for_single_module(monkeypatch):
     calls: list[tuple[nn.Module, object, object, object]] = []
 
-    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, shard_placement_fn=None):
         calls.append((mod, mesh, mp_policy, offload_policy))
 
     # Monkeypatch the symbol inside the utils module
@@ -190,7 +190,7 @@ def test__fully_shard_calls_for_single_module(monkeypatch):
 def test__fully_shard_calls_for_modulelist(monkeypatch):
     calls: list[nn.Module] = []
 
-    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, shard_placement_fn=None):
         calls.append(mod)
 
     monkeypatch.setattr(
@@ -234,10 +234,10 @@ def test_fully_shard_by_dtype_single_dtype(monkeypatch):
     fully_calls: list[nn.Module] = []
     sub_calls: list[nn.Module] = []
 
-    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, shard_placement_fn=None):
         fully_calls.append(mod)
 
-    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy):
+    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, shard_placement_fn=None):
         sub_calls.append(mod)
 
     monkeypatch.setattr(
@@ -259,10 +259,10 @@ def test_fully_shard_by_dtype_two_dtypes(monkeypatch):
     fully_calls: list[nn.Module] = []
     sub_calls: list[nn.Module] = []
 
-    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, shard_placement_fn=None):
         fully_calls.append(mod)
 
-    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy):
+    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, shard_placement_fn=None):
         sub_calls.append(mod)
 
     monkeypatch.setattr(
@@ -286,10 +286,10 @@ def test_fully_shard_by_dtype_three_dtypes(monkeypatch):
     fully_calls: list[nn.Module] = []
     sub_calls: list[nn.Module] = []
 
-    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, shard_placement_fn=None):
         fully_calls.append(mod)
 
-    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy):
+    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, shard_placement_fn=None):
         sub_calls.append(mod)
 
     monkeypatch.setattr(
