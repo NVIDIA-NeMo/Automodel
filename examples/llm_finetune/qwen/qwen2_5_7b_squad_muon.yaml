@@ -35,10 +35,10 @@ model:
   torch_dtype: bf16
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: checkpoints/
-  model_save_format: torch_save # torch_save or safetensors
-  save_consolidated: false 
+  model_save_format: safetensors # torch_save or safetensors
+  save_consolidated: true
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
