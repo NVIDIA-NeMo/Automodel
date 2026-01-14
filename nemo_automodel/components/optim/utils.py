@@ -182,10 +182,23 @@ def build_dion_optimizer(
 
     dion_mesh = _get_dion_mesh(distributed_mesh)
 
+    replicate_mesh = dion_mesh
+    outer_shard_mesh = None
+    inner_shard_mesh = None
+
+    if distributed_mesh is not None and hasattr(distributed_mesh, "__getitem__"):
+        replicate_mesh = distributed_mesh["dp_replicate"]
+        outer_shard_mesh = distributed_mesh["dp_shard_cp"]
+        inner_shard_mesh = distributed_mesh["tp"]
+    
     if "distributed_mesh" in valid_keys:
         cleaned_kwargs["distributed_mesh"] = dion_mesh
-    elif "replicate_mesh" in valid_keys:
-        cleaned_kwargs["replicate_mesh"] = dion_mesh
+    if "replicate_mesh" in valid_keys:
+        cleaned_kwargs["replicate_mesh"] = replicate_mesh
+    if "outer_shard_mesh" in valid_keys:
+        cleaned_kwargs["outer_shard_mesh"] = outer_shard_mesh
+    if "inner_shard_mesh" in valid_keys:
+        cleaned_kwargs["inner_shard_mesh"] = inner_shard_mesh
     if "adjust_lr" in cfg_dict:
         cleaned_kwargs["adjust_lr"] = cfg_dict["adjust_lr"]
 
