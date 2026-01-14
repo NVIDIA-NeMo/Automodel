@@ -45,11 +45,28 @@ def _supports_logits_to_keep(model: nn.Module) -> bool:
 
 def _supports_seq_lens(model: nn.Module) -> bool:
     """
-    Check if the model supports seq_lens.
+    Check if the model's forward() accepts seq_lens.
+
+    Returns True if:
+    - forward() has an explicit `seq_lens` parameter, OR
+    - forward() has **kwargs (so it won't crash if seq_lens is passed)
+
+    Returns False otherwise (passing seq_lens would cause "unexpected kwarg" error).
     """
-    if callable(getattr(model, "forward", None)):
-        return "seq_lens" in set(inspect.signature(model.forward).parameters.keys())
-    else:
+    if not callable(getattr(model, "forward", None)):
+        return False
+    try:
+        sig = inspect.signature(model.forward)
+        params = sig.parameters
+        # Check for explicit seq_lens parameter
+        if "seq_lens" in params:
+            return True
+        # Check for **kwargs (VAR_KEYWORD)
+        for param in params.values():
+            if param.kind == inspect.Parameter.VAR_KEYWORD:
+                return True
+        return False
+    except (ValueError, TypeError):
         return False
 
 

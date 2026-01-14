@@ -118,7 +118,6 @@ def test_build_validation_dataloader_collects_and_names_properly():
     assert kwargs["dp_world_size"] == 4
     assert kwargs["dp_rank"] == 1
     assert kwargs["pp_enabled"] is False
-    assert kwargs["supports_seq_lens"] is True
     assert kwargs["cp_size"] == 3
 
 
@@ -363,7 +362,6 @@ def test_build_dataloader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatc
         dp_rank=1,
         dp_world_size=2,
         pp_enabled=False,
-        supports_seq_lens=True,
         cp_size=1,
     )
 
