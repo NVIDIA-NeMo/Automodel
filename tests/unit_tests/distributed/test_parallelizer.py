@@ -881,3 +881,51 @@ class TestUnshardFsdp2Model:
 
             # Verify reshard was still called despite the exception
             assert test_fsdp_module.reshard_called is True
+
+
+def test_combined_projection_adapter_dtensor_helpers_renamed_and_dtensor_native_ops(monkeypatch):
+    """
+    Regression test for combined-projection adapter DTensor behavior:
+    - helpers were renamed from _safe_* to _dtensor_aware_*
+    - DTensor path should prefer DTensor-native split/cat (may trigger collectives)
+
+    Keep this lightweight by mocking DTensor and torch.cat so we don't need
+    to initialize distributed process groups.
+    """
+    import nemo_automodel.components.models.common.combined_projection.state_dict_adapter as mod
+
+    assert hasattr(mod, "_dtensor_aware_split")
+    assert hasattr(mod, "_dtensor_aware_cat")
+    assert not hasattr(mod, "_safe_split")
+    assert not hasattr(mod, "_safe_concat")
+
+    class DummyDTensor:
+        ndim = 2
+
+        def __init__(self):
+            self.split_calls = []
+
+        def split(self, split_sizes, dim=0):
+            self.split_calls.append((tuple(split_sizes), dim))
+            return ["q", "k", "v"]
+
+    # Make isinstance(x, DTensor) true inside the module.
+    monkeypatch.setattr(mod, "DTensor", DummyDTensor, raising=True)
+
+    # DTensor-native split should be used.
+    t = DummyDTensor()
+    out = mod._dtensor_aware_split(t, [1, 2, 3], dim=0)
+    assert out == ["q", "k", "v"]
+    assert t.split_calls == [((1, 2, 3), 0)]
+
+    # DTensor-native cat should be used (mock torch.cat since our dummy objects aren't real tensors).
+    cat_calls = []
+
+    def fake_cat(tensors, dim=0):
+        cat_calls.append((len(tensors), dim))
+        return "qkv"
+
+    monkeypatch.setattr(mod.torch, "cat", fake_cat, raising=True)
+    out2 = mod._dtensor_aware_cat([DummyDTensor(), DummyDTensor(), DummyDTensor()], dim=0)
+    assert out2 == "qkv"
+    assert cat_calls == [(3, 0)]
