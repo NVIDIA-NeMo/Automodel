@@ -80,9 +80,7 @@ def _pad_pack(
                 cp_padded_lens.append(cp_padded_len)
 
             # Convert to tensor
-            padded_seq_lens = torch.tensor(
-                cp_padded_lens, dtype=pack["seq_lens"].dtype, device=pack["seq_lens"].device
-            )
+            padded_seq_lens = torch.tensor(cp_padded_lens, dtype=pack["seq_lens"].dtype, device=pack["seq_lens"].device)
 
             # Add pack-level padding to the last sequence
             if num_padding_tokens > 0 and len(padded_seq_lens) > 0:
