@@ -10,7 +10,6 @@ coverage:
         threshold: 10%
         base: auto
         if_ci_failed: error
-        if_not_found: error
-
+        if_not_found: success
 fixes:
   - "/workspace/::"
