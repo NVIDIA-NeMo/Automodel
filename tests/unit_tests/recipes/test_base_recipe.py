@@ -185,7 +185,8 @@ def test_find_latest_checkpoint(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_ET, reason="expecttest required")
-def test_save_and_load_roundtrip(tmp_path):
+@pytest.mark.parametrize("symlink_supported", [True, False])
+def test_save_and_load_roundtrip(tmp_path, symlink_supported, monkeypatch):
     """
     End-to-end test for BaseRecipe.save_checkpoint/load_checkpoint.
 
@@ -214,8 +215,25 @@ def test_save_and_load_roundtrip(tmp_path):
     weight_after_step = recipe_inst.model.weight.clone()
     foo_after_step = recipe_inst.custom_state.foo.clone()
 
+    # Patch os.symlink to raise OSError if symlink_supported is False
+    if not symlink_supported:
+        def raise_os_error(*args, **kwargs):
+            raise OSError("Symlink not supported")
+        monkeypatch.setattr(os, "symlink", raise_os_error)
+
     # Save checkpoint.
     recipe_inst.save_checkpoint(epoch=0, step=0, train_loss=float(loss.item()))
+
+    # Check that the correct indicator exists (symlink or text file)
+    latest_link = tmp_path / "LATEST"
+    latest_txt = tmp_path / "LATEST.txt"
+
+    if symlink_supported:
+        assert latest_link.exists(follow_symlinks=False)
+        assert not latest_txt.exists()
+    else:
+        assert not latest_link.exists(follow_symlinks=False)
+        assert latest_txt.exists()
 
     # Further modify everything so that restore must actually change data back.
     recipe_inst.model.weight.data.add_(42.0)

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import io
+
 import json
 import os
 import threading
@@ -98,8 +98,7 @@ class MetricLogger:
         self._lock = threading.Lock()
         os.makedirs(os.path.dirname(self.filepath) or ".", exist_ok=True)
         mode = "a" if append else "w"
-        # Use buffered writer for performance; rely on flush flag when needed
-        self._fp = io.open(self.filepath, mode, encoding="utf-8", buffering=1)
+        self._fp = open(self.filepath, mode, encoding="utf-8")
 
     def log(self, record: MetricsSample) -> None:
         self.buffer.append(record)
