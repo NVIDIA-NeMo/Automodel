@@ -118,6 +118,7 @@ What you can expect:
 - 🔜 **FP8 MoE** - FP8 precision training and inference for MoE models.
 - 🔜 **Cudagraph with MoE** - CUDA graph support for MoE layers to reduce kernel launch overhead.
 - 🔜 **Extended VLM Support** - DeepSeek OCR, Qwen3 VL 235B, Kimi-VL, GLM4.5V
+- 🔜 **Extended LLM Support** - QWENCoder 480B Instruct, MiniMax2.1, and more
 - 🔜 **Kubernetes** - Multi-node job launch with k8s.
 
 
