@@ -23,11 +23,13 @@ Works with any transformer model (Llama, Qwen2, etc.) that uses these projection
 """
 
 import logging
+import os
 import re
 from typing import Any, Optional
 
 import torch
 from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Replicate, Shard
 
 logger = logging.getLogger(__name__)
 
@@ -37,11 +39,10 @@ def _is_dtensor(tensor: torch.Tensor) -> bool:
     return isinstance(tensor, DTensor)
 
 
-def _safe_split(tensor: torch.Tensor, split_sizes: list[int], dim: int = 0) -> list[torch.Tensor]:
-    """Split tensor handling both regular tensors and DTensors without triggering redistribution.
+def _dtensor_aware_split(tensor: torch.Tensor, split_sizes: list[int], dim: int = 0) -> list[torch.Tensor]:
+    """Split tensor handling both regular tensors and DTensors.
 
-    For DTensors, extracts local shard, splits it, and rewraps each piece as DTensor.
-    For regular tensors, performs normal split.
+    For DTensors, this helper may trigger redistribution/collectives 
 
     Args:
         tensor: Tensor to split (can be DTensor or regular tensor)
@@ -49,43 +50,47 @@ def _safe_split(tensor: torch.Tensor, split_sizes: list[int], dim: int = 0) -> l
         dim: Dimension to split along
     """
     if _is_dtensor(tensor):
-        # DTensor: work on local shard to avoid redistribution/OOM
-        local_tensor = tensor.to_local()
-        local_size = local_tensor.shape[dim]
-        global_size = sum(split_sizes)
+        try:
+            return list(tensor.split(split_sizes, dim=dim))
+        except Exception:
+            pass
 
-        # Scale split sizes to local tensor size
-        local_split_sizes = [(size * local_size) // global_size for size in split_sizes]
+        # Fallback for small 1D Shard(0) tensors (e.g., fused QKV bias)
+        if (
+            tensor.ndim == 1
+            and dim == 0
+            and len(tensor.placements) == 1
+            and isinstance(tensor.placements[0], Shard)
+            and tensor.placements[0].dim == 0
+        ):
+            replicated = tensor.redistribute(device_mesh=tensor.device_mesh, placements=[Replicate()])
+            full = replicated.to_local()
+            full_splits = list(full.split(split_sizes, dim=0))
+            mesh = tensor.device_mesh
+            out: list[torch.Tensor] = []
+            for part in full_splits:
+                part_rep = DTensor.from_local(
+                    part,
+                    device_mesh=mesh,
+                    placements=(Replicate(),),
+                    run_check=False,
+                )
+                out.append(part_rep.redistribute(device_mesh=mesh, placements=[Shard(0)]))
+            return out
 
-        # Verify splits sum exactly to local size
-        if sum(local_split_sizes) != local_size:
-            raise RuntimeError(
-                f"Split size mismatch: local_split_sizes={local_split_sizes} sum to {sum(local_split_sizes)}, "
-                f"but local tensor size is {local_size}. This indicates an incorrect split calculation."
-            )
-
-        local_splits = local_tensor.split(local_split_sizes, dim=dim)
-
-        # Rewrap each split as DTensor with same placement/device_mesh
-        return [
-            DTensor.from_local(
-                local_split,
-                device_mesh=tensor.device_mesh,
-                placements=tensor.placements,
-                run_check=False,
-            )
-            for local_split in local_splits
-        ]
+        raise RuntimeError(
+            f"DTensor split unsupported for shape={tuple(tensor.shape)} placements={tensor.placements} dim={dim} "
+            f"split_sizes={split_sizes}. Consider enabling a torch build with DTensor split support."
+        )
     else:
         # Regular tensor: normal split
         return list(tensor.split(split_sizes, dim=dim))
 
 
-def _safe_concat(tensors: list[torch.Tensor], dim: int = 0) -> torch.Tensor:
-    """Concatenate tensors handling both regular tensors and DTensors without triggering redistribution.
+def _dtensor_aware_cat(tensors: list[torch.Tensor], dim: int = 0) -> torch.Tensor:
+    """Concatenate tensors handling both regular tensors and DTensors.
 
-    For DTensors, extracts local shards, concatenates them, and rewraps as DTensor.
-    For regular tensors, performs normal concat.
+    For DTensors, this helper may trigger redistribution/collectives 
 
     Args:
         tensors: List of tensors to concatenate (all DTensors or all regular tensors)
@@ -95,16 +100,25 @@ def _safe_concat(tensors: list[torch.Tensor], dim: int = 0) -> torch.Tensor:
         raise ValueError("Cannot concatenate empty list of tensors")
 
     if _is_dtensor(tensors[0]):
-        # DTensor: work on local shards to avoid redistribution/OOM
-        local_tensors = [t.to_local() for t in tensors]
-        local_concat = torch.cat(local_tensors, dim=dim)
+        try:
+            return torch.cat(tensors, dim=dim)
+        except Exception:
+            pass
 
-        # Rewrap as DTensor with same placement/device_mesh as first tensor
-        return DTensor.from_local(
-            local_concat,
-            device_mesh=tensors[0].device_mesh,
-            placements=tensors[0].placements,
-            run_check=False,
+        dt0: DTensor = tensors[0]
+        if len(dt0.placements) == 1 and isinstance(dt0.placements[0], Replicate):
+            local_tensors = [t.to_local() for t in tensors]  # type: ignore[attr-defined]
+            local_concat = torch.cat(local_tensors, dim=dim)
+            return DTensor.from_local(
+                local_concat,
+                device_mesh=dt0.device_mesh,
+                placements=dt0.placements,
+                run_check=False,
+            )
+
+        raise RuntimeError(
+            f"DTensor cat unsupported for placements={dt0.placements} dim={dim}. "
+            "Consider enabling a torch build with DTensor cat support."
         )
     else:
         # Regular tensors: normal concat
@@ -191,7 +205,7 @@ class CombinedProjectionStateDictAdapter:
                 v_weight = hf_state_dict[v_weight_key]
 
                 # Concatenate along output dimension
-                qkv_weight = _safe_concat([q_weight, k_weight, v_weight], dim=0)
+                qkv_weight = _dtensor_aware_cat([q_weight, k_weight, v_weight], dim=0)
                 custom_state_dict[f"{prefix}.self_attn.qkv_proj.weight"] = qkv_weight
                 processed_keys.update([q_weight_key, k_weight_key, v_weight_key])
 
@@ -201,7 +215,7 @@ class CombinedProjectionStateDictAdapter:
                     k_bias_key = f"{prefix}.self_attn.k_proj.bias"
                     v_bias_key = f"{prefix}.self_attn.v_proj.bias"
 
-                    qkv_bias = _safe_concat(
+                    qkv_bias = _dtensor_aware_cat(
                         [hf_state_dict[q_bias_key], hf_state_dict[k_bias_key], hf_state_dict[v_bias_key]], dim=0
                     )
                     custom_state_dict[f"{prefix}.self_attn.qkv_proj.bias"] = qkv_bias
@@ -216,7 +230,7 @@ class CombinedProjectionStateDictAdapter:
                 up_weight = hf_state_dict[up_weight_key]
 
                 # Concatenate along output dimension
-                gate_up_weight = _safe_concat([gate_weight, up_weight], dim=0)
+                gate_up_weight = _dtensor_aware_cat([gate_weight, up_weight], dim=0)
                 custom_state_dict[f"{prefix}.mlp.gate_up_proj.weight"] = gate_up_weight
                 processed_keys.update([gate_weight_key, up_weight_key])
 
@@ -225,7 +239,7 @@ class CombinedProjectionStateDictAdapter:
                 if gate_bias_key in hf_state_dict:
                     up_bias_key = f"{prefix}.mlp.up_proj.bias"
 
-                    gate_up_bias = _safe_concat([hf_state_dict[gate_bias_key], hf_state_dict[up_bias_key]], dim=0)
+                    gate_up_bias = _dtensor_aware_cat([hf_state_dict[gate_bias_key], hf_state_dict[up_bias_key]], dim=0)
                     custom_state_dict[f"{prefix}.mlp.gate_up_proj.bias"] = gate_up_bias
                     processed_keys.update([gate_bias_key, up_bias_key])
 
@@ -290,7 +304,7 @@ class CombinedProjectionStateDictAdapter:
                 local_q_size = (self.q_size * qkv_actual_size) // total_size
                 local_kv_size = (self.kv_size * qkv_actual_size) // total_size
 
-                q_weight, k_weight, v_weight = _safe_split(
+                q_weight, k_weight, v_weight = _dtensor_aware_split(
                     qkv_weight, [local_q_size, local_kv_size, local_kv_size], dim=0
                 )
 
@@ -307,7 +321,9 @@ class CombinedProjectionStateDictAdapter:
                     local_q_size = (self.q_size * qkv_bias_size) // total_size
                     local_kv_size = (self.kv_size * qkv_bias_size) // total_size
 
-                    q_bias, k_bias, v_bias = _safe_split(qkv_bias, [local_q_size, local_kv_size, local_kv_size], dim=0)
+                    q_bias, k_bias, v_bias = _dtensor_aware_split(
+                        qkv_bias, [local_q_size, local_kv_size, local_kv_size], dim=0
+                    )
 
                     hf_state_dict[f"{prefix}.self_attn.q_proj.bias"] = q_bias
                     hf_state_dict[f"{prefix}.self_attn.k_proj.bias"] = k_bias
@@ -324,7 +340,7 @@ class CombinedProjectionStateDictAdapter:
                 gate_up_actual_size = gate_up_weight.shape[0]
                 local_intermediate_size = gate_up_actual_size // 2
 
-                gate_weight, up_weight = _safe_split(
+                gate_weight, up_weight = _dtensor_aware_split(
                     gate_up_weight, [local_intermediate_size, local_intermediate_size], dim=0
                 )
 
@@ -339,7 +355,7 @@ class CombinedProjectionStateDictAdapter:
                     gate_up_bias_size = gate_up_bias.shape[0]
                     local_intermediate_size = gate_up_bias_size // 2
 
-                    gate_bias, up_bias = _safe_split(
+                    gate_bias, up_bias = _dtensor_aware_split(
                         gate_up_bias, [local_intermediate_size, local_intermediate_size], dim=0
                     )
 
