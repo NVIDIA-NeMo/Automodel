@@ -530,7 +530,7 @@ def build_dataloader(
             logging.warning("Packed sequence is not supported without seq_lens; disabling packed sequence")
             packed_sequence_size = 0
 
-         # Apply packing if configured
+        # Apply packing if configured
         # Apply packing if configured
         if packed_sequence_size > 0:
             logger.info(f"Packing dataset with size: {packed_sequence_size}")
