@@ -1136,6 +1136,16 @@ wheels = [
 ]
 
 [[package]]
+name = "dion"
+version = "0.1.0"
+source = { git = "https://github.com/microsoft/dion.git#b17a7699f1398b9cba69d760a52c79bc0ee0e420" }
+dependencies = [
+    { name = "numpy" },
+    { name = "torch", marker = "sys_platform == 'never'" },
+    { name = "triton", marker = "sys_platform == 'never'" },
+]
+
+[[package]]
 name = "distlib"
 version = "0.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2811,6 +2821,7 @@ source = { editable = "." }
 dependencies = [
     { name = "datasets" },
     { name = "diffusers" },
+    { name = "dion" },
     { name = "ftfy" },
     { name = "imageio-ffmpeg" },
     { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
@@ -2896,6 +2907,7 @@ requires-dist = [
     { name = "backoff", marker = "extra == 'vlm'" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "diffusers" },
+    { name = "dion", git = "https://github.com/microsoft/dion.git" },
     { name = "flash-attn", marker = "extra == 'cuda'", specifier = "<=2.8.3" },
     { name = "flash-linear-attention", marker = "extra == 'extra'" },
     { name = "ftfy" },
