@@ -55,6 +55,29 @@ def _get_lm_head_weight_and_name(model: torch.nn.Module) -> Optional[tuple[torch
     return None, None
 
 
+def _get_peft_state_dict(models: list[torch.nn.Module]) -> dict[str, Any]:
+    """
+    Extract only the trainable PEFT (LoRA) adapter weights from the model(s).
+
+    This bypasses PyTorch's get_model_state_dict which doesn't handle Params4bit
+    objects from bitsandbytes properly (used in QLoRA).
+
+    Args:
+        models: List of model parts to extract PEFT weights from.
+
+    Returns:
+        dict: State dictionary containing only trainable LoRA adapter parameters.
+    """
+    state_dict = {}
+    for model in models:
+        for name, param in model.named_parameters():
+            # Only save trainable parameters (LoRA adapters have requires_grad=True)
+            if param.requires_grad:
+                # Move to CPU for serialization
+                state_dict[name] = param.detach().cpu()
+    return state_dict
+
+
 # modified from pytorch tutorial https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html
 class ModelState:
     """
@@ -113,21 +136,22 @@ class ModelState:
         if self.is_init_step:
             return self._get_base_model_state_dict()
 
-        options = None
         if self.is_peft:
-            options = StateDictOptions(full_state_dict=True, cpu_offload=True, ignore_frozen_params=True)
+            # For PEFT models (especially QLoRA with 4-bit quantization), we need to bypass
+            # PyTorch's get_model_state_dict which doesn't handle Params4bit objects properly.
+            # Instead, directly extract only the trainable LoRA adapter weights.
+            model_state_dict = _get_peft_state_dict(self.model)
+            # HF PEFT models are saved with a "base_model.model." prefix. This is so they can be loaded
+            # correctly with the HF PEFT API.
+            _add_outer_prefix(model_state_dict, "base_model.model.")
+            return model_state_dict
 
-        func = partial(get_model_state_dict, options=options)
+        func = partial(get_model_state_dict, options=None)
         model_state_dict = {k: v for sd in map(func, self.model) for k, v in sd.items()}
 
         if self.is_tied_lm_head:
             # PP models don't have tied embeddings. Safe to pass in model[0] here.
             model_state_dict.pop(self.lm_head_param_name, None)
-
-        if self.is_peft:
-            # HF PEFT models are saved with a "base.model." prefix. This is so they can be loaded
-            # correctly with the HF PEFT API.
-            _add_outer_prefix(model_state_dict, "base_model.model.")
 
         return model_state_dict
 
