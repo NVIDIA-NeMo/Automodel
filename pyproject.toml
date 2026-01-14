@@ -76,6 +76,7 @@ classifiers = [
 dependencies = [
     "datasets>=4.0.0",
     "diffusers",
+    "dion @ git+https://github.com/microsoft/dion.git",
     "ftfy",
     "imageio-ffmpeg",
     "liger-kernel>=0.5.9; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
