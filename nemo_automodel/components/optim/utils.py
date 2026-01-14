@@ -190,7 +190,7 @@ def build_dion_optimizer(
         replicate_mesh = distributed_mesh["dp_replicate"]
         outer_shard_mesh = distributed_mesh["dp_shard_cp"]
         inner_shard_mesh = distributed_mesh["tp"]
-    
+
     if "distributed_mesh" in valid_keys:
         cleaned_kwargs["distributed_mesh"] = dion_mesh
     if "replicate_mesh" in valid_keys:
