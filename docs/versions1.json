@@ -1,7 +1,14 @@
 [
     {
-        "preferred": true,
+        "version": "latest",
+        "url": "https://docs.nvidia.com/nemo/automodel/latest/"
+    },
+    {
+        "version": "0.2.0",
+        "url": "https://docs.nvidia.com/nemo/automodel/0.2.0/"
+    },
+    {
         "version": "0.1.0",
-        "url": "../0.1.0"
-    }
+        "url": "https://docs.nvidia.com/nemo/automodel/0.1.0/"
+    },
 ]
