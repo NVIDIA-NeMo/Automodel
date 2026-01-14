@@ -23,7 +23,6 @@ Works with any transformer model (Llama, Qwen2, etc.) that uses these projection
 """
 
 import logging
-import os
 import re
 from typing import Any, Optional
 
@@ -42,7 +41,7 @@ def _is_dtensor(tensor: torch.Tensor) -> bool:
 def _dtensor_aware_split(tensor: torch.Tensor, split_sizes: list[int], dim: int = 0) -> list[torch.Tensor]:
     """Split tensor handling both regular tensors and DTensors.
 
-    For DTensors, this helper may trigger redistribution/collectives 
+    For DTensors, this helper may trigger redistribution/collectives
 
     Args:
         tensor: Tensor to split (can be DTensor or regular tensor)
@@ -90,7 +89,7 @@ def _dtensor_aware_split(tensor: torch.Tensor, split_sizes: list[int], dim: int 
 def _dtensor_aware_cat(tensors: list[torch.Tensor], dim: int = 0) -> torch.Tensor:
     """Concatenate tensors handling both regular tensors and DTensors.
 
-    For DTensors, this helper may trigger redistribution/collectives 
+    For DTensors, this helper may trigger redistribution/collectives
 
     Args:
         tensors: List of tensors to concatenate (all DTensors or all regular tensors)
