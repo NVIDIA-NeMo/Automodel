@@ -77,6 +77,7 @@ from nemo_automodel.components.utils.compile_utils import (
 )
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
+    _supports_seq_lens,
     init_empty_weights,
     print_trainable_parameters,
     resolve_trust_remote_code,
@@ -468,8 +469,8 @@ def build_dataloader(
     dp_rank,
     dp_world_size,
     pp_enabled,
-    supports_seq_lens=True,
     cp_size=1,
+    model: Optional[nn.Module] = None,
 ) -> tuple[DataLoader, PreTrainedTokenizerBase]:
     """Build a DataLoader for the dataset.
 
@@ -486,7 +487,9 @@ def build_dataloader(
         dp_rank: Data parallel rank.
         dp_world_size: Data parallel world size.
         pp_enabled: Whether pipeline parallelism is enabled.
-        supports_seq_lens: Whether the model supports seq_lens (Default: True).
+        cp_size: Context parallel size.
+        model: Optional model instance. If provided and packed sequences are enabled,
+            seq_lens will only be included if the model's forward() accepts it.
     Returns:
         The instantiated DataLoader and tokenizer.
     """
@@ -520,16 +523,21 @@ def build_dataloader(
                 logging.warning(f"IterableDataset sharding skipped due to error: {e}")
 
         packed_sequence_size = getattr(cfg_ps, "packed_sequence_size", 0)
+
         # check if packed sequence is supported
+        supports_seq_lens = _supports_seq_lens(model)
         if packed_sequence_size > 0 and not supports_seq_lens:
             logging.warning("Packed sequence is not supported without seq_lens; disabling packed sequence")
             packed_sequence_size = 0
 
+         # Apply packing if configured
         # Apply packing if configured
         if packed_sequence_size > 0:
             logger.info(f"Packing dataset with size: {packed_sequence_size}")
             if hasattr(ds, "shuffle"):
                 ds = ds.shuffle(seed)
+            # Determine whether to include seq_lens/seq_lens_padded in packed samples.
+            # Priority: explicit config > model.forward signature detection > default False
             ds = pack_dataset(
                 ds,
                 split=cfg_ds.split,  # Assumes split is defined in dataset config
@@ -537,6 +545,7 @@ def build_dataloader(
                 max_packs=getattr(cfg_ps, "max_packs", None),
                 padding_idx=getattr(tokenizer, "pad_token_id", 0),
                 cp_size=cp_size,
+                include_seq_lens=supports_seq_lens,
             )
 
         if isinstance(ds, MegatronPretraining):
@@ -809,7 +818,7 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
     return loss_fn(**loss_fn_kwargs)
 
 
-def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled):
+def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: Optional[nn.Module] = None):
     def _prepare_val_ds_name(val_ds_name):
         val_ds_name = val_ds_name.replace("validation_dataset", "")
         if len(val_ds_name) > 1 and val_ds_name[0] in ("_", "-", "."):
@@ -838,8 +847,8 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled):
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             pp_enabled=False,
-            supports_seq_lens=True,
             cp_size=cfg.get("distributed.cp_size", 1),
+            model=model,
         )[0]
 
     return val_dataloaders
@@ -1066,14 +1075,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             dp_rank=self._get_dp_rank(),
             dp_world_size=self._get_dp_group_size(),
             pp_enabled=self.pp_enabled,
-            supports_seq_lens=True,
             cp_size=self.cfg.get("distributed.cp_size", 1),
+            model=self.model_parts[0],
         )
         self.val_dataloaders = build_validation_dataloader(
             self.cfg,
             self._get_dp_group_size(),
             self._get_dp_rank(),
             self.pp_enabled,
+            model=self.model_parts[0],
         )
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         # Scheduler
