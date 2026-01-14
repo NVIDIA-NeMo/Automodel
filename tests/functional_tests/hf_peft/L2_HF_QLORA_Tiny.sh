@@ -18,20 +18,15 @@ set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0"
 
-# NOTE: This functional test assumes the CI harness provides:
-# - $TEST_DATA_DIR (local tiny HF model fixtures)
-# - $HF_CACHE (local dataset fixtures)
-
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run \
---master-port=29511 --nproc_per_node=1 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace \
+TRANSFORMERS_OFFLINE=1 python \
+-m coverage run --data-file=/workspace/.coverage --source=/workspace \
 -m pytest tests/functional_tests/training/test_qlora_tiny.py \
     --config tests/functional_tests/hf_peft/qlora_tiny_squad.yaml \
-    --model.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
-    --dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
-    --validation_dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
+    --model.pretrained_model_name_or_path $TEST_DATA_DIR//hf_gemma3_2l \
+    --dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_gemma3_2l/ \
+    --validation_dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_gemma3_2l \
     --dataset.dataset_name $HF_CACHE/squad/ \
     --validation_dataset.dataset_name $HF_CACHE/squad/ \
-    --step_scheduler.max_steps 2 \
     --step_scheduler.global_batch_size 2 \
     --step_scheduler.local_batch_size 1 \
     --checkpoint.enabled true \
@@ -39,4 +34,21 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run \
     --checkpoint.model_save_format safetensors \
     --checkpoint.save_consolidated false
 
+# Now, rerun command with max_steps=4 (previous used 3)
+TRANSFORMERS_OFFLINE=1 python \
+-m coverage run --data-file=/workspace/.coverage --source=/workspace \
+-m pytest tests/functional_tests/training/test_qlora_tiny.py \
+    --config tests/functional_tests/hf_peft/qlora_tiny_squad.yaml \
+    --model.pretrained_model_name_or_path $TEST_DATA_DIR//hf_gemma3_2l \
+    --dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_gemma3_2l/ \
+    --validation_dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_gemma3_2l \
+    --dataset.dataset_name $HF_CACHE/squad/ \
+    --validation_dataset.dataset_name $HF_CACHE/squad/ \
+    --step_scheduler.global_batch_size 2 \
+    --step_scheduler.local_batch_size 1 \
+    --step_scheduler.max_steps 4 \
+    --checkpoint.enabled true \
+    --checkpoint.checkpoint_dir checkpoints/ \
+    --checkpoint.model_save_format safetensors \
+    --checkpoint.save_consolidated false
 
