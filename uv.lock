@@ -2855,7 +2855,6 @@ source = { editable = "." }
 dependencies = [
     { name = "datasets" },
     { name = "diffusers" },
-    { name = "dion" },
     { name = "ftfy" },
     { name = "imageio-ffmpeg" },
     { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
@@ -2918,6 +2917,7 @@ build = [
 ]
 dev = [
     { name = "cut-cross-entropy" },
+    { name = "dion" },
 ]
 docs = [
     { name = "myst-parser" },
@@ -2946,7 +2946,6 @@ requires-dist = [
     { name = "backoff", marker = "extra == 'vlm'" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "diffusers" },
-    { name = "dion", git = "https://github.com/microsoft/dion.git" },
     { name = "flash-attn", marker = "extra == 'cuda'", specifier = "<=2.8.3" },
     { name = "flash-linear-attention", marker = "extra == 'extra'" },
     { name = "ftfy" },
@@ -2985,7 +2984,10 @@ build = [
     { name = "torch", marker = "sys_platform != 'darwin'", specifier = "<=2.10.0", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torch", marker = "sys_platform == 'darwin'", specifier = "<=2.10.0", index = "https://pypi.org/simple" },
 ]
-dev = [{ name = "cut-cross-entropy", git = "https://github.com/apple/ml-cross-entropy.git?rev=87a86ab" }]
+dev = [
+    { name = "cut-cross-entropy", git = "https://github.com/apple/ml-cross-entropy.git?rev=87a86ab" },
+    { name = "dion", git = "https://github.com/microsoft/dion.git" },
+]
 docs = [
     { name = "myst-parser" },
     { name = "nvidia-sphinx-theme" },
