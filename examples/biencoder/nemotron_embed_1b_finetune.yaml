@@ -56,7 +56,7 @@ dataloader:
   dataset:
     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
     data_dir_list:
-      - /lustre/fsw/portfolios/llmservice/users/sthan/data/nv_pp_dd_sdg_train_eval/train_mined_unrolled.json
+      - ./data/nv_pp_dd_sdg_train_eval/train_mined_unrolled.json
     data_type: train
     train_n_passages: 5
     eval_negative_size: 4
