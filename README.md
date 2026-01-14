@@ -117,7 +117,7 @@ What you can expect:
 - 🔜 **SonicMoE** - Optimized MoE implementation for faster expert computation.
 - 🔜 **FP8 MoE** - FP8 precision training and inference for MoE models.
 - 🔜 **Cudagraph with MoE** - CUDA graph support for MoE layers to reduce kernel launch overhead.
-- 🔜 **Extended Model VLM Support** - DeepSeek OCR, Qwen3 VL 235B, Kimi-VL, GLM4.5V
+- 🔜 **Extended VLM Support** - DeepSeek OCR, Qwen3 VL 235B, Kimi-VL, GLM4.5V
 - 🔜 **Kubernetes** - Multi-node job launch with k8s.
 
 
