@@ -36,6 +36,7 @@ from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
 from transformers.utils.hub import TRANSFORMERS_CACHE
 from wandb import Settings
 
+from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
@@ -177,7 +178,11 @@ def build_model_and_optimizer(
     init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
     with ScopedRNG(seed=seed, ranked=True):
         kwargs = {"tp_size": tp_size, "cp_size": cp_size, "has_packed_sequence": has_packed_sequence}
-
+        if not cfg_model.get("_target_", None) in (
+            NeMoAutoModelForCausalLM.from_config,
+            NeMoAutoModelForCausalLM.from_pretrained,
+        ):
+            kwargs = {}
         if cfg_quantization is not None:
             logger.info("Model weight quantization enabled with BitsAndBytes")
             from nemo_automodel.components.quantization.qlora import create_bnb_config
@@ -1539,13 +1544,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        if wandb.run is not None:
-            wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+        # Log to remote services (WandB, MLflow) according to step_scheduler frequency
+        if self.step_scheduler.is_remote_logging_step:
+            if wandb.run is not None:
+                wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+            if self.mlflow_logger is not None:
+                self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
-        if self.mlflow_logger is not None:
-            self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
-
-        # JSONL training log
+        # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
         logging.info(
             "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(

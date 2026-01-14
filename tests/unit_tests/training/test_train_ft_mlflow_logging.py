@@ -63,7 +63,7 @@ def test_log_train_metrics_calls_mlflow(monkeypatch):
     recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg=None)
     # Minimal attributes required by the method
     recipe.dist_env = types.SimpleNamespace(is_main=True)
-    recipe.step_scheduler = types.SimpleNamespace(step=7)
+    recipe.step_scheduler = types.SimpleNamespace(step=7, is_remote_logging_step=True)
     recipe.metric_logger_train = types.SimpleNamespace(log=lambda x: None)
     mlflow_mock = Mock()
     recipe.mlflow_logger = types.SimpleNamespace(log_metrics=mlflow_mock)
