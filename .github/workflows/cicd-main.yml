@@ -179,7 +179,7 @@ jobs:
   cicd-e2e-tests:
     strategy:
       fail-fast: false
-      max-parallel: 5
+      max-parallel: 10
       matrix:
         include:
           - test-name: L2_Pretrain_and_KD
