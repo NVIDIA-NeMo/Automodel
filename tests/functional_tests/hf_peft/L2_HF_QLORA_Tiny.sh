@@ -36,7 +36,7 @@ TRANSFORMERS_OFFLINE=1 python \
 
 # Now, rerun command with max_steps=4 (previous used 3)
 TRANSFORMERS_OFFLINE=1 python \
--m coverage run --data-file=/workspace/.coverage --source=/workspace \
+-m coverage run --append --data-file=/workspace/.coverage --source=/workspace \
 -m pytest tests/functional_tests/training/test_qlora_tiny.py \
     --config tests/functional_tests/hf_peft/qlora_tiny_squad.yaml \
     --model.pretrained_model_name_or_path $TEST_DATA_DIR//hf_gemma3_2l \
