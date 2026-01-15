@@ -1182,13 +1182,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # Run validation every val_every_steps
                 val_losses = {}
                 if self.step_scheduler.is_val_step:
-                    if self.pp_enabled:
-                        logger.warning("Validation is not supported for pipeline parallelism")
-                    else:
-                        for val_name, val_dataloader in self.val_dataloaders.items():
-                            val_log_data = self._run_validation_epoch(val_dataloader)
-                            val_losses[val_name] = val_log_data.metrics["val_loss"]
-                            self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
+                    for val_name, val_dataloader in self.val_dataloaders.items():
+                        val_log_data = self._run_validation_epoch(val_dataloader)
+                        val_losses[val_name] = val_log_data.metrics["val_loss"]
+                        self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
                     for mp in self.model_parts:
                         mp.train()
 
@@ -1238,10 +1235,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         labels = batch.pop("labels")
 
         if self.pp_enabled:
-            if not is_train:
-                logging.info("Skipping forward pass for validation because pipeline parallelism is enabled")
-                return
-
             with train_ctx():
                 losses = [] if self.pp.info.has_last_stage else None
                 if self.pp.info.has_last_stage:
@@ -1251,10 +1244,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     targets = None
 
                 input_ids = batch.pop("input_ids")
-                if self.pp.info.has_first_stage:
-                    self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
+                if is_train:
+                    # Use step for training (forward + backward)
+                    if self.pp.info.has_first_stage:
+                        self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
+                    else:
+                        self.pp.info.schedule.step(target=targets, losses=losses, **batch)
                 else:
-                    self.pp.info.schedule.step(target=targets, losses=losses, **batch)
+                    # Use eval for validation (forward only, no backward)
+                    if self.pp.info.has_first_stage:
+                        self.pp.info.schedule.eval(input_ids, target=targets, losses=losses, **batch)
+                    else:
+                        self.pp.info.schedule.eval(target=targets, losses=losses, **batch)
 
             if self.pp.info.has_last_stage:
                 local_loss = torch.sum(torch.stack(losses))
@@ -1438,9 +1439,21 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 total_loss += torch.sum(torch.stack(loss_buffer)).item()
                 total_num_label_tokens += num_label_tokens
 
-        total_loss = self._dp_allreduce(total_loss, include_cp=True).item()
+        total_loss = self._dp_allreduce(total_loss, include_cp=True)
         total_num_label_tokens = self._dp_allreduce(torch.tensor(total_num_label_tokens, dtype=torch.long)).item()
         val_loss = total_loss / max(total_num_label_tokens, 1e-8)
+
+        # For PP, send val_loss from last stage to main rank for logging
+        if self.pp_enabled:
+            val_loss = val_loss.to(self.dist_env.device)
+            # Send loss to first rank from the last stage
+            src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
+            if self.dist_env.rank == src_rank:
+                torch.distributed.send(val_loss, dst=0)
+            elif self.dist_env.is_main:
+                torch.distributed.recv(val_loss, src=src_rank)
+
+        val_loss = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss
 
         return MetricsSample(
             step=self.step_scheduler.step,
@@ -1466,7 +1479,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     "mem": Memory allocated.
         """
 
-        # Pipeline parallelism does not support validation -> log_data is None
         if not self.dist_env.is_main or log_data is None:
             return
 
