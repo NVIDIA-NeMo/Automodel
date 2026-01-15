@@ -174,12 +174,8 @@ jobs:
       max-parallel: 5
       matrix:
         include:
-          - test-name: L2_Pretrain
-            test-folder: pretrain_llm
-            runner: self-hosted-nemo
-            timeout: 20
-          - test-name: L2_HF_Consolidated_FSDP
-            test-folder: hf_consolidated_fsdp
+          - test-name: L2_Pretrain_and_KD
+            test-folder: llm_pretrain_and_kd
             runner: self-hosted-nemo
             timeout: 20
           - test-name: L2_HF_DCP
@@ -188,10 +184,6 @@ jobs:
             timeout: 40
           - test-name: L2_HF_PEFT
             test-folder: hf_peft
-            runner: self-hosted-nemo
-            timeout: 30
-          - test-name: L2_MOE_PEFT
-            test-folder: moe_peft
             runner: self-hosted-nemo
             timeout: 30
           - test-name: L2_HF_Transformer
@@ -210,16 +202,8 @@ jobs:
             test-folder: hf_transformer_vlm
             runner: self-hosted-nemo
             timeout: 60
-          - test-name: L2_LLM_KD
-            test-folder: llm_kd
-            runner: self-hosted-nemo
-            timeout: 60
           - test-name: L2_Datasets
             test-folder: data
-            runner: self-hosted-nemo
-            timeout: 20
-          - test-name: L2_clip_grad_norm
-            test-folder: clip_grad_norm
             runner: self-hosted-nemo
             timeout: 20
     needs: [cicd-unit-tests]

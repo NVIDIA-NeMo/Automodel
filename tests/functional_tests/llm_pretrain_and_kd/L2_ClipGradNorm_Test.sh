@@ -38,4 +38,4 @@ fi
 
 # Run clip_grad_norm tests with detected GPU count
 torchrun --nproc_per_node=$NPROC --nnodes=1 \
-    tests/functional_tests/clip_grad_norm/run_clip_grad_norm.py
+    tests/functional_tests/llm_pretrain_and_kd/run_clip_grad_norm.py
