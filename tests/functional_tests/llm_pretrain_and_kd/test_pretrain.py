@@ -41,11 +41,18 @@ class TestPretrainLLM:
             # remove the checkpoint directory
             shutil.rmtree("checkpoints/", ignore_errors=True)
 
-   def test_clip_grad_norm_all_configs(self):
+    def test_clip_grad_norm_all_configs(self):
         """Test gradient clipping with all parallelism configurations."""
-        run_test_script(TEST_FOLDER, TEST_FILENAME)
+        try:
+            run_test_script(TEST_FOLDER, TEST_FILENAME)
+        finally:
+            # remove the checkpoint directory
+            shutil.rmtree("checkpoints/", ignore_errors=True)
 
     def test_kd_recipe_runs(self):
-        run_test_script(TEST_FOLDER, KD_SCRIPT)
-
+        try:
+            run_test_script(TEST_FOLDER, KD_SCRIPT)
+        finally:
+            # remove the checkpoint directory
+            shutil.rmtree("checkpoints/", ignore_errors=True)
 
