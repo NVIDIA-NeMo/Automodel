@@ -35,6 +35,7 @@ guides/llm/pretraining.md
 guides/llm/nanogpt-pretraining.md
 guides/llm/sequence-classification.md
 guides/omni/gemma3-3n.md
+guides/llm/databricks.md
 ```
 
 ```{toctree}
@@ -63,6 +64,7 @@ guides/gradient-checkpointing.md
 guides/pipelining.md
 guides/llm/knowledge-distillation.md
 guides/fp8-training.md
+guides/mlflow-logging.md
 
 apidocs/index.rst
 ```
