@@ -159,6 +159,11 @@ class ModelState:
             # PP models don't have tied embeddings. Safe to pass in model[0] here.
             model_state_dict.pop(self.lm_head_param_name, None)
 
+        if self.is_peft and not _has_quantized_params(self.model[0]):
+            # HF PEFT models are saved with a "base.model." prefix. This is so they can be loaded
+            # correctly with the HF PEFT API.
+            _add_outer_prefix(model_state_dict, "base_model.model.")
+
         return model_state_dict
 
     def load_state_dict(self, state_dict: dict[str, Any], strict: bool = True) -> None:
