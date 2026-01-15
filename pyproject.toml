@@ -13,9 +13,9 @@
 # limitations under the License.
 
 [build-system]
-requires = ["setuptools >= 61.0"]
+requires = ["setuptools >= 66.1.0"]
 build-backend = "build_backend"
-backend-path = ["."]
+backend-path = ["build_utils"]
 
 [tool.setuptools]
 include-package-data = true

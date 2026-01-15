@@ -13,11 +13,25 @@
 # limitations under the License.
 
 try:
-    from ._version import __git_version__ as __git_version__
-    from ._version import __version__ as __version__
+    import contextlib
+    import sys
+    from pathlib import Path
+
+    @contextlib.contextmanager
+    def temp_sys_path(path: Path):
+        sys.path.insert(0, str(path))
+        try:
+            yield
+        finally:
+            sys.path.pop(0)
+
+    with temp_sys_path(Path(__file__).parent.parent / "build_utils"):
+        from build_backend import dynamic_version_info
+
+        __version__, __git_version__ = dynamic_version_info()
 except ModuleNotFoundError:
     # Fallbacks for running directly from the source tree before _version.py is generated
-    __git_version__ = "unknown"
+    __git_version__ = "gitunknown"
     __version__ = "0.0.0"
 
 __package_name__ = "nemo_automodel"

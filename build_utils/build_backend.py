@@ -1,10 +1,12 @@
+import ast
 import logging
+import os
 import subprocess
 from pathlib import Path
 
 from setuptools import build_meta as orig
 
-_root = Path(__file__).parent.resolve()
+_root = Path(__file__).parent.parent.resolve()
 logger = logging.getLogger(__name__)
 
 
@@ -12,68 +14,72 @@ def is_git_repo():
     return (_root / ".git").is_dir()
 
 
-def get_git_commit_hash(cwd: Path | None, length: int = 10) -> str:
+def get_git_commit_hash(cwd: Path | None, length: int = 10) -> str | None:
     try:
         cmd = ["git", "rev-parse", f"--short={length}", "HEAD"]
-        return subprocess.check_output(cmd, cwd=cwd).strip().decode("utf-8")
+        return subprocess.check_output(cmd, cwd=cwd, stderr=subprocess.DEVNULL).strip().decode("utf-8")
     except Exception:
-        return "unknown"
-
-
-def get_git_branch(cwd: Path | None = None) -> str:
-    try:
-        cmd = ["git", "rev-parse", "--abbrev-ref", "HEAD"]
-        return subprocess.check_output(cmd, cwd=cwd).strip().decode("utf-8")
-    except Exception:
-        return ""
+        return None
 
 
 def get_git_tag(cwd: Path | None = None) -> str:
     try:
         cmd = ["git", "describe", "--tags", "--match", "v*", "--exact-match"]
-        return subprocess.check_output(cmd, cwd=cwd).strip().decode("utf-8")
+        return subprocess.check_output(cmd, cwd=cwd, stderr=subprocess.DEVNULL).strip().decode("utf-8")
     except Exception:
         return ""
 
 
-def _generate_version_info():
+def get_version_info_match(file_path: Path) -> dict[str, str]:
+    content = file_path.read_text(encoding="utf-8")
+    tree = ast.parse(content)
+    results = {}
+
+    for node in tree.body:
+        match node:
+            case ast.Assign(targets=[ast.Name(id=key)], value=ast.Constant(value=val)) if key in {
+                "__version__",
+                "__git_version__",
+            }:
+                results[key] = val
+    assert len(results) == 2, f"Expected 2 version info keys, got {len(results)}"
+    return results
+
+
+def dynamic_version_info():
     """Generate version info file with git metadata."""
     version_file = _root / "version.txt"
-    if version_file.exists():
-        with open(version_file, "r") as f:
-            version = f.read().strip()
-    else:
-        version = "0.0.0"
+    base_version = version_file.read_text().strip()
 
-    # Get git info
-    git_commit_hash = get_git_commit_hash(_root)
-    git_branch = get_git_branch(_root)
-    git_tag = get_git_tag(_root)
-
-    # Create version info in the source tree
-    package_dir = Path(__file__).parent / "nemo_automodel"
+    package_dir = Path(__file__).parent.parent / "nemo_automodel"
     _version_file = package_dir / "_version.py"
 
-    # If file exists and not in git repo (installing from sdist), keep existing file
-    if _version_file.exists() and not is_git_repo():
-        logger.info("The _version file already exists (not in git repo), keeping it")
-        return version
+    git_commit_hash = get_git_commit_hash(_root)
+    git_tag = get_git_tag(_root)
 
-    # In git repo (editable) or file doesn't exist, create/update it
+    if git_commit_hash:
+        git_commit_hash = git_commit_hash
+    elif _version_file.exists() and not is_git_repo():
+        git_commit_hash = get_version_info_match(_version_file).get("__git_version__")
+    else:
+        git_commit_hash = "gitunknown"
+
+    final_version = base_version
+
     with open(_version_file, "w") as f:
         f.write('"""Generate version info file with git metadata."""\n')
-        if git_branch.startswith("release") or git_tag:
-            # Release version or tag version may be pushed to PyPI; it shouldn't have a git hash suffix, which will affect the wheel name.
-            f.write(f'__version__ = "{version}"\n')
+        need_skip_git_version = os.environ.get("NO_GIT_VERSION", "").lower() in ("1", "true", "yes", "on")
+        if git_tag or need_skip_git_version:
+            f.write(f'__version__ = "{final_version}"\n')
         else:
-            f.write(f'__version__ = "{version}+{git_commit_hash}"\n')
+            final_version = f"{final_version}+{git_commit_hash}"
+            f.write(f'__version__ = "{final_version}"\n')
         f.write(f'__git_version__ = "{git_commit_hash}"\n')
-    logger.info(f"Created _version file with version {version}")
-    return version
+    logger.info(f"Created _version file with version {final_version}")
+    return final_version, git_commit_hash
 
 
-# Generate version info as soon as this module is imported
-_generate_version_info()
+dynamic_version_info()
 
 
 def get_requires_for_build_wheel(config_settings=None):
