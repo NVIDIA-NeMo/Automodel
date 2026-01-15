@@ -39,7 +39,9 @@ model:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: true
+  match_all_linear: false
+  exclude_modules:
+    - "*vision_tower*"
   dim: 4
   alpha: 8
   dropout: 0.0
