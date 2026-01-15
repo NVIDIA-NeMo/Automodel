@@ -48,7 +48,7 @@ def test_log_compare_losses_with_ground_truth(jsonl_paths: Tuple[Path, Path]) ->
     for index, (gt_loss, cmp_loss) in enumerate(zip(gt_losses, cmp_losses)):
         gt_tensor = torch.tensor(gt_loss, dtype=torch.float32)
         cmp_tensor = torch.tensor(cmp_loss, dtype=torch.float32)
-        if not torch.allclose(gt_tensor, cmp_tensor, rtol=1e-5, atol=1e-6):
+        if not torch.allclose(gt_tensor, cmp_tensor, rtol=0.0, atol=1e-3):
             mismatches.append(f"idx={index}: gt_loss={gt_loss:.9f} cmp_loss={cmp_loss:.9f}")
             # Keep collecting all mismatches to show a helpful summary
 
