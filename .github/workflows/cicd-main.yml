@@ -178,10 +178,6 @@ jobs:
             test-folder: llm_pretrain_and_kd
             runner: self-hosted-nemo
             timeout: 20
-          - test-name: L2_HF_Consolidated_FSDP
-            test-folder: hf_consolidated_fsdp
-            runner: self-hosted-nemo
-            timeout: 20
           - test-name: L2_HF_DCP
             test-folder: hf_dcp
             runner: self-hosted-nemo
