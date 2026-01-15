@@ -57,6 +57,7 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
         use_hf_chat_template: bool = False,
         delta_storage_options: Optional[Dict[str, str]] = None,
         delta_version: Optional[int] = None,
+        delta_use_duckdb: Optional[bool] = None,
     ) -> None:
         if tokenizer is None:
             raise ValueError("Tokenizer is required")
@@ -100,6 +101,7 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
             name=name,
             delta_storage_options=delta_storage_options,
             delta_version=delta_version,
+            delta_use_duckdb=delta_use_duckdb,
         )
         if limit_dataset_samples is not None:
             try:

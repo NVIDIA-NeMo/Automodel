@@ -131,7 +131,11 @@ def _check_databricks_sql_available() -> bool:
             from databricks import sql  # noqa: F401
 
             _DATABRICKS_SQL_AVAILABLE = True
-        except ImportError:
+        except Exception as e:  # noqa: BLE001
+            # In some environments (e.g., Databricks Repos), importing a missing module can surface
+            # as a non-ImportError (like an HTTP 404 from workspace import hooks). Treat any failure
+            # as "not available" and continue.
+            logger.debug("databricks-sql-connector not available (%s): %s", type(e).__name__, e)
             _DATABRICKS_SQL_AVAILABLE = False
     return _DATABRICKS_SQL_AVAILABLE
 
@@ -139,6 +143,23 @@ def _check_databricks_sql_available() -> bool:
 def _check_delta_reader_available() -> bool:
     """Check if any Delta Lake reader is available (DuckDB, deltalake, or databricks-sql)."""
     return _check_duckdb_available() or _check_deltalake_available() or _check_databricks_sql_available()
+
+
+def _is_deletion_vectors_error(e: BaseException) -> bool:
+    """Return True if *e* looks like the deltalake 'deletionVectors' unsupported-reader-features error."""
+    msg = str(e).lower()
+    return "deletionvectors" in msg or "deletion vectors" in msg
+
+
+def _normalize_duckdb_path(path: str) -> str:
+    """Normalize paths for DuckDB.
+
+    - Databricks DBFS URI paths (dbfs:/...) are typically accessible via the local FUSE mount (/dbfs/...).
+      We only rewrite when that mount exists to avoid breaking non-Databricks environments.
+    """
+    if path.startswith("dbfs:/") and Path("/dbfs").exists():
+        return str(Path("/dbfs") / path[len("dbfs:/") :])
+    return path
 
 
 def _is_unity_catalog_path(path: str) -> bool:
@@ -337,11 +358,13 @@ class DeltaLakeIterator:
             # Configure cloud storage access if needed
             self._configure_duckdb_cloud_access(conn)
 
+            duckdb_path = _normalize_duckdb_path(self.table_path)
+
             # DuckDB can read Delta tables directly
-            query = f"SELECT {col_select} FROM delta_scan('{self.table_path}')"
+            query = f"SELECT {col_select} FROM delta_scan(?)"
 
             # Fetch in batches for memory efficiency
-            result = conn.execute(query)
+            result = conn.execute(query, [duckdb_path])
             while True:
                 batch = result.fetchmany(self.batch_size)
                 if not batch:
@@ -356,14 +379,12 @@ class DeltaLakeIterator:
         """Iterate using deltalake library."""
         from deltalake import DeltaTable
 
-        # Open the Delta table
-        dt = DeltaTable(self.table_path, storage_options=self.storage_options, version=self.version)
-
         try:
-            # Get PyArrow dataset for efficient streaming
+            # Open the Delta table and get PyArrow dataset for efficient streaming
+            dt = DeltaTable(self.table_path, storage_options=self.storage_options, version=self.version)
             pa_dataset = dt.to_pyarrow_dataset()
-        except Exception as e:
-            if "deletionVectors" in str(e):
+        except Exception as e:  # noqa: BLE001
+            if _is_deletion_vectors_error(e):
                 if _check_duckdb_available():
                     logger.warning(
                         "Table uses deletion vectors. Falling back to DuckDB reader. "
@@ -516,20 +537,37 @@ class DeltaLakeDataset:
         storage_options: Optional[Dict[str, str]] = None,
         streaming: bool = False,
         version: Optional[int] = None,
+        use_duckdb: Optional[bool] = None,
     ):
-        if not _check_deltalake_available():
-            raise ImportError(
-                "The 'deltalake' package is required for Delta Lake support. "
-                "Install it with: pip install deltalake"
-            )
-
         self.table_path = _normalize_delta_path(table_path)
         self.columns = columns
         self.storage_options = storage_options or {}
         self.streaming = streaming
         self.version = version
+        self.use_duckdb = use_duckdb
         self._data: Optional[list] = None
         self._length: Optional[int] = None
+
+        if not _check_delta_reader_available():
+            raise ImportError(
+                "A Delta Lake reader is required. Install one of:\n"
+                "  pip install deltalake\n"
+                "  pip install duckdb\n"
+                "  pip install databricks-sql-connector  # for Unity Catalog tables"
+            )
+
+        if self.use_duckdb is True and not _check_duckdb_available():
+            raise ImportError("DuckDB is required but not installed. Install with: pip install duckdb")
+
+        if self.use_duckdb is False and not _check_deltalake_available():
+            raise ImportError("deltalake is required but not installed. Install with: pip install deltalake")
+
+        # Unity Catalog tables are supported in streaming mode via databricks-sql-connector.
+        if not self.streaming and _is_unity_catalog_path(self.table_path):
+            raise ValueError(
+                "Unity Catalog tables are only supported in streaming mode. "
+                "Use streaming=True (and install databricks-sql-connector)."
+            )
 
         # Add environment-based storage options
         self._iterator = DeltaLakeIterator(
@@ -537,6 +575,7 @@ class DeltaLakeDataset:
             columns=columns,
             storage_options=storage_options,
             version=version,
+            use_duckdb=use_duckdb,
         )
 
         if not streaming:
@@ -544,16 +583,90 @@ class DeltaLakeDataset:
 
     def _load_data(self):
         """Load the entire Delta table into memory."""
-        from deltalake import DeltaTable
+        # Unity Catalog tables are supported in streaming mode via databricks-sql-connector.
+        if _is_unity_catalog_path(self.table_path):
+            raise ValueError(
+                "Unity Catalog tables are only supported in streaming mode. "
+                "Use streaming=True (and install databricks-sql-connector)."
+            )
 
-        dt = DeltaTable(
-            self.table_path,
-            storage_options=self._iterator.storage_options,
-            version=self.version,
+        if self.use_duckdb is True:
+            iterator = DeltaLakeIterator(
+                table_path=self.table_path,
+                columns=self.columns,
+                storage_options=self._iterator.storage_options,
+                version=self.version,
+                use_duckdb=True,
+            )
+            self._data = list(iterator)
+            self._length = len(self._data)
+            return
+
+        if self.use_duckdb is False:
+            if not _check_deltalake_available():
+                raise ImportError("deltalake is required but not installed. Install with: pip install deltalake")
+            from deltalake import DeltaTable
+
+            try:
+                dt = DeltaTable(
+                    self.table_path,
+                    storage_options=self._iterator.storage_options,
+                    version=self.version,
+                )
+                pa_table = dt.to_pyarrow_table(columns=self.columns)
+            except Exception as e:  # noqa: BLE001
+                if _is_deletion_vectors_error(e):
+                    raise ImportError(
+                        "This Delta table uses deletion vectors which are not supported by the deltalake library. "
+                        "Install DuckDB to read this table:\n"
+                        "  pip install duckdb"
+                    ) from e
+                raise
+
+            self._data = pa_table.to_pylist()
+            self._length = len(self._data)
+            return
+
+        # Auto-detect: prefer deltalake when available, fall back to DuckDB when needed.
+        if _check_deltalake_available():
+            from deltalake import DeltaTable
+
+            try:
+                dt = DeltaTable(
+                    self.table_path,
+                    storage_options=self._iterator.storage_options,
+                    version=self.version,
+                )
+                pa_table = dt.to_pyarrow_table(columns=self.columns)
+                self._data = pa_table.to_pylist()
+                self._length = len(self._data)
+                return
+            except Exception as e:  # noqa: BLE001
+                if _is_deletion_vectors_error(e) and _check_duckdb_available():
+                    logger.warning(
+                        "Table uses deletion vectors. Falling back to DuckDB reader. "
+                        "To avoid this warning, set use_duckdb=True."
+                    )
+                else:
+                    raise
+
+        if _check_duckdb_available():
+            iterator = DeltaLakeIterator(
+                table_path=self.table_path,
+                columns=self.columns,
+                storage_options=self._iterator.storage_options,
+                version=self.version,
+                use_duckdb=True,
+            )
+            self._data = list(iterator)
+            self._length = len(self._data)
+            return
+
+        raise ImportError(
+            "Unable to read this Delta table. Install one of:\n"
+            "  pip install deltalake\n"
+            "  pip install duckdb"
         )
-        pa_table = dt.to_pyarrow_table(columns=self.columns)
-        self._data = pa_table.to_pylist()
-        self._length = len(self._data)
 
     def __len__(self) -> int:
         """Return the number of rows in the table.
@@ -605,6 +718,7 @@ def load_delta_lake_dataset(
     storage_options: Optional[Dict[str, str]] = None,
     streaming: bool = False,
     version: Optional[int] = None,
+    use_duckdb: Optional[bool] = None,
 ) -> Union[DeltaLakeDataset, "HFDeltaLakeDataset"]:
     """Load a Delta Lake table as a HuggingFace-compatible dataset.
 
@@ -634,11 +748,16 @@ def load_delta_lake_dataset(
         )
         ```
     """
-    if not _check_deltalake_available():
+    if not _check_delta_reader_available():
         raise ImportError(
-            "The 'deltalake' package is required for Delta Lake support. "
-            "Install it with: pip install deltalake"
+            "A Delta Lake reader is required. Install one of:\n"
+            "  pip install deltalake\n"
+            "  pip install duckdb\n"
+            "  pip install databricks-sql-connector  # for Unity Catalog tables"
         )
+
+    if use_duckdb is True and not _check_duckdb_available():
+        raise ImportError("DuckDB is required but not installed. Install with: pip install duckdb")
 
     # Return HF-compatible wrapper if datasets library is available
     try:
@@ -650,6 +769,7 @@ def load_delta_lake_dataset(
             storage_options=storage_options,
             streaming=streaming,
             version=version,
+            use_duckdb=use_duckdb,
         )
     except ImportError:
         return DeltaLakeDataset(
@@ -658,6 +778,7 @@ def load_delta_lake_dataset(
             storage_options=storage_options,
             streaming=streaming,
             version=version,
+            use_duckdb=use_duckdb,
         )
 
 
@@ -683,16 +804,21 @@ class HFDeltaLakeDataset:
         storage_options: Optional[Dict[str, str]] = None,
         streaming: bool = False,
         version: Optional[int] = None,
+        use_duckdb: Optional[bool] = None,
     ):
         self.table_path = _normalize_delta_path(table_path)
         self.columns = columns
         self.storage_options = storage_options or {}
         self.streaming = streaming
         self.version = version
+        self.use_duckdb = use_duckdb
         self._dataset: Optional[Any] = None
         self._epoch: int = 0
         self._shard_info: Optional[tuple] = None  # (num_shards, shard_index)
         self._shuffle_info: Optional[tuple] = None  # (buffer_size, seed)
+
+        if self.use_duckdb is True and not _check_duckdb_available():
+            raise ImportError("DuckDB is required but not installed. Install with: pip install duckdb")
 
         # Eagerly create the internal iterator to validate the table
         self._base_iterator = DeltaLakeIterator(
@@ -700,6 +826,7 @@ class HFDeltaLakeDataset:
             columns=columns,
             storage_options=storage_options,
             version=version,
+            use_duckdb=use_duckdb,
         )
 
         if not streaming:
@@ -709,15 +836,86 @@ class HFDeltaLakeDataset:
         """Load the Delta table as a HuggingFace Dataset."""
         from datasets import Dataset
 
-        from deltalake import DeltaTable
+        # Unity Catalog tables are supported in streaming mode via databricks-sql-connector.
+        if _is_unity_catalog_path(self.table_path):
+            raise ValueError(
+                "Unity Catalog tables are only supported in streaming mode. "
+                "Use streaming=True (and install databricks-sql-connector)."
+            )
 
-        dt = DeltaTable(
-            self.table_path,
-            storage_options=self._base_iterator.storage_options,
-            version=self.version,
+        if self.use_duckdb is True:
+            iterator = DeltaLakeIterator(
+                table_path=self.table_path,
+                columns=self.columns,
+                storage_options=self._base_iterator.storage_options,
+                version=self.version,
+                use_duckdb=True,
+            )
+            self._dataset = Dataset.from_list(list(iterator))
+            return
+
+        if self.use_duckdb is False:
+            if not _check_deltalake_available():
+                raise ImportError("deltalake is required but not installed. Install with: pip install deltalake")
+            from deltalake import DeltaTable
+
+            try:
+                dt = DeltaTable(
+                    self.table_path,
+                    storage_options=self._base_iterator.storage_options,
+                    version=self.version,
+                )
+                pa_table = dt.to_pyarrow_table(columns=self.columns)
+            except Exception as e:  # noqa: BLE001
+                if _is_deletion_vectors_error(e):
+                    raise ImportError(
+                        "This Delta table uses deletion vectors which are not supported by the deltalake library. "
+                        "Install DuckDB to read this table:\n"
+                        "  pip install duckdb"
+                    ) from e
+                raise
+
+            self._dataset = Dataset.from_list(pa_table.to_pylist())
+            return
+
+        # Auto-detect: prefer deltalake when available, fall back to DuckDB when needed.
+        if _check_deltalake_available():
+            from deltalake import DeltaTable
+
+            try:
+                dt = DeltaTable(
+                    self.table_path,
+                    storage_options=self._base_iterator.storage_options,
+                    version=self.version,
+                )
+                pa_table = dt.to_pyarrow_table(columns=self.columns)
+                self._dataset = Dataset.from_list(pa_table.to_pylist())
+                return
+            except Exception as e:  # noqa: BLE001
+                if _is_deletion_vectors_error(e) and _check_duckdb_available():
+                    logger.warning(
+                        "Table uses deletion vectors. Falling back to DuckDB reader. "
+                        "To avoid this warning, set use_duckdb=True."
+                    )
+                else:
+                    raise
+
+        if _check_duckdb_available():
+            iterator = DeltaLakeIterator(
+                table_path=self.table_path,
+                columns=self.columns,
+                storage_options=self._base_iterator.storage_options,
+                version=self.version,
+                use_duckdb=True,
+            )
+            self._dataset = Dataset.from_list(list(iterator))
+            return
+
+        raise ImportError(
+            "Unable to read this Delta table. Install one of:\n"
+            "  pip install deltalake\n"
+            "  pip install duckdb"
         )
-        pa_table = dt.to_pyarrow_table(columns=self.columns)
-        self._dataset = Dataset.from_pandas(pa_table.to_pandas())
 
     def __len__(self) -> int:
         """Return the number of rows in the table."""
@@ -743,6 +941,7 @@ class HFDeltaLakeDataset:
                 columns=self.columns,
                 storage_options=self._base_iterator.storage_options,
                 version=self.version,
+                use_duckdb=self.use_duckdb,
             )
 
             row_idx = 0

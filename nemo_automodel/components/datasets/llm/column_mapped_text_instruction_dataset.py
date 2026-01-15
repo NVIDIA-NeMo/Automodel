@@ -93,6 +93,7 @@ def _load_dataset(
     name: Optional[str] = None,
     delta_storage_options: Optional[Dict[str, str]] = None,
     delta_version: Optional[int] = None,
+    delta_use_duckdb: Optional[bool] = None,
 ):
     """Load a dataset from HuggingFace Hub, local JSON/JSONL files, or Delta Lake tables.
 
@@ -146,6 +147,7 @@ def _load_dataset(
                 storage_options=delta_storage_options,
                 streaming=streaming,
                 version=delta_version,
+                use_duckdb=delta_use_duckdb,
             )
 
     if isinstance(path_or_dataset_id, str) and _str_is_hf_repo_id(path_or_dataset_id):
