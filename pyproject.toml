@@ -85,7 +85,7 @@ dependencies = [
     "pyyaml",
     "torch<=2.10.0",
     "torchdata",
-    "transformers<=4.57.3",
+    "transformers<=4.57.5",
     "wandb",
     "torchao",
     "mlflow",
