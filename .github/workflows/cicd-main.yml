@@ -31,7 +31,12 @@ permissions:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.64.2
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.69.1
+    with:
+      default_runner_prefix: ${{ vars.INSTALL_TEST_DEFAULT_RUNNER_PREFIX }}
+      non_nvidia_runner_prefix: ${{ vars.INSTALL_TEST_NON_NVIDIA_RUNNER_PREFIX }}
+    secrets:
+      NVIDIA_MANAGEMENT_ORG_PAT: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
 
   linting:
     runs-on: ubuntu-latest
@@ -139,7 +144,7 @@ jobs:
             runner: linux-amd64-cpu16
             cpu-only: true
           - test-name: L0_Unit_Tests_GPU
-            runner: self-hosted-nemo
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
             cpu-only: false
             timeout: 30
     needs: [pre-flight, cicd-wait-in-queue]
@@ -167,6 +172,7 @@ jobs:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           PAT: ${{ secrets.PAT }}
+          test-data-path: ${{ needs.pre-flight.outputs.test-data-path }}
 
   cicd-e2e-tests:
     strategy:
@@ -176,37 +182,37 @@ jobs:
         include:
           - test-name: L2_Pretrain_and_KD
             test-folder: llm_pretrain_and_kd
-            runner: self-hosted-nemo
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
             timeout: 20
           - test-name: L2_HF_DCP
             test-folder: hf_dcp
-            runner: self-hosted-nemo
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
             timeout: 40
           - test-name: L2_HF_PEFT
             test-folder: hf_peft
-            runner: self-hosted-nemo
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
             timeout: 30
           - test-name: L2_HF_Transformer
             test-folder: hf_transformer
-            runner: self-hosted-nemo
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
             timeout: 20
           - test-name: L2_HF_Transformer_Finetune
             test-folder: hf_transformer_finetune
-            runner: self-hosted-nemo
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
             timeout: 40
           - test-name: L2_HF_Transformer_LLM
             test-folder: hf_transformer_llm
-            runner: linux-amd64-gpu-rtxa6000-latest-2-nemo
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
             timeout: 40
           - test-name: L2_HF_Transformer_VLM
             test-folder: hf_transformer_vlm
-            runner: self-hosted-nemo
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
             timeout: 60
           - test-name: L2_Datasets
             test-folder: data
-            runner: self-hosted-nemo
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
             timeout: 20
-    needs: [cicd-unit-tests]
+    needs: [cicd-unit-tests, pre-flight]
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.test-name }}
     environment: nemo-ci
@@ -231,6 +237,7 @@ jobs:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           PAT: ${{ secrets.PAT }}
+          test-data-path: ${{ needs.pre-flight.outputs.test-data-path }}
 
   Nemo_CICD_Test:
     needs:

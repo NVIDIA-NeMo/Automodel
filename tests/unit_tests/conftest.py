@@ -14,6 +14,7 @@
 import os
 from pathlib import Path
 from shutil import rmtree
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -104,3 +105,10 @@ def pytest_configure(config):
         "markers",
         "with_downloads: runs the test using data present in tests/.data",
     )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def mock_datasets_file_lock():
+    """Prevent the HF datasets library from writing a lock file in the read-only test data directory."""
+    with patch("datasets.builder.FileLock", return_value=MagicMock()):
+        yield
