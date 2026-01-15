@@ -15,7 +15,9 @@
 from tests.utils.test_utils import run_test_script
 import shutil
 
-TEST_FOLDER = "pretrain_llm"
+TEST_FOLDER = "llm_pretrain_and_kd"
+TEST_FILENAME = "L2_ClipGradNorm_Test.sh"
+KD_SCRIPT = "L2_KD_Transformer_SFT.sh"
 
 class TestPretrainLLM:
     def test_pretrain(self):
@@ -38,3 +40,19 @@ class TestPretrainLLM:
         finally:
             # remove the checkpoint directory
             shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    def test_clip_grad_norm_all_configs(self):
+        """Test gradient clipping with all parallelism configurations."""
+        try:
+            run_test_script(TEST_FOLDER, TEST_FILENAME)
+        finally:
+            # remove the checkpoint directory
+            shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    def test_kd_recipe_runs(self):
+        try:
+            run_test_script(TEST_FOLDER, KD_SCRIPT)
+        finally:
+            # remove the checkpoint directory
+            shutil.rmtree("checkpoints/", ignore_errors=True)
+
