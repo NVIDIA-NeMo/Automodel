@@ -1173,7 +1173,7 @@ name = "dion"
 version = "0.1.0"
 source = { git = "https://github.com/microsoft/dion.git#b17a7699f1398b9cba69d760a52c79bc0ee0e420" }
 dependencies = [
-    { name = "numpy" },
+    { name = "numpy", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
     { name = "torch", marker = "sys_platform == 'never'" },
     { name = "triton", marker = "sys_platform == 'never'" },
 ]
@@ -2914,7 +2914,7 @@ build = [
 ]
 dev = [
     { name = "cut-cross-entropy" },
-    { name = "dion" },
+    { name = "dion", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
 ]
 docs = [
     { name = "myst-parser" },
@@ -2983,7 +2983,7 @@ build = [
 ]
 dev = [
     { name = "cut-cross-entropy", git = "https://github.com/apple/ml-cross-entropy.git?rev=87a86ab" },
-    { name = "dion", git = "https://github.com/microsoft/dion.git" },
+    { name = "dion", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", git = "https://github.com/microsoft/dion.git" },
 ]
 docs = [
     { name = "myst-parser" },
