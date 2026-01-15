@@ -125,5 +125,3 @@ class TestAddTokenHelper:
         enc = BatchEncoding({"input_ids": "not-a-list"})
         with pytest.raises(ValueError):
             _add_token(enc, 101, 0, "input_ids")
-
-

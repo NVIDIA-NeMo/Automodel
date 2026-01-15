@@ -96,4 +96,3 @@ def test_nemotron_parse_forward_with_stub_encoder(monkeypatch):
     assert outputs.logits.shape == (1, labels.shape[1], vocab_size)
     assert outputs.loss is not None
     assert torch.isfinite(outputs.loss)
-

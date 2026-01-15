@@ -181,5 +181,3 @@ def test_iterable_dataset_mapping_checks_invalid_num_columns(tmp_path: Path):
             column_mapping={"answer": "a"},  # only 1 key
             tokenizer=_DummyTokenizer(),
         )
-
-

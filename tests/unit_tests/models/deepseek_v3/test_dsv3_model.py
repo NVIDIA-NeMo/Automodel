@@ -41,5 +41,3 @@ class TestDeepseekV3ModelUpdates:
 
         assert hasattr(dsv3_mod, "ModelClass")
         assert dsv3_mod.ModelClass is DeepseekV3ForCausalLM
-
-

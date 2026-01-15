@@ -98,5 +98,3 @@ def test_log_val_metrics_calls_mlflow(monkeypatch):
     mlflow_mock.assert_called_once()
     args, kwargs = mlflow_mock.call_args
     assert isinstance(args[0], dict) and kwargs.get("step") == log_data.step
-
-

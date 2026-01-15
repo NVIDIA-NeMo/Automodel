@@ -310,5 +310,3 @@ def test_fully_shard_by_dtype_three_dtypes(monkeypatch):
     # Expect all three subtrees to be individually sharded
     # Note: the 'b' subtree should be sharded as a whole since it is uniform float16
     assert set(sub_calls) == {model.a, model.b, model.c}
-
-

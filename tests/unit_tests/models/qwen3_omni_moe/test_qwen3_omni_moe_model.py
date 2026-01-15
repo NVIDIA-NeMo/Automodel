@@ -258,4 +258,3 @@ def test_modelclass_export_exists():
 
     assert hasattr(omni_module, "ModelClass")
     assert omni_module.ModelClass is Qwen3OmniMoeThinkerForConditionalGeneration
-

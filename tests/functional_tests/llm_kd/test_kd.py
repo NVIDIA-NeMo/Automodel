@@ -22,5 +22,3 @@ KD_SCRIPT = "L2_KD_Transformer_SFT.sh"
 class TestKDRecipe:
     def test_kd_recipe_runs(self):
         run_test_script(TEST_FOLDER, KD_SCRIPT)
-
-

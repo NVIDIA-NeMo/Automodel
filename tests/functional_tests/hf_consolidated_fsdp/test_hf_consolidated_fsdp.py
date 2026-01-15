@@ -26,7 +26,7 @@ class TestHFConsolidatedFSDP:
 
     def test_hf_consolidated_fsdp2_vlm_checkpoint(self):
         run_test_script(TEST_FOLDER, HF_CONSOLIDATED_FSDP2_VLM_FILENAME)
-    
+
     def test_hf_consolidated_fsdp2_llm_checkpoint_scalar_weight(self):
         run_test_script(TEST_FOLDER, HF_CONSOLIDATED_FSDP2_LLM_SCALAR_WEIGHT_FILENAME)
 

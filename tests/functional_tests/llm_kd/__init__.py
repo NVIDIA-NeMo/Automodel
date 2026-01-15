@@ -13,5 +13,3 @@
 # limitations under the License.
 
 """Functional tests for knowledge distillation (KD) recipe."""
-
-

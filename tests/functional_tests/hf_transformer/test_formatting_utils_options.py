@@ -178,5 +178,3 @@ def test_format_chat_template_options(seq_length, padding, truncation):
             else:
                 if seen_nonzero:
                     pytest.fail("Zero attention_mask value before non-padded tokens (padding not only in tail).")
-
-

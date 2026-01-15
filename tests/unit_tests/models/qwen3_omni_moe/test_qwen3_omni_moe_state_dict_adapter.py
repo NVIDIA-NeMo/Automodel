@@ -159,4 +159,3 @@ class TestFromHF:
         assert "thinker.model.layers.0.mlp.router.weight" in out
         passed = mock_from_hf.call_args[0][0]
         assert "model.layers.0.mlp.router.weight" in passed
-

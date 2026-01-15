@@ -326,4 +326,3 @@ def test_get_registry_is_cached(monkeypatch):
     r1 = reg.get_registry()
     r2 = reg.get_registry()
     assert r1 is r2
-
