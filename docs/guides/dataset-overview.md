@@ -196,6 +196,7 @@ See the [Function Calling guide](llm/toolcalling.md) for an end-to-end example w
   - Class: `nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining`
   - Use case: large-scale LM pretraining over Megatron-LM formatted tokenized corpora
   - Interoperability: If your corpus has already been tokenized/indexed for Megatron (i.e., `.bin`/`.idx` pairs), you can point Automodel to those assets directly. No re-tokenization required.
+  - Preprocessing tool: `tools/preprocess_megatron_dataset.py` supports both **JSONL** and **Parquet** input formats, enabling direct preprocessing of Hugging Face datasets stored in Parquet without conversion
   - Key args: `paths` (single path, glob, weighted list, or per-split dict), `seq_length`, `tokenizer`, `split`, `index_mapping_dir`, `splits_to_build`
   - Example YAML:
 ```yaml
