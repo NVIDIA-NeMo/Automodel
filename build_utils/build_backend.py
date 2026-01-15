@@ -10,7 +10,7 @@ _root = Path(__file__).parent.parent.resolve()
 logger = logging.getLogger(__name__)
 
 
-def is_git_repo():
+def is_git_repo() -> bool:
     return (_root / ".git").is_dir()
 
 
@@ -31,6 +31,7 @@ def get_git_tag(cwd: Path | None = None) -> str:
 
 
 def get_version_info_match(file_path: Path) -> dict[str, str]:
+    """Use to ast to parse static version form version file"""
     content = file_path.read_text(encoding="utf-8")
     tree = ast.parse(content)
     results = {}
@@ -46,7 +47,7 @@ def get_version_info_match(file_path: Path) -> dict[str, str]:
     return results
 
 
-def dynamic_version_info():
+def dynamic_version_info() -> tuple[str, str]:
     """Generate version info file with git metadata."""
     version_file = _root / "version.txt"
     base_version = version_file.read_text().strip()
@@ -60,7 +61,10 @@ def dynamic_version_info():
     if git_commit_hash:
         git_commit_hash = git_commit_hash
     elif _version_file.exists() and not is_git_repo():
+        # For build wheel from sdist, reuse _version.py info
         git_commit_hash = get_version_info_match(_version_file).get("__git_version__")
+        final_version = get_version_info_match(_version_file).get("__version__")
+        return final_version, git_commit_hash
     else:
         git_commit_hash = "gitunknown"
 
@@ -70,6 +74,7 @@ def dynamic_version_info():
         f.write('"""Generate version info file with git metadata."""\n')
         need_skip_git_version = os.environ.get("NO_GIT_VERSION", "").lower() in ("1", "true", "yes", "on")
         if git_tag or need_skip_git_version:
+            # If in stag or need skip git version, then ignore commit
             f.write(f'__version__ = "{final_version}"\n')
         else:
             final_version = f"{final_version}+{git_commit_hash}"
