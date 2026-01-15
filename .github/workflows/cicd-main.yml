@@ -174,7 +174,7 @@ jobs:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           PAT: ${{ secrets.PAT }}
-          test-data-path: ${{ needs.pre-flight.outputs.test-data-path }}
+          test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
 
   cicd-e2e-tests:
     strategy:
@@ -239,7 +239,7 @@ jobs:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           PAT: ${{ secrets.PAT }}
-          test-data-path: ${{ needs.pre-flight.outputs.test-data-path }}
+          test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
 
   Nemo_CICD_Test:
     needs:
