@@ -15,7 +15,7 @@
 from tests.utils.test_utils import run_test_script
 import shutil
 
-TEST_FOLDER = "pretrain_llm"
+TEST_FOLDER = "llm_pretrain_and_kd"
 TEST_FILENAME = "L2_ClipGradNorm_Test.sh"
 KD_SCRIPT = "L2_KD_Transformer_SFT.sh"
 
