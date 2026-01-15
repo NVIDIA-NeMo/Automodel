@@ -95,11 +95,9 @@ dependencies = [
 cuda = ["flash-attn<=2.8.3", "transformer-engine[pytorch]==2.8.0"]
 extra = ["flash-linear-attention", "perceptron", "sentencepiece"]
 delta = [
-    "duckdb>=1.0.0",  # DuckDB supports deletion vectors (Databricks 15.4+)
     "deltalake>=1.0.0",  # For basic Delta Lake operations
 ]
 delta-databricks = [
-    "duckdb>=1.0.0",  # DuckDB supports deletion vectors
     "deltalake>=1.0.0",  # For Delta Lake metadata
     "databricks-sql-connector>=3.0.0",  # For Unity Catalog streaming access
 ]

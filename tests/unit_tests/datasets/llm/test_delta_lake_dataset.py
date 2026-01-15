@@ -274,7 +274,6 @@ class TestLoadDatasetWithDelta:
                     storage_options=None,
                     streaming=True,
                     version=None,
-                    use_duckdb=None,
                 )
 
     def test_passes_delta_options(self):
@@ -291,7 +290,6 @@ class TestLoadDatasetWithDelta:
                     streaming=True,
                     delta_storage_options=storage_opts,
                     delta_version=5,
-                    delta_use_duckdb=True,
                 )
 
                 mock_load.assert_called_once_with(
@@ -299,14 +297,13 @@ class TestLoadDatasetWithDelta:
                     storage_options=storage_opts,
                     streaming=True,
                     version=5,
-                    use_duckdb=True,
                 )
 
 
 class TestDeletionVectorsFallback:
-    """Tests for deletion-vectors fallbacks without requiring real deltalake/duckdb installs."""
+    """Tests for deletion-vectors fallbacks without requiring real deltalake/pyspark installs."""
 
-    def test_falls_back_to_duckdb_when_deltalake_raises(self):
+    def test_falls_back_to_spark_when_deltalake_raises(self):
         from nemo_automodel.components.datasets.llm import delta_lake_dataset as mod
 
         class FakeDeltaTable:
@@ -324,15 +321,15 @@ class TestDeletionVectorsFallback:
 
         with patch.dict(sys.modules, {"deltalake": fake_deltalake}):
             with patch.object(mod, "_check_deltalake_available", return_value=True):
-                with patch.object(mod, "_check_duckdb_available", return_value=True):
+                with patch.object(mod, "_get_spark_session", return_value=object()):
                     it = mod.DeltaLakeIterator(table_path="delta:///tmp/table")
-                    with patch.object(it, "_iter_with_duckdb", return_value=iter([{"x": 1}])) as mock_duck:
+                    with patch.object(it, "_iter_with_spark", return_value=iter([{"x": 1}])) as mock_spark:
                         rows = list(it)
 
                     assert rows == [{"x": 1}]
-                    mock_duck.assert_called()
+                    mock_spark.assert_called()
 
-    def test_raises_clear_import_error_when_duckdb_missing(self):
+    def test_raises_clear_import_error_when_spark_missing(self):
         from nemo_automodel.components.datasets.llm import delta_lake_dataset as mod
 
         class FakeDeltaTable:
@@ -350,9 +347,9 @@ class TestDeletionVectorsFallback:
 
         with patch.dict(sys.modules, {"deltalake": fake_deltalake}):
             with patch.object(mod, "_check_deltalake_available", return_value=True):
-                with patch.object(mod, "_check_duckdb_available", return_value=False):
+                with patch.object(mod, "_get_spark_session", return_value=None):
                     it = mod.DeltaLakeIterator(table_path="delta:///tmp/table")
-                    with pytest.raises(ImportError, match=r"duckdb|DuckDB"):
+                    with pytest.raises(ImportError, match=r"Spark|pyspark|Databricks"):
                         _ = list(it)
 
 

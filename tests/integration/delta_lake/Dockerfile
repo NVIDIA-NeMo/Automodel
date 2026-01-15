@@ -15,7 +15,6 @@ ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
 # delta-spark 4.0.x requires Spark 4.0
 RUN pip install --no-cache-dir \
     deltalake>=1.0.0 \
-    duckdb>=1.0.0 \
     pyspark==3.5.3 \
     delta-spark==3.2.1 \
     pandas \

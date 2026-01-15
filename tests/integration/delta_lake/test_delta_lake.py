@@ -4,7 +4,7 @@
 This script:
 1. Creates a Delta table using PySpark with deletion vectors enabled
 2. Performs a DELETE operation to trigger deletion vector creation
-3. Reads the table using DuckDB (which supports deletion vectors)
+3. Reads the table using Spark (supports deletion vectors)
 4. Tests the DeltaLakeIterator class with auto-detection
 5. Verifies the data is correctly read
 """
@@ -15,7 +15,6 @@ import sys
 import tempfile
 
 import deltalake
-import duckdb
 import pandas as pd
 
 # The delta_lake_dataset.py module is copied to /app by the Dockerfile
@@ -75,7 +74,7 @@ def create_delta_table_with_deletion_vectors(table_path: str) -> None:
 
 
 def read_with_deltalake(table_path: str) -> pd.DataFrame:
-    """Read the Delta table metadata using deltalake and data using DuckDB."""
+    """Read the Delta table metadata using deltalake and data using Spark when needed."""
     print(f"\n--- Reading with deltalake {deltalake.__version__} ---")
 
     dt = deltalake.DeltaTable(table_path)
@@ -96,8 +95,8 @@ def read_with_deltalake(table_path: str) -> pd.DataFrame:
     )
 
     if has_deletion_vectors:
-        print("\n⚠️  Table has deletion vectors - using DuckDB to read (deltalake doesn't support this yet)")
-        df = read_with_duckdb(table_path)
+        print("\n⚠️  Table has deletion vectors - using Spark to read (deltalake doesn't support this yet)")
+        df = read_with_spark(table_path)
     else:
         # Read data with deltalake (for tables without deletion vectors)
         df = dt.to_pandas()
@@ -107,18 +106,30 @@ def read_with_deltalake(table_path: str) -> pd.DataFrame:
     return df
 
 
-def read_with_duckdb(table_path: str) -> pd.DataFrame:
-    """Read the Delta table using DuckDB (supports deletion vectors)."""
-    print(f"\n--- Reading with DuckDB {duckdb.__version__} ---")
+def read_with_spark(table_path: str) -> pd.DataFrame:
+    """Read the Delta table using Spark (supports deletion vectors)."""
+    from delta import configure_spark_with_delta_pip
+    from pyspark.sql import SparkSession
 
-    conn = duckdb.connect()
-    df = conn.execute(f"SELECT * FROM delta_scan('{table_path}')").fetchdf()
-    conn.close()
+    builder = (
+        SparkSession.builder.appName("DeltaLakeReadTest")
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config(
+            "spark.sql.catalog.spark_catalog",
+            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
+        )
+    )
 
-    print(f"\n✓ Successfully read {len(df)} rows with DuckDB:")
-    print(df)
-
-    return df
+    spark = configure_spark_with_delta_pip(builder).getOrCreate()
+    spark.sparkContext.setLogLevel("ERROR")
+    try:
+        sdf = spark.read.format("delta").load(table_path)
+        df = sdf.toPandas()
+        print(f"\n✓ Successfully read {len(df)} rows with Spark:")
+        print(df)
+        return df
+    finally:
+        spark.stop()
 
 
 def verify_data(df: pd.DataFrame) -> None:
@@ -144,7 +155,7 @@ def test_delta_lake_iterator(table_path: str) -> None:
     try:
         from delta_lake_dataset import DeltaLakeIterator
 
-        # Test with auto-detection (should fall back to DuckDB due to deletion vectors)
+        # Test with auto-detection (should fall back to Spark due to deletion vectors)
         iterator = DeltaLakeIterator(
             table_path=table_path,
             batch_size=100,
@@ -159,19 +170,18 @@ def test_delta_lake_iterator(table_path: str) -> None:
         assert 2 not in ids, "Deleted row (id=2) should not be present"
         print("✓ DeltaLakeIterator data verified!")
 
-        # Test with explicit DuckDB
-        print("\n--- Testing DeltaLakeIterator (explicit DuckDB) ---")
-        iterator_duckdb = DeltaLakeIterator(
+        # Test column selection (should work regardless of backend)
+        print("\n--- Testing DeltaLakeIterator (column selection) ---")
+        iterator_cols = DeltaLakeIterator(
             table_path=table_path,
-            use_duckdb=True,
             columns=["id", "name"],  # Test column selection
         )
 
-        rows_duckdb = list(iterator_duckdb)
-        print(f"✓ DeltaLakeIterator (DuckDB) read {len(rows_duckdb)} rows with selected columns")
+        rows_cols = list(iterator_cols)
+        print(f"✓ DeltaLakeIterator read {len(rows_cols)} rows with selected columns")
 
         # Verify only selected columns are present
-        assert set(rows_duckdb[0].keys()) == {"id", "name"}, "Should only have selected columns"
+        assert set(rows_cols[0].keys()) == {"id", "name"}, "Should only have selected columns"
         print("✓ Column selection works!")
 
     except ImportError as e:
@@ -186,7 +196,6 @@ def main():
     print("Delta Lake Deletion Vectors Test")
     print("=" * 60)
     print(f"deltalake version: {deltalake.__version__}")
-    print(f"duckdb version: {duckdb.__version__}")
     print()
 
     # Create a temporary directory for the test table
@@ -198,8 +207,8 @@ def main():
         print("\n--- Step 1: Creating Delta table with deletion vectors ---")
         create_delta_table_with_deletion_vectors(table_path)
 
-        # Step 2: Read with deltalake library (uses DuckDB fallback)
-        print("\n--- Step 2: Reading with deltalake/DuckDB ---")
+        # Step 2: Read with deltalake library (uses Spark fallback)
+        print("\n--- Step 2: Reading with deltalake/Spark ---")
         df = read_with_deltalake(table_path)
 
         # Step 3: Verify the data
@@ -212,8 +221,8 @@ def main():
 
         print("\n" + "=" * 60)
         print("SUCCESS: All tests passed!")
-        print("- DuckDB can read Delta tables with deletion vectors")
-        print("- DeltaLakeIterator auto-detects and uses DuckDB")
+        print("- Spark can read Delta tables with deletion vectors")
+        print("- DeltaLakeIterator auto-detects and uses Spark")
         print("- (deltalake library does not yet support deletion vectors)")
         print("=" * 60)
 
