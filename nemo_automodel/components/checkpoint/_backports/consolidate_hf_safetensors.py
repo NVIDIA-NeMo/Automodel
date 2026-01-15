@@ -590,7 +590,7 @@ def _consolidate_safetensors_files(
         # This is a single sequential write operation which Unity Catalog Volumes support
         for temp_path, final_path in temp_to_final_mapping.items():
             shutil.copy2(temp_path, final_path)
-            logger.debug("Copied %s to %s", temp_path, final_path)
+            logger.info("Copied %s to %s", temp_path, final_path)
 
     finally:
         # Clean up temp directory
