@@ -94,6 +94,8 @@ class CheckpointingConfig:
     skip_task_head_prefixes_for_base_model: list[str] | None = (
         None  # Parameter prefixes to skip when loading base model
     )
+    single_rank_consolidation: bool = False  # If True, only rank 0 performs consolidation.
+    # Use this for Unity Catalog Volumes to avoid multiple ranks writing simultaneously.
 
     def __post_init__(self):
         """
@@ -196,7 +198,13 @@ class Checkpointer:
 
         # Because this call lies outside of the dcp save call, we need to consolidate on all ranks on the main process
         # of all ranks, which lies on the critical path. Therefore, we can only do this outside of async mode.
-        consolidate_on_all_ranks = self._should_write_consolidated_safetensors() and not self.config.is_async
+        # If single_rank_consolidation is set, we skip distributed consolidation and let rank 0 handle it
+        # via the storage writer's finish() method - useful for Unity Catalog Volumes.
+        consolidate_on_all_ranks = (
+            self._should_write_consolidated_safetensors()
+            and not self.config.is_async
+            and not self.config.single_rank_consolidation
+        )
 
         model_state = ModelState(model, self.config.is_peft)
         state_dict = model_state.state_dict()

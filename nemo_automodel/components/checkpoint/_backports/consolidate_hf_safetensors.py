@@ -21,7 +21,9 @@ import logging
 import math
 import mmap
 import os
+import shutil
 import struct
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -539,34 +541,62 @@ def _consolidate_safetensors_files(
     fqn_to_file_mapping: dict[str, str],
     num_threads: int,
 ) -> dict[str, _OutputFileData]:
-    output_files_data: dict[str, _OutputFileData] = {}
-    # Create multiple output files based on the provided mapping
+    # Build final output paths
+    final_output_files_data: dict[str, _OutputFileData] = {}
     for fqn, filename in fqn_to_file_mapping.items():
         output_path = os.path.join(output_dir, filename)
 
-        if output_path not in output_files_data:
-            output_files_data[output_path] = _OutputFileData(fqn_data={fqn: _FqnData()})
+        if output_path not in final_output_files_data:
+            final_output_files_data[output_path] = _OutputFileData(fqn_data={fqn: _FqnData()})
         else:
-            output_files_data[output_path].fqn_data[fqn] = _FqnData()
+            final_output_files_data[output_path].fqn_data[fqn] = _FqnData()
 
-    # Find all safetensors files in the input directory
-    safetensors_files = glob.glob(os.path.join(input_dir, f"*{SUFFIX}"))
+    # Create a local temp directory for writing files
+    # This works around Unity Catalog Volumes which don't support direct-append or non-sequential writes
+    # We write complete files locally first, then copy them to the final destination
+    temp_dir = tempfile.mkdtemp(prefix="safetensors_consolidate_")
 
-    # Read metadata from all input files
-    input_files_data: dict[str, _InputFileData] = {}
-    for safetensor_file in safetensors_files:
-        with open(safetensor_file, "rb") as f:
-            metadata, size = _get_safetensors_file_metadata(f)
-            input_files_data[safetensor_file] = _InputFileData(metadata_size=size, metadata=metadata)
-    # Step 1: Parse metadata to determine tensor shapes and types
-    _parse_input_metadata(input_files_data, output_files_data)
+    try:
+        # Create temp output files data with temp paths, but preserve original path mapping for return value
+        temp_output_files_data: dict[str, _OutputFileData] = {}
+        temp_to_final_mapping: dict[str, str] = {}
 
-    # Step 2: Write metadata headers to output files
-    _write_metadata(output_files_data)
-    # Step 3: Write actual tensor data from input files to output files
-    _write_data(input_files_data, output_files_data, num_threads)
+        for final_path, output_data in final_output_files_data.items():
+            filename = os.path.basename(final_path)
+            temp_path = os.path.join(temp_dir, filename)
+            temp_output_files_data[temp_path] = output_data
+            temp_to_final_mapping[temp_path] = final_path
 
-    return output_files_data
+        # Find all safetensors files in the input directory
+        safetensors_files = glob.glob(os.path.join(input_dir, f"*{SUFFIX}"))
+
+        # Read metadata from all input files
+        input_files_data: dict[str, _InputFileData] = {}
+        for safetensor_file in safetensors_files:
+            with open(safetensor_file, "rb") as f:
+                metadata, size = _get_safetensors_file_metadata(f)
+                input_files_data[safetensor_file] = _InputFileData(metadata_size=size, metadata=metadata)
+
+        # Step 1: Parse metadata to determine tensor shapes and types
+        _parse_input_metadata(input_files_data, temp_output_files_data)
+
+        # Step 2: Write metadata headers to temp output files
+        _write_metadata(temp_output_files_data)
+
+        # Step 3: Write actual tensor data from input files to temp output files
+        _write_data(input_files_data, temp_output_files_data, num_threads)
+
+        # Step 4: Copy completed files from temp to final destination
+        # This is a single sequential write operation which Unity Catalog Volumes support
+        for temp_path, final_path in temp_to_final_mapping.items():
+            shutil.copy2(temp_path, final_path)
+            logger.debug("Copied %s to %s", temp_path, final_path)
+
+    finally:
+        # Clean up temp directory
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    return final_output_files_data
 
 
 def consolidate_safetensors_files(
