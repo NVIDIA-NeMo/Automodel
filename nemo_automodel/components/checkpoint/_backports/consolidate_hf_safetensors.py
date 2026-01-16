@@ -180,43 +180,72 @@ def _write_metadata(
     # Process each output file
     for file_path, output_data in output_files_data.items():
         with open(file_path, "wb") as f:
-            metadata = {}
-            curr_offset = 0
+            metadata = _compute_safetensors_metadata_and_offsets(output_data)
+            _write_safetensors_header(f, output_data, metadata)
 
-            # Calculate offsets for each tensor in the file
-            for fqn, fqn_data in output_data.fqn_data.items():
-                # Calculate the end offset by multiplying all dimensions and the data type size
-                end_offset = curr_offset + math.prod(fqn_data.shape_in_file) * fqn_data.dtype_size
 
-                # Store metadata for this tensor
-                metadata[fqn] = {
-                    SHAPE_KEY: fqn_data.shape_in_file,
-                    DTYPE_KEY: fqn_data.dtype_str,
-                    DATA_OFFSETS_KEY: [
-                        curr_offset,
-                        end_offset,
-                    ],  # Start and end byte offsets
-                }
-                # Store the offset for later use when writing the actual tensor data
-                fqn_data.offset_in_file = curr_offset
+def _compute_safetensors_metadata_and_offsets(output_data: _OutputFileData) -> dict[str, Any]:
+    """
+    Compute the safetensors JSON header (metadata) and update each tensor's offset_in_file.
 
-                # Update current offset for the next tensor
-                curr_offset = end_offset
+    The offsets stored in the safetensors JSON header are **relative to the start of the data section**
+    (i.e., immediately after the header JSON), so they can be computed up-front without any seeks.
 
-            # Convert metadata to JSON and encode as bytes
-            json_metadata = json.dumps(metadata)
-            json_bytes = json_metadata.encode("utf-8")
+    Args:
+        output_data: Metadata for a single output safetensors file.
 
-            # Write the metadata size as an 8-byte unsigned integer (little-endian)
-            size_in_bytes = len(json_bytes)
-            header_len = struct.pack("<Q", size_in_bytes)
+    Returns:
+        A metadata dict suitable to be JSON-serialized into a safetensors header.
+    """
+    metadata: dict[str, Any] = {}
+    curr_offset = 0
 
-            # Write the header length and metadata to the file
-            f.write(header_len)
-            f.write(json_bytes)
+    # Calculate offsets for each tensor in the file (in the existing insertion order)
+    for fqn, fqn_data in output_data.fqn_data.items():
+        # Calculate the end offset by multiplying all dimensions and the data type size
+        end_offset = curr_offset + math.prod(fqn_data.shape_in_file) * fqn_data.dtype_size
 
-            # Store the total metadata size (header + JSON) for later use
-            output_data.metadata_size = f.tell()
+        # Store metadata for this tensor
+        metadata[fqn] = {
+            SHAPE_KEY: fqn_data.shape_in_file,
+            DTYPE_KEY: fqn_data.dtype_str,
+            DATA_OFFSETS_KEY: [
+                curr_offset,
+                end_offset,
+            ],  # Start and end byte offsets
+        }
+
+        # Store the offset for later use when writing the actual tensor data
+        fqn_data.offset_in_file = curr_offset
+
+        # Update current offset for the next tensor
+        curr_offset = end_offset
+
+    return metadata
+
+
+def _write_safetensors_header(output_stream: Any, output_data: _OutputFileData, metadata: dict[str, Any]) -> None:
+    """
+    Write the safetensors header (8-byte length + JSON bytes) to an already-open output stream.
+
+    This enables single-pass `wb` writing: header first, then raw tensor bytes, without reopening
+    the file in append mode.
+    """
+    # Convert metadata to JSON and encode as bytes
+    json_metadata = json.dumps(metadata)
+    json_bytes = json_metadata.encode("utf-8")
+
+    # Write the metadata size as an 8-byte unsigned integer (little-endian)
+    size_in_bytes = len(json_bytes)
+    header_len = struct.pack("<Q", size_in_bytes)
+
+    # Write the header length and metadata to the file
+    output_stream.write(header_len)
+    output_stream.write(json_bytes)
+
+    # Store the total metadata size (header + JSON) for later use
+    # Avoid relying on `tell()` so this works with non-seekable write streams too.
+    output_data.metadata_size = 8 + size_in_bytes
 
 
 def _read_tensor_data_mmap(
@@ -260,17 +289,16 @@ def _process_output_file(
         output_data: Metadata for the output file
         input_files_data: Dictionary mapping input file paths to their metadata
     """
+    # Single-pass write:
+    # - open output once with "wb"
+    # - write safetensors header
+    # - stream tensor bytes sequentially (no append / no reopen required)
+    with open(output_file, "wb") as output_stream:
+        header_metadata = _compute_safetensors_metadata_and_offsets(output_data)
+        _write_safetensors_header(output_stream, output_data, header_metadata)
 
-    sorted_tensors = sorted(output_data.fqn_data.items(), key=lambda x: x[1].offset_in_file)
+        sorted_tensors = sorted(output_data.fqn_data.items(), key=lambda x: x[1].offset_in_file)
 
-    # `_write_metadata()` already created/truncated the file and wrote the safetensors header.
-    # Here we only need to append the raw tensor bytes after that header.
-    if not os.path.exists(output_file):
-        raise FileNotFoundError(
-            f"Expected output file {output_file} to exist (header written in _write_metadata()), but it does not."
-        )
-
-    with open(output_file, "ab") as output_stream:
         # Process each tensor in sequential output order
         for tensor_fqn, tensor_fqn_data in sorted_tensors:
             full_tensor_mv = memoryview(
@@ -301,7 +329,7 @@ def _process_output_file(
                 fqn_custom_metadata = _get_dcp_custom_metadata(file_metadata)[tensor_fqn]  # type: ignore[index]
                 offsets_of_tensor_being_read = fqn_custom_metadata[SAVED_OFFSETS_KEY]  # type: ignore[index]
 
-                # Write this tensor shard to the appropriate position in the output file
+                # Write this tensor shard to the appropriate position in the output file buffer
                 _write_sub_tensor_to_file_optimized(
                     full_tensor_mv,
                     data_to_write,
@@ -565,7 +593,8 @@ def _consolidate_safetensors_files(
 
     if use_staging:
         # Use staging directory for writing files first, then copy to final destination.
-        # This works around remote storage systems that don't support direct-append or non-sequential writes.
+        # This is useful when you want to avoid leaving partial files in the final output_dir (e.g., on failure),
+        # or when the destination storage backend has limited support for direct writes.
         if staging_dir is not None:
             os.makedirs(staging_dir, exist_ok=True)
             temp_dir = tempfile.mkdtemp(prefix="safetensors_consolidate_", dir=staging_dir)
@@ -585,11 +614,7 @@ def _consolidate_safetensors_files(
 
             # Step 1: Parse metadata to determine tensor shapes and types
             _parse_input_metadata(input_files_data, temp_output_files_data)
-
-            # Step 2: Write metadata headers to temp output files
-            _write_metadata(temp_output_files_data)
-
-            # Step 3: Write actual tensor data from input files to temp output files
+            # Step 2: Write metadata + tensor data from input files to temp output files
             _write_data(input_files_data, temp_output_files_data, num_threads)
 
             # Step 4: Copy completed files from temp to final destination
@@ -604,11 +629,7 @@ def _consolidate_safetensors_files(
         # Write directly to output directory
         # Step 1: Parse metadata to determine tensor shapes and types
         _parse_input_metadata(input_files_data, output_files_data)
-
-        # Step 2: Write metadata headers to output files
-        _write_metadata(output_files_data)
-
-        # Step 3: Write actual tensor data from input files to output files
+        # Step 2: Write metadata + tensor data from input files to output files
         _write_data(input_files_data, output_files_data, num_threads)
 
     return output_files_data
@@ -640,8 +661,9 @@ def consolidate_safetensors_files(
                              If None, all tensors will be consolidated into a single file.
         num_threads: Number of threads to use for parallel processing of saving data to output files.
         use_staging: If True, write to a staging directory first then copy to output_dir.
-                    Required for remote storage systems that don't support
-                    direct-append or non-sequential writes. Default is False.
+                    Useful when you want to avoid leaving partial files in output_dir (e.g., on failure),
+                    or when the destination storage backend has limited support for direct writes.
+                    Default is False.
         staging_dir: Optional directory for staging files during consolidation. If provided,
                     temporary files will be created in this directory instead of the system temp.
                     Only used when use_staging=True. Useful when system temp has limited space.
@@ -693,8 +715,9 @@ def consolidate_safetensors_files_on_every_rank(
         num_threads: Number of threads to use for parallel processing on each rank
         process_group: PyTorch distributed process group (default: None, will use default group)
         use_staging: If True, write to a staging directory first then copy to output_dir.
-                    Required for remote storage systems that don't support
-                    direct-append or non-sequential writes. Default is False.
+                    Useful when you want to avoid leaving partial files in output_dir (e.g., on failure),
+                    or when the destination storage backend has limited support for direct writes.
+                    Default is False.
         staging_dir: Optional directory for staging files during consolidation. If provided,
                     temporary files will be created in this directory instead of the system temp.
                     Only used when use_staging=True. Useful when system temp has limited space.
