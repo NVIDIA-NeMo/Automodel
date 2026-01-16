@@ -95,7 +95,9 @@ class CheckpointingConfig:
         None  # Parameter prefixes to skip when loading base model
     )
     single_rank_consolidation: bool = False  # If True, only rank 0 performs consolidation.
-    # Use this for Unity Catalog Volumes to avoid multiple ranks writing simultaneously.
+    # This should be used for remote storage systems that don't support direct-append or non-sequential writes.
+    staging_dir: str | None = None  # Optional directory for staging files during consolidation.
+    # If provided, temp files will be created here instead of system temp. Useful when system temp has limited space.
 
     def __post_init__(self):
         """
@@ -243,6 +245,8 @@ class Checkpointer:
                 output_dir=consolidated_dir,
                 fqn_to_index_mapping=fqn_to_file_index_mapping,
                 num_threads=5,
+                use_staging=self.config.staging_dir is not None,
+                staging_dir=self.config.staging_dir,
             )
 
     def save_optimizer(
@@ -622,6 +626,7 @@ class Checkpointer:
                 save_sharded=True,
                 consolidated_output_path=consolidated_output_path if not consolidate_on_all_ranks else None,
                 fqn_to_index_mapping=fqn_to_index_mapping,
+                staging_dir=self.config.staging_dir,
             )
 
     def _get_storage_reader(

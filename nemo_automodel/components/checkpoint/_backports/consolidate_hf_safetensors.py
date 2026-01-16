@@ -540,63 +540,78 @@ def _consolidate_safetensors_files(
     output_dir: str,
     fqn_to_file_mapping: dict[str, str],
     num_threads: int,
+    use_staging: bool = False,
+    staging_dir: Optional[str] = None,
 ) -> dict[str, _OutputFileData]:
-    # Build final output paths
-    final_output_files_data: dict[str, _OutputFileData] = {}
+    # Build output paths
+    output_files_data: dict[str, _OutputFileData] = {}
     for fqn, filename in fqn_to_file_mapping.items():
         output_path = os.path.join(output_dir, filename)
 
-        if output_path not in final_output_files_data:
-            final_output_files_data[output_path] = _OutputFileData(fqn_data={fqn: _FqnData()})
+        if output_path not in output_files_data:
+            output_files_data[output_path] = _OutputFileData(fqn_data={fqn: _FqnData()})
         else:
-            final_output_files_data[output_path].fqn_data[fqn] = _FqnData()
+            output_files_data[output_path].fqn_data[fqn] = _FqnData()
 
-    # Create a local temp directory for writing files
-    # This works around Unity Catalog Volumes which don't support direct-append or non-sequential writes
-    # We write complete files locally first, then copy them to the final destination
-    temp_dir = tempfile.mkdtemp(prefix="safetensors_consolidate_")
+    # Find all safetensors files in the input directory
+    safetensors_files = glob.glob(os.path.join(input_dir, f"*{SUFFIX}"))
 
-    try:
-        # Create temp output files data with temp paths, but preserve original path mapping for return value
-        temp_output_files_data: dict[str, _OutputFileData] = {}
-        temp_to_final_mapping: dict[str, str] = {}
+    # Read metadata from all input files
+    input_files_data: dict[str, _InputFileData] = {}
+    for safetensor_file in safetensors_files:
+        with open(safetensor_file, "rb") as f:
+            metadata, size = _get_safetensors_file_metadata(f)
+            input_files_data[safetensor_file] = _InputFileData(metadata_size=size, metadata=metadata)
 
-        for final_path, output_data in final_output_files_data.items():
-            filename = os.path.basename(final_path)
-            temp_path = os.path.join(temp_dir, filename)
-            temp_output_files_data[temp_path] = output_data
-            temp_to_final_mapping[temp_path] = final_path
+    if use_staging:
+        # Use staging directory for writing files first, then copy to final destination.
+        # This works around remote storage systems that don't support direct-append or non-sequential writes.
+        if staging_dir is not None:
+            os.makedirs(staging_dir, exist_ok=True)
+            temp_dir = tempfile.mkdtemp(prefix="safetensors_consolidate_", dir=staging_dir)
+        else:
+            temp_dir = tempfile.mkdtemp(prefix="safetensors_consolidate_")
 
-        # Find all safetensors files in the input directory
-        safetensors_files = glob.glob(os.path.join(input_dir, f"*{SUFFIX}"))
+        try:
+            # Create temp output files data with temp paths
+            temp_output_files_data: dict[str, _OutputFileData] = {}
+            temp_to_final_mapping: dict[str, str] = {}
 
-        # Read metadata from all input files
-        input_files_data: dict[str, _InputFileData] = {}
-        for safetensor_file in safetensors_files:
-            with open(safetensor_file, "rb") as f:
-                metadata, size = _get_safetensors_file_metadata(f)
-                input_files_data[safetensor_file] = _InputFileData(metadata_size=size, metadata=metadata)
+            for final_path, file_data in output_files_data.items():
+                filename = os.path.basename(final_path)
+                temp_path = os.path.join(temp_dir, filename)
+                temp_output_files_data[temp_path] = file_data
+                temp_to_final_mapping[temp_path] = final_path
 
+            # Step 1: Parse metadata to determine tensor shapes and types
+            _parse_input_metadata(input_files_data, temp_output_files_data)
+
+            # Step 2: Write metadata headers to temp output files
+            _write_metadata(temp_output_files_data)
+
+            # Step 3: Write actual tensor data from input files to temp output files
+            _write_data(input_files_data, temp_output_files_data, num_threads)
+
+            # Step 4: Copy completed files from temp to final destination
+            for temp_path, final_path in temp_to_final_mapping.items():
+                shutil.copy2(temp_path, final_path)
+                logger.info("Copied %s to %s", temp_path, final_path)
+
+        finally:
+            # Clean up temp directory
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    else:
+        # Write directly to output directory
         # Step 1: Parse metadata to determine tensor shapes and types
-        _parse_input_metadata(input_files_data, temp_output_files_data)
+        _parse_input_metadata(input_files_data, output_files_data)
 
-        # Step 2: Write metadata headers to temp output files
-        _write_metadata(temp_output_files_data)
+        # Step 2: Write metadata headers to output files
+        _write_metadata(output_files_data)
 
-        # Step 3: Write actual tensor data from input files to temp output files
-        _write_data(input_files_data, temp_output_files_data, num_threads)
+        # Step 3: Write actual tensor data from input files to output files
+        _write_data(input_files_data, output_files_data, num_threads)
 
-        # Step 4: Copy completed files from temp to final destination
-        # This is a single sequential write operation which Unity Catalog Volumes support
-        for temp_path, final_path in temp_to_final_mapping.items():
-            shutil.copy2(temp_path, final_path)
-            logger.info("Copied %s to %s", temp_path, final_path)
-
-    finally:
-        # Clean up temp directory
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-    return final_output_files_data
+    return output_files_data
 
 
 def consolidate_safetensors_files(
@@ -604,6 +619,8 @@ def consolidate_safetensors_files(
     output_dir: str,
     fqn_to_index_mapping: dict[str, int],
     num_threads: int = 1,
+    use_staging: bool = False,
+    staging_dir: Optional[str] = None,
 ) -> None:
     """
     Main function to consolidate sharded safetensors files into one or more output files.
@@ -622,6 +639,12 @@ def consolidate_safetensors_files(
         fqn_to_index_mapping: Optional mapping of tensor names to output file indices.
                              If None, all tensors will be consolidated into a single file.
         num_threads: Number of threads to use for parallel processing of saving data to output files.
+        use_staging: If True, write to a staging directory first then copy to output_dir.
+                    Required for remote storage systems that don't support
+                    direct-append or non-sequential writes. Default is False.
+        staging_dir: Optional directory for staging files during consolidation. If provided,
+                    temporary files will be created in this directory instead of the system temp.
+                    Only used when use_staging=True. Useful when system temp has limited space.
     """
     start_time = time.time()
     logger.info(
@@ -634,7 +657,9 @@ def consolidate_safetensors_files(
     max_index = max(fqn_to_index_mapping.values())
     fqn_to_file_mapping = {fqn: _gen_file_name(idx, max_index) for fqn, idx in fqn_to_index_mapping.items()}
 
-    output_files_data = _consolidate_safetensors_files(input_dir, output_dir, fqn_to_file_mapping, num_threads)
+    output_files_data = _consolidate_safetensors_files(
+        input_dir, output_dir, fqn_to_file_mapping, num_threads, use_staging, staging_dir
+    )
 
     # Step 4: Write overall model.index.safetensors.json file with weight map
     _write_overall_metadata_file(output_dir, output_files_data)
@@ -648,6 +673,8 @@ def consolidate_safetensors_files_on_every_rank(
     fqn_to_index_mapping: dict[str, int],
     num_threads: int = 1,
     process_group: Optional[dist.ProcessGroup] = None,
+    use_staging: bool = False,
+    staging_dir: Optional[str] = None,
 ) -> None:
     """
     Consolidate sharded safetensors files across multiple ranks, with each rank handling a subset of output files.
@@ -665,6 +692,12 @@ def consolidate_safetensors_files_on_every_rank(
         fqn_to_index_mapping: Mapping of tensor names to output file indices
         num_threads: Number of threads to use for parallel processing on each rank
         process_group: PyTorch distributed process group (default: None, will use default group)
+        use_staging: If True, write to a staging directory first then copy to output_dir.
+                    Required for remote storage systems that don't support
+                    direct-append or non-sequential writes. Default is False.
+        staging_dir: Optional directory for staging files during consolidation. If provided,
+                    temporary files will be created in this directory instead of the system temp.
+                    Only used when use_staging=True. Useful when system temp has limited space.
     """
 
     start_time = time.time()
@@ -719,6 +752,8 @@ def consolidate_safetensors_files_on_every_rank(
             output_dir=output_dir,
             fqn_to_file_mapping=filtered_filename_mapping,
             num_threads=num_threads,
+            use_staging=use_staging,
+            staging_dir=staging_dir,
         )
     else:
         output_files_data = {}
