@@ -142,9 +142,9 @@ jobs:
       max-parallel: 5
       matrix:
         include:
-          # - test-name: L0_Unit_Tests_CPU
-          #   runner: linux-amd64-cpu16
-          #   cpu-only: true
+          - test-name: L0_Unit_Tests_CPU
+            runner: linux-amd64-cpu16
+            cpu-only: true
           - test-name: L0_Unit_Tests_GPU
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
             cpu-only: false
@@ -176,76 +176,76 @@ jobs:
           PAT: ${{ secrets.PAT }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
 
-  # cicd-e2e-tests:
-  #   strategy:
-  #     fail-fast: false
-  #     max-parallel: 10
-  #     matrix:
-  #       include:
-  #         - test-name: L2_Pretrain_and_KD
-  #           test-folder: llm_pretrain_and_kd
-  #           runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
-  #           timeout: 20
-  #         - test-name: L2_HF_DCP
-  #           test-folder: hf_dcp
-  #           runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
-  #           timeout: 40
-  #         - test-name: L2_HF_PEFT
-  #           test-folder: hf_peft
-  #           runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
-  #           timeout: 30
-  #         - test-name: L2_HF_Transformer
-  #           test-folder: hf_transformer
-  #           runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
-  #           timeout: 20
-  #         - test-name: L2_HF_Transformer_Finetune
-  #           test-folder: hf_transformer_finetune
-  #           runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
-  #           timeout: 40
-  #         - test-name: L2_HF_Transformer_LLM
-  #           test-folder: hf_transformer_llm
-  #           runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
-  #           timeout: 40
-  #         - test-name: L2_HF_Transformer_VLM
-  #           test-folder: hf_transformer_vlm
-  #           runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
-  #           timeout: 60
-  #         - test-name: L2_Datasets
-  #           test-folder: data
-  #           runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
-  #           timeout: 20
-  #   needs: [cicd-unit-tests, pre-flight]
-  #   runs-on: ${{ matrix.runner }}
-  #   name: ${{ matrix.test-name }}
-  #   environment: nemo-ci
-  #   if: |
-  #     (
-  #       success()
-  #       || needs.pre-flight.outputs.is_ci_workload == 'true'
-  #       || needs.pre-flight.outputs.force_run_all == 'true'
-  #     )
-  #     && !cancelled()
-  #   steps:
-  #     - name: Checkout
-  #       uses: actions/checkout@v4
-  #     - name: main
-  #       uses: ./.github/actions/test-template
-  #       with:
-  #         test-folder: ${{ matrix.test-folder }}
-  #         timeout: ${{ matrix.timeout }}
-  #         is_unit_test: "false"
-  #         has-azure-credentials: "true"
-  #         azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-  #         azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-  #         azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-  #         PAT: ${{ secrets.PAT }}
-  #         test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+  cicd-e2e-tests:
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        include:
+          - test-name: L2_Pretrain_and_KD
+            test-folder: llm_pretrain_and_kd
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            timeout: 20
+          - test-name: L2_HF_DCP
+            test-folder: hf_dcp
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            timeout: 40
+          - test-name: L2_HF_PEFT
+            test-folder: hf_peft
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            timeout: 30
+          - test-name: L2_HF_Transformer
+            test-folder: hf_transformer
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            timeout: 20
+          - test-name: L2_HF_Transformer_Finetune
+            test-folder: hf_transformer_finetune
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            timeout: 40
+          - test-name: L2_HF_Transformer_LLM
+            test-folder: hf_transformer_llm
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            timeout: 40
+          - test-name: L2_HF_Transformer_VLM
+            test-folder: hf_transformer_vlm
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            timeout: 60
+          - test-name: L2_Datasets
+            test-folder: data
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            timeout: 20
+    needs: [pre-flight]
+    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.test-name }}
+    environment: nemo-ci
+    if: |
+      (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && !cancelled()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: main
+        uses: ./.github/actions/test-template
+        with:
+          test-folder: ${{ matrix.test-folder }}
+          timeout: ${{ matrix.timeout }}
+          is_unit_test: "false"
+          has-azure-credentials: "true"
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          PAT: ${{ secrets.PAT }}
+          test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
 
   Nemo_CICD_Test:
     needs:
       - pre-flight
       - cicd-unit-tests
-      # - cicd-e2e-tests
+      - cicd-e2e-tests
     if: |
       (
         needs.pre-flight.outputs.docs_only == 'true'
