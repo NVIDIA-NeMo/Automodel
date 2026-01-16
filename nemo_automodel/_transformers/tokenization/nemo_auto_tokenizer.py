@@ -95,6 +95,7 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
         finally:
             self.__class__ = original_cls
 
+
 def _add_token(tokenized, value, position, key):
     def _extend_single(sequence, val, pos, always_add):
         if pos == 0:
