@@ -1,0 +1,70 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Codestyle Check
+
+on:
+  pull_request:
+    branches: ["main", "r*"]
+
+jobs:
+  check-codestyle:
+    name: Run codestyle check
+    if: ${{ github.repository_owner == 'NVIDIA-NeMo' }}
+    runs-on: ubuntu-latest
+    env:
+      PR_ID: ${{ github.event.pull_request.number }}
+
+    steps:
+      - name: Checkout base repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 200
+
+      - name: Merge PR to test branch
+        run: |
+          git fetch origin pull/${PR_ID}/merge
+          git checkout -b test FETCH_HEAD
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Setup cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/prek
+          key: prek-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Install prek
+        run: |
+          uv tool install prek
+
+      - name: Run prek
+        run: |
+          set +e
+          prek run --all-files --show-diff-on-failure --color=always
+          EXIT_CODE=$?
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "::error::Codestyle check failed. Run 'uv tool install prek && prek run --all-files' locally to fix issues."
+            
+            echo "::group::Prek verbose logs"
+            cat ~/.cache/prek/prek.log || echo "No prek log file found"
+            echo "::endgroup::"
+            
+            exit $EXIT_CODE
+          fi
