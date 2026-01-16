@@ -92,7 +92,10 @@ def apply_torch_patches() -> None:
                 # 1. Build the layout manually to bypass the legacy 'stride < pre_stride' check
                 slice_from_root = device_mesh == self.get_root_mesh(device_mesh)
                 flatten_name_to_root_layout = (
-                    {key: mesh._layout for key, mesh in self.root_to_flatten_mapping.setdefault(device_mesh, {}).items()}
+                    {
+                        key: mesh._layout
+                        for key, mesh in self.root_to_flatten_mapping.setdefault(device_mesh, {}).items()
+                    }
                     if slice_from_root
                     else {}
                 )
@@ -142,4 +145,3 @@ def apply_torch_patches() -> None:
         _logger.debug(f"Could not apply DeviceMesh patch: {e}")
 
     _TORCH_PATCHES_APPLIED = True
-
