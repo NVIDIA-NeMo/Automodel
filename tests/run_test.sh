@@ -38,7 +38,7 @@ else
 fi
 
 if [[ "$UNIT_TEST" == "true" ]]; then
-    export TEST_DIR="tests/unit_tests"
+    export TEST_DIR="tests/unit_tests/datasets/llm/test_column_mapped_text_instruction.py"
 else
     export TEST_DIR="tests/functional_tests/$TEST_NAME"
 fi

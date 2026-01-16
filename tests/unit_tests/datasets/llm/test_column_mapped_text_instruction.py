@@ -26,6 +26,15 @@ from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_datas
 )
 
 
+@pytest.fixture(autouse=True)
+def override_hf_home(tmp_path: Path, monkeypatch):
+    """Override the HF_DATASETS_CACHE variable to point to a temporary directory."""
+    from datasets import config as datasets_config
+    hf_cache = tmp_path / "hf_datasets_cache"
+    hf_cache.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(datasets_config, "HF_DATASETS_CACHE", str(hf_cache))
+
+
 def test_make_iterable_basic():
     # single string -> iterator with one element
     assert list(make_iterable("hello")) == ["hello"]
