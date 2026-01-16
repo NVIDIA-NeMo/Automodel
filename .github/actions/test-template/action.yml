@@ -77,17 +77,17 @@ runs:
       with:
         path: NeMo-Automodel
 
-    - name: Build container
-      shell: bash
-      env:
-        GH_TOKEN: ${{ inputs.PAT }}
-      run: |
-        echo "::group::Build test container"
-        docker system prune -af
-        docker build -f docker/Dockerfile \
-          --build-arg BASE_IMAGE=pytorch \
-          --target automodel_final -t automodel .
-        echo "::endgroup::"
+    # - name: Build container
+    #   shell: bash
+    #   env:
+    #     GH_TOKEN: ${{ inputs.PAT }}
+    #   run: |
+    #     echo "::group::Build test container"
+    #     docker system prune -af
+    #     docker build -f docker/Dockerfile \
+    #       --build-arg BASE_IMAGE=pytorch \
+    #       --target automodel_final -t automodel .
+    #     echo "::endgroup::"
 
     - name: Start container
       shell: bash
