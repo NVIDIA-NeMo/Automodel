@@ -242,9 +242,7 @@ class CombinedProjectionStateDictAdapter:
                 gate_up_actual_size = gate_up_weight.shape[0]
                 local_intermediate_size = gate_up_actual_size // 2
 
-                gate_weight, up_weight = gate_up_weight.split(
-                    [local_intermediate_size, local_intermediate_size], dim=0
-                )
+                gate_weight, up_weight = gate_up_weight.split([local_intermediate_size, local_intermediate_size], dim=0)
 
                 hf_state_dict[f"{prefix}.mlp.gate_proj.weight"] = gate_weight
                 hf_state_dict[f"{prefix}.mlp.up_proj.weight"] = up_weight
@@ -257,9 +255,7 @@ class CombinedProjectionStateDictAdapter:
                     gate_up_bias_size = gate_up_bias.shape[0]
                     local_intermediate_size = gate_up_bias_size // 2
 
-                    gate_bias, up_bias = gate_up_bias.split(
-                        [local_intermediate_size, local_intermediate_size], dim=0
-                    )
+                    gate_bias, up_bias = gate_up_bias.split([local_intermediate_size, local_intermediate_size], dim=0)
 
                     hf_state_dict[f"{prefix}.mlp.gate_proj.bias"] = gate_bias
                     hf_state_dict[f"{prefix}.mlp.up_proj.bias"] = up_bias
