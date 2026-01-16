@@ -13,7 +13,7 @@
 # limitations under the License.
 
 ARG CUDA_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
-ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:25.09-py3
+ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:25.11-py3
 ARG BASE_IMAGE=cuda
 
 FROM ${CUDA_IMAGE} AS cuda
@@ -52,7 +52,7 @@ RUN if [ -f /usr/local/bin/torchrun ]; then \
 
 # Install TE
 ARG INSTALL_TE=False
-ARG TE_COMMIT=release_v2.8
+ARG TE_COMMIT=release_v2.11
 RUN if [ "$INSTALL_TE" = "True" ]; then \
     git clone https://github.com/NVIDIA/TransformerEngine.git && \
     cd TransformerEngine && \
@@ -67,7 +67,7 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
 FROM update_base_container AS automodel_dep
 
 # Install Grouped Gemm
-RUN pip install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
+RUN pip install --no-build-isolation git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
 
 # Install Liger Kernel
 RUN pip install git+https://github.com/linkedin/Liger-Kernel.git@49e63538e64b00780e424e34bc4f193dcfeba75c
@@ -110,7 +110,7 @@ RUN if [ $INSTALL_BITSANDBYTES = "True" ]; then \
 # Install Deepep
 COPY docker/common/deepep.patch /opt/deepep.patch
 ARG INSTALL_DEEPEP=False
-ARG DEEPEP_COMMIT=ef73fd9a4c098e09929e48dfd696505ddc8e2043
+ARG DEEPEP_COMMIT=1dddd194c26911c35b4f53a148617dd73de0ffc9
 RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     git clone https://github.com/deepseek-ai/DeepEP.git && \
     cd DeepEP && \
@@ -118,7 +118,7 @@ RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     git fetch origin $DEEPEP_COMMIT && \
     git checkout FETCH_HEAD && \
     patch -p1 < /opt/deepep.patch && \
-    pip install --no-cache-dir nvidia-nvshmem-cu13 && \
+    pip install --no-cache-dir nvidia-nvshmem-cu13==3.4.5 && \
     TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install --no-cache-dir --no-build-isolation -v . && \
     rm -rf /opt/deepep.patch && \
     rm -rf DeepEP; \

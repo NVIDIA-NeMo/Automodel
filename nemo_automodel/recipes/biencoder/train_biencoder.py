@@ -728,10 +728,12 @@ class TrainBiencoderRecipe(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        if wandb.run is not None:
-            wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+        # Log to remote services (WandB) according to step_scheduler frequency
+        if self.step_scheduler.is_remote_logging_step:
+            if wandb.run is not None:
+                wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
 
-        # JSONL training log
+        # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
 
         logging.info(
@@ -757,6 +759,7 @@ class TrainBiencoderRecipe(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
+        # Always log validation to remote services (validation is already infrequent via val_every_steps)
         if wandb.run is not None:
             wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
 

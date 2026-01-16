@@ -288,6 +288,8 @@ def make_cp_batch_for_te(
         "max_seqlen": torch.stack([chunk["max_seqlen"] for chunk in chunks]),
         "qkv_format": qkv_format,
         "padding_mask": torch.stack([chunk["padding_mask"] for chunk in chunks]),
+        "cp_size": cp_mesh.size() if cp_mesh is not None else 1,
+        "cp_rank": torch.distributed.get_rank(group=cp_mesh.get_group()) if cp_mesh is not None else 0,
     }
 
 
@@ -329,5 +331,7 @@ def _shard_thd_chunk_for_te(
         "max_seqlen": torch.tensor(max_seqlen).to(torch.int32).to(device=cu_seqlens_padded.device),
         "qkv_format": qkv_format,
         "padding_mask": (batch["input_ids"] == padding_token_id).bool().contiguous(),
+        "cp_size": cp_size,
+        "cp_rank": cp_rank,
     }
     return output_batch

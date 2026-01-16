@@ -59,6 +59,7 @@ class ExpertParallel(ParallelStyle):
 
         for name, param in module.named_parameters(recurse=False):
             dist_param = nn.Parameter(distribute_tensor(param, device_mesh, [Shard(0)]))
+            dist_param.requires_grad = param.requires_grad
             module.register_parameter(name, dist_param)
 
         if isinstance(module, GroupedExpertsDeepEP):
@@ -138,7 +139,10 @@ def apply_fsdp(
 
     if mp_policy is None:
         mp_policy = MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16, reduce_dtype=torch.float32, output_dtype=torch.bfloat16
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.bfloat16,
+            cast_forward_inputs=True,
         )
 
     fully_shard_default = functools.partial(

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020-2025, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,15 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from tests.utils.test_utils import run_test_script
+#!/bin/bash
+set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
+export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
+export CUDA_VISIBLE_DEVICES="0,1"
 
-TEST_FOLDER = "llm_kd"
-KD_SCRIPT = "L2_KD_Transformer_SFT.sh"
-
-
-class TestKDRecipe:
-    def test_kd_recipe_runs(self):
-        run_test_script(TEST_FOLDER, KD_SCRIPT)
-
-
+TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run \
+--nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
+examples/llm_pretrain/pretrain.py \
+--config tests/functional_tests/llm_pretrain_and_kd/moonlight_16b_te_2l.yaml

@@ -36,6 +36,7 @@ from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
 from transformers.utils.hub import TRANSFORMERS_CACHE
 from wandb import Settings
 
+from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
@@ -76,6 +77,7 @@ from nemo_automodel.components.utils.compile_utils import (
 )
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
+    _supports_seq_lens,
     init_empty_weights,
     print_trainable_parameters,
     resolve_trust_remote_code,
@@ -175,7 +177,11 @@ def build_model_and_optimizer(
     init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
     with ScopedRNG(seed=seed, ranked=True):
         kwargs = {"tp_size": tp_size, "cp_size": cp_size, "has_packed_sequence": has_packed_sequence}
-
+        if not cfg_model.get("_target_", None) in (
+            NeMoAutoModelForCausalLM.from_config,
+            NeMoAutoModelForCausalLM.from_pretrained,
+        ):
+            kwargs = {}
         if cfg_quantization is not None:
             logger.info("Model weight quantization enabled with BitsAndBytes")
             from nemo_automodel.components.quantization.qlora import create_bnb_config
@@ -463,8 +469,8 @@ def build_dataloader(
     dp_rank,
     dp_world_size,
     pp_enabled,
-    supports_seq_lens=True,
     cp_size=1,
+    model: Optional[nn.Module] = None,
 ) -> tuple[DataLoader, PreTrainedTokenizerBase]:
     """Build a DataLoader for the dataset.
 
@@ -481,7 +487,9 @@ def build_dataloader(
         dp_rank: Data parallel rank.
         dp_world_size: Data parallel world size.
         pp_enabled: Whether pipeline parallelism is enabled.
-        supports_seq_lens: Whether the model supports seq_lens (Default: True).
+        cp_size: Context parallel size.
+        model: Optional model instance. If provided and packed sequences are enabled,
+            seq_lens will only be included if the model's forward() accepts it.
     Returns:
         The instantiated DataLoader and tokenizer.
     """
@@ -515,16 +523,21 @@ def build_dataloader(
                 logging.warning(f"IterableDataset sharding skipped due to error: {e}")
 
         packed_sequence_size = getattr(cfg_ps, "packed_sequence_size", 0)
+
         # check if packed sequence is supported
+        supports_seq_lens = _supports_seq_lens(model)
         if packed_sequence_size > 0 and not supports_seq_lens:
             logging.warning("Packed sequence is not supported without seq_lens; disabling packed sequence")
             packed_sequence_size = 0
 
         # Apply packing if configured
+        # Apply packing if configured
         if packed_sequence_size > 0:
             logger.info(f"Packing dataset with size: {packed_sequence_size}")
             if hasattr(ds, "shuffle"):
                 ds = ds.shuffle(seed)
+            # Determine whether to include seq_lens/seq_lens_padded in packed samples.
+            # Priority: explicit config > model.forward signature detection > default False
             ds = pack_dataset(
                 ds,
                 split=cfg_ds.split,  # Assumes split is defined in dataset config
@@ -804,7 +817,7 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
     return loss_fn(**loss_fn_kwargs)
 
 
-def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled):
+def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: Optional[nn.Module] = None):
     def _prepare_val_ds_name(val_ds_name):
         val_ds_name = val_ds_name.replace("validation_dataset", "")
         if len(val_ds_name) > 1 and val_ds_name[0] in ("_", "-", "."):
@@ -833,8 +846,8 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled):
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             pp_enabled=False,
-            supports_seq_lens=True,
             cp_size=cfg.get("distributed.cp_size", 1),
+            model=model,
         )[0]
 
     return val_dataloaders
@@ -1061,14 +1074,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             dp_rank=self._get_dp_rank(),
             dp_world_size=self._get_dp_group_size(),
             pp_enabled=self.pp_enabled,
-            supports_seq_lens=True,
             cp_size=self.cfg.get("distributed.cp_size", 1),
+            model=self.model_parts[0],
         )
         self.val_dataloaders = build_validation_dataloader(
             self.cfg,
             self._get_dp_group_size(),
             self._get_dp_rank(),
             self.pp_enabled,
+            model=self.model_parts[0],
         )
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         # Scheduler
@@ -1505,13 +1519,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        if wandb.run is not None:
-            wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+        # Log to remote services (WandB, MLflow) according to step_scheduler frequency
+        if self.step_scheduler.is_remote_logging_step:
+            if wandb.run is not None:
+                wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+            if self.mlflow_logger is not None:
+                self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
-        if self.mlflow_logger is not None:
-            self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
-
-        # JSONL training log
+        # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
         logging.info(
             "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
