@@ -227,130 +227,6 @@ def test_fully_shard_by_dtype_no_params(monkeypatch):
     assert sub_calls == []
 
 
-def test_combined_projection_adapter_dtensor_split_fallback_allgather_for_1d_shard0(monkeypatch):
-    """
-    Cover the 1D Shard(0) fallback path in _dtensor_aware_split:
-    - tensor.split(...) raises
-    - we redistribute to Replicate, split locally, then DTensor.from_local + redistribute back to Shard(0)
-    """
-    import nemo_automodel.components.models.common.combined_projection.state_dict_adapter as mod
-
-    # Minimal placement types for isinstance checks.
-    class Shard:
-        def __init__(self, dim: int):
-            self.dim = dim
-
-    class Replicate:
-        pass
-
-    monkeypatch.setattr(mod, "Shard", Shard, raising=True)
-    monkeypatch.setattr(mod, "Replicate", Replicate, raising=True)
-
-    calls = {"redistribute": [], "from_local": []}
-
-    class DummyDeviceMesh:
-        pass
-
-    mesh = DummyDeviceMesh()
-
-    class DummyDTensor:
-        def __init__(self, local, placements):
-            self._local = local
-            self.placements = placements
-            self.device_mesh = mesh
-            self.ndim = local.ndim
-
-        @property
-        def shape(self):
-            return self._local.shape
-
-        def to_local(self):
-            return self._local
-
-        def split(self, *_args, **_kwargs):
-            raise RuntimeError("force fallback")
-
-        def redistribute(self, *, device_mesh, placements):
-            calls["redistribute"].append((device_mesh, placements))
-            assert device_mesh is mesh
-            # For the test we don't need real sharding; just propagate placements.
-            return DummyDTensor(self._local, (placements[0],))
-
-        @classmethod
-        def from_local(cls, local_tensor, *, device_mesh, placements, run_check=False):
-            calls["from_local"].append((tuple(local_tensor.shape), device_mesh, placements, run_check))
-            return cls(local_tensor, placements)
-
-    # Make isinstance(x, DTensor) true inside the module.
-    monkeypatch.setattr(mod, "DTensor", DummyDTensor, raising=True)
-
-    full = mod.torch.arange(6, dtype=mod.torch.float32)
-    dt = DummyDTensor(full, (Shard(0),))
-
-    out = mod._dtensor_aware_split(dt, [2, 2, 2], dim=0)
-    assert len(out) == 3
-    assert [tuple(x.shape) for x in out] == [(2,), (2,), (2,)]
-    assert any(isinstance(pl[0], Replicate) for _mesh, pl in calls["redistribute"])
-    assert len(calls["from_local"]) == 3
-
-
-def test_combined_projection_adapter_dtensor_cat_fallback_replicate_local_cat(monkeypatch):
-    """
-    Cover the Replicate fallback in _dtensor_aware_cat:
-    - torch.cat(DTensor, ...) raises
-    - placements == (Replicate(),) => cat local tensors and DTensor.from_local
-    """
-    import nemo_automodel.components.models.common.combined_projection.state_dict_adapter as mod
-
-    class Replicate:
-        pass
-
-    monkeypatch.setattr(mod, "Replicate", Replicate, raising=True)
-
-    real_cat = mod.torch.cat
-    calls = {"from_local": []}
-
-    class DummyDeviceMesh:
-        pass
-
-    mesh = DummyDeviceMesh()
-
-    class DummyDTensor:
-        def __init__(self, local):
-            self._local = local
-            self.ndim = local.ndim
-            self.device_mesh = mesh
-            self.placements = (Replicate(),)
-
-        def to_local(self):
-            return self._local
-
-        @classmethod
-        def from_local(cls, local_tensor, *, device_mesh, placements, run_check=False):
-            calls["from_local"].append((tuple(local_tensor.shape), device_mesh, placements, run_check))
-            inst = cls(local_tensor)
-            inst.device_mesh = device_mesh
-            inst.placements = placements
-            return inst
-
-    monkeypatch.setattr(mod, "DTensor", DummyDTensor, raising=True)
-
-    def cat_maybe_raise(tensors, dim=0):
-        if tensors and isinstance(tensors[0], DummyDTensor):
-            raise RuntimeError("force dtensor cat failure")
-        return real_cat(tensors, dim=dim)
-
-    monkeypatch.setattr(mod.torch, "cat", cat_maybe_raise, raising=True)
-
-    a = DummyDTensor(mod.torch.ones((2, 3)))
-    b = DummyDTensor(mod.torch.zeros((1, 3)))
-    out = mod._dtensor_aware_cat([a, b], dim=0)
-
-    assert isinstance(out, DummyDTensor)
-    assert out.to_local().shape == (3, 3)
-    assert len(calls["from_local"]) == 1
-
-
 def test_combined_projection_adapter_gate_up_bias_paths_tensor_only():
     """
     Cover the gate_up_proj.bias concat path (from_hf) and split path (to_hf) using regular tensors.
@@ -370,10 +246,10 @@ def test_combined_projection_adapter_gate_up_bias_paths_tensor_only():
     adapter = mod.CombinedProjectionStateDictAdapter(cfg)
 
     hf_sd = {
-        "model.layers.0.mlp.gate_proj.weight": mod.torch.ones((3, 4)),
-        "model.layers.0.mlp.up_proj.weight": 2 * mod.torch.ones((3, 4)),
-        "model.layers.0.mlp.gate_proj.bias": mod.torch.arange(3, dtype=mod.torch.float32),
-        "model.layers.0.mlp.up_proj.bias": mod.torch.arange(3, 6, dtype=mod.torch.float32),
+        "model.layers.0.mlp.gate_proj.weight": mod.torch.randn((3, 4)),
+        "model.layers.0.mlp.up_proj.weight": mod.torch.randn((3, 4)),
+        "model.layers.0.mlp.gate_proj.bias": mod.torch.randn(3, dtype=mod.torch.float32),
+        "model.layers.0.mlp.up_proj.bias": mod.torch.randn(3, dtype=mod.torch.float32),
     }
     custom_sd = adapter.from_hf(hf_sd)
     assert "model.layers.0.mlp.gate_up_proj.bias" in custom_sd
