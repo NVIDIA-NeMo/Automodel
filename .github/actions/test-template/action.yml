@@ -99,31 +99,36 @@ runs:
           ARG=("--runtime=nvidia --gpus all")
         fi
 
-        cmd=$(cat <<RUN_TEST_EOF
-        #!/bin/bash
-        docker container rm -f nemo_container_${{ github.run_id }} || true
-        docker run \
-          --rm \
-          -d \
-          --name nemo_container_${{ github.run_id }} ${ARG[@]} \
-          --shm-size=64g \
-          --env TRANSFORMERS_OFFLINE=0 \
-          --env HYDRA_FULL_ERROR=1 \
-          --env HF_CACHE=/home/TestData/lite/hf_cache \
-          --env HF_HOME=/home/TestData/HF_HOME \
-          --env HF_HUB_OFFLINE=1 \
-          --env RUN_ID=${{ github.run_id }} \
-          --env TEST_DATA_DIR=/home/TestData/automodel \
-          --volume $(pwd)/NeMo-Automodel:/workspace \
-          --workdir /workspace \
-          --volume ${{ inputs.test-data-path }}:/home/TestData \
-          automodel \
-          bash -c "sleep $(( ${{ inputs.timeout }} * 60 + 60 ))"
-        RUN_TEST_EOF
-        )
+        TEST_DATA=${{ inputs.test-data-path }}
+        ls -alh $TEST_DATA
+        ls -alh $TEST_DATA/automodel
+        ls -alh $TEST_DATA/lite
+        ls -alh $TEST_DATA/HF_HOME/hub
 
-        echo "$cmd" | tee "retry_job.sh"
-        bash retry_job.sh
+        # cmd=$(cat <<RUN_TEST_EOF
+        # #!/bin/bash
+        # docker container rm -f nemo_container_${{ github.run_id }} || true
+        # docker run \
+        #   --rm \
+        #   -d \
+        #   --name nemo_container_${{ github.run_id }} ${ARG[@]} \
+        #   --shm-size=64g \
+        #   --env HYDRA_FULL_ERROR=1 \
+        #   --env HF_CACHE=/home/TestData/lite/hf_cache \
+        #   --env HF_HOME=/home/TestData/HF_HOME \
+        #   --env HF_HUB_OFFLINE=1 \
+        #   --env RUN_ID=${{ github.run_id }} \
+        #   --env TEST_DATA_DIR=/home/TestData/automodel \
+        #   --volume $(pwd)/NeMo-Automodel:/workspace \
+        #   --workdir /workspace \
+        #   --volume ${{ inputs.test-data-path }}:/home/TestData \
+        #   automodel \
+        #   bash -c "sleep $(( ${{ inputs.timeout }} * 60 + 60 ))"
+        # RUN_TEST_EOF
+        # )
+
+        # echo "$cmd" | tee "retry_job.sh"
+        # bash retry_job.sh
         echo "::endgroup::"
 
     - name: Create run-script
