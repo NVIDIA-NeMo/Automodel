@@ -24,10 +24,10 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from nemo_automodel.components.distributed.init_utils import DistInfo, initialize_distributed
-from nemo_automodel.components.datasets.llm.retrieval_dataset import load_datasets
-from nemo_automodel.components.models.biencoder import NeMoAutoModelBiencoder
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
+from nemo_automodel.components.datasets.llm.retrieval_dataset import load_datasets
+from nemo_automodel.components.distributed.init_utils import DistInfo, initialize_distributed
+from nemo_automodel.components.models.biencoder import NeMoAutoModelBiencoder
 
 logger = logging.getLogger(__name__)
 
@@ -88,10 +88,10 @@ def build_distributed(cfg_dist: Dict[str, Any]) -> DistInfo:
 
 def _load_npz_array(path: Path) -> np.ndarray:
     """Load numpy array from NPZ archive.
-    
+
     Args:
         path: Path to NPZ file.
-        
+
     Returns:
         Loaded numpy array.
     """
@@ -101,15 +101,15 @@ def _load_npz_array(path: Path) -> np.ndarray:
 
 def _compute_rank_partition(total_size: int, world_size: int, rank: int) -> Tuple[int, int]:
     """Compute contiguous partition boundaries for a given rank.
-    
+
     Distributes `total_size` items across `world_size` ranks as evenly as possible,
     with remainder items distributed to lower ranks.
-    
+
     Args:
         total_size: Total number of items to partition.
         world_size: Number of ranks.
         rank: Current rank (0-indexed).
-        
+
     Returns:
         Tuple of (start_idx, end_idx) for this rank's partition.
     """
@@ -122,20 +122,17 @@ def _compute_rank_partition(total_size: int, world_size: int, rank: int) -> Tupl
 
 def _validate_shard_shape(shard_path: Path, expected_size: int, actual_size: int) -> None:
     """Validate that a shard has the expected number of items.
-    
+
     Args:
         shard_path: Path to the shard file (for error reporting).
         expected_size: Expected number of items.
         actual_size: Actual number of items.
-        
+
     Raises:
         ValueError: If sizes don't match.
     """
     if actual_size != expected_size:
-        raise ValueError(
-            f"Shard shape mismatch for {shard_path}: "
-            f"got {actual_size} items, expected {expected_size}"
-        )
+        raise ValueError(f"Shard shape mismatch for {shard_path}: got {actual_size} items, expected {expected_size}")
 
 
 class MineHardNegativesRecipe:
@@ -208,9 +205,9 @@ class MineHardNegativesRecipe:
         self.document_embeddings = None
 
         # Mining results (populated by _mine_hard_negatives)
-        self.mined_neg_indices = None    # List[List[int]] - mined negative indices per query
-        self.mined_neg_scores = None     # List[List[float]] - similarity scores for negatives
-        self.pos_scores = None           # List[List[float]] - similarity scores for positives
+        self.mined_neg_indices = None  # List[List[int]] - mined negative indices per query
+        self.mined_neg_scores = None  # List[List[float]] - similarity scores for negatives
+        self.pos_scores = None  # List[List[float]] - similarity scores for positives
 
     def setup(self):
         """Build all components needed for hard negative mining."""
@@ -308,7 +305,7 @@ class MineHardNegativesRecipe:
 
     def _validate_mining_params(self):
         """Validate required mining parameters.
-        
+
         Raises:
             ValueError: If any required parameter is missing or invalid.
         """
@@ -318,49 +315,42 @@ class MineHardNegativesRecipe:
             raise ValueError("Missing required parameter: --mining.train_file_output_path")
         if self.model_name_or_path is None:
             raise ValueError("Missing required parameter: --mining.model_name_or_path")
-        
+
         # Validate margin type if margin is specified
         if self.hard_neg_margin is not None:
             valid_types = ["perc", "abs"]
             if self.hard_neg_margin_type.lower() not in valid_types:
                 raise ValueError(
-                    f"Invalid hard_neg_margin_type: {self.hard_neg_margin_type}. "
-                    f"Must be one of {valid_types}"
+                    f"Invalid hard_neg_margin_type: {self.hard_neg_margin_type}. Must be one of {valid_types}"
                 )
 
     def _configure_tokenizer(self):
         """Load and configure tokenizer with appropriate settings."""
         logger.info(f"Loading tokenizer from {self.tokenizer_name_or_path}...")
-        
+
         # Build tokenizer kwargs
         tokenizer_kwargs = {}
         if self.add_bos_token is not None:
             tokenizer_kwargs["add_bos_token"] = self.add_bos_token
         if self.add_eos_token is not None:
             tokenizer_kwargs["add_eos_token"] = self.add_eos_token
-        
+
         # Load tokenizer
-        self.tokenizer = NeMoAutoTokenizer.from_pretrained(
-            self.tokenizer_name_or_path, 
-            **tokenizer_kwargs
-        )
-        
+        self.tokenizer = NeMoAutoTokenizer.from_pretrained(self.tokenizer_name_or_path, **tokenizer_kwargs)
+
         # Log tokenizer configuration for transparency
-        actual_bos = getattr(self.tokenizer, 'add_bos_token', None)
-        actual_eos = getattr(self.tokenizer, 'add_eos_token', None)
-        
+        actual_bos = getattr(self.tokenizer, "add_bos_token", None)
+        actual_eos = getattr(self.tokenizer, "add_eos_token", None)
+
         if self.add_bos_token is None and self.add_eos_token is None:
-            logger.info(
-                f"Using Automodel tokenizer defaults: "
-                f"add_bos_token={actual_bos}, add_eos_token={actual_eos}"
-            )
+            logger.info(f"Using Automodel tokenizer defaults: add_bos_token={actual_bos}, add_eos_token={actual_eos}")
         else:
             logger.info(
                 f"Using explicit tokenizer settings: "
                 f"add_bos_token={self.add_bos_token}, add_eos_token={self.add_eos_token} "
                 f"(overriding Automodel defaults)"
             )
-        
+
         # Set pad token if needed
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -368,7 +358,7 @@ class MineHardNegativesRecipe:
 
     def _synchronize_ranks(self):
         """Synchronize all distributed ranks with a barrier.
-        
+
         Handles device-specific barrier calls for CUDA vs CPU.
         """
         if torch.distributed.is_initialized():
@@ -519,10 +509,7 @@ class MineHardNegativesRecipe:
             )
 
             # Convert to list of dicts for padding
-            tokenized_list = [
-                {k: tokenized[k][j] for k in tokenized.keys()}
-                for j in range(len(batch_texts))
-            ]
+            tokenized_list = [{k: tokenized[k][j] for k in tokenized.keys()} for j in range(len(batch_texts))]
 
             # Pad and convert to tensors
             inputs = self.tokenizer.pad(
@@ -612,7 +599,7 @@ class MineHardNegativesRecipe:
             rr_path = shard_dir / f"queries_rank{rr:04d}.npz"
             if not rr_path.exists():
                 raise FileNotFoundError(f"Missing query shard cache: {rr_path}")
-            
+
             rr_emb = _load_npz_array(rr_path)
             rr_start, rr_end = _compute_rank_partition(num_q, ws, rr)
             expected = rr_end - rr_start
@@ -623,22 +610,22 @@ class MineHardNegativesRecipe:
 
     def _load_cached_chunk(self, cache_path: Path) -> Optional[np.ndarray]:
         """Load a fully-assembled chunk cache if it exists.
-        
+
         In distributed mode, only rank0 loads the cache to avoid redundant IO.
-        
+
         Args:
             cache_path: Path to cached chunk file.
-            
+
         Returns:
             Cached embeddings array, or None if cache doesn't exist.
         """
         if cache_path is None or not cache_path.exists():
             return None
-        
+
         # In distributed runs, only rank0 needs the assembled chunk
         if self.dist_env.world_size > 1 and not self.dist_env.is_main:
             return np.empty((0, 0), dtype=np.float32)
-        
+
         return _load_npz_array(cache_path)
 
     def _encode_chunk_distributed(
@@ -647,14 +634,14 @@ class MineHardNegativesRecipe:
         cache_path: Path,
     ) -> np.ndarray:
         """Encode a chunk of documents in distributed mode.
-        
+
         Shards the documents within the chunk across ranks, encodes each shard,
         and assembles on rank0.
-        
+
         Args:
             texts: Document texts to encode.
             cache_path: Path for caching the assembled chunk.
-            
+
         Returns:
             Assembled document embeddings for this chunk (rank0 only).
         """
@@ -664,7 +651,7 @@ class MineHardNegativesRecipe:
 
         # Compute this rank's partition
         local_start, local_end = _compute_rank_partition(num_docs_in_chunk, ws, r)
-        
+
         # Per-rank cache for this chunk
         rank_cache_path = cache_path.parent / f"{cache_path.stem}_rank{r:04d}{cache_path.suffix}"
 
@@ -693,12 +680,12 @@ class MineHardNegativesRecipe:
                 rr_path = cache_path.parent / f"{cache_path.stem}_rank{rr:04d}{cache_path.suffix}"
                 if not rr_path.exists():
                     raise FileNotFoundError(f"Missing rank shard cache for chunk: {rr_path}")
-                
+
                 rr_emb = _load_npz_array(rr_path)
                 expected = rr_end - rr_start
                 _validate_shard_shape(rr_path, expected, rr_emb.shape[0])
                 parts.append(rr_emb)
-            
+
             embeddings = np.concatenate(parts, axis=0)
             # Save assembled chunk for faster reuse next time
             np.savez(cache_path, embeddings)
@@ -713,11 +700,11 @@ class MineHardNegativesRecipe:
         cache_path: Optional[Path],
     ) -> np.ndarray:
         """Encode a chunk of documents locally (single-process).
-        
+
         Args:
             texts: Document texts to encode.
             cache_path: Optional path for caching.
-            
+
         Returns:
             Document embeddings for this chunk.
         """
@@ -950,7 +937,7 @@ class MineHardNegativesRecipe:
             return
 
         # Extract metadata needed for output before unloading
-        if not hasattr(self, '_model_pooling'):
+        if not hasattr(self, "_model_pooling"):
             self._model_pooling = self.model.pooling
             self._model_l2_normalize = self.model.l2_normalize
 
@@ -1079,13 +1066,8 @@ class MineHardNegativesRecipe:
                 pos_set = set(query_pos_indices)
 
                 # Filter out positives from top-k candidates
-                hard_neg_candidates = [
-                    idx for idx in topk_indices[i] if idx not in pos_set
-                ]
-                hard_neg_scores = [
-                    batch_scores[i, idx].item()
-                    for idx in topk_indices[i] if idx not in pos_set
-                ]
+                hard_neg_candidates = [idx for idx in topk_indices[i] if idx not in pos_set]
+                hard_neg_scores = [batch_scores[i, idx].item() for idx in topk_indices[i] if idx not in pos_set]
 
                 # Limit to num_negs
                 neg_indices_all.append(hard_neg_candidates[:num_negs])
@@ -1126,8 +1108,10 @@ class MineHardNegativesRecipe:
             # Model info (loaded directly from path, not from config)
             "model_name_or_path": str(self.model_name_or_path),
             "tokenizer_name_or_path": str(self.tokenizer_name_or_path),
-            "pooling": self._model_pooling if hasattr(self, '_model_pooling') else self.model.pooling,
-            "l2_normalize": self._model_l2_normalize if hasattr(self, '_model_l2_normalize') else self.model.l2_normalize,
+            "pooling": self._model_pooling if hasattr(self, "_model_pooling") else self.model.pooling,
+            "l2_normalize": self._model_l2_normalize
+            if hasattr(self, "_model_l2_normalize")
+            else self.model.l2_normalize,
         }
 
     def _build_negative_docs_by_question_id(self) -> Dict[str, List[Dict[str, Any]]]:
@@ -1147,17 +1131,16 @@ class MineHardNegativesRecipe:
             # Include supplied negatives first (if enabled)
             if self.use_negatives_from_file and self.supplied_neg_doc_indices[i]:
                 for neg_idx in self.supplied_neg_doc_indices[i]:
-                    neg_docs.append({
-                        "id": self.idx_to_doc[neg_idx],
-                        "score": -1  # Score unknown for supplied negatives
-                    })
+                    neg_docs.append(
+                        {
+                            "id": self.idx_to_doc[neg_idx],
+                            "score": -1,  # Score unknown for supplied negatives
+                        }
+                    )
 
             # Add mined negatives with scores
             for neg_idx, score in zip(self.mined_neg_indices[i], self.mined_neg_scores[i]):
-                neg_docs.append({
-                    "id": self.idx_to_doc[neg_idx],
-                    "score": score
-                })
+                neg_docs.append({"id": self.idx_to_doc[neg_idx], "score": score})
 
             negative_docs_by_question_id[question_id] = neg_docs
 
@@ -1171,10 +1154,7 @@ class MineHardNegativesRecipe:
         Returns:
             Dict mapping question_id to list of positive scores.
         """
-        return {
-            question_id: scores
-            for question_id, scores in zip(self.question_ids, self.pos_scores)
-        }
+        return {question_id: scores for question_id, scores in zip(self.question_ids, self.pos_scores)}
 
     def _write_output(self) -> None:
         """Write the output JSON file with mined hard negatives.
@@ -1189,7 +1169,7 @@ class MineHardNegativesRecipe:
         import json
 
         # Load original input file (preserves all top-level keys like corpus)
-        with open(self.train_qa_file_path, 'r') as f:
+        with open(self.train_qa_file_path, "r") as f:
             output = json.load(f)
 
         # Build lookup dictionaries
@@ -1197,12 +1177,10 @@ class MineHardNegativesRecipe:
         pos_scores_by_qid = self._build_positive_scores_by_question_id()
 
         # Add mining metadata
-        output['mining'] = {
-            'args': self._get_mining_args_dict()
-        }
+        output["mining"] = {"args": self._get_mining_args_dict()}
 
         # Clear data and rebuild with enriched rows
-        output['data'] = []
+        output["data"] = []
 
         # Iterate through original dataset and enrich with mining results
         for row in self.questions_dataset:
@@ -1218,10 +1196,10 @@ class MineHardNegativesRecipe:
                     pos_doc["score"] = pos_scores[j]
 
             # Remove legacy score fields if present
-            if 'pos_score' in row:
-                row.pop('pos_score')
-            if 'neg_scores' in row:
-                row.pop('neg_scores')
+            if "pos_score" in row:
+                row.pop("pos_score")
+            if "neg_scores" in row:
+                row.pop("neg_scores")
 
             output["data"].append(row)
 
@@ -1230,7 +1208,7 @@ class MineHardNegativesRecipe:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Write output file with formatting
-        with open(output_path, 'w') as f:
+        with open(output_path, "w") as f:
             json.dump(output, f, indent=4, ensure_ascii=False)
 
         logger.info(f"Output written to {output_path}")
@@ -1265,16 +1243,14 @@ class MineHardNegativesRecipe:
         # Mine hard negatives (only on main process)
         if self.dist_env.is_main:
             logger.info("Mining hard negatives...")
-            self.mined_neg_indices, self.mined_neg_scores, self.pos_scores = (
-                self._mine_hard_negatives(
-                    query_embeddings=self.query_embeddings,
-                    document_embeddings=self.document_embeddings,
-                    pos_doc_indices=self.pos_doc_indices,
-                    batch_size=self.mining_batch_size,
-                    num_negs=self.hard_negatives_to_mine,
-                    hard_neg_margin=self.hard_neg_margin,
-                    hard_neg_margin_type=self.hard_neg_margin_type,
-                )
+            self.mined_neg_indices, self.mined_neg_scores, self.pos_scores = self._mine_hard_negatives(
+                query_embeddings=self.query_embeddings,
+                document_embeddings=self.document_embeddings,
+                pos_doc_indices=self.pos_doc_indices,
+                batch_size=self.mining_batch_size,
+                num_negs=self.hard_negatives_to_mine,
+                hard_neg_margin=self.hard_neg_margin,
+                hard_neg_margin_type=self.hard_neg_margin_type,
             )
 
             # Log mining statistics
@@ -1325,8 +1301,8 @@ class MineHardNegativesRecipe:
         print(f"  model_name_or_path:     {self.model_name_or_path}")
         print(f"  tokenizer_name_or_path: {self.tokenizer_name_or_path}")
         # Use cached metadata if available, otherwise get from model
-        pooling = self._model_pooling if hasattr(self, '_model_pooling') else self.model.pooling
-        l2_normalize = self._model_l2_normalize if hasattr(self, '_model_l2_normalize') else self.model.l2_normalize
+        pooling = self._model_pooling if hasattr(self, "_model_pooling") else self.model.pooling
+        l2_normalize = self._model_l2_normalize if hasattr(self, "_model_l2_normalize") else self.model.l2_normalize
         print(f"  pooling:                {pooling}")
         print(f"  l2_normalize:           {l2_normalize}")
         print("\nData:")
