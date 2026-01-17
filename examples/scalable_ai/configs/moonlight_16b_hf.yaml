@@ -60,7 +60,8 @@ model:
   config:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
-  trust_remote_code: true
+    use_cache: false
+  trust_remote_code: false
 
 checkpoint:
   enabled: false
@@ -74,6 +75,10 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
   seq_len: 2048
   num_samples: 100000
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
+    trust_remote_code: true
 
 dataloader:
   batch_size: null  # Dataset already yields batches

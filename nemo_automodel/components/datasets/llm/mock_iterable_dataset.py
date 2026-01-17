@@ -23,7 +23,7 @@ class MockIterableDataset(IterableDataset):
     creating input_ids, labels, and position_ids for each sample.
     """
 
-    def __init__(self, vocab_size: int, seq_len: int, num_samples: int = 1000000, batch_size: int = 1):
+    def __init__(self, vocab_size: int, seq_len: int, num_samples: int = 1000000, batch_size: int = 1, tokenizer=None):
         """Initialize the mock dataset.
 
         Args:

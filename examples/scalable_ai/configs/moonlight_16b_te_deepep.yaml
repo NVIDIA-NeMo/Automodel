@@ -21,7 +21,7 @@ benchmark:
   peak_tflops: 989  # H100 peak TFLOPs
   nsys_start: -1
   nsys_end: -1
-  nsys_ranks: [0, 1, 2, 3]
+  nsys_ranks: [0]
   num_nodes: 1
 
 step_scheduler:
