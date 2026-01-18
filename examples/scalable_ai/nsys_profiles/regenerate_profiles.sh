@@ -81,7 +81,7 @@ nsys profile --force-overwrite true \
   -c cudaProfilerApi \
   -t cuda,nvtx \
   -o "$OUTPUT_DIR/mla_profile_hf" \
-  python examples/benchmark/profile_layer.py \
+  python examples/scalable_ai/profile_layer.py \
   --model-id moonshotai/Moonlight-16B-A3B \
   --layer mla \
   --use-hf
@@ -91,7 +91,7 @@ nsys profile --force-overwrite true \
   -c cudaProfilerApi \
   -t cuda,nvtx \
   -o "$OUTPUT_DIR/mla_profile_te" \
-  python examples/benchmark/profile_layer.py \
+  python examples/scalable_ai/profile_layer.py \
   --model-id moonshotai/Moonlight-16B-A3B \
   --layer mla \
   --backend-attn te
@@ -101,7 +101,7 @@ nsys profile --force-overwrite true \
   -c cudaProfilerApi \
   -t cuda,nvtx \
   -o "$OUTPUT_DIR/rmsnorm_profile_hf" \
-  python examples/benchmark/profile_layer.py \
+  python examples/scalable_ai/profile_layer.py \
   --model-id moonshotai/Moonlight-16B-A3B \
   --layer rmsnorm \
   --use-hf
@@ -111,7 +111,7 @@ nsys profile --force-overwrite true \
   -c cudaProfilerApi \
   -t cuda,nvtx \
   -o "$OUTPUT_DIR/rmsnorm_profile_te" \
-  python examples/benchmark/profile_layer.py \
+  python examples/scalable_ai/profile_layer.py \
   --model-id moonshotai/Moonlight-16B-A3B \
   --layer rmsnorm \
   --backend-rms-norm te
