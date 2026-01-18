@@ -33,6 +33,7 @@ from torch.distributed.pipelining.schedules import (
 )
 
 from nemo_automodel.components.distributed.pipelining.hf_utils import patch_hf_model_for_pp
+from nemo_automodel.components.utils.model_utils import get_text_module
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,8 @@ def generate_hf_model_fqn_per_model_part(
     include_embeddings: bool = True,
     include_lm_head: bool = True,
     include_rotary_emb: bool = True,
+    include_multimodal_encoders: bool = True,
+    extra_module_fqns: Optional[list[str]] = None,
     fqn_prefix: str = "model.",
 ) -> list[list[str]]:
     """
@@ -91,6 +94,8 @@ def generate_hf_model_fqn_per_model_part(
         num_layers: Total number of transformer layers in the model
         include_embeddings: Whether to include embedding layer in first stage
         include_lm_head: Whether to include lm_head in last stage (for CausalLM models)
+        include_multimodal_encoders: Whether to include common vision/audio encoder modules in stage 0
+        extra_module_fqns: Optional list of extra module FQNs to include in stage 0
 
     Returns:
         List of lists containing module names for each stage
@@ -125,9 +130,28 @@ def generate_hf_model_fqn_per_model_part(
         if stage_idx < extra_layers:
             stage_layer_count += 1
 
-        # First stage: add embeddings if requested
+        # First stage: add embeddings and multimodal encoders if requested
         if stage_idx == 0 and include_embeddings:
             stage_modules.append(f"{fqn_prefix}embed_tokens")
+        if stage_idx == 0:
+            if include_multimodal_encoders:
+                stage_modules.extend(
+                    [
+                        f"{fqn_prefix}vision_tower",
+                        f"{fqn_prefix}visual",
+                        f"{fqn_prefix}image_encoder",
+                        f"{fqn_prefix}vision_encoder",
+                        f"{fqn_prefix}audio_tower",
+                        f"{fqn_prefix}audio_encoder",
+                        f"{fqn_prefix}audio_model",
+                        f"{fqn_prefix}mm_projector",
+                        f"{fqn_prefix}multimodal_projector",
+                        f"{fqn_prefix}vision_projector",
+                        f"{fqn_prefix}audio_projector",
+                    ]
+                )
+            if extra_module_fqns:
+                stage_modules.extend(extra_module_fqns)
 
         # Add transformer layers for this stage
         for _ in range(stage_layer_count):
@@ -247,7 +271,8 @@ def split_model_into_stages(
     pp_size = pp_mesh.size()
     # Detect model structure
     has_model_attr = hasattr(model, "model")
-    has_rotary_emb = hasattr(model.model, "rotary_emb") if has_model_attr else hasattr(model, "rotary_emb")
+    text_model = get_text_module(model.model if has_model_attr else model)
+    has_rotary_emb = hasattr(text_model, "rotary_emb")
     has_lm_head = hasattr(model, "lm_head")
 
     if has_model_attr:
@@ -269,6 +294,34 @@ def split_model_into_stages(
         round_to_pp_multiple=round_to_pp_multiple,
     )
 
+    # Determine module prefix for text layers and where multimodal encoders live
+    base_prefix = "model." if has_model_attr else ""
+    layers_prefix = base_prefix
+    include_multimodal_encoders = True
+    extra_module_fqns = None
+
+    if has_model_attr and hasattr(model.model, "language_model"):
+        layers_prefix = f"{base_prefix}language_model."
+    elif not has_model_attr and hasattr(model, "language_model"):
+        layers_prefix = "language_model."
+
+    # If layers live under a nested language_model, keep multimodal encoders at the base prefix
+    if layers_prefix != base_prefix:
+        include_multimodal_encoders = False
+        extra_module_fqns = [
+            f"{base_prefix}vision_tower",
+            f"{base_prefix}visual",
+            f"{base_prefix}image_encoder",
+            f"{base_prefix}vision_encoder",
+            f"{base_prefix}audio_tower",
+            f"{base_prefix}audio_encoder",
+            f"{base_prefix}audio_model",
+            f"{base_prefix}mm_projector",
+            f"{base_prefix}multimodal_projector",
+            f"{base_prefix}vision_projector",
+            f"{base_prefix}audio_projector",
+        ]
+
     # Auto-generate module split if not provided
     if module_names_per_stage is None:
         module_names_per_stage = generate_hf_model_fqn_per_model_part(
@@ -277,7 +330,9 @@ def split_model_into_stages(
             include_embeddings=True,
             include_lm_head=has_lm_head,
             include_rotary_emb=has_rotary_emb,
-            fqn_prefix="model." if has_model_attr else "",
+            include_multimodal_encoders=include_multimodal_encoders,
+            extra_module_fqns=extra_module_fqns,
+            fqn_prefix=layers_prefix,
         )
 
     def _build_stage_from_modules(

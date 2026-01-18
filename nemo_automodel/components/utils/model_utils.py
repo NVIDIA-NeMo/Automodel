@@ -70,6 +70,18 @@ def _supports_seq_lens(model: nn.Module) -> bool:
         return False
 
 
+def get_text_module(model: nn.Module) -> nn.Module:
+    """Return the nested text/LLM module if present, else the model itself."""
+    if model is None:
+        return model
+    for attr_name in ("language_model", "text_model", "text_decoder"):
+        if hasattr(model, attr_name):
+            nested = getattr(model, attr_name)
+            if nested is not None:
+                return nested
+    return model
+
+
 def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
     """
     Get the number of trainable parameters and the L2 norm of the model.
