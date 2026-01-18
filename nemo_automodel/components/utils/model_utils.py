@@ -26,6 +26,21 @@ import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
+TEXT_MODULE_ATTRS = ("language_model", "text_model", "text_decoder")
+MULTIMODAL_SUFFIXES = (
+    "vision_tower",
+    "visual",
+    "image_encoder",
+    "vision_encoder",
+    "audio_tower",
+    "audio_encoder",
+    "audio_model",
+    "mm_projector",
+    "multimodal_projector",
+    "vision_projector",
+    "audio_projector",
+)
+
 
 def _supports_logits_to_keep(model: nn.Module) -> bool:
     """
@@ -74,7 +89,7 @@ def get_text_module(model: nn.Module) -> nn.Module:
     """Return the nested text/LLM module if present, else the model itself."""
     if model is None:
         return model
-    for attr_name in ("language_model", "text_model", "text_decoder"):
+    for attr_name in TEXT_MODULE_ATTRS:
         if hasattr(model, attr_name):
             nested = getattr(model, attr_name)
             if nested is not None:
