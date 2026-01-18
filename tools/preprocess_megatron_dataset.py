@@ -80,7 +80,9 @@ class Encoder(object):
 
     def initializer(self):
         # Use Encoder class as a container for global data
-        Encoder.tokenizer = AutoTokenizer.from_pretrained(self.args.pretrained_model_name_or_path)
+        Encoder.tokenizer = AutoTokenizer.from_pretrained(
+            self.args.pretrained_model_name_or_path, trust_remote_code=True
+        )
         if self.args.split_sentences:
             if not nltk_available:
                 print("NLTK is not available to split sentences.")
@@ -219,7 +221,7 @@ class Partition(object):
 
         startup_start = time.time()
         encoder = Encoder(self.args)
-        tokenizer = AutoTokenizer.from_pretrained(self.args.pretrained_model_name_or_path)
+        tokenizer = AutoTokenizer.from_pretrained(self.args.pretrained_model_name_or_path, trust_remote_code=True)
         pool = multiprocessing.Pool(self.workers, initializer=encoder.initializer)
 
         # Create iterator over parquet rows
