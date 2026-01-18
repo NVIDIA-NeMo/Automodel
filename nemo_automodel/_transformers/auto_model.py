@@ -447,7 +447,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             # TODO(@akoumpa): restore weights after initialization.
             model_cls = ModelRegistry.model_arch_name_to_cls[architectures[0]]
             with local_torch_dtype(torch_dtype, model_cls.__name__):
-                return model_cls(hf_config)
+                return model_cls(hf_config, *model_args, **kwargs)
 
         # 3. fallback to parent class
         model = None
@@ -599,7 +599,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         architectures = get_architectures(config)
         if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
             with local_torch_dtype(torch_dtype, ModelRegistry.model_arch_name_to_cls[architectures[0]].__name__):
-                return ModelRegistry.model_arch_name_to_cls[architectures[0]](config)
+                return ModelRegistry.model_arch_name_to_cls[architectures[0]](config, *model_args, **kwargs)
 
         # 3. fallback to parent class
         model = None
