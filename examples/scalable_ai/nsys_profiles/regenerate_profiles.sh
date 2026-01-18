@@ -27,7 +27,7 @@ nsys profile --force-overwrite true \
   --trace=cuda,nvtx \
   --cuda-memory-usage=true \
   --output="$OUTPUT_DIR/moonlight_hf_small.nsys-rep" \
-  /nemo-rl/hemild/ray_venvs/nemo_rl.models.policy.dtensor_policy_worker_v2.DTensorPolicyWorkerV2/bin/torchrun \
+  torchrun \
   --nproc-per-node 2 \
   nemo_automodel/recipes/llm/benchmark.py \
   --config examples/scalable_ai/configs/moonlight_16b_hf.yaml \
@@ -44,7 +44,7 @@ nsys profile --force-overwrite true \
   --trace=cuda,nvtx \
   --cuda-memory-usage=true \
   --output="$OUTPUT_DIR/moonlight_te_deepep-false_small.nsys-rep" \
-  /nemo-rl/hemild/ray_venvs/nemo_rl.models.policy.dtensor_policy_worker_v2.DTensorPolicyWorkerV2/bin/torchrun \
+  torchrun \
   --nproc-per-node 2 \
   nemo_automodel/recipes/llm/benchmark.py \
   --config examples/scalable_ai/configs/moonlight_16b_te_deepep.yaml \
@@ -62,7 +62,7 @@ nsys profile --force-overwrite true \
   --trace=cuda,nvtx \
   --cuda-memory-usage=true \
   --output="$OUTPUT_DIR/moonlight_te_deepep_small.nsys-rep" \
-  /nemo-rl/hemild/ray_venvs/nemo_rl.models.policy.dtensor_policy_worker_v2.DTensorPolicyWorkerV2/bin/torchrun \
+  torchrun \
   --nproc-per-node 2 \
   nemo_automodel/recipes/llm/benchmark.py \
   --config examples/scalable_ai/configs/moonlight_16b_te_deepep.yaml \
