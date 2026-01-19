@@ -43,7 +43,6 @@ Usage:
 
 import argparse
 import logging
-import time
 from typing import Literal
 
 import torch
@@ -310,6 +309,8 @@ def run_forward_backward(
     loss.backward()
 
     if use_nvtx:
+        # Synchronize to ensure backward kernels finish before popping range
+        torch.cuda.synchronize()
         torch.cuda.nvtx.range_pop()
 
     return loss
@@ -539,23 +540,31 @@ def main():
         # Recreate input with fresh gradients
         inputs["x"] = torch.randn_like(inputs["x"], requires_grad=True)
 
-        # Time the iteration
-        torch.cuda.synchronize()
-        start_time = time.perf_counter()
+        # Create CUDA events for accurate GPU timing
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
 
         # Mark iteration in NVTX
         if use_nvtx:
             phase = "warmup" if is_warmup else "profile"
             torch.cuda.nvtx.range_push(f"iteration_{i}_{phase}")
 
+        # Record start time
+        start_event.record()
+
         # Run forward/backward
         loss = run_forward_backward(layer, inputs, args.layer, i, use_nvtx=use_nvtx, use_hf=use_hf)
 
-        end_time = time.perf_counter()
-        iter_time = (end_time - start_time) * 1000  # ms
+        # Record end time
+        end_event.record()
 
+        # Pop NVTX range before synchronize
         if use_nvtx:
             torch.cuda.nvtx.range_pop()
+
+        # Synchronize and compute elapsed time
+        torch.cuda.synchronize()
+        iter_time = start_event.elapsed_time(end_event)  # Already in ms
 
         # Store timing (only for profile iterations)
         if not is_warmup:

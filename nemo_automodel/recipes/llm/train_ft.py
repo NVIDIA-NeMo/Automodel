@@ -290,10 +290,16 @@ def build_model_and_optimizer(
                     and "dp_shard_cp" in model_wrapper.device_mesh.mesh_dim_names
                     else ("dp_shard_cp",)
                 ),
-                cp_axis_name="cp",
-                tp_axis_name="tp",
-                ep_axis_name="ep",
-                ep_shard_axis_names=("ep_shard",),
+                cp_axis_name="cp" if "cp" in model_wrapper.device_mesh.mesh_dim_names else None,
+                tp_axis_name="tp" if "tp" in model_wrapper.device_mesh.mesh_dim_names else None,
+                ep_axis_name="ep"
+                if model_wrapper.moe_mesh is not None and "ep" in model_wrapper.moe_mesh.mesh_dim_names
+                else None,
+                ep_shard_axis_names=(
+                    ("ep_shard",)
+                    if model_wrapper.moe_mesh is not None and "ep_shard" in model_wrapper.moe_mesh.mesh_dim_names
+                    else None
+                ),
             )
             load_weights = True
         elif callable(getattr(model_wrapper, "parallelize", None)):
