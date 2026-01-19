@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 
+from nemo_automodel.components.utils.model_utils import get_text_module
+
 if TYPE_CHECKING:
     pass
 
@@ -102,8 +104,9 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
 
         # Rotary embeddings precomputation (shared across layers)
         position_embeddings = None
-        if hasattr(self, "rotary_emb") and self.rotary_emb is not None:
-            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        rotary_emb = get_text_module(self).rotary_emb
+        if rotary_emb is not None:
+            position_embeddings = rotary_emb(hidden_states, position_ids)
 
         if hasattr(self, "layers") and self.layers is not None:
             # Works for dict-like or list-like containers
