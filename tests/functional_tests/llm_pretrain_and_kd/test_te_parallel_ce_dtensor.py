@@ -14,7 +14,7 @@
 
 from tests.utils.test_utils import run_test_script
 
-TEST_FOLDER = "loss/"
+TEST_FOLDER = "llm_pretrain_and_kd/loss/"
 TE_PARALLEL_CE_DTENSOR_TP2_FILENAME = "L2_TEParallelCrossEntropy_DTENSOR_TP2.sh"
 
 
