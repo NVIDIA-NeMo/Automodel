@@ -63,7 +63,7 @@ class MoEConfig:
     norm_topk_prob: bool
     router_bias: bool = False
     expert_bias: bool = False
-    expert_activation: Literal["swiglu", "quick_geglu"] = "swiglu"
+    expert_activation: Literal["swiglu", "quick_geglu", "relu2"] = "swiglu"
     activation_alpha: float = 1.702
     activation_limit: float = 7.0
     softmax_before_topk: bool = False
@@ -122,14 +122,25 @@ class MLP(nn.Module):
         self.apply(init_weights_fn)
 
 
+# =============================================================================
+# Expert Activation Functions - Unified API
+# =============================================================================
+# All activation functions use a unified signature:
+#   forward(x, *, input_proj, down_proj, input_proj_bias=None, down_proj_bias=None)
+#
+# - input_proj: First projection weights (gated activations combine gate+up)
+# - down_proj: Output projection weights
+# =============================================================================
+
+
 @torch.compile
-def swiglu(x, *, gate_and_up_proj, down_proj, gate_up_proj_bias=None, down_proj_bias=None):
-    gate_and_up_out = x @ gate_and_up_proj
-    if gate_up_proj_bias is not None:
-        gate_and_up_out = gate_and_up_out + gate_up_proj_bias
+def _swiglu_forward(x, *, input_proj, down_proj, input_proj_bias=None, down_proj_bias=None):
+    """SwiGLU activation: input_proj contains combined [gate, up] projections."""
+    gate_and_up_out = x @ input_proj
+    if input_proj_bias is not None:
+        gate_and_up_out = gate_and_up_out + input_proj_bias
     gate_out, up_out = torch.chunk(gate_and_up_out, 2, -1)
     inter = F.silu(gate_out) * up_out
-
     inter = inter @ down_proj
     if down_proj_bias is not None:
         inter = inter + down_proj_bias
@@ -137,25 +148,24 @@ def swiglu(x, *, gate_and_up_proj, down_proj, gate_up_proj_bias=None, down_proj_
 
 
 @torch.compile
-def quick_geglu(
+def _quick_geglu_forward(
     x,
     *,
-    gate_and_up_proj,
+    input_proj,
     down_proj,
-    gate_up_proj_bias=None,
+    input_proj_bias=None,
     down_proj_bias=None,
     alpha: float = 1.702,
     limit: float | None = 7.0,
 ):
-    gate_and_up_out = x @ gate_and_up_proj
-    if gate_up_proj_bias is not None:
-        gate_and_up_out = gate_and_up_out + gate_up_proj_bias
+    """Quick GeGLU activation: input_proj contains interleaved [gate, up] projections."""
+    gate_and_up_out = x @ input_proj
+    if input_proj_bias is not None:
+        gate_and_up_out = gate_and_up_out + input_proj_bias
     gate_out, up_out = gate_and_up_out[:, ::2], gate_and_up_out[:, 1::2]
-    # Clamp the input values
     gate_out = gate_out.clamp(min=None, max=limit)
     up_out = up_out.clamp(min=-limit, max=limit)
     out_glu = gate_out * torch.sigmoid(alpha * gate_out)
-    # Note we add an extra bias of 1 to the linear layer
     inter = out_glu * (up_out + 1)
     inter = inter @ down_proj
     if down_proj_bias is not None:
@@ -163,13 +173,81 @@ def quick_geglu(
     return inter
 
 
-def get_expert_activation(config: MoEConfig):
-    if config.expert_activation == "swiglu":
-        return swiglu
-    elif config.expert_activation == "quick_geglu":
-        return partial(quick_geglu, alpha=config.activation_alpha, limit=config.activation_limit)
-    else:
-        raise ValueError(f"Invalid expert activation: {config.expert_activation}")
+@torch.compile
+def _relu2_forward(x, *, input_proj, down_proj, input_proj_bias=None, down_proj_bias=None):
+    """Squared ReLU activation: input_proj is just the up projection."""
+    up_out = x @ input_proj
+    if input_proj_bias is not None:
+        up_out = up_out + input_proj_bias
+    inter = F.relu(up_out) ** 2
+    inter = inter @ down_proj
+    if down_proj_bias is not None:
+        inter = inter + down_proj_bias
+    return inter
+
+
+class ExpertActivation:
+    """Encapsulates expert activation configuration and forward computation.
+
+    This class provides a unified interface for different expert activation types,
+    handling both parameter shape calculation and forward computation.
+
+    Supported activations:
+    - swiglu: SwiGLU with combined gate+up projection
+    - quick_geglu: Quick GeGLU with interleaved gate+up projection
+    - relu2: Squared ReLU with single up projection (no gating)
+    """
+
+    def __init__(self, config: MoEConfig):
+        self.activation_type = config.expert_activation
+        self.config = config
+
+        if self.activation_type == "swiglu":
+            self._forward_fn = _swiglu_forward
+            self._input_proj_dim_multiplier = 2  # gate + up combined
+        elif self.activation_type == "quick_geglu":
+            self._forward_fn = partial(
+                _quick_geglu_forward,
+                alpha=config.activation_alpha,
+                limit=config.activation_limit,
+            )
+            self._input_proj_dim_multiplier = 2  # gate + up interleaved
+        elif self.activation_type == "relu2":
+            self._forward_fn = _relu2_forward
+            self._input_proj_dim_multiplier = 1  # up only
+        else:
+            raise ValueError(f"Invalid expert activation: {self.activation_type}")
+
+    @property
+    def input_proj_dim(self) -> int:
+        """Returns the output dimension for input_proj based on activation type."""
+        return self.config.moe_inter_dim * self._input_proj_dim_multiplier
+
+    @property
+    def is_gated(self) -> bool:
+        """Returns True if activation uses gating (combined gate+up projection)."""
+        return self._input_proj_dim_multiplier > 1
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        input_proj: torch.Tensor,
+        down_proj: torch.Tensor,
+        input_proj_bias: Optional[torch.Tensor] = None,
+        down_proj_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute expert activation with unified signature."""
+        return self._forward_fn(
+            x,
+            input_proj=input_proj,
+            down_proj=down_proj,
+            input_proj_bias=input_proj_bias,
+            down_proj_bias=down_proj_bias,
+        )
+
+    def __call__(self, *args, **kwargs):
+        return self.forward(*args, **kwargs)
 
 
 class GroupedExperts(nn.Module):
@@ -181,8 +259,8 @@ class GroupedExperts(nn.Module):
 
     Attributes:
         n_routed_experts (int): Total number of experts in the model.
-        gate_projs (nn.Parameter): Linear layer for input-to-gate transformation.
-        up_projs (nn.Parameter): Linear layer for input-to-hidden transformation.
+        gate_and_up_projs (nn.Parameter): Combined gate+up projection for gated activations (swiglu, quick_geglu).
+        up_projs (nn.Parameter): Up projection for non-gated activations (relu2).
         down_projs (nn.Parameter): Linear layer for hidden-to-output transformation.
     """
 
@@ -198,23 +276,53 @@ class GroupedExperts(nn.Module):
         self.config = config
         self.n_routed_experts = config.n_routed_experts
         self.expert_bias = config.expert_bias
-        self.gate_and_up_projs = nn.Parameter(
-            torch.empty(config.n_routed_experts, config.dim, config.moe_inter_dim * 2, dtype=config.dtype)
+
+        # Use ExpertActivation class to determine projection dimensions
+        self.expert_activation = ExpertActivation(config)
+
+        # Create first projection with appropriate name based on activation type
+        # - Gated activations (swiglu, quick_geglu): gate_and_up_projs [n_experts, dim, 2*inter_dim]
+        # - Non-gated activations (relu2): up_projs [n_experts, dim, inter_dim]
+        first_proj = nn.Parameter(
+            torch.empty(
+                config.n_routed_experts,
+                config.dim,
+                self.expert_activation.input_proj_dim,
+                dtype=config.dtype,
+            )
         )
+        if self.expert_activation.is_gated:
+            self.gate_and_up_projs = first_proj
+        else:
+            self.up_projs = first_proj
+
         self.down_projs = nn.Parameter(
             torch.empty(config.n_routed_experts, config.moe_inter_dim, config.dim, dtype=config.dtype)
         )
 
         if self.expert_bias:
-            self.gate_up_proj_bias = nn.Parameter(
-                torch.empty(config.n_routed_experts, config.moe_inter_dim * 2, dtype=config.dtype)
+            first_proj_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, self.expert_activation.input_proj_dim, dtype=config.dtype)
             )
-            self.down_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.dim, dtype=config.dtype))
-        else:
-            self.gate_up_proj_bias = None
-            self.down_proj_bias = None
+            if self.expert_activation.is_gated:
+                self.gate_up_proj_bias = first_proj_bias
+            else:
+                self.up_proj_bias = first_proj_bias
+            self.down_proj_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, config.dim, dtype=config.dtype)
+            )
 
-        self.expert_activation = get_expert_activation(config)
+    @property
+    def _first_proj(self) -> nn.Parameter:
+        """Returns the first projection parameter (gate_and_up_projs or up_projs)."""
+        return self.gate_and_up_projs if self.expert_activation.is_gated else self.up_projs
+
+    @property
+    def _first_proj_bias(self) -> Optional[nn.Parameter]:
+        """Returns the first projection bias if expert_bias is enabled."""
+        if not self.expert_bias:
+            return None
+        return self.gate_up_proj_bias if self.expert_activation.is_gated else self.up_proj_bias
 
     def forward(
         self,
@@ -241,8 +349,10 @@ class GroupedExperts(nn.Module):
         """
         assert not isinstance(x, DTensor)
 
-        if isinstance(self.gate_and_up_projs, DTensor):
-            ep_mesh = self.gate_and_up_projs.device_mesh
+        # Get EP mesh from first projection parameter
+        first_proj = self._first_proj
+        if isinstance(first_proj, DTensor):
+            ep_mesh = first_proj.device_mesh
             assert ep_mesh is not None
             assert ep_mesh.ndim == 1, "We only support 1D mesh for MoE"
             ep_size = ep_mesh.size()
@@ -269,6 +379,8 @@ class GroupedExperts(nn.Module):
         experts_end_idx = experts_start_idx + n_local_experts
 
         def get_local_proj(proj, expert_id):
+            if proj is None:
+                return None
             local_proj = proj.to_local() if isinstance(proj, DTensor) else proj
             return local_proj[expert_id - experts_start_idx]
 
@@ -283,21 +395,22 @@ class GroupedExperts(nn.Module):
                 continue
             active_local_experts += 1
 
-            gate_and_up_proj = get_local_proj(self.gate_and_up_projs, i)
+            # Get projections for this expert
+            input_proj = get_local_proj(first_proj, i)
             down_proj = get_local_proj(self.down_projs, i)
-
-            gate_up_proj_bias = get_local_proj(self.gate_up_proj_bias, i) if self.expert_bias else None
+            input_proj_bias = get_local_proj(self._first_proj_bias, i) if self.expert_bias else None
             down_proj_bias = get_local_proj(self.down_proj_bias, i) if self.expert_bias else None
 
             idx_b = idx[:, None].expand(-1, x.size(1))
             x_idx = x.gather(dim=0, index=idx_b)
 
+            # Unified activation call - no conditional branching
             expert_out = (
                 self.expert_activation(
                     x_idx,
-                    gate_and_up_proj=gate_and_up_proj,
+                    input_proj=input_proj,
                     down_proj=down_proj,
-                    gate_up_proj_bias=gate_up_proj_bias,
+                    input_proj_bias=input_proj_bias,
                     down_proj_bias=down_proj_bias,
                 )
                 * weights[idx, top, None]
@@ -308,21 +421,23 @@ class GroupedExperts(nn.Module):
         # Handle the edge case where no tokens are routed to any local experts.
         # This can occur during expert parallelism when all tokens on a particular
         # rank happen to select experts hosted on other ranks. We perform a dummy
-        # computation through the local expert weights to ensure:
+        # computation through the first local expert weights to ensure:
         # 1. Gradient flow through local expert parameters during backpropagation
         # 2. Proper participation in collective operations (reduce-scatter)
         # The computation is a no-op since we multiply by zero (using zeros_like input).
         if active_local_experts == 0:
-            gate_and_up_proj = get_local_proj(self.gate_and_up_projs, experts_start_idx)
+            input_proj = get_local_proj(first_proj, experts_start_idx)
             down_proj = get_local_proj(self.down_projs, experts_start_idx)
-            gate_up_proj_bias = get_local_proj(self.gate_up_proj_bias, experts_start_idx) if self.expert_bias else None
+            input_proj_bias = get_local_proj(self._first_proj_bias, experts_start_idx) if self.expert_bias else None
             down_proj_bias = get_local_proj(self.down_proj_bias, experts_start_idx) if self.expert_bias else None
 
             expert_out = (
                 self.expert_activation(
                     torch.zeros_like(x[0]).unsqueeze(0),
-                    gate_and_up_proj=gate_and_up_proj,
+                    input_proj=input_proj,
                     down_proj=down_proj,
+                    input_proj_bias=input_proj_bias,
+                    down_proj_bias=down_proj_bias,
                 )
                 * weights[0, 0, None]
             )
@@ -356,6 +471,16 @@ def quick_geglu_deepep(
     return (inter * permuted_probs).to(x.dtype)
 
 
+@torch.compile
+def relu2_deepep(x, permuted_probs):
+    """Squared ReLU activation for DeepEP.
+
+    relu2(x) = max(0, x)^2, weighted by routing probabilities.
+    """
+    inter = F.relu(x) ** 2
+    return (inter * permuted_probs).to(x.dtype)
+
+
 def get_expert_activation_for_deepep(config: MoEConfig):
     if config.expert_activation == "swiglu":
         return weighted_bias_swiglu_impl
@@ -366,6 +491,8 @@ def get_expert_activation_for_deepep(config: MoEConfig):
             alpha=config.activation_alpha,
             linear_offset=1.0,
         )
+    elif config.expert_activation == "relu2":
+        return relu2_deepep
     else:
         raise ValueError(f"Invalid expert activation: {config.expert_activation}")
 
@@ -379,8 +506,8 @@ class GroupedExpertsDeepEP(nn.Module):
 
     Attributes:
         n_routed_experts (int): Total number of experts in the model.
-        gate_and_up_projs part1 / gate_projs (nn.Parameter): Linear layer for input-to-gate transformation.
-        gate_and_up_projs part2 / up_projs (nn.Parameter): Linear layer for input-to-hidden transformation.
+        gate_and_up_projs (nn.Parameter): Combined gate+up projection for gated activations (swiglu, quick_geglu).
+        up_projs (nn.Parameter): Up projection for non-gated activations (relu2).
         down_projs (nn.Parameter): Linear layer for hidden-to-output transformation.
     """
 
@@ -427,19 +554,45 @@ class GroupedExpertsDeepEP(nn.Module):
 
         self.config = config
         self.expert_bias = config.expert_bias
-        self.gate_and_up_projs = nn.Parameter(
-            torch.empty(config.n_routed_experts, config.dim, config.moe_inter_dim * 2)
+
+        # Use ExpertActivation to determine input projection dimension
+        self._activation_helper = ExpertActivation(config)
+
+        # Create first projection with appropriate name based on activation type
+        first_proj = nn.Parameter(
+            torch.empty(config.n_routed_experts, config.dim, self._activation_helper.input_proj_dim)
         )
+        if self._activation_helper.is_gated:
+            self.gate_and_up_projs = first_proj
+        else:
+            self.up_projs = first_proj
+
         self.down_projs = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim, config.dim))
 
         if self.expert_bias:
-            self.gate_up_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim * 2))
+            first_proj_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, self._activation_helper.input_proj_dim)
+            )
+            if self._activation_helper.is_gated:
+                self.gate_up_proj_bias = first_proj_bias
+            else:
+                self.up_proj_bias = first_proj_bias
             self.down_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.dim))
-        else:
-            self.gate_up_proj_bias = None
-            self.down_proj_bias = None
 
+        # DeepEP uses its own activation functions that include prob weighting
         self.expert_activation = get_expert_activation_for_deepep(config)
+
+    @property
+    def _first_proj(self) -> nn.Parameter:
+        """Returns the first projection parameter (gate_and_up_projs or up_projs)."""
+        return self.gate_and_up_projs if self._activation_helper.is_gated else self.up_projs
+
+    @property
+    def _first_proj_bias(self) -> Optional[nn.Parameter]:
+        """Returns the first projection bias if expert_bias is enabled."""
+        if not self.expert_bias:
+            return None
+        return self.gate_up_proj_bias if self._activation_helper.is_gated else self.up_proj_bias
 
     def init_token_dispatcher(self, ep_mesh: DeviceMesh):
         self.ep_size = ep_mesh.size()
@@ -506,19 +659,18 @@ class GroupedExpertsDeepEP(nn.Module):
         )
         permuted_probs = permuted_probs.unsqueeze(-1)
 
+        first_proj = self._first_proj
         if torch.count_nonzero(tokens_per_expert) > 0:
             output1 = ops.gmm(
                 permuted_local_hidden_states,
-                self.gate_and_up_projs.to_local(),
+                first_proj.to_local(),
                 tokens_per_expert,
                 trans_b=False,
             )
 
             if self.expert_bias:
-                gate_and_up_bias = self.gate_up_proj_bias.to_local()
-                output1 = self._apply_bias(output1, gate_and_up_bias, tokens_per_expert)
-            else:
-                gate_and_up_bias = None
+                input_bias = self._first_proj_bias.to_local()
+                output1 = self._apply_bias(output1, input_bias, tokens_per_expert)
 
             output1 = self.expert_activation(output1, permuted_probs)
             output2 = ops.gmm(output1, self.down_projs.to_local(), tokens_per_expert, trans_b=False)
@@ -527,7 +679,8 @@ class GroupedExpertsDeepEP(nn.Module):
                 down_bias = self.down_proj_bias.to_local()
                 output2 = self._apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
         else:
-            output1 = torch.matmul(x[0] * 0, self.gate_and_up_projs.to_local()[0])
+            # Handle zero-token case - ensure gradient flow through first local expert
+            output1 = torch.matmul(x[0] * 0, first_proj.to_local()[0])
             output1_ = self.expert_activation(output1, permuted_probs)
             output2 = torch.matmul(output1_, self.down_projs.to_local()[0])
 
@@ -642,7 +795,9 @@ class Gate(nn.Module):
             self.bias = None
 
         if self.bias_update_factor > 0:
-            self.register_buffer("e_score_correction_bias", torch.zeros((self.n_experts), dtype=config.dtype))
+            # Use float32 for e_score_correction_bias to maintain precision
+            # The bias values can be large (~50-60) and bfloat16 loses precision
+            self.register_buffer("e_score_correction_bias", torch.zeros((self.n_experts), dtype=torch.float32))
         else:
             self.e_score_correction_bias = None
 
@@ -1015,10 +1170,11 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
             if module.bias is not None:
                 to_local(module.bias).zero_()
         elif isinstance(module, (GroupedExperts, GroupedExpertsDeepEP)):
-            to_local(module.gate_and_up_projs).normal_(mean=0.0, std=init_std)
+            # Initialize first projection (gate_and_up_projs or up_projs) and down_projs
+            to_local(module._first_proj).normal_(mean=0.0, std=init_std)
             to_local(module.down_projs).normal_(mean=0.0, std=init_std)
             if module.expert_bias:
-                to_local(module.gate_up_proj_bias).zero_()
+                to_local(module._first_proj_bias).zero_()
                 to_local(module.down_proj_bias).zero_()
         elif isinstance(module, MLP):
             to_local(module.gate_proj.weight).normal_(mean=0.0, std=init_std)

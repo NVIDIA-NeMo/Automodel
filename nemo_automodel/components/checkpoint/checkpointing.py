@@ -862,7 +862,13 @@ def _maybe_adapt_state_dict_to_hf(
     """
     adapter = getattr(model_part, "state_dict_adapter", None)
     if adapter:
-        return adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization, **kwargs)
+        # Check if model has Mamba layers that need state preservation
+        # Mamba layers use _extra_state for conv_state and ssm_state
+        has_mamba = any("mamba" in name.lower() for name, _ in model_part.named_modules())
+
+        # Only exclude _extra_state if NO Mamba layers present
+        exclude_regex = None if has_mamba else r".*_extra_state.*"
+        return adapter.to_hf(state_dict, exclude_key_regex=exclude_regex, quantization=quantization, **kwargs)
     return state_dict
 
 

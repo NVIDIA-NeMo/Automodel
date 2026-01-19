@@ -20,15 +20,15 @@ import torch.nn.functional as F
 
 from nemo_automodel.components.moe.layers import (
     MLP,
+    ExpertActivation,
     FakeBalancedGate,
     Gate,
     GroupedExperts,
     GroupedExpertsDeepEP,
     MoE,
     MoEConfig,
-    get_expert_activation,
+    _swiglu_forward,
     get_expert_activation_for_deepep,
-    swiglu,
 )
 from nemo_automodel.components.moe.utils import BackendConfig
 
@@ -87,10 +87,10 @@ class TestActivationFunctions:
         inter_dim = 128
 
         x = torch.randn(batch_size, seq_len, dim, dtype=torch.bfloat16, device=device)
-        gate_and_up_proj = torch.randn(dim, inter_dim * 2, dtype=torch.bfloat16, device=device)
+        input_proj = torch.randn(dim, inter_dim * 2, dtype=torch.bfloat16, device=device)
         down_proj = torch.randn(inter_dim, dim, dtype=torch.bfloat16, device=device)
 
-        result = swiglu(x, gate_and_up_proj=gate_and_up_proj, down_proj=down_proj)
+        result = _swiglu_forward(x, input_proj=input_proj, down_proj=down_proj)
 
         assert result.shape == (batch_size, seq_len, dim)
         assert result.device == device
@@ -101,42 +101,43 @@ class TestActivationFunctions:
         inter_dim = 64
 
         x = torch.randn(batch_size, seq_len, dim, dtype=torch.bfloat16, device=device)
-        gate_and_up_proj = torch.randn(dim, inter_dim * 2, dtype=torch.bfloat16, device=device)
+        input_proj = torch.randn(dim, inter_dim * 2, dtype=torch.bfloat16, device=device)
         down_proj = torch.randn(inter_dim, dim, dtype=torch.bfloat16, device=device)
-        gate_up_proj_bias = torch.randn(inter_dim * 2, dtype=torch.bfloat16, device=device)
+        input_proj_bias = torch.randn(inter_dim * 2, dtype=torch.bfloat16, device=device)
         down_proj_bias = torch.randn(dim, dtype=torch.bfloat16, device=device)
 
-        result = swiglu(
+        result = _swiglu_forward(
             x,
-            gate_and_up_proj=gate_and_up_proj,
+            input_proj=input_proj,
             down_proj=down_proj,
-            gate_up_proj_bias=gate_up_proj_bias,
+            input_proj_bias=input_proj_bias,
             down_proj_bias=down_proj_bias,
         )
 
         assert result.shape == (batch_size, seq_len, dim)
 
-    def test_get_expert_activation_swiglu(self, moe_config):
-        """Test getting swiglu activation function."""
+    def test_expert_activation_swiglu(self, moe_config):
+        """Test ExpertActivation for swiglu."""
         moe_config.expert_activation = "swiglu"
-        activation_fn = get_expert_activation(moe_config)
+        activation = ExpertActivation(moe_config)
 
-        assert activation_fn == swiglu
+        assert activation.is_gated
+        assert activation.input_proj_dim == moe_config.moe_inter_dim * 2
 
-    def test_get_expert_activation_quick_geglu(self, moe_config):
-        """Test getting quick_geglu activation function."""
+    def test_expert_activation_quick_geglu(self, moe_config):
+        """Test ExpertActivation for quick_geglu."""
         moe_config.expert_activation = "quick_geglu"
-        activation_fn = get_expert_activation(moe_config)
+        activation = ExpertActivation(moe_config)
 
-        # Should be a partial function
-        assert callable(activation_fn)
+        assert activation.is_gated
+        assert callable(activation.forward)
 
-    def test_get_expert_activation_invalid(self, moe_config):
+    def test_expert_activation_invalid(self, moe_config):
         """Test error handling for invalid activation."""
         moe_config.expert_activation = "invalid"
 
         with pytest.raises(ValueError, match="Invalid expert activation"):
-            get_expert_activation(moe_config)
+            ExpertActivation(moe_config)
 
     def test_get_expert_activation_for_deepep_swiglu(self, moe_config):
         """Test getting swiglu activation for DeepEP."""

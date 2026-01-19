@@ -38,6 +38,7 @@ class _ModelRegistry:
 
     def __post_init__(self):
         self.naming_override["Qwen3OmniMoeThinkerForConditionalGeneration"] = "Qwen3OmniMoeForConditionalGeneration"
+        self.naming_override["NemotronV3ForCausalLMWrapper"] = "NemotronHForCausalLM"
         for modeling_path in self.modeling_path:
             self._mapping_model_arch_name_to_cls(modeling_path)
 

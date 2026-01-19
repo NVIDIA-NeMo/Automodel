@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import sys
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -23,19 +24,13 @@ from nemo_automodel.components.moe.layers import GroupedExperts, MoEConfig
 activation_called = [False]
 
 
-def tracking_swiglu(x, *, gate_and_up_proj, down_proj, gate_up_proj_bias=None, down_proj_bias=None):
-    """Tracking version of swiglu that sets activation_called[0] = True."""
+def tracking_forward(original_forward, x, *, input_proj, down_proj, input_proj_bias=None, down_proj_bias=None):
+    """Tracking wrapper that sets activation_called[0] = True before calling original."""
     global activation_called
     activation_called[0] = True
-    gate_and_up_out = x @ gate_and_up_proj
-    if gate_up_proj_bias is not None:
-        gate_and_up_out = gate_and_up_out + gate_up_proj_bias
-    gate_out, up_out = torch.chunk(gate_and_up_out, 2, -1)
-    inter = F.silu(gate_out) * up_out
-    inter = inter @ down_proj
-    if down_proj_bias is not None:
-        inter = inter + down_proj_bias
-    return inter
+    return original_forward(
+        x, input_proj=input_proj, down_proj=down_proj, input_proj_bias=input_proj_bias, down_proj_bias=down_proj_bias
+    )
 
 
 def main(device_str: str = "cuda:0") -> int:
@@ -77,7 +72,9 @@ def main(device_str: str = "cuda:0") -> int:
 
     device = torch.device(device_str)
     experts = GroupedExperts(moe_config)
-    experts.expert_activation = tracking_swiglu
+    # Wrap the expert_activation's forward method to track calls
+    original_forward = experts.expert_activation.forward
+    experts.expert_activation.forward = partial(tracking_forward, original_forward)
     experts = experts.to(device)
 
     with torch.no_grad():

@@ -549,6 +549,20 @@ def _mamba_layer_flops(config, gbs, seq_len):
     )
 
 
+def _nemotronh_moe_layer_flops(config, gbs, seq_len):
+    """Model FLOPs for NemotronH MoE layer with relu2 activation (no gate projection)."""
+    hs = config.hidden_size
+    moe_inter_dim = getattr(config, "moe_intermediate_size", config.intermediate_size)
+    moe_router_topk = getattr(config, "num_experts_per_tok", 6)
+
+    # relu2 has no gating, so gated_linear_unit=False
+    # FLOPs = 6 * (up_proj + down_proj) per activated expert
+    total_num_tokens = gbs * seq_len * moe_router_topk
+    linear_fc1 = total_num_tokens * hs * moe_inter_dim  # up_proj only (no gate)
+    linear_fc2 = total_num_tokens * moe_inter_dim * hs  # down_proj
+    return (linear_fc1 + linear_fc2) * 6
+
+
 def _hybrid_model_flops(config, gbs, seq_len):
     """Model FLOPs for hybrid model"""
     if not config.is_hybrid_model:
@@ -558,7 +572,7 @@ def _hybrid_model_flops(config, gbs, seq_len):
     hs = config.hidden_size
     vocab_size = config.vocab_size
 
-    num_attn_layers, num_mamba_layers, num_mlp_layers = 0, 0, 0
+    num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers = 0, 0, 0, 0
     for c in hybrid_override_pattern:
         if c == "M":
             num_mamba_layers += 1
@@ -566,11 +580,14 @@ def _hybrid_model_flops(config, gbs, seq_len):
             num_mlp_layers += 1
         elif c == "*":
             num_attn_layers += 1
+        elif c == "E":
+            num_moe_layers += 1
 
     return (
         num_attn_layers * _non_mla_attn_layer_flops(config, gbs, seq_len)
         + num_mamba_layers * _mamba_layer_flops(config, gbs, seq_len)
         + num_mlp_layers * _nemotronh_mlp_layer_flops(config, gbs, seq_len)
+        + num_moe_layers * _nemotronh_moe_layer_flops(config, gbs, seq_len)
         + 6 * gbs * seq_len * hs * vocab_size
     )
 
