@@ -136,7 +136,7 @@ class _ToyRecipe(BaseRecipe):
     Minimal concrete implementation of BaseRecipe for testing.
     """
 
-    def __init__(self, checkpoint_dir):
+    def __init__(self, checkpoint_dir, cfg_dict=None):
         super().__init__()
 
         from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
@@ -165,7 +165,9 @@ class _ToyRecipe(BaseRecipe):
         self.custom_state = _DummyStateful()
         self.peft_config = None
 
-        self.cfg = ConfigNode({"test": "config"})
+        if cfg_dict is None:
+            cfg_dict = {"test": "config"}
+        self.cfg = ConfigNode(cfg_dict)
 
 
 def test_find_latest_checkpoint(tmp_path):
@@ -309,6 +311,30 @@ def test_load_checkpoint_with_latest_keyword_case_insensitive(tmp_path):
     # Should restore to saved state
     assert torch.allclose(recipe_inst.model.weight, weight_after_step)
 
+
+@pytest.mark.parametrize("model,raises", [("toy/model-a", False), ("toy/model-a2", True)])
+def test_load_checkpoint_with_latest_mismatched_model_signature_fails(tmp_path, model, raises):
+    """
+    If restore_from='LATEST' auto-selects a checkpoint that doesn't match the current model config,
+    fail early with a clear error (user can force by setting restore_from to an explicit path).
+    """
+    # Create a checkpoint with a specific model signature
+    recipe_a = _ToyRecipe(tmp_path, cfg_dict={"model": {"pretrained_model_name_or_path": "toy/model-a"}})
+
+    x = torch.randn(4, 2)
+    loss = recipe_a.model(x).sum()
+    loss.backward()
+    recipe_a.optimizer.step()
+    recipe_a.save_checkpoint(epoch=0, step=100, train_loss=float(loss.item()))
+
+    # Attempt to restore with a different model signature using the 'LATEST' keyword
+    recipe_b = _ToyRecipe(tmp_path, cfg_dict={"model": {"pretrained_model_name_or_path": model}})
+
+    if raises:
+        with pytest.raises(RuntimeError, match="model signature mismatch"):
+            recipe_b.load_checkpoint(restore_from="LATEST")
+    else:
+        recipe_b.load_checkpoint(restore_from="LATEST")
 
 def test_load_checkpoint_with_latest_no_checkpoints_warns(tmp_path):
     """

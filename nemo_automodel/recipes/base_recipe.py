@@ -521,6 +521,28 @@ class BaseRecipe:
 
         self._validate_checkpoint_dir_exists(ckpt_dir, restore_from=restore_from, is_rank_0=is_rank_0)
 
+        # If the user asked for restore_from="LATEST", we auto-select a checkpoint. In that case,
+        # validate that the checkpoint's saved config.yaml matches this run's model config to avoid
+        # accidentally restoring from an unrelated experiment.
+        if restore_from.upper() == "LATEST":
+            ok, reason = _is_checkpoint_model_config_compatible(self.cfg, ckpt_dir)
+            if not ok:
+                msg = (
+                    "Checkpoint appears to be from a different model configuration; refusing to restore from "
+                    "`checkpoint.restore_from: LATEST`.\n"
+                    f"- checkpoint: {ckpt_dir}\n"
+                    f"- reason: {reason}\n"
+                    "If you want to force restore anyway, set `checkpoint.restore_from` to this checkpoint path "
+                    "(instead of 'LATEST')."
+                )
+                if is_rank_0:
+                    logging.error(msg)
+                    print(msg, flush=True)
+
+                # Ensure all ranks fail together.
+                _dist_barrier()
+                raise RuntimeError(msg)
+
         if is_rank_0:
             print(f"Loading checkpoint from {ckpt_dir}", flush=True)
 
@@ -736,3 +758,63 @@ def _find_latest_checkpoint(checkpoint_dir):
         return
 
     return latest
+
+
+def _extract_model_signature(cfg: dict) -> dict:
+    """
+    Extract a stable subset of the model config used to decide checkpoint compatibility.
+    """
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(model_cfg, dict):
+        return {}
+    keys = (
+        # the most common identifier in this repo's configs
+        "pretrained_model_name_or_path",
+        # common HF config-ish fields that indicate architecture
+        "architectures",
+        "model_type",
+        "hidden_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "intermediate_size",
+        "vocab_size",
+        "tie_word_embeddings",
+        "rope_theta",
+        "rope_scaling",
+    )
+    sig = {k: model_cfg.get(k, None) for k in keys}
+    return sig
+
+
+def _is_checkpoint_model_config_compatible(current_cfg: ConfigNode, ckpt_dir: str) -> tuple[bool, str]:
+    """
+    Compare the checkpoint's saved `config.yaml` model signature to the current run's model signature.
+    """
+    config_path = os.path.join(os.fspath(ckpt_dir), "config.yaml")
+    if not os.path.exists(config_path):
+        return True, "checkpoint has no config.yaml (cannot validate)"
+    try:
+        with open(config_path, "r") as f:
+            ckpt_cfg = yaml.safe_load(f) or {}
+    except Exception as e:
+        return True, f"failed to read checkpoint config.yaml (cannot validate): {e}"
+
+    try:
+        if hasattr(current_cfg, "to_dict"):
+            cur_cfg = current_cfg.to_dict()
+        elif hasattr(current_cfg, "raw_config"):
+            cur_cfg = current_cfg.raw_config
+        else:
+            cur_cfg = dict(current_cfg)
+    except Exception:
+        cur_cfg = {}
+
+    ckpt_sig = _extract_model_signature(ckpt_cfg)
+    cur_sig = _extract_model_signature(cur_cfg)
+    if not ckpt_sig or not cur_sig:
+        return True, "could not extract model signature (cannot validate)"
+
+    if ckpt_sig != cur_sig:
+        return False, f"model signature mismatch (checkpoint={ckpt_sig}, current={cur_sig})"
+    return True, "model signature matches"
