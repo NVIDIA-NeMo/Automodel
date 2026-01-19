@@ -253,6 +253,51 @@ def qwen3_omni_collate_fn(
     return batch
 
 
+def kimi_vl_collate_fn(
+    examples: Sequence[Dict[str, Any]],
+    processor,
+) -> Dict[str, torch.Tensor]:
+    """Collate function for KimiVL processors."""
+    conversations = [example["conversation"] for example in examples]
+    texts = [
+        processor.apply_chat_template(conversation, add_generation_prompt=False, tokenize=False)
+        for conversation in conversations
+    ]
+
+    images: List[Any] = []
+    for conversation in conversations:
+        for message in conversation:
+            content = message.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "image":
+                        images.append(item.get("image"))
+
+    processor_kwargs = {
+        "text": texts,
+        "return_tensors": "pt",
+        "padding": True,
+        "truncation": True,
+    }
+    if images:
+        processor_kwargs["images"] = images
+
+    batch = processor(**processor_kwargs)
+
+    labels = build_labels(
+        batch["input_ids"],
+        conversations,
+        processor,
+    )
+    batch["labels"] = labels[:, 1:]
+
+    input_shape = batch["input_ids"].shape
+    for key, value in list(batch.items()):
+        if isinstance(value, torch.Tensor) and value.shape == input_shape:
+            batch[key] = value[:, :-1]
+    return batch
+
+
 def nemotron_parse_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
@@ -379,6 +424,7 @@ def default_collate_fn(
 COLLATE_FNS = {
     "Qwen2_5_VLProcessor": qwen2_5_collate_fn,
     "Qwen3OmniMoeProcessor": qwen3_omni_collate_fn,
+    "KimiVLProcessor": kimi_vl_collate_fn,
     "NemotronParseProcessor": nemotron_parse_collate_fn,
     "default": default_collate_fn,
 }
