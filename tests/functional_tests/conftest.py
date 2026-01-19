@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 # List of CLI overrides forwarded by the functional-test shell scripts.
@@ -85,3 +87,10 @@ def pytest_addoption(parser: pytest.Parser):
         # ``dest`` must be a valid Python identifier, so replace dots.
         dest = opt.replace(".", "_")
         parser.addoption(f"--{opt}", dest=dest, action="store", help=f"(passthrough) {opt}")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def mock_datasets_file_lock():
+    """Prevent the HF datasets library from writing a lock file in the read-only test data directory."""
+    with patch("datasets.builder.FileLock", return_value=MagicMock()):
+        yield
