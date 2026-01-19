@@ -664,3 +664,355 @@ def test_compute_trust_remote_code_falls_back_to_resolve():
 
     assert result is True
     mock_resolve.assert_called_once_with("nvidia/foo")
+
+
+# -----------------
+# PP Validation tests
+# -----------------
+
+
+class MockSchedule:
+    """Mock PP schedule that tracks step/eval calls."""
+
+    def __init__(self):
+        self.step_calls = []
+        self.eval_calls = []
+
+    def step(self, *args, **kwargs):
+        self.step_calls.append((args, kwargs))
+        # Populate losses list if provided
+        if "losses" in kwargs and kwargs["losses"] is not None:
+            kwargs["losses"].append(torch.tensor(0.5))
+
+    def eval(self, *args, **kwargs):
+        self.eval_calls.append((args, kwargs))
+        # Populate losses list if provided
+        if "losses" in kwargs and kwargs["losses"] is not None:
+            kwargs["losses"].append(torch.tensor(0.5))
+
+
+class MockPPInfo:
+    """Mock PP info with configurable first/last stage flags."""
+
+    def __init__(self, has_first_stage=True, has_last_stage=True):
+        self.has_first_stage = has_first_stage
+        self.has_last_stage = has_last_stage
+        self.schedule = MockSchedule()
+
+
+def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
+    """Create a minimal TrainFinetuneRecipeForNextTokenPrediction for PP testing."""
+    cfg = ConfigNode(
+        {
+            "nvtx": False,
+            "model": {},
+            "dataloader": {"collate_fn": "nemo_automodel.components.datasets.utils.default_collater"},
+            "dataset": {},
+            "validation_dataloader": {},
+            "step_scheduler": {"local_batch_size": 1, "global_batch_size": 1},
+            "optimizer": {},
+            "loss_fn": {},
+            "checkpoint": {"best_metric_key": "default"},
+            "distributed": {"cp_size": 1},
+            "autopipeline": {"pp_microbatch_size": 1},
+        }
+    )
+
+    # Minimal stubs so we can create the recipe
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.build_distributed",
+        lambda cfg: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
+    )
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
+
+    # Mock helper functions to avoid needing full config
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_te_dot_product_attention", lambda cfg: False)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_thd_collater", lambda cfg: False)
+
+    # Create the recipe without calling setup
+    recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+
+    # Mock out attributes needed for _forward_backward_step
+    # Use object.__setattr__ to bypass the state tracking
+    object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
+    object.__setattr__(recipe, "device_mesh", None)
+    object.__setattr__(recipe, "pp_enabled", True)
+    object.__setattr__(recipe, "pp", SimpleNamespace(info=pp_info))
+    object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
+
+    return recipe
+
+
+def test_forward_backward_step_pp_uses_eval_for_validation(monkeypatch):
+    """Test that _forward_backward_step uses schedule.eval() when is_train=False with PP."""
+    from contextlib import nullcontext
+
+    pp_info = MockPPInfo(has_first_stage=True, has_last_stage=True)
+    recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
+
+    # Mock make_cp_batch_and_ctx to return a no-op context manager
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
+        lambda device_mesh, batch, **kwargs: (nullcontext, batch),
+    )
+
+    # Create a minimal batch
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "labels": torch.tensor([[1, 2, 3]]),
+    }
+
+    loss_buffer = []
+    recipe._forward_backward_step(
+        idx=0,
+        batch=batch,
+        loss_buffer=loss_buffer,
+        num_label_tokens=None,
+        num_batches=1,
+        is_train=False,  # Validation mode
+    )
+
+    # Should use eval, not step
+    assert len(pp_info.schedule.eval_calls) == 1, "schedule.eval() should be called once for validation"
+    assert len(pp_info.schedule.step_calls) == 0, "schedule.step() should not be called for validation"
+
+
+def test_forward_backward_step_pp_uses_step_for_training(monkeypatch):
+    """Test that _forward_backward_step uses schedule.step() when is_train=True with PP."""
+    from contextlib import nullcontext
+
+    pp_info = MockPPInfo(has_first_stage=True, has_last_stage=True)
+    recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
+
+    # Mock make_cp_batch_and_ctx to return a no-op context manager
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
+        lambda device_mesh, batch, **kwargs: (nullcontext, batch),
+    )
+
+    # Create a minimal batch
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "labels": torch.tensor([[1, 2, 3]]),
+    }
+
+    loss_buffer = []
+    recipe._forward_backward_step(
+        idx=0,
+        batch=batch,
+        loss_buffer=loss_buffer,
+        num_label_tokens=None,
+        num_batches=1,
+        is_train=True,  # Training mode
+    )
+
+    # Should use step, not eval
+    assert len(pp_info.schedule.step_calls) == 1, "schedule.step() should be called once for training"
+    assert len(pp_info.schedule.eval_calls) == 0, "schedule.eval() should not be called for training"
+
+
+def test_forward_backward_step_pp_non_first_stage_uses_eval_for_validation(monkeypatch):
+    """Test schedule.eval() without input_ids when not on first stage."""
+    from contextlib import nullcontext
+
+    pp_info = MockPPInfo(has_first_stage=False, has_last_stage=True)
+    recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
+
+    # Mock make_cp_batch_and_ctx to return a no-op context manager
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
+        lambda device_mesh, batch, **kwargs: (nullcontext, batch),
+    )
+
+    # Create a minimal batch
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "labels": torch.tensor([[1, 2, 3]]),
+    }
+
+    loss_buffer = []
+    recipe._forward_backward_step(
+        idx=0,
+        batch=batch,
+        loss_buffer=loss_buffer,
+        num_label_tokens=None,
+        num_batches=1,
+        is_train=False,  # Validation mode
+    )
+
+    # Should use eval without input_ids as first positional arg
+    assert len(pp_info.schedule.eval_calls) == 1
+    args, kwargs = pp_info.schedule.eval_calls[0]
+    assert len(args) == 0, "Non-first stage should not pass input_ids as positional arg"
+    assert "target" in kwargs
+
+
+def test_forward_backward_step_pp_non_first_stage_uses_step_for_training(monkeypatch):
+    """Test schedule.step() without input_ids when not on first stage."""
+    from contextlib import nullcontext
+
+    pp_info = MockPPInfo(has_first_stage=False, has_last_stage=True)
+    recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
+
+    # Mock make_cp_batch_and_ctx to return a no-op context manager
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
+        lambda device_mesh, batch, **kwargs: (nullcontext, batch),
+    )
+
+    # Create a minimal batch
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "labels": torch.tensor([[1, 2, 3]]),
+    }
+
+    loss_buffer = []
+    recipe._forward_backward_step(
+        idx=0,
+        batch=batch,
+        loss_buffer=loss_buffer,
+        num_label_tokens=None,
+        num_batches=1,
+        is_train=True,  # Training mode
+    )
+
+    # Should use step without input_ids as first positional arg
+    assert len(pp_info.schedule.step_calls) == 1
+    args, kwargs = pp_info.schedule.step_calls[0]
+    assert len(args) == 0, "Non-first stage should not pass input_ids as positional arg"
+    assert "target" in kwargs
+
+
+def test_run_validation_epoch_pp_sends_loss_from_last_stage_to_main(monkeypatch):
+    """Test that _run_validation_epoch sends val_loss from last stage to main rank for PP."""
+    from contextlib import nullcontext
+
+    pp_info = MockPPInfo(has_first_stage=True, has_last_stage=True)
+    recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
+
+    # Track distributed send/recv calls
+    send_calls = []
+    recv_calls = []
+
+    def mock_send(tensor, dst):
+        send_calls.append((tensor.item(), dst))
+
+    def mock_recv(tensor, src):
+        recv_calls.append((tensor, src))
+        # Simulate receiving a value
+        tensor.fill_(0.5)
+
+    monkeypatch.setattr("torch.distributed.send", mock_send)
+    monkeypatch.setattr("torch.distributed.recv", mock_recv)
+
+    # Set up recipe attributes for validation - use object.__setattr__ to bypass state tracking
+    object.__setattr__(recipe, "model_parts", [DummyModel()])
+    object.__setattr__(recipe, "step_scheduler", SimpleNamespace(step=1, epoch=0))
+    object.__setattr__(recipe, "optimizer", [SimpleNamespace(param_groups=[{"lr": 0.01}])])
+
+    # Mock device_mesh.mesh to return rank 0 as last stage
+    mock_mesh = MagicMock()
+    mock_mesh.reshape.return_value.__getitem__ = lambda self, idx: MagicMock(item=lambda: 0)
+    object.__setattr__(recipe, "device_mesh", SimpleNamespace(mesh=mock_mesh))
+
+    # Set dist_env.rank to 0 (last stage and main rank are the same in this test)
+    object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
+
+    # Mock the forward_backward_step to populate loss_buffer
+    def mock_forward_backward_step(idx, batch, *, loss_buffer, num_label_tokens, num_batches, is_train):
+        loss_buffer.append(torch.tensor(0.5))
+
+    monkeypatch.setattr(recipe, "_forward_backward_step", mock_forward_backward_step)
+
+    # Mock _dp_allreduce to return the tensor/value
+    def mock_dp_allreduce(val, include_cp=False):
+        if isinstance(val, torch.Tensor):
+            return val
+        return torch.tensor(val)
+
+    monkeypatch.setattr(recipe, "_dp_allreduce", mock_dp_allreduce)
+
+    # Mock make_cp_batch_and_ctx
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
+        lambda device_mesh, batch, **kwargs: (nullcontext, batch),
+    )
+
+    # Mock ScopedRNG
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.ScopedRNG",
+        lambda **kwargs: MagicMock(__enter__=lambda s: s, __exit__=lambda s, *a: None),
+    )
+
+    # Create a simple dataloader that yields one batch
+    val_dataloader = [{"input_ids": torch.tensor([[1, 2, 3]]), "labels": torch.tensor([[1, 2, 3]])}]
+
+    result = recipe._run_validation_epoch(val_dataloader)
+
+    # Verify result is a MetricsSample with val_loss
+    assert "val_loss" in result.metrics
+    # val_loss should be a float, not a tensor
+    assert isinstance(result.metrics["val_loss"], float)
+
+
+def test_run_validation_epoch_pp_main_rank_receives_from_last_stage(monkeypatch):
+    """Test that main rank receives val_loss from last stage when they differ."""
+    from contextlib import nullcontext
+
+    pp_info = MockPPInfo(has_first_stage=True, has_last_stage=False)
+    recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
+
+    recv_calls = []
+
+    def mock_send(tensor, dst):
+        pass
+
+    def mock_recv(tensor, src):
+        recv_calls.append(src)
+        tensor.fill_(0.5)
+
+    monkeypatch.setattr("torch.distributed.send", mock_send)
+    monkeypatch.setattr("torch.distributed.recv", mock_recv)
+
+    # Set up recipe attributes - use object.__setattr__ to bypass state tracking
+    object.__setattr__(recipe, "model_parts", [DummyModel()])
+    object.__setattr__(recipe, "step_scheduler", SimpleNamespace(step=1, epoch=0))
+    object.__setattr__(recipe, "optimizer", [SimpleNamespace(param_groups=[{"lr": 0.01}])])
+
+    # Mock device_mesh.mesh to return rank 3 as last stage
+    mock_mesh = MagicMock()
+    mock_mesh.reshape.return_value.__getitem__ = lambda self, idx: MagicMock(item=lambda: 3)
+    object.__setattr__(recipe, "device_mesh", SimpleNamespace(mesh=mock_mesh))
+
+    # Main rank (0) is different from last stage (3)
+    object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
+
+    def mock_forward_backward_step(idx, batch, *, loss_buffer, num_label_tokens, num_batches, is_train):
+        loss_buffer.append(torch.tensor(0.0))  # Non-last stage has 0 loss
+
+    monkeypatch.setattr(recipe, "_forward_backward_step", mock_forward_backward_step)
+
+    def mock_dp_allreduce(val, include_cp=False):
+        if isinstance(val, torch.Tensor):
+            return val
+        return torch.tensor(val)
+
+    monkeypatch.setattr(recipe, "_dp_allreduce", mock_dp_allreduce)
+
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
+        lambda device_mesh, batch, **kwargs: (nullcontext, batch),
+    )
+
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.ScopedRNG",
+        lambda **kwargs: MagicMock(__enter__=lambda s: s, __exit__=lambda s, *a: None),
+    )
+
+    val_dataloader = [{"input_ids": torch.tensor([[1, 2, 3]]), "labels": torch.tensor([[1, 2, 3]])}]
+
+    result = recipe._run_validation_epoch(val_dataloader)
+
+    # Main rank should have received from src_rank=3
+    assert 3 in recv_calls, "Main rank should receive val_loss from last stage (rank 3)"
+    assert isinstance(result.metrics["val_loss"], float)
