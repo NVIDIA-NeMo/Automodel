@@ -36,10 +36,13 @@ class BackendConfig:
     enable_hf_state_dict_adapter: bool = True
     enable_fsdp_optimizations: bool = False
     gate_precision: str | torch.dtype | None = None
+    gate_output_dtype: str | torch.dtype | None = None  # If None, use input dtype; else keep in this dtype
 
     def __post_init__(self):
         if isinstance(self.gate_precision, str):
             self.gate_precision = dtype_from_str(self.gate_precision, default=None)
+        if isinstance(self.gate_output_dtype, str):
+            self.gate_output_dtype = dtype_from_str(self.gate_output_dtype, default=None)
 
 
 def initialize_rms_norm_module(

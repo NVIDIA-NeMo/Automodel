@@ -63,46 +63,89 @@ class MoEConfig:
     norm_topk_prob: bool
     router_bias: bool = False
     expert_bias: bool = False
-    expert_activation: Literal["swiglu", "quick_geglu"] = "swiglu"
+    expert_activation: Literal["swiglu", "quick_geglu", "relu2"] = "swiglu"
     activation_alpha: float = 1.702
     activation_limit: float = 7.0
     softmax_before_topk: bool = False
     dtype: str | torch.dtype = torch.bfloat16
     shared_expert_gate: bool = False
     shared_expert_inter_dim: int | None = None
+    shared_expert_activation: str = "swiglu"  # Activation for shared experts ("swiglu" or "relu2")
+    accumulation_dtype: str | torch.dtype | None = None  # If None, use input dtype; else accumulate in this dtype
 
     def __post_init__(self):
         if isinstance(self.dtype, str):
             self.dtype = dtype_from_str(self.dtype, default=torch.bfloat16)
+        if isinstance(self.accumulation_dtype, str):
+            self.accumulation_dtype = dtype_from_str(self.accumulation_dtype, default=None)
+
+
+def is_gated_activation(activation: str) -> bool:
+    """Check if activation requires gating (gate_proj + up_proj).
+
+    Gated activations (SwiGLU, Quick-GEGLU) use both gate_proj and up_proj,
+    requiring gate_and_up_projs tensor with shape [n_experts, dim, 2*inter_dim].
+
+    Non-gated activations (ReLU²) only use up_proj, requiring up_projs tensor
+    with shape [n_experts, dim, inter_dim] - 50% memory savings.
+    """
+    return activation in ("swiglu", "quick_geglu")
 
 
 class MLP(nn.Module):
     """
     Multi-Layer Perceptron (MLP) used as a feed-forward layer.
 
+    Supports both gated activations (SwiGLU) and simple activations (ReLU²).
+
     Attributes:
-        gate_proj (nn.Module): Linear layer for input-to-hidden transformation.
+        gate_proj (nn.Module): Linear layer for gate in gated activations (or up_proj for simple).
         down_proj (nn.Module): Linear layer for hidden-to-output transformation.
-        up_proj (nn.Module): Additional linear layer for feature transformation.
+        up_proj (nn.Module): Additional linear layer for gated activations (None for simple).
     """
 
-    def __init__(self, dim: int, inter_dim: int, backend: str, dtype: torch.dtype = torch.bfloat16):
+    def __init__(
+        self,
+        dim: int,
+        inter_dim: int,
+        backend: str,
+        dtype: torch.dtype = torch.bfloat16,
+        activation: str = "swiglu",
+        bias: bool = False,
+    ):
         """
         Initializes the MLP layer.
 
         Args:
             dim (int): Input and output dimensionality.
             inter_dim (int): Hidden layer dimensionality.
+            backend (str): Backend for linear layers.
+            dtype (torch.dtype): Data type for weights.
+            activation (str): Activation function - "swiglu" (default) or "relu2".
+            bias (bool): Whether to use bias in linear layers.
         """
         super().__init__()
-        self.gate_proj = initialize_linear_module(
-            linear_impl=backend, in_features=dim, out_features=inter_dim, bias=False, dtype=dtype
-        )
+        self.activation = activation
+
+        if activation == "swiglu":
+            # SwiGLU: gate_proj and up_proj for gating
+            self.gate_proj = initialize_linear_module(
+                linear_impl=backend, in_features=dim, out_features=inter_dim, bias=bias, dtype=dtype
+            )
+            self.up_proj = initialize_linear_module(
+                linear_impl=backend, in_features=dim, out_features=inter_dim, bias=bias, dtype=dtype
+            )
+        elif activation == "relu2":
+            # ReLU²: only gate_proj (used as up_proj), no gating
+            self.gate_proj = initialize_linear_module(
+                linear_impl=backend, in_features=dim, out_features=inter_dim, bias=bias, dtype=dtype
+            )
+            self.up_proj = None
+        else:
+            raise ValueError(f"Unsupported activation: {activation}. Choose 'swiglu' or 'relu2'.")
+
         self.down_proj = initialize_linear_module(
-            linear_impl=backend, in_features=inter_dim, out_features=dim, bias=False, dtype=dtype
-        )
-        self.up_proj = initialize_linear_module(
-            linear_impl=backend, in_features=dim, out_features=inter_dim, bias=False, dtype=dtype
+            linear_impl=backend, in_features=inter_dim, out_features=dim, bias=bias, dtype=dtype
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -115,7 +158,10 @@ class MLP(nn.Module):
         Returns:
             torch.Tensor: Output tensor after MLP computation.
         """
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        if self.activation == "swiglu":
+            return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        elif self.activation == "relu2":
+            return self.down_proj(F.relu(self.gate_proj(x)).pow(2))
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         init_weights_fn = partial(_init_weights, buffer_device=buffer_device, init_std=init_std)
@@ -163,11 +209,33 @@ def quick_geglu(
     return inter
 
 
+@torch.compile
+def relu2(x, *, up_proj, down_proj, up_proj_bias=None, down_proj_bias=None):
+    """ReLU² activation: relu(x)^2
+
+    Uses efficient up_proj tensor with shape [dim, inter_dim].
+    Memory-efficient pathway - no duplication of weights.
+    """
+    up_out = x @ up_proj
+    if up_proj_bias is not None:
+        up_out = up_out + up_proj_bias
+
+    # ReLU² activation
+    inter = F.relu(up_out).pow(2)
+
+    inter = inter @ down_proj
+    if down_proj_bias is not None:
+        inter = inter + down_proj_bias
+    return inter
+
+
 def get_expert_activation(config: MoEConfig):
     if config.expert_activation == "swiglu":
         return swiglu
     elif config.expert_activation == "quick_geglu":
         return partial(quick_geglu, alpha=config.activation_alpha, limit=config.activation_limit)
+    elif config.expert_activation == "relu2":
+        return relu2
     else:
         raise ValueError(f"Invalid expert activation: {config.expert_activation}")
 
@@ -198,20 +266,41 @@ class GroupedExperts(nn.Module):
         self.config = config
         self.n_routed_experts = config.n_routed_experts
         self.expert_bias = config.expert_bias
-        self.gate_and_up_projs = nn.Parameter(
-            torch.empty(config.n_routed_experts, config.dim, config.moe_inter_dim * 2, dtype=config.dtype)
-        )
+        self.is_gated = is_gated_activation(config.expert_activation)
+
+        # Conditionally allocate tensors based on activation type
+        if self.is_gated:
+            # Gated activations (SwiGLU, Quick-GEGLU): need both gate and up projections
+            self.gate_and_up_projs = nn.Parameter(
+                torch.empty(config.n_routed_experts, config.dim, config.moe_inter_dim * 2, dtype=config.dtype)
+            )
+            self.up_projs = None
+        else:
+            # Non-gated activations (ReLU²): only need up projection - 50% memory savings
+            self.up_projs = nn.Parameter(
+                torch.empty(config.n_routed_experts, config.dim, config.moe_inter_dim, dtype=config.dtype)
+            )
+            self.gate_and_up_projs = None
+
         self.down_projs = nn.Parameter(
             torch.empty(config.n_routed_experts, config.moe_inter_dim, config.dim, dtype=config.dtype)
         )
 
         if self.expert_bias:
-            self.gate_up_proj_bias = nn.Parameter(
-                torch.empty(config.n_routed_experts, config.moe_inter_dim * 2, dtype=config.dtype)
-            )
+            if self.is_gated:
+                self.gate_up_proj_bias = nn.Parameter(
+                    torch.empty(config.n_routed_experts, config.moe_inter_dim * 2, dtype=config.dtype)
+                )
+                self.up_proj_bias = None
+            else:
+                self.up_proj_bias = nn.Parameter(
+                    torch.empty(config.n_routed_experts, config.moe_inter_dim, dtype=config.dtype)
+                )
+                self.gate_up_proj_bias = None
             self.down_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.dim, dtype=config.dtype))
         else:
             self.gate_up_proj_bias = None
+            self.up_proj_bias = None
             self.down_proj_bias = None
 
         self.expert_activation = get_expert_activation(config)
@@ -241,8 +330,10 @@ class GroupedExperts(nn.Module):
         """
         assert not isinstance(x, DTensor)
 
-        if isinstance(self.gate_and_up_projs, DTensor):
-            ep_mesh = self.gate_and_up_projs.device_mesh
+        # Get the projection tensor for EP mesh extraction
+        proj_tensor = self.gate_and_up_projs if self.is_gated else self.up_projs
+        if isinstance(proj_tensor, DTensor):
+            ep_mesh = proj_tensor.device_mesh
             assert ep_mesh is not None
             assert ep_mesh.ndim == 1, "We only support 1D mesh for MoE"
             ep_size = ep_mesh.size()
@@ -272,7 +363,11 @@ class GroupedExperts(nn.Module):
             local_proj = proj.to_local() if isinstance(proj, DTensor) else proj
             return local_proj[expert_id - experts_start_idx]
 
-        y = torch.zeros_like(x)
+        # Use accumulation_dtype if specified for higher precision accumulation
+        if self.config.accumulation_dtype is not None:
+            y = torch.zeros_like(x, dtype=self.config.accumulation_dtype)
+        else:
+            y = torch.zeros_like(x)
 
         active_local_experts = 0
         for i in range(experts_start_idx, experts_end_idx):
@@ -283,27 +378,42 @@ class GroupedExperts(nn.Module):
                 continue
             active_local_experts += 1
 
-            gate_and_up_proj = get_local_proj(self.gate_and_up_projs, i)
             down_proj = get_local_proj(self.down_projs, i)
-
-            gate_up_proj_bias = get_local_proj(self.gate_up_proj_bias, i) if self.expert_bias else None
             down_proj_bias = get_local_proj(self.down_proj_bias, i) if self.expert_bias else None
 
             idx_b = idx[:, None].expand(-1, x.size(1))
             x_idx = x.gather(dim=0, index=idx_b)
 
-            expert_out = (
-                self.expert_activation(
-                    x_idx,
-                    gate_and_up_proj=gate_and_up_proj,
-                    down_proj=down_proj,
-                    gate_up_proj_bias=gate_up_proj_bias,
-                    down_proj_bias=down_proj_bias,
+            if self.is_gated:
+                gate_and_up_proj = get_local_proj(self.gate_and_up_projs, i)
+                gate_up_proj_bias = get_local_proj(self.gate_up_proj_bias, i) if self.expert_bias else None
+                expert_out = (
+                    self.expert_activation(
+                        x_idx,
+                        gate_and_up_proj=gate_and_up_proj,
+                        down_proj=down_proj,
+                        gate_up_proj_bias=gate_up_proj_bias,
+                        down_proj_bias=down_proj_bias,
+                    )
+                    * weights[idx, top, None]
                 )
-                * weights[idx, top, None]
-            )
+            else:
+                up_proj = get_local_proj(self.up_projs, i)
+                up_proj_bias = get_local_proj(self.up_proj_bias, i) if self.expert_bias else None
+                expert_out = (
+                    self.expert_activation(
+                        x_idx,
+                        up_proj=up_proj,
+                        down_proj=down_proj,
+                        up_proj_bias=up_proj_bias,
+                        down_proj_bias=down_proj_bias,
+                    )
+                    * weights[idx, top, None]
+                )
 
-            y.scatter_add_(dim=0, index=idx_b, src=expert_out.to(x.dtype))
+            # Convert to accumulation dtype or input dtype depending on config
+            target_dtype = self.config.accumulation_dtype if self.config.accumulation_dtype is not None else x.dtype
+            y.scatter_add_(dim=0, index=idx_b, src=expert_out.to(target_dtype))
 
         # Handle the edge case where no tokens are routed to any local experts.
         # This can occur during expert parallelism when all tokens on a particular
@@ -313,24 +423,37 @@ class GroupedExperts(nn.Module):
         # 2. Proper participation in collective operations (reduce-scatter)
         # The computation is a no-op since we multiply by zero (using zeros_like input).
         if active_local_experts == 0:
-            gate_and_up_proj = get_local_proj(self.gate_and_up_projs, experts_start_idx)
             down_proj = get_local_proj(self.down_projs, experts_start_idx)
-            gate_up_proj_bias = get_local_proj(self.gate_up_proj_bias, experts_start_idx) if self.expert_bias else None
-            down_proj_bias = get_local_proj(self.down_proj_bias, experts_start_idx) if self.expert_bias else None
 
-            expert_out = (
-                self.expert_activation(
-                    torch.zeros_like(x[0]).unsqueeze(0),
-                    gate_and_up_proj=gate_and_up_proj,
-                    down_proj=down_proj,
+            if self.is_gated:
+                gate_and_up_proj = get_local_proj(self.gate_and_up_projs, experts_start_idx)
+                expert_out = (
+                    self.expert_activation(
+                        torch.zeros_like(x[0]).unsqueeze(0),
+                        gate_and_up_proj=gate_and_up_proj,
+                        down_proj=down_proj,
+                    )
+                    * weights[0, 0, None]
                 )
-                * weights[0, 0, None]
-            )
+            else:
+                up_proj = get_local_proj(self.up_projs, experts_start_idx)
+                expert_out = (
+                    self.expert_activation(
+                        torch.zeros_like(x[0]).unsqueeze(0),
+                        up_proj=up_proj,
+                        down_proj=down_proj,
+                    )
+                    * weights[0, 0, None]
+                )
             y[0] += expert_out[0]
 
         if ep_size > 1:
             y = DTensor.from_local(y, device_mesh=ep_mesh, placements=[Partial()])
             y = y.redistribute(placements=[Shard(0)]).to_local()
+
+        # Convert back to input dtype if we accumulated in higher precision
+        if self.config.accumulation_dtype is not None:
+            y = y.type(x.dtype)
 
         return y
 
@@ -353,7 +476,20 @@ def quick_geglu_deepep(
     out_glu = gate_out * torch.sigmoid(alpha * gate_out)
     # Note we add an extra bias of 1 to the linear layer
     inter = out_glu * (up_out + linear_offset)
-    return (inter * permuted_probs).to(x.dtype)
+    # Keep in input dtype - let caller handle final dtype conversion
+    return inter * permuted_probs
+
+
+@torch.compile
+def relu2_deepep(x, permuted_probs):
+    """ReLU² activation for DeepEP: relu(x)^2
+
+    For DeepEP with ReLU², x is the output of the up projection (already computed).
+    x already has shape [..., inter_dim] from efficient up_proj.
+    """
+    inter = F.relu(x).pow(2)
+    # Keep in input dtype - let caller handle final dtype conversion
+    return inter * permuted_probs
 
 
 def get_expert_activation_for_deepep(config: MoEConfig):
@@ -366,6 +502,8 @@ def get_expert_activation_for_deepep(config: MoEConfig):
             alpha=config.activation_alpha,
             linear_offset=1.0,
         )
+    elif config.expert_activation == "relu2":
+        return relu2_deepep
     else:
         raise ValueError(f"Invalid expert activation: {config.expert_activation}")
 
@@ -427,16 +565,35 @@ class GroupedExpertsDeepEP(nn.Module):
 
         self.config = config
         self.expert_bias = config.expert_bias
-        self.gate_and_up_projs = nn.Parameter(
-            torch.empty(config.n_routed_experts, config.dim, config.moe_inter_dim * 2)
-        )
+        self.is_gated = is_gated_activation(config.expert_activation)
+
+        # Conditionally allocate tensors based on activation type
+        if self.is_gated:
+            # Gated activations (SwiGLU, Quick-GEGLU): need both gate and up projections
+            self.gate_and_up_projs = nn.Parameter(
+                torch.empty(config.n_routed_experts, config.dim, config.moe_inter_dim * 2)
+            )
+            self.up_projs = None
+        else:
+            # Non-gated activations (ReLU²): only need up projection - 50% memory savings
+            self.up_projs = nn.Parameter(
+                torch.empty(config.n_routed_experts, config.dim, config.moe_inter_dim)
+            )
+            self.gate_and_up_projs = None
+
         self.down_projs = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim, config.dim))
 
         if self.expert_bias:
-            self.gate_up_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim * 2))
+            if self.is_gated:
+                self.gate_up_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim * 2))
+                self.up_proj_bias = None
+            else:
+                self.up_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim))
+                self.gate_up_proj_bias = None
             self.down_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.dim))
         else:
             self.gate_up_proj_bias = None
+            self.up_proj_bias = None
             self.down_proj_bias = None
 
         self.expert_activation = get_expert_activation_for_deepep(config)
@@ -506,30 +663,55 @@ class GroupedExpertsDeepEP(nn.Module):
         )
         permuted_probs = permuted_probs.unsqueeze(-1)
 
+        # Convert to accumulation dtype if specified for higher precision
+        if self.config.accumulation_dtype is not None:
+            permuted_local_hidden_states = permuted_local_hidden_states.to(dtype=self.config.accumulation_dtype)
+            # Also convert weights to accumulation dtype
+            if self.is_gated:
+                up_proj_tensor = self.gate_and_up_projs.to_local().to(dtype=self.config.accumulation_dtype)
+            else:
+                up_proj_tensor = self.up_projs.to_local().to(dtype=self.config.accumulation_dtype)
+            down_projs = self.down_projs.to_local().to(dtype=self.config.accumulation_dtype)
+        else:
+            if self.is_gated:
+                up_proj_tensor = self.gate_and_up_projs.to_local()
+            else:
+                up_proj_tensor = self.up_projs.to_local()
+            down_projs = self.down_projs.to_local()
+
         if torch.count_nonzero(tokens_per_expert) > 0:
             output1 = ops.gmm(
                 permuted_local_hidden_states,
-                self.gate_and_up_projs.to_local(),
+                up_proj_tensor,
                 tokens_per_expert,
                 trans_b=False,
             )
 
             if self.expert_bias:
-                gate_and_up_bias = self.gate_up_proj_bias.to_local()
-                output1 = self._apply_bias(output1, gate_and_up_bias, tokens_per_expert)
-            else:
-                gate_and_up_bias = None
+                if self.is_gated:
+                    up_bias = self.gate_up_proj_bias.to_local()
+                else:
+                    up_bias = self.up_proj_bias.to_local()
+                if self.config.accumulation_dtype is not None:
+                    up_bias = up_bias.to(dtype=self.config.accumulation_dtype)
+                output1 = self._apply_bias(output1, up_bias, tokens_per_expert)
 
             output1 = self.expert_activation(output1, permuted_probs)
-            output2 = ops.gmm(output1, self.down_projs.to_local(), tokens_per_expert, trans_b=False)
+            output2 = ops.gmm(output1, down_projs, tokens_per_expert, trans_b=False)
 
             if self.expert_bias:
                 down_bias = self.down_proj_bias.to_local()
+                if self.config.accumulation_dtype is not None:
+                    down_bias = down_bias.to(dtype=self.config.accumulation_dtype)
                 output2 = self._apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
         else:
-            output1 = torch.matmul(x[0] * 0, self.gate_and_up_projs.to_local()[0])
+            output1 = torch.matmul(x[0] * 0, up_proj_tensor[0])
             output1_ = self.expert_activation(output1, permuted_probs)
-            output2 = torch.matmul(output1_, self.down_projs.to_local()[0])
+            output2 = torch.matmul(output1_, down_projs[0])
+
+        # Convert back to input dtype if we accumulated in higher precision
+        if self.config.accumulation_dtype is not None:
+            output2 = output2.to(dtype=x.dtype)
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
@@ -605,13 +787,19 @@ class Gate(nn.Module):
         bias (Optional[torch.nn.Parameter]): Optional bias term for the gate.
     """
 
-    def __init__(self, config: MoEConfig, gate_precision: torch.dtype | None = None):
+    def __init__(
+        self,
+        config: MoEConfig,
+        gate_precision: torch.dtype | None = None,
+        gate_output_dtype: torch.dtype | None = None,
+    ):
         """
         Initializes the Gate module.
 
         Args:
             config (MoEConfig): Model configuration containing gating parameters.
             gate_precision (torch.dtype | None): Precision for gate computations (linear, softmax/sigmoid).
+            gate_output_dtype (torch.dtype | None): Output dtype for weights. If None, uses input dtype.
         """
         super().__init__()
         self.dim = config.dim
@@ -627,6 +815,7 @@ class Gate(nn.Module):
         self.aux_loss_coeff = config.aux_loss_coeff
         self.norm_topk_prob = config.norm_topk_prob
         self.gate_precision = gate_precision
+        self.gate_output_dtype = gate_output_dtype
 
         if self.bias_update_factor > 0:
             assert self.train_gate, "Require train_gate to be set to True to apply the bias update"
@@ -726,7 +915,9 @@ class Gate(nn.Module):
 
         weights = weights * self.route_scale
 
-        if self.gate_precision is not None:
+        # Convert back to original dtype if gate_precision was used,
+        # unless we're going to convert to gate_output_dtype instead
+        if self.gate_precision is not None and self.gate_output_dtype is None:
             weights = weights.to(dtype=original_dtype)
             original_scores = original_scores.to(dtype=original_dtype)
 
@@ -747,7 +938,13 @@ class Gate(nn.Module):
             # To correct this scaling, we need to scale the aux_loss by number of tokens here.
             MoEAuxLossAutoScaler.apply(weights, aux_loss * weights.shape[0])
 
-        return weights.type_as(x), indices, aux_loss
+        # Convert output weights to specified dtype, or back to input dtype if not specified
+        if self.gate_output_dtype is not None:
+            weights = weights.to(dtype=self.gate_output_dtype)
+        else:
+            weights = weights.type_as(x)
+
+        return weights, indices, aux_loss
 
     def update_bias(self) -> None:
         """
@@ -915,7 +1112,7 @@ class MoE(nn.Module):
         if backend.fake_balanced_gate:
             self.gate = FakeBalancedGate(config)
         else:
-            self.gate = Gate(config, gate_precision=backend.gate_precision)
+            self.gate = Gate(config, gate_precision=backend.gate_precision, gate_output_dtype=backend.gate_output_dtype)
         if backend.enable_deepep and get_world_size_safe() == 1:
             warnings.warn(
                 "DeepEP is enabled in config, but world size is 1. "
@@ -934,6 +1131,9 @@ class MoE(nn.Module):
                 config.dim,
                 config.n_shared_experts * (config.shared_expert_inter_dim or config.moe_inter_dim),
                 backend.linear,
+                dtype=config.dtype,
+                activation=config.shared_expert_activation,
+                bias=config.expert_bias,
             )
             if config.shared_expert_gate:
                 self.shared_expert_gate = initialize_linear_module(backend.linear, config.dim, 1, False)
@@ -1015,10 +1215,17 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
             if module.bias is not None:
                 to_local(module.bias).zero_()
         elif isinstance(module, (GroupedExperts, GroupedExpertsDeepEP)):
-            to_local(module.gate_and_up_projs).normal_(mean=0.0, std=init_std)
+            # Initialize the appropriate projection tensor based on activation type
+            if module.is_gated:
+                to_local(module.gate_and_up_projs).normal_(mean=0.0, std=init_std)
+            else:
+                to_local(module.up_projs).normal_(mean=0.0, std=init_std)
             to_local(module.down_projs).normal_(mean=0.0, std=init_std)
             if module.expert_bias:
-                to_local(module.gate_up_proj_bias).zero_()
+                if module.is_gated:
+                    to_local(module.gate_up_proj_bias).zero_()
+                else:
+                    to_local(module.up_proj_bias).zero_()
                 to_local(module.down_proj_bias).zero_()
         elif isinstance(module, MLP):
             to_local(module.gate_proj.weight).normal_(mean=0.0, std=init_std)

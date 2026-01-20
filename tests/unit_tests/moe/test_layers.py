@@ -28,6 +28,8 @@ from nemo_automodel.components.moe.layers import (
     MoEConfig,
     get_expert_activation,
     get_expert_activation_for_deepep,
+    is_gated_activation,
+    relu2,
     swiglu,
 )
 from nemo_automodel.components.moe.utils import BackendConfig
@@ -1434,3 +1436,245 @@ class TestMoE:
 
             # Should return the reshaped output since aux_loss handling is done in gate
             assert result.shape == x.shape
+
+
+class TestNonGatedActivations:
+    """Test non-gated activation support (ReLU²) for memory-efficient MoE.
+
+    Non-gated activations like ReLU² only need up_projs with shape [n_experts, dim, inter_dim]
+    instead of gate_and_up_projs with shape [n_experts, dim, 2*inter_dim], saving 50% memory.
+    """
+
+    @pytest.fixture
+    def relu2_config(self):
+        """Create MoEConfig with ReLU² activation (non-gated)."""
+        return MoEConfig(
+            n_routed_experts=4,
+            n_shared_experts=0,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=False,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="softmax",
+            route_scale=1.0,
+            dim=64,
+            inter_dim=128,
+            moe_inter_dim=128,
+            norm_topk_prob=False,
+            router_bias=False,
+            expert_bias=False,
+            expert_activation="relu2",
+            dtype=torch.bfloat16,
+        )
+
+    @pytest.fixture
+    def swiglu_config(self):
+        """Create MoEConfig with SwiGLU activation (gated)."""
+        return MoEConfig(
+            n_routed_experts=4,
+            n_shared_experts=0,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=False,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="softmax",
+            route_scale=1.0,
+            dim=64,
+            inter_dim=128,
+            moe_inter_dim=128,
+            norm_topk_prob=False,
+            router_bias=False,
+            expert_bias=False,
+            expert_activation="swiglu",
+            dtype=torch.bfloat16,
+        )
+
+    def test_is_gated_activation_swiglu(self):
+        """Test is_gated_activation returns True for swiglu."""
+        assert is_gated_activation("swiglu") is True
+
+    def test_is_gated_activation_quick_geglu(self):
+        """Test is_gated_activation returns True for quick_geglu."""
+        assert is_gated_activation("quick_geglu") is True
+
+    def test_is_gated_activation_relu2(self):
+        """Test is_gated_activation returns False for relu2."""
+        assert is_gated_activation("relu2") is False
+
+    def test_grouped_experts_relu2_uses_up_projs(self, relu2_config):
+        """Test that GroupedExperts with ReLU² creates up_projs, not gate_and_up_projs."""
+        experts = GroupedExperts(relu2_config)
+
+        # Should have up_projs with shape [n_experts, dim, inter_dim]
+        assert experts.up_projs is not None
+        assert experts.up_projs.shape == (
+            relu2_config.n_routed_experts,
+            relu2_config.dim,
+            relu2_config.moe_inter_dim,
+        )
+
+        # Should NOT have gate_and_up_projs
+        assert experts.gate_and_up_projs is None
+
+        # Should have down_projs (same for both gated and non-gated)
+        assert experts.down_projs is not None
+        assert experts.down_projs.shape == (
+            relu2_config.n_routed_experts,
+            relu2_config.moe_inter_dim,
+            relu2_config.dim,
+        )
+
+    def test_grouped_experts_swiglu_uses_gate_and_up_projs(self, swiglu_config):
+        """Test that GroupedExperts with SwiGLU creates gate_and_up_projs, not up_projs."""
+        experts = GroupedExperts(swiglu_config)
+
+        # Should have gate_and_up_projs with shape [n_experts, dim, 2*inter_dim]
+        assert experts.gate_and_up_projs is not None
+        assert experts.gate_and_up_projs.shape == (
+            swiglu_config.n_routed_experts,
+            swiglu_config.dim,
+            swiglu_config.moe_inter_dim * 2,
+        )
+
+        # Should NOT have up_projs
+        assert experts.up_projs is None
+
+    def test_grouped_experts_relu2_with_bias(self, relu2_config):
+        """Test GroupedExperts with ReLU² and bias uses up_proj_bias, not gate_up_proj_bias."""
+        relu2_config.expert_bias = True
+        experts = GroupedExperts(relu2_config)
+
+        # Should have up_proj_bias
+        assert experts.up_proj_bias is not None
+        assert experts.up_proj_bias.shape == (relu2_config.n_routed_experts, relu2_config.moe_inter_dim)
+
+        # Should NOT have gate_up_proj_bias
+        assert experts.gate_up_proj_bias is None
+
+        # Should have down_proj_bias
+        assert experts.down_proj_bias is not None
+
+    def test_grouped_experts_swiglu_with_bias(self, swiglu_config):
+        """Test GroupedExperts with SwiGLU and bias uses gate_up_proj_bias, not up_proj_bias."""
+        swiglu_config.expert_bias = True
+        experts = GroupedExperts(swiglu_config)
+
+        # Should have gate_up_proj_bias
+        assert experts.gate_up_proj_bias is not None
+        assert experts.gate_up_proj_bias.shape == (
+            swiglu_config.n_routed_experts,
+            swiglu_config.moe_inter_dim * 2,
+        )
+
+        # Should NOT have up_proj_bias
+        assert experts.up_proj_bias is None
+
+    def test_grouped_experts_relu2_forward(self, relu2_config, device):
+        """Test GroupedExperts with ReLU² forward pass works correctly."""
+        experts = GroupedExperts(relu2_config)
+        experts = experts.to(device)
+
+        # Initialize weights
+        with torch.no_grad():
+            experts.up_projs.normal_(0, 0.02)
+            experts.down_projs.normal_(0, 0.02)
+
+        num_tokens = 8
+        x = torch.randn(num_tokens, relu2_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, relu2_config.n_activated_experts, dtype=torch.bfloat16, device=device)
+        indices = torch.randint(
+            0, relu2_config.n_routed_experts, (num_tokens, relu2_config.n_activated_experts), device=device
+        )
+
+        output = experts(x, token_mask, weights, indices)
+
+        assert output.shape == x.shape
+        assert output.device == device
+        assert not torch.isnan(output).any(), "Output should not contain NaN values"
+
+    def test_relu2_function_shape_preservation(self, device):
+        """Test that relu2 function preserves expected output shape."""
+        batch_size, seq_len, dim = 4, 8, 64
+        inter_dim = 128
+
+        x = torch.randn(batch_size, seq_len, dim, dtype=torch.bfloat16, device=device)
+        up_proj = torch.randn(dim, inter_dim, dtype=torch.bfloat16, device=device)
+        down_proj = torch.randn(inter_dim, dim, dtype=torch.bfloat16, device=device)
+
+        result = relu2(x, up_proj=up_proj, down_proj=down_proj)
+
+        assert result.shape == (batch_size, seq_len, dim)
+        assert result.device == device
+
+    def test_relu2_function_with_bias(self, device):
+        """Test relu2 with bias terms."""
+        batch_size, seq_len, dim = 2, 4, 32
+        inter_dim = 64
+
+        x = torch.randn(batch_size, seq_len, dim, dtype=torch.bfloat16, device=device)
+        up_proj = torch.randn(dim, inter_dim, dtype=torch.bfloat16, device=device)
+        down_proj = torch.randn(inter_dim, dim, dtype=torch.bfloat16, device=device)
+        up_proj_bias = torch.randn(inter_dim, dtype=torch.bfloat16, device=device)
+        down_proj_bias = torch.randn(dim, dtype=torch.bfloat16, device=device)
+
+        result = relu2(
+            x,
+            up_proj=up_proj,
+            down_proj=down_proj,
+            up_proj_bias=up_proj_bias,
+            down_proj_bias=down_proj_bias,
+        )
+
+        assert result.shape == (batch_size, seq_len, dim)
+
+    def test_relu2_memory_efficiency(self, relu2_config, swiglu_config):
+        """Test that ReLU² uses ~50% less memory for up projection weights than SwiGLU."""
+        relu2_experts = GroupedExperts(relu2_config)
+        swiglu_experts = GroupedExperts(swiglu_config)
+
+        # Calculate parameter sizes
+        relu2_up_params = relu2_experts.up_projs.numel()
+        swiglu_up_params = swiglu_experts.gate_and_up_projs.numel()
+
+        # ReLU² should have exactly half the up projection parameters
+        assert relu2_up_params * 2 == swiglu_up_params
+
+    def test_get_expert_activation_relu2(self, relu2_config):
+        """Test getting relu2 activation function."""
+        activation_fn = get_expert_activation(relu2_config)
+        assert activation_fn == relu2
+
+    def test_grouped_experts_deepep_relu2_uses_up_projs(self, relu2_config):
+        """Test that GroupedExpertsDeepEP with ReLU² creates up_projs."""
+        experts = GroupedExpertsDeepEP(relu2_config)
+
+        # Should have up_projs with shape [n_experts, dim, inter_dim]
+        assert experts.up_projs is not None
+        assert experts.up_projs.shape == (
+            relu2_config.n_routed_experts,
+            relu2_config.dim,
+            relu2_config.moe_inter_dim,
+        )
+
+        # Should NOT have gate_and_up_projs
+        assert experts.gate_and_up_projs is None
+
+    def test_grouped_experts_deepep_swiglu_uses_gate_and_up_projs(self, swiglu_config):
+        """Test that GroupedExpertsDeepEP with SwiGLU creates gate_and_up_projs."""
+        experts = GroupedExpertsDeepEP(swiglu_config)
+
+        # Should have gate_and_up_projs with shape [n_experts, dim, 2*inter_dim]
+        assert experts.gate_and_up_projs is not None
+        assert experts.gate_and_up_projs.shape == (
+            swiglu_config.n_routed_experts,
+            swiglu_config.dim,
+            swiglu_config.moe_inter_dim * 2,
+        )
+
+        # Should NOT have up_projs
+        assert experts.up_projs is None
