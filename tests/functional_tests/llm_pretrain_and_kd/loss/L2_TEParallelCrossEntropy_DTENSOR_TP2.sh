@@ -19,5 +19,5 @@ export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1"
 
 torchrun --nproc_per_node=2 --nnodes=1 \
-  tests/functional_tests/training/loss/run_te_parallel_ce_dtensor.py
+  tests/functional_tests/llm_pretrain_and_kd/loss/run_te_parallel_ce_dtensor.py
 
