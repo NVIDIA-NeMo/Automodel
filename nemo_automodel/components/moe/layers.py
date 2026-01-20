@@ -830,10 +830,13 @@ class Gate(nn.Module):
         else:
             self.bias = None
 
-        if self.bias_update_factor > 0:
-            self.register_buffer("e_score_correction_bias", torch.zeros((self.n_experts), dtype=config.dtype))
-        else:
-            self.e_score_correction_bias = None
+        # CRITICAL: e_score_correction_bias must ALWAYS be created and ALWAYS be float32.
+        # HF models have trained bias values saved in checkpoints that affect routing.
+        # We must create the buffer to load these values, even if bias_update_factor=0.
+        # The bias_update_factor only controls whether we UPDATE the bias during training,
+        # not whether we create/load it from checkpoints.
+        # Small quantization errors in bf16 can cause completely different expert routing.
+        self.register_buffer("e_score_correction_bias", torch.zeros((self.n_experts), dtype=torch.float32))
 
         self.e_score_correction_bias_master = None
 
@@ -889,16 +892,14 @@ class Gate(nn.Module):
             original_scores = scores
 
             # Add correction bias to balance tokens across gates.
-            if self.e_score_correction_bias is not None:
-                correction_bias = self.e_score_correction_bias
-                scores = scores + correction_bias
+            # Bias is always present (loaded from checkpoint or initialized to zeros).
+            scores = scores + self.e_score_correction_bias
 
             if self.n_groups > 1:
                 scores = scores.view(x.size(0), self.n_groups, -1)
-                if self.e_score_correction_bias is None:
-                    group_scores = scores.amax(dim=-1)
-                else:
-                    group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
+                # When bias is used (non-zero), use topk(2) sum for group scores.
+                # When bias is all zeros, this is equivalent to amax but keeps code consistent.
+                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
 
                 indices = group_scores.topk(self.topk_groups, dim=-1)[1]
                 mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
