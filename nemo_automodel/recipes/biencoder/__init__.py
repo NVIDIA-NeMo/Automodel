@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .mine_hard_negatives import MineHardNegativesRecipe
 from .train_biencoder import TrainBiencoderRecipe
 
-__all__ = ["TrainBiencoderRecipe"]
+__all__ = ["MineHardNegativesRecipe", "TrainBiencoderRecipe"]
