@@ -163,9 +163,15 @@ override-dependencies = ["nvidia-cudnn-cu12>=9.18.0.0"]
 nv_grouped_gemm = { git = "https://github.com/fanshiqing/grouped_gemm", rev = "v1.1.4.post8" }
 deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "e3908bf5bd0cc6265bcb225d15cd8c996d4759ef" }
 torch = [
-  { index = "pytorch-cpu", marker = "sys_platform != 'linux'" },
+  { index = "pytorch-cpu", marker = "sys_platform != 'linux' and sys_platform != 'darwin'" },
   { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
+  { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
