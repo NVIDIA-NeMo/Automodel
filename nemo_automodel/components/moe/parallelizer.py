@@ -222,6 +222,81 @@ def apply_fsdp(
         fully_shard_default(model)
 
 
+def setup_fsdp_prefetching(model: torch.nn.Module, ep_enabled: bool = False):
+    """
+    Set up explicit FSDP prefetching when EP is enabled.
+
+    D2H syncs in EP could interfere with implicit prefetching in FSDP,
+    so we need to set up explicit prefetching to ensure correct behavior.
+
+    Args:
+        model: The model to set up prefetching for. Expected to have either
+               a nested structure (model.model) or be the model directly.
+        ep_enabled: Whether expert parallelism is enabled. If False, this
+                    function returns early as implicit prefetching is sufficient.
+    """
+    from torch.distributed.fsdp import FSDPModule
+
+    if not ep_enabled:
+        return
+
+    if hasattr(model, "model") and model.model is not None:
+        _model = model.model
+    else:
+        _model = model
+
+    # Get transformer blocks as a list
+    transformer_blocks = list(_model.layers.values())
+    if len(transformer_blocks) == 0:
+        return
+
+    next_transformer_blocks = transformer_blocks[1:] + [None]
+
+    # Forward prefetching setup
+    embed_tokens = getattr(_model, "embed_tokens", None)
+    if embed_tokens is not None:
+        embed_tokens.set_modules_to_forward_prefetch([transformer_blocks[0]])
+
+    for transformer_block, next_transformer_block in zip(transformer_blocks, next_transformer_blocks):
+        if next_transformer_block is not None:
+            modules_to_prefetch = [next_transformer_block]
+            if isinstance(next_transformer_block.mlp, MoE) and isinstance(
+                next_transformer_block.mlp.experts, FSDPModule
+            ):
+                modules_to_prefetch.append(next_transformer_block.mlp.experts)
+            transformer_block.set_modules_to_forward_prefetch(modules_to_prefetch)
+        else:
+            # Last block - prefetch norm and lm_head
+            norm = getattr(_model, "norm", None)
+            lm_head = getattr(_model, "lm_head", None) or getattr(model, "lm_head", None)
+            modules_to_prefetch = []
+            if norm is not None and isinstance(norm, FSDPModule):
+                modules_to_prefetch.append(norm)
+            if lm_head is not None and isinstance(lm_head, FSDPModule):
+                modules_to_prefetch.append(lm_head)
+            if modules_to_prefetch:
+                transformer_block.set_modules_to_forward_prefetch(modules_to_prefetch)
+
+    # Backward prefetching setup
+    reversed_transformer_blocks = list(reversed(transformer_blocks))
+    prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
+
+    lm_head = getattr(_model, "lm_head", None) or getattr(model, "lm_head", None)
+    if lm_head is not None and isinstance(lm_head, FSDPModule):
+        lm_head.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
+
+    for transformer_block, prev_transformer_block in zip(reversed_transformer_blocks, prev_transformer_blocks):
+        if prev_transformer_block is not None:
+            modules_to_prefetch = [prev_transformer_block]
+            if isinstance(prev_transformer_block.mlp, MoE) and isinstance(
+                prev_transformer_block.mlp.experts, FSDPModule
+            ):
+                modules_to_prefetch.append(prev_transformer_block.mlp.experts)
+            transformer_block.set_modules_to_backward_prefetch(modules_to_prefetch)
+        elif embed_tokens is not None and isinstance(embed_tokens, FSDPModule):
+            transformer_block.set_modules_to_backward_prefetch([embed_tokens])
+
+
 def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p2p"):
     from transformer_engine.pytorch.attention import DotProductAttention
 
@@ -298,3 +373,7 @@ def parallelize_model(
             lm_head_precision=lm_head_precision,
             wrap_outer_model=wrap_outer_model,
         )
+
+        # Set up explicit FSDP prefetching when EP is enabled to avoid
+        # D2H sync interference with implicit prefetching
+        setup_fsdp_prefetching(model, ep_enabled=ep_enabled)
