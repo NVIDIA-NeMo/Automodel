@@ -632,8 +632,17 @@ def get_test_hf_peft_checkpoint_expected_keys():
             torch.bfloat16,
             "cpu",
         ),
+        # LoRA on the output head (enabled by match_all_linear=True for CausalLMs)
+        "base_model.model.lm_head.lora_A.weight": ([8, 512], torch.bfloat16, "cpu"),
+        "base_model.model.lm_head.lora_B.weight": ([32000, 8], torch.bfloat16, "cpu"),
     }
     expected_optim_keys = {
+        "optim.state.lm_head.lora_A.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.lm_head.lora_A.weight.exp_avg": ([4, 512], torch.bfloat16, "cpu"),
+        "optim.state.lm_head.lora_A.weight.exp_avg_sq": ([4, 512], torch.bfloat16, "cpu"),
+        "optim.state.lm_head.lora_B.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.lm_head.lora_B.weight.exp_avg": ([16000, 8], torch.bfloat16, "cpu"),
+        "optim.state.lm_head.lora_B.weight.exp_avg_sq": ([16000, 8], torch.bfloat16, "cpu"),
         "optim.state.model.layers.0.self_attn.q_proj.lora_A.weight.step": ([], torch.float32, "cpu"),
         "optim.state.model.layers.0.self_attn.q_proj.lora_A.weight.exp_avg": ([4, 512], torch.bfloat16, "cpu"),
         "optim.state.model.layers.0.self_attn.q_proj.lora_A.weight.exp_avg_sq": ([4, 512], torch.bfloat16, "cpu"),
@@ -1789,6 +1798,7 @@ def test_hf_peft_checkpoint(use_triton=False):
         "peft_type": "LORA",
         "r": 8,
         "target_modules": [
+            "lm_head",
             "model.layers.0.block_sparse_moe.experts.0.w1",
             "model.layers.0.block_sparse_moe.experts.0.w2",
             "model.layers.0.block_sparse_moe.experts.0.w3",
