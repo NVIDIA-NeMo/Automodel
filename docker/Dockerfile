@@ -129,8 +129,8 @@ ARG AUTOMODEL_INSTALL=all
 COPY . /opt/Automodel
 RUN cd /opt/Automodel && \
     if [ "$BASE_IMAGE" = "pytorch" ]; then \
-        sed -i '/override-dependencies = \["nvidia-cudnn-cu12>=9.18.0.0/{ r /opt/Automodel/docker/common/uv-pytorch.toml
-          d; }' pyproject.toml && \
+        sed -i '/override-dependencies = \["nvidia-cudnn-cu12/d' pyproject.toml && \
+        sed -i '/\[tool\.uv\]/r /opt/Automodel/docker/common/uv-pytorch.toml' pyproject.toml && \
         mv /opt/Automodel/docker/common/uv-pytorch.lock /opt/Automodel/uv.lock; \
     fi && \
     uv sync --locked --extra $AUTOMODEL_INSTALL --all-groups
