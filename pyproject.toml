@@ -159,9 +159,6 @@ constraint-dependencies = [
 # This is required for GPTOSS TE support + faster cudnn attention
 override-dependencies = ["nvidia-cudnn-cu12>=9.18.0.0"]
 
-[tool.uv.pip]
-torch-backend = "auto"
-
 [tool.uv.sources]
 nv_grouped_gemm = { git = "https://github.com/fanshiqing/grouped_gemm", rev = "v1.1.4.post8" }
 deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "e3908bf5bd0cc6265bcb225d15cd8c996d4759ef" }
