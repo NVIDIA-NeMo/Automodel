@@ -37,6 +37,8 @@ _OVERRIDES = [
     "checkpoint.enabled",
     "checkpoint.checkpoint_dir",
     "checkpoint.model_save_format",
+    "checkpoint.single_rank_consolidation",
+    "checkpoint.staging_dir",
     "dataloader.batch_size",
     "checkpoint.save_consolidated",
     "peft.peft_fn",
