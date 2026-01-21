@@ -84,6 +84,7 @@ Environment Variables:
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, Union
 
@@ -234,6 +235,98 @@ def _normalize_delta_path(path: str) -> str:
     return path
 
 
+_UNITY_STORAGE_TABLE_PATH_RE = re.compile(
+    r"__unitystorage/catalogs/(?P<catalog_id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+    r"/tables/(?P<table_id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
+
+
+def _parse_unity_storage_ids(path: str) -> Optional[Dict[str, str]]:
+    """Parse Unity Catalog managed storage IDs from a __unitystorage path.
+
+    Databricks Unity Catalog managed tables use internal cloud locations like:
+      .../__unitystorage/catalogs/<catalog_uuid>/tables/<table_uuid>
+    Direct path access to these locations is blocked on Databricks ("LOCATION_OVERLAP").
+    """
+    m = _UNITY_STORAGE_TABLE_PATH_RE.search(path)
+    if not m:
+        return None
+    return {"catalog_id": m.group("catalog_id"), "table_id": m.group("table_id")}
+
+
+def _quote_sql_ident(ident: str) -> str:
+    """Quote an identifier for Spark SQL (handles embedded backticks)."""
+    return f"`{ident.replace('`', '``')}`"
+
+
+def _build_uc_table_fqn(catalog: str, schema: str, table: str) -> str:
+    """Build a fully-qualified UC table name with safe quoting."""
+    return f"{_quote_sql_ident(catalog)}.{_quote_sql_ident(schema)}.{_quote_sql_ident(table)}"
+
+
+def _try_resolve_uc_table_from_system_tables(
+    spark: Any,
+    *,
+    table_id: Optional[str] = None,
+    storage_location: Optional[str] = None,
+) -> Optional[str]:
+    """Best-effort reverse lookup of a UC table name via Databricks system tables."""
+    candidates: list[str] = []
+    if table_id:
+        safe_table_id = table_id.replace("'", "''")
+        for col in ("table_id", "id", "table_uuid"):
+            candidates.append(
+                "SELECT TABLE_CATALOG AS table_catalog, TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name "
+                f"FROM system.information_schema.tables WHERE {col} = '{safe_table_id}'"
+            )
+    if storage_location:
+        safe_loc = storage_location.replace("'", "''")
+        # Unity Catalog information schema uses STORAGE_PATH for table locations.
+        for col in ("storage_path", "storage_location", "location"):
+            candidates.append(
+                "SELECT TABLE_CATALOG AS table_catalog, TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name "
+                f"FROM system.information_schema.tables WHERE {col} = '{safe_loc}'"
+            )
+
+    for query in candidates:
+        try:
+            rows = spark.sql(query).take(1)
+        except Exception:  # noqa: BLE001
+            continue
+        if not rows:
+            continue
+        row = rows[0]
+        row_dict = row.asDict(recursive=True) if hasattr(row, "asDict") else dict(row)
+        cat = row_dict.get("table_catalog")
+        sch = row_dict.get("table_schema")
+        name = row_dict.get("table_name")
+        if cat and sch and name:
+            return _build_uc_table_fqn(str(cat), str(sch), str(name))
+    return None
+
+
+def _resolve_uc_table_from_unity_storage_path(spark: Any, path: str) -> Optional[str]:
+    """If *path* looks like UC managed storage, try to resolve to catalog.schema.table."""
+    ids = _parse_unity_storage_ids(path)
+    if ids is None:
+        return None
+    # Try a few storage path variants (some APIs include/omit trailing slash).
+    loc_variants = {path, path.rstrip("/"), f"{path.rstrip('/')}/"}
+    for loc in loc_variants:
+        resolved = _try_resolve_uc_table_from_system_tables(
+            spark, table_id=ids.get("table_id"), storage_location=loc
+        )
+        if resolved is not None:
+            return resolved
+    return None
+
+
+def _is_location_overlap_error(e: BaseException) -> bool:
+    """Return True if *e* looks like Databricks UC managed-storage overlap."""
+    msg = str(e).lower()
+    return "location_overlap" in msg or "checkpathaccess" in msg or "overlaps with managed storage" in msg
+
+
 class DeltaLakeIterator:
     """Iterator that yields rows from a Delta Lake table.
 
@@ -320,26 +413,61 @@ class DeltaLakeIterator:
             )
 
         try:
-            if _is_unity_catalog_path(self.table_path):
+            effective_path = self.table_path
+
+            # Unity Catalog managed tables have internal storage locations under __unitystorage.
+            # Databricks blocks direct reads of these locations (LOCATION_OVERLAP); resolve to a UC table name if possible.
+            if not _is_unity_catalog_path(effective_path):
+                ids = _parse_unity_storage_ids(effective_path)
+                if ids is not None:
+                    resolved = _resolve_uc_table_from_unity_storage_path(spark, effective_path)
+                    if resolved is not None:
+                        logger.info(
+                            "Resolved Unity Catalog managed storage path to table: %s (from %s)",
+                            resolved,
+                            effective_path,
+                        )
+                        effective_path = resolved
+                        self.table_path = resolved
+                    else:
+                        raise RuntimeError(
+                            "This looks like a Unity Catalog managed-table storage location (contains '__unitystorage'). "
+                            "Databricks blocks direct path access to UC managed storage. "
+                            "Pass the Unity Catalog table name in `catalog.schema.table` format (or "
+                            "`delta://catalog.schema.table`) instead of the underlying cloud path.\n"
+                            f"Provided: {effective_path}\n"
+                            f"Detected table_id: {ids.get('table_id')}"
+                        )
+
+            if _is_unity_catalog_path(effective_path):
                 if self.version is not None:
                     col_select = (
                         ", ".join([f"`{c}`" for c in self.columns]) if self.columns else "*"
                     )
                     df = spark.sql(
-                        f"SELECT {col_select} FROM {self.table_path} VERSION AS OF {int(self.version)}"
+                        f"SELECT {col_select} FROM {effective_path} VERSION AS OF {int(self.version)}"
                     )
                 else:
-                    df = spark.table(self.table_path)
+                    df = spark.table(effective_path)
                     if self.columns:
                         df = df.select(*self.columns)
             else:
                 reader = spark.read.format("delta")
                 if self.version is not None:
                     reader = reader.option("versionAsOf", str(int(self.version)))
-                df = reader.load(self.table_path)
+                df = reader.load(effective_path)
                 if self.columns:
                     df = df.select(*self.columns)
         except Exception as e:  # noqa: BLE001
+            # Common Databricks failure when users pass the managed storage path for a UC table.
+            if _is_location_overlap_error(e) and not _is_unity_catalog_path(self.table_path):
+                raise RuntimeError(
+                    "Spark refused to read this Delta location because it overlaps with Unity Catalog managed storage "
+                    "(LOCATION_OVERLAP / CheckPathAccess). If this Delta table is managed by Unity Catalog, pass the "
+                    "table name in `catalog.schema.table` format (or `delta://catalog.schema.table`) instead of the "
+                    "underlying cloud path.\n"
+                    f"Provided: {self.table_path}"
+                ) from e
             raise RuntimeError(f"Failed to read Delta table via Spark: {e}") from e
 
         for row in df.toLocalIterator():
