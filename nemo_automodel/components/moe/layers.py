@@ -730,7 +730,7 @@ class Gate(nn.Module):
         else:
             self.bias = None
 
-        # CRITICAL: e_score_correction_bias must ALWAYS be created and ALWAYS be float32.
+        # e_score_correction_bias must be created and be float32.
         # HF models have trained bias values saved in checkpoints that affect routing.
         # We must create the buffer to load these values, even if bias_update_factor=0.
         # The bias_update_factor only controls whether we UPDATE the bias during training,
@@ -797,8 +797,6 @@ class Gate(nn.Module):
 
             if self.n_groups > 1:
                 scores = scores.view(x.size(0), self.n_groups, -1)
-                # When bias is used (non-zero), use topk(2) sum for group scores.
-                # When bias is all zeros, this is equivalent to amax but keeps code consistent.
                 group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
 
                 indices = group_scores.topk(self.topk_groups, dim=-1)[1]
