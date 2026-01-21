@@ -463,8 +463,7 @@ def quick_geglu_deepep(
     out_glu = gate_out * torch.sigmoid(alpha * gate_out)
     # Note we add an extra bias of 1 to the linear layer
     inter = out_glu * (up_out + linear_offset)
-    # Keep in input dtype - let caller handle final dtype conversion
-    return inter * permuted_probs
+    return (inter * permuted_probs).to(x.dtype)
 
 
 @torch.compile
@@ -475,7 +474,6 @@ def relu2_deepep(x, permuted_probs):
     x already has shape [..., inter_dim] from efficient up_proj.
     """
     inter = F.relu(x).pow(2)
-    # Cast back to input dtype since permuted_probs may be float32 and grouped_gemm requires bfloat16
     return (inter * permuted_probs).to(x.dtype)
 
 
