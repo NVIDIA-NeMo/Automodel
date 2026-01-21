@@ -122,24 +122,21 @@ class MLP(nn.Module):
             bias (bool): Whether to use bias in linear layers.
         """
         super().__init__()
-        self.activation = activation
+        if activation not in ("swiglu", "relu2"):
+            raise ValueError(f"Unsupported activation: {activation}. Choose 'swiglu' or 'relu2'.")
 
-        if activation == "swiglu":
-            # SwiGLU: gate_proj and up_proj for gating
-            self.gate_proj = initialize_linear_module(
-                linear_impl=backend, in_features=dim, out_features=inter_dim, bias=bias, dtype=dtype
-            )
+        self.activation = activation
+        self.is_gated = is_gated_activation(activation)
+
+        self.gate_proj = initialize_linear_module(
+            linear_impl=backend, in_features=dim, out_features=inter_dim, bias=bias, dtype=dtype
+        )
+        if self.is_gated:
             self.up_proj = initialize_linear_module(
                 linear_impl=backend, in_features=dim, out_features=inter_dim, bias=bias, dtype=dtype
             )
-        elif activation == "relu2":
-            # ReLU²: only gate_proj (used as up_proj), no gating
-            self.gate_proj = initialize_linear_module(
-                linear_impl=backend, in_features=dim, out_features=inter_dim, bias=bias, dtype=dtype
-            )
-            self.up_proj = None
         else:
-            raise ValueError(f"Unsupported activation: {activation}. Choose 'swiglu' or 'relu2'.")
+            self.up_proj = None
 
         self.down_proj = initialize_linear_module(
             linear_impl=backend, in_features=inter_dim, out_features=dim, bias=bias, dtype=dtype
@@ -155,9 +152,9 @@ class MLP(nn.Module):
         Returns:
             torch.Tensor: Output tensor after MLP computation.
         """
-        if self.activation == "swiglu":
+        if self.is_gated:
             return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-        elif self.activation == "relu2":
+        else:
             return self.down_proj(F.relu(self.gate_proj(x)).pow(2))
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
