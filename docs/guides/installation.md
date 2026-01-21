@@ -41,17 +41,17 @@ This installs the latest stable release of NeMo Automodel from PyPI, along with 
 ### Install via NeMo Docker Container
 You can use NeMo Automodel with the NeMo Docker container. Pull the container by running:
 ```bash
-docker pull nvcr.io/nvidia/nemo:25.07
+docker pull nvcr.io/nvidia/nemo-automodel:25.11.00
 ```
 :::{note}
-The above `docker` command uses the `25.07` container. Use the most recent container version to ensure you get the latest version of Automodel and its dependencies like torch, transformers, etc.
+The above `docker` command uses the `25.11.00` container. Use the most recent container version to ensure you get the latest version of Automodel and its dependencies like torch, transformers, etc.
 :::
 
 Then you can enter the container using:
 ```bash
 docker run --gpus all -it --rm \
   --shm-size=8g \
-  nvcr.io/nvidia/nemo:25.07
+  nvcr.io/nvidia/nemo-automodel:25.11.00
 ```
 
 ---
@@ -96,15 +96,15 @@ To run `Automodel` inside a NeMo container while **mounting your local repo**, f
 # Step 1: Clone the Automodel repository.
 git clone https://github.com/NVIDIA-NeMo/Automodel.git && cd Automodel && \
 
-# Step 2: Pull the latest compatible NeMo container (replace 25.07 with latest if needed).
-docker pull nvcr.io/nvidia/nemo:25.07 && \
+# Step 2: Pull the latest compatible NeMo container (replace 25.11.00 with latest if needed).
+docker pull nvcr.io/nvidia/nemo-automodel:25.11.00 && \
 
 # Step 3: Run the NeMo container with GPU support, shared memory, and mount the repo.
 docker run --gpus all -it --rm \
   -v $(pwd):/workspace/Automodel \         # Mount repo into container workspace
   -v $(pwd)/Automodel:/opt/Automodel \     # Optional: Mount Automodel under /opt for flexibility
   --shm-size=8g \                           # Increase shared memory for PyTorch/data loading
-  nvcr.io/nvidia/nemo:25.07 /bin/bash -c "\
+  nvcr.io/nvidia/nemo-automodel:25.11.00 /bin/bash -c "\
     cd /workspace/Automodel && \           # Enter the mounted repo
     pip install -e . && \                  # Install Automodel in editable mode
     python3 examples/llm/finetune.py" # Run a usage example

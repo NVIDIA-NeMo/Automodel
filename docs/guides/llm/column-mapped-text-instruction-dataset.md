@@ -252,7 +252,7 @@ slurm:
   time: 00:30:00
   account: your_account
   partition: gpu
-  container_image: nvcr.io/nvidia/nemo:25.07
+  container_image: nvcr.io/nvidia/nemo-automodel:25.11.00
   gpus_per_node: 8
 ```
 
@@ -276,7 +276,7 @@ slurm:
   time: 02:00:00 # Maximum job runtime (format: `HH:MM:SS`)
   account: your_account # Slurm account to charge resources to
   partition: gpu # Slurm partition to submit to
-  container_image: nvcr.io/nvidia/nemo:25.07 # Container image to use for the job
+  container_image: nvcr.io/nvidia/nemo-automodel:25.11.00 # Container image to use for the job
   gpus_per_node: 8 # Number of GPUs per node (adds `#SBATCH --gpus-per-node=N`)
   # Optional: Add extra mount points if needed
   extra_mounts: # Additional mount points for the container

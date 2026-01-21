@@ -59,7 +59,7 @@ slurm:
   time: 00:30:00
   account: your_account
   partition: gpu
-  container_image: nvcr.io/nvidia/nemo:25.07
+  container_image: nvcr.io/nvidia/nemo-automodel:25.11.00
   gpus_per_node: 8 # Adds an SBATCH line: "#SBATCH --gpus-per-node=8"
   # Optional: Add extra mount points if needed
   extra_mounts:
