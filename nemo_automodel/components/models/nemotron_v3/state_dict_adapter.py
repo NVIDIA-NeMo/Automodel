@@ -48,11 +48,10 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
 
     For MoE layers:
         - HF: Split per-expert weights (experts.{}.up_proj.weight, experts.{}.down_proj.weight)
-        - Internal: Merged expert weights (experts.up_projs, experts.down_projs)
+        - Internal: Merged expert weights (experts.gate_and_up_projs, experts.down_projs)
 
-    NemotronV3 uses ReLU² activation (non-gated), so experts only need up_projs
-    with shape [n_experts, dim, inter_dim] instead of gate_and_up_projs with
-    shape [n_experts, dim, 2*inter_dim]. This saves 50% memory.
+    NemotronV3 uses ReLU² activation (non-gated), so gate_and_up_projs has
+    shape [n_experts, dim, inter_dim] instead of [n_experts, dim, 2*inter_dim].
 
     Note: NemotronV3 uses 'mixer' instead of 'mlp' in layer paths.
     """
@@ -71,10 +70,8 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         self._uses_model_prefix = True
 
         # Mapping for expert weights (HF split → internal merged)
-        # NemotronV3 uses ReLU² (non-gated), so up_proj -> up_projs (not gate_and_up_projs)
-        # This saves 50% memory by not duplicating weights.
         self.from_hf_map = {
-            "model.layers.{}.mixer.experts.{}.up_proj.weight": "model.layers.{}.mixer.experts.up_projs",
+            "model.layers.{}.mixer.experts.{}.up_proj.weight": "model.layers.{}.mixer.experts.gate_and_up_projs",
             "model.layers.{}.mixer.experts.{}.down_proj.weight": "model.layers.{}.mixer.experts.down_projs",
         }
 
@@ -203,9 +200,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
                     expert_weights_by_layer[layer_num] = {}
 
                 if which == "up_proj":
-                    # NemotronV3 uses ReLU² (non-gated), so use up_projs directly
-                    # This saves 50% memory by not duplicating weights into gate_and_up_projs
-                    native_key = f"model.layers.{layer_num}.mixer.experts.up_projs"
+                    native_key = f"model.layers.{layer_num}.mixer.experts.gate_and_up_projs"
                 else:  # down_proj
                     native_key = f"model.layers.{layer_num}.mixer.experts.down_projs"
 
@@ -213,7 +208,6 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
                     expert_weights_by_layer[layer_num][native_key] = {}
 
                 if which == "up_proj":
-                    # Store up_proj directly (no duplication needed for ReLU²)
                     expert_weights_by_layer[layer_num][native_key][expert_num] = value
 
                     if len(expert_weights_by_layer[layer_num][native_key]) == expected_experts_per_rank:
@@ -281,8 +275,8 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         # For to_hf conversion, we always want backbone. prefix
         prefix = "backbone."
 
-        # Handle up_projs (NemotronV3 uses ReLU², non-gated activation)
-        if ".mixer.experts.up_projs" in fqn and fqn.endswith(".up_projs"):
+        # Handle gate_and_up_projs (maps to HF up_proj for non-gated activations like ReLU²)
+        if ".mixer.experts.gate_and_up_projs" in fqn and fqn.endswith(".gate_and_up_projs"):
             layer_num = re.search(r"layers\.(\d+)", fqn).group(1)
 
             from nemo_automodel.components.moe.state_dict_utils import (
@@ -291,7 +285,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             )
 
             if is_dtensor(tensor):
-                validate_dtensor_expert_sharding(tensor, n_experts, f"up_projs layer {layer_num}")
+                validate_dtensor_expert_sharding(tensor, n_experts, f"gate_and_up_projs layer {layer_num}")
 
             splits = self._split_experts_weights(tensor, n_experts)
             result = []
