@@ -71,13 +71,10 @@ class MoEConfig:
     shared_expert_gate: bool = False
     shared_expert_inter_dim: int | None = None
     shared_expert_activation: str = "swiglu"  # Activation for shared experts ("swiglu" or "relu2")
-    accumulation_dtype: str | torch.dtype | None = None  # If None, use input dtype; else accumulate in this dtype
 
     def __post_init__(self):
         if isinstance(self.dtype, str):
             self.dtype = dtype_from_str(self.dtype, default=torch.bfloat16)
-        if isinstance(self.accumulation_dtype, str):
-            self.accumulation_dtype = dtype_from_str(self.accumulation_dtype, default=None)
 
 
 def is_gated_activation(activation: str) -> bool:
@@ -363,11 +360,7 @@ class GroupedExperts(nn.Module):
             local_proj = proj.to_local() if isinstance(proj, DTensor) else proj
             return local_proj[expert_id - experts_start_idx]
 
-        # Use accumulation_dtype if specified for higher precision accumulation
-        if self.config.accumulation_dtype is not None:
-            y = torch.zeros_like(x, dtype=self.config.accumulation_dtype)
-        else:
-            y = torch.zeros_like(x)
+        y = torch.zeros_like(x)
 
         active_local_experts = 0
         for i in range(experts_start_idx, experts_end_idx):
@@ -411,9 +404,7 @@ class GroupedExperts(nn.Module):
                     * weights[idx, top, None]
                 )
 
-            # Convert to accumulation dtype or input dtype depending on config
-            target_dtype = self.config.accumulation_dtype if self.config.accumulation_dtype is not None else x.dtype
-            y.scatter_add_(dim=0, index=idx_b, src=expert_out.to(target_dtype))
+            y.scatter_add_(dim=0, index=idx_b, src=expert_out.to(x.dtype))
 
         # Handle the edge case where no tokens are routed to any local experts.
         # This can occur during expert parallelism when all tokens on a particular
@@ -451,10 +442,6 @@ class GroupedExperts(nn.Module):
             y = DTensor.from_local(y, device_mesh=ep_mesh, placements=[Partial()])
             y = y.redistribute(placements=[Shard(0)]).to_local()
 
-        # Convert back to input dtype if we accumulated in higher precision
-        if self.config.accumulation_dtype is not None:
-            y = y.type(x.dtype)
-
         return y
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
@@ -488,8 +475,8 @@ def relu2_deepep(x, permuted_probs):
     x already has shape [..., inter_dim] from efficient up_proj.
     """
     inter = F.relu(x).pow(2)
-    # Keep in input dtype - let caller handle final dtype conversion
-    return inter * permuted_probs
+    # Cast back to input dtype since permuted_probs may be float32 and grouped_gemm requires bfloat16
+    return (inter * permuted_probs).to(x.dtype)
 
 
 def get_expert_activation_for_deepep(config: MoEConfig):
@@ -663,21 +650,11 @@ class GroupedExpertsDeepEP(nn.Module):
         )
         permuted_probs = permuted_probs.unsqueeze(-1)
 
-        # Convert to accumulation dtype if specified for higher precision
-        if self.config.accumulation_dtype is not None:
-            permuted_local_hidden_states = permuted_local_hidden_states.to(dtype=self.config.accumulation_dtype)
-            # Also convert weights to accumulation dtype
-            if self.is_gated:
-                up_proj_tensor = self.gate_and_up_projs.to_local().to(dtype=self.config.accumulation_dtype)
-            else:
-                up_proj_tensor = self.up_projs.to_local().to(dtype=self.config.accumulation_dtype)
-            down_projs = self.down_projs.to_local().to(dtype=self.config.accumulation_dtype)
+        if self.is_gated:
+            up_proj_tensor = self.gate_and_up_projs.to_local()
         else:
-            if self.is_gated:
-                up_proj_tensor = self.gate_and_up_projs.to_local()
-            else:
-                up_proj_tensor = self.up_projs.to_local()
-            down_projs = self.down_projs.to_local()
+            up_proj_tensor = self.up_projs.to_local()
+        down_projs = self.down_projs.to_local()
 
         if torch.count_nonzero(tokens_per_expert) > 0:
             output1 = ops.gmm(
@@ -692,8 +669,6 @@ class GroupedExpertsDeepEP(nn.Module):
                     up_bias = self.gate_up_proj_bias.to_local()
                 else:
                     up_bias = self.up_proj_bias.to_local()
-                if self.config.accumulation_dtype is not None:
-                    up_bias = up_bias.to(dtype=self.config.accumulation_dtype)
                 output1 = self._apply_bias(output1, up_bias, tokens_per_expert)
 
             output1 = self.expert_activation(output1, permuted_probs)
@@ -701,17 +676,11 @@ class GroupedExpertsDeepEP(nn.Module):
 
             if self.expert_bias:
                 down_bias = self.down_proj_bias.to_local()
-                if self.config.accumulation_dtype is not None:
-                    down_bias = down_bias.to(dtype=self.config.accumulation_dtype)
                 output2 = self._apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
         else:
             output1 = torch.matmul(x[0] * 0, up_proj_tensor[0])
             output1_ = self.expert_activation(output1, permuted_probs)
             output2 = torch.matmul(output1_, down_projs[0])
-
-        # Convert back to input dtype if we accumulated in higher precision
-        if self.config.accumulation_dtype is not None:
-            output2 = output2.to(dtype=x.dtype)
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
@@ -791,7 +760,6 @@ class Gate(nn.Module):
         self,
         config: MoEConfig,
         gate_precision: torch.dtype | None = None,
-        gate_output_dtype: torch.dtype | None = None,
     ):
         """
         Initializes the Gate module.
@@ -799,7 +767,6 @@ class Gate(nn.Module):
         Args:
             config (MoEConfig): Model configuration containing gating parameters.
             gate_precision (torch.dtype | None): Precision for gate computations (linear, softmax/sigmoid).
-            gate_output_dtype (torch.dtype | None): Output dtype for weights. If None, uses input dtype.
         """
         super().__init__()
         self.dim = config.dim
@@ -815,7 +782,6 @@ class Gate(nn.Module):
         self.aux_loss_coeff = config.aux_loss_coeff
         self.norm_topk_prob = config.norm_topk_prob
         self.gate_precision = gate_precision
-        self.gate_output_dtype = gate_output_dtype
 
         if self.bias_update_factor > 0:
             assert self.train_gate, "Require train_gate to be set to True to apply the bias update"
@@ -916,9 +882,7 @@ class Gate(nn.Module):
 
         weights = weights * self.route_scale
 
-        # Convert back to original dtype if gate_precision was used,
-        # unless we're going to convert to gate_output_dtype instead
-        if self.gate_precision is not None and self.gate_output_dtype is None:
+        if self.gate_precision is not None:
             weights = weights.to(dtype=original_dtype)
             original_scores = original_scores.to(dtype=original_dtype)
 
@@ -939,13 +903,7 @@ class Gate(nn.Module):
             # To correct this scaling, we need to scale the aux_loss by number of tokens here.
             MoEAuxLossAutoScaler.apply(weights, aux_loss * weights.shape[0])
 
-        # Convert output weights to specified dtype, or back to input dtype if not specified
-        if self.gate_output_dtype is not None:
-            weights = weights.to(dtype=self.gate_output_dtype)
-        else:
-            weights = weights.type_as(x)
-
-        return weights, indices, aux_loss
+        return weights.type_as(x), indices, aux_loss
 
     def update_bias(self) -> None:
         """
@@ -1113,7 +1071,7 @@ class MoE(nn.Module):
         if backend.fake_balanced_gate:
             self.gate = FakeBalancedGate(config)
         else:
-            self.gate = Gate(config, gate_precision=backend.gate_precision, gate_output_dtype=backend.gate_output_dtype)
+            self.gate = Gate(config, gate_precision=backend.gate_precision)
         if backend.enable_deepep and get_world_size_safe() == 1:
             warnings.warn(
                 "DeepEP is enabled in config, but world size is 1. "

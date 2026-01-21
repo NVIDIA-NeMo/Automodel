@@ -73,7 +73,6 @@ class NemotronV3Model(nn.Module):
             shared_expert_gate=False,
             shared_expert_inter_dim=config.moe_shared_expert_intermediate_size,
             shared_expert_activation="relu2",  # Use ReLU² for shared experts
-            accumulation_dtype=torch.float32,  # Use float32 for accumulation precision
         )
 
         # Embeddings
@@ -245,7 +244,7 @@ class NemotronV3Model(nn.Module):
                 moe_module.shared_experts.down_proj.weight /= math.sqrt(self.config.num_hidden_layers)
 
 
-class NemotronV3ForCausalLM(nn.Module, MoEFSDPSyncMixin):
+class NemotronHForCausalLM(nn.Module, MoEFSDPSyncMixin):
     """NemotronV3 model with language modeling head."""
 
     @classmethod
@@ -263,7 +262,7 @@ class NemotronV3ForCausalLM(nn.Module, MoEFSDPSyncMixin):
             **kwargs: Additional arguments
 
         Returns:
-            NemotronV3ForCausalLM instance
+            NemotronHForCausalLM instance
         """
         return cls(config, backend, **kwargs)
 
@@ -282,7 +281,7 @@ class NemotronV3ForCausalLM(nn.Module, MoEFSDPSyncMixin):
             **kwargs: Additional keyword arguments
 
         Returns:
-            NemotronV3ForCausalLM instance
+            NemotronHForCausalLM instance
         """
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
         return cls.from_config(config, *model_args, **kwargs)
@@ -381,4 +380,4 @@ class NemotronV3ForCausalLM(nn.Module, MoEFSDPSyncMixin):
 
 
 # Alias for consistency with other models
-ModelClass = NemotronV3ForCausalLM
+ModelClass = NemotronHForCausalLM

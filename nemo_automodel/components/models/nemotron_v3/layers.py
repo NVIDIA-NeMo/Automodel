@@ -372,15 +372,20 @@ class NemotronV3Block(nn.Module):
             if backend is None:
                 backend = BackendConfig()
 
-            # Ensure backend has necessary settings for NemotronV3
+            # Use float32 for gate computation (numerical stability)
             if backend.gate_precision is None:
                 backend.gate_precision = torch.float32
-            if backend.gate_output_dtype is None:
-                backend.gate_output_dtype = torch.float32
 
             self.mixer = MoE(moe_config, backend)
         else:
             raise ValueError(f"Invalid block_type: {self.block_type}")
+
+    @property
+    def mlp(self):
+        """Return mixer for MoE blocks for compatibility with parallelizer."""
+        if self.block_type == "moe":
+            return self.mixer
+        return None
 
     def forward(
         self,
