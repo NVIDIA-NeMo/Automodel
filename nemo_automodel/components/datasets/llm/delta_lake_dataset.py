@@ -747,8 +747,6 @@ def load_delta_lake_dataset(
 
     # Return HF-compatible wrapper if datasets library is available
     try:
-        from datasets import Dataset, IterableDataset
-
         return HFDeltaLakeDataset(
             table_path=path,
             columns=columns,
