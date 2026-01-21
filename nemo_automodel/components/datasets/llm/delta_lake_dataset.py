@@ -313,9 +313,7 @@ def _resolve_uc_table_from_unity_storage_path(spark: Any, path: str) -> Optional
     # Try a few storage path variants (some APIs include/omit trailing slash).
     loc_variants = {path, path.rstrip("/"), f"{path.rstrip('/')}/"}
     for loc in loc_variants:
-        resolved = _try_resolve_uc_table_from_system_tables(
-            spark, table_id=ids.get("table_id"), storage_location=loc
-        )
+        resolved = _try_resolve_uc_table_from_system_tables(spark, table_id=ids.get("table_id"), storage_location=loc)
         if resolved is not None:
             return resolved
     return None
@@ -441,12 +439,8 @@ class DeltaLakeIterator:
 
             if _is_unity_catalog_path(effective_path):
                 if self.version is not None:
-                    col_select = (
-                        ", ".join([f"`{c}`" for c in self.columns]) if self.columns else "*"
-                    )
-                    df = spark.sql(
-                        f"SELECT {col_select} FROM {effective_path} VERSION AS OF {int(self.version)}"
-                    )
+                    col_select = ", ".join([f"`{c}`" for c in self.columns]) if self.columns else "*"
+                    df = spark.sql(f"SELECT {col_select} FROM {effective_path} VERSION AS OF {int(self.version)}")
                 else:
                     df = spark.table(effective_path)
                     if self.columns:
@@ -941,4 +935,3 @@ class _LimitedDeltaLakeDataset:
 
     def take(self, n: int):
         return _LimitedDeltaLakeDataset(self._base, min(n, self._limit))
-
