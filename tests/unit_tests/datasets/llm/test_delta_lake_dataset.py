@@ -24,6 +24,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+def _deltalake_available():
+    """Helper to check if deltalake is available."""
+    try:
+        import deltalake  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
 class TestIsDeltaLakePath:
     """Tests for the is_delta_lake_path function."""
 
@@ -351,13 +361,4 @@ class TestDeletionVectorsFallback:
                     it = mod.DeltaLakeIterator(table_path="delta:///tmp/table")
                     with pytest.raises(ImportError, match=r"Spark|pyspark|Databricks"):
                         _ = list(it)
-
-
-def _deltalake_available():
-    """Helper to check if deltalake is available."""
-    try:
-        import deltalake  # noqa: F401
-        return True
-    except ImportError:
-        return False
 
