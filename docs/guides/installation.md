@@ -44,7 +44,7 @@ You can use NeMo Automodel with the NeMo Docker container. Pull the container by
 docker pull nvcr.io/nvidia/nemo-automodel:25.11.00
 ```
 :::{note}
-The above `docker` command uses the `25.11.00` container. Use the most recent container version to ensure you get the latest version of Automodel and its dependencies like torch, transformers, etc.
+The above `docker` command uses the [`25.11.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=25.11.00) container. Use the [most recent container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) version to ensure you get the latest version of Automodel and its dependencies like torch, transformers, etc.
 :::
 
 Then you can enter the container using:
@@ -96,7 +96,7 @@ To run `Automodel` inside a NeMo container while **mounting your local repo**, f
 # Step 1: Clone the Automodel repository.
 git clone https://github.com/NVIDIA-NeMo/Automodel.git && cd Automodel && \
 
-# Step 2: Pull the latest compatible NeMo container (replace 25.11.00 with latest if needed).
+# Step 2: Pull the latest compatible NeMo container (replace `25.11.00` with [latest](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=25.11.00) if needed).
 docker pull nvcr.io/nvidia/nemo-automodel:25.11.00 && \
 
 # Step 3: Run the NeMo container with GPU support, shared memory, and mount the repo.
