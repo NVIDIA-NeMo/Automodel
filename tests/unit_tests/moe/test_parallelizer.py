@@ -175,6 +175,26 @@ def _install_torch_and_layers_stubs(monkeypatch):
 
     cpw_stub.checkpoint_wrapper = checkpoint_wrapper
 
+    # utils module hierarchy
+    utils_stub = types.ModuleType("torch.utils")
+
+    # utils.data
+    utils_data_stub = types.ModuleType("torch.utils.data")
+
+    class PinMemory:
+        @staticmethod
+        def _pin_memory_loop(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def pin_memory(*args, **kwargs):
+            pass
+
+    class DataUtils:
+        pin_memory = PinMemory
+
+    utils_data_stub._utils = DataUtils
+
     # utils.checkpoint
     utils_checkpoint_stub = types.ModuleType("torch.utils.checkpoint")
 
@@ -233,6 +253,8 @@ def _install_torch_and_layers_stubs(monkeypatch):
         "torch.distributed.algorithms._checkpoint.checkpoint_wrapper",
         cpw_stub,
     )
+    monkeypatch.setitem(sys.modules, "torch.utils", utils_stub)
+    monkeypatch.setitem(sys.modules, "torch.utils.data", utils_data_stub)
     monkeypatch.setitem(sys.modules, "torch.utils.checkpoint", utils_checkpoint_stub)
 
     # Stub heavy layers import as well to avoid real dependencies
@@ -427,8 +449,8 @@ def test_apply_ac_wraps_blocks_with_and_without_context(monkeypatch):
     blocks = [DummyBlock(), DummyBlock()]
     model = DummyModel(blocks)
 
-    # ignore_router=True path
-    P.apply_ac(model, ignore_router=True)
+    # ignore_router=True path - provide explicit hidden_size and num_experts
+    P.apply_ac(model, ignore_router=True, hidden_size=7168, num_experts=256)
     assert wrapper_mock.call_count == 2
     # registration should replace both blocks
     assert len(model.layers.registered) == 2
@@ -439,7 +461,7 @@ def test_apply_ac_wraps_blocks_with_and_without_context(monkeypatch):
     wrapper_mock.reset_mock()
     model.layers.registered.clear()
 
-    P.apply_ac(model, ignore_router=False)
+    P.apply_ac(model, ignore_router=False, hidden_size=7168, num_experts=256)
     # context_fn should not be passed (3rd arg remains default None)
     for _, kwargs in wrapper_mock.call_args_list:
         assert "context_fn" not in kwargs or kwargs["context_fn"] is None
@@ -522,7 +544,6 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
     P.apply_fsdp(
         model=model,
         fsdp_mesh=fsdp_mesh,
-        pp_enabled=True,
         ep_enabled=True,
         ep_shard_enabled=True,
         ep_shard_mesh=ep_shard_mesh,
@@ -534,7 +555,7 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
     assert experts_call is not None
     _, experts_kwargs = experts_call
     assert experts_kwargs["mesh"] is ep_shard_mesh
-    assert experts_kwargs["reshard_after_forward"] is False  # pp_enabled=True -> not pp == False
+    assert experts_kwargs["reshard_after_forward"] is False
     assert callable(experts_kwargs["shard_placement_fn"])  # lambda _: Shard(1)
 
     # Block should be sharded with ignored_params when ep_enabled
@@ -571,7 +592,6 @@ def test_apply_fsdp_without_ep_enabled_has_no_ignored_params(monkeypatch):
     P.apply_fsdp(
         model=model,
         fsdp_mesh=fsdp_mesh,
-        pp_enabled=False,
         ep_enabled=False,
         ep_shard_enabled=False,
         ep_shard_mesh=None,
@@ -616,7 +636,6 @@ def test_apply_fsdp_handles_multimodal_components(monkeypatch, audio_trainable, 
     P.apply_fsdp(
         model=model,
         fsdp_mesh=object(),
-        pp_enabled=False,
         ep_enabled=False,
         ep_shard_enabled=False,
         ep_shard_mesh=None,
@@ -685,7 +704,6 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
         model=model,
         world_mesh=world_mesh,
         moe_mesh=moe_mesh,
-        pp_enabled=True,
         dp_axis_names=("dp",),
         cp_axis_name=None,
         tp_axis_name=None,
@@ -695,20 +713,18 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     )
     apply_ep_mock.assert_called_once()
     # AC enabled
-    apply_ac_mock.assert_called_once_with(model)
+    apply_ac_mock.assert_called_once_with(model, ignore_router=False)
     # FSDP called with combined flags and derived meshes
     args, kwargs = apply_fsdp_mock.call_args
     # handle positional or keyword invocations
     fsdp_model = kwargs.get("model", args[0] if args else None)
     fsdp_mesh_arg = kwargs.get("fsdp_mesh", args[1] if len(args) > 1 else None)
-    pp_enabled = kwargs.get("pp_enabled", args[2] if len(args) > 2 else None)
-    ep_enabled = kwargs.get("ep_enabled", args[3] if len(args) > 3 else None)
-    ep_shard_enabled = kwargs.get("ep_shard_enabled", args[4] if len(args) > 4 else None)
-    ep_shard_mesh_arg = kwargs.get("ep_shard_mesh", args[5] if len(args) > 5 else None)
+    ep_enabled = kwargs.get("ep_enabled", args[2] if len(args) > 2 else None)
+    ep_shard_enabled = kwargs.get("ep_shard_enabled", args[3] if len(args) > 3 else None)
+    ep_shard_mesh_arg = kwargs.get("ep_shard_mesh", args[4] if len(args) > 4 else None)
 
     assert fsdp_model is model
     assert fsdp_mesh_arg.size() == 2
-    assert pp_enabled is True
     assert ep_enabled is True
     assert ep_shard_enabled is True
     assert ep_shard_mesh_arg.size() == 2
@@ -735,7 +751,6 @@ def test_parallelize_model_asserts_on_invalid_tp_cp_and_ep_divisibility(monkeypa
             model=model,
             world_mesh=world_mesh_bad_tp,
             moe_mesh=moe_mesh,
-            pp_enabled=False,
             dp_axis_names=None,
             cp_axis_name=None,
             tp_axis_name="tp",
@@ -752,7 +767,6 @@ def test_parallelize_model_asserts_on_invalid_tp_cp_and_ep_divisibility(monkeypa
             model=model,
             world_mesh=world_mesh_ok,
             moe_mesh=moe_mesh_ep,
-            pp_enabled=False,
             dp_axis_names=("dp",),
             cp_axis_name=None,
             tp_axis_name=None,
@@ -781,7 +795,6 @@ def test_apply_fsdp_with_lm_head_precision_fp32(monkeypatch):
     P.apply_fsdp(
         model=model,
         fsdp_mesh=fsdp_mesh,
-        pp_enabled=False,
         ep_enabled=False,
         ep_shard_enabled=False,
         lm_head_precision=torch_stub.float32,
@@ -822,7 +835,6 @@ def test_apply_fsdp_without_lm_head_precision_uses_default_policy(monkeypatch):
     P.apply_fsdp(
         model=model,
         fsdp_mesh=fsdp_mesh,
-        pp_enabled=False,
         ep_enabled=False,
         ep_shard_enabled=False,
         lm_head_precision=None,
@@ -863,7 +875,6 @@ def test_parallelize_model_passes_lm_head_precision_to_apply_fsdp(monkeypatch):
         model=model,
         world_mesh=world_mesh,
         moe_mesh=moe_mesh,
-        pp_enabled=False,
         dp_axis_names=("dp",),
         lm_head_precision=torch_stub.float32,
     )
@@ -902,7 +913,6 @@ def test_apply_fsdp_with_lm_head_precision_string_input(monkeypatch):
     P.apply_fsdp(
         model=model,
         fsdp_mesh=fsdp_mesh,
-        pp_enabled=False,
         ep_enabled=False,
         ep_shard_enabled=False,
         lm_head_precision="float32",
@@ -949,7 +959,6 @@ def test_parallelize_model_with_lm_head_precision_string_input(monkeypatch):
         model=model,
         world_mesh=world_mesh,
         moe_mesh=moe_mesh,
-        pp_enabled=False,
         dp_axis_names=("dp",),
         lm_head_precision="float32",
     )
@@ -983,7 +992,6 @@ def test_apply_fsdp_with_wrap_outer_model_true(monkeypatch):
     P.apply_fsdp(
         model=outer_model,
         fsdp_mesh=fsdp_mesh,
-        pp_enabled=False,
         ep_enabled=False,
         ep_shard_enabled=False,
         wrap_outer_model=True,
@@ -1021,7 +1029,6 @@ def test_apply_fsdp_with_wrap_outer_model_false(monkeypatch):
     P.apply_fsdp(
         model=outer_model,
         fsdp_mesh=fsdp_mesh,
-        pp_enabled=False,
         ep_enabled=False,
         ep_shard_enabled=False,
         wrap_outer_model=False,
@@ -1053,7 +1060,6 @@ def test_apply_fsdp_wrap_outer_model_no_nested_structure(monkeypatch):
     P.apply_fsdp(
         model=model,
         fsdp_mesh=fsdp_mesh,
-        pp_enabled=False,
         ep_enabled=False,
         ep_shard_enabled=False,
         wrap_outer_model=True,
@@ -1096,7 +1102,6 @@ def test_parallelize_model_passes_wrap_outer_model_to_apply_fsdp(monkeypatch):
         model=model,
         world_mesh=world_mesh,
         moe_mesh=moe_mesh,
-        pp_enabled=False,
         dp_axis_names=("dp",),
         wrap_outer_model=True,
     )
@@ -1132,7 +1137,6 @@ def test_parallelize_model_wrap_outer_model_defaults_to_true(monkeypatch):
         model=model,
         world_mesh=world_mesh,
         moe_mesh=moe_mesh,
-        pp_enabled=False,
         dp_axis_names=("dp",),
     )
 
@@ -1140,3 +1144,243 @@ def test_parallelize_model_wrap_outer_model_defaults_to_true(monkeypatch):
     apply_fsdp_mock.assert_called_once()
     _, kwargs = apply_fsdp_mock.call_args
     assert kwargs.get("wrap_outer_model") is True
+
+
+def test_apply_ac_derives_hidden_size_and_num_experts_from_config(monkeypatch):
+    """Test that apply_ac derives hidden_size and num_experts from model.config."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    captured_hidden_size = None
+    captured_num_experts = None
+
+    def fake_create_selective_checkpoint_contexts(policy_cb):
+        nonlocal captured_hidden_size, captured_num_experts
+        # Extract hidden_size and num_experts by testing the policy
+        torch_stub = sys.modules["torch"]
+        # Test with various shapes to determine what was captured
+        for hs in [128, 256, 512, 1024]:
+            for ne in [8, 16, 32, 64]:
+                rhs = type("Mat", (), {"shape": (hs, ne)})()
+                result = policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs)
+                if result == P.CheckpointPolicy.MUST_SAVE:
+                    captured_hidden_size = hs
+                    captured_num_experts = ne
+                    break
+            if captured_hidden_size is not None:
+                break
+        return "CTX"
+
+    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+        if context_fn is not None:
+            context_fn()  # Trigger the context function to capture values
+        return block
+
+    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
+
+    # Create model with config containing hidden_size and num_experts
+    class Config:
+        hidden_size = 256
+        num_experts = 16
+
+    class ModelWithConfig:
+        def __init__(self):
+            self.config = Config()
+            self.layers = LayerContainer([DummyBlock()])
+
+    model = ModelWithConfig()
+
+    P.apply_ac(model, ignore_router=True)
+
+    assert captured_hidden_size == 256
+    assert captured_num_experts == 16
+
+
+def test_apply_ac_raises_when_hidden_size_not_available(monkeypatch):
+    """Test that apply_ac raises ValueError when hidden_size is not in config and not provided."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    # Model without config
+    class ModelWithoutConfig:
+        def __init__(self):
+            self.layers = LayerContainer([DummyBlock()])
+
+    model = ModelWithoutConfig()
+
+    with pytest.raises(ValueError, match="hidden_size must be provided"):
+        P.apply_ac(model)
+
+
+def test_apply_ac_raises_when_num_experts_not_available(monkeypatch):
+    """Test that apply_ac raises ValueError when num_experts is not in config and not provided."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    # Model with config containing only hidden_size
+    class ConfigPartial:
+        hidden_size = 256
+
+    class ModelPartialConfig:
+        def __init__(self):
+            self.config = ConfigPartial()
+            self.layers = LayerContainer([DummyBlock()])
+
+    model = ModelPartialConfig()
+
+    with pytest.raises(ValueError, match="num_experts must be provided"):
+        P.apply_ac(model)
+
+
+def test_apply_ac_accepts_explicit_hidden_size_and_num_experts(monkeypatch):
+    """Test that apply_ac accepts explicit hidden_size and num_experts parameters."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    captured_hidden_size = None
+    captured_num_experts = None
+
+    def fake_create_selective_checkpoint_contexts(policy_cb):
+        nonlocal captured_hidden_size, captured_num_experts
+        torch_stub = sys.modules["torch"]
+        # Test with the expected explicit values
+        rhs_match = type("Mat", (), {"shape": (512, 32)})()
+        result = policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs_match)
+        if result == P.CheckpointPolicy.MUST_SAVE:
+            captured_hidden_size = 512
+            captured_num_experts = 32
+        return "CTX"
+
+    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+        if context_fn is not None:
+            context_fn()
+        return block
+
+    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
+
+    # Model without config - should work with explicit params
+    class ModelWithoutConfig:
+        def __init__(self):
+            self.layers = LayerContainer([DummyBlock()])
+
+    model = ModelWithoutConfig()
+
+    P.apply_ac(model, ignore_router=True, hidden_size=512, num_experts=32)
+
+    assert captured_hidden_size == 512
+    assert captured_num_experts == 32
+
+
+def test_apply_ac_explicit_params_override_config(monkeypatch):
+    """Test that explicit hidden_size and num_experts override model.config values."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    captured_hidden_size = None
+    captured_num_experts = None
+
+    def fake_create_selective_checkpoint_contexts(policy_cb):
+        nonlocal captured_hidden_size, captured_num_experts
+        torch_stub = sys.modules["torch"]
+        # Test with explicit override values
+        rhs_match = type("Mat", (), {"shape": (1024, 64)})()
+        result = policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs_match)
+        if result == P.CheckpointPolicy.MUST_SAVE:
+            captured_hidden_size = 1024
+            captured_num_experts = 64
+        return "CTX"
+
+    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+        if context_fn is not None:
+            context_fn()
+        return block
+
+    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
+
+    # Model with config
+    class Config:
+        hidden_size = 256
+        num_experts = 16
+
+    class ModelWithConfig:
+        def __init__(self):
+            self.config = Config()
+            self.layers = LayerContainer([DummyBlock()])
+
+    model = ModelWithConfig()
+
+    # Explicit params should override config
+    P.apply_ac(model, ignore_router=True, hidden_size=1024, num_experts=64)
+
+    assert captured_hidden_size == 1024
+    assert captured_num_experts == 64
+
+
+def test_parallelize_model_passes_ignore_router_for_ac_to_apply_ac(monkeypatch):
+    """Test that parallelize_model passes ignore_router_for_ac to apply_ac."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    apply_ac_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_ac", apply_ac_mock)
+    monkeypatch.setattr(P, "apply_ep", MagicMock())
+    monkeypatch.setattr(P, "apply_fsdp", MagicMock())
+
+    world_mesh = FakeWorldMesh({("dp",): 2}, mesh_dim_names=["dp"])
+    moe_mesh = None
+
+    class Inner:
+        def __init__(self):
+            self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+
+    class Outer:
+        def __init__(self):
+            self.model = Inner()
+
+    model = Outer()
+
+    P.parallelize_model(
+        model=model,
+        world_mesh=world_mesh,
+        moe_mesh=moe_mesh,
+        dp_axis_names=("dp",),
+        activation_checkpointing=True,
+        ignore_router_for_ac=True,
+    )
+
+    # Verify apply_ac was called with ignore_router=True
+    apply_ac_mock.assert_called_once()
+    args, kwargs = apply_ac_mock.call_args
+    assert args[0] is model
+    assert kwargs.get("ignore_router") is True
+
+
+def test_parallelize_model_ignore_router_for_ac_defaults_to_false(monkeypatch):
+    """Test that parallelize_model defaults ignore_router_for_ac to False."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    apply_ac_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_ac", apply_ac_mock)
+    monkeypatch.setattr(P, "apply_ep", MagicMock())
+    monkeypatch.setattr(P, "apply_fsdp", MagicMock())
+
+    world_mesh = FakeWorldMesh({("dp",): 2}, mesh_dim_names=["dp"])
+    moe_mesh = None
+
+    class Inner:
+        def __init__(self):
+            self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+
+    class Outer:
+        def __init__(self):
+            self.model = Inner()
+
+    model = Outer()
+
+    P.parallelize_model(
+        model=model,
+        world_mesh=world_mesh,
+        moe_mesh=moe_mesh,
+        dp_axis_names=("dp",),
+        activation_checkpointing=True,
+    )
+
+    # Verify apply_ac was called with ignore_router=False (default)
+    apply_ac_mock.assert_called_once()
+    args, kwargs = apply_ac_mock.call_args
+    assert kwargs.get("ignore_router") is False
