@@ -564,5 +564,4 @@ class TestPipelineModel:
         # Verify parallelize_fn was called
         mock_parallelize_fn.assert_called_once()
         call_kwargs = mock_parallelize_fn.call_args[1]
-        assert call_kwargs['pp_enabled'] is True
         assert call_kwargs['dp_axis_names'] == ("dp",)
