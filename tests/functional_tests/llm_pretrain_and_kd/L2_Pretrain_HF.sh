@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020-2025, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,16 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from tests.utils.test_utils import run_test_script
-import shutil
+#!/bin/bash
+set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
-TEST_FOLDER = "moe_peft"
-HF_PEFT_DEEPSEEK_MOE_LORA_FILENAME = "L2_HF_PEFT_DeepSeek_MoE_LoRA.sh"
+export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
+export CUDA_VISIBLE_DEVICES="0,1"
 
-class TestMoEPEFT:
-    def test_hf_peft_deepseek_moe_lora(self):
-        try:
-            run_test_script(TEST_FOLDER, HF_PEFT_DEEPSEEK_MOE_LORA_FILENAME)
-        finally:
-            # remove the checkpoint directory
-            shutil.rmtree("checkpoints/", ignore_errors=True)
+TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run \
+--nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
+examples/llm_pretrain/pretrain.py \
+--config tests/functional_tests/llm_pretrain_and_kd/nanogpt_pretrain_hf.yaml
