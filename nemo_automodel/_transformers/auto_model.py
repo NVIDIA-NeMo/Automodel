@@ -406,6 +406,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel
         )
         hf_config = get_hf_config(pretrained_model_name_or_path, attn_implementation, kwargs)
+        # Optional state-dict key remapping used by NeMo checkpointer when loading
+        # weights from HF safetensors into the instantiated model.
+        checkpoint_key_mapping = kwargs.get("key_mapping", None)
 
         def _retry(**override):
             """Internal helper to re-enter this function with patched args."""
@@ -429,7 +432,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         # 1. if force_hf is True, we will use the parent class to load and return the model as is
         if force_hf:
-            return cls._from_pretrained_parent_class(
+            model = cls._from_pretrained_parent_class(
                 pretrained_model_name_or_path,
                 *model_args,
                 torch_dtype=torch_dtype,
@@ -437,6 +440,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 quantization_config=quantization_config,
                 **kwargs,
             )
+            if checkpoint_key_mapping is not None:
+                setattr(model, "_checkpoint_conversion_mapping", checkpoint_key_mapping)
+            if hasattr(model, "config"):
+                model.config.update({"nemo_version": __version__})
+            return model
         architectures = get_architectures(hf_config)
         # 2. If we have a custom model implementation available, we prioritize that over HF
         if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
@@ -445,9 +453,15 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             logger.info(f"Using custom model implementation for {architectures[0]}")
             kwargs.pop("trust_remote_code", None)
             # TODO(@akoumpa): restore weights after initialization.
+            custom_key_mapping = kwargs.pop("key_mapping", checkpoint_key_mapping)
             model_cls = ModelRegistry.model_arch_name_to_cls[architectures[0]]
             with local_torch_dtype(torch_dtype, model_cls.__name__):
-                return model_cls(hf_config, *model_args, **kwargs)
+                model = model_cls(hf_config, *model_args, **kwargs)
+            if custom_key_mapping is not None:
+                setattr(model, "_checkpoint_conversion_mapping", custom_key_mapping)
+            if hasattr(model, "config"):
+                model.config.update({"nemo_version": __version__})
+            return model
 
         # 3. fallback to parent class
         model = None
@@ -489,6 +503,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             return _retry(use_sdpa_patching=False)
 
         _verify_sdpa_support(model, is_hf_model, cp_size)
+
+        if checkpoint_key_mapping is not None:
+            setattr(model, "_checkpoint_conversion_mapping", checkpoint_key_mapping)
 
         model.config.update({"nemo_version": __version__})
         return model
@@ -560,6 +577,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         attn_implementation, use_liger_kernel = _apply_preload_overrides(
             is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel
         )
+        checkpoint_key_mapping = kwargs.get("key_mapping", None)
 
         def _retry(**override):
             """Internal helper to re-enter this function with patched args."""
@@ -587,19 +605,30 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             )
         # 1. if force_hf is True, we will use the parent class to load and return the model as is
         if force_hf:
-            return cls._from_config_parent_class(
+            model = cls._from_config_parent_class(
                 config,
                 *model_args,
                 attn_implementation=attn_implementation,
                 torch_dtype=torch_dtype,
                 **kwargs,
             )
+            if checkpoint_key_mapping is not None:
+                setattr(model, "_checkpoint_conversion_mapping", checkpoint_key_mapping)
+            if hasattr(model, "config"):
+                model.config.update({"nemo_version": __version__})
+            return model
 
         # 2. If we have a custom model implementation available, we prioritize that over HF
         architectures = get_architectures(config)
         if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
+            custom_key_mapping = kwargs.pop("key_mapping", checkpoint_key_mapping)
             with local_torch_dtype(torch_dtype, ModelRegistry.model_arch_name_to_cls[architectures[0]].__name__):
-                return ModelRegistry.model_arch_name_to_cls[architectures[0]](config, *model_args, **kwargs)
+                model = ModelRegistry.model_arch_name_to_cls[architectures[0]](config, *model_args, **kwargs)
+            if custom_key_mapping is not None:
+                setattr(model, "_checkpoint_conversion_mapping", custom_key_mapping)
+            if hasattr(model, "config"):
+                model.config.update({"nemo_version": __version__})
+            return model
 
         # 3. fallback to parent class
         model = None
@@ -638,6 +667,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             return _retry(use_sdpa_patching=False)
 
         _verify_sdpa_support(model, is_hf_model, cp_size)
+
+        if checkpoint_key_mapping is not None:
+            setattr(model, "_checkpoint_conversion_mapping", checkpoint_key_mapping)
 
         model.config.update({"nemo_version": __version__})
         return model

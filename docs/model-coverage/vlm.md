@@ -33,6 +33,9 @@ NeMo Automodel supports <a href=https://huggingface.co/docs/transformers/main/mo
 | InternVL3.5-4B                     | cord-v2                     | Supported  | Supported  | [internvl_3_5_4b.yaml](../../examples/vlm_finetune/internvl/internvl_3_5_4b.yaml) |
 | Ministral3-{3B,8B,14B}             | MedPix-VQA                  | Supported  | Supported  | [ministral3_3b_medpix.yaml](../../examples/vlm_finetune/mistral/ministral3_3b_medpix.yaml), [ministral3_8b_medpix.yaml](../../examples/vlm_finetune/mistral/ministral3_8b_medpix.yaml), [ministral3_14b_medpix.yaml](../../examples/vlm_finetune/mistral/ministral3_14b_medpix.yaml) |
 | Phi-4-multimodal-instruct          | commonvoice_17_tr_fixed     | Supported  | Supported  | [phi4_mm_cv17.yaml](../../examples/vlm_finetune/phi4/phi4_mm_cv17.yaml) |
+| Step3-VL-10B                       | rdr-items                   | Supported  | Supported  | [step3_vl_10b_rdr.yaml](../../examples/vlm_finetune/step3/step3_vl_10b_rdr.yaml) |
+
+> **Note:** Some models (e.g., Step3-VL-10B) rely on custom Hugging Face code and require `trust_remote_code: true`. Some may also require a checkpoint `key_mapping` to load weights correctly, and processor flags like `fix_mistral_regex: true` as used in the official demo. See the linked example YAML for details.
 
 For detailed instructions on fine-tuning these models using both SFT and PEFT approaches, please refer to the [Gemma 3 and Gemma 3n Fine-Tuning Guide](../guides/omni/gemma3-3n.md). The guide covers dataset preparation, configuration, and running both full fine-tuning and LoRA-based parameter efficient fine-tuning.
 
