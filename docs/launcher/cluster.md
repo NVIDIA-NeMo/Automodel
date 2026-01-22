@@ -197,7 +197,11 @@ torchrun \
 Notes:
 - Set `NODE_RANK=0` on the master node (where `MASTER_ADDR` resolves), `NODE_RANK=1` on the second node, and so on.
 - Ensure `--nproc_per_node` matches the number of GPUs per node.
+:::{note}
+- Set `NODE_RANK=0` on the master node (where `MASTER_ADDR` resolves), `NODE_RANK=1` on the second node, and so on.
+- Ensure `--nproc_per_node` matches the number of GPUs per node.
 - When launching under Slurm, prefer the CLI `slurm` configuration above or ensure equivalent rendezvous/env settings are provided via the scheduler.
+:::
 
 ## Customize Configuration Settings
 
