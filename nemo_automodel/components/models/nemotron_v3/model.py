@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoConfig
+from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block
 from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import NemotronV3StateDictAdapter
@@ -111,6 +112,8 @@ class NemotronV3Model(nn.Module):
         # Get embeddings
         hidden_states = self.embed_tokens(input_ids)
 
+        # TODO: attention mask currently does not work. A default causal mask is applied.
+
         # Get 4D causal mask for attention layers (from precomputed masks)
         causal_mask = causal_mask_mapping.get("full_attention") if causal_mask_mapping is not None else None
 
@@ -133,6 +136,12 @@ class NemotronV3Model(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         return hidden_states
+
+    def _to_local(self, tensor):
+        """Get local tensor from DTensor or return tensor as-is."""
+        if DTensor is not None and isinstance(tensor, DTensor):
+            return tensor.to_local()
+        return tensor
 
     @torch.no_grad()
     def initialize_weights(self, buffer_device: torch.device | None = None) -> None:
@@ -169,8 +178,11 @@ class NemotronV3Model(nn.Module):
         mamba_module.D._no_weight_decay = True
 
         # Special dt_bias initialization (inverse softplus)
+        # Use _to_local to handle DTensor case after model parallelization
+        dt_bias_local = self._to_local(mamba_module.dt_bias)
+        local_num_heads = dt_bias_local.shape[0]  # May be sharded
         dt = torch.exp(
-            torch.rand(self.config.mamba_num_heads)
+            torch.rand(local_num_heads, device=dt_bias_local.device)
             * (math.log(self.config.time_step_max) - math.log(self.config.time_step_min))
             + math.log(self.config.time_step_min)
         ).clamp(min=self.config.time_step_floor)
@@ -178,7 +190,7 @@ class NemotronV3Model(nn.Module):
         # Inverse of softplus
         inv_dt = dt + torch.log(-torch.expm1(-dt))
         with torch.no_grad():
-            mamba_module.dt_bias.copy_(inv_dt)
+            dt_bias_local.copy_(inv_dt)
         mamba_module.dt_bias._no_reinit = True
 
         # Linear layers
