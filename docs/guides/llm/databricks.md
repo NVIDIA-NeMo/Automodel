@@ -68,6 +68,8 @@ Finally, we'll [authenticate](https://huggingface.co/docs/hub/en/security-tokens
 from getpass import getpass
 
 hf_token = getpass("HF token: ")
+```
+```
 !hf auth login --token {hf_token}
 ```
 
