@@ -354,7 +354,7 @@ class Checkpointer:
             model_class = model.config.architectures[0]
         except:
             model_class = ""
-        if model_class not in ["Gemma3ForConditionalGeneration", "NemotronHForCausalLM"]:
+        if model_class not in ["Gemma3ForConditionalGeneration"]:
             for _, module in model.named_modules():
                 if hasattr(module, "_is_hf_initialized"):
                     module._is_hf_initialized = False
