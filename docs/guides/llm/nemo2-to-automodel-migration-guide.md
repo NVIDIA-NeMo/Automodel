@@ -68,7 +68,6 @@ torchrun \
 export PYTHONPATH=$(realpath Automodel/)
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 export TRANSFORMERS_OFFLINE=1
-
 torchrun \
     --nproc-per-node=4 \
     --nnodes=1 \
@@ -114,7 +113,7 @@ def migration_recipe() -> run.Partial:
         dir="/app/output",
         name="cust-llama33-70b",
         num_nodes=1,
-        num_gpus_per_node=4,
+        num_gpus_per_node=4,  
         peft_scheme="lora",
     )
 
