@@ -95,10 +95,6 @@ class ModuleMatcher:
         """
         full_name = f"{prefix}.{name}" if prefix else name
 
-        if self.is_causal_lm:
-            if "lm_head" in full_name:
-                return False
-
         # 1. matching by layer type takes absolute precedence
         if self.match_all_linear and _is_linear_module(m):
             return True

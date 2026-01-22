@@ -94,13 +94,18 @@ class CheckpointingConfig:
     skip_task_head_prefixes_for_base_model: list[str] | None = (
         None  # Parameter prefixes to skip when loading base model
     )
+    single_rank_consolidation: bool = False  # If True, only rank 0 performs consolidation.
+    # This should be used for remote storage systems that don't support direct-append or non-sequential writes.
+    staging_dir: str | None = None  # Optional directory for staging files during consolidation.
+    # If provided, temp files will be created here instead of system temp. Useful when system temp has limited space.
 
     def __post_init__(self):
         """
         Convert a raw string such as "safetensors" into the right Enum.
         """
-        assert self.model_save_format in [v.value for v in SerializationFormat], (
-            f"Unsupported model save format: {self.model_save_format}"
+        formats = [v.value for v in SerializationFormat]
+        assert self.model_save_format in formats, (
+            f"Unsupported model save format: {self.model_save_format}. Supported formats: {formats}"
         )
         self.model_save_format = SerializationFormat[self.model_save_format.upper()]
 
@@ -195,7 +200,13 @@ class Checkpointer:
 
         # Because this call lies outside of the dcp save call, we need to consolidate on all ranks on the main process
         # of all ranks, which lies on the critical path. Therefore, we can only do this outside of async mode.
-        consolidate_on_all_ranks = self._should_write_consolidated_safetensors() and not self.config.is_async
+        # If single_rank_consolidation is set, we skip distributed consolidation and let rank 0 handle it
+        # via the storage writer's finish() method - useful for Unity Catalog Volumes.
+        consolidate_on_all_ranks = (
+            self._should_write_consolidated_safetensors()
+            and not self.config.is_async
+            and not self.config.single_rank_consolidation
+        )
 
         model_state = ModelState(model, self.config.is_peft)
         state_dict = model_state.state_dict()
@@ -234,6 +245,8 @@ class Checkpointer:
                 output_dir=consolidated_dir,
                 fqn_to_index_mapping=fqn_to_file_index_mapping,
                 num_threads=5,
+                use_staging=self.config.staging_dir is not None,
+                staging_dir=self.config.staging_dir,
             )
 
     def save_optimizer(
@@ -580,7 +593,8 @@ class Checkpointer:
 
         # Add any missing keys from the model_state_dict
         # These will go to the same file as the last file (or file 1 for single-file models)
-        default_index = max(fqn_to_file_index_mapping.values())
+        # Use default of 1 when mapping is empty (e.g., biencoder models with different key prefixes)
+        default_index = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
 
         # add any additional keys that are not in the base checkpoint
         for fqn in list(state_dict.keys()):
@@ -612,6 +626,7 @@ class Checkpointer:
                 save_sharded=True,
                 consolidated_output_path=consolidated_output_path if not consolidate_on_all_ranks else None,
                 fqn_to_index_mapping=fqn_to_index_mapping,
+                staging_dir=self.config.staging_dir,
             )
 
     def _get_storage_reader(
