@@ -61,10 +61,10 @@ torchrun \
 </code></pre>
       </td>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
-        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh"># I'm assuming there's Automodel folder in the same directory as this script, if not
-# you can git clone git@github.com:NVIDIA-NeMo/Automodel.git
-# If you have Automodel installed, you do not need to change the PYTHONPATH,
-# instead you only need to provide the absolute path to the finetune.py script
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">&#35; I'm assuming there's Automodel folder in the same directory as this script, if not
+&#35; you can git clone git@github.com:NVIDIA-NeMo/Automodel.git
+&#35; If you have Automodel installed, you do not need to change the PYTHONPATH,
+&#35; instead you only need to provide the absolute path to the finetune.py script
 export PYTHONPATH=$(realpath Automodel/)
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 export TRANSFORMERS_OFFLINE=1
@@ -113,7 +113,7 @@ def migration_recipe() -> run.Partial:
         dir="/app/output",
         name="cust-llama33-70b",
         num_nodes=1,
-        num_gpus_per_node=4,  
+        num_gpus_per_node=4,
         peft_scheme="lora",
     )
 
