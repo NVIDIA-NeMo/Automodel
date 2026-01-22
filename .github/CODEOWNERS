@@ -8,7 +8,7 @@ nemo_automodel @akoumpa @HuiyingLi @adil-a @hemildesai
 examples @akoumpa @HuiyingLi @adil-a @hemildesai
 README.md @akoumpa @HuiyingLi @snowmanwwg
 
-nemo_automodel/components/datasets/llm/ @akoumpa @adil-a @ybabakhin @rnyak @oliverholworthy @gabrielspmoreira
-nemo_automodel/components/models/biencoder/ @akoumpa @adil-a @ybabakhin @rnyak @oliverholworthy @gabrielspmoreira
-examples/biencoder/ @akoumpa @adil-a @ybabakhin @rnyak @oliverholworthy @gabrielspmoreira
-nemo_automodel/recipes/biencoder @akoumpa @adil-a @ybabakhin @rnyak @oliverholworthy @gabrielspmoreira
+nemo_automodel/components/datasets/llm/ @akoumpa @adil-a @NVIDIA-NeMo/automodel_retreiver_maintainers
+nemo_automodel/components/models/biencoder/ @akoumpa @adil-a @NVIDIA-NeMo/automodel_retreiver_maintainers
+examples/biencoder/ @akoumpa @adil-a @NVIDIA-NeMo/automodel_retreiver_maintainers
+nemo_automodel/recipes/biencoder @akoumpa @adil-a @NVIDIA-NeMo/automodel_retreiver_maintainers
