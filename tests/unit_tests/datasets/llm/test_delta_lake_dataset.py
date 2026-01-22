@@ -85,7 +85,6 @@ class TestIsDeltaLakePath:
 
         assert is_delta_lake_path("/path/to/file.json") is False
         assert is_delta_lake_path("org/dataset") is False
-        assert is_delta_lake_path("s3://bucket/regular_data") is False
 
     def test_non_string_input(self):
         """Test that non-string inputs return False."""

@@ -207,8 +207,8 @@ def is_delta_lake_path(path: str) -> bool:
     if path.startswith("abfss://"):
         return True
 
-    # Check for s3:// or s3a:// paths with _delta_log hint
-    if path.startswith(("s3://", "s3a://", "gs://")) and "_delta" in path.lower():
+    # Check for s3:// or s3a:// paths
+    if path.startswith(("s3://", "s3a://", "gs://")):
         return True
 
     # Check for local directory with _delta_log
