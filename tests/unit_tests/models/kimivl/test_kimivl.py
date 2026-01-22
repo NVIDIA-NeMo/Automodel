@@ -490,7 +490,7 @@ class TestKimiVLStateDictAdapter:
         """Create adapter setup for testing."""
         from nemo_automodel.components.models.common import BackendConfig
         from nemo_automodel.components.models.kimivl.model import KimiVLStateDictAdapter
-        from nemo_automodel.components.moe.layers import MoEConfig
+        from nemo_automodel.components.moe.config import MoEConfig
 
         config = KimiVLConfig(
             vision_config=MoonViTConfig(hidden_size=64),

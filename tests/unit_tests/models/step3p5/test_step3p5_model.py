@@ -25,7 +25,7 @@ from nemo_automodel.components.models.step3p5.model import (
     Step3p5Model,
     parse_moe_layers_enum,
 )
-from nemo_automodel.components.moe.layers import MoEConfig
+from nemo_automodel.components.moe.config import MoEConfig
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

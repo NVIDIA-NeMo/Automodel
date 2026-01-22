@@ -25,7 +25,8 @@ from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding,
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention, Qwen3NextRMSNorm
 from nemo_automodel.components.models.qwen3_next.state_dict_adapter import Qwen3NextStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
+from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.layers import MLP, MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
