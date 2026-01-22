@@ -46,7 +46,7 @@ In these guides, we use the `quintend/rdr-items` and `naver-clova-ix/cord-v2` da
 ### rdr items dataset
 The rdr items dataset [`quintend/rdr-items`](https://huggingface.co/datasets/quintend/rdr-items) is a small dataset containing 48 images with descriptions. This dataset serves as an example of how to prepare image-text data for VLM fine-tuning. For complete instructions on dataset preprocessing and the collate functions used, see the [Gemma Fine-Tuning Guide](../guides/omni/gemma3-3n.md).
 
-### cord-v2 dataset
+### CORD-v2 Dataset
 The cord-v2 dataset [`naver-clova-ix/cord-v2`](https://huggingface.co/datasets/naver-clova-ix/cord-v2) contains receipts with descriptions in JSON format. This demonstrates handling structured data in VLMs. The [Gemma Fine-Tuning Guide](../guides/omni/gemma3-3n.md) provides detailed examples of custom preprocessing and collate functions for similar datasets.
 
 ## Train VLM Models
