@@ -9,7 +9,7 @@ NeMo Automodel uses recipes to run end-to-end workflows. If you're new to recipe
 Kubernetes support is coming soon.
 :::
 
-## Quick start: Choose your job launch option
+## Quickstart: Choose Your Job Launch Option
 
 Slurm jobs support two modes of execution: `batch` and `interactive`. In `batch` mode, the job is submitted to the cluster queue and
 is executed without any other input from the user (e.g., no keyboard input), whereas the `interactive` mode, as the name implies, enables keyboard input.
