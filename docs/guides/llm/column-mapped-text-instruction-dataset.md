@@ -59,7 +59,7 @@ This section provides practical usage examples, including how to load remote dat
 ### Local JSONL Example
 
 Assume you have a local newline-delimited JSON file at `/data/my_corpus.jsonl`
-with the simple schema `{instruction, output}`.  A few sample rows:
+with the simple schema `{instruction, output}`. A few sample rows:
 
 ```json
 {"instruction": "Translate 'Hello' to French", "output": "Bonjour"}
