@@ -16,6 +16,18 @@ from typing import Optional
 
 import torch
 
+try:
+    # DTensor support is needed when tensor-parallel plans set `use_local_output=False`
+    # causing `logits` to be a DTensor sharded on vocab dim.
+    from torch.distributed.tensor import DTensor
+    from torch.distributed.tensor.placement_types import Shard
+
+    HAVE_DTENSOR = True
+except Exception:  # pragma: no cover
+    DTensor = None  # type: ignore[assignment]
+    Shard = None  # type: ignore[assignment]
+    HAVE_DTENSOR = False
+
 from nemo_automodel.components.loss.triton.te_cross_entropy import (
     HAVE_TRITON,
     cross_entropy_backward,
@@ -139,6 +151,21 @@ class TEParallelCrossEntropy:
         if not HAVE_TE_PARALLEL_CE:
             raise ImportError(MISSING_TE_PARALLEL_CE_MSG)
 
+        # If TP plans return DTensor logits (use_local_output=False), convert to local shard
+        # and (optionally) infer the TP process group from the DTensor mesh.
+        tp_group = self.tp_group
+        if HAVE_DTENSOR and isinstance(logits, DTensor):
+            # We only infer a TP group if the logits are sharded on the vocab dimension.
+            is_vocab_sharded = any(
+                isinstance(p, Shard) and (p.dim == -1 or p.dim == logits.ndim - 1) for p in logits.placements
+            )
+            if is_vocab_sharded and tp_group is None:
+                tp_group = logits.device_mesh.get_group()
+            logits = logits.to_local()
+
+        if HAVE_DTENSOR and isinstance(labels, DTensor):
+            labels = labels.to_local()
+
         if mask is not None:
             with torch.no_grad():
                 if mask.device != labels.device:
@@ -149,7 +176,7 @@ class TEParallelCrossEntropy:
         reduce_loss = self.reduction == "mean"
 
         # Compute TE parallel cross entropy
-        te_loss = parallel_cross_entropy(logits, labels, 0.0, reduce_loss, self.tp_group, self.ignore_index)
+        te_loss = parallel_cross_entropy(logits, labels, 0.0, reduce_loss, tp_group, self.ignore_index)
 
         # Apply reduction
         if self.reduction == "none" or self.reduction == "mean":
