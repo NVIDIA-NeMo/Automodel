@@ -83,7 +83,7 @@ print(remote_ds[0].keys())  # {'context', 'question', 'answer'}
 print(local_ds[0].keys())   # {'question', 'answer'}
 ```
 
-You can configure the dataset entirely from your recipe YAML.  For example:
+You can configure the dataset entirely from your recipe YAML. For example:
 ```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
