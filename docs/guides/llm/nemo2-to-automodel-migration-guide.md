@@ -31,62 +31,74 @@ bash run.sh fp8
 
 ### Launch scripts (side-by-side)
 
-```{list-table}
-:header-rows: 1
-:widths: 1 1
+<table style="border-collapse:collapse; width:100%;">
+  <thead>
+    <tr>
+      <th style="border:1px solid #d0d7de; padding:8px; text-align:left; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        NeMo 2 (<code>nemo2/run.sh</code>)
+      </th>
+      <th style="border:1px solid #d0d7de; padding:8px; text-align:left; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        NeMo Automodel (<code>automodel/run.sh</code>)
+      </th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">#!/bin/bash
 
-* - NeMo 2 (`nemo2/run.sh`)
-  - NeMo Automodel (`automodel/run.sh`)
-* -
-    ```bash
-    #!/bin/bash
+set -ex
 
-    set -ex
+torchrun \
+    --standalone \
+    --nnodes=1 \
+    --nproc_per_node=4 \
+    recipe.py \
+    --factory 'migration_recipe()' \
+    --yes \
+    --yaml config-${1}.yaml \
+    -v
+</code></pre>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh"># I'm assuming there's Automodel folder in the same directory as this script, if not
+# you can git clone git@github.com:NVIDIA-NeMo/Automodel.git
+# If you have Automodel installed, you do not need to change the PYTHONPATH,
+# instead you only need to provide the absolute path to the finetune.py script
+export PYTHONPATH=$(realpath Automodel/)
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export TRANSFORMERS_OFFLINE=1
 
-    torchrun \
-        --standalone \
-        --nnodes=1 \
-        --nproc_per_node=4 \
-        recipe.py \
-        --factory 'migration_recipe()' \
-        --yes \
-        --yaml config-${1}.yaml \
-        -v
-    ```
-  -
-    ```bash
-    # I'm assuming there's Automodel folder in the same directory as this script, if not
-    # you can git clone git@github.com:NVIDIA-NeMo/Automodel.git
-    # If you have Automodel installed, you do not need to change the PYTHONPATH,
-    # instead you only need to provide the absolute path to the finetune.py script
-    export PYTHONPATH=$(realpath Automodel/)
-    export CUDA_VISIBLE_DEVICES=0,1,2,3
-    export TRANSFORMERS_OFFLINE=1
+torchrun \
+    --nproc-per-node=4 \
+    --nnodes=1 \
+    Automodel/examples/llm_finetune/finetune.py \
+    --config config-fp16.yaml
+</code></pre>
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <em>(no direct equivalent)</em>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <strong>Optional smaller-model launcher</strong> (<code>automodel/run_llama3_2_1b.sh</code>)
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">export PYTHONPATH=$(realpath Automodel/)
+export CUDA_VISIBLE_DEVICES=0,1
+export TRANSFORMERS_OFFLINE=1
 
-    torchrun \
-        --nproc-per-node=4 \
-        --nnodes=1 \
-        Automodel/examples/llm_finetune/finetune.py \
-        --config config-fp16.yaml
-    ```
-* - *(no direct equivalent)*
-  -
-    **Optional smaller-model launcher** (`automodel/run_llama3_2_1b.sh`)
-
-    ```bash
-    export PYTHONPATH=$(realpath Automodel/)
-    export CUDA_VISIBLE_DEVICES=0,1
-    export TRANSFORMERS_OFFLINE=1
-
-    torchrun \
-        --nproc-per-node=2 \
-        --nnodes=1 \
-        Automodel/examples/llm_finetune/finetune.py \
-        --config config-fp16.yaml \
-        --model.pretrained_model_name_or_path meta-llama/Llama-3.2-1B \
-        --distributed.tp_size 1
-    ```
-```
+torchrun \
+    --nproc-per-node=2 \
+    --nnodes=1 \
+    Automodel/examples/llm_finetune/finetune.py \
+    --config config-fp16.yaml \
+    --model.pretrained_model_name_or_path meta-llama/Llama-3.2-1B \
+    --distributed.tp_size 1
+</code></pre>
+      </td>
+    </tr>
+  </tbody>
+</table>
 
 ### NeMo 2 recipe (`nemo2/recipe.py`)
 
@@ -280,353 +292,428 @@ The two YAMLs in `automodel/` configure:
 
 ### BF16 / BF16-mixed
 
-```{list-table}
-:header-rows: 1
-:widths: 1 1
+<table style="border-collapse:collapse; width:100%;">
+  <thead>
+    <tr>
+      <th style="border:1px solid #d0d7de; padding:8px; text-align:left; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        NeMo 2 (<code>nemo2/config-fp16.yaml</code>)
+      </th>
+      <th style="border:1px solid #d0d7de; padding:8px; text-align:left; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        NeMo Automodel (<code>automodel/config-fp16.yaml</code>)
+      </th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-yaml">data:
+  dataset_root: /mount/models/data/
+  seq_length: 4096
+  global_batch_size: 8
+  micro_batch_size: 1
+  dataset_kwargs:
+    prompt_template: '{prompt} {completion}'
+    label_key: completion
+    truncation_field: prompt
+trainer:
+  accelerator: gpu
+  max_epochs: 3
+  max_steps: 30
+  limit_val_batches: 1.0
+  log_every_n_steps: 10
+  val_check_interval: 10
+  strategy:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    ckpt_async_save: false
+  plugins:
+    precision: bf16-mixed
+    # fp8: hybrid
+    # fp8_margin: 0
+    # fp8_amax_history_len: 1024
+    # fp8_amax_compute_algo: max
+    # fp8_params: true
+log:
+  ckpt:
+    save_last: link
+    save_top_k: 1
+    train_time_interval: null
+optim:
+  lr_scheduler:
+    warmup_steps: 50
+  config:
+    lr: 0.0001
+resume:
+  restore_config:
+    path: /mount/models/llama-3_3-70b-instruct_v0.0.1
+peft:
+  dim: 8
+  alpha: 16
+  dropout: 0.1
+</code></pre>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-yaml">step_scheduler:
+  ckpt_every_steps: 10
+  val_every_steps: 10  # will run every x number of gradient steps
+  num_epochs: 3
+  max_steps: 30
 
-* - NeMo 2 (`nemo2/config-fp16.yaml`)
-  - NeMo Automodel (`automodel/config-fp16.yaml`)
-* -
-    ```yaml
-    data:
-      dataset_root: /mount/models/data/
-      seq_length: 4096
-      global_batch_size: 8
-      micro_batch_size: 1
-      dataset_kwargs:
-        prompt_template: '{prompt} {completion}'
-        label_key: completion
-        truncation_field: prompt
-    trainer:
-      accelerator: gpu
-      max_epochs: 3
-      max_steps: 30
-      limit_val_batches: 1.0
-      log_every_n_steps: 10
-      val_check_interval: 10
-      strategy:
-        tensor_model_parallel_size: 4
-        pipeline_model_parallel_size: 1
-        context_parallel_size: 1
-        ckpt_async_save: false
-      plugins:
-        precision: bf16-mixed
-        # fp8: hybrid
-        # fp8_margin: 0
-        # fp8_amax_history_len: 1024
-        # fp8_amax_compute_algo: max
-        # fp8_params: true
-    log:
-      ckpt:
-        save_last: link
-        save_top_k: 1
-        train_time_interval: null
-    optim:
-      lr_scheduler:
-        warmup_steps: 50
-      config:
-        lr: 0.0001
-    resume:
-      restore_config:
-        path: /mount/models/llama-3_3-70b-instruct_v0.0.1
-    peft:
-      dim: 8
-      alpha: 16
-      dropout: 0.1
-    ```
-  -
-    ```yaml
-    step_scheduler:
-      ckpt_every_steps: 10
-      val_every_steps: 10  # will run every x number of gradient steps
-      num_epochs: 3
-      max_steps: 30
+  global_batch_size: 8
+  local_batch_size: 1
 
-      global_batch_size: 8
-      local_batch_size: 1
+dist_env:
+  backend: nccl
+  timeout_minutes: 1
 
-    dist_env:
-      backend: nccl
-      timeout_minutes: 1
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
 
-    rng:
-      _target_: nemo_automodel.components.training.rng.StatefulRNG
-      seed: 1111
-      ranked: true
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
+  torch_dtype: bf16
 
-    model:
-      _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-      pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
-      torch_dtype: bf16
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors # torch_save or safetensors
+  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
-    checkpoint:
-      enabled: true
-      checkpoint_dir: checkpoints/
-      model_save_format: safetensors # torch_save or safetensors
-      save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: ['gate_proj', 'up_proj']
+  match_all_linear: True
+  dim: 8
+  alpha: 16
+  dropout: 0.1
 
-    peft:
-      _target_: nemo_automodel.components._peft.lora.PeftConfig
-      target_modules: ['gate_proj', 'up_proj']
-      match_all_linear: True
-      dim: 8
-      alpha: 16
-      dropout: 0.1
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: none
+  dp_replicate_size: 1 # dp_shard_size = dp_size / dp_replicate_size and dp_shard_size &lt; dp_size. For DDP usecase, use DDPManager
+  tp_size: 4
+  cp_size: 1
+  sequence_parallel: false
 
-    distributed:
-      _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
-      dp_size: none
-      dp_replicate_size: 1 # dp_shard_size = dp_size / dp_replicate_size and dp_shard_size < dp_size. For DDP usecase, use DDPManager
-      tp_size: 4
-      cp_size: 1
-      sequence_parallel: false
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
-    loss_fn:
-      _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
+  path_or_dataset_id: ../data/training.jsonl
+  column_mapping:
+    context: prompt
+    answer: completion
 
-    dataset:
-      _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
-      path_or_dataset_id: ../data/training.jsonl
-      column_mapping:
-        context: prompt
-        answer: completion
+packed_sequence:
+  # Set packed_sequence_size > 0 to run with packed sequences
+  packed_sequence_size: 0
+  split_across_pack: False
 
-    packed_sequence:
-      # Set packed_sequence_size > 0 to run with packed sequences
-      packed_sequence_size: 0
-      split_across_pack: False
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
 
-    dataloader:
-      _target_: torchdata.stateful_dataloader.StatefulDataLoader
-      collate_fn: nemo_automodel.components.datasets.utils.default_collater
-      shuffle: false
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
+  path_or_dataset_id: ../data/validation.jsonl
+  column_mapping:
+    context: prompt
+    answer: completion
 
-    validation_dataset:
-      _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
-      path_or_dataset_id: ../data/validation.jsonl
-      column_mapping:
-        context: prompt
-        answer: completion
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
 
-    validation_dataloader:
-      _target_: torchdata.stateful_dataloader.StatefulDataLoader
-      collate_fn: nemo_automodel.components.datasets.utils.default_collater
+lr_scheduler:
+  lr_decay_style: cosine
+  # lr_warmup_steps: 50
+  min_lr: 0.0
 
-    lr_scheduler:
-      lr_decay_style: cosine
-      # lr_warmup_steps: 50
-      min_lr: 0.0
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 1e-5
+  weight_decay: 0
 
-    optimizer:
-      _target_: torch.optim.Adam
-      betas: [0.9, 0.999]
-      eps: 1e-8
-      lr: 1e-5
-      weight_decay: 0
-
-    # Uncomment and configure for W&B logging
-    # wandb:
-    #   project: <your_wandb_project>
-    #   entity: <your_wandb_entity>
-    #   name: <your_wandb_exp_name>
-    #   save_dir: <your_wandb_save_dir>
-    ```
-```
+# Uncomment and configure for W&B logging
+# wandb:
+#   project: &lt;your_wandb_project&gt;
+#   entity: &lt;your_wandb_entity&gt;
+#   name: &lt;your_wandb_exp_name&gt;
+#   save_dir: &lt;your_wandb_save_dir&gt;
+</code></pre>
+      </td>
+    </tr>
+  </tbody>
+</table>
 
 ### FP8
 
-```{list-table}
-:header-rows: 1
-:widths: 1 1
+<table style="border-collapse:collapse; width:100%;">
+  <thead>
+    <tr>
+      <th style="border:1px solid #d0d7de; padding:8px; text-align:left; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        NeMo 2 (<code>nemo2/config-fp8.yaml</code>)
+      </th>
+      <th style="border:1px solid #d0d7de; padding:8px; text-align:left; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        NeMo Automodel (<code>automodel/config-fp8.yaml</code>)
+      </th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-yaml">data:
+  dataset_root: /mount/models/data/
+  seq_length: 4096
+  global_batch_size: 8
+  micro_batch_size: 1
+  dataset_kwargs:
+    prompt_template: '{prompt} {completion}'
+    label_key: completion
+    truncation_field: prompt
+trainer:
+  accelerator: gpu
+  max_epochs: 3
+  max_steps: 30
+  limit_val_batches: 1.0
+  log_every_n_steps: 10
+  val_check_interval: 10
+  strategy:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    ckpt_async_save: false
+  plugins:
+    precision: bf16-mixed
+    fp8: hybrid
+    fp8_margin: 0
+    fp8_amax_history_len: 1024
+    fp8_amax_compute_algo: max
+    fp8_params: true
+log:
+  ckpt:
+    save_last: link
+    save_top_k: 1
+    train_time_interval: null
+optim:
+  lr_scheduler:
+    warmup_steps: 50
+  config:
+    lr: 0.0001
+resume:
+  restore_config:
+    path: /mount/models/llama-3_3-70b-instruct_v0.0.1
+peft:
+  dim: 8
+  alpha: 16
+  dropout: 0.1
+</code></pre>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-yaml">step_scheduler:
+  ckpt_every_steps: 10
+  val_every_steps: 10  # will run every x number of gradient steps
+  num_epochs: 3
+  max_steps: 30
 
-* - NeMo 2 (`nemo2/config-fp8.yaml`)
-  - NeMo Automodel (`automodel/config-fp8.yaml`)
-* -
-    ```yaml
-    data:
-      dataset_root: /mount/models/data/
-      seq_length: 4096
-      global_batch_size: 8
-      micro_batch_size: 1
-      dataset_kwargs:
-        prompt_template: '{prompt} {completion}'
-        label_key: completion
-        truncation_field: prompt
-    trainer:
-      accelerator: gpu
-      max_epochs: 3
-      max_steps: 30
-      limit_val_batches: 1.0
-      log_every_n_steps: 10
-      val_check_interval: 10
-      strategy:
-        tensor_model_parallel_size: 4
-        pipeline_model_parallel_size: 1
-        context_parallel_size: 1
-        ckpt_async_save: false
-      plugins:
-        precision: bf16-mixed
-        fp8: hybrid
-        fp8_margin: 0
-        fp8_amax_history_len: 1024
-        fp8_amax_compute_algo: max
-        fp8_params: true
-    log:
-      ckpt:
-        save_last: link
-        save_top_k: 1
-        train_time_interval: null
-    optim:
-      lr_scheduler:
-        warmup_steps: 50
-      config:
-        lr: 0.0001
-    resume:
-      restore_config:
-        path: /mount/models/llama-3_3-70b-instruct_v0.0.1
-    peft:
-      dim: 8
-      alpha: 16
-      dropout: 0.1
-    ```
-  -
-    ```yaml
-    step_scheduler:
-      ckpt_every_steps: 10
-      val_every_steps: 10  # will run every x number of gradient steps
-      num_epochs: 3
-      max_steps: 30
+  global_batch_size: 8
+  local_batch_size: 1
 
-      global_batch_size: 8
-      local_batch_size: 1
+dist_env:
+  backend: nccl
+  timeout_minutes: 1
 
-    dist_env:
-      backend: nccl
-      timeout_minutes: 1
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
 
-    rng:
-      _target_: nemo_automodel.components.training.rng.StatefulRNG
-      seed: 1111
-      ranked: true
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
+  torch_dtype: bf16
 
-    model:
-      _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-      pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
-      torch_dtype: bf16
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors # torch_save or safetensors
+  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
-    checkpoint:
-      enabled: true
-      checkpoint_dir: checkpoints/
-      model_save_format: safetensors # torch_save or safetensors
-      save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: ['*_proj']
+  match_all_linear: True
+  dim: 8
+  alpha: 16
+  dropout: 0.1
 
-    peft:
-      _target_: nemo_automodel.components._peft.lora.PeftConfig
-      target_modules: ['*_proj']
-      match_all_linear: True
-      dim: 8
-      alpha: 16
-      dropout: 0.1
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: none
+  dp_replicate_size: 1 # dp_shard_size = dp_size / dp_replicate_size and dp_shard_size &lt; dp_size. For DDP usecase, use DDPManager
+  tp_size: 4
+  cp_size: 1
+  sequence_parallel: false
 
-    distributed:
-      _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
-      dp_size: none
-      dp_replicate_size: 1 # dp_shard_size = dp_size / dp_replicate_size and dp_shard_size < dp_size. For DDP usecase, use DDPManager
-      tp_size: 4
-      cp_size: 1
-      sequence_parallel: false
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
-    loss_fn:
-      _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
-
-    fp8:
-      enabled: true
-      recipe_name: tensorwise  # Options: tensorwise, rowwise, rowwise_with_gw_hp
-      enable_fsdp_float8_all_gather: true
-      precompute_float8_dynamic_scale_for_fsdp: true
-      force_recompute_fp8_weight_in_bwd: true
-      filter_fqns: ["lm_head"]
-      emulate: false  # Set to true for testing on older GPUs without native FP8 support
-
-
-    dataset:
-      _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
-      path_or_dataset_id: ../data/training.jsonl
-      column_mapping:
-        context: prompt
-        answer: completion
-
-    packed_sequence:
-      # Set packed_sequence_size > 0 to run with packed sequences
-      packed_sequence_size: 0
-      split_across_pack: False
-
-    dataloader:
-      _target_: torchdata.stateful_dataloader.StatefulDataLoader
-      collate_fn: nemo_automodel.components.datasets.utils.default_collater
-      shuffle: false
-
-    validation_dataset:
-      _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
-      path_or_dataset_id: ../data/validation.jsonl
-      column_mapping:
-        context: prompt
-        answer: completion
-
-    validation_dataloader:
-      _target_: torchdata.stateful_dataloader.StatefulDataLoader
-      collate_fn: nemo_automodel.components.datasets.utils.default_collater
+fp8:
+  enabled: true
+  recipe_name: tensorwise  # Options: tensorwise, rowwise, rowwise_with_gw_hp
+  enable_fsdp_float8_all_gather: true
+  precompute_float8_dynamic_scale_for_fsdp: true
+  force_recompute_fp8_weight_in_bwd: true
+  filter_fqns: ["lm_head"]
+  emulate: false  # Set to true for testing on older GPUs without native FP8 support
 
 
-    lr_scheduler:
-      lr_decay_style: cosine
-      # lr_warmup_steps: 50
-      min_lr: 0.0
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
+  path_or_dataset_id: ../data/training.jsonl
+  column_mapping:
+    context: prompt
+    answer: completion
 
-    optimizer:
-      _target_: torch.optim.Adam
-      betas: [0.9, 0.999]
-      eps: 1e-8
-      lr: 1e-5
-      weight_decay: 0
+packed_sequence:
+  # Set packed_sequence_size > 0 to run with packed sequences
+  packed_sequence_size: 0
+  split_across_pack: False
 
-    # Uncomment and configure for W&B logging
-    # wandb:
-    #   project: <your_wandb_project>
-    #   entity: <your_wandb_entity>
-    #   name: <your_wandb_exp_name>
-    #   save_dir: <your_wandb_save_dir>
-    ```
-```
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
+  path_or_dataset_id: ../data/validation.jsonl
+  column_mapping:
+    context: prompt
+    answer: completion
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+
+
+lr_scheduler:
+  lr_decay_style: cosine
+  # lr_warmup_steps: 50
+  min_lr: 0.0
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 1e-5
+  weight_decay: 0
+
+# Uncomment and configure for W&B logging
+# wandb:
+#   project: &lt;your_wandb_project&gt;
+#   entity: &lt;your_wandb_entity&gt;
+#   name: &lt;your_wandb_exp_name&gt;
+#   save_dir: &lt;your_wandb_save_dir&gt;
+</code></pre>
+      </td>
+    </tr>
+  </tbody>
+</table>
 
 ## Key knob mapping (side-by-side)
 
-```{list-table}
-:header-rows: 1
-:widths: 2 3 3
-
-* - Topic
-  - NeMo 2
-  - NeMo Automodel
-* - Model initialization / restore
-  - `resume.restore_config.path: /mount/models/llama-3_3-70b-instruct_v0.0.1`
-  - `model.pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct`
-* - Batch sizes
-  - `data.global_batch_size: 8`, `data.micro_batch_size: 1`
-  - `step_scheduler.global_batch_size: 8`, `step_scheduler.local_batch_size: 1`
-* - Parallelism
-  - `trainer.strategy.tensor_model_parallel_size: 4`, `pipeline_model_parallel_size: 1`, `context_parallel_size: 1`
-  - `distributed.tp_size: 4`, `distributed.cp_size: 1`
-* - LoRA (PEFT)
-  - Enabled via `peft_scheme="lora"` (in `recipe.py`); parameters under `peft.*`
-  - Configured via `peft._target_: ...PeftConfig`; parameters under `peft.*`
-* - FP8
-  - Under `trainer.plugins` (example keys include `fp8`, `fp8_params`, and amax settings)
-  - Under the top-level `fp8:` block (example keys include `enabled`, `recipe_name`, and FSDP float8 settings)
-* - Dataset wiring
-  - `data.dataset_root` + `data.dataset_kwargs` (`prompt_template`, `label_key`, `truncation_field`)
-  - `dataset.path_or_dataset_id` + `dataset.column_mapping` (`context: prompt`, `answer: completion`)
-```
+<table style="border-collapse:collapse; width:100%;">
+  <thead>
+    <tr>
+      <th style="border:1px solid #d0d7de; padding:8px; text-align:left; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Topic
+      </th>
+      <th style="border:1px solid #d0d7de; padding:8px; text-align:left; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        NeMo 2
+      </th>
+      <th style="border:1px solid #d0d7de; padding:8px; text-align:left; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        NeMo Automodel
+      </th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Model initialization / restore
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>resume.restore_config.path: /mount/models/llama-3_3-70b-instruct_v0.0.1</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>model.pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct</code>
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Batch sizes
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>data.global_batch_size: 8</code>, <code>data.micro_batch_size: 1</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>step_scheduler.global_batch_size: 8</code>, <code>step_scheduler.local_batch_size: 1</code>
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Parallelism
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>trainer.strategy.tensor_model_parallel_size: 4</code>, <code>pipeline_model_parallel_size: 1</code>, <code>context_parallel_size: 1</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>distributed.tp_size: 4</code>, <code>distributed.cp_size: 1</code>
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        LoRA (PEFT)
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Enabled via <code>peft_scheme="lora"</code> (in <code>recipe.py</code>); parameters under <code>peft.*</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Configured via <code>peft._target_: ...PeftConfig</code>; parameters under <code>peft.*</code>
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        FP8
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Under <code>trainer.plugins</code> (example keys include <code>fp8</code>, <code>fp8_params</code>, and amax settings)
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Under the top-level <code>fp8:</code> block (example keys include <code>enabled</code>, <code>recipe_name</code>, and FSDP float8 settings)
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Dataset wiring
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>data.dataset_root</code> + <code>data.dataset_kwargs</code> (<code>prompt_template</code>, <code>label_key</code>, <code>truncation_field</code>)
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>dataset.path_or_dataset_id</code> + <code>dataset.column_mapping</code> (<code>context: prompt</code>, <code>answer: completion</code>)
+      </td>
+    </tr>
+  </tbody>
+</table>
 
 ## Example dataset schema (illustrative)
 
