@@ -18,6 +18,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from nemo_automodel.components.moe.utils import BackendConfig, initialize_rms_norm_module
+
 try:
     from torch.distributed.device_mesh import DeviceMesh
     from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
@@ -28,26 +30,6 @@ try:
     from grouped_gemm import ops
 except ImportError:
     print("grouped_gemm is not available.")
-
-
-class NemotronV3RMSNorm(nn.Module):
-    """RMSNorm for NemotronV3.
-
-    Equivalent to T5LayerNorm and LlamaRMSNorm.
-    Performs computation in float32 for numerical stability.
-    """
-
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return (self.weight.to(torch.float32) * hidden_states).to(input_dtype)
 
 
 class NemotronV3Attention(nn.Module):
@@ -316,7 +298,11 @@ class NemotronV3Block(nn.Module):
         self.residual_in_fp32 = getattr(config, "residual_in_fp32", False)
 
         # RMSNorm
-        self.norm = NemotronV3RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.norm = initialize_rms_norm_module(
+            backend.rms_norm,
+            config.hidden_size,
+            eps=config.layer_norm_epsilon,
+        )
 
         # Determine layer type from config
         # 'M' → mamba, '*' → attention, '-' → mlp, other → moe
@@ -342,11 +328,6 @@ class NemotronV3Block(nn.Module):
             )
         elif self.block_type == "moe":
             from nemo_automodel.components.moe.layers import MoE
-            from nemo_automodel.components.moe.utils import BackendConfig
-
-            # Use provided backend or create default
-            if backend is None:
-                backend = BackendConfig()
 
             # Use float32 for gate computation (numerical stability)
             if backend.gate_precision is None:

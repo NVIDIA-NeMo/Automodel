@@ -25,7 +25,7 @@ from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block
 from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import NemotronV3StateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module
+from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -86,8 +86,11 @@ class NemotronV3Model(nn.Module):
             self.layers[str(idx)] = NemotronV3Block(config, layer_idx=idx, moe_config=self.moe_config, backend=self.backend)
 
         # Final norm
-        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3RMSNorm
-        self.norm = NemotronV3RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.norm = initialize_rms_norm_module(
+            self.backend.rms_norm,
+            config.hidden_size,
+            eps=config.layer_norm_epsilon,
+        )
 
 
     def forward(
