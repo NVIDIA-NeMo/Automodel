@@ -5,7 +5,7 @@ This guide explains how to install NeMo Automodel for LLM, VLM, and OMNI models 
 | Method                  | Dev Mode | Use Case                                                          | Recommended For             |
 | ----------------------- | ---------|----------------------------------------------------------------- | ---------------------------- |
 | 📦 **PyPI**             | - | Install stable release with minimal setup                         | Most users, production usage |
-| 🐳 **Docker**           | - | Use in isolated GPU environments, e.g., with NeMo container       | Multinode deployments     |
+| 🐳 **Docker**           | - | Use in isolated GPU environments, e.g., with NeMo container       | Multi-node deployments     |
 | 🐍 **Git Repo**         | ✅ | Use the latest code without cloning or installing extras manually | Power users, testers         |
 | 🧪 **Editable Install** | ✅ | Contribute to the codebase or make local modifications            | Contributors, researchers    |
 | 🐳 **Docker + Mount**   | ✅ | Use in isolated GPU environments, e.g., with NeMo container       | Multinode deployments     |
