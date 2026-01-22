@@ -85,7 +85,6 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh):
     # Prefer nested text modules when present
     _model = get_text_module(_model)
 
-
     for _, block in _model.layers.named_children():
         if isinstance(block.mlp, MoE):
             parallelize_module(
@@ -161,6 +160,8 @@ def apply_fsdp(
         _model = model.model
     else:
         _model = model
+    #handle VLM
+    _model = get_text_module(_model)
 
     for _, block in _model.layers.named_children():
         if isinstance(block.mlp, MoE) and ep_shard_enabled:
