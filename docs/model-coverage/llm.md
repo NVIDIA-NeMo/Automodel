@@ -5,7 +5,7 @@ Large Language Models (LLMs) power a variety of tasks such as dialogue systems, 
 NeMo Automodel provides a simple interface for loading and fine-tuning LLMs hosted on the Hugging Face Hub.
 
 ## Run LLMs with NeMo Automodel
-To run LLMs with NeMo Automodel, make sure you're using NeMo container version `25.07` or later. If the model you intend to fine-tune requires a newer version of Transformers, you may need to upgrade to the latest version of NeMo Automodel by using:
+To run LLMs with NeMo Automodel, make sure you're using NeMo container version [`25.11.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=25.11.00) or later. If the model you intend to fine-tune requires a newer version of Transformers, you may need to upgrade to the latest version of NeMo Automodel by using:
 
 ```bash
 
@@ -43,7 +43,7 @@ The table below lists the main architectures we test against (FSDP2 combined wit
 | `GraniteForCausalLM`                  | Granite 3.0, Granite 3.1, PowerLM     | `ibm-granite/granite-3.0-2b-base`, `ibm-granite/granite-3.1-8b-instruct`, `ibm/PowerLM-3b` etc. |
 | `GraniteMoeForCausalLM`               | Granite 3.0 MoE, PowerMoE             | `ibm-granite/granite-3.0-1b-a400m-base`, `ibm-granite/granite-3.0-3b-a800m-instruct`, `ibm/PowerMoE-3b` etc. |
 | `GraniteMoeSharedForCausalLM`         | Granite MoE Shared                    | `ibm-research/moe-7b-1b-active-shared-experts` (test model)                       |
-| `GritLM`                              | GritLM                                | `parasail-ai/GritLM-7B-vllm`.                                                     |
+| `GritLM`                              | GritLM                                | `parasail-ai/GritLM-7B-vllm`                                                    |
 | `InternLMForCausalLM`                 | InternLM                              | `internlm/internlm-7b`, `internlm/internlm-chat-7b` etc.                          |
 | `InternLM2ForCausalLM`                | InternLM2                             | `internlm/internlm2-7b`, `internlm/internlm2-chat-7b` etc.                        |
 | `InternLM3ForCausalLM`                | InternLM3                             | `internlm/internlm3-8b-instruct` etc.                                             |
