@@ -40,7 +40,7 @@ For detailed instructions on fine-tuning these models using both SFT and PEFT ap
 ## Dataset Examples
 
 :::{tip}
-In these guides, we use the `quintend/rdr-items` and `naver-clova-ix/cord-v2` datasets for demonstation purposes, but you can specify your own data as needed.
+In these guides, we use the `quintend/rdr-items` and `naver-clova-ix/cord-v2` datasets for demonstration purposes, but you can specify your own data as needed.
 :::
 
 ### RDR Items Dataset
