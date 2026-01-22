@@ -137,12 +137,6 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             if new_key == "model.embeddings.weight":
                 new_key = "model.embed_tokens.weight"
 
-            # For shared experts in MoE layers using relu2 activation:
-            # HF has 'shared_experts.up_proj' but internal has 'shared_experts.gate_proj'
-            # (because MLP with relu2 uses gate_proj as the up projection)
-            if ".mixer.shared_experts.up_proj." in new_key:
-                new_key = new_key.replace(".mixer.shared_experts.up_proj.", ".mixer.shared_experts.gate_proj.")
-
             renamed_state_dict[new_key] = value
 
         # Then merge experts (override mixer → mlp for mixin compatibility)
@@ -359,10 +353,6 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             # Internal uses 'embed_tokens' but HF uses 'embeddings'
             if new_fqn == "backbone.embed_tokens.weight":
                 new_fqn = "backbone.embeddings.weight"
-
-            # For shared experts: gate_proj → up_proj (inverse of from_hf)
-            if ".mixer.shared_experts.gate_proj." in new_fqn:
-                new_fqn = new_fqn.replace(".mixer.shared_experts.gate_proj.", ".mixer.shared_experts.up_proj.")
 
             result = [(new_fqn, tensor)]
 
