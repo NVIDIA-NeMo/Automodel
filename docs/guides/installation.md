@@ -92,7 +92,7 @@ This installs Automodel in editable mode, so changes to the code are immediately
 ### Mount the Repo into a NeMo Docker Container
 To run `Automodel` inside a NeMo container while **mounting your local repo**, follow these steps:
 
-```
+```bash
 # Step 1: Clone the Automodel repository.
 git clone https://github.com/NVIDIA-NeMo/Automodel.git && cd Automodel && \
 
