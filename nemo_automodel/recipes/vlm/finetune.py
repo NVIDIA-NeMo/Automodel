@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 import wandb
 from torch.distributed.device_mesh import DeviceMesh
+from torch.utils.data import DataLoader, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoProcessor
 from transformers.modeling_utils import no_init_weights
@@ -883,10 +884,72 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     targets = None
 
                 input_ids = batch.pop("input_ids")
+
+                # VLM: Custom chunking for pixel_values and image_grid_hws
+                # These tensors have non-standard structure that can't be naively chunked by dim 0
+                # pixel_values: [total_patches, 3, 14, 14] where patches from different images are concatenated
+                # image_grid_hws: [num_images, 2] where each row is [H, W] for one image
+                pixel_values = batch.pop("pixel_values", None)
+                image_grid_hws = batch.pop("image_grid_hws", None)
+                
+                if self.pp.info.has_first_stage and pixel_values is not None and image_grid_hws is not None:
+                    stage0_model = self.model_parts[0]
+                    n_microbatches = self.pp._info.schedule._n_microbatches
+                    batch_size = input_ids.shape[0]
+                    n_images = image_grid_hws.shape[0]
+                    
+                    # Calculate patch counts per image: H * W for each image
+                    patch_counts = image_grid_hws[:, 0] * image_grid_hws[:, 1]
+                    cumsum = torch.cumsum(patch_counts, dim=0)
+                    
+                    # Pre-chunk pixel_values and image_grid_hws aligned with image boundaries
+                    pixel_values_chunks = []
+                    image_grid_hws_chunks = []
+                    
+                    # Handle case where n_images != batch_size
+                    # This can happen if samples have 0 or multiple images
+                    if n_images == batch_size:
+                        # 1 image per sample - chunk by samples
+                        images_per_mb = batch_size // n_microbatches
+                        for mb_idx in range(n_microbatches):
+                            img_start = mb_idx * images_per_mb
+                            img_end = min(img_start + images_per_mb, n_images)
+                            
+                            # Slice image_grid_hws
+                            image_grid_hws_chunks.append(image_grid_hws[img_start:img_end])
+                            
+                            # Calculate patch boundaries
+                            patch_start = 0 if img_start == 0 else cumsum[img_start - 1].item()
+                            patch_end = cumsum[img_end - 1].item() if img_end > 0 else 0
+                            
+                            # Slice pixel_values at correct image boundaries
+                            pixel_values_chunks.append(pixel_values[int(patch_start):int(patch_end)])
+                    else:
+                        # Irregular - give all images to first microbatch, empty to rest
+                        # This handles cases where n_images != batch_size
+                        pixel_values_chunks.append(pixel_values)
+                        image_grid_hws_chunks.append(image_grid_hws)
+                        for _ in range(n_microbatches - 1):
+                            pixel_values_chunks.append(pixel_values[:0])  # Empty tensor with same structure
+                            image_grid_hws_chunks.append(image_grid_hws[:0])
+                        logging.warning(f"VLM chunking: n_images={n_images} != batch_size={batch_size}, giving all images to first microbatch")
+                    
+                    # Store pre-chunked tensors on model for forward to use
+                    stage0_model._vlm_pixel_values_chunks = pixel_values_chunks
+                    stage0_model._vlm_image_grid_hws_chunks = image_grid_hws_chunks
+                    stage0_model._vlm_chunk_idx = 0
+
                 if self.pp.info.has_first_stage:
                     self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
                 else:
                     self.pp.info.schedule.step(target=targets, losses=losses, **batch)
+
+                # Clear stored VLM chunks after PP step
+                if self.pp.info.has_first_stage and pixel_values is not None:
+                    stage0_model = self.model_parts[0]
+                    stage0_model._vlm_pixel_values_chunks = None
+                    stage0_model._vlm_image_grid_hws_chunks = None
+                    stage0_model._vlm_chunk_idx = None
 
             if self.pp.info.has_last_stage:
                 local_loss = torch.sum(torch.stack(losses))
@@ -1011,10 +1074,24 @@ class FinetuneRecipeForVLM(BaseRecipe):
         reporting_loss = torch.sum(torch.stack(loss_buffer))
         reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
         if self.pp_enabled:
+            # PP uses sum reduction per microbatch (no internal normalization).
+            # Divide by num_label_tokens to get the mean loss, same as non-PP.
             reporting_loss = reporting_loss / num_label_tokens
-            reporting_loss = reporting_loss.to(self.dist_env.device)
-            # Send loss to first rank if pp group rank is 0
-            src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
+            reporting_loss = reporting_loss.float().to(self.dist_env.device)
+            # Send loss to first rank from the last PP stage of rank0's mesh coords.
+            # This avoids picking a global-rank sender from a different EP/PP group.
+            if self.device_mesh is not None and "pp" in self.device_mesh.mesh_dim_names:
+                dim_names = list(self.device_mesh.mesh_dim_names)
+                mesh = self.device_mesh.mesh
+                idx = []
+                for name in dim_names:
+                    if name == "pp":
+                        idx.append(-1)
+                    else:
+                        idx.append(0)
+                src_rank = mesh[tuple(idx)].item()
+            else:
+                src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
             if self.dist_env.rank == src_rank:
                 torch.distributed.send(reporting_loss, dst=0)
             elif self.dist_env.is_main:

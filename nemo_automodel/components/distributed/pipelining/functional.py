@@ -89,6 +89,7 @@ def generate_hf_model_fqn_per_model_part(
     include_multimodal_encoders: bool = True,
     extra_module_fqns: Optional[list[str]] = None,
     fqn_prefix: str = "model.",
+    lm_head_fqn: str = "lm_head",
 ) -> list[list[str]]:
     """
     Generates module names for each pipeline stage for HuggingFace models.
@@ -152,7 +153,7 @@ def generate_hf_model_fqn_per_model_part(
         if stage_idx == num_stages - 1:
             stage_modules.append(f"{fqn_prefix}norm")
             if include_lm_head:
-                stage_modules.append("lm_head")
+                stage_modules.append(lm_head_fqn)
 
         if include_rotary_emb:
             # Always include rotary_emb in all stages (it's needed for position embeddings)
@@ -262,15 +263,25 @@ def split_model_into_stages(
     # Detect model structure
     has_model_attr = hasattr(model, "model")
     text_model = get_text_module(model.model if has_model_attr else model)
+    text_model_attr_name = ""
+    for attr_name in TEXT_MODULE_ATTRS:
+        if hasattr(model, attr_name) or hasattr(model.model, attr_name):
+            text_model_attr_name = attr_name
+            break
     has_rotary_emb = hasattr(text_model, "rotary_emb")
-    has_lm_head = hasattr(model, "lm_head")
 
-    if has_model_attr:
+    # Check for lm_head in multiple locations:
+    has_lm_head = hasattr(text_model, "lm_head") or hasattr(model, "lm_head")
+    lm_head_on_top_level = hasattr(model, "lm_head") and not hasattr(text_model, "lm_head")
+
+    text_model_has_model_attr = hasattr(text_model, "model")
+
+    if text_model_has_model_attr:
         # Models like LlamaForCausalLM have model.layers
-        num_layers = len(model.model.layers)
+        num_layers = len(text_model.model.layers)
     else:
         # Direct model access
-        num_layers = len(model.layers)
+        num_layers = len(text_model.layers)
 
     schedule_class = get_schedule_class(pp_schedule)
     is_single_stage_schedule = issubclass(schedule_class, PipelineScheduleSingle)
@@ -290,18 +301,20 @@ def split_model_into_stages(
     include_multimodal_encoders = True
     extra_module_fqns = None
 
-    for attr_name in TEXT_MODULE_ATTRS:
-        if has_model_attr and hasattr(model.model, attr_name):
-            layers_prefix = f"{base_prefix}{attr_name}."
-            break
-        if not has_model_attr and hasattr(model, attr_name):
-            layers_prefix = f"{attr_name}."
-            break
+    text_model_attr_prefix = text_model_attr_name+"."
+    layers_prefix = f"{base_prefix}{text_model_attr_prefix}model." if text_model_has_model_attr else f"{base_prefix}{text_model_attr_prefix}"
+
 
     # If layers live under a nested language_model, keep multimodal encoders at the base prefix
     if layers_prefix != base_prefix:
         include_multimodal_encoders = False
         extra_module_fqns = [f"{base_prefix}{suffix}" for suffix in MULTIMODAL_SUFFIXES]
+        if lm_head_on_top_level:
+            lm_head_fqn = "lm_head"
+        else:
+            lm_head_fqn = f"{base_prefix}{text_model_attr_name}.lm_head"
+    else:
+        lm_head_fqn = "lm_head"
 
     # Auto-generate module split if not provided
     if module_names_per_stage is None:
@@ -314,6 +327,7 @@ def split_model_into_stages(
             include_multimodal_encoders=include_multimodal_encoders,
             extra_module_fqns=extra_module_fqns,
             fqn_prefix=layers_prefix,
+            lm_head_fqn=lm_head_fqn,
         )
 
     def _build_stage_from_modules(
@@ -335,6 +349,9 @@ def split_model_into_stages(
         def _process_module(parent_module, parent_name=""):
             for name, module in list(parent_module.named_children()):
                 full_name = f"{parent_name}.{name}" if parent_name else name
+
+                if full_name in modules_to_keep:
+                    continue
 
                 # Special handling for layers (ModuleList)
                 if isinstance(module, (nn.ModuleDict, nn.ModuleList)):

@@ -36,6 +36,7 @@ MULTIMODAL_SUFFIXES = (
     "audio_encoder",
     "audio_model",
     "mm_projector",
+    "multi_modal_projector",
     "multimodal_projector",
     "vision_projector",
     "audio_projector",
