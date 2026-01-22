@@ -58,6 +58,9 @@ def get_recipe_script_path(command: str, domain: str, repo_root: str | Path) -> 
         str: Full path to the recipe script
     """
     recipe_name = COMMAND_ALIASES.get(command, command)
+    # VLM uses finetune.py instead of train_ft.py
+    if domain == "vlm" and command == "finetune":
+        recipe_name = "finetune"
     return f"{repo_root}/nemo_automodel/recipes/{domain}/{recipe_name}.py"
 
 

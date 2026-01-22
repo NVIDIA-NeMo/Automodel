@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import pathlib
 import time
 from contextlib import nullcontext
@@ -26,6 +27,7 @@ from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers.utils.hub import TRANSFORMERS_CACHE
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
+from nemo_automodel.components.callbacks import CallbackRunner
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
@@ -302,17 +304,20 @@ class TrainBiencoderRecipe(BaseRecipe):
     and contrastive learning.
     """
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, callbacks=None):
         """Initialize the recipe with configuration.
 
         Args:
             cfg: Configuration dictionary/object for training.
+            callbacks: Optional list of Callback instances.
         """
         self.cfg = cfg
+        self.callbacks = callbacks or []
 
     def setup(self):
         """Build all components needed for training/validation/logging/checkpointing."""
         torch.cuda.reset_peak_memory_stats()
+        self.callback_runner = CallbackRunner(self.callbacks)
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
         # setups logging and adds the rankfilter to logging
         setup_logging()
@@ -509,6 +514,7 @@ class TrainBiencoderRecipe(BaseRecipe):
         """Run the training loop over all epochs and batches."""
         for mp in self.model_parts:
             mp.train()
+        self.callback_runner.on_train_start(self)
         self.timestamp = time.perf_counter()
 
         for epoch in self.step_scheduler.epochs:
@@ -516,32 +522,54 @@ class TrainBiencoderRecipe(BaseRecipe):
             # The step scheduler yields a list of batches for gradient accumulation
             for batches in self.step_scheduler:
                 train_log_data = self._run_train_optim_step(batches, 1.0)
+                self.callback_runner.on_train_batch_end(self, train_log_data=train_log_data)
 
                 # Log metrics
                 self.log_train_metrics(train_log_data)
 
                 # Run validation every val_every_steps
                 val_loss = None
+                val_results = {}
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     val_log_data = self._run_validation_epoch(self.val_dataloader)
                     self.log_val_metrics(val_log_data)
                     val_loss = {"val_loss": val_log_data.metrics["val_loss"]}
+                    val_results["validation"] = val_log_data
+                    self.callback_runner.on_validation_end(self, val_results=val_results)
                     for mp in self.model_parts:
                         mp.train()
 
                 # Save checkpoint every ckpt_every_steps
                 if self.step_scheduler.is_ckpt_step:
+                    step = self.step_scheduler.step
+                    train_loss = train_log_data.metrics["loss"]
+
                     self.save_checkpoint(
                         epoch,
-                        self.step_scheduler.step,
-                        train_loss=train_log_data.metrics["loss"],
+                        step,
+                        train_loss=train_loss,
                         val_loss=val_loss,
                     )
+
+                    # Prepare checkpoint info for callback
+                    checkpoint_path = os.path.join(
+                        self.checkpointer.config.checkpoint_dir, f"epoch_{epoch}_step_{step}"
+                    )
+                    checkpoint_info = {
+                        "epoch": epoch,
+                        "step": step,
+                        "train_loss": train_loss,
+                        "val_losses": val_loss or {},
+                        "checkpoint_path": checkpoint_path,
+                    }
+                    self.callback_runner.on_save_checkpoint(self, checkpoint_info=checkpoint_info)
 
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
         self.metric_logger_valid.close()
         self.checkpointer.close()
+
+        self.callback_runner.on_train_end(self)
 
     def _forward_backward_step(self, idx, batch, *, loss_buffer, num_batches, is_train: bool = True):
         """Forward and backward pass for a single batch.
@@ -790,7 +818,11 @@ def main(default_config_path="examples/biencoder/llama3_2_1b_biencoder.yaml"):
     cfg = parse_args_and_load_config(default_config_path)
     recipe = TrainBiencoderRecipe(cfg)
     recipe.setup()
-    recipe.run_train_validation_loop()
+    try:
+        recipe.run_train_validation_loop()
+    except Exception as e:
+        recipe.callback_runner.on_exception(recipe, exception=e)
+        raise e
 
 
 if __name__ == "__main__":
