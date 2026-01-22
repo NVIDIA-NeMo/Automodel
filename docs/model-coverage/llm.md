@@ -84,7 +84,7 @@ The models listed above can be fine-tuned using NeMo Automodel to adapt them to 
 Please see our [Fine-Tuning Guide](../guides/llm/finetune.md) how you can apply both of these fine-tuning methods with your data.
 
 :::{tip}
-In these guides, we use the `SQuAD v1.1` dataset for demonstation purposes, but you can specify your own data as needed.
+In these guides, we use the `SQuAD v1.1` dataset for demonstration purposes, but you can specify your own data as needed.
 :::
 
 ### Example: Fine-Tuning with SQuAD Dataset
