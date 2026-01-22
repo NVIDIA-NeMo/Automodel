@@ -256,6 +256,7 @@ def qwen3_omni_collate_fn(
 def kimi_vl_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
+    max_length: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """Collate function for KimiVL processors."""
     conversations = [example["conversation"] for example in examples]
@@ -279,6 +280,9 @@ def kimi_vl_collate_fn(
         "padding": True,
         "truncation": True,
     }
+    if max_length is not None:
+        processor_kwargs["max_length"] = max_length
+        processor_kwargs["padding"] = "max_length"
     if images:
         processor_kwargs["images"] = images
 

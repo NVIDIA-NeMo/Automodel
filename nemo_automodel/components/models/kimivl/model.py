@@ -22,6 +22,8 @@ This is a self-contained implementation that includes all necessary components:
 """
 
 import json
+import os
+import logging
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -32,6 +34,8 @@ from transformers import AutoConfig
 from transformers.activations import GELUActivation
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast
+
+LOGGER = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -202,7 +206,8 @@ class KimiVLConfig(PretrainedConfig):
 
 
 
-from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3Model
+from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3Model, DeepseekV3ForCausalLM
+from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids
 from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
@@ -482,6 +487,56 @@ class KimiVLMultiModalProjector(nn.Module):
 
 
 # =============================================================================
+# Rotary Embedding Adapter (Non-Module callable for PP/FSDP compatibility)
+# =============================================================================
+
+class DeepSeekV3RotaryEmbeddingAdapter:
+    """Callable adapter that wraps DeepseekV3's freqs_cis-based RoPE.
+    
+    This is NOT an nn.Module to avoid being pruned during PP split.
+    It holds a reference to the parent module's freqs_cis buffer and computes
+    position embeddings on demand.
+    
+    The parent module (KimiVLLanguageModelBackend) owns the freqs_cis buffer,
+    and this adapter accesses it via the reference.
+    """
+    
+    def __init__(self, parent_module: nn.Module, rope_fusion: bool = False):
+        # Store weak reference to avoid circular dependencies
+        self._parent = parent_module
+        self.rope_fusion = rope_fusion
+    
+    @property
+    def freqs_cis(self):
+        """Access freqs_cis from the parent module."""
+        return self._parent.freqs_cis
+    
+    def __call__(self, hidden_states: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        """Compute position embeddings from pre-computed freqs_cis.
+        
+        Args:
+            hidden_states: Input tensor (used only for device/dtype inference)
+            position_ids: Position indices tensor
+            
+        Returns:
+            Position embeddings tensor compatible with DeepseekV3 Block layers
+        """
+        freqs = self.freqs_cis
+        if freqs is None:
+            raise RuntimeError(
+                "freqs_cis is None on parent module. This can happen if the model "
+                "was pruned during PP split and freqs_cis buffer was not preserved."
+            )
+        return freqs_cis_from_position_ids(
+            position_ids,
+            freqs,
+            qkv_format="bshd",
+            for_fused_rope=self.rope_fusion,
+            cp_size=1,
+        )
+
+
+# =============================================================================
 # Language Model Backend
 # =============================================================================
 
@@ -496,14 +551,22 @@ class KimiVLLanguageModelBackend(nn.Module):
         super().__init__()
         self.config = config
         self.backend = backend
+        # Use DeepseekV3Model (backbone only, no lm_head). lm_head is created at KimiVLForConditionalGeneration level.
         self.model = DeepseekV3Model(config, backend, moe_config=moe_config)
         self.moe_config = self.model.moe_config
+        self.register_buffer("freqs_cis", self.model.freqs_cis, persistent=False)
+
+        self.rotary_emb = DeepSeekV3RotaryEmbeddingAdapter(
+            parent_module=self, rope_fusion=backend.rope_fusion
+        )
 
     def get_input_embeddings(self):
-        return self.model.embed_tokens
+        return self.embed_tokens
 
     def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
+        text_model = self._text_model()
+        if text_model is not None:
+            text_model.embed_tokens = value
 
     def forward(
         self,
@@ -515,23 +578,132 @@ class KimiVLLanguageModelBackend(nn.Module):
         padding_mask=None,
         **kwargs,
     ):
-        if inputs_embeds is not None:
-            original_embed_tokens = self.model.embed_tokens
-            self.model.embed_tokens = None
-            try:
-                hidden_states = self.model(
-                    input_ids=inputs_embeds,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    padding_mask=padding_mask,
-                    **kwargs,
-                )
-            finally:
-                self.model.embed_tokens = original_embed_tokens
-            return hidden_states
-
-        hidden_states = self.model(
+        return self.model(
             input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            padding_mask=padding_mask,
+            **kwargs,
+        )
+
+    @torch.no_grad()
+    def init_weights(self, buffer_device=None):
+        if self.model is not None:
+            self.model.init_weights(buffer_device=buffer_device)
+            self.freqs_cis = self.model.freqs_cis
+
+    @property
+    def embed_tokens(self):
+        return self.model.embed_tokens if self.model is not None else None
+
+    @property
+    def layers(self):
+        return self.model.layers if self.model is not None else None
+
+    @property
+    def norm(self):
+        return self.model.norm if self.model is not None else None
+
+
+# =============================================================================
+# Main Model
+# =============================================================================
+
+class KimiVLModel(nn.Module):
+    """KimiVL multimodal backbone with a DeepseekV3 text decoder."""
+
+    def __init__(self, config, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None):
+        super().__init__()
+        self.config = config
+        self.backend = backend or BackendConfig()
+
+        self.vision_tower = MoonVitPretrainedModel(config.vision_config)
+        self.multi_modal_projector = KimiVLMultiModalProjector(config)
+        self.language_model = KimiVLLanguageModelBackend(config.text_config, backend=self.backend, moe_config=moe_config)
+
+        self.moe_config = self.language_model.moe_config
+
+        self.media_placeholder_token_id = config.media_placeholder_token_id
+
+
+    @property
+    def layers(self):
+        return self.language_model.layers
+
+    @property
+    def embed_tokens(self):
+        return self.language_model.embed_tokens
+
+    @property
+    def norm(self):
+        return self.language_model.norm
+
+    def _merge_with_image_features(self, inputs_embeds, input_ids, image_features):
+        """Merge image features into input embeddings."""
+        batch_size, seq_len, embed_dim = inputs_embeds.shape
+        inputs_embeds = inputs_embeds.reshape(-1, embed_dim)
+        input_ids_flat = input_ids.flatten()
+        inputs_embeds[input_ids_flat == self.media_placeholder_token_id] = image_features
+        return inputs_embeds.reshape(batch_size, seq_len, embed_dim)
+
+    def _extract_image_features(self, pixel_values, image_grid_hws):
+        """Extract and project image features."""
+        image_features = self.vision_tower(pixel_values, image_grid_hws)
+        return self.multi_modal_projector(image_features)
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        inputs_embeds=None,
+        pixel_values=None,
+        image_grid_hws=None,
+        padding_mask=None,
+        **kwargs,
+    ):
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if "qkv_format" in kwargs and kwargs["qkv_format"] == "thd":
+            input_ids, position_ids, padding_mask, kwargs = squeeze_input_for_thd(
+                input_ids, position_ids, padding_mask, kwargs
+            )
+            attention_mask = None
+            if padding_mask is not None:
+                kwargs["padding_mask"] = padding_mask
+
+        if inputs_embeds is None:
+            embed_tokens = self.language_model.get_input_embeddings()
+            if embed_tokens is None:
+                if (
+                    input_ids is not None
+                    and isinstance(input_ids, torch.Tensor)
+                    and input_ids.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                ):
+                    # PP middle stages may receive hidden states as input_ids
+                    inputs_embeds = input_ids
+                else:
+                    raise ValueError(
+                        "inputs_embeds must be provided for pipeline stages without embed_tokens"
+                    )
+            else:
+                inputs_embeds = embed_tokens(input_ids)
+
+        if (
+            pixel_values is not None
+            and pixel_values.size(0) > 0
+            and self.vision_tower is not None
+            and self.multi_modal_projector is not None
+        ):
+            pixel_values = pixel_values.to(self.vision_tower.dtype)
+            image_features = self._extract_image_features(pixel_values, image_grid_hws)
+            inputs_embeds = inputs_embeds.to(image_features.dtype)
+            inputs_embeds = self._merge_with_image_features(inputs_embeds, input_ids, image_features)
+
+        hidden_states = self.language_model(
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
             padding_mask=padding_mask,
@@ -539,14 +711,6 @@ class KimiVLLanguageModelBackend(nn.Module):
         )
         return hidden_states
 
-    @torch.no_grad()
-    def init_weights(self, buffer_device=None):
-        self.model.init_weights(buffer_device=buffer_device)
-
-
-# =============================================================================
-# Main Model
-# =============================================================================
 
 class KimiVLForConditionalGeneration(nn.Module, MoEFSDPSyncMixin):
     """KimiVL model with backend-aware DeepseekV3 language model."""
@@ -570,18 +734,13 @@ class KimiVLForConditionalGeneration(nn.Module, MoEFSDPSyncMixin):
         self.config = config
         self.backend = backend or BackendConfig()
 
-        self.vision_tower = MoonVitPretrainedModel(config.vision_config)
-        self.multi_modal_projector = KimiVLMultiModalProjector(config)
-        self.language_model = KimiVLLanguageModelBackend(config.text_config, backend=self.backend, moe_config=moe_config)
-        self.moe_config = self.language_model.moe_config
-        
-        self.lm_head = initialize_linear_module(
+        self.model = KimiVLModel(config, moe_config=moe_config, backend=self.backend)
+        self.moe_config = self.model.moe_config
+
+    
+        self.model.language_model.lm_head = initialize_linear_module(
             self.backend.linear, config.text_config.hidden_size, config.text_config.vocab_size, bias=False
         )
-        
-        # Create a model wrapper for parallelizer compatibility
-        self.model = self.language_model.model
-        self.model.moe_config = self.moe_config
 
         self.vocab_size = config.text_config.vocab_size
         self.pad_token_id = getattr(config.text_config, "pad_token_id", -1) or -1
@@ -600,29 +759,21 @@ class KimiVLForConditionalGeneration(nn.Module, MoEFSDPSyncMixin):
         return next(self.parameters()).dtype
 
     def get_input_embeddings(self):
-        return self.language_model.get_input_embeddings()
+        return self.model.language_model.get_input_embeddings()
 
     def set_input_embeddings(self, value):
-        self.language_model.set_input_embeddings(value)
+        self.model.language_model.set_input_embeddings(value)
 
     def get_output_embeddings(self):
-        return self.lm_head
+        return self.model.language_model.lm_head
 
     def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
+        self.model.language_model.lm_head = new_embeddings
 
-    def _merge_with_image_features(self, inputs_embeds, input_ids, image_features):
-        """Merge image features into input embeddings."""
-        batch_size, seq_len, embed_dim = inputs_embeds.shape
-        inputs_embeds = inputs_embeds.reshape(-1, embed_dim)
-        input_ids_flat = input_ids.flatten()
-        inputs_embeds[input_ids_flat == self.media_placeholder_token_id] = image_features
-        return inputs_embeds.reshape(batch_size, seq_len, embed_dim)
-
-    def _extract_image_features(self, pixel_values, image_grid_hws):
-        """Extract and project image features."""
-        image_features = self.vision_tower(pixel_values, image_grid_hws)
-        return self.multi_modal_projector(image_features)
+    @property
+    def lm_head(self):
+        """Convenience property to access lm_head from top level."""
+        return self.model.language_model.lm_head
 
     def forward(
         self,
@@ -641,34 +792,38 @@ class KimiVLForConditionalGeneration(nn.Module, MoEFSDPSyncMixin):
         padding_mask=None,
         **kwargs,
     ):
-        if "qkv_format" in kwargs and kwargs["qkv_format"] == "thd":
-            input_ids, position_ids, padding_mask, kwargs = squeeze_input_for_thd(
-                input_ids, position_ids, padding_mask, kwargs
+        # Retrieve pre-chunked VLM inputs from model attributes
+        # This allows native forward to work with pipeline parallelism
+        # finetune.py stores chunks on model, we retrieve them here per microbatch
+        if pixel_values is None and hasattr(self, "_vlm_pixel_values_chunks") and self._vlm_pixel_values_chunks is not None:
+            # Check if we have media tokens to process
+            has_media_tokens = (
+                input_ids is not None
+                and self.media_placeholder_token_id is not None
+                and (input_ids == self.media_placeholder_token_id).any()
             )
-            attention_mask = None
-            if padding_mask is not None:
-                kwargs["padding_mask"] = padding_mask
+            if has_media_tokens:
+                chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
+                if chunk_idx < len(self._vlm_pixel_values_chunks):
+                    pixel_values = self._vlm_pixel_values_chunks[chunk_idx]
+                    image_grid_hws = self._vlm_image_grid_hws_chunks[chunk_idx]
+                    self._vlm_chunk_idx = chunk_idx + 1
 
-        if inputs_embeds is None:
-            inputs_embeds = self.get_input_embeddings()(input_ids)
-
-        if pixel_values is not None and pixel_values.size(0) > 0:
-            pixel_values = pixel_values.to(self.vision_tower.dtype)
-            image_features = self._extract_image_features(pixel_values, image_grid_hws)
-            inputs_embeds = inputs_embeds.to(image_features.dtype)
-            inputs_embeds = self._merge_with_image_features(inputs_embeds, input_ids, image_features)
-
-        hidden_states = self.language_model(
-            inputs_embeds=inputs_embeds,
+        hidden_states = self.model(
+            input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            image_grid_hws=image_grid_hws,
             padding_mask=padding_mask,
             **kwargs,
         )
-        logits = self.lm_head(hidden_states)
+
+        logits = self.lm_head(hidden_states) if self.lm_head is not None else hidden_states
 
         loss = None
-        if labels is not None:
+        if labels is not None and self.lm_head is not None:
             if attention_mask is not None:
                 shift_mask = attention_mask[..., 1:]
                 shift_logits = logits[..., :-1, :][shift_mask.to(logits.device) != 0].contiguous()
@@ -681,6 +836,11 @@ class KimiVLForConditionalGeneration(nn.Module, MoEFSDPSyncMixin):
                 shift_labels.view(-1).to(shift_logits.device),
             )
 
+        if return_dict is None:
+            return_dict = False
+        if not return_dict:
+            return logits
+
         return LlavaCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
@@ -691,7 +851,7 @@ class KimiVLForConditionalGeneration(nn.Module, MoEFSDPSyncMixin):
 
     @torch.no_grad()
     def initialize_weights(self, buffer_device=None, dtype=torch.bfloat16):
-        self.language_model.init_weights(buffer_device=buffer_device)
+        self.model.language_model.init_weights(buffer_device=buffer_device)
 
 
 class KimiVLStateDictAdapter:
@@ -703,36 +863,96 @@ class KimiVLStateDictAdapter:
         self.backend = backend
         self.dtype = dtype
         self.llm_adapter = DeepSeekV3StateDictAdapter(config.text_config, moe_config, backend, dtype)
+        self._last_expected_hf_keys: set[str] | None = None
+
+    def _maybe_debug_hf_key_diff(self, expected_keys: set[str], phase: str) -> None:
+        import os
+
+        if not os.getenv("KIMIVL_STATE_DICT_DEBUG"):
+            return
+
+        self._last_expected_hf_keys = expected_keys
+        hf_index_path = os.getenv("KIMIVL_HF_INDEX_PATH")
+        if not hf_index_path:
+            LOGGER.info(
+                "KimiVL state_dict debug (%s): expected HF keys=%d. Set KIMIVL_HF_INDEX_PATH to compare.",
+                phase,
+                len(expected_keys),
+            )
+            return
+
+        try:
+            index_path = (
+                os.path.join(hf_index_path, "model.safetensors.index.json")
+                if os.path.isdir(hf_index_path)
+                else hf_index_path
+            )
+            with open(index_path, "r", encoding="utf-8") as f:
+                index = json.load(f)
+            hf_keys = set(index.get("weight_map", {}).keys())
+            if not hf_keys:
+                LOGGER.info(
+                    "KimiVL state_dict debug (%s): empty or missing weight_map in %s",
+                    phase,
+                    index_path,
+                )
+                return
+            missing = sorted(expected_keys - hf_keys)
+            extra = sorted(hf_keys - expected_keys)
+            LOGGER.info(
+                "KimiVL state_dict debug (%s): expected=%d hf=%d missing=%d extra=%d",
+                phase,
+                len(expected_keys),
+                len(hf_keys),
+                len(missing),
+                len(extra),
+            )
+            if missing:
+                LOGGER.info("KimiVL state_dict debug (%s): missing sample=%s", phase, missing[:20])
+            if extra:
+                LOGGER.info("KimiVL state_dict debug (%s): extra sample=%s", phase, extra[:20])
+        except Exception as exc:
+            LOGGER.info("KimiVL state_dict debug (%s): failed to read HF index: %s", phase, exc)
 
     def to_hf(self, state_dict: dict, **kwargs) -> dict:
         import re
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
         
         hf_state_dict = {}
+        llm_keys = {}
         for key, value in state_dict.items():
             if exclude_key_regex and re.match(exclude_key_regex, key):
                 continue
             
-            # Skip model.* keys - they're aliases of language_model.model.* (same params)
-            # This happens because self.model = self.language_model.model creates an alias
-            if key.startswith("model.") and not key.startswith("model.language_model"):
+            if key.startswith("model.model."):
                 continue
+            if key.startswith("model.language_model."):
+                key = key.replace("model.", "", 1)
+            if key.startswith("model.") and not key.startswith("model.language_model."):
+                key = key.replace("model.", "", 1)
                 
             if key.startswith("language_model.model."):
                 llm_key = key.replace("language_model.model.", "model.")
-                for k, v in self.llm_adapter.to_hf({llm_key: value}, **kwargs).items():
-                    hf_state_dict[k.replace("model.", "language_model.model.")] = v
+                llm_keys[llm_key] = value
+            elif key.startswith("language_model.embed_tokens.") or key.startswith("language_model.layers.") or key.startswith(
+                "language_model.norm."
+            ):
+                llm_key = "model." + key.replace("language_model.", "", 1)
+                llm_keys[llm_key] = value
             elif key.startswith("lm_head."):
                 hf_state_dict["language_model." + key] = value
             else:
                 hf_state_dict[key] = value
+                
+        if llm_keys:
+            for k, v in self.llm_adapter.to_hf(llm_keys, **kwargs).items():
+                hf_state_dict[k.replace("model.", "language_model.model.")] = v
+        self._maybe_debug_hf_key_diff(set(hf_state_dict.keys()), phase="to_hf")
         return hf_state_dict
 
     def from_hf(self, state_dict: dict, **kwargs) -> dict:
         native_state_dict = {}
         
-        # Collect all language_model.model.* keys for batch processing by LLM adapter
-        # The DeepSeekV3 adapter needs all keys at once to properly merge expert weights
         llm_keys = {}
         for key, value in state_dict.items():
             if key.startswith("language_model.model."):
@@ -742,6 +962,8 @@ class KimiVLStateDictAdapter:
                 # Map HF format language_model.lm_head to top-level lm_head
                 native_key = key.replace("language_model.lm_head.", "lm_head.")
                 native_state_dict[native_key] = value
+            elif key.startswith(("vision_tower.", "multi_modal_projector.", "language_model.")):
+                native_state_dict["model." + key] = value
             else:
                 native_state_dict[key] = value
         
@@ -749,9 +971,7 @@ class KimiVLStateDictAdapter:
         if llm_keys:
             converted_llm = self.llm_adapter.from_hf(llm_keys, **kwargs)
             for k, v in converted_llm.items():
-                native_state_dict[k.replace("model.", "language_model.model.")] = v
-                # Also add model.* key for the alias (self.model = self.language_model.model)
-                native_state_dict[k] = v
+                native_state_dict[k.replace("model.", "model.language_model.model.")] = v
         
         return native_state_dict
 
