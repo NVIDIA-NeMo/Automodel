@@ -70,7 +70,7 @@ model:
     attn: flex
     linear: torch
     rms_norm: torch
-    enable_deepep: false
+    dispatcher: torch
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: false
 

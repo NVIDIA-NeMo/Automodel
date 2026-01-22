@@ -31,7 +31,8 @@ class BackendConfig:
     linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
-    enable_deepep: bool = HAVE_DEEP_EP
+    dispatcher: Literal["torch", "deepep", "hybridep"] = "deepep" if HAVE_DEEP_EP else "torch"
+    dispatcher_num_sms: int = 128
     fake_balanced_gate: bool = False
     enable_hf_state_dict_adapter: bool = True
     enable_fsdp_optimizations: bool = False

@@ -415,17 +415,26 @@ class GroupedExpertsDeepEP(nn.Module):
 
         return output
 
-    def __init__(self, config: MoEConfig):
+    def __init__(
+        self,
+        config: MoEConfig,
+        dispatcher_backend: Literal["deepep", "hybridep"] = "deepep",
+        dispatcher_num_sms: int = 128,
+    ):
         """
         Initializes the GroupedExperts module.
 
         Args:
-            args (MoEArgs): Model arguments containing the number of routed experts,
+            config (MoEConfig): Model arguments containing the number of routed experts,
                 model and intermediate dimension parameters.
+            dispatcher_backend: Backend for token dispatching ("deepep" or "hybridep").
+            dispatcher_num_sms: Number of SMs to use for dispatcher backend.
         """
         super().__init__()
 
         self.config = config
+        self.dispatcher_backend = dispatcher_backend
+        self.dispatcher_num_sms = dispatcher_num_sms
         self.expert_bias = config.expert_bias
         self.gate_and_up_projs = nn.Parameter(
             torch.empty(config.n_routed_experts, config.dim, config.moe_inter_dim * 2)
@@ -450,7 +459,9 @@ class GroupedExpertsDeepEP(nn.Module):
             moe_router_topk=self.config.n_activated_experts,
             num_moe_experts=self.config.n_routed_experts,
             moe_permute_fusion=True,
-            moe_enable_deepep=True,
+            moe_flex_dispatcher_backend=self.dispatcher_backend,
+            moe_hybridep_num_sms=self.dispatcher_num_sms,
+            moe_deepep_num_sms=self.dispatcher_num_sms,
         )
 
         self.n_routed_experts = self.config.n_routed_experts
@@ -504,6 +515,7 @@ class GroupedExpertsDeepEP(nn.Module):
             token_probs=weights,
             token_indices=indices,
         )
+        tokens_per_expert = tokens_per_expert.to("cpu")
         permuted_probs = permuted_probs.unsqueeze(-1)
 
         if torch.count_nonzero(tokens_per_expert) > 0:
@@ -916,16 +928,20 @@ class MoE(nn.Module):
             self.gate = FakeBalancedGate(config)
         else:
             self.gate = Gate(config, gate_precision=backend.gate_precision)
-        if backend.enable_deepep and get_world_size_safe() == 1:
+        if backend.dispatcher in ("deepep", "hybridep") and get_world_size_safe() == 1:
             warnings.warn(
-                "DeepEP is enabled in config, but world size is 1. "
-                "DeepEP requires multiple GPUs. Falling back to standard GroupedExperts.",
+                f"{backend.dispatcher} dispatcher is enabled in config, but world size is 1. "
+                f"{backend.dispatcher} requires multiple GPUs. Falling back to standard GroupedExperts.",
                 category=UserWarning,
                 stacklevel=2,
             )
             self.experts = GroupedExperts(config)
-        elif backend.enable_deepep:
-            self.experts = GroupedExpertsDeepEP(config)
+        elif backend.dispatcher in ("deepep", "hybridep"):
+            self.experts = GroupedExpertsDeepEP(
+                config,
+                dispatcher_backend=backend.dispatcher,
+                dispatcher_num_sms=backend.dispatcher_num_sms,
+            )
         else:
             self.experts = GroupedExperts(config)
 

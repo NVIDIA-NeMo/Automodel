@@ -161,7 +161,7 @@ override-dependencies = ["nvidia-cudnn-cu12>=9.18.0.0; sys_platform == 'linux'"]
 
 [tool.uv.sources]
 nv_grouped_gemm = { git = "https://github.com/fanshiqing/grouped_gemm", rev = "v1.1.4.post8" }
-deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "e3908bf5bd0cc6265bcb225d15cd8c996d4759ef" }
+deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "a48493600c4886c1b297aaa78db0e1ebc2d8dd6c" }
 torch = [
   { index = "pytorch-cpu", marker = "sys_platform != 'linux' and sys_platform != 'darwin'" },
   { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
@@ -199,7 +199,7 @@ nv_grouped_gemm = ["setuptools"]
 [[tool.uv.dependency-metadata]]
 name = "deep_ep"
 # This version has to match the version in the commit/rev/tag used
-version = "v1.1.0+e3908bf"
+version = "v1.2.1+a484936"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]

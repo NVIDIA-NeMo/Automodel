@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Benchmarking config for Kimi K2 Te Deepep
+# Benchmarking config for Moonlight 16B Te Deepep
 
 seed: 1234
 
@@ -21,12 +21,12 @@ benchmark:
   peak_tflops: 989  # H100 peak TFLOPs
   nsys_start: -1
   nsys_end: -1
-  nsys_ranks: []
-  num_nodes: 32
+  nsys_ranks: [0]
+  num_nodes: 1
 
 step_scheduler:
-  global_batch_size: 512
-  local_batch_size: 8
+  global_batch_size: 256
+  local_batch_size: 1
   ckpt_every_steps: 1000
   val_every_steps: 1000
   num_epochs: 1
@@ -36,16 +36,16 @@ distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   tp_size: 1
   cp_size: 1
-  pp_size: 8
+  pp_size: 1
   dp_replicate_size: 1
-  ep_size: 32
+  ep_size: 1
   sequence_parallel: false
 
 autopipeline:
   _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
   pp_schedule: interleaved1f1b
-  pp_microbatch_size: 1
-  round_virtual_stages_to_pp_multiple: down
+  pp_microbatch_size: 4
+  round_virtual_stages_to_pp_multiple: up
   scale_grads_in_schedule: false
   patch_inner_model: false
   patch_causal_lm_model: false
@@ -55,25 +55,12 @@ dist_env:
   backend: nccl
   timeout_minutes: 10
 
-parallelizer:
-  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
-  activation_checkpointing: true
-
 model:
-  _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_config
+  _target_: transformers.AutoModelForCausalLM.from_config
   config:
     _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: moonshotai/Kimi-K2-Base
+    pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
   trust_remote_code: true
-  backend:
-    _target_: nemo_automodel.components.moe.utils.BackendConfig
-    attn: te
-    linear: te
-    rms_norm: te
-    rope_fusion: true
-    dispatcher: deepep
-    fake_balanced_gate: true
-    enable_hf_state_dict_adapter: false
 
 checkpoint:
   enabled: false
@@ -85,7 +72,7 @@ loss_fn:
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
-  seq_len: 4096
+  seq_len: 2048
   num_samples: 100000
 
 dataloader:

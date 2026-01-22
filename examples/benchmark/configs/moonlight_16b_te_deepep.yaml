@@ -72,7 +72,7 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: true
-    enable_deepep: true
+    dispatcher: deepep
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
