@@ -294,41 +294,6 @@ class NemotronV3Mamba2Mixer(nn.Module):
             nn.init.zeros_(self.out_proj.bias)
 
 
-class ReLUSquaredActivation(nn.Module):
-    """ReLU squared activation: relu(x)^2"""
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.relu(x).pow(2)
-
-
-class NemotronV3MLP(nn.Module):
-    """MLP for NemotronV3.
-
-    Simple two-layer MLP with ReLU squared activation.
-    """
-
-    def __init__(self, config, intermediate_size: int | None = None):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = intermediate_size or config.intermediate_size
-        self.mlp_bias = getattr(config, "mlp_bias", False)
-
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=self.mlp_bias)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=self.mlp_bias)
-        self.act_fn = ReLUSquaredActivation()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.up_proj(x)))
-
-    @torch.no_grad()
-    def init_weights(self, init_std: float = 0.02):
-        for linear in [self.up_proj, self.down_proj]:
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
-            if linear.bias is not None:
-                nn.init.zeros_(linear.bias)
-
-
-
 class NemotronV3Block(nn.Module):
     """NemotronV3 decoder block (training-only, simplified).
 
@@ -363,7 +328,18 @@ class NemotronV3Block(nn.Module):
         elif self.block_type == "attention":
             self.mixer = NemotronV3Attention(config)
         elif self.block_type == "mlp":
-            self.mixer = NemotronV3MLP(config)
+            from nemo_automodel.components.moe.layers import MLP
+            from nemo_automodel.shared.utils import dtype_from_str
+
+            dtype = dtype_from_str(config.torch_dtype, torch.bfloat16)
+            self.mixer = MLP(
+                dim=config.hidden_size,
+                inter_dim=config.intermediate_size,
+                backend=backend.linear,
+                dtype=dtype,
+                activation=getattr(config, "mlp_hidden_act", "relu2"),
+                bias=getattr(config, "mlp_bias", False),
+            )
         elif self.block_type == "moe":
             from nemo_automodel.components.moe.layers import MoE
             from nemo_automodel.components.moe.utils import BackendConfig

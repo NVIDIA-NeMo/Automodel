@@ -128,15 +128,15 @@ class MLP(nn.Module):
         self.activation = activation
         self.is_gated = is_gated_activation(activation)
 
-        self.gate_proj = initialize_linear_module(
+        self.up_proj = initialize_linear_module(
             linear_impl=backend, in_features=dim, out_features=inter_dim, bias=bias, dtype=dtype
         )
         if self.is_gated:
-            self.up_proj = initialize_linear_module(
+            self.gate_proj = initialize_linear_module(
                 linear_impl=backend, in_features=dim, out_features=inter_dim, bias=bias, dtype=dtype
             )
         else:
-            self.up_proj = None
+            self.gate_proj = None
 
         self.down_proj = initialize_linear_module(
             linear_impl=backend, in_features=inter_dim, out_features=dim, bias=bias, dtype=dtype
@@ -155,7 +155,7 @@ class MLP(nn.Module):
         if self.is_gated:
             return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
         else:
-            return self.down_proj(F.relu(self.gate_proj(x)).pow(2))
+            return self.down_proj(F.relu(self.up_proj(x)).pow(2))
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         init_weights_fn = partial(_init_weights, buffer_device=buffer_device, init_std=init_std)
@@ -1112,6 +1112,7 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
                 to_local(module.gate_up_proj_bias).zero_()
                 to_local(module.down_proj_bias).zero_()
         elif isinstance(module, MLP):
-            to_local(module.gate_proj.weight).normal_(mean=0.0, std=init_std)
             to_local(module.down_proj.weight).normal_(mean=0.0, std=init_std)
             to_local(module.up_proj.weight).normal_(mean=0.0, std=init_std)
+            if module.gate_proj is not None:
+                to_local(module.gate_proj.weight).normal_(mean=0.0, std=init_std)

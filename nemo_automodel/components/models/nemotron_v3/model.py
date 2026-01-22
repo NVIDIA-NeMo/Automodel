@@ -230,8 +230,8 @@ class NemotronV3Model(nn.Module):
             nn.init.zeros_(moe_module.experts.down_proj_bias)
 
         # Shared expert
-        if moe_module.shared_experts.gate_proj.bias is not None:
-            nn.init.zeros_(moe_module.shared_experts.gate_proj.bias)
+        if moe_module.shared_experts.up_proj.bias is not None:
+            nn.init.zeros_(moe_module.shared_experts.up_proj.bias)
         if moe_module.shared_experts.down_proj.bias is not None:
             nn.init.zeros_(moe_module.shared_experts.down_proj.bias)
 
