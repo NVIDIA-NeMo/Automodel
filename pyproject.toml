@@ -185,6 +185,8 @@ omit = [
     "config-3.py",
     # transformer v5 backports
     "nemo_automodel/_transformers/tokenization/tokenization_mistral_common.py",
+    # requires databricks
+    "nemo_automodel/components/datasets/llm/delta_lake_dataset.py",
 ]
 
 [tool.ruff]
