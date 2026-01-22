@@ -66,7 +66,7 @@ slurm:
     - /lustre:/lustre
   # Optional: Specify custom HF_HOME location (will auto-create if not specified)
   hf_home: /path/to/your/HF_HOME
-  # Optional : Specify custom env vars
+  # Optional: Specify custom env vars
   # env_vars:
   #   ENV_VAR: value
   # Optional: Specify custom job directory (defaults to cwd/slurm_jobs)
