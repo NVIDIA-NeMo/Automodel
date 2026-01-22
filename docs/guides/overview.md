@@ -21,6 +21,7 @@ End-to-end fine-tuning recipes for many open models. Each subfolder contains YAM
 - Folder: [examples/llm_finetune](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune)
 - Representative families: Llama 3.1/3.2/3.3, Gemma 2/3, Falcon 3, Mistral/Mixtral, Nemotron, Granite, Starcoder, Qwen, Baichuan, GLM, OLMo, Phi, GPT-OSS, Moonlight
 - How-to guide: [LLM finetuning](llm/finetune.md)
+- Migration guide: [NeMo 2 → NeMo Automodel migration](llm/nemo2-to-automodel-migration.md)
 
 ### Pretraining
 
