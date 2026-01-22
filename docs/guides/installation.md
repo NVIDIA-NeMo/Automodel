@@ -118,7 +118,7 @@ under `/opt/Automodel`.
 Some functionality may require optional extras. You can install them like this:
 ```bash
 pip3 install nemo-automodel[cli]    # Installs only the Automodel CLI
-pip3 install nemo-Automodel         # Installs the CLI and all LLM dependencies.
+pip3 install nemo-automodel         # Installs the CLI and all LLM dependencies.
 pip3 install nemo-Automodel[vlm]    # Install all VLM-related dependencies.
 ```
 
