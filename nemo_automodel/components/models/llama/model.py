@@ -21,7 +21,7 @@ Example (YAML):
 
 ```yaml
 model:
-  _target_: nemo_automodel.components.models.llama.build_llama_model
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
 ```
 """
@@ -29,11 +29,10 @@ model:
 from __future__ import annotations
 
 import os
-from typing import Any, Callable, Optional, Union
+from typing import Callable, Optional, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import LlamaConfig
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_causal_mask
@@ -50,17 +49,12 @@ from transformers.models.llama.modeling_llama import (
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
-from transformers.utils.generic import check_model_inputs
 
-from nemo_automodel.components.models.common.combined_projection import (
-    CombinedGateUpMLP,
-    CombinedQKVAttentionMixin,
-)
+from nemo_automodel.components.models.common.combined_projection import CombinedGateUpMLP, CombinedQKVAttentionMixin
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
-from nemo_automodel.components.moe.utils import BackendConfig
-from nemo_automodel.shared.utils import dtype_from_str
+from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
 
-__all__ = ["build_llama_model", "LlamaForCausalLM"]
+check_model_inputs = get_check_model_inputs_decorator()
 
 
 class LlamaAttention(CombinedQKVAttentionMixin, nn.Module):
@@ -358,19 +352,15 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
     def __init__(
         self,
         config: LlamaConfig,
-        backend: Optional[BackendConfig] = None,
     ):
         super().__init__(config)
         self.config = config
-        self.backend = backend or BackendConfig()
         self.model = LlamaModel(config=config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        # Create state_dict_adapter if enabled
-        if self.backend.enable_hf_state_dict_adapter:
-            self.state_dict_adapter = LlamaStateDictAdapter(config=self.config)
-
+        # Create state_dict_adapter
+        self.state_dict_adapter = LlamaStateDictAdapter(config=self.config)
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -485,93 +475,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
+            hidden_states=hidden_states,
         )
 
 
-def build_llama_model(pretrained_model_name_or_path: str, **kwargs: Any) -> nn.Module:
-    """Build a custom Llama model with combined projections for efficiency.
-
-    This function loads the config from a HuggingFace model card and builds
-    a custom Llama model with combined QKV and gate_up projections for improved efficiency.
-
-    Args:
-        pretrained_model_name_or_path: HuggingFace model card name (e.g., "meta-llama/Meta-Llama-3-70B")
-        **kwargs: Override config parameters. Common parameters include:
-                  - vocab_size: Vocabulary size
-                  - hidden_size: Hidden dimension size
-                  - num_hidden_layers: Number of transformer layers (useful for testing)
-                  - num_attention_heads: Number of attention heads
-                  - num_key_value_heads: Number of key/value heads for GQA
-                  - intermediate_size: MLP intermediate size
-                  - max_position_embeddings: Maximum sequence length
-                  - rms_norm_eps: RMSNorm epsilon
-                  - rope_theta: RoPE base frequency
-                  - attention_dropout: Attention dropout probability
-                  - pad_token_id: Padding token ID
-                  - attn_implementation: Attention backend ("eager", "sdpa", "flash_attention_2")
-                  - torch_dtype: Model dtype (default: bfloat16)
-
-    Returns:
-        LlamaForCausalLM model instance with combined projections
-
-    Example:
-        # Load with default settings (combined projections, bfloat16)
-        model = build_llama_model("meta-llama/Meta-Llama-3-70B")
-
-        # Use SDPA for faster attention
-        model = build_llama_model("meta-llama/Meta-Llama-3-70B",
-                                   attn_implementation="sdpa")
-
-        # Override for testing with fewer layers
-        model = build_llama_model("meta-llama/Meta-Llama-3-70B", num_hidden_layers=4)
-    """
-    # Extract and convert torch_dtype
-    torch_dtype = kwargs.pop("torch_dtype", None)
-    if torch_dtype is not None and isinstance(torch_dtype, str):
-        torch_dtype = dtype_from_str(torch_dtype)
-    elif torch_dtype is None:
-        torch_dtype = torch.bfloat16  # Default to bf16
-
-    # Extract attention implementation if specified, otherwise auto-detect
-    # This matches nemo_automodel/_transformers/auto_model.py approach
-    attn_implementation = kwargs.pop("attn_implementation", None)
-
-    # Load config from HuggingFace (with any overrides from kwargs)
-    config = LlamaConfig.from_pretrained(pretrained_model_name_or_path, **kwargs)
-
-    # Ensure architectures is set for LoRA compatibility
-    if not hasattr(config, "architectures") or config.architectures is None:
-        config.architectures = ["LlamaForCausalLM"]
-
-    # Set attention implementation with auto-detection
-    # Priority: user-specified > existing in config > auto-detect (flash_attention_2 > sdpa > eager)
-    # This matches the logic in nemo_automodel/_transformers/auto_model.py
-    if attn_implementation is not None:
-        config._attn_implementation = attn_implementation
-    elif not hasattr(config, "_attn_implementation") or config._attn_implementation is None:
-        # Auto-detect best available implementation (same as nemo_automodel default)
-        try:
-            # Try flash_attention_2 first (fastest)
-            config._attn_implementation = "flash_attention_2"
-        except (ImportError, ModuleNotFoundError):
-            # Fall back to SDPA if available (PyTorch 2.0+)
-            if hasattr(F, "scaled_dot_product_attention"):
-                config._attn_implementation = "sdpa"
-            else:
-                # Final fallback to eager
-                config._attn_implementation = "eager"
-
-    if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-        print(f"[build_llama_model] Attention implementation: {config._attn_implementation}")
-        print(f"[build_llama_model] torch_dtype: {torch_dtype}")
-
-    # Create backend config with HF state dict adapter enabled
-    backend = BackendConfig(enable_hf_state_dict_adapter=True)
-
-    # Create model with combined projections
-    model = LlamaForCausalLM(config=config, backend=backend)
-
-    # need to convert model manually since LlamaForCausalLM does not support to(dtype=...)
-    model = model.to(dtype=torch_dtype)
-
-    return model
+ModelClass = LlamaForCausalLM

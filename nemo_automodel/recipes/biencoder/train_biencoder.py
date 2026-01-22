@@ -433,6 +433,8 @@ class TrainBiencoderRecipe(BaseRecipe):
             self.model_parts = [model]
             self.pp = None
 
+        self.checkpointer.config.model_state_dict_keys = ["model." + k for k in model.lm_q.state_dict().keys()]
+
         # Build optimizer
         logger.info("Building optimizer...")
         trainable_params = list(filter(lambda x: x.requires_grad, self.model_parts[0].parameters()))
@@ -518,16 +520,23 @@ class TrainBiencoderRecipe(BaseRecipe):
                 # Log metrics
                 self.log_train_metrics(train_log_data)
 
-                # Save checkpoint every ckpt_every_steps
-                if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(epoch, self.step_scheduler.step)
-
                 # Run validation every val_every_steps
+                val_loss = None
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     val_log_data = self._run_validation_epoch(self.val_dataloader)
                     self.log_val_metrics(val_log_data)
+                    val_loss = {"val_loss": val_log_data.metrics["val_loss"]}
                     for mp in self.model_parts:
                         mp.train()
+
+                # Save checkpoint every ckpt_every_steps
+                if self.step_scheduler.is_ckpt_step:
+                    self.save_checkpoint(
+                        epoch,
+                        self.step_scheduler.step,
+                        train_loss=train_log_data.metrics["loss"],
+                        val_loss=val_loss,
+                    )
 
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
@@ -611,7 +620,7 @@ class TrainBiencoderRecipe(BaseRecipe):
                 scheduler.step(1)
 
         # Compute average loss across gradient accumulation and DP ranks
-        reporting_loss = torch.sum(torch.stack(loss_buffer))
+        reporting_loss = torch.mean(torch.stack(loss_buffer))
         if torch.distributed.is_initialized():
             reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
             # Divide by DP group size to get average across all ranks
@@ -719,10 +728,12 @@ class TrainBiencoderRecipe(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        if wandb.run is not None:
-            wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+        # Log to remote services (WandB) according to step_scheduler frequency
+        if self.step_scheduler.is_remote_logging_step:
+            if wandb.run is not None:
+                wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
 
-        # JSONL training log
+        # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
 
         logging.info(
@@ -748,6 +759,7 @@ class TrainBiencoderRecipe(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
+        # Always log validation to remote services (validation is already infrequent via val_every_steps)
         if wandb.run is not None:
             wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
 

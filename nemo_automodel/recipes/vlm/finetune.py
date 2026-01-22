@@ -174,8 +174,6 @@ def build_model_and_optimizer(
                 fp8_config = build_fp8_config(cfg_fp8)
                 model = apply_fp8_to_model(model, config=fp8_config)
 
-        print_trainable_parameters(model)
-
         # hold a copy of the model state dict keys before any parallelization
         state_dict_keys = model.state_dict().keys()
 
@@ -185,10 +183,15 @@ def build_model_and_optimizer(
 
         load_weights = False
         if parallelize_fn is not None and get_world_size_safe() > 1:
+            moe_mesh = getattr(model_wrapper, "moe_mesh", None)
+            ep_axis_name = "ep" if moe_mesh is not None and "ep" in moe_mesh.mesh_dim_names else None
+            ep_shard_axis_names = (
+                ("ep_shard",) if moe_mesh is not None and "ep_shard" in moe_mesh.mesh_dim_names else None
+            )
             parallelize_fn(
                 model,
                 world_mesh=model_wrapper.device_mesh,
-                moe_mesh=getattr(model_wrapper, "moe_mesh", None),
+                moe_mesh=moe_mesh,
                 pp_enabled=False,
                 dp_axis_names=(
                     ("dp_replicate", "dp_shard_cp")
@@ -198,8 +201,8 @@ def build_model_and_optimizer(
                 ),
                 cp_axis_name="cp",
                 tp_axis_name="tp",
-                ep_axis_name="ep",
-                ep_shard_axis_names=("ep_shard",),
+                ep_axis_name=ep_axis_name,
+                ep_shard_axis_names=ep_shard_axis_names,
             )
             load_weights = True
         elif callable(getattr(model_wrapper, "parallelize", None)):
@@ -226,6 +229,7 @@ def build_model_and_optimizer(
                 load_base_model=load_base_model,
             )
 
+        print_trainable_parameters(model)
         model = model.to(device)
 
         # Apply torch.compile if configured
@@ -601,6 +605,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
             True if self.cfg.get("peft", None) else False,
         )
 
+        if self.cfg.get("clip_grad_norm.max_norm", None) is not None:
+            self.max_grad_norm = float(self.cfg.clip_grad_norm.max_norm)
+        else:
+            logging.info("No clip_grad_norm.max_norm specified in config, using default value of 1.0")
+            self.max_grad_norm = 1.0
+
         # Create Checkpointer instance
         self.checkpointer = Checkpointer(
             config=checkpoint_config,
@@ -696,7 +706,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
             for batch_idx, batches in enumerate(self.step_scheduler):
-                log_data = self._run_train_optim_step(batches, 1.0)
+                log_data = self._run_train_optim_step(batches, self.max_grad_norm)
                 self.callback_runner.on_train_batch_end(self, train_log_data=log_data)
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step(1)
@@ -748,7 +758,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         self.callback_runner.on_train_end(self)
 
-    def _run_train_optim_step(self, batches, max_grad_norm=1.0):
+    def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
 
         Args:
@@ -774,7 +784,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
             labels = batch.pop("labels")
 
             train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
-            with train_ctx(), get_sync_ctx(self.model, i == num_batches - 1):
+            with (
+                train_ctx(),
+                get_sync_ctx(
+                    self.model,
+                    i == num_batches - 1,
+                    defer_fsdp_grad_sync=getattr(self.model_wrapper, "defer_fsdp_grad_sync", True),
+                ),
+            ):
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
                     out = self.model(logits_to_keep=1, **batch)
@@ -797,8 +814,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 local_loss.backward()
 
         grad_norm = scale_grads_and_clip_grad_norm(
-            max_grad_norm,
-            [self.model],
+            max_grad_norm=max_grad_norm,
+            model_parts=[self.model],
             norm_type=2.0,
             pp_enabled=False,
             device_mesh=self.device_mesh,
@@ -970,9 +987,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        if wandb.run is not None:
-            wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
-        # JSONL training log
+        # Log to remote services (WandB) according to step_scheduler frequency
+        if self.step_scheduler.is_remote_logging_step:
+            if wandb.run is not None:
+                wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+
+        # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
         logging.info(
             "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(

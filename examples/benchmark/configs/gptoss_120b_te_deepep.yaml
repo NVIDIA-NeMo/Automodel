@@ -71,10 +71,10 @@ model:
     attn: flex
     linear: te
     rms_norm: te
+    rope_fusion: true
     enable_deepep: true
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: false
-    fsdp_optimization_config: null
 
 checkpoint:
   enabled: false

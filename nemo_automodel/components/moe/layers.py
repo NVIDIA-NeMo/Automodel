@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import warnings
 from dataclasses import dataclass
 from functools import partial
 from typing import Literal, Optional
@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -194,6 +195,7 @@ class GroupedExperts(nn.Module):
                 model and intermediate dimension parameters.
         """
         super().__init__()
+        self.config = config
         self.n_routed_experts = config.n_routed_experts
         self.expert_bias = config.expert_bias
         self.gate_and_up_projs = nn.Parameter(
@@ -302,6 +304,29 @@ class GroupedExperts(nn.Module):
             )
 
             y.scatter_add_(dim=0, index=idx_b, src=expert_out.to(x.dtype))
+
+        # Handle the edge case where no tokens are routed to any local experts.
+        # This can occur during expert parallelism when all tokens on a particular
+        # rank happen to select experts hosted on other ranks. We perform a dummy
+        # computation through the local expert weights to ensure:
+        # 1. Gradient flow through local expert parameters during backpropagation
+        # 2. Proper participation in collective operations (reduce-scatter)
+        # The computation is a no-op since we multiply by zero (using zeros_like input).
+        if active_local_experts == 0:
+            gate_and_up_proj = get_local_proj(self.gate_and_up_projs, experts_start_idx)
+            down_proj = get_local_proj(self.down_projs, experts_start_idx)
+            gate_up_proj_bias = get_local_proj(self.gate_up_proj_bias, experts_start_idx) if self.expert_bias else None
+            down_proj_bias = get_local_proj(self.down_proj_bias, experts_start_idx) if self.expert_bias else None
+
+            expert_out = (
+                self.expert_activation(
+                    torch.zeros_like(x[0]).unsqueeze(0),
+                    gate_and_up_proj=gate_and_up_proj,
+                    down_proj=down_proj,
+                )
+                * weights[0, 0, None]
+            )
+            y[0] += expert_out[0]
 
         if ep_size > 1:
             y = DTensor.from_local(y, device_mesh=ep_mesh, placements=[Partial()])
@@ -891,7 +916,15 @@ class MoE(nn.Module):
             self.gate = FakeBalancedGate(config)
         else:
             self.gate = Gate(config, gate_precision=backend.gate_precision)
-        if backend.enable_deepep:
+        if backend.enable_deepep and get_world_size_safe() == 1:
+            warnings.warn(
+                "DeepEP is enabled in config, but world size is 1. "
+                "DeepEP requires multiple GPUs. Falling back to standard GroupedExperts.",
+                category=UserWarning,
+                stacklevel=2,
+            )
+            self.experts = GroupedExperts(config)
+        elif backend.enable_deepep:
             self.experts = GroupedExpertsDeepEP(config)
         else:
             self.experts = GroupedExperts(config)

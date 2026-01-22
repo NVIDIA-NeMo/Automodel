@@ -14,167 +14,259 @@
 import importlib
 import sys
 import types
-from typing import List
 
 import pytest
 import torch
 
-SKIP_TOKEN = 99  # token that must be masked with -100 in labels
+
+CONVERSATION = [
+    {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
+    {"role": "assistant", "content": [{"type": "text", "text": "Hello"}]},
+]
 
 
 class DummyTokenizer:
-    """
-    Mimics the tokenizer API used by create_loss_mask_with_start_of_response_token
-    """
-
     def __init__(self, pad_token_id=0):
         self.pad_token_id = pad_token_id
+        self.eos_token = "<eos>"
 
-    def __call__(self, text, add_special_tokens=True):
-        if text == "<start_of_turn>":
-            return {"input_ids": [100]}  # single token for start of turn
-        elif text == "<start_of_turn>model\n":
-            return {"input_ids": [100, 101, 102]}  # multi-token response marker
-        else:
-            return {"input_ids": [10, 20, 30]}  # dummy token IDs
+    def __call__(self, text, add_special_tokens=True, **kwargs):
+        return {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long)}
+
+    def decode(self, token):
+        if isinstance(token, torch.Tensor):
+            token = token.item()
+        return str(token)
 
 
 class DummyQwen25Processor:
-    """
-    Mimics the public API used by qwen2_5_collate_fn:
-      • apply_chat_template(tokenize=bool)
-      • __call__(text, images, padding, return_tensors="pt")
-    """
-
     def __init__(self):
-        self.call_counter = 0  # handy for assertions if you like
-        self.tokenizer = DummyTokenizer(pad_token_id=0)  # Add tokenizer attribute
+        self.tokenizer = DummyTokenizer(pad_token_id=0)
 
-    # Called with tokenize=False (single example) in qwen2_5_collate_fn
     def apply_chat_template(self, conversation, *, tokenize=False, **kwargs):
-        if tokenize:
-            raise RuntimeError("This fake is only used with tokenize=False in qwen2_5_collate_fn")
+        assert tokenize is False
         return "dummy chat string"
 
-    # Called by processor(...) in qwen2_5_collate_fn
-    def __call__(self, *, text: List[str], images: List[torch.Tensor], padding: bool, return_tensors: str):
-        self.call_counter += 1
-        bs = len(text)
-        # Produce a deterministic fake sequence that includes the SKIP_TOKEN so
-        # we can validate the masking logic.
-        seq = torch.tensor([0, 1, SKIP_TOKEN, 2, 3])
-        input_ids = seq.unsqueeze(0).repeat(bs, 1)
-
+    def __call__(self, *, text, images, padding, return_tensors):
+        batch_size = len(text)
+        input_ids = torch.arange(1, 6).unsqueeze(0).repeat(batch_size, 1)
         return {
             "input_ids": input_ids,
-            "pixel_values": torch.zeros(bs, 3, 224, 224, dtype=torch.float32),
+            "pixel_values": torch.zeros(batch_size, 3, 224, 224, dtype=torch.float32),
         }
 
 
 class DummyDefaultProcessor:
-    """
-    Mimics the public API used by default_collate_fn:
-      • apply_chat_template(tokenize=True, return_tensors="pt", return_dict=True)
-    """
-
     def __init__(self):
-        self.tokenizer = DummyTokenizer(pad_token_id=0)  # Add tokenizer attribute
+        self.tokenizer = DummyTokenizer(pad_token_id=0)
 
     def apply_chat_template(
         self,
         conv_list,
         *,
-        tokenize: bool,
-        add_generation_prompt: bool = True,
-        padding: bool = False,
-        truncation: bool = False,
-        return_tensors: str,
-        return_dict: bool,
+        tokenize,
+        add_generation_prompt=True,
+        padding=False,
+        truncation=False,
+        return_tensors,
+        return_dict=True,
     ):
         assert tokenize and return_tensors == "pt" and return_dict
-        bs = len(conv_list)
-        seq = torch.tensor([5, 6, SKIP_TOKEN, 7])
-        input_ids = seq.unsqueeze(0).repeat(bs, 1)
-        pixel_values = torch.ones(bs, 3, 64, 64, dtype=torch.float32)
-
+        batch_size = len(conv_list)
+        input_ids = torch.arange(1, 5).unsqueeze(0).repeat(batch_size, 1)
+        pixel_values = torch.ones(batch_size, 3, 64, 64, dtype=torch.float32)
         return {"input_ids": input_ids, "pixel_values": pixel_values}
 
 
 class DummyQwen3OmniProcessor:
-    """
-    Mimics the public API used by qwen3_omni_collate_fn:
-      • apply_chat_template(add_generation_prompt=False, tokenize=False)
-      • __call__(text, return_tensors="pt", padding=True, optional multimodal kwargs)
-    """
-
     def __init__(self):
         self.tokenizer = DummyTokenizer(pad_token_id=0)
-        self.call_kwargs_list = []
+        self.call_kwargs = []
 
-    def apply_chat_template(
-        self, conversation, *, add_generation_prompt: bool, tokenize: bool, **kwargs
-    ):
+    def apply_chat_template(self, conversation, *, add_generation_prompt, tokenize, **kwargs):
         assert add_generation_prompt is False
         assert tokenize is False
-        # Produce deterministic string based on user content for observability
-        user_content = conversation[0]["content"]
-        return f"chat:{user_content}"
+        return "chat:" + conversation[0]["content"][0]["text"]
 
     def __call__(self, *, text, return_tensors, padding, **kwargs):
         assert return_tensors == "pt"
         assert padding is True
-        self.call_kwargs_list.append(dict(kwargs))
-
-        bs = len(text)
-        # Deterministic sequence containing SKIP_TOKEN and a start marker (100)
-        seq = torch.tensor([5, 100, SKIP_TOKEN, 7, 8])
-        input_ids = seq.unsqueeze(0).repeat(bs, 1)
-
+        self.call_kwargs.append(dict(kwargs))
+        batch_size = len(text)
+        input_ids = torch.arange(1, 6).unsqueeze(0).repeat(batch_size, 1)
         return {"input_ids": input_ids}
 
 
+class DummyPhi4Processor:
+    def __init__(self):
+        self.tokenizer = DummyTokenizer(pad_token_id=0)
+        self.chat_calls = []
+        self.forward_calls = []
+        self.produced_input_ids = None
+
+    def apply_chat_template(self, conversation, *, tokenize, **kwargs):
+        assert tokenize is False
+        self.chat_calls.append({"conversation": conversation, "kwargs": kwargs})
+        return "chat::" + conversation[0]["content"][0]["text"]
+
+    def __call__(
+        self,
+        *,
+        text,
+        audios,
+        return_tensors,
+        padding,
+        truncation,
+        max_length,
+    ):
+        self.forward_calls.append(
+            {
+                "text": list(text),
+                "audios": list(audios),
+                "return_tensors": return_tensors,
+                "padding": padding,
+                "truncation": truncation,
+                "max_length": max_length,
+            },
+        )
+        batch_size = len(text)
+        base = torch.arange(1, batch_size * 3 + 1, dtype=torch.long).reshape(batch_size, 3)
+        attention_mask = torch.ones_like(base)
+        extra = torch.arange(batch_size, dtype=torch.long)
+        self.produced_input_ids = base.clone()
+        return {"input_ids": base, "attention_mask": attention_mask, "extra": extra}
+
+
+class DummyNemotronParseProcessor:
+    def __init__(self):
+        self.tokenizer = types.SimpleNamespace(
+            pad_token_id=0,
+            decoder_start_token_id=5,
+            bos_token_id=6,
+            eos_token_id=7,
+        )
+
+    def __call__(self, *, images, text, padding, return_tensors):
+        assert padding is True and return_tensors == "pt"
+        batch_size = len(text)
+        input_ids = torch.tensor([[10, 11, 12, 13]], dtype=torch.long).repeat(batch_size, 1)
+        attention_mask = torch.ones_like(input_ids)
+        pixel_values = torch.ones(batch_size, 3, 2, 2, dtype=torch.float32)
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "pixel_values": pixel_values}
+
+
+def test_build_labels_includes_stop_token(collate_mod, monkeypatch):
+    """
+    Ensure `build_labels` copies the trailing stop token when it matches the configured set.
+    """
+
+    class StubTokenizer:
+        def __call__(self, text, add_special_tokens, return_tensors):
+            assert text == "assistant text"
+            assert add_special_tokens is False
+            assert return_tensors == "pt"
+            return {"input_ids": torch.tensor([[5, 6]])}
+
+        def decode(self, token):
+            if isinstance(token, torch.Tensor):
+                token = token.item()
+            return "STOP" if token == 7 else str(token)
+
+    class StubProcessor:
+        def __init__(self):
+            self.tokenizer = StubTokenizer()
+
+    monkeypatch.setattr(collate_mod, "default_stop_tokens", lambda processor: ("STOP",), raising=True)
+
+    input_ids_batch = torch.tensor([[1, 5, 6, 7]])
+    conversation = [
+        {"role": "user", "content": [{"type": "text", "text": "question"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "assistant text"}]},
+    ]
+
+    labels = collate_mod.build_labels(input_ids_batch, [conversation], StubProcessor())
+    assert labels.shape == input_ids_batch.shape
+    assert labels.tolist()[0] == [-100, 5, 6, 7]
+
+
+def test_phi4_mm_collate_fn_handles_audio_and_trimming(collate_mod, monkeypatch):
+    processor = DummyPhi4Processor()
+    examples = [
+        {
+            "conversation": CONVERSATION,
+            "audio": {"array": [0.1, 0.2], "sampling_rate": 16000},
+        },
+        {
+            "conversation": [
+                {"role": "user", "content": [{"type": "text", "text": "Hola"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "Adios"}]},
+            ],
+            "audio": ([0.3, -0.4], 8000),
+        },
+    ]
+
+    captured = {}
+    labels_stub = torch.tensor([[101, 102, 103], [201, 202, 203]], dtype=torch.long)
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        captured["input_ids"] = input_ids.clone()
+        captured["conversations"] = conversations
+        captured["processor"] = processor_arg
+        return labels_stub
+
+    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+
+    batch = collate_mod.phi4_mm_collate_fn(examples, processor)
+
+    assert len(processor.chat_calls) == len(examples)
+    for call, example in zip(processor.chat_calls, examples, strict=True):
+        assert call["conversation"] is example["conversation"]
+
+    assert len(processor.forward_calls) == 1
+    forward_call = processor.forward_calls[0]
+    assert forward_call["return_tensors"] == "pt"
+    assert forward_call["padding"] is True
+    assert forward_call["truncation"] is True
+    assert forward_call["max_length"] == 1024
+    assert forward_call["text"] == ["chat::Hi", "chat::Hola"]
+
+    expected_audio0 = (examples[0]["audio"]["array"], examples[0]["audio"]["sampling_rate"])
+    assert forward_call["audios"][0] == expected_audio0
+    assert forward_call["audios"][1] == examples[1]["audio"]
+
+    assert torch.equal(captured["input_ids"], processor.produced_input_ids)
+    assert captured["conversations"] == [example["conversation"] for example in examples]
+    assert captured["processor"] is processor
+
+    trimmed_input = processor.produced_input_ids[:, :-1]
+    assert torch.equal(batch["input_ids"], trimmed_input)
+    assert torch.equal(batch["attention_mask"], torch.ones_like(trimmed_input))
+    assert torch.equal(batch["extra"], torch.arange(len(examples), dtype=torch.long))
+    assert torch.equal(batch["labels"], labels_stub)
 @pytest.fixture()
 def collate_mod():
-    """
-    Import the module under test fresh for every test so monkey-patching of
-    module-level variables does not leak between tests.
-    """
     import nemo_automodel.components.datasets.vlm.collate_fns as _m
 
-    # Always reload so each test starts from a clean module object.
     return importlib.reload(_m)
 
 
 @pytest.fixture()
-def patch_skipped(monkeypatch):
-    """
-    Patch extract_skipped_token_ids to return our fixed SKIP_TOKEN.
-    """
-
-    def _fake_skip_fn(processor):
-        return torch.tensor([SKIP_TOKEN])
-
-    monkeypatch.setattr(
-        "nemo_automodel.components.datasets.vlm.collate_fns.extract_skipped_token_ids",
-        _fake_skip_fn,
-        raising=True,
-    )
-
-
-@pytest.fixture()
 def fake_qwen_utils(monkeypatch):
-    """
-    Provide a fake qwen_vl_utils.process_vision_info so the import inside the
-    collate module succeeds.
-    """
-    fake_utils = types.ModuleType("qwen_vl_utils")
+    vision_utils = types.ModuleType("qwen_vl_utils")
 
     def _fake_process_vision_info(conversation):
-        # Return tuple expected by qwen2_5_collate_fn; only first element is used.
         return torch.zeros(3, 224, 224), None
 
-    fake_utils.process_vision_info = _fake_process_vision_info
-    monkeypatch.setitem(sys.modules, "qwen_vl_utils", fake_utils)
+    vision_utils.process_vision_info = _fake_process_vision_info
+    monkeypatch.setitem(sys.modules, "qwen_vl_utils", vision_utils)
+
+    omni_utils = types.ModuleType("qwen_omni_utils")
+
+    def _fake_process_mm_info(conversation, use_audio_in_video=False):
+        return None, [], []
+
+    omni_utils.process_mm_info = _fake_process_mm_info
+    monkeypatch.setitem(sys.modules, "qwen_omni_utils", omni_utils)
 
 
 def test_dispatch_table(collate_mod):
@@ -182,510 +274,85 @@ def test_dispatch_table(collate_mod):
     assert collate_mod.COLLATE_FNS["default"] is collate_mod.default_collate_fn
 
 
-def _fake_process_vision_info(conv):
-    # qwen2_5_collate_fn only uses the first return value
-    return (torch.zeros(3, 224, 224),)  # 1-tuple
-
-
-def test_qwen25_collate_happy_path(collate_mod, patch_skipped, monkeypatch):
-    # Patch the *imported symbol* inside collate_mod, not the module.
-    monkeypatch.setattr(collate_mod, "process_vision_info", _fake_process_vision_info, raising=True)
-
-    # Ensure code path that requires the utils is enabled
+def test_qwen25_collate_shapes(collate_mod, fake_qwen_utils, monkeypatch):
     monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
 
     processor = DummyQwen25Processor()
-    examples = [{"conversation": "a"}, {"conversation": "b"}]
+    batch = collate_mod.qwen2_5_collate_fn([{"conversation": CONVERSATION}], processor)
 
-    batch = collate_mod.qwen2_5_collate_fn(examples, processor)
-
-    assert batch["input_ids"].shape == (2, 5)
-    assert batch["labels"].shape == (2, 5)
-
-    # last column is -100
+    assert batch["input_ids"].shape == (1, 4)
+    assert batch["labels"].shape == (1, 4)
     assert torch.all(batch["labels"][:, -1] == -100)
 
-    # the SKIP_TOKEN (99) should be masked out in labels
-    # Original seq: [0, 1, 99, 2, 3]
-    # Shifted   -> [1, 99, 2, 3, -100]  then 99 → -100
-    expected = torch.tensor([1, -100, 2, 3, -100])
-    assert torch.equal(batch["labels"][0], expected)
 
-
-def test_default_collate_happy_path(collate_mod, patch_skipped, monkeypatch):
+def test_default_collate_shapes(collate_mod, fake_qwen_utils, monkeypatch):
     monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
 
     processor = DummyDefaultProcessor()
-    examples = [{"conversation": "hello"}, {"conversation": "world"}]
+    batch = collate_mod.default_collate_fn([{"conversation": CONVERSATION} for _ in range(2)], processor)
 
-    batch = collate_mod.default_collate_fn(examples, processor)
-
-    assert batch["input_ids"].shape == (2, 4)
-    assert batch["labels"].shape == (2, 4)
-    # pixel_values should have been cast to bfloat16
+    assert batch["input_ids"].shape == (2, 3)
+    assert batch["labels"].shape == (2, 3)
     assert batch["pixel_values"].dtype == torch.bfloat16
-    # last column -100
-    assert torch.all(batch["labels"][:, -1] == -100)
-    # SKIP_TOKEN location masked
-    # seq = [5,6,SKIP_TOKEN,7]  -> after shift SKIP_TOKEN is at col 1
-    assert torch.all(batch["labels"][:, 1] == -100)
+
+
+def test_qwen3_omni_collate_shapes(collate_mod, fake_qwen_utils, monkeypatch):
+    monkeypatch.setattr(collate_mod, "HAVE_QWEN_OMNI_UTILS", True, raising=True)
+
+    processor = DummyQwen3OmniProcessor()
+    batch = collate_mod.qwen3_omni_collate_fn([{"conversation": CONVERSATION} for _ in range(3)], processor)
+
+    assert batch["input_ids"].shape == (3, 4)
+    assert batch["labels"].shape == (3, 4)
+
+
+def test_nemotron_parse_collate_shifts_and_casts(collate_mod, monkeypatch):
+    processor = DummyNemotronParseProcessor()
+
+    # Return deterministic labels to bypass tokenizer-heavy logic.
+    labels_stub = torch.tensor([[20, 21, 22, 23]], dtype=torch.long)
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        assert processor_arg is processor
+        assert input_ids.shape == (1, 4)
+        return labels_stub
+
+    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+
+    examples = [
+        {
+            "conversation": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "please parse"},
+                        {"type": "image", "image": "dummy.png"},
+                    ],
+                },
+                {"role": "assistant", "content": "ok"},
+            ]
+        }
+    ]
+
+    batch = collate_mod.nemotron_parse_collate_fn(
+        examples,
+        processor=processor,
+        task_prompt="</s><s><predict_bbox>",
+    )
+
+    assert batch["pixel_values"].dtype == torch.bfloat16
+    assert torch.equal(batch["input_ids"], torch.tensor([[10, 11, 12]]))
+    assert torch.equal(batch["attention_mask"], torch.tensor([[1, 1, 1]]))
+    assert torch.equal(batch["labels"], torch.tensor([[21, 22, 23]]))
+    assert torch.equal(batch["decoder_input_ids"], torch.tensor([[10, 11, 12]]))
+    assert torch.equal(batch["decoder_attention_mask"], torch.tensor([[1, 1, 1]]))
 
 
 @pytest.mark.parametrize("fn_name", ["qwen2_5_collate_fn", "default_collate_fn", "qwen3_omni_collate_fn"])
 def test_import_error_when_qwen_utils_missing(collate_mod, fn_name, monkeypatch):
-    # Simulate missing qwen_vl_utils
     monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", False, raising=True)
     monkeypatch.setattr(collate_mod, "HAVE_QWEN_OMNI_UTILS", False, raising=True)
     func = getattr(collate_mod, fn_name)
 
     with pytest.raises(ImportError):
         func([], None)
-
-
-class TestCreateLossMaskWithStartOfResponseToken:
-    """Test cases for create_loss_mask_with_start_of_response_token function."""
-
-    def test_no_start_of_response_token(self, collate_mod):
-        """Test when start_of_response_token is None."""
-        processor = DummyQwen25Processor()
-        input_ids = torch.tensor([1, 2, 3, 4, 5])
-
-        result = collate_mod.create_loss_mask_with_start_of_response_token(
-            input_ids, processor, start_of_response_token=None
-        )
-
-        # Should return all 1s (no masking) when no start token is provided
-        expected = [1, 1, 1, 1, 1]
-        assert result == expected
-
-    def test_complete_sequence_found(self, collate_mod):
-        """Test when complete start_of_response_token sequence is found."""
-        processor = DummyQwen25Processor()
-        # Input contains the complete sequence [100, 101, 102] at indices 4-6
-        input_ids = torch.tensor([0, 1, 2, 3, 100, 101, 102, 7, 8])
-        
-        result = collate_mod.create_loss_mask_with_start_of_response_token(
-            input_ids, processor, start_of_response_token="<start_of_turn>model\n"
-        )
-
-        # Complete sequence found at index 4-6, response starts at index 4 (include start token)
-        expected = [0, 0, 0, 0, 1, 1, 1, 1, 1]
-        assert result == expected
-
-    def test_start_of_response_token_not_found(self, collate_mod):
-        """Test when start_of_response_token is not found in input_ids."""
-        processor = DummyQwen25Processor()
-        input_ids = torch.tensor([1, 2, 3, 4, 5])
-
-        result = collate_mod.create_loss_mask_with_start_of_response_token(
-            input_ids, processor, start_of_response_token="<start_of_turn>model\n"
-        )
-
-        # Should return all 1s when token sequence is not found
-        expected = [1, 1, 1, 1, 1]
-        assert result == expected
-
-    def test_partial_sequence_not_matched(self, collate_mod):
-        """Test that partial sequences don't trigger false positives."""
-        processor = DummyQwen25Processor()
-        # Input has token 100 but not the complete sequence [100, 101, 102]
-        input_ids = torch.tensor([1, 100, 2, 3, 4])  # Changed to avoid padding token at start
-
-        result = collate_mod.create_loss_mask_with_start_of_response_token(
-            input_ids, processor, start_of_response_token="<start_of_turn>model\n"
-        )
-
-        # Complete sequence not found, should return all 1s
-        expected = [1, 1, 1, 1, 1]
-        assert result == expected
-
-    def test_single_token_response_marker(self, collate_mod):
-        """Test with single token response marker."""
-        processor = DummyQwen25Processor()
-        # Looking for single token [100], first occurrence at index 1
-        input_ids = torch.tensor([0, 100, 1, 2, 3])
-
-        result = collate_mod.create_loss_mask_with_start_of_response_token(
-            input_ids, processor, start_of_response_token="<start_of_turn>"
-        )
-
-        # Single token found at index 1, response starts at index 1 (include start token)
-        expected = [0, 1, 1, 1, 1]
-        assert result == expected
-
-    def test_padding_tokens_masked(self, collate_mod):
-        """Test that padding tokens are properly masked."""
-        processor = DummyQwen25Processor()
-        processor.tokenizer = DummyTokenizer(pad_token_id=0)
-        # Input with padding tokens (0s) at the end
-        input_ids = torch.tensor([1, 2, 100, 101, 102, 3, 4, 0, 0])
-
-        result = collate_mod.create_loss_mask_with_start_of_response_token(
-            input_ids, processor, start_of_response_token="<start_of_turn>model\n"
-        )
-
-        # Complete sequence at index 2-4, response starts at index 2 (include start token), padding tokens masked
-        expected = [0, 0, 1, 1, 1, 1, 1, 0, 0]
-        assert result == expected
-
-    def test_padding_tokens_in_middle(self, collate_mod):
-        """Test that padding tokens in the middle are also masked."""
-        processor = DummyQwen25Processor()
-        processor.tokenizer = DummyTokenizer(pad_token_id=0)
-        # Input with padding tokens (0s) in the middle
-        input_ids = torch.tensor([1, 0, 100, 101, 102, 3, 4])
-
-        result = collate_mod.create_loss_mask_with_start_of_response_token(
-            input_ids, processor, start_of_response_token="<start_of_turn>model\n"
-        )
-
-        # Complete sequence at index 2-4, response starts at index 2 (include start token), padding token at index 1 masked
-        expected = [0, 0, 1, 1, 1, 1, 1]
-        assert result == expected
-
-    def test_custom_pad_token_id(self, collate_mod):
-        """Test with custom pad token ID."""
-        processor = DummyQwen25Processor()
-        processor.tokenizer = DummyTokenizer(pad_token_id=999)
-        # Input with custom padding tokens (999s) at the end
-        input_ids = torch.tensor([1, 2, 100, 101, 102, 3, 999, 999])
-
-        result = collate_mod.create_loss_mask_with_start_of_response_token(
-            input_ids, processor, start_of_response_token="<start_of_turn>model\n"
-        )
-
-        # Complete sequence at index 2-4, response starts at index 2 (include start token), custom padding tokens masked
-        expected = [0, 0, 1, 1, 1, 1, 0, 0]
-        assert result == expected
-
-
-class TestCollateFunctionIntegration:
-    """Test cases for the integration of loss mask creation in collate functions."""
-
-    def test_qwen25_collate_fn_loss_mask_integration(self, collate_mod, patch_skipped, monkeypatch):
-        """Test that qwen2_5_collate_fn properly creates loss masks."""
-        # Patch the process_vision_info function
-        monkeypatch.setattr(collate_mod, "process_vision_info", _fake_process_vision_info, raising=True)
-        monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
-
-        processor = DummyQwen25Processor()
-        processor.tokenizer = DummyTokenizer(pad_token_id=0)
-        examples = [{"conversation": "a"}, {"conversation": "b"}]
-
-        batch = collate_mod.qwen2_5_collate_fn(examples, processor, start_of_response_token="<start_of_turn>model\n")
-
-        # Verify loss_mask is present and properly shaped
-        assert "loss_mask" in batch
-        assert batch["loss_mask"].shape == batch["input_ids"].shape
-        assert batch["loss_mask"].dtype == torch.float
-        assert batch["loss_mask"].device == batch["input_ids"].device
-
-    def test_default_collate_fn_loss_mask_integration(self, collate_mod, patch_skipped, monkeypatch):
-        """Test that default_collate_fn properly creates loss masks."""
-        monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
-
-        processor = DummyDefaultProcessor()
-        examples = [{"conversation": "hello"}, {"conversation": "world"}]
-
-        batch = collate_mod.default_collate_fn(examples, processor, start_of_response_token="<start_of_turn>model\n")
-
-        # Verify loss_mask is present and properly shaped
-        assert "loss_mask" in batch
-        assert batch["loss_mask"].shape == batch["input_ids"].shape
-        assert batch["loss_mask"].dtype == torch.float
-        assert batch["loss_mask"].device == batch["input_ids"].device
-
-    def test_inline_batch_processing_with_padding(self, collate_mod):
-        """Test that the inline batch processing handles padding correctly."""
-        processor = DummyQwen25Processor()
-        processor.tokenizer = DummyTokenizer(pad_token_id=0)
-
-        # Create a batch with input_ids that have padding tokens
-        batch_input_ids = torch.tensor(
-            [
-                [1, 100, 2, 3, 100, 101, 102, 4, 0],  # With padding at end
-                [5, 100, 6, 7, 100, 101, 102, 8, 9],  # No padding
-            ]
-        )
-
-        # Test the inline list comprehension logic
-        loss_masks = [
-            collate_mod.create_loss_mask_with_start_of_response_token(input_ids, processor, "<start_of_turn>model\n")
-            for input_ids in batch_input_ids
-        ]
-        result = torch.tensor(loss_masks, dtype=torch.float, device=batch_input_ids.device)
-
-        expected = torch.tensor(
-            [
-                [0, 0, 0, 0, 1, 1, 1, 1, 0],  # Complete sequence at 4-6, response starts at 4 (include start token), padding token masked
-                [0, 0, 0, 0, 1, 1, 1, 1, 1],  # Complete sequence at 4-6, response starts at 4 (include start token), no padding
-            ],
-            dtype=torch.float,
-            device=batch_input_ids.device,
-        )
-
-        assert torch.equal(result, expected)
-
-    def test_inline_batch_processing_mixed_sequences(self, collate_mod):
-        """Test inline batch processing with mixed sequence types."""
-        processor = DummyQwen25Processor()
-
-        batch_input_ids = torch.tensor(
-            [
-                [0, 100, 1, 2, 100, 101, 102, 3, 4],  # Has valid response start
-                [5, 6, 7, 8, 9, 10, 11, 12, 13],  # No start token
-            ]
-        )
-
-        # Test the inline list comprehension logic
-        loss_masks = [
-            collate_mod.create_loss_mask_with_start_of_response_token(input_ids, processor, "<start_of_turn>model\n")
-            for input_ids in batch_input_ids
-        ]
-        result = torch.tensor(loss_masks, dtype=torch.float, device=batch_input_ids.device)
-
-        expected = torch.tensor(
-            [
-                [0, 0, 0, 0, 1, 1, 1, 1, 1],  # Complete sequence at 4-6, response starts at 4 (include start token)
-                [1, 1, 1, 1, 1, 1, 1, 1, 1],  # No masking (all 1s)
-            ],
-            dtype=torch.float,
-            device=batch_input_ids.device,
-        )
-
-        assert torch.equal(result, expected)
-
-    def test_qwen3_omni_collate_fn_modalities_and_masks(self, collate_mod, patch_skipped, monkeypatch):
-        monkeypatch.setattr(collate_mod, "HAVE_QWEN_OMNI_UTILS", True, raising=True)
-
-        examples = [
-            {
-                "conversation": [
-                    {"role": "user", "content": "user-0"},
-                    {"role": "assistant", "content": "assistant-0"},
-                ]
-            },
-            {
-                "conversation": [
-                    {"role": "user", "content": "user-1"},
-                    {"role": "assistant", "content": "assistant-1"},
-                ]
-            },
-        ]
-
-        call_mode = {"returns_data": True}
-        call_records = []
-
-        def _fake_process_mm_info(conversation, use_audio_in_video):
-            call_records.append(use_audio_in_video)
-            if call_mode["returns_data"]:
-                user_token = conversation[0]["content"]
-                return (
-                    [f"{user_token}_audio"],
-                    [f"{user_token}_image"],
-                    [f"{user_token}_video"],
-                )
-            return ([], [], [])
-
-        monkeypatch.setattr(collate_mod, "process_mm_info", _fake_process_mm_info, raising=True)
-
-        processor_with_modalities = DummyQwen3OmniProcessor()
-        batch = collate_mod.qwen3_omni_collate_fn(
-            examples,
-            processor_with_modalities,
-            start_of_response_token="<start_of_turn>",
-            use_audio_in_video=True,
-        )
-
-        assert call_records == [True, True]
-        first_call_kwargs = processor_with_modalities.call_kwargs_list[-1]
-        assert set(first_call_kwargs.keys()) == {"audio", "images", "videos"}
-        assert first_call_kwargs["audio"] == [["user-0_audio"], ["user-1_audio"]]
-        assert first_call_kwargs["images"] == [["user-0_image"], ["user-1_image"]]
-        assert first_call_kwargs["videos"] == [["user-0_video"], ["user-1_video"]]
-
-        expected_labels = torch.tensor([100, -100, 7, 8, -100])
-        expected_loss_mask = torch.tensor([0, 1, 1, 1, 1], dtype=torch.float)
-
-        assert torch.equal(batch["labels"][0], expected_labels)
-        assert torch.equal(batch["loss_mask"][0], expected_loss_mask)
-        assert batch["loss_mask"].dtype == torch.float
-        assert batch["loss_mask"].shape == batch["input_ids"].shape
-        assert batch["loss_mask"].device == batch["input_ids"].device
-        assert batch["labels"].shape == batch["input_ids"].shape
-
-        call_mode["returns_data"] = False
-        call_records.clear()
-
-        processor_without_modalities = DummyQwen3OmniProcessor()
-        batch_empty = collate_mod.qwen3_omni_collate_fn(
-            examples,
-            processor_without_modalities,
-            start_of_response_token="<start_of_turn>",
-            use_audio_in_video=False,
-        )
-
-        assert call_records == [False, False]
-        second_call_kwargs = processor_without_modalities.call_kwargs_list[-1]
-        assert second_call_kwargs == {}
-
-        assert torch.equal(batch_empty["labels"][0], expected_labels)
-        assert torch.equal(batch_empty["loss_mask"][0], expected_loss_mask)
-        assert batch_empty["loss_mask"].shape == batch_empty["input_ids"].shape
-        assert batch_empty["loss_mask"].device == batch_empty["input_ids"].device
-
-
-class DummyPhi4Processor:
-    """
-    Mimics the processor API used by phi4_mm_collate_fn:
-      • apply_chat_template(conversation, tokenize=False)
-      • __call__(text, audios, return_tensors="pt", padding=True, truncation=True, max_length=1024)
-      • tokenizer with __call__ method for tokenizing content
-    """
-
-    def __init__(self):
-        self.tokenizer = DummyPhi4Tokenizer()
-
-    def apply_chat_template(self, conversation, tokenize=False):
-        """Generate a chat template string from conversation."""
-        assert not tokenize, "phi4_mm_collate_fn calls this with tokenize=False"
-        # Simulate a chat template that includes both user and assistant parts
-        user_part = conversation[0]["content"]
-        assistant_part = conversation[1]["content"]
-        return f"<|user|>{user_part}<|assistant|>{assistant_part}<|end|>"
-
-    def __call__(self, *, text, audios, return_tensors, padding, truncation, max_length):
-        """Process text and audio inputs."""
-        assert return_tensors == "pt"
-        bs = len(text)
-
-        # Create deterministic input_ids that include both user and assistant parts
-        # User part: [1, 2, 3] Assistant part: [4, 5]
-        input_ids = torch.tensor([[1, 2, 3, 4, 5] for _ in range(bs)])
-
-        # Mock audio embeddings
-        audio_embed_dim = 64
-        audio_seq_len = 10
-        input_audio_embeds = torch.randn(bs, audio_seq_len, audio_embed_dim)
-        audio_embed_sizes = torch.tensor([audio_seq_len] * bs)
-
-        return {
-            "input_ids": input_ids,
-            "input_audio_embeds": input_audio_embeds,
-            "audio_embed_sizes": audio_embed_sizes,
-            "attention_mask": torch.ones_like(input_ids),
-        }
-
-
-class DummyPhi4Tokenizer:
-    """Mock tokenizer for phi4 processor."""
-
-    def __init__(self):
-        self.pad_token_id = 0
-
-    def __call__(self, text, add_special_tokens=False):
-        """Tokenize text content - used for finding assistant content in input_ids."""
-        # Map common assistant responses to token sequences
-        if "Hello there" in text:
-            return {"input_ids": [4, 5]}  # Assistant tokens in our mock input_ids
-        elif "How are you" in text:
-            return {"input_ids": [4, 5]}  # Same tokens for simplicity
-        else:
-            return {"input_ids": [10, 11]}  # Default tokens that won't match
-
-    def decode(self, tokens, skip_special_tokens=False):
-        """Mock decode method."""
-        return f"decoded:{tokens.tolist()}"
-
-
-def test_phi4_mm_collate_fn(collate_mod):
-    """Test basic functionality of phi4_mm_collate_fn."""
-    processor = DummyPhi4Processor()
-
-    examples = [
-        {
-            "conversation": [
-                {"role": "user", "content": "<|audio_1|>What is in this audio?"},
-                {"role": "assistant", "content": "Hello there"},
-            ],
-            "audio": {
-                "array": [0.1, 0.2, 0.3],
-                "sampling_rate": 16000
-            }
-        },
-        {
-            "conversation": [
-                {"role": "user", "content": "<|audio_1|>Transcribe this"},
-                {"role": "assistant", "content": "How are you"},
-            ],
-            "audio": {
-                "array": [0.4, 0.5, 0.6],
-                "sampling_rate": 16000
-            }
-        }
-    ]
-
-    batch = collate_mod.phi4_mm_collate_fn(examples, processor)
-
-    # Check basic structure
-    assert "input_ids" in batch
-    assert "labels" in batch
-    assert "loss_mask" in batch
-    assert "input_audio_embeds" in batch
-    assert "audio_embed_sizes" in batch
-
-    # Check shapes - labels and loss_mask should have same length as input_ids
-    assert batch["input_ids"].shape == batch["labels"].shape
-    assert batch["input_ids"].shape == batch["loss_mask"].shape
-
-    # Check batch size
-    assert batch["input_ids"].shape[0] == 2
-
-    # Check that labels are properly created with -100 padding
-    assert batch["labels"].shape[1] == batch["input_ids"].shape[1]
-
-    # Check audio embeddings
-    assert batch["input_audio_embeds"].dim() == 3  # (batch, seq_len, embed_dim)
-    assert batch["audio_embed_sizes"].shape[0] == 2
-
-    # Verify no unwanted keys remain
-    assert "input_image_embeds" not in batch
-    assert "image_sizes" not in batch
-    assert "image_attention_mask" not in batch
-
-
-def test_phi4_mm_collate_fn_labels_and_loss_mask(collate_mod):
-    """Test that labels and loss_mask are created correctly."""
-    processor = DummyPhi4Processor()
-
-    examples = [
-        {
-            "conversation": [
-                {"role": "user", "content": "<|audio_1|>What is this?"},
-                {"role": "assistant", "content": "Hello there"},  # Will match tokens [4, 5]
-            ],
-            "audio": {
-                "array": [0.1, 0.2],
-                "sampling_rate": 16000
-            }
-        }
-    ]
-
-    batch = collate_mod.phi4_mm_collate_fn(examples, processor)
-
-    # Check that input_ids, labels, and loss_mask have same length
-    input_ids = batch["input_ids"][0]
-    labels = batch["labels"][0]
-    loss_mask = batch["loss_mask"][0]
-
-    assert len(input_ids) == len(labels) == len(loss_mask)
-
-    # Loss mask should have 1s where assistant tokens are found
-    # Our mock sets assistant tokens [4, 5] to be at positions 3, 4 in input_ids [1, 2, 3, 4, 5]
-    expected_loss_mask = [0, 0, 0, 1, 1]  # Only assistant tokens unmasked
-    assert loss_mask.tolist() == expected_loss_mask
-
-    # Labels should have -100 where loss_mask is 0
-    for i, mask_val in enumerate(loss_mask):
-        if mask_val == 0:
-            assert labels[i] == -100

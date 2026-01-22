@@ -99,6 +99,12 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
         from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 
+        if self.cfg.get("clip_grad_norm.max_norm", None) is not None:
+            self.max_grad_norm = float(self.cfg.clip_grad_norm.max_norm)
+        else:
+            logging.info("No clip_grad_norm.max_norm specified in config, using default value of 1.0")
+            self.max_grad_norm = 1.0
+
         self.checkpointer = Checkpointer(
             config=checkpoint_config,
             dp_rank=self._get_dp_rank(include_cp=True),
@@ -275,7 +281,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
         # Calculate gradient norm (distributed-aware)
         grad_norm = clip_grad_norm(
-            max_grad_norm=1e9,  # Effectively no clipping (measure only)
+            max_grad_norm=self.max_grad_norm,
             model_parts=self.model_parts,
             norm_type=2.0,
             pp_enabled=self._get_pp_rank() != 0 if hasattr(self, "_get_pp_rank") else False,
@@ -436,10 +442,12 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        if wandb.run is not None:
-            wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+        # Log to remote services (WandB) according to step_scheduler frequency
+        if self.step_scheduler.is_remote_logging_step:
+            if wandb.run is not None:
+                wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
 
-        # JSONL training log
+        # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
         logging.info(
             "step {} | epoch {} | loss {:.4f} | accuracy {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu)".format(

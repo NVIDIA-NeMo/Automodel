@@ -113,8 +113,8 @@ lr_scheduler:
 checkpoint:
   enabled: true
   checkpoint_dir: ./output/llama3_2_1b_biencoder/checkpoints
-  model_save_format: torch_save
-  save_consolidated: false
+  model_save_format: safetensors
+  save_consolidated: true
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager

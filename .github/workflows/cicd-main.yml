@@ -45,7 +45,7 @@ jobs:
       - name: Set up UV
         uses: astral-sh/setup-uv@v1
         with:
-          version: 0.7.2
+          version: 0.8.22
       - name: Install ruff
         env:
           UV_PROJECT_ENVIRONMENT: ./venv
@@ -60,8 +60,9 @@ jobs:
       - name: Run ruff
         run: |
           source ./venv/bin/activate
-          uv run ruff check . --verbose
-          uv run ruff format --check . --verbose
+          uv run --active ruff --version
+          uv run --active ruff check --verbose .
+          uv run --active ruff format --check --verbose .
 
   import_linting:
     runs-on: ubuntu-latest
@@ -173,12 +174,8 @@ jobs:
       max-parallel: 5
       matrix:
         include:
-          - test-name: L2_Pretrain
-            test-folder: pretrain_llm
-            runner: self-hosted-nemo
-            timeout: 20
-          - test-name: L2_HF_Consolidated_FSDP
-            test-folder: hf_consolidated_fsdp
+          - test-name: L2_Pretrain_and_KD
+            test-folder: llm_pretrain_and_kd
             runner: self-hosted-nemo
             timeout: 20
           - test-name: L2_HF_DCP
@@ -205,16 +202,8 @@ jobs:
             test-folder: hf_transformer_vlm
             runner: self-hosted-nemo
             timeout: 60
-          - test-name: L2_LLM_KD
-            test-folder: llm_kd
-            runner: self-hosted-nemo
-            timeout: 60
           - test-name: L2_Datasets
             test-folder: data
-            runner: self-hosted-nemo
-            timeout: 20
-          - test-name: L2_clip_grad_norm
-            test-folder: clip_grad_norm
             runner: self-hosted-nemo
             timeout: 20
     needs: [cicd-unit-tests]
