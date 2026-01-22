@@ -8,5 +8,5 @@ nemo_automodel @akoumpa @HuiyingLi @adil-a @hemildesai
 examples @akoumpa @HuiyingLi @adil-a @hemildesai
 README.md @akoumpa @HuiyingLi @snowmanwwg
 
-nemo_automodel/components/datasets/llm/ @akoumpa @adil-a @NVIDIA-NeMo/automodel_retreiver_maintainers
+nemo_automodel/components/datasets/llm/ @akoumpa @adil-a @NVIDIA-NeMo/automodel_retriever_maintainers
 biencoder/ @akoumpa @adil-a @NVIDIA-NeMo/automodel_retriever_maintainers
