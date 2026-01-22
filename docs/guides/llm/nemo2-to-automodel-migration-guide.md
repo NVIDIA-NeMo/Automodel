@@ -635,13 +635,16 @@ optimizer:
   <thead>
     <tr>
       <th style="border:1px solid #d0d7de; padding:8px; text-align:left; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
-        Topic
+        Explanation
       </th>
       <th style="border:1px solid #d0d7de; padding:8px; text-align:left; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
-        NeMo 2
+        What the NeMo 2 YAML files configure
       </th>
       <th style="border:1px solid #d0d7de; padding:8px; text-align:left; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
-        NeMo Automodel
+        What the Automodel YAML files configure
+      </th>
+      <th style="border:1px solid #d0d7de; padding:8px; text-align:left; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Notes
       </th>
     </tr>
   </thead>
@@ -651,10 +654,33 @@ optimizer:
         Model initialization / restore
       </td>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
-        <code>resume.restore_config.path: /mount/models/llama-3_3-70b-instruct_v0.0.1</code>
+        <code>resume.restore_config.path</code>
       </td>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
-        <code>model.pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct</code>
+        <code>model.pretrained_model_name_or_path</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Same concept, different key name. Both can usually be a local path or an HF model id.
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Training schedule (epochs/steps + val/ckpt cadence)
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>trainer.max_epochs</code><br/>
+        <code>trainer.max_steps</code><br/>
+        <code>trainer.val_check_interval</code><br/>
+        <code>trainer.log_every_n_steps</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>step_scheduler.num_epochs</code><br/>
+        <code>step_scheduler.max_steps</code><br/>
+        <code>step_scheduler.val_every_steps</code><br/>
+        <code>step_scheduler.ckpt_every_steps</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        The Automodel example expresses scheduling in a single <code>step_scheduler</code> block. There is no 1:1 YAML key for <code>log_every_n_steps</code> in the Automodel example config.
       </td>
     </tr>
     <tr>
@@ -662,54 +688,270 @@ optimizer:
         Batch sizes
       </td>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
-        <code>data.global_batch_size: 8</code>, <code>data.micro_batch_size: 1</code>
+        <code>data.global_batch_size</code><br/>
+        <code>data.micro_batch_size</code>
       </td>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
-        <code>step_scheduler.global_batch_size: 8</code>, <code>step_scheduler.local_batch_size: 1</code>
-      </td>
-    </tr>
-    <tr>
-      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
-        Parallelism
+        <code>step_scheduler.global_batch_size</code><br/>
+        <code>step_scheduler.local_batch_size</code>
       </td>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
-        <code>trainer.strategy.tensor_model_parallel_size: 4</code>, <code>pipeline_model_parallel_size: 1</code>, <code>context_parallel_size: 1</code>
-      </td>
-      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
-        <code>distributed.tp_size: 4</code>, <code>distributed.cp_size: 1</code>
+        <code>micro_batch_size</code> and <code>local_batch_size</code> both represent per-rank batch size; naming differs.
       </td>
     </tr>
     <tr>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
-        LoRA (PEFT)
+        Dataset source (train/val paths)
       </td>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
-        Enabled via <code>peft_scheme="lora"</code> (in <code>recipe.py</code>); parameters under <code>peft.*</code>
+        <code>data.dataset_root</code>
       </td>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
-        Configured via <code>peft._target_: ...PeftConfig</code>; parameters under <code>peft.*</code>
-      </td>
-    </tr>
-    <tr>
-      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
-        FP8
+        <code>dataset.path_or_dataset_id</code><br/>
+        <code>validation_dataset.path_or_dataset_id</code>
       </td>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
-        Under <code>trainer.plugins</code> (example keys include <code>fp8</code>, <code>fp8_params</code>, and amax settings)
-      </td>
-      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
-        Under the top-level <code>fp8:</code> block (example keys include <code>enabled</code>, <code>recipe_name</code>, and FSDP float8 settings)
+        Automodel supports local files or an HF dataset id. NeMo 2 example uses a dataset root directory plus dataset kwargs handled by the NeMo 2 data module.
       </td>
     </tr>
     <tr>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
-        Dataset wiring
+        Dataset column wiring (prompt/answer fields)
       </td>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
-        <code>data.dataset_root</code> + <code>data.dataset_kwargs</code> (<code>prompt_template</code>, <code>label_key</code>, <code>truncation_field</code>)
+        <code>data.dataset_kwargs.prompt_template</code><br/>
+        <code>data.dataset_kwargs.label_key</code><br/>
+        <code>data.dataset_kwargs.truncation_field</code>
       </td>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
-        <code>dataset.path_or_dataset_id</code> + <code>dataset.column_mapping</code> (<code>context: prompt</code>, <code>answer: completion</code>)
+        <code>dataset.column_mapping</code><br/>
+        <code>validation_dataset.column_mapping</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        There is no direct <code>prompt_template</code> equivalent in the example Automodel YAML; formatting is handled by the dataset + collate function (and optionally <code>use_hf_chat_template</code>).
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Sequence length, padding, truncation
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>data.seq_length</code><br/>
+        <code>data.dataset_kwargs.truncation_field</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>dataset.seq_length</code> (optional)<br/>
+        <code>dataset.padding</code><br/>
+        <code>dataset.truncation</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Automodel’s dataset class exposes <code>seq_length</code>/<code>padding</code>/<code>truncation</code>, but the example YAML does not set them (defaults are <code>do_not_pad</code>/<code>do_not_truncate</code>).
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Parallelism (tensor/context/pipeline)
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>trainer.strategy.tensor_model_parallel_size</code><br/>
+        <code>trainer.strategy.context_parallel_size</code><br/>
+        <code>trainer.strategy.pipeline_model_parallel_size</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>distributed.tp_size</code><br/>
+        <code>distributed.cp_size</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        The example Automodel config does not include a direct pipeline-parallel knob (no 1:1 mapping shown).
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Data-parallel / sharding strategy
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <em>(implicit in NeMo 2 strategy + world size)</em>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>distributed._target_</code> (e.g. <code>...FSDP2Manager</code>)<br/>
+        <code>distributed.dp_size</code><br/>
+        <code>distributed.dp_replicate_size</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        These are effectively “new” YAML knobs in the Automodel example; NeMo 2 expresses more of this via the chosen Lightning strategy and the launcher’s world size.
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Precision (BF16 / mixed precision)
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>trainer.plugins.precision</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>model.torch_dtype</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Keying differs: NeMo 2 sets precision via the trainer plugin; Automodel example sets the model dtype directly.
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        FP8 enablement + recipe
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>trainer.plugins.fp8</code><br/>
+        <code>trainer.plugins.fp8_params</code><br/>
+        <code>trainer.plugins.fp8_margin</code><br/>
+        <code>trainer.plugins.fp8_amax_history_len</code><br/>
+        <code>trainer.plugins.fp8_amax_compute_algo</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>fp8.enabled</code><br/>
+        <code>fp8.recipe_name</code><br/>
+        <code>fp8.enable_fsdp_float8_all_gather</code><br/>
+        <code>fp8.precompute_float8_dynamic_scale_for_fsdp</code><br/>
+        <code>fp8.force_recompute_fp8_weight_in_bwd</code><br/>
+        <code>fp8.filter_fqns</code><br/>
+        <code>fp8.emulate</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Automodel exposes extra FP8 knobs in the example config (e.g. <code>filter_fqns</code>, <code>emulate</code>) that don’t have a direct NeMo 2 YAML equivalent.
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Checkpointing (directory + format)
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>log.ckpt.save_last</code><br/>
+        <code>log.ckpt.save_top_k</code><br/>
+        <code>log.ckpt.train_time_interval</code><br/>
+        <code>trainer.strategy.ckpt_async_save</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>checkpoint.enabled</code><br/>
+        <code>checkpoint.checkpoint_dir</code><br/>
+        <code>checkpoint.model_save_format</code><br/>
+        <code>checkpoint.save_consolidated</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>model_save_format</code>/<code>save_consolidated</code> are “new” (or at least much more explicit) in the Automodel YAML. Retention policies like <code>save_top_k</code> are not shown in the Automodel example.
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Optimizer (LR + hyperparameters)
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>optim.config.lr</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>optimizer._target_</code><br/>
+        <code>optimizer.lr</code><br/>
+        <code>optimizer.betas</code><br/>
+        <code>optimizer.eps</code><br/>
+        <code>optimizer.weight_decay</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Automodel example makes the optimizer fully explicit in YAML; NeMo 2 example sets fewer optimizer knobs in YAML (others come from recipe defaults).
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        LR scheduler / warmup
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>optim.lr_scheduler.warmup_steps</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>lr_scheduler.lr_warmup_steps</code><br/>
+        <code>lr_scheduler.lr_decay_style</code><br/>
+        <code>lr_scheduler.min_lr</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        In the example Automodel YAML, <code>lr_warmup_steps</code> is present but commented out—enable it if you want the same behavior as NeMo 2’s <code>warmup_steps</code>.
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        LoRA (PEFT) hyperparameters + targeting
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>peft.dim</code><br/>
+        <code>peft.alpha</code><br/>
+        <code>peft.dropout</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>peft._target_</code><br/>
+        <code>peft.target_modules</code><br/>
+        <code>peft.match_all_linear</code><br/>
+        <code>peft.dim</code><br/>
+        <code>peft.alpha</code><br/>
+        <code>peft.dropout</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        NeMo 2 also needs <code>peft_scheme="lora"</code> in <code>recipe.py</code> (not a YAML key). Automodel enables/configures PEFT entirely in YAML (and exposes targeting knobs like <code>target_modules</code>).
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Distributed backend + RNG (new in Automodel YAML)
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <em>(not configured in the example NeMo 2 YAML)</em>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>dist_env.backend</code><br/>
+        <code>dist_env.timeout_minutes</code><br/>
+        <code>rng.seed</code><br/>
+        <code>rng.ranked</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        These knobs are explicit in the Automodel example YAML (previously often set via defaults, CLI flags, or launcher/environment).
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Packed sequences (new in Automodel example)
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <em>(no equivalent in the example NeMo 2 YAML)</em>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>packed_sequence.packed_sequence_size</code><br/>
+        <code>packed_sequence.split_across_pack</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Set <code>packed_sequence_size</code> to a positive value to enable packed sequences.
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Loss function (explicit in Automodel YAML)
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <em>(implicit via recipe defaults)</em>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>loss_fn._target_</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Automodel makes the loss component explicit/configurable in YAML in this example.
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Validation limiting / subsetting
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>trainer.limit_val_batches</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <code>validation_dataset.limit_dataset_samples</code>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        Not a perfect 1:1 mapping: NeMo 2 can limit “batches”; Automodel can limit “samples” at the dataset level (in this dataset implementation).
       </td>
     </tr>
   </tbody>
