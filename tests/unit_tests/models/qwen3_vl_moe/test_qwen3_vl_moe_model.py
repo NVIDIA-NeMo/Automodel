@@ -104,7 +104,7 @@ def backend_config():
         linear="torch",
         attn="sdpa",
         rms_norm="torch",
-        enable_deepep=False,
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )
@@ -353,4 +353,3 @@ class TestQwen3VLMoeFromPretrainedAndModelClass:
 
     def test_modelclass_export_exists(self):
         assert ModelClass is Qwen3VLMoeForConditionalGeneration
-

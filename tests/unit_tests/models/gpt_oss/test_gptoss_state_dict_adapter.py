@@ -641,7 +641,7 @@ class TestConvertSingleTensorToHf:
 
     def create_mock_backend_config(self):
         backend = Mock()
-        backend.enable_deepep = False
+        backend.dispatcher = "torch"
         return backend
 
     def test_applies_key_mapping(self):

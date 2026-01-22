@@ -49,7 +49,7 @@ def backend_config():
         linear="torch",
         attn="sdpa",
         rms_norm="torch",
-        enable_deepep=False,
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )
@@ -258,4 +258,3 @@ def test_modelclass_export_exists():
 
     assert hasattr(omni_module, "ModelClass")
     assert omni_module.ModelClass is Qwen3OmniMoeThinkerForConditionalGeneration
-

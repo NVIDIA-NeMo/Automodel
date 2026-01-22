@@ -73,7 +73,7 @@ def backend_config():
         linear="torch",
         attn="sdpa",
         rms_norm="torch",
-        enable_deepep=False,
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )
@@ -159,4 +159,3 @@ class TestFromHF:
         assert "thinker.model.layers.0.mlp.router.weight" in out
         passed = mock_from_hf.call_args[0][0]
         assert "model.layers.0.mlp.router.weight" in passed
-

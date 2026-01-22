@@ -56,7 +56,7 @@ class TestDeepSeekV3StateDictAdapter:
 
     def create_mock_backend_config(self, **overrides):
         backend = Mock(spec=BackendConfig)
-        backend.enable_deepep = False
+        backend.dispatcher = "torch"
 
         for key, value in overrides.items():
             setattr(backend, key, value)
@@ -191,7 +191,7 @@ class TestDeepSeekV3StateDictAdapter:
     def test_to_hf(self):
         config = self.create_mock_config()
         moe_config = self.create_mock_moe_config()
-        backend = self.create_mock_backend_config(enable_deepep=True)
+        backend = self.create_mock_backend_config(dispatcher="deepep")
 
         adapter = DeepSeekV3StateDictAdapter(config, moe_config, backend)
 
@@ -208,7 +208,7 @@ class TestDeepSeekV3StateDictAdapter:
     def test_to_hf_with_exclude_regex(self):
         config = self.create_mock_config()
         moe_config = self.create_mock_moe_config()
-        backend = self.create_mock_backend_config(enable_deepep=False)
+        backend = self.create_mock_backend_config(dispatcher="torch")
 
         adapter = DeepSeekV3StateDictAdapter(config, moe_config, backend)
 
@@ -229,7 +229,7 @@ class TestDeepSeekV3StateDictAdapter:
     def test_to_hf_quantization_true(self):
         config = self.create_mock_config()
         moe_config = self.create_mock_moe_config()
-        backend = self.create_mock_backend_config(enable_deepep=False)
+        backend = self.create_mock_backend_config(dispatcher="torch")
 
         adapter = DeepSeekV3StateDictAdapter(config, moe_config, backend)
 
@@ -246,7 +246,7 @@ class TestDeepSeekV3StateDictAdapter:
     def test_to_hf_quantization_false(self):
         config = self.create_mock_config()
         moe_config = self.create_mock_moe_config()
-        backend = self.create_mock_backend_config(enable_deepep=False)
+        backend = self.create_mock_backend_config(dispatcher="torch")
 
         adapter = DeepSeekV3StateDictAdapter(config, moe_config, backend)
 
@@ -266,7 +266,7 @@ class TestDeepSeekV3StateDictAdapter:
     def test_to_hf_exclude_then_quantize(self):
         config = self.create_mock_config()
         moe_config = self.create_mock_moe_config()
-        backend = self.create_mock_backend_config(enable_deepep=False)
+        backend = self.create_mock_backend_config(dispatcher="torch")
 
         adapter = DeepSeekV3StateDictAdapter(config, moe_config, backend)
 
@@ -289,7 +289,7 @@ class TestDeepSeekV3StateDictAdapter:
     def test_from_hf_detects_model_prefix(self):
         config = self.create_mock_config()
         moe_config = self.create_mock_moe_config()
-        backend = self.create_mock_backend_config(enable_deepep=False)
+        backend = self.create_mock_backend_config(dispatcher="torch")
 
         adapter = DeepSeekV3StateDictAdapter(config, moe_config, backend)
 
@@ -311,7 +311,7 @@ class TestDeepSeekV3StateDictAdapter:
     def test_from_hf_no_model_prefix(self):
         config = self.create_mock_config()
         moe_config = self.create_mock_moe_config()
-        backend = self.create_mock_backend_config(enable_deepep=False)
+        backend = self.create_mock_backend_config(dispatcher="torch")
 
         adapter = DeepSeekV3StateDictAdapter(config, moe_config, backend)
 
@@ -333,7 +333,7 @@ class TestDeepSeekV3StateDictAdapter:
     def test_from_hf(self):
         config = self.create_mock_config()
         moe_config = self.create_mock_moe_config()
-        backend = self.create_mock_backend_config(enable_deepep=True)
+        backend = self.create_mock_backend_config(dispatcher="deepep")
 
         adapter = DeepSeekV3StateDictAdapter(config, moe_config, backend)
 
@@ -517,7 +517,7 @@ class TestConvertSingleTensorToHf:
 
     def create_mock_backend_config(self, **overrides):
         backend = Mock(spec=BackendConfig)
-        backend.enable_deepep = False
+        backend.dispatcher = "torch"
         for key, value in overrides.items():
             setattr(backend, key, value)
         return backend

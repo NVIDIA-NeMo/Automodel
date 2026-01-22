@@ -66,7 +66,7 @@ def backend_config():
         linear="torch",
         attn="sdpa",
         rms_norm="torch",
-        enable_deepep=False,
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )
@@ -346,5 +346,3 @@ class TestConvertSingleTensorToHf:
         result = adapter.convert_single_tensor_to_hf(fqn, tensor, exclude_key_regex=r"exclude.*")
 
         assert result == []
-
-

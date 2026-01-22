@@ -72,7 +72,7 @@ def backend_config():
         linear="torch",
         attn="flex",
         rms_norm="torch",
-        enable_deepep=False,
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )
@@ -1260,7 +1260,7 @@ class TestMoE:
 
     def test_moe_init_with_deepep_single_device(self, moe_config, backend_config):
         """DeepEP enabled but world size == 1 should fall back to GroupedExperts."""
-        backend_config.enable_deepep = True
+        backend_config.dispatcher = "deepep"
         with patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=1):
             moe = MoE(moe_config, backend_config)
 
@@ -1269,7 +1269,7 @@ class TestMoE:
 
     def test_moe_init_with_deepep_multi_device(self, moe_config, backend_config):
         """DeepEP enabled and world size > 1 should use GroupedExpertsDeepEP."""
-        backend_config.enable_deepep = True
+        backend_config.dispatcher = "deepep"
         with patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=2):
             moe = MoE(moe_config, backend_config)
 
@@ -1434,3 +1434,169 @@ class TestMoE:
 
             # Should return the reshaped output since aux_loss handling is done in gate
             assert result.shape == x.shape
+
+
+class TestBackendConfigDispatcher:
+    """Test BackendConfig dispatcher field and dispatcher_num_sms field."""
+
+    def test_backend_config_dispatcher_torch(self):
+        """Test setting dispatcher to 'torch'."""
+        backend = BackendConfig(dispatcher="torch")
+        assert backend.dispatcher == "torch"
+
+    def test_backend_config_dispatcher_deepep(self):
+        """Test setting dispatcher to 'deepep'."""
+        backend = BackendConfig(dispatcher="deepep")
+        assert backend.dispatcher == "deepep"
+
+    def test_backend_config_dispatcher_hybridep(self):
+        """Test setting dispatcher to 'hybridep'."""
+        backend = BackendConfig(dispatcher="hybridep")
+        assert backend.dispatcher == "hybridep"
+
+    def test_backend_config_default_dispatcher_num_sms(self):
+        """Test default dispatcher_num_sms is 128."""
+        backend = BackendConfig()
+        assert backend.dispatcher_num_sms == 128
+
+    def test_backend_config_custom_dispatcher_num_sms(self):
+        """Test setting custom dispatcher_num_sms."""
+        backend = BackendConfig(dispatcher_num_sms=64)
+        assert backend.dispatcher_num_sms == 64
+
+
+class TestMoEDispatcherIntegration:
+    """Test MoE class integration with different dispatcher settings."""
+
+    @pytest.fixture
+    def moe_config(self):
+        return MoEConfig(
+            n_routed_experts=8,
+            n_shared_experts=0,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=True,
+            gate_bias_update_factor=0.1,
+            aux_loss_coeff=0.01,
+            score_func="softmax",
+            route_scale=1.0,
+            dim=128,
+            inter_dim=256,
+            moe_inter_dim=256,
+            norm_topk_prob=False,
+            router_bias=False,
+            expert_bias=False,
+            expert_activation="swiglu",
+            activation_alpha=1.702,
+            activation_limit=7.0,
+            dtype=torch.bfloat16,
+        )
+
+    def test_moe_with_torch_dispatcher(self, moe_config):
+        """Test MoE uses GroupedExperts when dispatcher is 'torch'."""
+        backend = BackendConfig(dispatcher="torch")
+        moe = MoE(moe_config, backend)
+        assert isinstance(moe.experts, GroupedExperts)
+
+    def test_moe_with_deepep_dispatcher_single_device(self, moe_config):
+        """Test MoE falls back to GroupedExperts when dispatcher is 'deepep' but world_size=1."""
+        backend = BackendConfig(dispatcher="deepep")
+        with patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=1):
+            moe = MoE(moe_config, backend)
+        assert isinstance(moe.experts, GroupedExperts)
+
+    def test_moe_with_deepep_dispatcher_multi_device(self, moe_config):
+        """Test MoE uses GroupedExpertsDeepEP when dispatcher is 'deepep' and world_size>1."""
+        backend = BackendConfig(dispatcher="deepep")
+        with patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=2):
+            moe = MoE(moe_config, backend)
+        assert isinstance(moe.experts, GroupedExpertsDeepEP)
+        assert moe.experts.dispatcher_backend == "deepep"
+
+    def test_moe_with_hybridep_dispatcher_single_device(self, moe_config):
+        """Test MoE falls back to GroupedExperts when dispatcher is 'hybridep' but world_size=1."""
+        backend = BackendConfig(dispatcher="hybridep")
+        with patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=1):
+            moe = MoE(moe_config, backend)
+        assert isinstance(moe.experts, GroupedExperts)
+
+    def test_moe_with_hybridep_dispatcher_multi_device(self, moe_config):
+        """Test MoE uses GroupedExpertsDeepEP when dispatcher is 'hybridep' and world_size>1."""
+        backend = BackendConfig(dispatcher="hybridep")
+        with patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=2):
+            moe = MoE(moe_config, backend)
+        assert isinstance(moe.experts, GroupedExpertsDeepEP)
+        assert moe.experts.dispatcher_backend == "hybridep"
+
+    def test_moe_dispatcher_num_sms_passed_to_experts(self, moe_config):
+        """Test dispatcher_num_sms is passed to GroupedExpertsDeepEP."""
+        backend = BackendConfig(dispatcher="deepep", dispatcher_num_sms=64)
+        with patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=2):
+            moe = MoE(moe_config, backend)
+        assert isinstance(moe.experts, GroupedExpertsDeepEP)
+        assert moe.experts.dispatcher_num_sms == 64
+
+
+class TestGroupedExpertsDeepEPDispatcher:
+    """Test GroupedExpertsDeepEP with dispatcher settings."""
+
+    @pytest.fixture
+    def moe_config(self):
+        return MoEConfig(
+            n_routed_experts=8,
+            n_shared_experts=0,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=True,
+            gate_bias_update_factor=0.1,
+            aux_loss_coeff=0.01,
+            score_func="softmax",
+            route_scale=1.0,
+            dim=128,
+            inter_dim=256,
+            moe_inter_dim=256,
+            norm_topk_prob=False,
+            router_bias=False,
+            expert_bias=False,
+            expert_activation="swiglu",
+            activation_alpha=1.702,
+            activation_limit=7.0,
+            dtype=torch.bfloat16,
+        )
+
+    def test_grouped_experts_deepep_default_backend(self, moe_config):
+        """Test GroupedExpertsDeepEP default dispatcher_backend is 'deepep'."""
+        experts = GroupedExpertsDeepEP(moe_config)
+        assert experts.dispatcher_backend == "deepep"
+
+    def test_grouped_experts_deepep_deepep_backend(self, moe_config):
+        """Test GroupedExpertsDeepEP with 'deepep' dispatcher_backend."""
+        experts = GroupedExpertsDeepEP(moe_config, dispatcher_backend="deepep")
+        assert experts.dispatcher_backend == "deepep"
+
+    def test_grouped_experts_deepep_hybridep_backend(self, moe_config):
+        """Test GroupedExpertsDeepEP with 'hybridep' dispatcher_backend."""
+        experts = GroupedExpertsDeepEP(moe_config, dispatcher_backend="hybridep")
+        assert experts.dispatcher_backend == "hybridep"
+
+    def test_grouped_experts_deepep_default_num_sms(self, moe_config):
+        """Test GroupedExpertsDeepEP default dispatcher_num_sms is 128."""
+        experts = GroupedExpertsDeepEP(moe_config)
+        assert experts.dispatcher_num_sms == 128
+
+    def test_grouped_experts_deepep_custom_num_sms(self, moe_config):
+        """Test GroupedExpertsDeepEP with custom dispatcher_num_sms."""
+        experts = GroupedExpertsDeepEP(moe_config, dispatcher_num_sms=64)
+        assert experts.dispatcher_num_sms == 64
+
+    def test_grouped_experts_deepep_stores_config(self, moe_config):
+        """Test GroupedExpertsDeepEP stores all dispatcher settings."""
+        experts = GroupedExpertsDeepEP(
+            moe_config,
+            dispatcher_backend="hybridep",
+            dispatcher_num_sms=96,
+        )
+        assert experts.dispatcher_backend == "hybridep"
+        assert experts.dispatcher_num_sms == 96
