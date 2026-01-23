@@ -46,9 +46,7 @@ bash run.sh fp8
     <tr>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
         <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">#!/bin/bash
-
 set -ex
-
 torchrun \
     --standalone \
     --nnodes=1 \
@@ -85,7 +83,6 @@ torchrun \
         <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">export PYTHONPATH=$(realpath Automodel/)
 export CUDA_VISIBLE_DEVICES=0,1
 export TRANSFORMERS_OFFLINE=1
-
 torchrun \
     --nproc-per-node=2 \
     --nnodes=1 \
@@ -358,30 +355,24 @@ peft:
   val_every_steps: 10  # will run every x number of gradient steps
   num_epochs: 3
   max_steps: 30
-
   global_batch_size: 8
   local_batch_size: 1
-
 dist_env:
   backend: nccl
   timeout_minutes: 1
-
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
   seed: 1111
   ranked: true
-
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
   torch_dtype: bf16
-
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: safetensors # torch_save or safetensors
   save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
-
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   target_modules: ['gate_proj', 'up_proj']
@@ -389,7 +380,6 @@ peft:
   dim: 8
   alpha: 16
   dropout: 0.1
-
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: none
@@ -397,56 +387,47 @@ distributed:
   tp_size: 4
   cp_size: 1
   sequence_parallel: false
-
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
-
 dataset:
   _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
   path_or_dataset_id: ../data/training.jsonl
   column_mapping:
     context: prompt
     answer: completion
-
 packed_sequence:
   # Set packed_sequence_size > 0 to run with packed sequences
   packed_sequence_size: 0
   split_across_pack: False
-
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
   shuffle: false
-
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
   path_or_dataset_id: ../data/validation.jsonl
   column_mapping:
     context: prompt
     answer: completion
-
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-
 lr_scheduler:
   lr_decay_style: cosine
   # lr_warmup_steps: 50
   min_lr: 0.0
-
 optimizer:
   _target_: torch.optim.Adam
   betas: [0.9, 0.999]
   eps: 1e-8
   lr: 1e-5
   weight_decay: 0
-
-# Uncomment and configure for W&B logging
-# wandb:
-#   project: &lt;your_wandb_project&gt;
-#   entity: &lt;your_wandb_entity&gt;
-#   name: &lt;your_wandb_exp_name&gt;
-#   save_dir: &lt;your_wandb_save_dir&gt;
+&#35; Uncomment and configure for W&B logging
+&#35; wandb:
+&#35;   project: &lt;your_wandb_project&gt;
+&#35;   entity: &lt;your_wandb_entity&gt;
+&#35;   name: &lt;your_wandb_exp_name&gt;
+&#35;   save_dir: &lt;your_wandb_save_dir&gt;
 </code></pre>
       </td>
     </tr>
@@ -522,30 +503,24 @@ peft:
   val_every_steps: 10  # will run every x number of gradient steps
   num_epochs: 3
   max_steps: 30
-
   global_batch_size: 8
   local_batch_size: 1
-
 dist_env:
   backend: nccl
   timeout_minutes: 1
-
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
   seed: 1111
   ranked: true
-
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
   torch_dtype: bf16
-
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: safetensors # torch_save or safetensors
   save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
-
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   target_modules: ['*_proj']
@@ -553,7 +528,6 @@ peft:
   dim: 8
   alpha: 16
   dropout: 0.1
-
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: none
@@ -561,10 +535,8 @@ distributed:
   tp_size: 4
   cp_size: 1
   sequence_parallel: false
-
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
-
 fp8:
   enabled: true
   recipe_name: tensorwise  # Options: tensorwise, rowwise, rowwise_with_gw_hp
@@ -573,55 +545,45 @@ fp8:
   force_recompute_fp8_weight_in_bwd: true
   filter_fqns: ["lm_head"]
   emulate: false  # Set to true for testing on older GPUs without native FP8 support
-
-
 dataset:
   _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
   path_or_dataset_id: ../data/training.jsonl
   column_mapping:
     context: prompt
     answer: completion
-
 packed_sequence:
   # Set packed_sequence_size > 0 to run with packed sequences
   packed_sequence_size: 0
   split_across_pack: False
-
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
   shuffle: false
-
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
   path_or_dataset_id: ../data/validation.jsonl
   column_mapping:
     context: prompt
     answer: completion
-
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-
-
 lr_scheduler:
   lr_decay_style: cosine
   # lr_warmup_steps: 50
   min_lr: 0.0
-
 optimizer:
   _target_: torch.optim.Adam
   betas: [0.9, 0.999]
   eps: 1e-8
   lr: 1e-5
   weight_decay: 0
-
-# Uncomment and configure for W&B logging
-# wandb:
-#   project: &lt;your_wandb_project&gt;
-#   entity: &lt;your_wandb_entity&gt;
-#   name: &lt;your_wandb_exp_name&gt;
-#   save_dir: &lt;your_wandb_save_dir&gt;
+&#35; Uncomment and configure for W&B logging
+&#35; wandb:
+&#35;   project: &lt;your_wandb_project&gt;
+&#35;   entity: &lt;your_wandb_entity&gt;
+&#35;   name: &lt;your_wandb_exp_name&gt;
+&#35;   save_dir: &lt;your_wandb_save_dir&gt;
 </code></pre>
       </td>
     </tr>
@@ -1360,7 +1322,6 @@ optimizer:
 export PYTHONPATH=$(realpath Automodel/)
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 export TRANSFORMERS_OFFLINE=1
-
 torchrun \
     --nproc-per-node=4 \
     --nnodes=1 \
@@ -1374,7 +1335,6 @@ torchrun \
 export PYTHONPATH=$(realpath Automodel/)
 export CUDA_VISIBLE_DEVICES=0,1
 export TRANSFORMERS_OFFLINE=1
-
 torchrun \
     --nproc-per-node=2 \
     --nnodes=1 \
