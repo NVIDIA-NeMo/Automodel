@@ -12,14 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 from typing import Any
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import AutoConfig
-from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block
 from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import NemotronV3StateDictAdapter
@@ -83,7 +80,9 @@ class NemotronV3Model(nn.Module):
         # Transformer layers (hybrid: mamba, attention, mlp, moe)
         self.layers = nn.ModuleDict()
         for idx in range(config.num_hidden_layers):
-            self.layers[str(idx)] = NemotronV3Block(config, layer_idx=idx, moe_config=self.moe_config, backend=self.backend)
+            self.layers[str(idx)] = NemotronV3Block(
+                config, layer_idx=idx, moe_config=self.moe_config, backend=self.backend
+            )
 
         # Final norm
         self.norm = initialize_rms_norm_module(
@@ -91,7 +90,6 @@ class NemotronV3Model(nn.Module):
             config.hidden_size,
             eps=config.layer_norm_epsilon,
         )
-
 
     def forward(
         self,
@@ -140,123 +138,21 @@ class NemotronV3Model(nn.Module):
 
         return hidden_states
 
-    def _to_local(self, tensor):
-        """Get local tensor from DTensor or return tensor as-is."""
-        if DTensor is not None and isinstance(tensor, DTensor):
-            return tensor.to_local()
-        return tensor
-
     @torch.no_grad()
     def initialize_weights(self, buffer_device: torch.device | None = None) -> None:
         """Initialize model weights according to NemotronV3 spec.
 
         Args:
-            buffer_device: Device to use for buffer initialization (unused for NemotronV3)
+            buffer_device: Device to use for buffer initialization
         """
         # Embedding weights: normal initialization
-        nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=self.config.initializer_range)
+        with buffer_device:
+            nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=self.config.initializer_range)
+            self.norm.reset_parameters()
 
-        # Initialize all layers
-        for layer_idx, block in enumerate(self.layers.values()):
-            # Initialize norm
-            nn.init.ones_(block.norm.weight)
-
-            # Initialize mixer based on type
-            if block.block_type == "mamba":
-                self._init_mamba_weights(block.mixer)
-            elif block.block_type == "attention":
-                self._init_attention_weights(block.mixer)
-            elif block.block_type == "mlp":
-                self._init_mlp_weights(block.mixer)
-            elif block.block_type == "moe":
-                self._init_moe_weights(block.mixer)
-
-        # Final norm
-        nn.init.ones_(self.norm.weight)
-
-    def _init_mamba_weights(self, mamba_module):
-        """Initialize Mamba2Mixer weights."""
-        # Mark A_log and D for no weight decay
-        mamba_module.A_log._no_weight_decay = True
-        mamba_module.D._no_weight_decay = True
-
-        # Special dt_bias initialization (inverse softplus)
-        # Use _to_local to handle DTensor case after model parallelization
-        dt_bias_local = self._to_local(mamba_module.dt_bias)
-        local_num_heads = dt_bias_local.shape[0]  # May be sharded
-        dt = torch.exp(
-            torch.rand(local_num_heads, device=dt_bias_local.device)
-            * (math.log(self.config.time_step_max) - math.log(self.config.time_step_min))
-            + math.log(self.config.time_step_min)
-        ).clamp(min=self.config.time_step_floor)
-
-        # Inverse of softplus
-        inv_dt = dt + torch.log(-torch.expm1(-dt))
-        with torch.no_grad():
-            dt_bias_local.copy_(inv_dt)
-        mamba_module.dt_bias._no_reinit = True
-
-        # Linear layers
-        if mamba_module.in_proj.bias is not None:
-            nn.init.zeros_(mamba_module.in_proj.bias)
-        if mamba_module.out_proj.bias is not None:
-            nn.init.zeros_(mamba_module.out_proj.bias)
-
-        # Rescale out_proj if enabled
-        if getattr(self.config, "rescale_prenorm_residual", True):
-            with torch.no_grad():
-                mamba_module.out_proj.weight /= math.sqrt(self.config.num_hidden_layers)
-
-    def _init_attention_weights(self, attn_module):
-        """Initialize attention weights."""
-        # Zero biases if present
-        for proj in [attn_module.q_proj, attn_module.k_proj, attn_module.v_proj, attn_module.o_proj]:
-            if proj.bias is not None:
-                nn.init.zeros_(proj.bias)
-
-        # Rescale o_proj if enabled
-        if getattr(self.config, "rescale_prenorm_residual", True):
-            with torch.no_grad():
-                attn_module.o_proj.weight /= math.sqrt(self.config.num_hidden_layers)
-
-    def _init_mlp_weights(self, mlp_module):
-        """Initialize MLP weights."""
-        # Zero biases if present
-        for proj in [mlp_module.up_proj, mlp_module.down_proj]:
-            if proj.bias is not None:
-                nn.init.zeros_(proj.bias)
-
-        # Rescale down_proj if enabled
-        if getattr(self.config, "rescale_prenorm_residual", True):
-            with torch.no_grad():
-                mlp_module.down_proj.weight /= math.sqrt(self.config.num_hidden_layers)
-
-    def _init_moe_weights(self, moe_module):
-        """Initialize MoE weights."""
-        # Router: initialize gate weights (they are created with torch.empty)
-        nn.init.normal_(moe_module.gate.weight, mean=0.0, std=self.config.initializer_range)
-        if moe_module.gate.bias is not None:
-            nn.init.zeros_(moe_module.gate.bias)
-
-        # Experts: zero biases if present
-        if hasattr(moe_module.experts, "gate_up_proj_bias") and moe_module.experts.gate_up_proj_bias is not None:
-            nn.init.zeros_(moe_module.experts.gate_up_proj_bias)
-        if hasattr(moe_module.experts, "down_proj_bias") and moe_module.experts.down_proj_bias is not None:
-            nn.init.zeros_(moe_module.experts.down_proj_bias)
-
-        # Shared expert
-        if moe_module.shared_experts.up_proj.bias is not None:
-            nn.init.zeros_(moe_module.shared_experts.up_proj.bias)
-        if moe_module.shared_experts.down_proj.bias is not None:
-            nn.init.zeros_(moe_module.shared_experts.down_proj.bias)
-
-        # Rescale output projections if enabled
-        if getattr(self.config, "rescale_prenorm_residual", True):
-            with torch.no_grad():
-                # Rescale expert down_projs
-                moe_module.experts.down_projs /= math.sqrt(self.config.num_hidden_layers)
-                # Rescale shared expert down_proj
-                moe_module.shared_experts.down_proj.weight /= math.sqrt(self.config.num_hidden_layers)
+        # Initialize all layers via delegation
+        for block in self.layers.values():
+            block.init_weights(buffer_device=buffer_device)
 
 
 class NemotronHForCausalLM(nn.Module, MoEFSDPSyncMixin):
@@ -384,15 +280,12 @@ class NemotronHForCausalLM(nn.Module, MoEFSDPSyncMixin):
             buffer_device: Device to use for buffer initialization
             dtype: Target dtype for model weights
         """
-        # Initialize base model
-        self.model.initialize_weights(buffer_device=buffer_device)
+        buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
+        with buffer_device:
+            self.model.initialize_weights(buffer_device=buffer_device)
+            nn.init.normal_(self.lm_head.weight, mean=0.0, std=self.config.initializer_range)
 
-        # Initialize LM head
-        nn.init.normal_(self.lm_head.weight, mean=0.0, std=self.config.initializer_range)
-
-        # Convert to target dtype
         self.to(dtype)
 
 
-# Alias for consistency with other models
 ModelClass = NemotronHForCausalLM

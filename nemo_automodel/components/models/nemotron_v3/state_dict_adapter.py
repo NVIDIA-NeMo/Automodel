@@ -75,9 +75,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             "model.layers.{}.mixer.experts.{}.down_proj.weight": "model.layers.{}.mixer.experts.down_projs",
         }
 
-    def to_hf(
-        self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, **kwargs
-    ) -> dict[str, Any]:
+    def to_hf(self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, **kwargs) -> dict[str, Any]:
         """Convert from internal model state dict to HuggingFace format.
 
         Args:
@@ -130,7 +128,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         for key, value in hf_state_dict.items():
             new_key = key
             if new_key.startswith("backbone."):
-                new_key = "model." + new_key[len("backbone."):]
+                new_key = "model." + new_key[len("backbone.") :]
             if new_key == "model.norm_f.weight":
                 new_key = "model.norm.weight"
             # HF uses 'embeddings' but internal uses 'embed_tokens'
@@ -177,9 +175,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         for key, value in hf_state_dict.items():
             if ".mixer.experts." in key and key.endswith(".weight"):
                 # Handle: model.layers.{L}.mixer.experts.{E}.up_proj.weight
-                m = re.match(
-                    r"(?:model\.)?layers\.(\d+)\.mixer\.experts\.(\d+)\.(up_proj|down_proj)\.weight", key
-                )
+                m = re.match(r"(?:model\.)?layers\.(\d+)\.mixer\.experts\.(\d+)\.(up_proj|down_proj)\.weight", key)
                 if m is None:
                     state_dict[key] = value
                     continue
@@ -344,7 +340,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
 
             # Rename model → backbone
             if new_fqn.startswith("model."):
-                new_fqn = "backbone." + new_fqn[len("model."):]
+                new_fqn = "backbone." + new_fqn[len("model.") :]
 
             # Rename norm → norm_f
             if new_fqn == "backbone.norm.weight":

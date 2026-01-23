@@ -12,24 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+import math
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components.moe.utils import BackendConfig, initialize_rms_norm_module
-
-try:
-    from torch.distributed.device_mesh import DeviceMesh
-    from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
-except ImportError:
-    print("torch.distributed.tensor is not available.")
-
-try:
-    from grouped_gemm import ops
-except ImportError:
-    print("grouped_gemm is not available.")
+from nemo_automodel.components.moe.utils import initialize_rms_norm_module
 
 
 class NemotronV3Attention(nn.Module):
@@ -111,11 +101,21 @@ class NemotronV3Attention(nn.Module):
         return output
 
     @torch.no_grad()
-    def init_weights(self, init_std: float = 0.02):
-        for linear in [self.q_proj, self.k_proj, self.v_proj, self.o_proj]:
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
-            if linear.bias is not None:
-                nn.init.zeros_(linear.bias)
+    def init_weights(
+        self,
+        num_hidden_layers: int,
+        rescale_prenorm_residual: bool = True,
+        buffer_device: torch.device | None = None,
+    ) -> None:
+        """Initialize attention weights following NemotronV3 spec."""
+        with buffer_device:
+            for proj in [self.q_proj, self.k_proj, self.v_proj, self.o_proj]:
+                if proj.bias is not None:
+                    nn.init.zeros_(proj.bias)
+
+            # Rescale o_proj for stable residual stream
+            if rescale_prenorm_residual:
+                self.o_proj.weight /= math.sqrt(num_hidden_layers)
 
 
 class NemotronV3MambaRMSNormGated(nn.Module):
@@ -178,6 +178,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
         self.time_step_limit = config.time_step_limit
         self.time_step_min = config.time_step_min
         self.time_step_max = config.time_step_max
+        self.time_step_floor = config.time_step_floor
 
         # Layers
         # Input projection: projects to [gate, x, B, C, dt]
@@ -266,14 +267,48 @@ class NemotronV3Mamba2Mixer(nn.Module):
         return out
 
     @torch.no_grad()
-    def init_weights(self, init_std: float = 0.02):
-        nn.init.trunc_normal_(self.in_proj.weight, mean=0.0, std=init_std)
-        if self.in_proj.bias is not None:
-            nn.init.zeros_(self.in_proj.bias)
+    def init_weights(
+        self,
+        num_hidden_layers: int,
+        rescale_prenorm_residual: bool = True,
+        buffer_device: torch.device | None = None,
+    ) -> None:
+        """Initialize Mamba2Mixer weights following NemotronV3 spec."""
 
-        nn.init.trunc_normal_(self.out_proj.weight, mean=0.0, std=init_std)
-        if self.out_proj.bias is not None:
-            nn.init.zeros_(self.out_proj.bias)
+        def _to_local(tensor):
+            """Get local tensor from DTensor or return as-is."""
+            if DTensor is not None and isinstance(tensor, DTensor):
+                return tensor.to_local()
+            return tensor
+
+        with buffer_device:
+            # dt_bias: inverse softplus initialization
+            # Check _no_reinit flag to avoid re-initializing if called multiple times
+            if not getattr(self.dt_bias, "_no_reinit", False):
+                dt_bias_local = _to_local(self.dt_bias)
+                local_num_heads = dt_bias_local.shape[0]
+                dt = torch.exp(
+                    torch.rand(local_num_heads, device=dt_bias_local.device)
+                    * (math.log(self.time_step_max) - math.log(self.time_step_min))
+                    + math.log(self.time_step_min)
+                ).clamp(min=self.time_step_floor)
+                inv_dt = dt + torch.log(-torch.expm1(-dt))
+                dt_bias_local.copy_(inv_dt)
+                self.dt_bias._no_reinit = True
+
+            # Mark A_log and D for no weight decay
+            self.A_log._no_weight_decay = True
+            self.D._no_weight_decay = True
+
+            # Zero biases (don't reinitialize weights - they use default init)
+            if self.in_proj.bias is not None:
+                nn.init.zeros_(self.in_proj.bias)
+            if self.out_proj.bias is not None:
+                nn.init.zeros_(self.out_proj.bias)
+
+            # Rescale out_proj for stable residual stream
+            if rescale_prenorm_residual:
+                self.out_proj.weight /= math.sqrt(num_hidden_layers)
 
 
 class NemotronV3Block(nn.Module):
@@ -388,3 +423,55 @@ class NemotronV3Block(nn.Module):
         hidden_states = residual + hidden_states
 
         return hidden_states
+
+    @torch.no_grad()
+    def init_weights(self, buffer_device: torch.device | None = None) -> None:
+        """Initialize block weights following NemotronV3 spec.
+
+        Args:
+            buffer_device: Device for buffer initialization (used by MLP/MoE)
+        """
+        num_hidden_layers = self.config.num_hidden_layers
+        rescale_prenorm_residual = getattr(self.config, "rescale_prenorm_residual", True)
+        init_std = getattr(self.config, "initializer_range", 0.02)
+
+        # Initialize norm
+        self.norm.reset_parameters()
+
+        # Initialize mixer based on block type
+        if self.block_type == "mamba" or self.block_type == "attention":
+            self.mixer.init_weights(
+                num_hidden_layers=num_hidden_layers,
+                rescale_prenorm_residual=rescale_prenorm_residual,
+                buffer_device=buffer_device,
+            )
+        elif self.block_type == "mlp":
+            # MLP uses existing init_weights, then apply rescaling
+            self.mixer.init_weights(buffer_device=buffer_device, init_std=init_std)
+            if rescale_prenorm_residual:
+                self.mixer.down_proj.weight /= math.sqrt(num_hidden_layers)
+        elif self.block_type == "moe":
+            # MoE: use existing init_weights for base initialization
+            self.mixer.init_weights(buffer_device=buffer_device, init_std=init_std)
+
+            # Override gate weight with normal (not trunc_normal) for backward compat
+            nn.init.normal_(self.mixer.gate.weight, mean=0.0, std=init_std)
+            if self.mixer.gate.bias is not None:
+                nn.init.zeros_(self.mixer.gate.bias)
+
+            # Zero expert biases
+            if hasattr(self.mixer.experts, "gate_up_proj_bias") and self.mixer.experts.gate_up_proj_bias is not None:
+                nn.init.zeros_(self.mixer.experts.gate_up_proj_bias)
+            if hasattr(self.mixer.experts, "down_proj_bias") and self.mixer.experts.down_proj_bias is not None:
+                nn.init.zeros_(self.mixer.experts.down_proj_bias)
+
+            # Zero shared expert biases
+            if self.mixer.shared_experts.up_proj.bias is not None:
+                nn.init.zeros_(self.mixer.shared_experts.up_proj.bias)
+            if self.mixer.shared_experts.down_proj.bias is not None:
+                nn.init.zeros_(self.mixer.shared_experts.down_proj.bias)
+
+            # Apply rescaling
+            if rescale_prenorm_residual:
+                self.mixer.experts.down_projs /= math.sqrt(num_hidden_layers)
+                self.mixer.shared_experts.down_proj.weight /= math.sqrt(num_hidden_layers)

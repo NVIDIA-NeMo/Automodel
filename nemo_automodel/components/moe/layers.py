@@ -274,9 +274,7 @@ class GroupedExperts(nn.Module):
         )
 
         if self.expert_bias:
-            self.gate_up_proj_bias = nn.Parameter(
-                torch.empty(config.n_routed_experts, up_proj_dim, dtype=config.dtype)
-            )
+            self.gate_up_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, up_proj_dim, dtype=config.dtype))
             self.down_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.dim, dtype=config.dtype))
         else:
             self.gate_up_proj_bias = None
@@ -510,9 +508,7 @@ class GroupedExpertsDeepEP(nn.Module):
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
         # Non-gated (ReLU²): [n_experts, dim, inter_dim]
         up_proj_dim = config.moe_inter_dim * 2 if self.is_gated else config.moe_inter_dim
-        self.gate_and_up_projs = nn.Parameter(
-            torch.empty(config.n_routed_experts, config.dim, up_proj_dim)
-        )
+        self.gate_and_up_projs = nn.Parameter(torch.empty(config.n_routed_experts, config.dim, up_proj_dim))
 
         self.down_projs = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim, config.dim))
 
