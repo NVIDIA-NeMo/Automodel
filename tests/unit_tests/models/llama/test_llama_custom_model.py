@@ -21,8 +21,9 @@ import pytest
 import torch
 from transformers import AutoModelForCausalLM, LlamaConfig
 
-from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 from nemo_automodel import NeMoAutoModelForCausalLM
+from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
+
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
 
@@ -62,11 +63,15 @@ class TestLlamaModel:
         adapter = LlamaStateDictAdapter(config)
 
         # Load HF model
-        llama_model_hf = AutoModelForCausalLM.from_pretrained(
-            pretrained_model_name_or_path=tiny_llama_checkpoint,
-            attn_implementation="eager",
-            torch_dtype=torch.bfloat16,
-        ).to("cuda")
+        llama_model_hf = (
+            AutoModelForCausalLM.from_pretrained(
+                pretrained_model_name_or_path=tiny_llama_checkpoint,
+                attn_implementation="eager",
+                torch_dtype=torch.bfloat16,
+            )
+            .to("cuda")
+            .to(torch.bfloat16)
+        )  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
         llama_model_hf.eval()
 
         # Build custom model
@@ -96,7 +101,9 @@ class TestLlamaModel:
             assert p1.shape == p2.shape, f"Parameter shape mismatch: {p1.shape} != {p2.shape}"
             assert p1.dtype == p2.dtype, f"Parameter dtype mismatch: {p1.dtype} != {p2.dtype}"
             assert p1.device == p2.device, f"Parameter device mismatch: {p1.device} != {p2.device}"
-            assert p1.requires_grad == p2.requires_grad, f"Parameter requires_grad mismatch: {p1.requires_grad} != {p2.requires_grad}"
+            assert p1.requires_grad == p2.requires_grad, (
+                f"Parameter requires_grad mismatch: {p1.requires_grad} != {p2.requires_grad}"
+            )
             assert torch.allclose(p1, p2, atol=1e-5, rtol=1e-5), f"Parameter mismatch: {p1} != {p2}"
 
         # Generate test inputs
@@ -121,11 +128,13 @@ class TestLlamaModel:
         hf_state_dict_from_custom = adapter.to_hf(custom_state_dict)
 
         # Create new HF model and load converted state dict
-        llama_model_hf_converted = AutoModelForCausalLM.from_pretrained(
-            tiny_llama_checkpoint,
-            attn_implementation="eager",
-            torch_dtype=torch.bfloat16
-        ).to("cuda")
+        llama_model_hf_converted = (
+            AutoModelForCausalLM.from_pretrained(
+                tiny_llama_checkpoint, attn_implementation="eager", torch_dtype=torch.bfloat16
+            )
+            .to("cuda")
+            .to(torch.bfloat16)
+        )  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
         llama_model_hf_converted.eval()
         llama_model_hf_converted.load_state_dict(hf_state_dict_from_custom, strict=True)
 
@@ -149,7 +158,7 @@ class TestLlamaModel:
         # Load HF model and get state dict
         llama_model_hf = AutoModelForCausalLM.from_pretrained(
             tiny_llama_checkpoint, attn_implementation="eager", torch_dtype=torch.bfloat16
-        )
+        ).to(torch.bfloat16)  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
         hf_state_dict = llama_model_hf.state_dict()
 
         # Convert to custom format
@@ -214,11 +223,15 @@ class TestLlamaModel:
             llama_model_custom.save_pretrained_hf_format(export_path)
 
             # Load from saved HF checkpoint
-            llama_model_hf_loaded = AutoModelForCausalLM.from_pretrained(
-                export_path,
-                attn_implementation="eager",
-                torch_dtype=torch.bfloat16,
-            ).to("cuda")
+            llama_model_hf_loaded = (
+                AutoModelForCausalLM.from_pretrained(
+                    export_path,
+                    attn_implementation="eager",
+                    torch_dtype=torch.bfloat16,
+                )
+                .to("cuda")
+                .to(torch.bfloat16)
+            )  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
             llama_model_hf_loaded.eval()
 
             # Compare outputs

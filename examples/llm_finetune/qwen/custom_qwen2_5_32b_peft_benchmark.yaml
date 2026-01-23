@@ -28,7 +28,7 @@ rng:
   ranked: true
 
 model:
-  _target_: nemo_automodel.components.models.qwen2.build_qwen2_model
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen2.5-32B-Instruct
   torch_dtype: bf16
 
