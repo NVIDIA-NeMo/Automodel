@@ -83,7 +83,7 @@ To run training on a single GPU, use this command:
 !python finetune.py \
     --config llama3_2_1b_squad.yaml \
     --step_scheduler.max_steps 20 \
-    --checkpoint.checkpoint_dir /Volumes/<catalog_name>/<schema_name>/<volume_name>/checkpoints_single/
+    --checkpoint.checkpoint_dir /Volumes/<catalog_name>/<schema_name>/<volume_name>/checkpoints_single/ \
     --checkpoint.staging_dir /local_disk0/checkpoints_single/ \
     --checkpoint.is_async True
 ```
@@ -93,7 +93,7 @@ In addition to specifying the configuration file, we also use these options:
 - `--step_scheduler.max_steps`: Limits the number of training steps taken. Again, this is for example purposes – adapt for your actual use case as needed.
 - `--checkpoint.checkpoint_dir`: Tells Automodel where to {doc}`save model checkpoints </guides/checkpointing>` from training. We recommend saving model checkpoints in a Databricks Unity Catalog [volume](https://docs.databricks.com/aws/en/volumes/).
 - `--checkpoint.staging_dir`: Specifies a temporary staging location for model checkpoints. Files will be temporarily saved to this location before being moved to the final `checkpoint_dir` location. This is needed when saving checkpoints in Unity Catalog. 
-- `--checkpoint.is_async`: Use asynchronous checkpointing. 
+- `--checkpoint.is_async`: Uses asynchronous checkpointing. 
 
 Looking at GPU metrics in Databricks, we see our single GPU is being well utilized (\~95% utilization).
 
@@ -144,7 +144,7 @@ def run_command(cmd):
     return p.stdout.decode()
  
 rdd = sc.parallelize(range(sc.defaultParallelism))
-results = rdd.mapPartitions(lambda x: run_command("hf auth login --token " + hf_token)).collect()
+rdd.mapPartitions(lambda _: [run_command("hf auth login --token " + hf_token)]).collect();
 ```
 
 Next, we use PySpark's [TorchDistributor](https://spark.apache.org/docs/latest/api/python/reference/api/pyspark.ml.torch.distributor.TorchDistributor.html) to run the same training job across multiple instances like this:
