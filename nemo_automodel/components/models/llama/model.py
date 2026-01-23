@@ -365,7 +365,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         self.post_init()
 
         # Convert to configured dtype if specified
-        if hasattr(config, 'torch_dtype') and config.torch_dtype is not None:
+        if hasattr(config, "torch_dtype") and config.torch_dtype is not None:
             self.to(dtype=config.torch_dtype)
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:

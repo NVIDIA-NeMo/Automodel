@@ -31,11 +31,10 @@ model:
 from __future__ import annotations
 
 import os
-from typing import Any, Callable, Optional, Union
+from typing import Callable, Optional, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import Qwen2Config
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
@@ -58,7 +57,6 @@ from nemo_automodel.components.models.common.combined_projection import (
 from nemo_automodel.components.models.qwen2.state_dict_adapter import Qwen2StateDictAdapter
 from nemo_automodel.components.moe.utils import BackendConfig
 from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
-from nemo_automodel.shared.utils import dtype_from_str
 
 __all__ = ["Qwen2ForCausalLM"]
 
@@ -357,14 +355,13 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             self.tie_weights()
 
         # Convert to configured dtype if specified
-        if hasattr(config, 'torch_dtype') and config.torch_dtype is not None:
+        if hasattr(config, "torch_dtype") and config.torch_dtype is not None:
             self.to(dtype=config.torch_dtype)
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             print(f"[Qwen2ForCausalLM] Attention implementation: {self.config._attn_implementation}")
             print("[Qwen2ForCausalLM] Custom implementation with COMBINED QKV and gate_up projections")
             print(f"[Qwen2ForCausalLM] torch_dtype: {self.config.torch_dtype}")
-
 
     @can_return_tuple
     def forward(

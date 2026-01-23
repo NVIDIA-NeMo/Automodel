@@ -230,7 +230,9 @@ class TestQwen2Model:
                     torch_dtype=torch.bfloat16,
                 )
                 .to("cuda")
-                .to(torch.bfloat16)  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
+                .to(
+                    torch.bfloat16
+                )  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
             )
 
             # Compare outputs
