@@ -21,7 +21,7 @@ import pytest
 import torch
 from transformers import AutoModelForCausalLM, Qwen2Config
 
-from nemo_automodel.components.models.qwen2 import build_qwen2_model
+from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel.components.models.qwen2.state_dict_adapter import Qwen2StateDictAdapter
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -72,11 +72,11 @@ class TestQwen2Model:
                 tiny_qwen2_checkpoint, attn_implementation="eager", torch_dtype=torch.bfloat16
             )
             .to("cuda")
-            .to(torch.bfloat16)  # need to manual cast to bfloat16 since HF initialize weights in float32 dtype
+            .to(torch.bfloat16)  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
         )
 
         # Build custom model
-        qwen2_model_custom = build_qwen2_model(
+        qwen2_model_custom = NeMoAutoModelForCausalLM.from_pretrained(
             pretrained_model_name_or_path=tiny_qwen2_checkpoint,
             attn_implementation="eager",
             torch_dtype=torch.bfloat16,
@@ -121,7 +121,7 @@ class TestQwen2Model:
                 tiny_qwen2_checkpoint, attn_implementation="eager", torch_dtype=torch.bfloat16
             )
             .to("cuda")
-            .to(torch.bfloat16)
+            .to(torch.bfloat16)  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
         )
         qwen2_model_hf_converted.load_state_dict(hf_state_dict_from_custom, strict=True)
 
@@ -169,11 +169,11 @@ class TestQwen2Model:
     def test_state_dict_adapter_to_hf(self, tiny_qwen2_checkpoint):
         """Test converting custom model state dict back to HF format.
 
-        This test verifies that the custom model (built with build_qwen2_model) has combined
+        This test verifies that the custom model (built with NeMoAutoModelForCausalLM) has combined
         projections by default, and that these are the only projection keys present.
         """
-        # Build custom model (which uses adapter internally to load from HF checkpoint)
-        qwen2_model_custom = build_qwen2_model(
+        # Build custom model
+        qwen2_model_custom = NeMoAutoModelForCausalLM.from_pretrained(
             pretrained_model_name_or_path=tiny_qwen2_checkpoint,
             attn_implementation="eager",
             torch_dtype=torch.bfloat16,
@@ -204,11 +204,12 @@ class TestQwen2Model:
             export_path = os.path.join(tmpdir, "hf_checkpoint")
 
             # Build custom model
-            qwen2_model_custom = build_qwen2_model(
+            qwen2_model_custom = NeMoAutoModelForCausalLM.from_pretrained(
                 pretrained_model_name_or_path=tiny_qwen2_checkpoint,
                 attn_implementation="eager",
                 torch_dtype=torch.bfloat16,
             ).to("cuda")
+            qwen2_model_custom.eval()
 
             # Generate test input
             input_ids = torch.randint(0, config.vocab_size, (1, 10)).to("cuda")
@@ -229,7 +230,7 @@ class TestQwen2Model:
                     torch_dtype=torch.bfloat16,
                 )
                 .to("cuda")
-                .to(torch.bfloat16)
+                .to(torch.bfloat16)  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
             )
 
             # Compare outputs

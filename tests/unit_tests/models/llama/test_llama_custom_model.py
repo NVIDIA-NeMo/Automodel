@@ -66,7 +66,7 @@ class TestLlamaModel:
             pretrained_model_name_or_path=tiny_llama_checkpoint,
             attn_implementation="eager",
             torch_dtype=torch.bfloat16,
-        ).to("cuda")
+        ).to("cuda").to(torch.bfloat16)  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
         llama_model_hf.eval()
 
         # Build custom model
@@ -125,7 +125,7 @@ class TestLlamaModel:
             tiny_llama_checkpoint,
             attn_implementation="eager",
             torch_dtype=torch.bfloat16
-        ).to("cuda")
+        ).to("cuda").to(torch.bfloat16)  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
         llama_model_hf_converted.eval()
         llama_model_hf_converted.load_state_dict(hf_state_dict_from_custom, strict=True)
 
@@ -149,7 +149,7 @@ class TestLlamaModel:
         # Load HF model and get state dict
         llama_model_hf = AutoModelForCausalLM.from_pretrained(
             tiny_llama_checkpoint, attn_implementation="eager", torch_dtype=torch.bfloat16
-        )
+        ).to(torch.bfloat16)  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
         hf_state_dict = llama_model_hf.state_dict()
 
         # Convert to custom format
@@ -218,7 +218,7 @@ class TestLlamaModel:
                 export_path,
                 attn_implementation="eager",
                 torch_dtype=torch.bfloat16,
-            ).to("cuda")
+            ).to("cuda").to(torch.bfloat16)  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
             llama_model_hf_loaded.eval()
 
             # Compare outputs

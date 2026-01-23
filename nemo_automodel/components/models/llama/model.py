@@ -364,6 +364,15 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+        # Convert to configured dtype if specified
+        if hasattr(config, 'torch_dtype') and config.torch_dtype is not None:
+            self.to(dtype=config.torch_dtype)
+
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            print(f"[LlamaForCausalLM] Attention implementation: {self.config._attn_implementation}")
+            print("[LlamaForCausalLM] Custom implementation with COMBINED QKV and gate_up projections")
+            print(f"[LlamaForCausalLM] torch_dtype: {self.config.torch_dtype}")
+
     def save_pretrained_hf_format(self, save_directory: str, **kwargs):
         """Save model in HuggingFace-compatible format by converting combined projections.
 
