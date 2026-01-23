@@ -41,14 +41,6 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
 
-# torch.compile configuration
-compile:
-  enabled: false
-  mode: "default"  # Options: "default", "reduce-overhead", "max-autotune"
-  fullgraph: false
-  dynamic: true  # Set to false for better performance with fixed shapes
-  backend: null  # Use default backend (inductor)
-
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: none
@@ -63,8 +55,8 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
   split: train
 
 packed_sequence:
@@ -76,10 +68,10 @@ dataloader:
   shuffle: True
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
   split: validation
-  limit_dataset_samples: 64
+  num_samples_limit: 64
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
