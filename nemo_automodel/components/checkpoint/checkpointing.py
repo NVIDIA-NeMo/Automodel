@@ -571,11 +571,19 @@ class Checkpointer:
             # some HF models like Moonlight-16B have non-persistent buffers in the base checkpoint
             # however, HF initializes buffers with persistent=False, so we need to make sure these
             # buffer keys are not saved during checkpointing
-            keys_to_remove = list(set(fqn_to_file_index_mapping.keys()) - set(self.config.model_state_dict_keys))
-            if model_state.is_tied_lm_head:
-                keys_to_remove.append(model_state.lm_head_param_name)
+
+            # Temporary patch
+            keys_to_remove = [key for key in fqn_to_file_index_mapping.keys() if "inv_freq" in key]
             for key in keys_to_remove:
                 fqn_to_file_index_mapping.pop(key, None)
+
+            # The below does not work for custom models since the keys haven't been converted to HF.
+            # We need to create new methods in the adapter to cast the strings to HF keys.
+            # keys_to_remove = list(set(fqn_to_file_index_mapping.keys()) - set(self.config.model_state_dict_keys))
+            # if model_state.is_tied_lm_head:
+            #     keys_to_remove.append(model_state.lm_head_param_name)
+            # for key in keys_to_remove:
+            #     fqn_to_file_index_mapping.pop(key, None)
         else:
             fqn_to_file_index_mapping = {k: 1 for k in state_dict.keys()}
 
@@ -638,9 +646,11 @@ class Checkpointer:
         """
         Get the path to the original model from the Hugging Face checkpoint.
         """
-        if not hasattr(model_state.model[0], "name_or_path"):
+        if not hasattr(model_state.model[0], "name_or_path") and not hasattr(getattr(model_state.model[0], "config", None), "name_or_path"):
             return None
-        pretrained_model_name_or_path = getattr(model_state.model[0], "name_or_path")
+        pretrained_model_name_or_path = getattr(model_state.model[0], "name_or_path", None) or getattr(getattr(model_state.model[0], "config", None), "name_or_path", None)
+        if os.path.isdir(pretrained_model_name_or_path):
+            return pretrained_model_name_or_path
         return get_safetensors_index_path(
             getattr(self.config, "original_model_root_dir", None) or TRANSFORMERS_CACHE, pretrained_model_name_or_path
         )
