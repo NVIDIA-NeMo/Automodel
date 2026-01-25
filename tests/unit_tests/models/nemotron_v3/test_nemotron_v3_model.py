@@ -375,6 +375,7 @@ class TestNemotronV3ModelWithMoE:
         assert hasattr(model.layers["0"].mixer, "experts")
         assert hasattr(model.layers["0"].mixer, "shared_experts")
 
+    @skip_if_no_gpu
     def test_moe_model_forward(self, config, backend):
         """Test MoE model forward pass."""
         from nemo_automodel.components.models.nemotron_v3.model import NemotronV3Model
