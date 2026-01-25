@@ -25,6 +25,17 @@ from nemo_automodel.components.moe.layers import MoEConfig
 
 skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")
 
+try:
+    import mamba_ssm
+    _has_mamba_ssm = True
+except ImportError:
+    _has_mamba_ssm = False
+
+skip_if_no_mamba = pytest.mark.skipif(
+    not torch.cuda.is_available() or not _has_mamba_ssm,
+    reason="CUDA and mamba_ssm required for Mamba Triton kernels"
+)
+
 
 class MockNemotronV3Config:
     """Mock configuration for NemotronV3 model."""
@@ -297,6 +308,7 @@ class TestNemotronV3Block:
 
         assert output.shape == (batch_size, seq_len, config.hidden_size)
 
+    @skip_if_no_gpu
     def test_block_forward_moe(self, config, backend, moe_config):
         """Test block forward pass with MoE layer."""
         config.layers_block_type = ["moe"]
@@ -409,7 +421,7 @@ class TestNemotronV3MambaRMSNormGated:
         assert norm.variance_epsilon == 1e-5
         assert norm.group_size == group_size
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Mamba Triton kernels")
+    @skip_if_no_mamba
     def test_gated_rmsnorm_forward_requires_cuda(self):
         """Test that forward requires CUDA for Triton kernels."""
         from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3MambaRMSNormGated
