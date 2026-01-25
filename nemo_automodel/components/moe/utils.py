@@ -31,7 +31,8 @@ class BackendConfig:
     linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
-    enable_deepep: bool = HAVE_DEEP_EP
+    experts: Literal["torch", "te", "gmm"] = "torch"
+    dispatcher: Literal["torch", "deepep"] = "torch"
     fake_balanced_gate: bool = False
     enable_hf_state_dict_adapter: bool = True
     enable_fsdp_optimizations: bool = False
@@ -40,6 +41,11 @@ class BackendConfig:
     def __post_init__(self):
         if isinstance(self.gate_precision, str):
             self.gate_precision = dtype_from_str(self.gate_precision, default=None)
+        # TE and GMM experts require DeepEP dispatcher
+        if self.experts in ("te", "gmm") and self.dispatcher != "deepep":
+            raise ValueError(
+                f"experts='{self.experts}' requires dispatcher='deepep', but got dispatcher='{self.dispatcher}'"
+            )
 
 
 def initialize_rms_norm_module(

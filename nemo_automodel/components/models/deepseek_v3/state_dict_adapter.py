@@ -94,7 +94,7 @@ class DeepSeekV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
     ) -> dict[str, Any]:
         """Convert from native model state dict to HuggingFace format.
-        Automatically detects format based on backend.enable_deepep configuration.
+        Automatically detects format based on backend.dispatcher configuration.
         """
         hf_state_dict = {}
         for fqn, tensor in state_dict.items():
