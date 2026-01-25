@@ -29,7 +29,7 @@ from nemo_automodel.components.moe.fsdp_mixin import set_is_optim_step
 # - model.layers.X.mlp.experts.gate_up_linear.bias0
 # - model.layers.X.mlp.experts.down_linear.weight0
 # - model.layers.X.mlp.experts.down_linear.bias0
-_EXPERT_PARAM_PATTERN = re.compile(r"(^|\.)mlp\.experts\.(gate_up_linear|down_linear)\.(weight|bias)\d+")
+_TE_EXPERT_PARAM_PATTERN = re.compile(r"(^|\.)mlp\.experts\.(gate_up_linear|down_linear)\.(weight|bias)\d+")
 
 
 @torch.no_grad()
@@ -315,7 +315,11 @@ def scale_grads_and_clip_grad_norm(
                         and ep_axis_name
                         and ep_axis_name in p.device_mesh.mesh_dim_names
                     )
-                    is_expert_param = _EXPERT_PARAM_PATTERN.search(name) is not None
+                    is_expert_param = (
+                        isinstance(p, torch.Tensor)
+                        and isinstance(p.grad, torch.Tensor)
+                        and _TE_EXPERT_PARAM_PATTERN.search(name) is not None
+                    )
                     if is_ep_sharded_dtensor or is_expert_param:
                         p.grad.div_(ep_ratio)
 
