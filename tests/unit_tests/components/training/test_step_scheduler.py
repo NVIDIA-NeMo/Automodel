@@ -13,12 +13,16 @@
 # limitations under the License.
 
 import pytest
-
-from nemo_automodel.components.training.step_scheduler import StepScheduler, _calculate_max_steps
+from nemo_automodel.components.training.step_scheduler import (
+    StepScheduler,
+    _calculate_max_steps,
+)
 
 
 class SizedDataLoader:
-    def __init__(self, num_batches: int, global_batch_size: int = 1, local_batch_size: int = 1):
+    def __init__(
+        self, num_batches: int, global_batch_size: int = 1, local_batch_size: int = 1
+    ):
         self.num_batches = num_batches
         # self.global_batch_size = global_batch_size
         # self.local_batch_size = local_batch_size
@@ -30,7 +34,7 @@ class SizedDataLoader:
             yield {"batch": (i, 0)}
 
     def __len__(self):
-        return self.num_batches #* (self.global_batch_size // self.local_batch_size)
+        return self.num_batches  # * (self.global_batch_size // self.local_batch_size)
 
 
 class IterableDataLoader:
@@ -67,6 +71,8 @@ def test_iteration_groups_and_epoch_increment_sized():
     # One epoch completed and 3 steps performed
     assert scheduler.step == 3
     assert scheduler.epoch == 1
+
+
 @pytest.mark.parametrize(
     "max_steps, ckpt_every_steps",
     [
@@ -81,6 +87,7 @@ def test_iteration_groups_and_epoch_increment_sized():
 )
 def test_resume(max_steps, ckpt_every_steps):
     from copy import deepcopy
+
     max_steps = 10
     dataloader = SizedDataLoader(num_batches=max_steps)
     scheduler = StepScheduler(
@@ -97,7 +104,7 @@ def test_resume(max_steps, ckpt_every_steps):
     ref_state = None
     saved_is_ckpt = None
     start_collecting = False
-    for i, _  in enumerate(scheduler):
+    for i, _ in enumerate(scheduler):
         if i == 2:
             ref_state = deepcopy(scheduler.state_dict())
             saved_is_ckpt = scheduler.is_ckpt_step
@@ -106,7 +113,9 @@ def test_resume(max_steps, ckpt_every_steps):
             continue
         if start_collecting:
             # record exact values; sequence starts at step ref_state['step']
-            ref_outputs.append((scheduler.step, scheduler.is_val_step, scheduler.is_ckpt_step))
+            ref_outputs.append(
+                (scheduler.step, scheduler.is_val_step, scheduler.is_ckpt_step)
+            )
 
     del scheduler
     scheduler = StepScheduler(
@@ -120,17 +129,20 @@ def test_resume(max_steps, ckpt_every_steps):
     )
 
     scheduler.load_state_dict(ref_state)
-    for j, _  in enumerate(scheduler):
+    for j, _ in enumerate(scheduler):
         expected_step, expected_is_val, expected_is_ckpt = ref_outputs.pop(0)
         # Ensure we don't checkpoint immediately after resume if we saved on a checkpoint step
         if j == 0 and saved_is_ckpt and ckpt_every_steps > 1:
             expected_is_ckpt = False
         assert (expected_step, expected_is_val, expected_is_ckpt) == (
-            scheduler.step, scheduler.is_val_step, scheduler.is_ckpt_step
+            scheduler.step,
+            scheduler.is_val_step,
+            scheduler.is_ckpt_step,
         )
         # step at resume should be ref_state['step'] + j
         assert scheduler.step == j + ref_state["step"]
     assert len(ref_outputs) == 0
+
 
 @pytest.mark.parametrize(
     "max_steps, ckpt_every_steps, global_batch_size, local_batch_size, is_ckpt_step",
@@ -141,10 +153,18 @@ def test_resume(max_steps, ckpt_every_steps):
         (3, 3, 2, 2, [False, False, True]),
         (5, 3, 1, 1, [False, False, True, False, True]),
         (6, 2, 2, 1, [False, True, False, True, False, True]),
-        (10, 4, 4, 2, [False, False, False, True, False, False, False, True, False, True]),
+        (
+            10,
+            4,
+            4,
+            2,
+            [False, False, False, True, False, False, False, True, False, True],
+        ),
     ],
 )
-def test_is_ckpt_step_parametrized_iterable(max_steps, ckpt_every_steps, global_batch_size, local_batch_size, is_ckpt_step):
+def test_is_ckpt_step_parametrized_iterable(
+    max_steps, ckpt_every_steps, global_batch_size, local_batch_size, is_ckpt_step
+):
     dataloader = SizedDataLoader(
         num_batches=max_steps * (global_batch_size // local_batch_size),
     )
@@ -174,13 +194,14 @@ def test_is_ckpt_step_parametrized_iterable(max_steps, ckpt_every_steps, global_
     assert scheduler.step == max_steps
     assert scheduler.is_ckpt_step is True
 
+
 @pytest.mark.parametrize(
     "expected_last_batch_steps",
-    [
-        ([3, 7, 9])
-    ],
+    [([3, 7, 9])],
 )
-def test_is_ckpt_step_triggers_on_last_batch_with_sized_dataloader(expected_last_batch_steps):
+def test_is_ckpt_step_triggers_on_last_batch_with_sized_dataloader(
+    expected_last_batch_steps,
+):
     epoch_len = 4  # number of micro-batches per epoch
     dataloader = SizedDataLoader(num_batches=epoch_len)
     scheduler = StepScheduler(
@@ -208,6 +229,7 @@ def test_is_ckpt_step_triggers_on_last_batch_with_sized_dataloader(expected_last
     assert scheduler.is_ckpt_step is True
     assert scheduler.state_dict() == {"step": 10, "epoch": 2}
 
+
 @pytest.mark.parametrize(
     "max_steps, ckpt_every_steps, epoch, num_epochs, global_batch_size, local_batch_size, num_batches, is_ckpt_step",
     [
@@ -215,7 +237,16 @@ def test_is_ckpt_step_triggers_on_last_batch_with_sized_dataloader(expected_last
         (1000, 1000, 0, 1, 64, 1, 317 + 1, [False] * 317 + [True]),
     ],
 )
-def test_ckpt_every_steps_larger_than_max_steps(max_steps, ckpt_every_steps, epoch, num_epochs, global_batch_size, local_batch_size, num_batches, is_ckpt_step):
+def test_ckpt_every_steps_larger_than_max_steps(
+    max_steps,
+    ckpt_every_steps,
+    epoch,
+    num_epochs,
+    global_batch_size,
+    local_batch_size,
+    num_batches,
+    is_ckpt_step,
+):
     dataloader = SizedDataLoader(
         num_batches=num_batches * (global_batch_size // local_batch_size),
     )
@@ -238,6 +269,7 @@ def test_ckpt_every_steps_larger_than_max_steps(max_steps, ckpt_every_steps, epo
             assert val == scheduler.is_last_step, i
     assert len(is_ckpt_step) == 0
 
+
 @pytest.mark.parametrize(
     "num_epochs, epoch_len, expected_max_steps",
     [
@@ -248,6 +280,7 @@ def test_ckpt_every_steps_larger_than_max_steps(max_steps, ckpt_every_steps, epo
 )
 def test_calculate_max_steps(num_epochs, epoch_len, expected_max_steps):
     assert _calculate_max_steps(num_epochs, epoch_len) == expected_max_steps
+
 
 @pytest.mark.parametrize(
     "dataloader, is_iterable",
@@ -273,6 +306,7 @@ def test_ckpt_every_steps_is_none(dataloader, is_iterable):
         assert scheduler.epoch_len is 10
         assert scheduler.ckpt_every_steps is 10
 
+
 def test_iterable_dataloader():
     dataloader = IterableDataLoader(num_batches=10)
     scheduler = StepScheduler(
@@ -285,6 +319,7 @@ def test_iterable_dataloader():
         max_steps=10,
     )
     assert scheduler.epoch_len is None
+
 
 def test_set_epoch():
     dataloader = SizedDataLoader(num_batches=10)
@@ -299,3 +334,31 @@ def test_set_epoch():
     )
     scheduler.set_epoch(2)
     assert scheduler.epoch == 2
+
+
+def test_scheduler_max_steps_priority():
+    dataloader = SizedDataLoader(num_batches=20)
+    scheduler = StepScheduler(
+        global_batch_size=1,
+        local_batch_size=1,
+        dp_size=1,
+        ckpt_every_steps=10,
+        dataloader=dataloader,
+        max_steps=1000,
+    )
+
+    assert scheduler.num_epochs != 10, (
+        "Scheduler defaulted to 10 epochs despite max_steps being set!"
+    )
+
+    scheduler_default = StepScheduler(
+        global_batch_size=1,
+        local_batch_size=1,
+        dp_size=1,
+        ckpt_every_steps=10,
+        dataloader=dataloader,
+    )
+
+    assert scheduler_default.num_epochs == 10, (
+        "Should default to 10 epochs if nothing is provided"
+    )

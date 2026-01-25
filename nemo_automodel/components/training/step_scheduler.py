@@ -24,7 +24,9 @@ logger = logging.getLogger(__name__)
 
 
 def _calculate_max_steps(
-    num_epochs: int, epoch_len: Optional[int], default_max_steps: int = 9223372036854775807
+    num_epochs: int,
+    epoch_len: Optional[int],
+    default_max_steps: int = 9223372036854775807,
 ) -> int:
     """
     Calculate the maximum number of steps.
@@ -50,8 +52,8 @@ class StepScheduler(Stateful):
         log_remote_every_steps: int = 1,
         start_step: int = 0,
         start_epoch: int = 0,
-        num_epochs: int = 10,
-        max_steps: int = None,
+        num_epochs: Optional[int] = None,
+        max_steps: Optional[int] = None,
     ):
         """
         Initialize the StepScheduler.
@@ -66,7 +68,7 @@ class StepScheduler(Stateful):
             log_remote_every_steps (int): Frequency of remote logging (e.g., WandB, MLflow). Default: 1 (every step).
             start_step (int): Initial global step. Used when resuming from checkpoint. Default: 0.
             start_epoch (int): Initial epoch. Used when resuming from checkpoint. Default: 0.
-            num_epochs (int): Total number of epochs. Default: 10.
+            num_epochs (Optional[int]): Total number of epochs. Default: None or 10 if max_steps and num_epochs are both None.
             max_steps (Optional[int]): Maximum number of steps to run. If None, calculated from num_epochs.
         """
         assert global_batch_size % (local_batch_size * dp_size) == 0, (
@@ -81,8 +83,15 @@ class StepScheduler(Stateful):
         assert start_step >= 0, "start_step must be greater than or equal to 0"
         self.epoch = start_epoch
         assert start_epoch >= 0, "start_epoch must be greater than or equal to 0"
+
+        # This is for backward compatibility in the sense that num_epochs's default value was 10
+        if num_epochs is None and max_steps is None:
+            num_epochs = 10
+
         self.num_epochs = num_epochs
-        assert num_epochs > 0, "num_epochs must be greater than 0"
+        assert num_epochs is None or num_epochs > 0, (
+            "num_epochs must be greater than 0 or None if max_steps is provided"
+        )
         # Throws with IterableDataset.
         try:
             self.epoch_len = ceil(len(dataloader) / self.grad_acc_steps)
