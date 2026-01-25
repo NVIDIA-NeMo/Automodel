@@ -44,7 +44,6 @@ class ParallelizeFnProtocol(Protocol):
         world_mesh: DeviceMesh,
         moe_mesh: DeviceMesh,
         *,
-        pp_enabled: bool,
         dp_axis_names: tuple[str, ...],
         cp_axis_name: str | None = None,
         tp_axis_name: str | None = None,
@@ -326,14 +325,18 @@ def split_model_into_stages(
                         elif isinstance(module, nn.ModuleList):
                             setattr(parent_module, name, nn.ModuleDict())
 
+                # If this module is explicitly in modules_to_keep, keep it and all its children
+                # (don't recurse to avoid removing PEFT adapters like lora_A, lora_B)
+                elif full_name in modules_to_keep:
+                    # Keep this module and all its children intact
+                    pass
+
                 # Handle other modules
-                elif full_name not in modules_to_keep and not any(
-                    kept_name.startswith(full_name + ".") for kept_name in modules_to_keep
-                ):
+                elif not any(kept_name.startswith(full_name + ".") for kept_name in modules_to_keep):
                     # This module and its children are not needed
                     setattr(parent_module, name, None)
                 else:
-                    # Recursively process children
+                    # This module has descendants that need to be kept, recurse into it
                     _process_module(module, full_name)
 
         # Process the model
@@ -497,7 +500,6 @@ def pipeline_model(
                 m,
                 world_mesh=world_mesh,
                 moe_mesh=moe_mesh,
-                pp_enabled=True,
                 dp_axis_names=dp_axis_names,
                 cp_axis_name=cp_axis_name,
                 tp_axis_name=tp_axis_name,

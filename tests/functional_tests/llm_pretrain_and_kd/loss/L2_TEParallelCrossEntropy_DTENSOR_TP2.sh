@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,8 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Custom Qwen2 model implementation for NeMo Automodel."""
+#!/bin/bash
+set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
-from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM
+export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
+export CUDA_VISIBLE_DEVICES="0,1"
 
-__all__ = ["Qwen2ForCausalLM"]
+torchrun --nproc_per_node=2 --nnodes=1 \
+  tests/functional_tests/llm_pretrain_and_kd/loss/run_te_parallel_ce_dtensor.py
+
