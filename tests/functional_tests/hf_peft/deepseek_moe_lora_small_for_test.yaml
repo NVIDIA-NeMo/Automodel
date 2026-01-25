@@ -67,7 +67,7 @@ model:
     norm_topk_prob: false
     dtype: bfloat16
   backend:
-    _target_: nemo_automodel.components.moe.utils.BackendConfig
+    _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
     linear: torch
     rms_norm: torch

@@ -40,17 +40,18 @@ from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 
-# Import HuggingFace's Llama components directly to ensure exact same behavior
-from transformers.models.llama.modeling_llama import (
-    LlamaRMSNorm,
-    LlamaRotaryEmbedding,
-    apply_rotary_pos_emb,
-    eager_attention_forward,
-)
+# Import HuggingFace's Llama components for attention
+from transformers.models.llama.modeling_llama import eager_attention_forward
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 
-from nemo_automodel.components.models.common.combined_projection import CombinedGateUpMLP, CombinedQKVAttentionMixin
+from nemo_automodel.components.models.common import (
+    BackendConfig,
+    CombinedGateUpMLP,
+    CombinedQKVAttentionMixin,
+    initialize_rms_norm_module,
+)
+from nemo_automodel.components.models.llama.rope_utils import apply_rotary_pos_emb, LlamaRotaryEmbedding
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
 
@@ -173,6 +174,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         self,
         config: LlamaConfig,
         layer_idx: int,
+        backend: BackendConfig,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -185,8 +187,12 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         # ALWAYS use combined gate_up MLP for efficiency
         self.mlp = CombinedGateUpMLP(config=config)
 
-        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
+        )
+        self.post_attention_layernorm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
+        )
 
     def forward(
         self,
@@ -251,6 +257,7 @@ class LlamaModel(LlamaPreTrainedModel):
     def __init__(
         self,
         config: LlamaConfig,
+        backend: BackendConfig,
     ):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
@@ -262,11 +269,14 @@ class LlamaModel(LlamaPreTrainedModel):
                 LlamaDecoderLayer(
                     config=config,
                     layer_idx=layer_idx,
+                    backend=backend,
                 )
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
+        )
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
@@ -349,13 +359,24 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
+    @classmethod
+    def from_config(
+        cls,
+        config: LlamaConfig,
+        backend: Optional[BackendConfig] = None,
+        **kwargs,
+    ):
+        return cls(config, backend, **kwargs)
+
     def __init__(
         self,
         config: LlamaConfig,
+        backend: Optional[BackendConfig] = None,
     ):
         super().__init__(config)
         self.config = config
-        self.model = LlamaModel(config=config)
+        self.backend = backend or BackendConfig()
+        self.model = LlamaModel(config=config, backend=self.backend)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
