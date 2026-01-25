@@ -122,7 +122,7 @@ class MoESplitExpertsStateDictMixin:
             return
 
         missing_weights = []
-        projection_types = ["gate_proj", "up_proj", "down_proj"]
+        projection_types = ["gate_proj", "up_proj", "down_proj"] if self._is_gated_moe else ["up_proj", "down_proj"]
 
         for layer_num, prefixes in layers_with_experts.items():
             for prefix in prefixes:
