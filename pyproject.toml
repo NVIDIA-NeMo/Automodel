@@ -89,12 +89,11 @@ dependencies = [
     "wandb",
     "torchao",
     "mlflow",
-    "mamba-ssm[causal-conv1d]",
 ]
 
 [project.optional-dependencies]
 cuda = ["flash-attn<=2.8.3", "transformer-engine[pytorch]==2.8.0"]
-extra = ["flash-linear-attention", "perceptron", "sentencepiece"]
+extra = ["flash-linear-attention", "perceptron", "sentencepiece", "mamba-ssm[causal-conv1d]"]
 delta-databricks = [
     "deltalake>=1.0.0",  # For Delta Lake metadata
     "databricks-sql-connector>=3.0.0",  # For Unity Catalog streaming access
