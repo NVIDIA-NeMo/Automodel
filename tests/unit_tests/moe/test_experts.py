@@ -703,18 +703,9 @@ class TestGroupedExpertsTE:
         assert experts.num_local_experts == te_moe_config.n_routed_experts
         assert experts.dim == te_moe_config.dim
         assert experts.moe_inter_dim == te_moe_config.moe_inter_dim
-        assert experts.enable_fp8 is False
         assert experts.token_dispatcher is None
         assert experts.ep_mesh is None
         assert experts.ep_rank == 0
-
-    def test_grouped_experts_te_init_with_fp8(self, te_moe_config):
-        """Test GroupedExpertsTE initialization with FP8 enabled."""
-        from nemo_automodel.components.moe.experts import GroupedExpertsTE
-
-        experts = GroupedExpertsTE(te_moe_config, enable_fp8=True)
-
-        assert experts.enable_fp8 is True
 
     def test_grouped_experts_te_init_with_bias(self, te_moe_config_with_bias):
         """Test GroupedExpertsTE initialization with bias."""
