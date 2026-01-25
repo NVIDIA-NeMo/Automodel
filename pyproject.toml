@@ -89,12 +89,11 @@ dependencies = [
     "wandb",
     "torchao",
     "mlflow",
-    "mamba-ssm[causal-conv1d]",
 ]
 
 [project.optional-dependencies]
 cuda = ["flash-attn<=2.8.3", "transformer-engine[pytorch]==2.8.0"]
-extra = ["flash-linear-attention", "perceptron", "sentencepiece"]
+extra = ["flash-linear-attention", "perceptron", "sentencepiece", "mamba-ssm[causal-conv1d]"]
 vlm = [
     "pillow",
     "qwen-vl-utils[decord]; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
