@@ -2878,7 +2878,6 @@ dependencies = [
     { name = "ftfy" },
     { name = "imageio-ffmpeg" },
     { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
-    { name = "mamba-ssm", extra = ["causal-conv1d"] },
     { name = "megatron-fsdp" },
     { name = "mlflow" },
     { name = "opencv-python-headless" },
@@ -2896,6 +2895,7 @@ all = [
     { name = "albumentations" },
     { name = "backoff" },
     { name = "flash-linear-attention" },
+    { name = "mamba-ssm", extra = ["causal-conv1d"] },
     { name = "mistral-common", extra = ["opencv"] },
     { name = "numba" },
     { name = "numpy" },
@@ -2913,6 +2913,7 @@ cuda = [
 ]
 extra = [
     { name = "flash-linear-attention" },
+    { name = "mamba-ssm", extra = ["causal-conv1d"] },
     { name = "perceptron" },
     { name = "sentencepiece" },
 ]
@@ -2969,7 +2970,7 @@ requires-dist = [
     { name = "ftfy" },
     { name = "imageio-ffmpeg" },
     { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", specifier = ">=0.5.9" },
-    { name = "mamba-ssm", extras = ["causal-conv1d"] },
+    { name = "mamba-ssm", extras = ["causal-conv1d"], marker = "extra == 'extra'" },
     { name = "megatron-fsdp" },
     { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'" },
     { name = "mlflow" },
