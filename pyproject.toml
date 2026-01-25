@@ -89,6 +89,7 @@ dependencies = [
     "wandb",
     "torchao",
     "mlflow",
+    "mamba-ssm[causal-conv1d]",
 ]
 
 [project.optional-dependencies]
