@@ -93,9 +93,13 @@ class MoESplitExpertsStateDictMixin:
             rank_info = ""
 
         expert_segment = self._expert_path_segment
-        hf_prefix = self._hf_prefix
-        uses_hf_prefix = any(key.startswith(hf_prefix) for key in hf_state_dict.keys() if f".{expert_segment}." in key)
-        key_prefix = hf_prefix if uses_hf_prefix else ""
+
+        # Detect actual prefix from keys (handles both HF format and pre-renamed internal format)
+        key_prefix = ""
+        for key in hf_state_dict.keys():
+            if f".{expert_segment}." in key and "layers." in key:
+                key_prefix = key[: key.index("layers.")]
+                break
 
         layers_with_experts = set()
         pattern = rf"{re.escape(key_prefix)}layers\.(\d+)\.{re.escape(expert_segment)}\.\d+\.(gate_proj|up_proj|down_proj)\.weight"
@@ -109,7 +113,7 @@ class MoESplitExpertsStateDictMixin:
             return
 
         missing_weights = []
-        projection_types = ["gate_proj", "up_proj", "down_proj"]
+        projection_types = ["gate_proj", "up_proj", "down_proj"] if self._is_gated_moe else ["up_proj", "down_proj"]
 
         for layer_num in layers_with_experts:
             for expert_id in required_experts:
