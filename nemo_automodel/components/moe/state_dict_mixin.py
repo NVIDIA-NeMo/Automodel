@@ -47,10 +47,20 @@ class MoESplitExpertsStateDictMixin:
 
     @property
     def _is_gated_moe(self) -> bool:
-        """Check if the MoE uses gated activation (gate_and_up_projs) or non-gated (up_projs)."""
+        """Check if the MoE uses gated activation (e.g., SwiGLU) or non-gated (e.g., ReLU²)."""
         from nemo_automodel.components.moe.layers import is_gated_activation
 
         return is_gated_activation(self.moe_config.expert_activation)
+
+    @property
+    def _hf_prefix(self) -> str:
+        """Prefix for HuggingFace format keys. Override in subclass."""
+        return "model." if self._uses_model_prefix else ""
+
+    @property
+    def _expert_path_segment(self) -> str:
+        """Path segment for experts (e.g., 'mlp.experts' or 'mixer.experts'). Override in subclass."""
+        return "mlp.experts"
 
     def _validate_expert_availability(
         self,
@@ -82,11 +92,13 @@ class MoESplitExpertsStateDictMixin:
             required_experts = list(range(n_experts))
             rank_info = ""
 
-        uses_model_prefix = any(key.startswith("model.") for key in hf_state_dict.keys() if ".mlp.experts." in key)
-        key_prefix = "model." if uses_model_prefix else ""
+        expert_segment = self._expert_path_segment
+        hf_prefix = self._hf_prefix
+        uses_hf_prefix = any(key.startswith(hf_prefix) for key in hf_state_dict.keys() if f".{expert_segment}." in key)
+        key_prefix = hf_prefix if uses_hf_prefix else ""
 
         layers_with_experts = set()
-        pattern = rf"{re.escape(key_prefix)}layers\.(\d+)\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.weight"
+        pattern = rf"{re.escape(key_prefix)}layers\.(\d+)\.{re.escape(expert_segment)}\.\d+\.(gate_proj|up_proj|down_proj)\.weight"
         for key in hf_state_dict.keys():
             match = re.match(pattern, key)
             if match:
@@ -102,7 +114,7 @@ class MoESplitExpertsStateDictMixin:
         for layer_num in layers_with_experts:
             for expert_id in required_experts:
                 for proj_type in projection_types:
-                    expected_key = f"{key_prefix}layers.{layer_num}.mlp.experts.{expert_id}.{proj_type}.weight"
+                    expected_key = f"{key_prefix}layers.{layer_num}.{expert_segment}.{expert_id}.{proj_type}.weight"
                     if expected_key not in hf_state_dict:
                         missing_weights.append(expected_key)
 
@@ -195,12 +207,12 @@ class MoESplitExpertsStateDictMixin:
             transposed down_projs tensors.
 
         For non-gated activations (ReLU²):
-            Creates up_projs [n_experts, dim, inter_dim] and transposed down_projs tensors.
-            50% memory savings by not duplicating weights.
+            Creates gate_and_up_projs [n_experts, dim, inter_dim] and transposed down_projs tensors.
         """
 
         n_experts = self.moe_config.n_routed_experts
         is_gated = self._is_gated_moe
+        expert_segment = self._expert_path_segment
 
         self._validate_expert_availability(hf_state_dict, n_experts, device_mesh)
 
@@ -220,14 +232,16 @@ class MoESplitExpertsStateDictMixin:
         state_dict: dict[str, Any] = {}
         expert_weights_by_layer: dict[str, dict[str, dict[int, torch.Tensor]]] = {}
 
+        # Handle both formats:
+        # - model.layers.{L}.{expert_segment}.{E}.gate_proj.weight (with model prefix)
+        # - layers.{L}.{expert_segment}.{E}.gate_proj.weight (without model prefix)
+        expert_pattern = re.compile(
+            rf"(?:model\.)?layers\.(\d+)\.{re.escape(expert_segment)}\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
+        )
+
         for key, value in hf_state_dict.items():
-            if ".mlp.experts." in key and key.endswith(".weight"):
-                # Handle both formats:
-                # - model.layers.{L}.mlp.experts.{E}.gate_proj.weight (with model prefix)
-                # - layers.{L}.mlp.experts.{E}.gate_proj.weight (without model prefix)
-                m = re.match(
-                    r"(?:model\.)?layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight", key
-                )
+            if f".{expert_segment}." in key and key.endswith(".weight"):
+                m = expert_pattern.match(key)
                 if m is None:
                     state_dict[key] = value
                     continue
@@ -242,75 +256,59 @@ class MoESplitExpertsStateDictMixin:
                     expert_weights_by_layer[layer_num] = {}
 
                 if which in ["gate_proj", "up_proj"]:
-                    if is_gated:
-                        native_key = f"model.layers.{layer_num}.mlp.experts.gate_and_up_projs"
-                    else:
-                        # Non-gated: only use up_proj, create up_projs tensor
-                        native_key = f"model.layers.{layer_num}.mlp.experts.up_projs"
+                    # Both gated and non-gated use gate_and_up_projs
+                    native_key = f"model.layers.{layer_num}.{expert_segment}.gate_and_up_projs"
                 else:  # down_proj
-                    native_key = f"model.layers.{layer_num}.mlp.experts.down_projs"
+                    native_key = f"model.layers.{layer_num}.{expert_segment}.down_projs"
 
                 if native_key not in expert_weights_by_layer[layer_num]:
                     expert_weights_by_layer[layer_num][native_key] = {}
 
                 if which in ["gate_proj", "up_proj"]:
+                    # Non-gated models only use up_proj, skip gate_proj
+                    if not is_gated and which == "gate_proj":
+                        continue
+
+                    # Store weight: gated uses dict for gate+up, non-gated stores tensor directly
                     if is_gated:
-                        # Gated: need both gate_proj and up_proj
                         if expert_num not in expert_weights_by_layer[layer_num][native_key]:
                             expert_weights_by_layer[layer_num][native_key][expert_num] = {}
                         expert_weights_by_layer[layer_num][native_key][expert_num][which] = value
+                    else:
+                        expert_weights_by_layer[layer_num][native_key][expert_num] = value
 
-                        if len(expert_weights_by_layer[layer_num][native_key]) == expected_experts_per_rank and all(
-                            isinstance(expert_data, dict) and "gate_proj" in expert_data and "up_proj" in expert_data
-                            for expert_data in expert_weights_by_layer[layer_num][native_key].values()
-                        ):
-                            expert_ids = sorted(expert_weights_by_layer[layer_num][native_key].keys())
+                    # Check if all experts are complete
+                    all_complete = len(expert_weights_by_layer[layer_num][native_key]) == expected_experts_per_rank
+                    if is_gated:
+                        all_complete = all_complete and all(
+                            isinstance(d, dict) and "gate_proj" in d and "up_proj" in d
+                            for d in expert_weights_by_layer[layer_num][native_key].values()
+                        )
 
-                            combined_tensors = []
-                            for expert_id in expert_ids:
-                                expert_data = expert_weights_by_layer[layer_num][native_key][expert_id]
-                                gate_weight = expert_data["gate_proj"]  # [inter_dim, dim]
-                                up_weight = expert_data["up_proj"]  # [inter_dim, dim]
+                    if all_complete:
+                        expert_ids = sorted(expert_weights_by_layer[layer_num][native_key].keys())
+                        tensors = []
+                        for expert_id in expert_ids:
+                            expert_data = expert_weights_by_layer[layer_num][native_key][expert_id]
 
-                                # Extract local tensor if input is already a DTensor
+                            if is_gated:
+                                gate_weight = expert_data["gate_proj"]
+                                up_weight = expert_data["up_proj"]
                                 if is_dtensor(gate_weight):
                                     gate_weight = gate_weight.to_local()
                                 if is_dtensor(up_weight):
                                     up_weight = up_weight.to_local()
+                                gate_t = gate_weight.transpose(0, 1)
+                                up_t = up_weight.transpose(0, 1)
+                                tensors.append(torch.cat([gate_t, up_t], dim=-1))
+                            else:
+                                up_weight = expert_data
+                                if is_dtensor(up_weight):
+                                    up_weight = up_weight.to_local()
+                                tensors.append(up_weight.transpose(0, 1))
 
-                                gate_t = gate_weight.transpose(0, 1)  # [dim, inter_dim]
-                                up_t = up_weight.transpose(0, 1)  # [dim, inter_dim]
-                                combined = torch.cat([gate_t, up_t], dim=-1)  # [dim, 2*inter_dim]
-                                combined_tensors.append(combined)
-
-                            stacked = torch.stack(combined_tensors, dim=0)
-                            stacked = stacked.to(self.dtype)
-
-                            dtensor = create_dtensor_from_local(stacked, device_mesh, rank)
-                            state_dict[native_key] = dtensor
-                    else:
-                        # Non-gated: only use up_proj (ignore gate_proj if present)
-                        if which == "up_proj":
-                            expert_weights_by_layer[layer_num][native_key][expert_num] = value
-
-                            if len(expert_weights_by_layer[layer_num][native_key]) == expected_experts_per_rank:
-                                expert_ids = sorted(expert_weights_by_layer[layer_num][native_key].keys())
-
-                                up_tensors = []
-                                for expert_id in expert_ids:
-                                    up_weight = expert_weights_by_layer[layer_num][native_key][expert_id]
-
-                                    if is_dtensor(up_weight):
-                                        up_weight = up_weight.to_local()
-
-                                    up_t = up_weight.transpose(0, 1)  # [dim, inter_dim]
-                                    up_tensors.append(up_t)
-
-                                stacked = torch.stack(up_tensors, dim=0)
-                                stacked = stacked.to(self.dtype)
-
-                                dtensor = create_dtensor_from_local(stacked, device_mesh, rank)
-                                state_dict[native_key] = dtensor
+                        stacked = torch.stack(tensors, dim=0).to(self.dtype)
+                        state_dict[native_key] = create_dtensor_from_local(stacked, device_mesh, rank)
 
                 else:  # down_proj
                     expert_weights_by_layer[layer_num][native_key][expert_num] = value
@@ -355,9 +353,10 @@ class MoESplitExpertsStateDictMixin:
         """
         n_experts = self.moe_config.n_routed_experts
         inter_dim = self.moe_config.moe_inter_dim
-        prefix = "model." if self._uses_model_prefix else ""
+        prefix = self._hf_prefix
+        expert_segment = self._expert_path_segment
 
-        if ".mlp.experts.gate_and_up_projs" in fqn and fqn.endswith(".gate_and_up_projs"):
+        if f".{expert_segment}.gate_and_up_projs" in fqn and fqn.endswith(".gate_and_up_projs"):
             layer_num = re.search(r"layers\.(\d+)", fqn).group(1)
 
             from nemo_automodel.components.moe.state_dict_utils import (
@@ -372,35 +371,20 @@ class MoESplitExpertsStateDictMixin:
             result = []
             for i, w in enumerate(splits):
                 expert_id = self._last_expert_ids[i]
-                w_gate = w[:, :inter_dim].transpose(0, 1).contiguous()
-                w_up = w[:, inter_dim:].transpose(0, 1).contiguous()
-                result.append((f"{prefix}layers.{layer_num}.mlp.experts.{expert_id}.gate_proj.weight", w_gate))
-                result.append((f"{prefix}layers.{layer_num}.mlp.experts.{expert_id}.up_proj.weight", w_up))
-            return result
-
-        elif ".mlp.experts.up_projs" in fqn and fqn.endswith(".up_projs"):
-            # Non-gated activations: up_projs -> up_proj.weight only (no gate_proj)
-            layer_num = re.search(r"layers\.(\d+)", fqn).group(1)
-
-            from nemo_automodel.components.moe.state_dict_utils import (
-                is_dtensor,
-                validate_dtensor_expert_sharding,
-            )
-
-            if is_dtensor(tensor):
-                validate_dtensor_expert_sharding(tensor, n_experts, f"up_projs layer {layer_num}")
-
-            splits = self._split_experts_weights(tensor, n_experts)
-            result = []
-            for i, w in enumerate(splits):
-                expert_id = self._last_expert_ids[i]
-                # w is [dim, inter_dim], HF expects [inter_dim, dim]
-                w_up = w.transpose(0, 1).contiguous()
-                result.append((f"{prefix}layers.{layer_num}.mlp.experts.{expert_id}.up_proj.weight", w_up))
+                if self._is_gated_moe:
+                    # Gated: split into gate_proj and up_proj
+                    w_gate = w[:, :inter_dim].transpose(0, 1).contiguous()
+                    w_up = w[:, inter_dim:].transpose(0, 1).contiguous()
+                    result.append((f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.gate_proj.weight", w_gate))
+                    result.append((f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.up_proj.weight", w_up))
+                else:
+                    # Non-gated: only up_proj (tensor is [dim, inter_dim], not [dim, 2*inter_dim])
+                    w_up = w.transpose(0, 1).contiguous()
+                    result.append((f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.up_proj.weight", w_up))
             return result
 
         elif (
-            ".mlp.experts.down_projs" in fqn
+            f".{expert_segment}.down_projs" in fqn
             and fqn.endswith(".down_projs")
             and tensor.ndim == 3
             and tensor.shape[1] == inter_dim
@@ -421,7 +405,7 @@ class MoESplitExpertsStateDictMixin:
                 expert_id = self._last_expert_ids[i]
                 result.append(
                     (
-                        f"{prefix}layers.{layer_num}.mlp.experts.{expert_id}.down_proj.weight",
+                        f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.down_proj.weight",
                         w.transpose(0, 1).contiguous(),
                     )
                 )

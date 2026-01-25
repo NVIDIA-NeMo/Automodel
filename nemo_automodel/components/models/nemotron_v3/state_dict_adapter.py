@@ -75,6 +75,16 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             "model.layers.{}.mixer.experts.{}.down_proj.weight": "model.layers.{}.mixer.experts.down_projs",
         }
 
+    @property
+    def _hf_prefix(self) -> str:
+        """NemotronV3 HF format uses 'backbone.' prefix."""
+        return "backbone."
+
+    @property
+    def _expert_path_segment(self) -> str:
+        """NemotronV3 uses 'mixer.experts' instead of 'mlp.experts'."""
+        return "mixer.experts"
+
     def to_hf(self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, **kwargs) -> dict[str, Any]:
         """Convert from internal model state dict to HuggingFace format.
 
@@ -137,185 +147,8 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
 
             renamed_state_dict[new_key] = value
 
-        # Then merge experts (override mixer → mlp for mixin compatibility)
-        return self._from_hf_w_merged_experts_nemotron(renamed_state_dict, device_mesh)
-
-    def _from_hf_w_merged_experts_nemotron(
-        self,
-        hf_state_dict: dict[str, Any],
-        device_mesh: Optional["DeviceMesh"] = None,
-    ) -> dict[str, Any]:
-        """NemotronV3-specific version that handles .mixer.experts. instead of .mlp.experts."""
-        from nemo_automodel.components.moe.state_dict_utils import (
-            create_dtensor_from_local,
-            get_expert_range_for_rank_from_mesh,
-            get_submesh,
-            is_dtensor,
-            should_load_expert_for_rank,
-        )
-
-        n_experts = self.moe_config.n_routed_experts
-
-        if device_mesh is not None:
-            start_expert, end_expert = get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
-            expected_experts_per_rank = end_expert - start_expert
-            rank = (
-                get_submesh(device_mesh, ("ep",)).get_rank()
-                if "ep" in device_mesh.mesh_dim_names
-                else device_mesh.get_rank()
-            )
-        else:
-            start_expert, end_expert = 0, n_experts
-            expected_experts_per_rank = n_experts
-            rank = None
-
-        state_dict: dict[str, Any] = {}
-        expert_weights_by_layer: dict[str, dict[str, dict[int, torch.Tensor]]] = {}
-
-        for key, value in hf_state_dict.items():
-            if ".mixer.experts." in key and key.endswith(".weight"):
-                # Handle: model.layers.{L}.mixer.experts.{E}.up_proj.weight
-                m = re.match(r"(?:model\.)?layers\.(\d+)\.mixer\.experts\.(\d+)\.(up_proj|down_proj)\.weight", key)
-                if m is None:
-                    state_dict[key] = value
-                    continue
-
-                layer_num, expert_num, which = m.groups()
-                expert_num = int(expert_num)
-
-                if not should_load_expert_for_rank(expert_num, device_mesh, n_experts):
-                    continue
-
-                if layer_num not in expert_weights_by_layer:
-                    expert_weights_by_layer[layer_num] = {}
-
-                if which == "up_proj":
-                    native_key = f"model.layers.{layer_num}.mixer.experts.gate_and_up_projs"
-                else:  # down_proj
-                    native_key = f"model.layers.{layer_num}.mixer.experts.down_projs"
-
-                if native_key not in expert_weights_by_layer[layer_num]:
-                    expert_weights_by_layer[layer_num][native_key] = {}
-
-                if which == "up_proj":
-                    expert_weights_by_layer[layer_num][native_key][expert_num] = value
-
-                    if len(expert_weights_by_layer[layer_num][native_key]) == expected_experts_per_rank:
-                        expert_ids = sorted(expert_weights_by_layer[layer_num][native_key].keys())
-
-                        up_tensors = []
-                        for expert_id in expert_ids:
-                            up_weight = expert_weights_by_layer[layer_num][native_key][expert_id]
-
-                            if is_dtensor(up_weight):
-                                up_weight = up_weight.to_local()
-
-                            up_t = up_weight.transpose(0, 1)  # [dim, inter_dim]
-                            up_tensors.append(up_t)
-
-                        stacked = torch.stack(up_tensors, dim=0)  # [n_experts, dim, inter_dim]
-                        stacked = stacked.to(self.dtype)
-
-                        dtensor = create_dtensor_from_local(stacked, device_mesh, rank)
-                        state_dict[native_key] = dtensor
-
-                else:  # down_proj
-                    expert_weights_by_layer[layer_num][native_key][expert_num] = value
-
-                    if len(expert_weights_by_layer[layer_num][native_key]) == expected_experts_per_rank:
-                        expert_ids = sorted(expert_weights_by_layer[layer_num][native_key].keys())
-
-                        ordered = []
-                        for expert_id in expert_ids:
-                            down_weight = expert_weights_by_layer[layer_num][native_key][expert_id]  # [dim, inter_dim]
-
-                            if is_dtensor(down_weight):
-                                down_weight = down_weight.to_local()
-
-                            down_t = down_weight.transpose(0, 1)  # [inter_dim, dim]
-                            ordered.append(down_t)
-
-                        stacked = torch.stack(ordered, dim=0)
-                        stacked = stacked.to(self.dtype)
-
-                        dtensor = create_dtensor_from_local(stacked, device_mesh, rank)
-                        state_dict[native_key] = dtensor
-
-            else:
-                state_dict[key] = value
-
-        return state_dict
-
-    def _convert_single_merged_expert_to_hf_split_experts(
-        self, fqn: str, tensor: torch.Tensor, **kwargs
-    ) -> list[tuple[str, torch.Tensor]]:
-        """Convert a single merged expert tensor to split HuggingFace format.
-
-        Overrides parent to handle .mixer.experts. instead of .mlp.experts.
-
-        Args:
-            fqn: Fully qualified name of the tensor in internal format
-            tensor: The tensor to convert
-
-        Returns:
-            List of (fqn, tensor) tuples in HuggingFace format, or None if not an expert tensor
-        """
-        n_experts = self.moe_config.n_routed_experts
-        inter_dim = self.moe_config.moe_inter_dim
-        # For to_hf conversion, we always want backbone. prefix
-        prefix = "backbone."
-
-        # Handle gate_and_up_projs (maps to HF up_proj for non-gated activations like ReLU²)
-        if ".mixer.experts.gate_and_up_projs" in fqn and fqn.endswith(".gate_and_up_projs"):
-            layer_num = re.search(r"layers\.(\d+)", fqn).group(1)
-
-            from nemo_automodel.components.moe.state_dict_utils import (
-                is_dtensor,
-                validate_dtensor_expert_sharding,
-            )
-
-            if is_dtensor(tensor):
-                validate_dtensor_expert_sharding(tensor, n_experts, f"gate_and_up_projs layer {layer_num}")
-
-            splits = self._split_experts_weights(tensor, n_experts)
-            result = []
-            for i, w in enumerate(splits):
-                expert_id = self._last_expert_ids[i]
-                # w is [dim, inter_dim], HF expects [inter_dim, dim]
-                w_up = w.transpose(0, 1).contiguous()
-                result.append((f"{prefix}layers.{layer_num}.mixer.experts.{expert_id}.up_proj.weight", w_up))
-            return result
-
-        # Handle down_projs
-        elif (
-            ".mixer.experts.down_projs" in fqn
-            and fqn.endswith(".down_projs")
-            and tensor.ndim == 3
-            and tensor.shape[1] == inter_dim
-        ):
-            layer_num = re.search(r"layers\.(\d+)", fqn).group(1)
-
-            from nemo_automodel.components.moe.state_dict_utils import (
-                is_dtensor,
-                validate_dtensor_expert_sharding,
-            )
-
-            if is_dtensor(tensor):
-                validate_dtensor_expert_sharding(tensor, n_experts, f"down_projs layer {layer_num}")
-
-            splits = self._split_experts_weights(tensor, n_experts)
-            result = []
-            for i, w in enumerate(splits):
-                expert_id = self._last_expert_ids[i]
-                result.append(
-                    (
-                        f"{prefix}layers.{layer_num}.mixer.experts.{expert_id}.down_proj.weight",
-                        w.transpose(0, 1).contiguous(),
-                    )
-                )
-            return result
-
-        return None
+        # Then merge experts using the mixin method
+        return self._from_hf_w_merged_experts(renamed_state_dict, device_mesh)
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         """Convert a single tensor from internal format to HuggingFace format.

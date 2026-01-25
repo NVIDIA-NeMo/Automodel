@@ -646,9 +646,13 @@ class Checkpointer:
         """
         Get the path to the original model from the Hugging Face checkpoint.
         """
-        if not hasattr(model_state.model[0], "name_or_path") and not hasattr(getattr(model_state.model[0], "config", None), "name_or_path"):
+        if not hasattr(model_state.model[0], "name_or_path") and not hasattr(
+            getattr(model_state.model[0], "config", None), "name_or_path"
+        ):
             return None
-        pretrained_model_name_or_path = getattr(model_state.model[0], "name_or_path", None) or getattr(getattr(model_state.model[0], "config", None), "name_or_path", None)
+        pretrained_model_name_or_path = getattr(model_state.model[0], "name_or_path", None) or getattr(
+            getattr(model_state.model[0], "config", None), "name_or_path", None
+        )
         if os.path.isdir(pretrained_model_name_or_path):
             return pretrained_model_name_or_path
         return get_safetensors_index_path(
