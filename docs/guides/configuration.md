@@ -94,7 +94,7 @@ dataset:
 
 ---
 
-## Preventing secret leakage in logs
+## Prevent Secret Leakage in Logs
 
 When an env var placeholder is resolved, the config keeps the original placeholder in an internal `._orig_value` field for **safe printing**:
 
