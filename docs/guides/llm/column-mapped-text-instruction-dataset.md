@@ -415,4 +415,4 @@ slurm:
 
 ---
 ### That's It!
-With the mapping specified, the rest of the NeMo Automodel pipeline (pre-tokenisation, packing, collate-fn, *etc.*) works as usual.
+With the mapping specified, the rest of the NeMo Automodel pipeline (pre-tokenization, packing, collate-fn, *etc.*) works as usual.
