@@ -87,7 +87,9 @@ class CheckpointingConfig:
     model_repo_id: str
     save_consolidated: bool
     is_peft: bool
-    model_state_dict_keys: list[str] = None  # copy of the model state dict keys before any parallelization
+    model_keys_to_remove_for_consolidation: list[str] = (
+        None  # non-persistent buffer keys to exclude from consolidated index
+    )
     is_async: bool = False
     dequantize_base_checkpoint: bool | None = None
     original_model_root_dir: str | None = None
@@ -583,7 +585,7 @@ class Checkpointer:
             # some HF models like Moonlight-16B have non-persistent buffers in the base checkpoint
             # however, HF initializes buffers with persistent=False, so we need to make sure these
             # buffer keys are not saved during checkpointing
-            keys_to_remove = list(set(fqn_to_file_index_mapping.keys()) - set(self.config.model_state_dict_keys))
+            keys_to_remove = list(self.config.model_keys_to_remove_for_consolidation or [])
             if model_state.is_tied_lm_head:
                 keys_to_remove.append(model_state.lm_head_param_name)
             for key in keys_to_remove:

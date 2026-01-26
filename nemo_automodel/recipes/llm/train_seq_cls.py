@@ -103,7 +103,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
 
         self.peft_config = self.cfg.instantiate_path("peft")
-        model, model_state_dict_keys, self.optimizer, _, _ = build_model_and_optimizer(
+        model, keys_to_remove, self.optimizer, _, _ = build_model_and_optimizer(
             device=self.dist_env.device,
             cfg_model=self.cfg.model,
             cfg_opt=self.cfg.optimizer,
@@ -124,7 +124,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             unfreeze_modules=["classifier"] if self.peft_config is not None else None,
         )
 
-        self.checkpointer.config.model_state_dict_keys = model_state_dict_keys
+        self.checkpointer.config.model_keys_to_remove_for_consolidation = keys_to_remove
 
         self.model_parts = [model]
 

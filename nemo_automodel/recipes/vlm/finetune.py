@@ -149,7 +149,7 @@ def build_model_and_optimizer(
         load_base_model: Whether to load the base model.
 
     Returns:
-        The instantiated model on the specified device, the state dict keys before any parallelization, and the optimizer.
+        The instantiated model on the specified device, non-persistent buffer keys to exclude from consolidation, and the optimizer.
     """
     is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager))
 
@@ -172,8 +172,13 @@ def build_model_and_optimizer(
                 fp8_config = build_fp8_config(cfg_fp8)
                 model = apply_fp8_to_model(model, config=fp8_config)
 
-        # hold a copy of the model state dict keys before any parallelization
-        state_dict_keys = model.state_dict().keys()
+        # Collect non-persistent buffer keys to exclude from consolidated checkpoint index
+        # Non-persistent buffers (registered with persistent=False) should not be saved
+        non_persistent_buffer_keys = []
+        for module_name, module in model.named_modules():
+            prefix = module_name + "." if module_name else ""
+            for buf_name in getattr(module, "_non_persistent_buffers_set", set()):
+                non_persistent_buffer_keys.append(prefix + buf_name)
 
         if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
@@ -211,7 +216,7 @@ def build_model_and_optimizer(
                     cfg_opt.foreach = False
                 optimizer = cfg_opt.instantiate(params=trainable_params)
                 model, optimizer = model_wrapper.parallelize(model, optimizer)
-                return model, state_dict_keys, optimizer
+                return model, non_persistent_buffer_keys, optimizer
             else:
                 load_weights = True
                 model = model_wrapper.parallelize(model)
@@ -243,7 +248,7 @@ def build_model_and_optimizer(
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         optimizer = cfg_opt.instantiate(params=trainable_params)
 
-        return model, state_dict_keys, optimizer
+        return model, non_persistent_buffer_keys, optimizer
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
@@ -615,7 +620,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             moe_mesh=self.moe_mesh,
         )
 
-        self.model, model_state_dict_keys, self.optimizer = build_model_and_optimizer(
+        self.model, keys_to_remove, self.optimizer = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
             self.cfg.optimizer,
@@ -632,7 +637,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             load_base_model=self.cfg.get("checkpoint.load_base_model", True),
             checkpointer=self.checkpointer,
         )
-        self.checkpointer.config.model_state_dict_keys = model_state_dict_keys
+        self.checkpointer.config.model_keys_to_remove_for_consolidation = keys_to_remove
 
         self.dataloader, self.processor = build_dataloader(
             self.cfg.dataset,

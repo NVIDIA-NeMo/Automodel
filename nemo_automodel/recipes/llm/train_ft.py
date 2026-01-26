@@ -168,7 +168,7 @@ def build_model_and_optimizer(
         unfreeze_modules: List of module names/substrings to unfreeze (e.g. ["classifier"]). Applied after PEFT freezing but before optimizer creation.
 
     Returns:
-        The instantiated model on the specified device, the state dict keys before any parallelization, the optimizer, the loss function, and param_info dict.
+        The instantiated model on the specified device, non-persistent buffer keys to exclude from consolidation, the optimizer, the loss function, and param_info dict.
     """
     is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and not cfg_model.get(
         "force_hf", False
@@ -237,22 +237,22 @@ def build_model_and_optimizer(
                     param.requires_grad_(True)
             logging.info(f"Unfroze parameters matching: {unfreeze_modules}")
 
-    param_info = {
-        "trainable_params": 0,
-        "total_params": 0,
-    }
+    param_info = {}
+    param_info["trainable_params"], param_info["total_params"] = print_trainable_parameters(model)
 
-    # hold a list copy of the model state dict keys before any parallelization
-    state_dict_keys = list(model.state_dict().keys())
+    # Collect non-persistent buffer keys to exclude from consolidated checkpoint index
+    # Non-persistent buffers (registered with persistent=False) should not be saved
+    non_persistent_buffer_keys = []
+    for module_name, module in model.named_modules():
+        prefix = module_name + "." if module_name else ""
+        for buf_name in getattr(module, "_non_persistent_buffers_set", set()):
+            non_persistent_buffer_keys.append(prefix + buf_name)
 
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
         loss_fn = MaskedCrossEntropy()
 
     if autopipeline is not None:
-        trainable_params, total_params = print_trainable_parameters(model)
-        param_info["trainable_params"] = trainable_params
-        param_info["total_params"] = total_params
         if get_world_size_safe() == 1:
             logger.info("World size is 1, skipping autopipeline.")
         else:
@@ -315,11 +315,7 @@ def build_model_and_optimizer(
 
                 model, optimizer = model_wrapper.parallelize(model, optimizer)
 
-                trainable_params, total_params = print_trainable_parameters(model)
-                param_info["trainable_params"] = trainable_params
-                param_info["total_params"] = total_params
-
-                return model, state_dict_keys, [optimizer], loss_fn, param_info
+                return model, non_persistent_buffer_keys, [optimizer], loss_fn, param_info
 
             else:
                 load_weights = True
@@ -359,13 +355,7 @@ def build_model_and_optimizer(
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         optimizer = [cfg_opt.instantiate(params=trainable_params)]
 
-    # Print trainable parameters after model has been moved to device
-    if autopipeline is None:
-        trainable_params, total_params = print_trainable_parameters(model)
-        param_info["trainable_params"] = trainable_params
-        param_info["total_params"] = total_params
-
-    return model, state_dict_keys, optimizer, loss_fn, param_info
+    return model, non_persistent_buffer_keys, optimizer, loss_fn, param_info
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
@@ -1025,7 +1015,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             moe_mesh=self.moe_mesh,
         )
 
-        model, model_state_dict_keys, self.optimizer, self.loss_fn, self.param_info = build_model_and_optimizer(
+        model, keys_to_remove, self.optimizer, self.loss_fn, self.param_info = build_model_and_optimizer(
             self.dist_env.device,
             self.cfg.model,
             self.cfg.optimizer,
@@ -1045,7 +1035,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             load_base_model=self.cfg.get("checkpoint.load_base_model", True),
             checkpointer=self.checkpointer,
         )
-        self.checkpointer.config.model_state_dict_keys = model_state_dict_keys
+        self.checkpointer.config.model_keys_to_remove_for_consolidation = keys_to_remove
 
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts

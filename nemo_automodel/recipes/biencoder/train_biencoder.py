@@ -433,7 +433,13 @@ class TrainBiencoderRecipe(BaseRecipe):
             self.model_parts = [model]
             self.pp = None
 
-        self.checkpointer.config.model_state_dict_keys = ["model." + k for k in model.lm_q.state_dict().keys()]
+        # Collect non-persistent buffer keys to exclude from consolidated checkpoint index
+        non_persistent_buffer_keys = []
+        for module_name, module in model.named_modules():
+            prefix = module_name + "." if module_name else ""
+            for buf_name in getattr(module, "_non_persistent_buffers_set", set()):
+                non_persistent_buffer_keys.append(prefix + buf_name)
+        self.checkpointer.config.model_keys_to_remove_for_consolidation = non_persistent_buffer_keys
 
         # Build optimizer
         logger.info("Building optimizer...")

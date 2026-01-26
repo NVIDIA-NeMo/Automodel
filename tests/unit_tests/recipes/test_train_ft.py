@@ -471,7 +471,7 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_loss_fn", lambda cfg: "loss_fn")
     monkeypatch.setattr(
         "nemo_automodel.recipes.llm.train_ft.build_checkpoint_config",
-        lambda *a, **k: SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None),
+        lambda *a, **k: SimpleNamespace(checkpoint_dir="ckpts", model_keys_to_remove_for_consolidation=None),
     )
     # Avoid requiring a distributed _target_
     monkeypatch.setattr(

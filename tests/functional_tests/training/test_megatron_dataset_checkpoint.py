@@ -46,7 +46,7 @@ def test_megatron_dataset_checkpointing():
         model_repo_id="",
         save_consolidated=False,
         is_peft=False,
-        model_state_dict_keys=[],
+        model_keys_to_remove_for_consolidation=[],
     )
     checkpointer = Checkpointer(
         config=checkpoint_config,
@@ -69,7 +69,7 @@ def test_megatron_dataset_checkpointing():
         dp_world_size=dp_world_size,
         pp_enabled=False,
     )[0]
-    
+
     # fast-forward. not necessary, but we want to make sure the dataset is not at the beginning.
     for i, batch in enumerate(dataset):
         if i == 2:
