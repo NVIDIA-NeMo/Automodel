@@ -275,7 +275,7 @@ for sample in ds:
     break
 ```
 
-:::note
+:::{note}
 **Authentication:** The Delta Lake loader automatically picks up credentials from environment variables
 (`DATABRICKS_TOKEN`, `AWS_ACCESS_KEY_ID`, `AZURE_STORAGE_ACCOUNT_KEY`, etc.) if not explicitly
 provided in `delta_storage_options`.
