@@ -146,7 +146,7 @@ jobs:
       - name: main
         uses: ./.github/actions/build-container
         with:
-          repo_name: "Automodel"
+          repo-name: "Automodel"
           has-azure-credentials: "true"
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}

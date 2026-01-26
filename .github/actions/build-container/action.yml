@@ -15,7 +15,7 @@
 name: Build container
 
 inputs:
-  repo_name:
+  repo-name:
     description: "The name of the repo to build container"
     required: true
     type: string
@@ -85,11 +85,10 @@ runs:
       id: cache_from
       env:
         GH_TOKEN: ${{ github.token }}
-        REPO_NAME: ${{ inputs.repo_name }}
       run: |
         LAST_PRS=$(gh api graphql -f query='
           query {
-            repository(owner: "NVIDIA-NeMo", name: "$REPO_NAME") {
+            repository(owner: "NVIDIA-NeMo", name: ${{ inputs.repo-name }}) {
               pullRequests(states: MERGED, first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
                 nodes {
                   number
@@ -97,7 +96,7 @@ runs:
               }
             }
           }' | jq -r '.data.repository.pullRequests.nodes[].number' | while read -r number; do
-            echo "type=registry,ref=${{ env.container-registry }}/$REPO_NAME:$number-buildcache,mode=max"
+            echo "type=registry,ref=${{ env.container-registry }}/${{ inputs.repo-name }}:$number-buildcache,mode=max"
           done)
 
         echo "LAST_PRS<<EOF" | tee -a $GITHUB_OUTPUT
@@ -109,8 +108,6 @@ runs:
 
     - name: Build and push
       uses: docker/build-push-action@v5
-      env:
-        REPO_NAME: ${{ inputs.repo_name }}
       with:
         file: ./docker/Dockerfile.ci
         push: true
@@ -118,14 +115,14 @@ runs:
         build-args: |
           BASE_IMAGE=pytorch
         cache-from: |
-          type=registry,ref=${{ env.container-registry }}/$REPO_NAME:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
-          type=registry,ref=${{ env.container-registry }}/$REPO_NAME:main-buildcache,mode=max
+          type=registry,ref=${{ env.container-registry }}/${{ inputs.repo-name }}:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
+          type=registry,ref=${{ env.container-registry }}/${{ inputs.repo-name }}:main-buildcache,mode=max
           ${{ steps.cache_from.outputs.LAST_PRS }}
         cache-to: |
-          type=registry,ref=${{ env.container-registry }}/$REPO_NAME:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
+          type=registry,ref=${{ env.container-registry }}/${{ inputs.repo-name }}:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
         no-cache: false
         tags: |
-          ${{ env.container-registry }}/$REPO_NAME:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
-          ${{ env.container-registry }}/$REPO_NAME:${{ github.sha }}
+          ${{ env.container-registry }}/${{ inputs.repo-name }}:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
+          ${{ env.container-registry }}/${{ inputs.repo-name }}:${{ github.sha }}
         secrets: |
           GH_TOKEN=${{ secrets.PAT }}
