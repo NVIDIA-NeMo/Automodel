@@ -34,8 +34,8 @@ from nemo_automodel.components.moe.layers import (
     GroupedExpertsDeepEP,
     MoE,
 )
-from nemo_automodel.shared.utils import dtype_from_str
 from nemo_automodel.components.utils.model_utils import get_text_module
+from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
 _CP_STREAM = None
@@ -160,7 +160,7 @@ def apply_fsdp(
         _model = model.model
     else:
         _model = model
-    #handle VLM
+    # handle VLM
     _model = get_text_module(_model)
 
     for _, block in _model.layers.named_children():

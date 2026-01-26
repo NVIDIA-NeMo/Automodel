@@ -301,9 +301,12 @@ def split_model_into_stages(
     include_multimodal_encoders = True
     extra_module_fqns = None
 
-    text_model_attr_prefix = text_model_attr_name+"."
-    layers_prefix = f"{base_prefix}{text_model_attr_prefix}model." if text_model_has_model_attr else f"{base_prefix}{text_model_attr_prefix}"
-
+    text_model_attr_prefix = text_model_attr_name + "."
+    layers_prefix = (
+        f"{base_prefix}{text_model_attr_prefix}model."
+        if text_model_has_model_attr
+        else f"{base_prefix}{text_model_attr_prefix}"
+    )
 
     # If layers live under a nested language_model, keep multimodal encoders at the base prefix
     if layers_prefix != base_prefix:
