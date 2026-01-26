@@ -513,17 +513,19 @@ def build_dataloader(
 
         # If using an IterableDataset, per-rank sharding for unique samples
         if isinstance(ds, IterableDataset):
-            if getattr(ds, "shard", None) is not None:
+            if callable(getattr(ds, "shard", None)):
                 ds = ds.shard(dp_world_size, dp_rank)
                 logging.info(
                     f"Sharded IterableDataset via dataset.shard: world_size={dp_world_size}, rank={dp_rank}"
                 )
-            else:
+            elif hasattr(ds, "dataset"):
                 # HuggingFace streaming datasets: split by file shards when possible.
                 from datasets.distributed import split_dataset_by_node
                 assert hasattr(ds, "dataset"), "dataset must have a dataset attribute"
                 ds.dataset = split_dataset_by_node(ds.dataset, world_size=dp_world_size, rank=dp_rank)
                 logging.info(f"Sharded dataset via split_dataset_by_node: world_size={dp_world_size}")
+            else:
+                logging.warning("IterableDataset does not support sharding; Data may be duplicated across ranks.")
 
         packed_sequence_size = getattr(cfg_ps, "packed_sequence_size", 0)
 
