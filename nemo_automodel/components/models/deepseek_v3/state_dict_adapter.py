@@ -24,11 +24,49 @@ from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAda
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
+from nemo_automodel.components.moe.state_dict_utils import is_dtensor
+
+try:
+    import triton
+    import triton.language as tl
+
+    _TRITON_AVAILABLE = True
+except Exception:
+    triton = None
+    tl = None
+    _TRITON_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
 # Fixed block size of 128x128 as specified in https://arxiv.org/pdf/2412.19437
 BLOCK_SIZE = 128
+
+if _TRITON_AVAILABLE:
+
+    @triton.jit
+    def _weight_dequant_kernel(
+        x_ptr,
+        s_ptr,
+        y_ptr,
+        M,
+        N,
+        stride_xm,
+        stride_xn,
+        stride_ym,
+        stride_yn,
+        stride_sm,
+        stride_sn,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid_m = tl.program_id(axis=0)
+        pid_n = tl.program_id(axis=1)
+        offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        x = tl.load(x_ptr + offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn, mask=mask).to(tl.float32)
+        s = tl.load(s_ptr + pid_m * stride_sm + pid_n * stride_sn)
+        y = x * s
+        tl.store(y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn, y, mask=mask)
 
 
 class DeepSeekV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
@@ -184,46 +222,110 @@ def calculate_scale_shape(weight: torch.Tensor, BLOCK_SIZE: int = BLOCK_SIZE) ->
     return torch.Size((block_rows, block_cols))
 
 
+def _dequantize_with_torch(
+    weight: torch.Tensor,
+    scale_inv: torch.Tensor,
+    dtype: torch.dtype,
+    block_size: int,
+) -> torch.Tensor:
+    float_weight = weight.to(torch.float32)
+    orig_shape = weight.shape
+    block_rows = (orig_shape[0] + block_size - 1) // block_size
+    block_cols = (orig_shape[1] + block_size - 1) // block_size
+
+    # NOTE: When processing large models on-the-fly, misalignment between block boundaries
+    # and DTensor local shape partitioning can lead to silent numerical inaccuracies.
+    dequantized = float_weight.detach().clone().to(dtype=dtype)
+
+    for i in range(block_rows):
+        row_start = i * block_size
+        row_end = min(row_start + block_size, orig_shape[0])
+
+        for j in range(block_cols):
+            col_start = j * block_size
+            col_end = min(col_start + block_size, orig_shape[1])
+
+            block = float_weight[row_start:row_end, col_start:col_end]
+            scale = scale_inv[i, j]
+            block = block * scale
+
+            block_converted = block.to(dtype=torch.float32)
+            dequantized[row_start:row_end, col_start:col_end] = block_converted
+
+    return dequantized
+
+
+def _dequantize_with_triton(
+    weight: torch.Tensor,
+    scale_inv: torch.Tensor,
+    dtype: torch.dtype,
+    block_size: int,
+) -> torch.Tensor:
+    if not _TRITON_AVAILABLE:
+        raise RuntimeError("Triton is not available for dequantization.")
+
+    m, n = weight.shape
+    output = torch.empty((m, n), device=weight.device, dtype=dtype)
+    grid = (triton.cdiv(m, block_size), triton.cdiv(n, block_size))
+    _weight_dequant_kernel[grid](
+        weight,
+        scale_inv,
+        output,
+        m,
+        n,
+        weight.stride(0),
+        weight.stride(1),
+        output.stride(0),
+        output.stride(1),
+        scale_inv.stride(0),
+        scale_inv.stride(1),
+        BLOCK_SIZE=block_size,
+    )
+    return output
+
+
 def dequantize_from_fp8(
     weight: torch.Tensor,
     scale_inv: torch.Tensor,
     dtype=torch.bfloat16,
     BLOCK_SIZE: int = BLOCK_SIZE,
 ) -> torch.Tensor:
-    # Convert to float32 for computation
-    float_weight = weight.to(torch.float32)
-    scale_inv = scale_inv.to(device=weight.device)
-    # Get original dimensions
-    orig_shape = weight.shape
+    weight_is_dtensor = is_dtensor(weight)
+    scale_is_dtensor = is_dtensor(scale_inv)
 
-    # Verify scale_inv shape matches expected block dimensions
-    expected_scale_shape = calculate_scale_shape(weight, BLOCK_SIZE)
-    block_rows, block_cols = expected_scale_shape
-    if scale_inv.shape != expected_scale_shape:
-        logger.warning(f"scale_inv shape {scale_inv.shape} doesn't match expected shape {expected_scale_shape}")
+    weight_local = weight.to_local() if weight_is_dtensor else weight
+    scale_local = scale_inv.to_local() if scale_is_dtensor else scale_inv
 
-    # NOTE: When processing large models on-the-fly, misalignment between block boundaries
-    # and DTensor local shape partitioning can lead to silent numerical inaccuracies.
-    dequantized = float_weight.detach().clone().to(dtype=dtype)
+    expected_scale_shape = calculate_scale_shape(weight_local, BLOCK_SIZE)
+    if scale_local.shape != expected_scale_shape:
+        logger.warning(f"scale_inv shape {scale_local.shape} doesn't match expected shape {expected_scale_shape}")
 
-    # Apply scaling factors to each block
-    for i in range(block_rows):
-        row_start = i * BLOCK_SIZE
-        row_end = min(row_start + BLOCK_SIZE, orig_shape[0])
+    scale_local = scale_local.to(device=weight_local.device)
+    if not weight_local.is_contiguous():
+        weight_local = weight_local.contiguous()
+    if not scale_local.is_contiguous():
+        scale_local = scale_local.contiguous()
 
-        for j in range(block_cols):
-            col_start = j * BLOCK_SIZE
-            col_end = min(col_start + BLOCK_SIZE, orig_shape[1])
+    use_triton = (
+        _TRITON_AVAILABLE
+        and weight_local.is_cuda
+        and scale_local.is_cuda
+        and weight_local.dim() == 2
+        and scale_local.dim() == 2
+    )
 
-            # Get the block
-            block = float_weight[row_start:row_end, col_start:col_end]
+    if use_triton:
+        try:
+            dequantized_local = _dequantize_with_triton(weight_local, scale_local, dtype, BLOCK_SIZE)
+        except Exception as exc:
+            logger.warning(f"Triton dequant failed ({exc}). Falling back to torch.")
+            dequantized_local = _dequantize_with_torch(weight_local, scale_local, dtype, BLOCK_SIZE)
+    else:
+        dequantized_local = _dequantize_with_torch(weight_local, scale_local, dtype, BLOCK_SIZE)
 
-            scale = scale_inv[i, j]
-            block = block * scale
+    if weight_is_dtensor:
+        from torch.distributed._tensor import DTensor
 
-            # Explicitly convert block to dtype
-            block_converted = block.to(dtype=torch.float32)
-            # Store the dequantized block
-            dequantized[row_start:row_end, col_start:col_end] = block_converted
+        return DTensor.from_local(dequantized_local, weight.device_mesh, weight.placements)
 
-    return dequantized
+    return dequantized_local

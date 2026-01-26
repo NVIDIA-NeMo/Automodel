@@ -21,6 +21,9 @@ from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import (
     DeepSeekV3StateDictAdapter,
     calculate_scale_shape,
     dequantize_from_fp8,
+    _dequantize_with_torch,
+    _dequantize_with_triton,
+    _TRITON_AVAILABLE,
     BLOCK_SIZE,
 )
 from nemo_automodel.components.moe.layers import MoEConfig
@@ -635,3 +638,166 @@ class TestConvertSingleTensorToHf:
             # Each expert weight should be quantized
             assert len(result) == 4  # 2 weights * 2 (weight + scale_inv)
             assert all("_scale_inv" in k or k.endswith(".weight") for k, _ in result)
+
+
+skip_if_no_triton = pytest.mark.skipif(not _TRITON_AVAILABLE, reason="Triton is required")
+
+
+class TestDequantizeTritonVsTorch:
+    """Tests to verify functional equivalence between _dequantize_with_triton and _dequantize_with_torch."""
+
+    def _create_test_tensors(self, m: int, n: int, device: str = "cuda") -> tuple[torch.Tensor, torch.Tensor]:
+        """Create FP8 weight tensor and corresponding scale_inv tensor."""
+        weight_float = torch.randn(m, n, device=device, dtype=torch.float32)
+        weight_fp8 = weight_float.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+
+        scale_shape = calculate_scale_shape(weight_fp8, BLOCK_SIZE)
+        scale_inv = torch.rand(scale_shape, device=device, dtype=torch.float32) * 2.0 + 0.5
+
+        return weight_fp8, scale_inv
+
+    @skip_if_no_gpu
+    @skip_if_no_triton
+    def test_equivalence_small_matrix(self):
+        """Test equivalence for small matrices (256x256)."""
+        weight, scale_inv = self._create_test_tensors(256, 256)
+        dtype = torch.bfloat16
+
+        torch_result = _dequantize_with_torch(weight, scale_inv, dtype, BLOCK_SIZE)
+        triton_result = _dequantize_with_triton(weight, scale_inv, dtype, BLOCK_SIZE)
+
+        assert torch.allclose(torch_result.float(), triton_result.float(), atol=1e-3, rtol=1e-3)
+
+    @skip_if_no_gpu
+    @skip_if_no_triton
+    def test_equivalence_medium_matrix(self):
+        """Test equivalence for medium matrices (512x512)."""
+        weight, scale_inv = self._create_test_tensors(512, 512)
+        dtype = torch.bfloat16
+
+        torch_result = _dequantize_with_torch(weight, scale_inv, dtype, BLOCK_SIZE)
+        triton_result = _dequantize_with_triton(weight, scale_inv, dtype, BLOCK_SIZE)
+
+        assert torch.allclose(torch_result.float(), triton_result.float(), atol=1e-3, rtol=1e-3)
+
+    @skip_if_no_gpu
+    @skip_if_no_triton
+    def test_equivalence_non_square_tall(self):
+        """Test equivalence for non-square tall matrices (768x256)."""
+        weight, scale_inv = self._create_test_tensors(768, 256)
+        dtype = torch.bfloat16
+
+        torch_result = _dequantize_with_torch(weight, scale_inv, dtype, BLOCK_SIZE)
+        triton_result = _dequantize_with_triton(weight, scale_inv, dtype, BLOCK_SIZE)
+
+        assert torch.allclose(torch_result.float(), triton_result.float(), atol=1e-3, rtol=1e-3)
+
+    @skip_if_no_gpu
+    @skip_if_no_triton
+    def test_equivalence_non_square_wide(self):
+        """Test equivalence for non-square wide matrices (256x768)."""
+        weight, scale_inv = self._create_test_tensors(256, 768)
+        dtype = torch.bfloat16
+
+        torch_result = _dequantize_with_torch(weight, scale_inv, dtype, BLOCK_SIZE)
+        triton_result = _dequantize_with_triton(weight, scale_inv, dtype, BLOCK_SIZE)
+
+        assert torch.allclose(torch_result.float(), triton_result.float(), atol=1e-3, rtol=1e-3)
+
+    @skip_if_no_gpu
+    @skip_if_no_triton
+    def test_equivalence_partial_blocks(self):
+        """Test equivalence for matrices with partial blocks (non-divisible by BLOCK_SIZE)."""
+        weight, scale_inv = self._create_test_tensors(200, 100)
+        dtype = torch.bfloat16
+
+        torch_result = _dequantize_with_torch(weight, scale_inv, dtype, BLOCK_SIZE)
+        triton_result = _dequantize_with_triton(weight, scale_inv, dtype, BLOCK_SIZE)
+
+        assert torch.allclose(torch_result.float(), triton_result.float(), atol=1e-3, rtol=1e-3)
+
+    @skip_if_no_gpu
+    @skip_if_no_triton
+    def test_equivalence_float32_output(self):
+        """Test equivalence with float32 output dtype."""
+        weight, scale_inv = self._create_test_tensors(512, 512)
+        dtype = torch.float32
+
+        torch_result = _dequantize_with_torch(weight, scale_inv, dtype, BLOCK_SIZE)
+        triton_result = _dequantize_with_triton(weight, scale_inv, dtype, BLOCK_SIZE)
+
+        assert torch_result.dtype == torch.float32
+        assert triton_result.dtype == torch.float32
+        assert torch.allclose(torch_result, triton_result, atol=1e-5, rtol=1e-5)
+
+    @skip_if_no_gpu
+    @skip_if_no_triton
+    def test_equivalence_float16_output(self):
+        """Test equivalence with float16 output dtype."""
+        weight, scale_inv = self._create_test_tensors(512, 512)
+        dtype = torch.float16
+
+        torch_result = _dequantize_with_torch(weight, scale_inv, dtype, BLOCK_SIZE)
+        triton_result = _dequantize_with_triton(weight, scale_inv, dtype, BLOCK_SIZE)
+
+        assert torch_result.dtype == torch.float16
+        assert triton_result.dtype == torch.float16
+        assert torch.allclose(torch_result.float(), triton_result.float(), atol=1e-3, rtol=1e-3)
+
+    @skip_if_no_gpu
+    @skip_if_no_triton
+    def test_equivalence_uniform_scale(self):
+        """Test equivalence with uniform scale_inv values."""
+        weight, _ = self._create_test_tensors(512, 512)
+        scale_shape = calculate_scale_shape(weight, BLOCK_SIZE)
+        scale_inv = torch.ones(scale_shape, device="cuda", dtype=torch.float32) * 2.5
+        dtype = torch.bfloat16
+
+        torch_result = _dequantize_with_torch(weight, scale_inv, dtype, BLOCK_SIZE)
+        triton_result = _dequantize_with_triton(weight, scale_inv, dtype, BLOCK_SIZE)
+
+        assert torch.allclose(torch_result.float(), triton_result.float(), atol=1e-3, rtol=1e-3)
+
+    @skip_if_no_gpu
+    @skip_if_no_triton
+    def test_equivalence_varying_scales(self):
+        """Test equivalence with varying scale_inv values across blocks."""
+        weight, _ = self._create_test_tensors(512, 512)
+        scale_shape = calculate_scale_shape(weight, BLOCK_SIZE)
+        # Create scales that vary significantly across blocks
+        scale_inv = torch.arange(1, scale_shape[0] * scale_shape[1] + 1, device="cuda", dtype=torch.float32)
+        scale_inv = scale_inv.reshape(scale_shape) * 0.1
+        dtype = torch.bfloat16
+
+        torch_result = _dequantize_with_torch(weight, scale_inv, dtype, BLOCK_SIZE)
+        triton_result = _dequantize_with_triton(weight, scale_inv, dtype, BLOCK_SIZE)
+
+        assert torch.allclose(torch_result.float(), triton_result.float(), atol=1e-3, rtol=1e-3)
+
+    @skip_if_no_gpu
+    @skip_if_no_triton
+    def test_output_shapes_match(self):
+        """Test that output shapes match for both implementations."""
+        test_shapes = [(256, 256), (512, 512), (768, 256), (200, 100)]
+        dtype = torch.bfloat16
+
+        for m, n in test_shapes:
+            weight, scale_inv = self._create_test_tensors(m, n)
+
+            torch_result = _dequantize_with_torch(weight, scale_inv, dtype, BLOCK_SIZE)
+            triton_result = _dequantize_with_triton(weight, scale_inv, dtype, BLOCK_SIZE)
+
+            assert torch_result.shape == triton_result.shape == (m, n), f"Shape mismatch for ({m}, {n})"
+
+    @skip_if_no_gpu
+    @skip_if_no_triton
+    def test_output_devices_match(self):
+        """Test that output devices match input device."""
+        weight, scale_inv = self._create_test_tensors(512, 512, device="cuda")
+        dtype = torch.bfloat16
+
+        torch_result = _dequantize_with_torch(weight, scale_inv, dtype, BLOCK_SIZE)
+        triton_result = _dequantize_with_triton(weight, scale_inv, dtype, BLOCK_SIZE)
+
+        assert torch_result.device.type == "cuda"
+        assert triton_result.device.type == "cuda"
