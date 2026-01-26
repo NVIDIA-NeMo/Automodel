@@ -236,6 +236,9 @@ class ColumnMappedTextInstructionDataset(Dataset):
         self.truncation = truncation
         self.use_hf_chat_template = use_hf_chat_template
 
+    def __iter__(self) -> Iterator[Dict[str, List[int]]]:
+        raise ValueError("__iter__ is not supported in map mode.")
+
     def __len__(self) -> int:  # noqa: D401
         """
         Returns the length of the dataset.
