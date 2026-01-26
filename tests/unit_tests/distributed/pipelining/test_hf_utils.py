@@ -665,3 +665,57 @@ class TestValidateHfModelForPipelineSupport:
 
         assert isinstance(output, BaseModelOutputWithPast)
         assert output.attentions is None
+
+    @patch('nemo_automodel.components.distributed.pipelining.hf_utils.get_text_module')
+    def test_rotary_emb_via_get_text_module(self, mock_get_text_module):
+        """Test that rotary_emb is accessed via get_text_module for multimodal model support."""
+        mock_model = Mock()
+        mock_model.config = Mock()
+        mock_model.gradient_checkpointing = False
+        mock_model.embed_tokens = None
+        mock_model.norm = None
+        mock_model.layers = None
+
+        # Create a mock text module with rotary_emb
+        mock_text_module = Mock()
+        mock_rotary = Mock()
+        mock_rotary.return_value = (torch.randn(1, 10, 64), torch.randn(1, 10, 64))
+        mock_text_module.rotary_emb = mock_rotary
+
+        mock_get_text_module.return_value = mock_text_module
+
+        forward_fn = create_pipeline_forward_inner("AutoModel")
+
+        inputs_embeds = torch.randn(1, 10, 768)
+        position_ids = torch.arange(10).unsqueeze(0)
+        output = forward_fn(mock_model, inputs_embeds=inputs_embeds, position_ids=position_ids)
+
+        # Verify get_text_module was called with the model
+        mock_get_text_module.assert_called_with(mock_model)
+
+        # Verify rotary_emb was called
+        mock_rotary.assert_called_once()
+
+    @patch('nemo_automodel.components.distributed.pipelining.hf_utils.get_text_module')
+    def test_rotary_emb_none_via_get_text_module(self, mock_get_text_module):
+        """Test that None rotary_emb from get_text_module is handled correctly."""
+        mock_model = Mock()
+        mock_model.config = Mock()
+        mock_model.gradient_checkpointing = False
+        mock_model.embed_tokens = None
+        mock_model.norm = None
+        mock_model.layers = None
+
+        # Create a mock text module with None rotary_emb
+        mock_text_module = Mock()
+        mock_text_module.rotary_emb = None
+
+        mock_get_text_module.return_value = mock_text_module
+
+        forward_fn = create_pipeline_forward_inner("AutoModel")
+
+        inputs_embeds = torch.randn(1, 10, 768)
+        # Should not raise error when rotary_emb is None
+        output = forward_fn(mock_model, inputs_embeds=inputs_embeds)
+
+        assert isinstance(output, BaseModelOutputWithPast)
