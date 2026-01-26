@@ -129,6 +129,21 @@ jobs:
         run: |
           echo "Running CI tests"
 
+  cicd-container-build:
+    needs: [pre-flight, cicd-wait-in-queue]
+    runs-on: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+    environment: nemo-ci
+    if: |
+      (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && !cancelled()
+    uses: ./.github/workflows/_build_container.yml
+    with:
+      repo_name: "Automodel"
+
   cicd-unit-tests:
     strategy:
       fail-fast: false

@@ -123,16 +123,25 @@ RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
 
 FROM automodel_dep as automodel_final
 
+WORKDIR /opt/Automodel
+
+COPY pyproject.toml uv.lock /opt/Automodel/
+COPY nemo_automodel/__init__.py nemo_automodel/package_info.py /opt/Automodel/nemo_automodel
+
 # Install Automodel
 ARG BASE_IMAGE=cuda
 ARG AUTOMODEL_INSTALL=all
-COPY . /opt/Automodel
-RUN cd /opt/Automodel && \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    --mount=type=cache,target=/root/.cache/uv \
     if [ "$BASE_IMAGE" = "pytorch" ]; then \
         sed -i '/\[tool\.uv\]/r /opt/Automodel/docker/common/uv-pytorch.toml' pyproject.toml && \
         mv /opt/Automodel/docker/common/uv-pytorch.lock /opt/Automodel/uv.lock; \
     fi && \
     uv sync --locked --extra $AUTOMODEL_INSTALL --all-groups
+    uv cache prune
+
+COPY . /opt/Automodel
 
 COPY <<EOF /opt/venv/env.sh
 export UV_PROJECT_ENVIRONMENT=/opt/venv
