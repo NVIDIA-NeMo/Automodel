@@ -21,6 +21,8 @@ from pathlib import Path
 
 import yaml
 
+from nemo_automodel.components.config.loader import resolve_yaml_env_vars
+
 logging.getLogger().setLevel(logging.INFO)
 
 
@@ -100,7 +102,7 @@ def load_yaml(file_path):
     """
     try:
         with open(file_path, "r") as file:
-            return yaml.safe_load(file)
+            return resolve_yaml_env_vars(yaml.safe_load(file))
     except FileNotFoundError as e:
         logging.error(f"File '{file_path}' was not found.")
         raise e

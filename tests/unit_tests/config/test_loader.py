@@ -303,6 +303,35 @@ def test_load_yaml_config(tmp_path):
     assert cfg.scheduler.gamma == 0.5
 
 
+def test_load_yaml_config_resolves_oc_env(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("DATABRICKS_HOST", "https://example.databricks.local")
+    yml = tmp_path / "cfg.yaml"
+    yml.write_text(
+        """
+        dataset:
+          delta_storage_options:
+            DATABRICKS_HOST: ${oc.env:DATABRICKS_HOST}
+        """
+    )
+    cfg = load_yaml_config(str(yml))
+    assert cfg.dataset.delta_storage_options.DATABRICKS_HOST == "https://example.databricks.local"
+
+def test_load_yaml_config_oc_env_default(monkeypatch, tmp_path: Path):
+    monkeypatch.delenv("NOT_SET", raising=False)
+    yml = tmp_path / "cfg.yaml"
+    yml.write_text("x: ${oc.env:NOT_SET,default_value}\n")
+    cfg = load_yaml_config(str(yml))
+    assert cfg.x == "default_value"
+
+
+def test_load_yaml_config_oc_env_missing_raises(monkeypatch, tmp_path: Path):
+    monkeypatch.delenv("MISSING_ENV_VAR", raising=False)
+    yml = tmp_path / "cfg.yaml"
+    yml.write_text("x: ${oc.env:MISSING_ENV_VAR}\n")
+    with pytest.raises(KeyError, match="MISSING_ENV_VAR"):
+        _ = load_yaml_config(str(yml))
+
+
 def test_load_module_from_file(tmp_path):
     """Module is imported, its globals are accessible, and it gets a unique name."""
     py_file = tmp_path / "plugin.py"

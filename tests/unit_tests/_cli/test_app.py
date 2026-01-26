@@ -64,6 +64,14 @@ def test_load_yaml_bad_format(tmp_path):
         module.load_yaml(bad_yaml)
 
 
+def test_load_yaml_resolves_oc_env(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("FOO_ENV", "bar")
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text("x: ${oc.env:FOO_ENV}\n")
+    data = module.load_yaml(cfg)
+    assert data["x"] == "bar"
+
+
 def test_load_function_success(tmp_path):
     # Create a mock Python file with a function
     file_path = tmp_path / "mock_module.py"

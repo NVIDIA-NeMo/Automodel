@@ -18,6 +18,7 @@ import importlib.util
 import inspect
 import os
 import pprint
+import re
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -158,6 +159,46 @@ def translate_value(v):
     except Exception:
         # fallback to raw string
         return v
+
+
+_OC_ENV_PATTERN = re.compile(r"\$\{oc\.env:([^}]+)\}")
+
+
+def resolve_yaml_env_vars(obj: Any) -> Any:
+    """Resolve `${oc.env:VAR}` (and `${oc.env:VAR,default}`) references in a YAML-loaded container.
+
+    This is intentionally a small subset of OmegaConf/Hydra interpolation semantics, supporting only
+    `oc.env` because NeMo AutoModel config files are commonly written using this convention.
+    """
+
+    def _resolve_in_str(value: str) -> str:
+        if "${oc.env:" not in value:
+            return value
+
+        def _repl(match: re.Match[str]) -> str:
+            expr = match.group(1).strip()
+            if "," in expr:
+                var_name, default = expr.split(",", 1)
+                var_name = var_name.strip()
+                default = default.strip()
+            else:
+                var_name, default = expr, None
+
+            if var_name in os.environ:
+                return os.environ[var_name]
+            if default is not None:
+                return default
+            raise KeyError(f"Environment variable '{var_name}' is not set (required by '{match.group(0)}').")
+
+        return _OC_ENV_PATTERN.sub(_repl, value)
+
+    if isinstance(obj, dict):
+        return {k: resolve_yaml_env_vars(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [resolve_yaml_env_vars(v) for v in obj]
+    if isinstance(obj, str):
+        return _resolve_in_str(obj)
+    return obj
 
 
 def load_module_from_file(file_path):
@@ -654,4 +695,5 @@ def load_yaml_config(path):
     """
     with open(path, "r") as f:
         raw = yaml.safe_load(f)
+    raw = resolve_yaml_env_vars(raw)
     return ConfigNode(raw)
