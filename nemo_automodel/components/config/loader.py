@@ -161,31 +161,51 @@ def translate_value(v):
         return v
 
 
-_OC_ENV_PATTERN = re.compile(r"\$\{oc\.env:([^}]+)\}")
-
-
 class _OrigValueStr(str):
     """String that keeps its original (unresolved) value for safe printing."""
 
     def __new__(cls, value: str, orig_value: str):
         obj = super().__new__(cls, value)
         obj._orig_value = orig_value
+        # Mark values that already went through env resolution so we don't accidentally
+        # re-resolve `$FOO` sequences that happen to appear in secrets.
+        obj._no_env_resolve = True
         return obj
 
 
 def resolve_yaml_env_vars(obj: Any) -> Any:
-    """Resolve `${oc.env:VAR}` (and `${oc.env:VAR,default}`) references in a YAML-loaded container.
+    """Resolve env var references inside a YAML-loaded container.
 
-    This is intentionally a small subset of OmegaConf/Hydra interpolation semantics, supporting only
-    `oc.env` because NeMo AutoModel config files are commonly written using this convention.
+    Supported forms inside strings:
+    - `${VAR}` / `${VAR,default}`
+    - `${var.dot.var}` (dots are treated as part of the env var name)
+    - `$VAR` / `$var.dot.var`
+    - Back-compat: `${oc.env:VAR}` / `${oc.env:VAR,default}`
     """
 
     def _resolve_in_str(value: str) -> str:
-        if "${oc.env:" not in value:
+        # Skip values that opted out / were already resolved.
+        if hasattr(value, "_no_env_resolve"):
+            return value
+        if "$" not in value:
             return value
 
-        def _repl(match: re.Match[str]) -> str:
+        def _get_env(var_name: str, default: str | None, token: str) -> str:
+            if var_name in os.environ:
+                return os.environ[var_name]
+            if default is not None:
+                return default
+            raise KeyError(f"Environment variable '{var_name}' is not set (required by '{token}').")
+
+        # Handle braced patterns first: ${...}
+        braced_pattern = re.compile(r"\$\{([^}]+)\}")
+
+        def _braced_repl(match: re.Match[str]) -> str:
             expr = match.group(1).strip()
+            # Back-compat: ${oc.env:VAR}
+            if expr.startswith("oc.env:"):
+                expr = expr[len("oc.env:") :].strip()
+
             if "," in expr:
                 var_name, default = expr.split(",", 1)
                 var_name = var_name.strip()
@@ -193,13 +213,19 @@ def resolve_yaml_env_vars(obj: Any) -> Any:
             else:
                 var_name, default = expr, None
 
-            if var_name in os.environ:
-                return os.environ[var_name]
-            if default is not None:
-                return default
-            raise KeyError(f"Environment variable '{var_name}' is not set (required by '{match.group(0)}').")
+            return _get_env(var_name, default, match.group(0))
 
-        return _OC_ENV_PATTERN.sub(_repl, value)
+        value = braced_pattern.sub(_braced_repl, value)
+
+        # Then handle $VAR patterns (allow dots in name).
+        # `$VAR` and `$var.dot.var` (dot-separated segments; do not allow trailing dot).
+        dollar_pattern = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*)")
+
+        def _dollar_repl(match: re.Match[str]) -> str:
+            var_name = match.group(1)
+            return _get_env(var_name, None, match.group(0))
+
+        return dollar_pattern.sub(_dollar_repl, value)
 
     if isinstance(obj, dict):
         return {k: resolve_yaml_env_vars(v) for k, v in obj.items()}
@@ -348,10 +374,10 @@ class ConfigNode:
         else:
             # Support `${oc.env:VAR}` (with optional default) in YAML scalars.
             # Store the resolved value for runtime, but keep the original token for safe printing.
-            if isinstance(v, str) and "${oc.env:" in v:
+            if isinstance(v, str) and "$" in v:
                 resolved = resolve_yaml_env_vars(v)
                 translated = translate_value(resolved)
-                if isinstance(translated, str):
+                if isinstance(translated, str) and resolved != v:
                     return _OrigValueStr(translated, v)
                 return translated
             return translate_value(v)

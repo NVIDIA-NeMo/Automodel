@@ -316,6 +316,11 @@ def main():
     config = load_yaml(config_path)
 
     if slurm_config := config.pop("slurm", None):
+        # Allow env var references inside the slurm section (e.g., `${HF_HOME}`, `$HF_HOME`,
+        # `${oc.env:HF_HOME}`), since slurm config is not processed by ConfigNode.
+        from nemo_automodel.components.config.loader import resolve_yaml_env_vars
+
+        slurm_config = resolve_yaml_env_vars(slurm_config)
         logging.info("Launching job via SLURM")
         # if there's no `job_dir` in the slurm section, use cwd/slurm_job/unix_timestamp
         # otherwise will use slurm.job_dir / unix_timestamp
