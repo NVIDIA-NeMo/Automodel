@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 BLOCK_SIZE = 128
 
 if _TRITON_AVAILABLE:
-
+    # Adapted from https://github.com/nvidia-cosmos/cosmos-rl/blob/main/cosmos_rl/policy/model/deepseek_v3/weight_mapper.py#L233
     @triton.jit
     def _weight_dequant_kernel(
         x_ptr,
