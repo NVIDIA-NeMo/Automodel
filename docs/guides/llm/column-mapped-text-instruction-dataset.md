@@ -6,7 +6,9 @@ The `ColumnMappedTextInstructionDataset` is a lightweight, plug-and-play helper 
 
 * Quick prototyping across diverse instruction datasets
 * Schema flexibility without needing codebase changes
-* Consistent field names for training loops, regardless of dataset source
+- Quick prototyping across diverse instruction datasets
+- Schema flexibility without requiring code changes
+- Consistent field names for training loops, regardless of dataset source
 
 It supports three data sources out-of-the-box and optionally streams them so they never fully reside in memory:
 
