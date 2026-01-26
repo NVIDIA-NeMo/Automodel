@@ -32,11 +32,11 @@ from torch.distributed.pipelining.schedules import (
     get_schedule_class,
 )
 
-from nemo_automodel.components.distributed.pipelining.hf_utils import patch_hf_model_for_pp
-from nemo_automodel.components.utils.model_utils import (
+from nemo_automodel.components.distributed.pipelining.hf_utils import (
     MULTIMODAL_SUFFIXES,
     TEXT_MODULE_ATTRS,
     get_text_module,
+    patch_hf_model_for_pp,
 )
 
 logger = logging.getLogger(__name__)
