@@ -74,7 +74,7 @@ NeMo Automodel supports env var interpolation inside YAML **string values**.
   - `${oc.env:VAR}`
   - `${oc.env:VAR,default}`
 
-### Behavior
+### Interpolation Behavior
 
 - Interpolation happens when values are wrapped into a `ConfigNode`.
 - If a referenced env var is **missing** and **no default** is provided, config loading raises a `KeyError`.
