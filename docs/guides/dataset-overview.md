@@ -38,12 +38,13 @@ dataset:
   start_of_turn_token: "<|assistant|>"
 ```
 
-- **ColumnMappedTextInstructionDataset (generic instruction SFT)**
+- **ColumnMappedTextInstructionDataset (generic instruction SFT, map-style)**
   - Class: `nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset`
   - Use case: quickly adapt instruction datasets by mapping your schema's columns to `context`, `question`, `answer`
   - Sources: local JSON/JSONL or Hugging Face Hub dataset ID
   - Notes:
-    - For tokenizers with chat templates and answer-only loss, you may set `answer_only_loss_mask: true` and provide `start_of_turn_token`.
+    - Map-style, non-streaming dataset (supports `len(ds)` and `ds[i]`)
+    - For streaming (including Delta Lake / Databricks), use `ColumnMappedTextInstructionIterableDataset`
   - Example YAML:
 ```yaml
 dataset:
@@ -55,9 +56,29 @@ dataset:
     question: inputs
     answer: targets
   answer_only_loss_mask: true
-  start_of_turn_token: "<|assistant|>"
 ```
-See the detailed guide, [Column-Mapped Text Instruction Dataset](llm/column-mapped-text-instruction-dataset.md), for more information.
+
+- **ColumnMappedTextInstructionIterableDataset (generic instruction SFT, streaming)**
+  - Class: `nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset.ColumnMappedTextInstructionIterableDataset`
+  - Use case: stream instruction datasets (including Delta Lake / Databricks)
+  - Notes:
+    - Iterable/streaming dataset (iterate; no `len(ds)` / `ds[i]`)
+    - Always streaming by design (helps avoid accidental dataset materialization/data leakages)
+  - Example YAML:
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset.ColumnMappedTextInstructionIterableDataset
+  path_or_dataset_id: delta://catalog.schema.training_data
+  column_mapping:
+    question: user_message
+    answer: assistant_message
+  answer_only_loss_mask: true
+  delta_storage_options:
+    DATABRICKS_TOKEN: ${oc.env:DATABRICKS_TOKEN}
+    DATABRICKS_HOST: ${oc.env:DATABRICKS_HOST}
+```
+
+See the detailed guides, [Column-Mapped Text Instruction Dataset](llm/column-mapped-text-instruction-dataset.md) and [Column-Mapped Text Instruction Iterable Dataset](llm/column-mapped-text-instruction-iterable-dataset.md), for more information.
 
 - **ChatDataset (multi-turn conversations and tool calling)**
   - Class: `nemo_automodel.components.datasets.llm.ChatDataset`
