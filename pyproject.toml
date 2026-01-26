@@ -13,8 +13,9 @@
 # limitations under the License.
 
 [build-system]
-requires = ["setuptools >= 61.0"]
-build-backend = "setuptools.build_meta"
+requires = ["setuptools >= 66.1.0"]
+build-backend = "build_backend"
+backend-path = ["build_utils"]
 
 [tool.setuptools]
 include-package-data = true
@@ -28,7 +29,7 @@ nemo_automodel = [
 ]
 
 [tool.setuptools.dynamic]
-version = { attr = "nemo_automodel.package_info.__version__" } # any module attribute compatible with ast.literal_eval
+version = { attr = "nemo_automodel._version.__version__" } # any module attribute compatible with ast.literal_eval
 readme = { file = "README.md", content-type = "text/markdown" }
 
 [project]

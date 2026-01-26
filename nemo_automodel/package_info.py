@@ -12,17 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+try:
+    import contextlib
+    import sys
+    from pathlib import Path
 
-MAJOR = 0
-MINOR = 3
-PATCH = 0
-PRE_RELEASE = "rc0"
+    @contextlib.contextmanager
+    def temp_sys_path(path: Path):
+        sys.path.insert(0, str(path))
+        try:
+            yield
+        finally:
+            sys.path.pop(0)
 
-# Use the following formatting: (major, minor, patch, pre-release)
-VERSION = (MAJOR, MINOR, PATCH, PRE_RELEASE)
+    with temp_sys_path(Path(__file__).parent.parent / "build_utils"):
+        from build_backend import dynamic_version_info
 
-__shortversion__ = ".".join(map(str, VERSION[:3]))
-__version__ = ".".join(map(str, VERSION[:3])) + "".join(VERSION[3:])
+        __version__, __git_version__ = dynamic_version_info()
+except ModuleNotFoundError:
+    # Fallbacks for running directly from the source tree before _version.py is generated
+    __git_version__ = "gitunknown"
+    __version__ = "0.0.0"
 
 __package_name__ = "nemo_automodel"
 __contact_names__ = "NVIDIA"
