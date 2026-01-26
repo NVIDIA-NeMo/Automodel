@@ -380,7 +380,7 @@ slurm:
 ### Multi-Node Slurm Configuration
 
 :::{note}
-**Note for Multi-Node Training**: When using Hugging Face datasets in multi-node setups, you need shared storage accessible by all nodes. Set the `HF_DATASETS_CACHE` environment variable to point to a shared directory (e.g., `HF_DATASETS_CACHE=/shared/hf_cache`) in the yaml file as shown, to ensure all nodes can access the cached datasets.
+**Multi-Node Training**: When using Hugging Face datasets in multi-node setups, you need shared storage accessible by all nodes. Set the `HF_DATASETS_CACHE` environment variable to point to a shared directory (e.g., `HF_DATASETS_CACHE=/shared/hf_cache`) in the yaml file as shown, to ensure all nodes can access the cached datasets.
 :::
 
 When using multiple nodes with Hugging Face datasets:
