@@ -1,6 +1,6 @@
 # Model Training on Databricks
 
-Databricks is a widely-used platform for managing data, models, applications, and compute on the cloud. This guide shows how to use Automodel for scalable, performant model training on Databricks.
+Databricks is a widely used platform for managing data, models, applications, and compute on the cloud. This guide shows how to use Automodel for scalable, performant model training on Databricks.
 
 The specific example here fine-tunes a [Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B) model using the [SQuAD dataset](https://huggingface.co/datasets/rajpurkar/squad) from Hugging Face, but any Automodel functionality (for example, {doc}`model pre-training <pretraining>`, {doc}`VLMs </model-coverage/vlm>`, {doc}`other supported models </model-coverage/overview>`) can also be run on Databricks.
 
@@ -9,7 +9,7 @@ The specific example here fine-tunes a [Llama-3.2-1B](https://huggingface.co/met
 Let’s start by [provisioning](https://docs.databricks.com/aws/en/compute/configure) a Databricks classic compute cluster with the following setup:
 
 - Databricks runtime: [18.0 LTS (Machine Learning version)](https://docs.databricks.com/aws/en/release-notes/runtime/18.0ml)
-- Worker instance type: `g6e.12xlarge` on AWS (4x L40S GPU per node)  
+- Worker instance type: `g6e.12xlarge` on AWS (4x L40S GPUs per node)  
 - Number of workers: 2  
 - Global [environment variable](https://docs.databricks.com/aws/en/compute/configure#environment-variables): `GLOO_SOCKET_IFNAME=eth0` (see [this](https://docs.databricks.com/aws/en/machine-learning/train-model/distributed-training/spark-pytorch-distributor#gloo-failure-runtimeerror-connection-refused) for details)   
 - Cluster-scoped [init script](https://docs.databricks.com/aws/en/init-scripts/cluster-scoped):
@@ -71,8 +71,9 @@ hf_token = getpass("HF token: ")
 ```
 ```bash
 !hf auth login --token {hf_token}
+```
 
-### Single-node
+### Single-Node
 
 To run fine-tuning, we’ll use the `finetune.py` script from the Automodel repository and our config file.
 
@@ -126,7 +127,7 @@ Multi-GPU, single-node utilization of ~95% during model training.
 :::
 
 
-### Multi-node
+### Multi-Node
 
 To scale further to multi-node training, we need to submit training jobs to all instances in our Databricks cluster.
 
