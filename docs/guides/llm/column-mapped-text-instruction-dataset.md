@@ -1,6 +1,6 @@
 # Use the ColumnMappedTextInstructionDataset
 
-This guide explains how to use `ColumnMappedTextInstructionDataset` to quickly and flexibly load instruction–answer datasets for LLM fine-tuning, with minimal code changes and support for common tokenization strategies.
+This guide explains how to use `ColumnMappedTextInstructionDataset` to quickly and flexibly load instruction-answer datasets for LLM fine-tuning, with minimal code changes and support for common tokenization strategies.
 
 The `ColumnMappedTextInstructionDataset` is a lightweight, plug-and-play helper that lets you train on instruction–answer style corpora without writing custom Python for every new schema. You simply specify which columns map to logical fields like `context`, `question`, and `answer`, and the loader handles the rest automatically. This enables:
 
