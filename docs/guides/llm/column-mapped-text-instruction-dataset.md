@@ -140,7 +140,7 @@ remote_ds = ColumnMappedTextInstructionDataset(
     column_mapping={
         "context": "definition",  # high-level context
          "question": "inputs",      # the actual prompt / input
-        "answer": "targets",          # expected answer string
+        "answer": "targets",       # expected answer string
     },
     tokenizer=tokenizer,
     split="train[:5%]",        # demo slice; omit (i.e. `split="train",`) for full data
