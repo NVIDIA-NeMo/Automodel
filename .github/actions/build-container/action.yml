@@ -86,16 +86,19 @@ runs:
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
-        LAST_PRS=$(gh api graphql -f query='
-          query {
-            repository(owner: "NVIDIA-NeMo", name: ${{ inputs.repo-name }}) {
-              pullRequests(states: MERGED, first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
-                nodes {
-                  number
+        LAST_PRS=$(gh api graphql \
+          -F owner="NVIDIA-NeMo" \
+          -F name="${{ inputs.repo-name }}" \
+          -f query='
+            query($owner: String!, $name: String!) {
+              repository(owner: $owner, name: $name) {
+                pullRequests(states: MERGED, first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
+                  nodes {
+                    number
+                  }
                 }
               }
-            }
-          }' | jq -r '.data.repository.pullRequests.nodes[].number' | while read -r number; do
+            }' | jq -r '.data.repository.pullRequests.nodes[].number' | while read -r number; do
             echo "type=registry,ref=${{ env.container-registry }}/${{ inputs.repo-name }}:$number-buildcache,mode=max"
           done)
 
