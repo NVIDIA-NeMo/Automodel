@@ -18,11 +18,12 @@ import os
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from datasets import Dataset, concatenate_datasets, load_dataset
 
 EXAMPLE_TEMPLATE = {"text": "", "image": "", "nr_ocr": ""}
+INLINE_CORPUS_ID = "__inline__"
 
 
 class AbstractDataset(ABC):
@@ -152,56 +153,194 @@ def add_corpus(qa_corpus_paths: Union[dict, list], corpus_dict: dict):
             corpus_dict[corpus_id] = CorpusInfo(corpus_metadata, corpus)
 
 
+def _load_json_or_jsonl(path: str) -> Union[dict, list]:
+    """Load a JSON file, falling back to JSONL (one JSON object per line)."""
+    with open(path, "r") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            # Fall back to JSONL
+            f.seek(0)
+            records: list[dict] = []
+            for line_no, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"Failed to parse JSONL at {path}:{line_no}: {e}") from e
+            if not records:
+                raise ValueError(f"No records found in JSONL file: {path}")
+            return records
+
+
+def _coerce_to_list(value: Any) -> list:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _normalize_id_doc(doc: Any) -> Dict[str, Any]:
+    """Normalize a corpus-id based doc reference into a canonical dict shape."""
+    if isinstance(doc, dict) and "id" in doc:
+        doc_id = doc["id"]
+    else:
+        doc_id = doc
+    doc_id = doc_id if isinstance(doc_id, str) else str(doc_id)
+    return {"id": doc_id, "text": "", "image": "", "nr_ocr": ""}
+
+
+def _normalize_inline_doc(doc: Any) -> Dict[str, Any]:
+    """Normalize an inline doc (text/image provided) into a canonical dict shape."""
+    if isinstance(doc, dict):
+        if "text" not in doc:
+            raise ValueError(f"Inline doc dict must include 'text'. Got keys: {sorted(list(doc.keys()))}")
+        text = doc.get("text", "")
+        image = doc.get("image", "")
+        nr_ocr = doc.get("nr_ocr", "")
+    else:
+        text = doc if isinstance(doc, str) else str(doc)
+        image = ""
+        nr_ocr = ""
+    return {
+        "id": "",
+        "text": "" if text is None else str(text),
+        "image": "" if image is None else image,
+        "nr_ocr": "" if nr_ocr is None else str(nr_ocr),
+    }
+
+
+def _resolve_doc_to_example(doc: Any, corpus_id: str, corpus_dict: Dict[str, Any]) -> dict:
+    """
+    Resolve a doc reference into an example dict with keys: text, image, nr_ocr.
+
+    Supports:
+    - corpus-id based docs: {"id": "..."} (looked up in corpus_dict[corpus_id])
+    - inline docs: {"text": "...", "image": "", "nr_ocr": ""} (used directly)
+    """
+    if isinstance(doc, dict):
+        doc_id = doc.get("id", "")
+        # Treat non-empty "id" as a corpus lookup.
+        if doc_id:
+            if corpus_id not in corpus_dict:
+                raise KeyError(
+                    f"Corpus '{corpus_id}' not found in corpus_dict (needed to resolve doc id '{doc_id}')."
+                )
+            return corpus_dict[corpus_id].get_document_by_id(str(doc_id))
+
+        # Inline doc: copy supported fields over the template.
+        example = deepcopy(EXAMPLE_TEMPLATE)
+        if "text" in doc and doc["text"] is not None:
+            example["text"] = str(doc["text"])
+        if "image" in doc and doc["image"] is not None:
+            example["image"] = doc["image"]
+        if "nr_ocr" in doc and doc["nr_ocr"] is not None:
+            example["nr_ocr"] = str(doc["nr_ocr"])
+        return example
+
+    # String docs are interpreted as ids only when a corpus is available; otherwise as inline text.
+    if isinstance(doc, str):
+        if corpus_id in corpus_dict:
+            return corpus_dict[corpus_id].get_document_by_id(doc)
+        example = deepcopy(EXAMPLE_TEMPLATE)
+        example["text"] = doc
+        return example
+
+    # Fallback: coerce to string text
+    example = deepcopy(EXAMPLE_TEMPLATE)
+    example["text"] = str(doc)
+    return example
+
+
 def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True):
     """
-    Load datasets from JSON files.
+    Load retrieval datasets from JSON/JSONL files.
 
     Copied from nemo-retriever-research/src/data/datasets.py
 
     Returns:
         Tuple of (dataset, corpus_dict)
     """
-    REQUIRED_FIELDS = ["question_id", "question", "corpus_id", "pos_doc", "neg_doc"]
     if not isinstance(data_dir_list, list):
         data_dir_list = [data_dir_list]
     corpus_dict = {}
     datasets = []
     for data_dir in data_dir_list:
-        with open(data_dir, "r") as f:
-            train_data = json.load(f)
-        qa_corpus_paths = train_data["corpus"]
-        add_corpus(qa_corpus_paths, corpus_dict)
+        train_data = _load_json_or_jsonl(data_dir)
 
-        # Extract only the required fields for training, ignoring extra fields
+        # Corpus-id based format:
+        # {
+        #   "corpus": [{"path": "..."}],
+        #   "data": [{"question_id": "...", "question": "...", "corpus_id": "...", "pos_doc": [{"id": "..."}], ...}]
+        # }
+        is_corpus_id_format = isinstance(train_data, dict) and "corpus" in train_data and "data" in train_data
+        if is_corpus_id_format:
+            REQUIRED_FIELDS = ["question_id", "question", "corpus_id", "pos_doc", "neg_doc"]
+
+            qa_corpus_paths = train_data["corpus"]
+            add_corpus(qa_corpus_paths, corpus_dict)
+
+            normalized_data = []
+            for item in train_data["data"]:
+                missing = [f for f in REQUIRED_FIELDS if f not in item]
+                if missing:
+                    raise ValueError(f"Missing required fields: {missing} in train_data item: {item}")
+                normalized_item = {
+                    "question_id": item["question_id"],
+                    "question": item["question"],
+                    "corpus_id": item["corpus_id"],
+                    "pos_doc": [_normalize_id_doc(d) for d in _coerce_to_list(item["pos_doc"])],
+                    "neg_doc": [_normalize_id_doc(d) for d in _coerce_to_list(item["neg_doc"])],
+                }
+                normalized_data.append(normalized_item)
+
+            datasets.append(Dataset.from_list(normalized_data))
+            continue
+
+        # Inline-text format (JSONL or JSON list/dict). Example record:
+        # {"query": "...", "pos_doc": "...", "neg_doc": ["...", "..."]}
+        if isinstance(train_data, dict) and "data" in train_data and "corpus" not in train_data:
+            records = train_data["data"]
+        else:
+            records = train_data
+
+        if isinstance(records, dict):
+            records = [records]
+        if not isinstance(records, list):
+            raise ValueError(f"Unsupported inline retrieval dataset container type: {type(records)} in {data_dir}")
+
         normalized_data = []
-        for item in train_data["data"]:
-            # Extract only the essential fields we need
-            missing = [f for f in REQUIRED_FIELDS if f not in item]
-            if missing:
-                raise ValueError(f"Missing required fields: {missing} in train_data item: {item}")
+        file_prefix = os.path.basename(data_dir)
+        for idx, item in enumerate(records):
+            if not isinstance(item, dict):
+                raise ValueError(f"Inline retrieval record must be a dict. Got: {type(item)} ({item})")
+
+            question = item.get("query", item.get("question", None))
+            if question is None:
+                raise ValueError(f"Inline retrieval record must include 'query' or 'question'. Got: {item}")
+
+            if "pos_doc" not in item:
+                raise ValueError(f"Inline retrieval record must include 'pos_doc'. Got: {item}")
+            if "neg_doc" not in item:
+                raise ValueError(f"Inline retrieval record must include 'neg_doc'. Got: {item}")
+
+            question_id = item.get("question_id", item.get("id", f"{file_prefix}:{idx}"))
+            corpus_id = item.get("corpus_id", INLINE_CORPUS_ID)
+
+            pos_docs_raw = _coerce_to_list(item.get("pos_doc"))
+            if len(pos_docs_raw) == 0:
+                raise ValueError(f"Inline retrieval record pos_doc cannot be empty. Got: {item}")
+
             normalized_item = {
-                "question_id": item["question_id"],
-                "question": item["question"],
-                "corpus_id": item["corpus_id"],
+                "question_id": question_id,
+                "question": question,
+                "corpus_id": corpus_id,
+                "pos_doc": [_normalize_inline_doc(d) for d in pos_docs_raw],
+                "neg_doc": [_normalize_inline_doc(d) for d in _coerce_to_list(item.get("neg_doc"))],
             }
-            # Extract pos_doc with only id field
-            normalized_item["pos_doc"] = []
-            for doc in item["pos_doc"]:
-                if isinstance(doc, dict) and "id" in doc:
-                    normalized_item["pos_doc"].append({"id": doc["id"]})
-                else:
-                    # Handle case where doc might be just a string ID
-                    doc_id = doc if isinstance(doc, str) else str(doc)
-                    normalized_item["pos_doc"].append({"id": doc_id})
-            # Extract neg_doc with only id field
-            normalized_item["neg_doc"] = []
-            for doc in item["neg_doc"]:
-                if isinstance(doc, dict) and "id" in doc:
-                    normalized_item["neg_doc"].append({"id": doc["id"]})
-                else:
-                    # Handle case where doc might be just a string ID
-                    doc_id = doc if isinstance(doc, str) else str(doc)
-                    normalized_item["neg_doc"].append({"id": doc_id})
             normalized_data.append(normalized_item)
 
         datasets.append(Dataset.from_list(normalized_data))
@@ -245,14 +384,24 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
         positives = batch_positives[i_example]
         if isinstance(positives, list) and len(positives) > 0:
             cur_pos_neg_doc.append(positives[0])
+        elif isinstance(positives, list) and len(positives) == 0:
+            raise ValueError(f"pos_doc cannot be empty for question='{questions[i_example]}'")
         else:
             cur_pos_neg_doc.append(positives)
 
         # Get negatives (limit to num_neg_docs)
         negatives = batch_negatives[i_example]
-        neg_ids = [i for i in range(len(negatives))]
-        cur_neg_ids = [neg_ids[idx % len(neg_ids)] for idx in range(num_neg_docs)]
-        cur_pos_neg_doc += [negatives[n_id] for n_id in cur_neg_ids]
+        if not isinstance(negatives, list):
+            negatives = _coerce_to_list(negatives)
+        if num_neg_docs > 0 and len(negatives) == 0:
+            raise ValueError(
+                f"neg_doc must contain at least 1 document to sample {num_neg_docs} negatives "
+                f"for question='{questions[i_example]}'"
+            )
+        if num_neg_docs > 0:
+            neg_ids = [i for i in range(len(negatives))]
+            cur_neg_ids = [neg_ids[idx % len(neg_ids)] for idx in range(num_neg_docs)]
+            cur_pos_neg_doc += [negatives[n_id] for n_id in cur_neg_ids]
 
         cur_pos_neg_doc_batch.append(cur_pos_neg_doc)
 
@@ -268,8 +417,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
         cur_corpus_id = corpus_ids[idx_doc]
 
         for doc in docs:
-            cur_id = doc["id"]
-            cur_doc = corpus_dict[cur_corpus_id].get_document_by_id(cur_id)
+            cur_doc = _resolve_doc_to_example(doc, cur_corpus_id, corpus_dict)
 
             # Extract text
             if cur_doc["text"] != "" and not cur_doc["image"]:
@@ -290,7 +438,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
         cur_pos_neg_text_batch.append(cur_pos_neg_text)
         cur_pos_neg_image_batch.append(cur_pos_neg_image)
 
-        if use_dataset_instruction:
+        if use_dataset_instruction and cur_corpus_id in corpus_dict:
             query_instruction_batch.append(corpus_dict[cur_corpus_id].query_instruction)
             passage_instruction_batch.append(corpus_dict[cur_corpus_id].passage_instruction)
         else:
