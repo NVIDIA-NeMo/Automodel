@@ -484,3 +484,86 @@ def test_transform_func_with_use_dataset_instruction():
     # Both should have same question and doc_text content
     assert out_with_instruction["question"] == out_without_instruction["question"]
     assert out_with_instruction["doc_text"] == out_without_instruction["doc_text"]
+
+
+def test_load_datasets_inline_jsonl(tmp_path):
+    """Inline retrieval format: query + inline pos/neg doc texts (JSONL)."""
+    f = tmp_path / "inline.jsonl"
+    records = [
+        {
+            "query": "Explain transformers",
+            "pos_doc": "Transformers are a type of neural network...",
+            "neg_doc": ["RNNs are...", "CNNs are..."],
+            "extra_field": 123,  # should be ignored
+        },
+        {
+            # Support "question" as alias for "query", plus list/singleton coercions
+            "question": "What is Python?",
+            "pos_doc": ["A programming language."],
+            "neg_doc": "A snake.",
+        },
+    ]
+    f.write_text("\n".join(json.dumps(r) for r in records))
+
+    dataset, corpus_dict = rd.load_datasets(str(f))
+    assert len(dataset) == 2
+    assert corpus_dict == {}
+
+    row0 = dataset[0]
+    assert row0["question"] == "Explain transformers"
+    assert row0["corpus_id"] == rd.INLINE_CORPUS_ID
+    assert row0["pos_doc"][0]["id"] == ""
+    assert row0["pos_doc"][0]["text"].startswith("Transformers are")
+    assert [d["text"] for d in row0["neg_doc"]] == ["RNNs are...", "CNNs are..."]
+
+    row1 = dataset[1]
+    assert row1["question"] == "What is Python?"
+    assert [d["text"] for d in row1["pos_doc"]] == ["A programming language."]
+    assert [d["text"] for d in row1["neg_doc"]] == ["A snake."]
+
+
+def test_transform_func_inline_text_docs_no_corpus():
+    """_transform_func should work without a corpus_dict when docs are inline text."""
+    examples = {
+        "question": ["Q"],
+        "corpus_id": [rd.INLINE_CORPUS_ID],
+        "pos_doc": [[{"id": "", "text": "P", "image": "", "nr_ocr": ""}]],
+        "neg_doc": [
+            [
+                {"id": "", "text": "N1", "image": "", "nr_ocr": ""},
+                {"id": "", "text": "N2", "image": "", "nr_ocr": ""},
+            ]
+        ],
+    }
+
+    out = rd._transform_func(examples, num_neg_docs=2, corpus_dict={}, use_dataset_instruction=True)
+    assert out["question"] == ["Q"]
+    assert out["doc_text"][0] == ["P", "N1", "N2"]
+    assert len(out["doc_image"][0]) == 3
+    # No corpus metadata -> instructions should be empty even if enabled
+    assert out["query_instruction"][0] == ""
+    assert out["passage_instruction"][0] == ""
+
+
+def test_make_retrieval_dataset_inline_end_to_end(tmp_path):
+    """End-to-end: make_retrieval_dataset should accept inline JSONL input."""
+    f = tmp_path / "inline.jsonl"
+    f.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "query": "Explain transformers",
+                        "pos_doc": "Transformers are a type of neural network...",
+                        "neg_doc": ["RNNs are...", "CNNs are..."],
+                    }
+                )
+            ]
+        )
+    )
+
+    ds = rd.make_retrieval_dataset(data_dir_list=str(f), data_type="train", train_n_passages=3, do_shuffle=False)
+    ex = ds[0]
+    assert ex["question"] == "Explain transformers"
+    assert ex["doc_text"] == ["Transformers are a type of neural network...", "RNNs are...", "CNNs are..."]
+    assert ex["doc_image"] == ["", "", ""]
