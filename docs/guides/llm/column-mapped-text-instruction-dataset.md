@@ -2,7 +2,7 @@
 
 This guide explains how to use `ColumnMappedTextInstructionDataset` to quickly and flexibly load instruction-answer datasets for LLM fine-tuning, with minimal code changes and support for common tokenization strategies.
 
-The `ColumnMappedTextInstructionDataset` is a lightweight, plug-and-play helper that lets you train on instruction–answer style corpora without writing custom Python for every new schema. You simply specify which columns map to logical fields like `context`, `question`, and `answer`, and the loader handles the rest automatically. This enables:
+The `ColumnMappedTextInstructionDataset` is a lightweight, plug-and-play helper that lets you train on instruction-answer style corpora without writing custom Python for every new schema. You simply specify which columns map to logical fields like `context`, `question`, and `answer`, and the loader handles the rest automatically. This enables:
 
 - Quick prototyping across diverse instruction datasets
 - Schema flexibility without requiring code changes
@@ -136,7 +136,7 @@ remote_ds = ColumnMappedTextInstructionDataset(
         "answer": "targets",       # expected answer string
     },
     tokenizer=tokenizer,
-    split="train[:5%]",        # demo slice; omit (i.e. `split="train",`) for full data
+    split="train[:5%]",        # demo slice; omit (i.e., `split="train",`) for full data
     answer_only_loss_mask=True,
 )
 ```
@@ -157,9 +157,9 @@ dataset:
 
 ### Streaming / Delta Lake / Databricks
 
-:::::{note}
+:::{note}
 `ColumnMappedTextInstructionDataset` does not support streaming or Delta Lake / Databricks sources. For those, use [`ColumnMappedTextInstructionIterableDataset`](column-mapped-text-instruction-iterable-dataset.md).
-::::
+:::
 
 :::{note}
 Delta Lake / Databricks (including `delta_sql_query` and authentication) is supported only by `ColumnMappedTextInstructionIterableDataset`. See [`column-mapped-text-instruction-iterable-dataset.md`](column-mapped-text-instruction-iterable-dataset.md) for details.
@@ -250,7 +250,7 @@ slurm:
 ### Multi-Node Slurm Configuration
 
 :::{note}
-**Multi-Node Training**: When using Hugging Face datasets in multi-node setups, you need shared storage accessible by all nodes. Set the `HF_DATASETS_CACHE` environment variable to point to a shared directory (e.g., `HF_DATASETS_CACHE=/shared/hf_cache`) in the yaml file as shown, to ensure all nodes can access the cached datasets.
+**Multi-Node Training**: When using Hugging Face datasets in multi-node setups, you need shared storage accessible by all nodes. Set the `HF_DATASETS_CACHE` environment variable to point to a shared directory (e.g., `HF_DATASETS_CACHE=/shared/hf_cache`) in the YAML file as shown, to ensure all nodes can access the cached datasets.
 :::
 
 When using multiple nodes with Hugging Face datasets:

@@ -1,6 +1,6 @@
 # Use the ColumnMappedTextInstructionIterableDataset (Streaming)
 
-This guide explains how to use `ColumnMappedTextInstructionIterableDataset` to **stream** instruction datasets for LLM fine-tuning, including **Delta Lake / Databricks** sources.
+This guide explains how to use `ColumnMappedTextInstructionIterableDataset` to **stream** instruction datasets for LLM fine-tuning, including **Delta Lake/Databricks** sources.
 
 Unlike `ColumnMappedTextInstructionDataset` (map-style, non-streaming), this class is a `torch.utils.data.IterableDataset` and **always** loads data in streaming mode. This is intentional: it helps ensure data is consumed as a stream and avoids accidentally materializing full datasets/tables to disk or memory (which is especially important for large or sensitive corpora).
 
@@ -10,7 +10,7 @@ Unlike `ColumnMappedTextInstructionDataset` (map-style, non-streaming), this cla
 Use `ColumnMappedTextInstructionIterableDataset` when you need:
 
 - **Streaming-only behavior** (e.g., to reduce accidental data leakages from full dataset materialization)
-- **Delta Lake / Databricks** (Unity Catalog, cloud lakehouse storage, DBFS, etc.)
+- **Delta Lake/Databricks** (Unity Catalog, cloud lakehouse storage, DBFS, etc.)
 - **Very large datasets** where map-style loading/caching is undesirable
 
 If you do *not* need streaming (and you want `len(ds)` / `ds[i]`), use [`ColumnMappedTextInstructionDataset`](column-mapped-text-instruction-dataset.md).
@@ -56,7 +56,7 @@ print(sample.keys())  # input_ids / labels / attention_mask (and ___PAD_TOKEN_ID
 ```
 
 ---
-## Delta Lake / Databricks
+## Delta Lake/Databricks
 
 `ColumnMappedTextInstructionIterableDataset` supports Delta Lake tables from:
 
@@ -110,7 +110,7 @@ ds = ColumnMappedTextInstructionIterableDataset(
 )
 ```
 
-### Cloud Storage (S3 / Azure / GCS)
+### Cloud Storage (S3/Azure/GCS)
 
 ```python
 # S3 Delta table
