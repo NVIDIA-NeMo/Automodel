@@ -97,4 +97,3 @@ class TestMinistral3ForCausalLM:
 
         assert outputs.logits.shape == (batch, seq_len, cfg.vocab_size)
         mock_forward.assert_called_once()
-
