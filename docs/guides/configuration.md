@@ -32,7 +32,7 @@ YAML-native types (like `step_size: 10` without quotes) are already typed by the
 
 ---
 
-## `_target_` and instantiation
+## Use `_target_` for Instantiation
 
 Any mapping containing a `_target_` key can be instantiated via `ConfigNode.instantiate()`:
 
