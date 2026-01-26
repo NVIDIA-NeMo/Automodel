@@ -58,7 +58,6 @@ jobs:
           set +e
           mv uv.lock uv_main.lock
           mv docker/common/uv-pytorch.lock uv.lock
-          sed -i '/override-dependencies = \["nvidia-cudnn-cu12/d' pyproject.toml
           sed -i '/\[tool\.uv\]/r docker/common/uv-pytorch.toml' pyproject.toml
           uv lock --check
           EXIT_CODE=$?

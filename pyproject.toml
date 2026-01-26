@@ -93,10 +93,15 @@ dependencies = [
 
 [project.optional-dependencies]
 fa = ["flash-attn<=2.8.3"]
+# nvidia-cudnn-cu12 pin: This is required for GPTOSS TE support + faster cudnn attention (only on Linux where CUDA is available)
 # Flash-attn version should be selected to satisfy TE requirements
 # https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
 # "flash-attn==2.8.1",
-cuda = ["nemo_automodel[fa]", "transformer-engine[pytorch]==2.10.0"]
+cuda = [
+    "nemo_automodel[fa]",
+    "nvidia-cudnn-cu12>=9.18.0.0; sys_platform == 'linux'",
+    "transformer-engine[pytorch]==2.10.0",
+]
 extra = ["flash-linear-attention", "perceptron", "sentencepiece"]
 moe = [
     "nemo_automodel[cuda]",
@@ -122,7 +127,6 @@ all = [
     "nemo_automodel[extra]",
     "nemo_automodel[vlm]",
 ]
-
 
 [project.urls]
 Homepage = "https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/stable/"
@@ -156,8 +160,6 @@ no-build-isolation-package = ["transformer-engine-torch", "transformer-engine", 
 constraint-dependencies = [
     "starlette>=0.49.1", # Address CVE GHSA-7f5h-v6xp-fcq8
 ]
-# This is required for GPTOSS TE support + faster cudnn attention (only on Linux where CUDA is available)
-override-dependencies = ["nvidia-cudnn-cu12>=9.18.0.0; sys_platform == 'linux'"]
 
 [tool.uv.sources]
 nv_grouped_gemm = { git = "https://github.com/fanshiqing/grouped_gemm", rev = "v1.1.4.post8" }
