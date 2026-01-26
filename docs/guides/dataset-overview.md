@@ -220,7 +220,7 @@ packed_sequence:
   packed_sequence_size: 8192   # > 0 enables packing
   split_across_pack: false
 ```
-Use a collater that pads to an FP8-friendly multiple when training with FP8:
+Use a collate function that pads to an FP8-friendly multiple when training with FP8:
 ```yaml
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
