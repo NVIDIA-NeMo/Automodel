@@ -101,9 +101,9 @@ When an env var placeholder is resolved, the config keeps the original placehold
 - `str(cfg)` / `repr(cfg)` prints placeholders (e.g. `${DATABRICKS_TOKEN}`), not resolved secrets.
 - `cfg.to_yaml_dict(use_orig_values=True, redact_sensitive=True)` is the recommended way to produce a loggable YAML dict.
 
-Important caveat:
-
-- Printing a **leaf value** (e.g. `print(cfg.dataset.delta_storage_options.DATABRICKS_TOKEN)`) prints the resolved value and can leak secrets. Prefer printing the whole config or a redacted YAML dict.
+:::{important}
+Printing a **leaf value** (for example, `print(cfg.dataset.delta_storage_options.DATABRICKS_TOKEN)`) outputs the resolved secret. Instead, print the full config or use a redacted YAML dict.
+:::
 
 ---
 
