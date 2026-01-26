@@ -22,7 +22,6 @@ resolution-markers = [
 
 [manifest]
 constraints = [{ name = "starlette", specifier = ">=0.49.1" }]
-overrides = [{ name = "nvidia-cudnn-cu12", marker = "sys_platform == 'linux'", specifier = ">=9.18.0.0" }]
 
 [[manifest.dependency-metadata]]
 name = "deep-ep"
@@ -3466,14 +3465,14 @@ wheels = [
 
 [[package]]
 name = "nvidia-cudnn-cu12"
-version = "9.18.0.77"
+version = "9.10.2.21"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "nvidia-cublas-cu12", marker = "sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/db/8f/dbdff27309b2fbde2220f025556b69aa16848ff59f1d5f3fdb842911f3ad/nvidia_cudnn_cu12-9.18.0.77-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:090ad0b9d676b2eb95b0b48e2e947f9e06a3acf549b31066aaf3dbb33881e0c3", size = 647466235, upload-time = "2026-01-16T20:24:19.728Z" },
-    { url = "https://files.pythonhosted.org/packages/2b/e0/bdf6249ce9f78df6262b0bd56d947a8ca73396e546f7a775c7a4393b58e1/nvidia_cudnn_cu12-9.18.0.77-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:3a1c17088ab54049b9e0e107eb5a9b7893c1d1d9d9f425acd830a7113851586f", size = 648582780, upload-time = "2026-01-16T20:25:58.677Z" },
+    { url = "https://files.pythonhosted.org/packages/fa/41/e79269ce215c857c935fd86bcfe91a451a584dfc27f1e068f568b9ad1ab7/nvidia_cudnn_cu12-9.10.2.21-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:c9132cc3f8958447b4910a1720036d9eff5928cc3179b0a51fb6d167c6cc87d8", size = 705026878, upload-time = "2025-06-06T21:52:51.348Z" },
+    { url = "https://files.pythonhosted.org/packages/ba/51/e123d997aa098c61d029f76663dedbfb9bc8dcf8c60cbd6adbe42f76d049/nvidia_cudnn_cu12-9.10.2.21-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:949452be657fa16687d0930933f032835951ef0892b37d2d53824d1a84dc97a8", size = 706758467, upload-time = "2025-06-06T21:54:08.597Z" },
 ]
 
 [[package]]
